@@ -8,6 +8,7 @@
 #include <cublas_v2.h>
 
 #include "h3_column_major_gemm.h"
+#include "diffusion_epilogue.h"
 
 namespace {
 __global__ void prepare_fp16_rows(const float* input, half* output,
@@ -256,6 +257,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_fp16", &h3_prepare_fp16);
   m.def("dequantize", &h3_dequantize);
   m.def("rotate", &h3_rotate);
+  m.def("scaled_add_", &sm70_diffusion::scaled_add, pybind11::arg("output"),
+        pybind11::arg("delta"), pybind11::arg("scales"), pybind11::arg("alpha"),
+        pybind11::arg("offset") = 0);
   m.def("gemm", &h3_fp16_gemm, pybind11::arg("input"), pybind11::arg("weight"),
         pybind11::arg("output_fp32") = false);
 }

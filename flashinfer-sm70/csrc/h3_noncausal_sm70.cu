@@ -9,28 +9,20 @@
 namespace fi = flashinfer::attention::sm70;
 namespace {
 constexpr int D = 128;
-constexpr int BQ = 128;
+constexpr int BQ = 192;
 constexpr int BK = 64;
-// Two warps share 16 query rows. Each owns two K16 score fragments, so
-// expanding BK does not double the CTA's thread count.
-constexpr int KEY_WARPS = 2;
+// One warp owns Q16 and both logical K32 halves, retaining FP32 arithmetic.
+constexpr int KEY_WARPS = 1;
 constexpr int KEY_FRAGMENTS = BK / (KEY_WARPS * 16);
 constexpr int OUTPUT_FRAGMENTS = D / (KEY_WARPS * 16);
 constexpr int VLD = BK + 8;
 constexpr int THREADS = (BQ / 16) * KEY_WARPS * 32;
-constexpr int PREFETCH_VECTORS = BK * D / (THREADS * 8);
-static_assert(THREADS * PREFETCH_VECTORS * 8 == BK * D);
-static_assert(BQ / 16 < 16);  // Barrier 0 joins the CTA; 1..8 join query pairs.
+constexpr int PREFETCH_VECTORS = (BK * D + THREADS * 8 - 1) / (THREADS * 8);
+static_assert(THREADS * PREFETCH_VECTORS * 8 >= BK * D);
+static_assert(KEY_WARPS == 1 && BK == 64);
 constexpr int shared_bytes() {
-  constexpr int QLD = D + 8, PLD = BK + 4;
-  return (BQ * D + BK * QLD + D * VLD + BQ * PLD) * 2 +
-         (BQ * KEY_WARPS * 2 + BQ * 2) * 4;
-}
-
-// QK maxima and probability rows are consumed only by the matching pair.
-// Keep CTA-wide barriers around K/V staging and tile consumption.
-__device__ __forceinline__ void sync_query_pair(int query_group) {
-  asm volatile("bar.sync %0, 64;" ::"r"(query_group + 1) : "memory");
+  constexpr int QLD = D + 8;
+  return (BQ * D + BK * QLD + D * VLD) * 2;
 }
 
 __device__ __forceinline__ int q_swizzle(int row) {
@@ -49,19 +41,28 @@ __device__ __forceinline__ void load_q_fragment(fi::AFragment& fragment,
   values[1] = *reinterpret_cast<const uint4*>(base + ((col + 8) ^ mask));
 }
 
-// A 68-half P stride makes accumulator pair stores conflict-free. Odd rows
-// remain 8-byte aligned, so use 64-bit loads rather than WMMA's 128-bit loads.
-__device__ __forceinline__ void load_p_fragment(fi::AFragment& fragment,
-                                                const half* source, int row,
-                                                int col) {
+// Convert FP16-rounded probability accumulator pairs to the existing Volta
+// A fragment layout. Exchange row ownership across lane bit 1, then concatenate
+// the two eight-column halves across lane bit 3. No arithmetic in the exchange.
+__device__ __forceinline__ void load_probability_fragment(
+    fi::AFragment& fragment, const unsigned* pairs) {
   const int lane = threadIdx.x & 31;
-  const int physical_row =
-      row + (lane & 3) + ((lane & 16) >> 2) + ((lane & 4) << 1);
-  const half* base = source + physical_row * (BK + 4) + col;
-  auto* values = reinterpret_cast<uint2*>(fragment.x);
+  const int row_bit = (lane >> 1) & 1;
+  const unsigned own0 = row_bit ? pairs[1] : pairs[0];
+  const unsigned own1 = row_bit ? pairs[3] : pairs[2];
+  const unsigned other0 =
+      __shfl_xor_sync(0xffffffff, row_bit ? pairs[0] : pairs[1], 2);
+  const unsigned other1 =
+      __shfl_xor_sync(0xffffffff, row_bit ? pairs[2] : pairs[3], 2);
+  const unsigned local[4] = {row_bit ? other0 : own0, row_bit ? own0 : other0,
+                             row_bit ? other1 : own1, row_bit ? own1 : other1};
+  auto* output = reinterpret_cast<unsigned*>(fragment.x);
 #pragma unroll
-  for (int i = 0; i < 4; ++i)
-    values[i] = *reinterpret_cast<const uint2*>(base + i * 4);
+  for (int part = 0; part < 4; ++part) {
+    const unsigned opposite = __shfl_xor_sync(0xffffffff, local[part], 8);
+    output[part] = (lane & 8) ? opposite : local[part];
+    output[part + 4] = (lane & 8) ? local[part] : opposite;
+  }
 }
 
 __global__ __launch_bounds__(THREADS,
@@ -69,15 +70,13 @@ __global__ __launch_bounds__(THREADS,
                                                   const half* v, half* output,
                                                   int length, int heads,
                                                   float scale) {
-  constexpr int QLD = D + 8, PLD = BK + 4;
+  constexpr int QLD = D + 8;
   extern __shared__ __align__(32) unsigned char raw[];
   half* qs = reinterpret_cast<half*>(raw);
   half* ks = qs + BQ * D;
   half* vs = ks + BK * QLD;
-  half* probabilities = vs + D * VLD;
-  float* scores = reinterpret_cast<float*>(probabilities + BQ * PLD);
-  float* maximum = scores + BQ * KEY_WARPS * 2;
-  float* denominator = maximum + BQ;
+  float running_max[2] = {-INFINITY, -INFINITY};
+  float running_sum[2] = {0.f, 0.f};
   const int tid = threadIdx.x, warp = tid / 32;
   const int warp_q = warp / KEY_WARPS, warp_k = warp % KEY_WARPS;
   const int lane = tid % 32;
@@ -100,10 +99,6 @@ __global__ __launch_bounds__(THREADS,
     qs[(i / D) * D + ((i % D) ^ q_swizzle(i / D))] =
         row < length ? q[base + int64_t(row) * heads * D + i % D]
                      : __float2half(0.f);
-  }
-  if (tid < BQ) {
-    maximum[tid] = -INFINITY;
-    denominator[tid] = 0.f;
   }
   __syncthreads();
   for (int start = 0; start < length; start += BK) {
@@ -135,75 +130,72 @@ __global__ __launch_bounds__(THREADS,
         fi::mma_sync_m16n16k16_row_col_f16f16f32(qk[n], qa, kb);
       }
     }
+    unsigned probability_pairs[KEY_FRAGMENTS][4];
     {
-      // Volta distributes each accumulator row across lanes differing in
-      // bits 1 and 3. Reduce its 16 columns in registers, then combine only
-      // the two warp partials through shared memory.
-      float row_max[2] = {-INFINITY, -INFINITY};
+      // Preserve the original two logical K32 partials and their FP32 sum
+      // order even though one warp now owns both halves of this K64 tile.
+      float row_max[2][2] = {{-INFINITY, -INFINITY}, {-INFINITY, -INFINITY}};
 #pragma unroll
       for (int n = 0; n < KEY_FRAGMENTS; ++n) {
 #pragma unroll
         for (int i = 0; i < qk[n].num_elements; ++i) {
-          const int col = warp_k * (BK / KEY_WARPS) + n * 16 + fragment_col +
-                          (i & 1) + ((i >> 2) & 1) * 4;
+          const int col = n * 16 + fragment_col + (i & 1) + ((i >> 2) & 1) * 4;
+          const int row = (i >> 1) & 1;
           qk[n].x[i] = start + col < length ? qk[n].x[i] * scale : -INFINITY;
-          row_max[(i >> 1) & 1] = fmaxf(row_max[(i >> 1) & 1], qk[n].x[i]);
+          row_max[n / 2][row] = fmaxf(row_max[n / 2][row], qk[n].x[i]);
         }
       }
 #pragma unroll
-      for (int r = 0; r < 2; ++r) {
-        row_max[r] =
-            fmaxf(row_max[r], __shfl_xor_sync(0xffffffff, row_max[r], 2));
-        row_max[r] =
-            fmaxf(row_max[r], __shfl_xor_sync(0xffffffff, row_max[r], 8));
-        const int row = warp_q * 16 + fragment_row + r * 2;
-        if ((lane & 10) == 0) scores[row * KEY_WARPS + warp_k] = row_max[r];
+      for (int half = 0; half < 2; ++half) {
+#pragma unroll
+        for (int row = 0; row < 2; ++row) {
+          auto& maximum = row_max[half][row];
+          maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
+          maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 8));
+        }
       }
-      sync_query_pair(warp_q);
-      float new_max[2], row_sum[2] = {0.f, 0.f};
+      float new_max[2], row_sum[2][2] = {{0.f, 0.f}, {0.f, 0.f}};
 #pragma unroll
-      for (int r = 0; r < 2; ++r) {
-        const int row = warp_q * 16 + fragment_row + r * 2;
-        new_max[r] = maximum[row];
-#pragma unroll
-        for (int w = 0; w < KEY_WARPS; ++w)
-          new_max[r] = fmaxf(new_max[r], scores[row * KEY_WARPS + w]);
-        register_alpha[r] = __expf(maximum[row] - new_max[r]);
+      for (int row = 0; row < 2; ++row) {
+        new_max[row] =
+            fmaxf(fmaxf(running_max[row], row_max[0][row]), row_max[1][row]);
+        register_alpha[row] = __expf(running_max[row] - new_max[row]);
       }
 #pragma unroll
       for (int n = 0; n < KEY_FRAGMENTS; ++n) {
 #pragma unroll
         for (int i = 0; i < qk[n].num_elements; ++i) {
-          const int r = (i >> 1) & 1;
-          const int row = warp_q * 16 + fragment_row + r * 2;
-          const int col = warp_k * (BK / KEY_WARPS) + n * 16 + fragment_col +
-                          (i & 1) + ((i >> 2) & 1) * 4;
-          const float p = __expf(qk[n].x[i] - new_max[r]);
-          probabilities[row * PLD + col] = __float2half_rn(p);
-          row_sum[r] += p;
+          const int row = (i >> 1) & 1;
+          const float p = __expf(qk[n].x[i] - new_max[row]);
+          qk[n].x[i] = p;
+          row_sum[n / 2][row] += p;
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          union PackedPair {
+            half2 value;
+            unsigned bits;
+          } pair;
+          pair.value = __floats2half2_rn(qk[n].x[2 * i], qk[n].x[2 * i + 1]);
+          probability_pairs[n][i] = pair.bits;
         }
       }
-      float* partial_sums = scores + BQ * KEY_WARPS;
 #pragma unroll
-      for (int r = 0; r < 2; ++r) {
-        row_sum[r] += __shfl_xor_sync(0xffffffff, row_sum[r], 2);
-        row_sum[r] += __shfl_xor_sync(0xffffffff, row_sum[r], 8);
-        const int row = warp_q * 16 + fragment_row + r * 2;
-        if ((lane & 10) == 0)
-          partial_sums[row * KEY_WARPS + warp_k] = row_sum[r];
-      }
-      sync_query_pair(warp_q);
-      if (warp_k == 0 && (lane & 10) == 0) {
+      for (int half = 0; half < 2; ++half) {
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-          const int row = warp_q * 16 + fragment_row + r * 2;
-          float sum = 0.f;
-#pragma unroll
-          for (int w = 0; w < KEY_WARPS; ++w)
-            sum += partial_sums[row * KEY_WARPS + w];
-          denominator[row] = denominator[row] * register_alpha[r] + sum;
-          maximum[row] = new_max[r];
+        for (int row = 0; row < 2; ++row) {
+          auto& sum = row_sum[half][row];
+          sum += __shfl_xor_sync(0xffffffff, sum, 2);
+          sum += __shfl_xor_sync(0xffffffff, sum, 8);
         }
+      }
+#pragma unroll
+      for (int row = 0; row < 2; ++row) {
+        float sum = 0.f;
+        sum += row_sum[0][row];
+        sum += row_sum[1][row];
+        running_sum[row] = running_sum[row] * register_alpha[row] + sum;
+        running_max[row] = new_max[row];
       }
     }
     // Issue the next K/V global loads while the current V tile is consumed.
@@ -219,7 +211,7 @@ __global__ __launch_bounds__(THREADS,
       const int tile_row = (tile / (D / 32)) * 8 + (lane >> 2);
       const int next_row = start + BK + tile_row;
       const int next_col = (tile % (D / 32)) * 32 + (lane & 3) * 8;
-      if (next_row < length) {
+      if (tile_row < BK && next_row < length) {
         const int64_t position =
             base + int64_t(next_row) * heads * D + next_col;
         if ((reinterpret_cast<uintptr_t>(k) % 16 == 0) &&
@@ -247,19 +239,19 @@ __global__ __launch_bounds__(THREADS,
     }
 #pragma unroll
     for (int part = 0; part < OUTPUT_FRAGMENTS; ++part) {
-      const int col = warp_k * (D / KEY_WARPS) + part * 16;
-      const int row = warp_q * 16;
-      auto& pv = accumulators[part];
 #pragma unroll
-      for (int i = 0; i < pv.num_elements; ++i)
-        pv.x[i] *= register_alpha[(i >> 1) & 1];
+      for (int i = 0; i < accumulators[part].num_elements; ++i)
+        accumulators[part].x[i] *= register_alpha[(i >> 1) & 1];
+    }
 #pragma unroll
-      for (int kv = 0; kv < BK; kv += 16) {
-        fi::AFragment pa;
+    for (int kv = 0; kv < KEY_FRAGMENTS; ++kv) {
+      fi::AFragment pa;
+      load_probability_fragment(pa, probability_pairs[kv]);
+#pragma unroll
+      for (int part = 0; part < OUTPUT_FRAGMENTS; ++part) {
         fi::QKBFragment vb;
-        load_p_fragment(pa, probabilities, row, kv);
-        fi::load_qk_b_fragment(vb, vs + col * VLD + kv, VLD);
-        fi::mma_sync_m16n16k16_row_col_f16f16f32(pv, pa, vb);
+        fi::load_qk_b_fragment(vb, vs + part * 16 * VLD + kv * 16, VLD);
+        fi::mma_sync_m16n16k16_row_col_f16f16f32(accumulators[part], pa, vb);
       }
     }
     __syncthreads();
@@ -269,6 +261,7 @@ __global__ __launch_bounds__(THREADS,
         const int tile = (tid + n * THREADS) / 32;
         const int tile_row = (tile / (D / 32)) * 8 + (lane >> 2);
         const int next_col = (tile % (D / 32)) * 32 + (lane & 3) * 8;
+        if (tile_row >= BK) continue;
         *reinterpret_cast<uint4*>(ks + tile_row * QLD + next_col) =
             next_k[n].packed;
         // Transpose four rows with exact 32-bit lane exchanges. Each lane
@@ -292,7 +285,8 @@ __global__ __launch_bounds__(THREADS,
               __shfl_xor_sync(0xffffffff, transposed[2 * j], 8);
           const unsigned other1 =
               __shfl_xor_sync(0xffffffff, transposed[2 * j + 1], 8);
-          const unsigned local = transposed[2 * j + ((lane & 8) >> 3)];
+          const unsigned local =
+              ((lane & 8) ? transposed[2 * j + 1] : transposed[2 * j]);
           const unsigned other = (lane & 8) ? other1 : other0;
           const uint2 vector =
               (lane & 8) ? make_uint2(other, local) : make_uint2(local, other);
@@ -313,7 +307,7 @@ __global__ __launch_bounds__(THREADS,
                         (i & 1) + ((i >> 2) & 1) * 4;
         if (q_start + row < length)
           output[base + int64_t(q_start + row) * heads * D + col] =
-              __float2half_rn(pv.x[i] / denominator[row]);
+              __float2half_rn(pv.x[i] / running_sum[(i >> 1) & 1]);
       }
     }
   }

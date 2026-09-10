@@ -18,7 +18,11 @@ execution uses the same SM70 staged delta path. The pruned INT8 integration
 restores original dense AdaLN/time tensors, preserving backbone INT8 data.
 FastH3 Dense mapping and fusion follow `diffusion/models/minimax_h3/fasth3.py`
 at the initial pinned Omni revision. Original weights are fused before native
-TP loading and staging; native INT8 fusion and VSA remain unimplemented.
+TP loading and staging. Native VSA now follows the same revision's
+`attention/backends/fastvideo_vsa.py` geometry and learned compression, with a
+true SM70 block-sparse CUTLASS kernel. All three VSA adapter identities and
+complete gate inventories are validated. Native INT8 fusion remains unsupported;
+full VSA sampling quality and performance acceptance are still pending.
 Approximate diffusion caches, step batching, Ulysses/Ring parallelism and other
 model families remain outside this implementation. Model weights and checkpoint
 remote code retain their respective upstream terms; they are not vendored here.

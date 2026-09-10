@@ -22,7 +22,10 @@ from .config import H3InputError
 
 logger = init_logger(__name__)
 FASTH3_FILENAME = "adapter_model.safetensors"
-_IDENTITY = "fastvideo/fastvideo-fasth3-dense-4-step-v1"
+_DENSE_IDENTITY = "fastvideo/fastvideo-fasth3-dense-4-step-v1"
+_VSA_IDENTITIES = frozenset(
+    f"fastvideo/fastvideo-fasth3-4-step-{version}" for version in ("v1", "v1.1", "v1.2")
+)
 _MODEL_TARGETS = {
     "proj_in": "video_patch_proj",
     "proj_out": "final_layer.video_out",
@@ -39,6 +42,7 @@ _BLOCK_TARGETS = {
     "attn.to_k": ("attn.qkv_proj", "k"),
     "attn.to_v": ("attn.qkv_proj", "v"),
     "attn.to_out.0": ("attn.out_proj", "plain"),
+    "attn.to_gate_compress": ("attn.to_gate_compress", "plain"),
     "ff.net.0.proj": ("mlp.fc1", "swap"),
     "ff.net.2": ("mlp.fc2", "plain"),
     "adaln_proj.linear": ("adaln_proj.linear", "plain"),
@@ -54,6 +58,7 @@ _ROLES = {
     ".lora_B.weight": "b",
     ".diff_b": "bias",
     ".diff": "diff",
+    ".set_weight": "set",
 }
 
 
@@ -67,6 +72,7 @@ class FastH3Spec:
     denoise_steps: int = 4
     api_steps: int = 4
     supported_tasks: frozenset[str] = frozenset({"t2va"})
+    requires_vsa: bool = False
 
 
 @dataclass
@@ -74,6 +80,7 @@ class _Patch:
     layout: str
     pairs: dict[str, dict[str, str]] = field(default_factory=dict)
     diff: str | None = None
+    assigned: str | None = None
 
 
 def _native_target(module: str):
@@ -99,18 +106,18 @@ def _read_index(path: str | Path, partition: str):
     counted = {"low_rank_tensors": 0, "diff_tensors": 0, "set_weight_tensors": 0}
     with safe_open(path, framework="pt", device="cpu") as checkpoint:
         metadata = checkpoint.metadata() or {}
+        identity = metadata.get("finetuned_model", "").lower()
+        requires_vsa = identity in _VSA_IDENTITIES
         if (
             metadata.get("format") != "fastvideo-lora-v2"
-            or metadata.get("finetuned_model", "").lower() != _IDENTITY
+            or identity not in (_DENSE_IDENTITY, *_VSA_IDENTITIES)
             or metadata.get("base_model", "").lower() != "minimaxai/minimax-h3"
             or metadata.get("rank") != "64"
         ):
             raise H3InputError(
-                "Only the official rank-64 FastH3 Dense release is supported"
+                "Only the official rank-64 FastH3 Dense/VSA releases are supported"
             )
         for name in checkpoint.keys():  # noqa: SIM118
-            if name.endswith(".set_weight"):
-                raise H3InputError("FastH3 VSA needs a sparse attention implementation")
             match = next(
                 (
                     (name[: -len(suffix)], role)
@@ -131,6 +138,21 @@ def _read_index(path: str | Path, partition: str):
             shape = value.get_shape()
             if value.get_dtype() not in ("F16", "BF16", "F32"):
                 raise H3InputError(f"FastH3 requires floating-point deltas: {name}")
+            is_gate = native.endswith(".attn.to_gate_compress")
+            if role == "set" or is_gate:
+                if (
+                    not requires_vsa
+                    or role != "set"
+                    or not is_gate
+                    or not native.startswith("blocks.")
+                    or len(shape) != 2
+                    or min(shape) <= 0
+                    or patch.assigned is not None
+                ):
+                    raise H3InputError(f"Invalid FastH3 VSA compression gate: {name}")
+                patch.assigned = name
+                counted["set_weight_tensors"] += 1
+                continue
             if role in ("a", "b"):
                 if len(shape) != 2 or shape[0 if role == "a" else 1] != 64:
                     raise H3InputError(
@@ -157,6 +179,16 @@ def _read_index(path: str | Path, partition: str):
         for prefix, (_, count) in _PREFIXES.items():
             if coverage[prefix] != set(range(count)):
                 raise H3InputError(f"FastH3 must edit every {prefix} block")
+        expected_gates = (
+            {f"blocks.{i}.attn.to_gate_compress.weight" for i in range(50)}
+            if requires_vsa
+            else set()
+        )
+        actual_gates = {key for key, patch in patches.items() if patch.assigned}
+        if actual_gates != expected_gates:
+            raise H3InputError(
+                "FastH3 VSA must assign every main-block compression gate"
+            )
         for param, patch in patches.items():
             if any(set(pair) != {"a", "b"} for pair in patch.pairs.values()):
                 raise H3InputError(f"FastH3 has an unpaired factor for {param}")
@@ -164,7 +196,7 @@ def _read_index(path: str | Path, partition: str):
                 raise H3InputError(
                     f"FastH3 grouped QKV requires all three projections: {param}"
                 )
-    return FastH3Spec(), patches
+    return FastH3Spec(requires_vsa=requires_vsa), patches
 
 
 def inspect_fasth3_lora(path: str | Path, partition: str) -> FastH3Spec:
@@ -186,6 +218,8 @@ class FastH3Fusion:
         patch = self.patches.get(name)
         if patch is None:
             return weight
+        if patch.assigned is not None:
+            raise H3InputError("FastH3 gate must be new, not replace a base parameter")
         if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise H3InputError("FastH3 fusion requires original floating-point weights")
 
@@ -248,6 +282,13 @@ class FastH3Fusion:
                 if name in self.applied:
                     raise H3InputError(f"Duplicate FastH3 base parameter: {name}")
                 yield name, self._fuse(checkpoint, name, weight)
+            for name, patch in self.patches.items():
+                if patch.assigned is not None:
+                    value = checkpoint.get_tensor(patch.assigned)
+                    if not torch.isfinite(value).all():
+                        raise H3InputError(f"FastH3 gate is non-finite: {name}")
+                    self.applied.add(name)
+                    yield name, value
         self.validate_fully_applied()
 
     def validate_fully_applied(self, loaded=None):

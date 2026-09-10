@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
+import time
 import uuid
 from collections.abc import Iterable
+from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -187,6 +192,7 @@ class PinnedModuleStager:
         self._ready_event = torch.cuda.Event()
         self.cache_retention = cache_retention
         self.loaded = False
+        self._layerwise_active = False
         self._groups = self._snapshot_groups(
             modules, pin_memory=pin_memory, host_backing=host_backing
         )
@@ -289,12 +295,108 @@ class PinnedModuleStager:
 
     @staticmethod
     def _view(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:
+        element_size = binding.dtype.itemsize
+        backing_offset = backing.storage_offset() * backing.element_size()
+        if backing_offset % element_size:
+            raise ValueError("shared weight storage must preserve dtype alignment")
         return torch.empty(0, dtype=binding.dtype, device=backing.device).set_(
             backing.untyped_storage(),
-            binding.storage_offset,
+            backing_offset // element_size + binding.storage_offset,
             binding.shape,
             binding.stride,
         )
+
+    def share_cpu_storage(self, directory: str | Path) -> None:
+        """Share a checked immutable replica across this engine's TP workers.
+
+        The engine owns the temporary directory and removes it after workers
+        stop. Private mappings prevent accidental CPU writes from affecting a
+        different rank. Only identical complete storage groups may be shared.
+        """
+        import torch.distributed as dist
+
+        if self.loaded or any(group.master.is_pinned() for group in self._groups):
+            raise ValueError("shared host storage requires unloaded pageable masters")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        directory = Path(directory)
+        if rank == 0:
+            self._write_shared_groups(directory)
+        if dist.is_initialized():
+            dist.barrier()
+        self._read_shared_groups(directory)
+
+    @staticmethod
+    def _group_description(group: _StorageGroup) -> dict:
+        return {
+            "bytes": group.master.numel(),
+            "bindings": [
+                {
+                    "dtype": str(binding.dtype),
+                    "shape": list(binding.shape),
+                    "stride": list(binding.stride),
+                    "storage_offset": binding.storage_offset,
+                }
+                for binding in group.bindings
+            ],
+        }
+
+    @staticmethod
+    def _storage_digest(master: torch.Tensor) -> str:
+        return hashlib.sha256(memoryview(master.numpy())).hexdigest()
+
+    def _write_shared_groups(self, directory: Path) -> None:
+        directory.mkdir(mode=0o700)
+        records, total = [], 0
+        for group in self._groups:
+            total = (total + 255) // 256 * 256
+            records.append({**self._group_description(group), "offset": total})
+            total += group.master.numel()
+        data_path = directory / "weights.bin"
+        fd = os.open(data_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            # Reserve tmpfs space before mapping so a later write cannot SIGBUS
+            # because unrelated processes consume the remaining free space.
+            if total:
+                os.posix_fallocate(fd, 0, total)
+        finally:
+            os.close(fd)
+        shared = torch.from_file(
+            str(data_path), shared=True, size=total, dtype=torch.uint8
+        )
+        for group, record in zip(self._groups, records):
+            target = shared.narrow(0, record["offset"], record["bytes"])
+            target.copy_(group.master)
+            record["sha256"] = self._storage_digest(target)
+        (directory / "metadata.json").write_text(
+            json.dumps({"version": 1, "bytes": total, "groups": records})
+        )
+
+    def _read_shared_groups(self, directory: Path) -> None:
+        metadata = json.loads((directory / "metadata.json").read_text())
+        records = metadata["groups"]
+        if metadata["version"] != 1 or len(records) != len(self._groups):
+            raise ValueError("shared component storage inventory differs across ranks")
+        # COW mappings share physical pages while keeping the file immutable.
+        shared = torch.from_file(
+            str(directory / "weights.bin"),
+            shared=False,
+            size=metadata["bytes"],
+            dtype=torch.uint8,
+        )
+        for group, record in zip(self._groups, records):
+            if any(
+                record[key] != value
+                for key, value in self._group_description(group).items()
+            ):
+                raise ValueError("shared component tensor layouts differ across ranks")
+            if self._storage_digest(group.master) != record["sha256"]:
+                raise ValueError("shared component weights differ across ranks")
+            target = shared.narrow(0, record["offset"], record["bytes"])
+            if self._storage_digest(target) != record["sha256"]:
+                raise ValueError("shared component snapshot failed its checksum")
+            group.master = target
+            for binding in group.bindings:
+                set_tensor_storage(binding.target, self._view(target, binding))
 
     def _bind(self, storages: list[torch.Tensor]) -> None:
         for storage, group in zip(storages, self._groups):
@@ -347,6 +449,8 @@ class PinnedModuleStager:
         self._release_cache(force=True)
 
     def load(self) -> None:
+        if getattr(self, "_layerwise_active", False):
+            raise RuntimeError("whole-module load overlaps layerwise weight staging")
         if self.loaded:
             return
         try:
@@ -381,6 +485,117 @@ class PinnedModuleStager:
         self._device_storages.clear()
         self.loaded = False
         self._release_cache()
+
+
+class LayerwiseModuleStager:
+    """Execute disjoint blocks from the same immutable host snapshot.
+
+    Storage shared across blocks, or between a block and the outer module,
+    remains resident throughout the context. Other block storage is loaded
+    immediately before its forward and released afterwards, including errors.
+    Transfers synchronize at block boundaries; this is a capacity policy.
+    """
+
+    def __init__(
+        self,
+        snapshot: PinnedModuleStager,
+        blocks: Iterable[nn.Module],
+        *,
+        resident_modules: Iterable[nn.Module] = (),
+    ):
+        self.snapshot = snapshot
+        self.blocks = tuple(blocks)
+        if len({id(block) for block in self.blocks}) != len(self.blocks):
+            raise ValueError("layerwise staging blocks must be unique")
+        block_ids = {id(block) for block in self.blocks}
+        for block in self.blocks:
+            if any(id(child) in block_ids for child in tuple(block.modules())[1:]):
+                raise ValueError("layerwise staging blocks must not be nested")
+        owners: dict[int, set[int]] = {}
+        for index, block in enumerate(self.blocks):
+            for target in chain(block.parameters(), block.buffers()):
+                owners.setdefault(id(target), set()).add(index)
+        for module in resident_modules:
+            for target in chain(module.parameters(), module.buffers()):
+                owners.setdefault(id(target), set()).add(-1)
+        grouped: list[list[_StorageGroup]] = [[] for _ in self.blocks]
+        resident = []
+        for group in snapshot._groups:
+            group_owners: set[int] = set().union(
+                *(owners.get(id(binding.target), {-1}) for binding in group.bindings)
+            )
+            if len(group_owners) == 1 and -1 not in group_owners:
+                grouped[next(iter(group_owners))].append(group)
+            else:
+                resident.append(group)
+
+        def subset(groups: list[_StorageGroup]) -> PinnedModuleStager:
+            stager = copy(snapshot)
+            stager._groups = groups
+            stager._device_storages = []
+            stager.loaded = False
+            stager.cache_retention = snapshot.cache_retention or BoundedAllocatorCache(
+                snapshot.device
+            )
+            return stager
+
+        self.resident = subset(resident)
+        self.stagers = tuple(subset(groups) for groups in grouped)
+        self.load_seconds = 0.0
+        self.offload_seconds = 0.0
+        self.loaded_bytes = 0
+
+    def _load(self, stager):
+        started = time.perf_counter()
+        stager.load()
+        torch.accelerator.synchronize()
+        self.load_seconds += time.perf_counter() - started
+        self.loaded_bytes += sum(group.master.numel() for group in stager._groups)
+
+    def _offload(self, stager):
+        started = time.perf_counter()
+        stager.offload()
+        self.offload_seconds += time.perf_counter() - started
+
+    @contextmanager
+    def on_device(self):
+        if self.snapshot.loaded or getattr(self.snapshot, "_layerwise_active", False):
+            raise RuntimeError("layerwise staging requires an idle host snapshot")
+        self.snapshot._layerwise_active = True
+        self.load_seconds = self.offload_seconds = 0.0
+        self.loaded_bytes = 0
+        hooks = []
+        try:
+            self._load(self.resident)
+            for block, stager in zip(self.blocks, self.stagers):
+                hooks.append(
+                    block.register_forward_pre_hook(
+                        lambda module, args, stager=stager: self._load(stager)
+                    )
+                )
+                hooks.append(
+                    block.register_forward_hook(
+                        lambda module, args, result, stager=stager: self._offload(
+                            stager
+                        ),
+                        always_call=True,
+                    )
+                )
+            yield
+        finally:
+            for hook in hooks:
+                hook.remove()
+            errors = []
+            try:
+                for stager in (*self.stagers, self.resident):
+                    try:
+                        self._offload(stager)
+                    except Exception as exc:
+                        errors.append(exc)
+            finally:
+                self.snapshot._layerwise_active = False
+            if errors:
+                raise errors[0]
 
 
 __all__ = ["BoundedAllocatorCache", "PinnedModuleStager"]
