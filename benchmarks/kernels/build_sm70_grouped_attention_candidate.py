@@ -354,7 +354,71 @@ def accumulate_qk_fp64(source: str) -> str:
     return source[:start] + qk + source[end:]
 
 
-def specialize_full_q8(source: str, visible_tiles: bool) -> str:
+def register_softmax_state(partial: str) -> str:
+    """Keep each warp's three online rows private until the final publication.
+
+    Every lane consumes the same broadcast tile maximum/sum and runs the
+    original N32 update. Only row_scale is shared with PV between tiles.
+    """
+    marker = "  // Recompute QK for the conservative path"
+    partial = replace_once(
+        partial,
+        marker,
+        "  static_assert(!TWO_PASS && kGroupedVerifyWarps == 16 &&\n"
+        '      kGroupedVerifyRows == 48, "Three fixed online rows per warp");\n'
+        "  float online_max[3] = {kXQANegInf, kXQANegInf, kXQANegInf};\n"
+        "  float online_sum[3] = {};\n" + marker,
+    )
+    begin = partial.index(marker)
+    end = partial.index("  // The compute buffers are dead.", begin)
+    loop = partial[begin:end]
+    loop = replace_once(
+        loop,
+        "const float old_max = smem.row_max[row];",
+        "const float old_max = online_max[row / kGroupedVerifyWarps];",
+    )
+    loop = replace_once(
+        loop,
+        "        // Finish every lane's shared-state reads before lane 0 "
+        "overwrites the\n"
+        """        // online maximum. Shuffle synchronization does not order memory.
+        __syncwarp();
+        if (lane_id == 0) {
+          if (tile_sum > 0.0f) {
+            smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
+            smem.row_max[row] = new_max;
+          }
+          smem.row_scale[row] = exp_diff;
+        }""",
+        "        // Each lane owns an identical copy; no shared maximum "
+        "is overwritten.\n"
+        """        const int local_row = row / kGroupedVerifyWarps;
+        if (tile_sum > 0.0f) {
+          online_sum[local_row] = online_sum[local_row] * exp_diff + tile_sum;
+          online_max[local_row] = new_max;
+        }
+        if (lane_id == 0) smem.row_scale[row] = exp_diff;""",
+    )
+    return (
+        partial[:begin]
+        + loop
+        + """  // Publish final row statistics before the existing output barrier.
+  if (lane_id == 0) {
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+      smem.row_max[warp_id + i * kGroupedVerifyWarps] = online_max[i];
+      smem.row_sum[warp_id + i * kGroupedVerifyWarps] = online_sum[i];
+    }
+  }
+
+"""
+        + partial[end:]
+    )
+
+
+def specialize_full_q8(
+    source: str, visible_tiles: bool, register_state: bool = False
+) -> str:
     """Remove variable-Q branches only when all eight query rows exist.
 
     Per-row GPU lengths remain authoritative. The optional all-visible branch
@@ -380,6 +444,8 @@ def specialize_full_q8(source: str, visible_tiles: bool) -> str:
         "  constexpr int query_len = 8;\n"
         "  using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;",
     )
+    if register_state:
+        partial = register_softmax_state(partial)
     if visible_tiles:
         loop_start = partial.index("  // Recompute QK for the conservative path")
         partial = (
@@ -422,6 +488,102 @@ def specialize_full_q8(source: str, visible_tiles: bool) -> str:
     )
 
 
+def qk_head_rows(source: str) -> str:
+    """Audit M8/N32 per head; WMMA shape equality is not assumed.
+
+    Q is staged as six groups of eight rows. Scores are stored back to the
+    parent's token/head order, so softmax, PV and merge retain their layout.
+    """
+    start = source.index("template <bool COMPENSATE = false>")
+    end = source.index(
+        "__device__ __forceinline__ void grouped_verify_scale_output_fragment(",
+        start,
+    )
+    qk = source[start:end].replace("grouped_verify_qk(", "grouped_verify_qk_head(")
+    qk = qk.replace("16, 16, 16", "8, 32, 16")
+    a = qk.index("  const int m_tile =")
+    b = qk.index("  volta::fragment<", a)
+    qk = qk[:a] + "  const int head = warp_id;\n" + qk[b:]
+    qk = replace_once(
+        qk,
+        "shared_q + m_tile * 16 * kGroupedVerifyQStride + k_offset",
+        "shared_q + head * 8 * kGroupedVerifyQStride + k_offset",
+    )
+    qk = replace_once(
+        qk,
+        "shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset",
+        "shared_k + k_offset",
+    )
+    qk = replace_once(
+        qk,
+        """      shared_scores + m_tile * 16 * kGroupedVerifyScoreStride + n_tile * 16,
+      score_fragment, kGroupedVerifyScoreStride, volta::mem_row_major);""",
+        """      shared_scores + head * kGroupedVerifyScoreStride,
+      score_fragment, 6 * kGroupedVerifyScoreStride, volta::mem_row_major);""",
+    )
+    source = source[:end] + qk + source[end:]
+    start = source.index("void flash_attention_grouped_verify_e4m3_full_q8_kernel(")
+    end = source.index("template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY", start)
+    partial = source[start:end]
+    at = partial.index("  if (tid < kGroupedVerifyRows) {")
+    setup = partial[:at]
+    old = "shared_q_vec[row * kSharedQVecsPerRow + vec_col]"
+    assert setup.count(old) == 2
+    setup = setup.replace(
+        old,
+        "shared_q_vec[(local_head * 8 + token_idx) *\n"
+        "                   kSharedQVecsPerRow + vec_col]",
+    )
+    partial = setup + partial[at:]
+    partial = replace_once(
+        partial, "grouped_verify_qk<COMPENSATE_P>(", "grouped_verify_qk_head<true>("
+    )
+    return source[:start] + partial + source[end:]
+
+
+def pipeline_qk_operands(source: str) -> str:
+    """Rotate Q/K fragment loads before the preceding K16 correction.
+
+    Current operands are dead after MMA. Their registers can hold the next
+    operands while the original FP32 correction consumes the current product.
+    """
+    start = source.index("template <bool COMPENSATE = false>")
+    end = source.index(
+        "__device__ __forceinline__ void grouped_verify_scale_output_fragment(",
+        start,
+    )
+    qk = source[start:end]
+    begin = qk.index("    volta::load_matrix_sync(")
+    finish = qk.index("    if constexpr (COMPENSATE)", begin)
+    loads = qk[begin:finish]
+    qk = qk[:begin] + qk[finish:]
+    before_loop = qk.index("#pragma unroll")
+    qk = qk[:before_loop] + loads.replace("k_offset", "0") + qk[before_loop:]
+    marker = (
+        "      volta::mma_sync(tile_fragment, q_fragment, k_fragment, tile_fragment);"
+    )
+    qk = replace_once(
+        qk,
+        marker,
+        marker
+        + "\n      if (k_offset + 16 < kGroupedVerifyHeadDim) {\n"
+        + loads.replace("k_offset", "(k_offset + 16)")
+        + "      }",
+    )
+    marker = (
+        "      volta::mma_sync(score_fragment, q_fragment, k_fragment, score_fragment);"
+    )
+    qk = replace_once(
+        qk,
+        marker,
+        marker
+        + "\n      if (k_offset + 16 < kGroupedVerifyHeadDim) {\n"
+        + loads.replace("k_offset", "(k_offset + 16)")
+        + "      }",
+    )
+    return source[:start] + qk + source[end:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -437,6 +599,9 @@ def main() -> None:
     parser.add_argument("--qk-fp64-sum", action="store_true")
     parser.add_argument("--specialize-full-q8", action="store_true")
     parser.add_argument("--all-visible-tiles", action="store_true")
+    parser.add_argument("--register-softmax-state", action="store_true")
+    parser.add_argument("--qk-head-rows", action="store_true")
+    parser.add_argument("--qk-operand-pipeline", action="store_true")
     parser.add_argument("--diagnostic-output-fp32", action="store_true")
     parser.add_argument("--splits", type=int, choices=(80, 160, 320), default=80)
     parser.add_argument("--grouped-only", action="store_true")
@@ -459,6 +624,24 @@ def main() -> None:
         parser.error("Full-q8 specialization requires the six-head PV-reuse path")
     if args.all_visible_tiles and not args.specialize_full_q8:
         parser.error("Visible-tile specialization requires --specialize-full-q8")
+    if args.register_softmax_state and not args.specialize_full_q8:
+        parser.error("Register softmax state requires --specialize-full-q8")
+    if args.qk_head_rows and not (
+        args.specialize_full_q8
+        and not args.register_softmax_state
+        and not args.qk_paired_products
+        and not args.qk_fp64_sum
+    ):
+        parser.error("Audit the M8/N32 QK shape independently on fixed q8")
+    if args.qk_operand_pipeline and not (
+        args.head_groups == 1
+        and args.grouped_only
+        and not args.qk_paired_products
+        and not args.qk_fp64_sum
+        and not args.qk_head_rows
+        and not args.register_softmax_state
+    ):
+        parser.error("Audit QK operand rotation independently on six-head groups")
     if args.qk_fp64_sum and not (
         args.grouped_only and args.head_groups == 1 and not args.qk_paired_products
     ):
@@ -617,7 +800,13 @@ def main() -> None:
         ):
             source = replace_once(source, old, new)
     if args.specialize_full_q8:
-        source = specialize_full_q8(source, args.all_visible_tiles)
+        source = specialize_full_q8(
+            source, args.all_visible_tiles, args.register_softmax_state
+        )
+    if args.qk_head_rows:
+        source = qk_head_rows(source)
+    if args.qk_operand_pipeline:
+        source = pipeline_qk_operands(source)
     if args.diagnostic_output_fp32:
         source = retain_fp32_output(source)
     source = replace_once(
@@ -674,6 +863,9 @@ def main() -> None:
         "prefetch_k": args.prefetch_k,
         "prefetch_k_warps": args.prefetch_k_warps if args.prefetch_k else None,
         "specialize_full_q8": args.specialize_full_q8,
+        "register_softmax_state": args.register_softmax_state,
+        "qk_head_rows": args.qk_head_rows,
+        "qk_operand_pipeline": args.qk_operand_pipeline,
         "all_visible_tiles": args.all_visible_tiles,
         "qk_fp64_sum": args.qk_fp64_sum,
         "arithmetic_change": args.qk_fp64_sum or args.splits != 80,

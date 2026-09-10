@@ -728,3 +728,201 @@ unchanged in both arms.
 | FP64 sum of K16 products | `e477e605fb94b9003cf71308da371b9051d7c72eb841e4e6e7fb4dbd6a8484da` | `e86ee04a6c7e949f9d3ded8ca7613b208bd89f4d3b642804d57e3f51f37daa1d` |
 | PV parent, pre-cast diagnostic | `f30d85ef59aa86ca99d48aeba96eaa4a63dca8fbe4aaa1c375295d42f6ed284e` | `fc08222e8d768691d052817d89aadb2c7e5a7aa0207397da04fe4d70739ed0af` |
 | FP64 K16 sum, pre-cast diagnostic | `9ba8011dbdc11103fb4746e07e3b798953bfa17d54557f973cdcb7638084e353` | `23ae5cb0b011b797e9279c6f2377863e2b337d301423b0ca38f4b28f59254699` |
+
+## Physical N64 and scalar page-map screens
+
+The physical N64 prototype computes two independent QK tiles together but
+retains two consecutive N32 softmax/PV updates, the 80 logical partitions,
+K16 compensation and probability residual products. It admits only aligned
+q8; other query shapes and unaligned strides use its PV-reuse parent. Three
+V-loading schedules are screened independently. All fail the working-set
+speed gate despite byte-identical output and full FP32 workspaces: the first
+two complete 130 checks in total, and the softmax-overlap variant completes
+65. None advances to a service or sanitizer campaign.
+
+| Sixteen-layer working set | PV parent | Raw V prefetch | V after QK | V during softmax |
+| --- | ---: | ---: | ---: | ---: |
+| 131072 tokens | 7.811 ms | 9.757 ms | 7.922 ms | 8.977 ms |
+| 261888 tokens | 15.084 ms | 18.927 ms | 15.330 ms | 17.378 ms |
+
+The softmax-overlap run has its own paired parent at 7.815/15.095 ms; it is
+not compared by subtracting measurements from the earlier launch. Raw V
+prefetch uses 128 registers and spills; V-after-QK uses 116 without spills.
+Holding only the first N32 V tile across QK and loading the second during
+softmax still uses 128 registers with spills. The wider tile does not produce
+a useful local gain on this workload.
+
+The scalar q1 page-map prototype exploits the validated 3296-token page and
+1024-token partition contract: each partition spans at most two physical
+pages. It replaces per-token page/offset arrays with two page IDs and two
+consecutive PV segments, preserving each head's original FP32 FMA order.
+Together with and without the existing E4M3 lookup, the candidates complete
+45 byte checks. The compact lookup variant improves the 128K sixteen-layer
+workset from 8.011 to 7.554 ms but regresses 261888 from 15.965 to 17.436 ms;
+neither compact variant is admitted. A separate unused 4096-byte dynamic
+shared-memory reservation tests whether the changed resource limit explains
+the long-context regression. Resource bounds are not achieved occupancy.
+
+The original selected natural campaign reaches 24/30 exact natural-EOS
+pairs, including all twelve structured/tool cases. The final seed-1
+LiveCodeBench-131/162 outputs contain 49357/61290 tokens. Six seed-2 code
+pairs remain. These comparisons do not establish new benchmark scores or
+admit a later untested combination.
+
+The same-startup scalar control/shared/lookup experiment completes all saved
+requests with matching output and acceptance, but records no eligible scalar
+q1 calls in any arm. Its postprocessing failed because of a missing `Path`
+import; offline recovery validates the retained requests and preserves the
+original failure. Neither its timings nor its zero-hit counter establishes
+incremental scalar speed or scalar operator quality.
+
+| Candidate | Source SHA256 | DSO SHA256 |
+| --- | --- | --- |
+| physical N64, raw V prefetch | `cf4ac891a5c3e7d38354ae5ec7af8d3e8800f23a6d56113828827bfd9b3e088f` | `1350da745048a53137347715c1d4155ce4770ddd5a87b4745ad186af639206be` |
+| physical N64, V after QK | `cf41ce8b2d8d171c900a3d943dc9d8f0698b5493a00f46a816939058340ad60d` | `4f342b5cde1189e6b15bb78e87472f7081354f7e722b390e844151aee265a0c3` |
+| physical N64, V during softmax | `1d44e0ae130d906877c9ed24308a6d079cbe5191d72db4a9a85d0737945cd5f2` | `9fecce8b8d1626a6ac3bd3de52b736219e3bcfdf03e9c78a0a731b342fa84bac` |
+| scalar compact pages | `46980a019914f5a80861f9e7173aada8f292fe2c0bc2a17d1e1b0c6bddf5252d` | `00c602f201323071c5790443e08d8294febae2dbca53f44701e70bce177815b7` |
+| scalar compact pages with lookup | `3cf205e3f3c2744b9a059663a6c5ff3db84cef53fd37ad5b663700154d7d2a97` | `eb54d60463e9811b1c116da25e7f56655925f9bfe0d61f691f48f06e2c5c537c` |
+| scalar compact lookup, 4096-byte reservation | `5e68578c0252c7525496abab98aef5ed5f774528ac1dab6c5e1c587912cfa632` | `6d2b2b1ec5e0501de9abf49a81670cca2fb2ee700be66365f98db118a62fee21` |
+
+The next exact q8 candidate keeps each warp's three online max/sum rows in
+registers and publishes them at the final output barrier. PV still consumes
+the original shared row scales, and every row retains its ordered N32
+update. The builder switch `--register-softmax-state` requires the fixed-q8
+specialization; it changes no serving default. The generated visible-tile
+source without this switch retains its original SHA. Native byte checks,
+working-set timing and, if faster, its own sanitizers precede any service
+trial. New 32K/261888 complete-round traces of the current visible-tile path
+are collected separately from uninstrumented admission results.
+
+## Visible-tile repeated service results and next resource controls
+
+The visible-tile/PV-parent comparison completes three independent paired
+startups (PIDs 1094304, 1101605 and 1103057), 180 requests and 90 exact pairs.
+All contexts retain prompt, tokens, finish reason, sampling and acceptance.
+The scalar q1 operator remains the original implementation in both arms.
+The values below are medians of the three startup medians after one cold
+request and five measured requests per context/arm. No profiler or tensor
+dump is enabled.
+
+| Input tokens | PV-parent round | Visible-tile round | Visible pure decode | Accepted drafts/round | Emitted tokens/round |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 16.008 ms | 15.982 ms | 295.464 tokens/s | 3.777778 | 4.740741 |
+| 32768 | 18.222 ms | 18.185 ms | 212.458 tokens/s | 2.893939 | 3.878788 |
+| 65536 | 20.084 ms | 20.040 ms | 196.015 tokens/s | 3.030769 | 3.938462 |
+| 131072 | 23.786 ms | 23.687 ms | 165.712 tokens/s | 2.984615 | 3.938462 |
+| 261888 | 37.547 ms | 37.298 ms | 124.306 tokens/s | 3.563636 | 4.654545 |
+
+These are small gains; the third startup's 32K candidate is 0.005 ms slower
+and remains included. The aggregate short-context median does not regress.
+All four revised long-context targets and the short-context <15 ms target
+remain unmet. Do not rank this trajectory against earlier scalar-q1 trials
+with different accepted outputs.
+
+| Visible-tile input | Request-average p50/p90/p99 | Cold TTFT median | Cold prefill median |
+| --- | --- | ---: | ---: |
+| 1024 | 15.982 / 16.061 / 16.149 ms | 0.273 s | 3989.826 tokens/s |
+| 32768 | 18.185 / 18.235 / 18.243 ms | 8.288 s | 3977.766 tokens/s |
+| 65536 | 20.014 / 20.058 / 20.065 ms | 18.417 s | 3573.957 tokens/s |
+| 131072 | 23.674 / 23.706 / 23.711 ms | 44.248 s | 2971.068 tokens/s |
+| 261888 | 37.298 / 37.494 / 37.530 ms | 117.995 s | 2223.944 tokens/s |
+
+Request-average quantiles are not actual GPU-round quantiles. Cold requests
+verify the full computed-token count; cached repeat prefill is not used for
+the cold throughput. Complete-round increments are 1.855, 3.647 and 13.611 ms
+for 32K→64K, 64K→128K and 128K→261888. Their marginal costs are 0.057968,
+0.056977 and 0.106546 ms per additional 1024 tokens. The last interval spans
+127.75 such units and includes terminal q1 work. See the retained
+`full-q8-visible-three-startup-summary.json` and its six hashed arm reports.
+
+The compact scalar lookup with the extra 4096-byte reservation passes all
+45 paired operator checks. At 261888, sixteen-layer working-set cost is
+15.026 ms versus 17.444 ms without the reservation and 15.967 ms for the
+previous lookup. The 128K pair is 7.556/8.013 ms versus the previous lookup.
+Changing this resource reservation removes the observed compact-layout
+regression, but it does not measure achieved occupancy or isolate all cache
+effects. Its own sanitizer campaign and an actual service comparison follow;
+this local result is not a complete-round gain.
+
+Register-held q8 max/sum passes 65 full-workspace byte checks but regresses
+every workset. Its 128K/261888 costs are 7.787/15.079 ms versus the paired
+visible-tile parent at 7.695/14.862 ms. The relevant build uses 125 registers,
+a 24-byte stack frame and no reported spills. Reject it before sanitizer or
+service trials. Source SHA is
+`3fb342d6737c1fe81220b2f18d805c3f394d1e728cda4e41683a7aaa4a15a905`;
+the DSO SHA is
+`153c8521e3dc173de9806fd5e1aef40e9768be8735c89ab448b1d126ed7aea12`.
+
+A separate `--qk-head-rows` prototype stages Q by head and uses one M8/N32
+QK tile per head, storing scores back in the original token/head order.
+K16 compensation and all softmax/PV updates stay in place. Matrix-shape
+equivalence is explicitly not assumed: the
+[PTX WMMA contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-wmma-mma)
+does not specify accumulation order or rounding for FP16 operations. The
+byte gate must pass before timing; any difference instead requires the
+independent reference audit. The normal source remains unchanged without
+this experiment's switch.
+
+The M8/N32 candidate passes 65 byte checks but is slower at every measured
+context. At 128K/261888 it takes 7.801/15.076 ms versus its paired parent at
+7.699/14.876 ms. Rotating the next Q/K fragment load ahead of the original
+current K16 correction also passes 65 byte checks but loses:
+7.883/15.279 ms versus 7.696/14.893 ms. Neither advances. Their source/DSO
+hashes are respectively:
+
+| Candidate | Source SHA256 | DSO SHA256 |
+| --- | --- | --- |
+| M8/N32 QK by head | `b99968cac226fc4443b097f71a4dd0a5ad3882b739eee697ff4f6ca28e04c2a7` | `bafa8a3a5fccb2fc07f94f45a5100b2ee58a6b68d2346a7d3be63d348a2cf06d` |
+| QK operand rotation | `cda4d682a262bf859b54885f3044ca8b490fb55100d8277943114c1f43543e35` | `08c18843465cb7ee8e44b69e6ad8842cc9adb051ef33079cb3cae9a46cf149a9` |
+
+The compact lookup/reservation candidate's own three sanitizers each pass
+six cases with zero errors or race hazards. Its first uninstrumented service
+pair uses visible-tile q8 in both arms and hits 384 actual scalar calls per
+rank. All twelve request pairs are exact. At 1K the round median changes
+15.995→15.968 ms; at 261888 it changes 37.160→35.602 ms and pure decode
+137.245→143.250 tokens/s. Accepted drafts/round remain 4.02 and emitted
+tokens/round 5.12. This is one startup, not completed repeated-start admission.
+
+An actual-q1 diagnostic compares original, shared, lookup and compact lookup
+using saved live operands and isolated output/workspaces. The retained subset
+contains eight unique K/V pointer pairs per rank, with 96 exact candidate
+comparisons across four ranks. Its final client assertion incorrectly expected
+sixteen unique pairs and the job exits 1. Preserve the original failed report
+and the separate subset analysis; this is not evidence that all sixteen
+attention layers were sampled. Median per-operand graph times across ranks
+are approximately 3.69–3.85 ms original, 2.02–2.10 ms shared,
+0.96–1.00 ms lookup and 0.90–0.94 ms compact lookup. These operator events
+and sums over eight samples are not complete-round costs. Additional route
+metadata is required to close the smaller observed complete-round gain.
+
+## Latest whole-round attribution and small-Q coverage
+
+The new visible-tile 32K trace contains 57 analyzed q8 intervals after edge
+exclusion. Its critical-rank mean interval is 20.121 ms, GPU event union
+18.499 ms and uncovered time 1.623 ms. A 39.244-ms outlier remains included.
+QPN2 service is 7.370 ms, draft service 3.933 ms and target grouped attention
+2.379 ms on those same critical ranks. These instrumented values do not
+replace the 18.185-ms unprofiled endpoint result.
+
+The 261888 trace observes 54 q8 steps, one q6 step and four q1 steps in the
+whole diagnostic request. In the analyzed inner intervals, q8 target
+attention takes 15.027 ms and draft 3.889 ms. The q6 interval uses eager
+target execution and target attention takes 24.435 ms. The q1 intervals use
+the original scalar implementation. A partial verifier therefore loses both
+the q8 graph and the q8-specific scheduling wrapper. All such costs remain
+in the complete-round denominator; do not remove them to claim a target.
+
+Earlier query-shape fixtures exercised q2 and q5 in addition to q8; they
+did not qualify every q2–q7 shape. The benchmark now exposes an explicit
+`--tail-queries` suite, a `--performance-query-rows` selector, and a hashed
+reference binding to the actual frozen `grouped_e4m3_fp32_paged_fwd` entry.
+The reference requires precision revision 4 and retains DSO SHA
+`a751fed902279b0de23537c4aad2dc4fee360146d7fce7ef0c4f255a77f48b02`.
+Default benchmark queries and candidate entrypoints are unchanged.
+
+All six q2–q7 shapes pass 60 byte checks against that production reference,
+including page crossing, padded strides, zero/rejected rows, restored lengths
+and graph replay. Sixteen-layer q6 worksets improve from 12.176 to 7.796 ms
+at 128K and from 23.717 to 15.066 ms at 261888. Its own small-Q sanitizer
+suite precedes any eager service-route extension. No new shape is enabled
+merely by adding the benchmark selector.

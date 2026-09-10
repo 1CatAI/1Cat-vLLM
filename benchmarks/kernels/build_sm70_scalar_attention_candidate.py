@@ -119,6 +119,68 @@ SHARED_HEADS_BODY = r"""{
 """
 
 
+def compact_page_map(partition: str) -> str:
+    """Keep two page IDs instead of per-token IDs/offsets; preserve FMA order.
+
+    The host validates page3296 and partition1024, so a partition spans at most
+    two physical pages. Both PV segments visit exactly the original token order.
+    """
+    partition = replace_once(
+        partition,
+        "  __shared__ int block_idx_shared[PARTITION_SIZE];\n"
+        "  __shared__ int block_offset_shared[PARTITION_SIZE];",
+        "  __shared__ int block_idx_shared[2];\n"
+        "  const int first_block = start_token_idx / block_size;\n"
+        "  const int first_offset = start_token_idx - first_block * block_size;\n"
+        "  const int first_page_tokens = min(part_tokens, block_size - first_offset);",
+    )
+    a = partition.index("  for (int i = threadIdx.x; i < part_tokens;")
+    b = partition.index("  __syncthreads();", a)
+    partition = (
+        partition[:a]
+        + """  if (threadIdx.x == 0) {
+    block_idx_shared[0] = block_table[first_block];
+    block_idx_shared[1] = first_page_tokens < part_tokens
+        ? block_table[first_block + 1] : block_idx_shared[0];
+  }
+"""
+        + partition[b:]
+    )
+    partition = replace_once(
+        partition,
+        """    const int64_t k_index =
+        static_cast<int64_t>(block_idx_shared[token_local]) * k_block_stride +
+        static_cast<int64_t>(block_offset_shared[token_local]) * k_token_stride;""",
+        """    const bool second_page = token_local >= first_page_tokens;
+    const int token_offset = second_page ? token_local - first_page_tokens
+                                         : first_offset + token_local;
+    const int64_t k_index =
+        static_cast<int64_t>(block_idx_shared[second_page]) * k_block_stride +
+        static_cast<int64_t>(token_offset) * k_token_stride;""",
+    )
+    a = partition.index("    for (int i = 0; i < part_tokens; ++i) {")
+    b = partition.index("#pragma unroll\n    for (int head = 0;", a)
+    partition = (
+        partition[:a]
+        + """    for (int page = 0; page < 2; ++page) {
+      const int begin = page == 0 ? 0 : first_page_tokens;
+      const int end = page == 0 ? first_page_tokens : part_tokens;
+      int64_t v_index = static_cast<int64_t>(block_idx_shared[page]) *
+          v_block_stride + (page == 0 ? first_offset * v_token_stride : 0) + d;
+      for (int i = begin; i < end; ++i, v_index += v_token_stride) {
+        const float vv =
+            flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(v_cache, v_index);
+#pragma unroll
+        for (int head = 0; head < 6; ++head)
+          acc[head] = fmaf(scores_shared[head][i], vv, acc[head]);
+      }
+    }
+"""
+        + partition[b:]
+    )
+    return partition
+
+
 def template_function(source: str, name: str) -> tuple[int, str]:
     symbol = source.index("void " + name + "(")
     start = source.rfind("template <", 0, symbol)
@@ -214,6 +276,10 @@ def main() -> None:
     parser.add_argument("--pv-prefetch", action="store_true")
     parser.add_argument("--share-kv-six-heads", action="store_true")
     parser.add_argument("--e4m3-lut", action="store_true")
+    parser.add_argument("--compact-page-map", action="store_true")
+    parser.add_argument(
+        "--dynamic-shared-bytes", type=int, choices=(0, 4096), default=0
+    )
     parser.add_argument("--build", action="store_true")
     args = parser.parse_args()
     original = args.source.read_text()
@@ -267,6 +333,10 @@ def main() -> None:
             parser.error("Screen shared-head KV reuse independently")
         partition = partition[: partition.index("{")] + SHARED_HEADS_BODY
         host = replace_once(host, "<<<dim3(1, 6, 256),", "<<<dim3(1, 1, 256),")
+    if args.compact_page_map:
+        if not args.share_kv_six_heads:
+            parser.error("The compact page map requires six-head KV sharing")
+        partition = compact_page_map(partition)
     if args.e4m3_lut:
         if not args.share_kv_six_heads:
             parser.error("The LUT probe currently requires six-head KV sharing")
@@ -288,6 +358,16 @@ def main() -> None:
             partition,
             "flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(v_cache, v_index)",
             "kv_lut[static_cast<const uint8_t*>(v_cache)[v_index]]",
+        )
+    if args.dynamic_shared_bytes:
+        if not (args.compact_page_map and args.e4m3_lut):
+            parser.error("Shared-memory occupancy tuning requires the compact LUT")
+        # No data is stored here. The extra reservation tests the two-block
+        # resource limit against the compact layout's three-block limit.
+        host = replace_once(
+            host,
+            "<<<dim3(1, 1, 256), 256, 0, stream>>>",
+            f"<<<dim3(1, 1, 256), 256, {args.dynamic_shared_bytes}, stream>>>",
         )
     source = original[:start] + partition + "\n" + reduce + "\n" + host
     directory = args.output_dir.resolve()
@@ -327,6 +407,8 @@ def main() -> None:
         pv_prefetch=args.pv_prefetch,
         share_kv_six_heads=args.share_kv_six_heads,
         e4m3_lut=args.e4m3_lut,
+        compact_page_map=args.compact_page_map,
+        dynamic_shared_bytes=args.dynamic_shared_bytes,
         max_context=262144,
         source_files={
             str(p.relative_to(sources)): hashlib.sha256(p.read_bytes()).hexdigest()

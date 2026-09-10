@@ -111,6 +111,7 @@ def main() -> None:
     base = json.loads(args.base_manifest.read_text())
     assert base["head_groups"] == 1 and base["splits"] == 80
     assert base["prefetch_v"] and base["reuse_pv_values"]
+    assert base.get("physical_tile_n", 32) == 32
     source_dir = args.base_manifest.parent / "sources"
     for relative, digest in base["source_files"].items():
         assert (

@@ -24,7 +24,15 @@ def load_operator(manifest_path):
             f"Extension module alias: requested {path}, loaded {module.__file__}. "
             "Build candidates with distinct native module names."
         )
-    return module.run, manifest
+    entrypoint = manifest.get("entrypoint", "run")
+    if entrypoint not in ("run", "grouped_e4m3_fp32_paged_fwd"):
+        raise ValueError(f"Unsupported grouped attention entrypoint: {entrypoint}")
+    if (
+        entrypoint == "grouped_e4m3_fp32_paged_fwd"
+        and int(module.grouped_e4m3_fp32_precision_version()) < 4
+    ):
+        raise ValueError("The frozen native reference requires precision revision 4")
+    return getattr(module, entrypoint), manifest
 
 
 def make_case(rows, page, length, num_arms, stride_padding=0, split_counts=None):
@@ -106,6 +114,14 @@ def main():
     parser.add_argument("--profile-one", action="store_true")
     parser.add_argument("--performance-page", type=int, default=1648)
     parser.add_argument(
+        "--performance-query-rows", type=int, choices=range(2, 9), default=8
+    )
+    parser.add_argument(
+        "--tail-queries",
+        action="store_true",
+        help="Audit each q2..q7 shape on the traced 3296-token page layout",
+    )
+    parser.add_argument(
         "--performance-contexts",
         type=int,
         nargs="+",
@@ -175,6 +191,13 @@ def main():
             (8, 3296, args.extended_boundary, 0),
             (8, 1648, args.extended_boundary, 8),
         ]
+    if args.tail_queries:
+        tail_boundary = args.extended_boundary or 262144
+        cases = [(q, 3296, 3297, 8) for q in range(2, 8)]
+        if args.sanitizer:
+            cases.append((6, 3296, tail_boundary, 0))
+        else:
+            cases += [(q, 3296, tail_boundary, 0) for q in range(2, 8)]
     for rows, page, length, padding in cases:
         case = make_case(rows, page, length, len(operators), padding)
         graphs = []
@@ -229,7 +252,12 @@ def main():
             # Sixteen distinct KV allocations represent the target's real
             # layer working set and prevent single-layer hot-cache claims.
             cases = [
-                make_case(8, args.performance_page, length, len(operators))
+                make_case(
+                    args.performance_query_rows,
+                    args.performance_page,
+                    length,
+                    len(operators),
+                )
                 for _ in range(16)
             ]
             graphs = []
@@ -263,6 +291,7 @@ def main():
             row = {
                 "context": length,
                 "page": args.performance_page,
+                "query_rows": args.performance_query_rows,
                 "layers": 16,
                 "samples_ms": samples,
                 "median_ms": [statistics.median(values) for values in samples],
