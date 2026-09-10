@@ -201,6 +201,42 @@ def test_checkpoint_selection_respects_unquantized_expert_exclusions():
     }
 
 
+def test_online_mixed_mtp_can_be_unquantized_by_absence_from_metadata():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+    from vllm.models.qwen4_exp.nvidia.mtp_fp8_experts import (
+        MTPExpertFp8Config,
+        MTPFp8SM70MoEMethod,
+    )
+
+    fallback = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                },
+            }
+        }
+    )
+    layer = MagicMock(spec=RoutedExperts)
+    layer.moe_config = SimpleNamespace(has_bias=False)
+    assert isinstance(
+        MTPExpertFp8Config(fallback).get_quant_method(
+            layer, "mtp.layers.48.mlp.experts"
+        ),
+        MTPFp8SM70MoEMethod,
+    )
+
+
 @pytest.mark.parametrize("quant_name", ["awq", "modelopt_fp4", "modelopt_mixed"])
 @pytest.mark.parametrize("rank", range(4))
 def test_native_checkpoint_uses_normal_tp_loader_with_each_target_format(

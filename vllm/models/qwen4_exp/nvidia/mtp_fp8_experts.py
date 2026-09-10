@@ -234,9 +234,19 @@ class MTPExpertFp8Config(QuantizationConfig):
             and isinstance(layer, RoutedExperts)
             and prefix.startswith("mtp.layers.")
         ):
+            from vllm.model_executor.layers.quantization.modelopt import (
+                ModelOptMixedPrecisionConfig,
+            )
+
             excluded = getattr(self.fallback, "is_layer_excluded", lambda _: False)
+            # Mixed checkpoints also leave layers unquantized by omitting them
+            # from quantized_layers; an explicit exclusion is not required.
+            absent_from_mixed = (
+                isinstance(self.fallback, ModelOptMixedPrecisionConfig)
+                and self.fallback._resolve_quant_algo(prefix) is None
+            )
             if not isinstance(method, UnquantizedFusedMoEMethod) and not (
-                method is None and excluded(prefix)
+                method is None and (excluded(prefix) or absent_from_mixed)
             ):
                 raise ValueError(
                     "Online MTP FP8 requires unquantized checkpoint experts"
