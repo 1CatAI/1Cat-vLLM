@@ -27,8 +27,12 @@ def should_do_global_cleanup_after_test():
     ],
 )
 def test_fp8_feature_requires_supported_draft_and_real_verification(
-    method, architecture, sampler, valid
+    monkeypatch, method, architecture, sampler, valid
 ):
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform",
+        SimpleNamespace(is_cuda=lambda: True, is_device_capability=lambda cap: True),
+    )
     config = SimpleNamespace(
         mtp_expert_quantization="fp8",
         method=method,
@@ -42,6 +46,50 @@ def test_fp8_feature_requires_supported_draft_and_real_verification(
     else:
         with pytest.raises(ValueError):
             SpeculativeConfig._verify_mtp_expert_quantization(config)
+
+
+@pytest.mark.parametrize(
+    "platform,capability", [("rocm", 90), ("cpu", 0), ("cuda", 80)]
+)
+def test_fp8_feature_rejects_unsupported_platform(monkeypatch, platform, capability):
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: platform == "cuda",
+            is_device_capability=lambda cap: capability == cap[0] * 10 + cap[1],
+        ),
+    )
+    config = SimpleNamespace(
+        mtp_expert_quantization="fp8",
+        method="mtp",
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen4ExpMTP"])
+        ),
+        rejection_sample_method="standard",
+    )
+    with pytest.raises(ValueError, match="requires CUDA SM70"):
+        SpeculativeConfig._verify_mtp_expert_quantization(config)
+    # Existing configurations without the opt-in stay available on all platforms.
+    config.mtp_expert_quantization = None
+    SpeculativeConfig._verify_mtp_expert_quantization(config)
+
+
+def test_online_fp8_has_a_distinct_compilation_hash():
+    config = SimpleNamespace(
+        method="mtp",
+        mtp_expert_quantization=None,
+        draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        use_dflash_family=lambda: False,
+        use_dspark=lambda: False,
+        use_dflash_ddtree=lambda: False,
+    )
+    original = SpeculativeConfig.compute_hash(config)
+    config.mtp_expert_quantization = "fp8"
+    fp8 = SpeculativeConfig.compute_hash(config)
+    assert fp8 != original
+    assert SpeculativeConfig.compute_hash(config) == fp8
+    config.mtp_expert_quantization = None
+    assert SpeculativeConfig.compute_hash(config) == original
 
 
 @pytest.mark.parametrize("shape", [(320, 2560), (2560, 160), (16, 16)])

@@ -392,6 +392,10 @@ class SpeculativeConfig:
         )
         factors.append(uses_aux_hidden_states)
 
+        # Online FP8 changes the draft expert kernels and padded weight layout.
+        if self.mtp_expert_quantization is not None:
+            factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
+
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
             layer_ids = getattr(
@@ -1427,6 +1431,12 @@ class SpeculativeConfig:
     def _verify_mtp_expert_quantization(self):
         if self.mtp_expert_quantization is None:
             return
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda() or not current_platform.is_device_capability(
+            (7, 0)
+        ):
+            raise ValueError("mtp_expert_quantization currently requires CUDA SM70")
         hf_config = getattr(self.draft_model_config, "hf_config", None)
         if self.method != "mtp" or getattr(hf_config, "architectures", []) != [
             "Qwen4ExpMTP"
