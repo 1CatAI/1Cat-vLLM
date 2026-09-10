@@ -100,6 +100,124 @@ its paired parent's 7.698/14.871 ms. Reject it before sanitizer or model runs.
 Raw report: `heads2-vector-qk2-screen.json`. Reducing the per-CTA footprint
 does not by itself overcome duplicated KV reads and padded three-head rows.
 
+## Compact probability layout
+
+The current work focuses on the approximately 15-ms **target q8 attention**
+at 256K. Scalar q1 graphs and unrelated round costs are deferred. The private
+`build_sm70_grouped_attention_swizzle.py` builder binds either the hashed
+visible-q8 parent or its exact-LUT child and changes shared-memory layouts.
+It copies and hashes all native inputs; no default service imports it.
+
+The probability/residual layout packs each M16/K16 panel into two 128-half
+planes. An SM70-specific row permutation feeds matrix-A fragments through
+two aligned vector shared loads. Q remains in its original padded layout in
+the selected candidate. Moving the P/residual stores before the warp sum
+reduction retains every arithmetic operation and the publication barrier.
+This targets data access; it does not truncate the context, change 80 logical
+splits, remove residual compensation, or change online update order.
+
+| Paired layout screen, 16 distinct layers | 128K, ms | 261888, ms |
+| --- | ---: | ---: |
+| Exact-LUT parent | 7.571 | 14.620 |
+| Q layout only | 7.552 | 14.589 |
+| Q and P layout | 6.836 | 13.193 |
+
+Both candidates pass 65 byte/workspace/canary checks each. The next screen
+holds the Q/P candidate as the control and separates P from Q:
+
+| Layout screen | 1K, ms | 32K, ms | 128K, ms | 261888, ms |
+| --- | ---: | ---: | ---: | ---: |
+| Q and P control | 0.505 | 1.989 | 6.836 | 13.207 |
+| P only | 0.502 | 1.977 | 6.779 | 13.084 |
+| **P only, early stores** | **0.501** | **1.968** | **6.739** | **13.010** |
+
+The two additional candidates each pass 65 checks. The selected early-store
+DSO also passes 60 q2–q7 tail checks against the original visible-q8 parent.
+Its memcheck, racecheck and synccheck each pass 25 checks, including the full
+262144 boundary, with zero errors or race hazards. The 3296-page full-q8
+specialization uses 118 registers and 512 static shared bytes, with no stack
+or spills reported. This is a compiler observation, not achieved occupancy.
+
+Selected source SHA256:
+`eb7a85511f581fcd22cf13619c85ed2f42a8cbc8b216bb3e632bf448f6b820e1`.
+Selected DSO SHA256:
+`9db33737adb880cd4198266ac4f29785ce3e709936aa47dcc79011a9bce4b811`.
+Regenerating with the final builder retains every source-file hash.
+Raw reports are `qp-swizzle-screen.json`, `p-swizzle-screen.json`,
+`p-swizzle-early-tail-checks.json` and
+`p-swizzle-early-{memcheck,racecheck,synccheck}.{json,txt}`. The local handoff
+records their absolute locations in the owned artifact directory.
+
+The `--pv-m8n32` screen widens PV tiles and keeps three accumulator fragments
+per warp. A native fragment probe validates all 512 matrix-A halves and 256
+accumulator elements before the operator comparison; all 65 full-operator
+checks then pass. Performance nevertheless regresses from 6.736/13.006 ms
+to 7.130/13.805 ms at 128K/261888. Reject it before sanitizer or model trials.
+Source SHA256 `549ed030aa129f496c84db6df9c74bfa84f186ea78cb7ecb624d84f6dd2bcdbd`,
+DSO SHA256 `2be7d9fcaa728b9fc287457af35957bbda6c7dfa83534707b8cbd1283f2e37b5`.
+Report: `p-swizzle-pv8-screen.json`.
+
+A final direct comparison includes the original visible-q8 DSO, the selected
+P layout, compact K/P, and a same-warp two-product QK schedule. All three
+candidates pass 65 byte checks each. The K experiment preserves V's padded
+layout; its native matrix-B word map is checked before the operator run.
+An initial K build was discarded by source inspection because a zero-fill
+rewrite also affected V; only the corrected `kp-swizzle-early-r2` is measured.
+The QK schedule forms two K16 products before summing them in the unchanged
+FP32 compensation order, without the earlier experiment's CTA barriers.
+
+| Final paired operator screen | 1K, ms | 128K, ms | 261888, ms |
+| --- | ---: | ---: | ---: |
+| Original visible-q8 | 0.544 | 7.701 | 14.893 |
+| **Selected P layout + early stores + lookup** | **0.505** | **6.738** | **12.983** |
+| K and P layout + early stores + lookup | 0.526 | 7.330 | 14.149 |
+| P layout + same-warp QK pipeline + lookup | 0.502 | 6.737 | 12.984 |
+
+The selected 256K operator is **12.83% faster** in this direct comparison.
+Reject K layout for its regression, and reject the extra QK schedule because
+its long-context benefit is below measurement resolution. Neither requires
+further sanitizer or model trials. Report: `p-k-qk-final-screen.json`.
+K source/DSO SHA256:
+`08f56749cd466a27d4a52f4fa796db70c4058f14a8cbb4f12162ca4e86a795ee` /
+`b098987572665dd729818d52dbf9f6652dfdc105eaf1625eb01670fc36e9fb39`.
+QK source/DSO SHA256:
+`a93f18addd174f1cfb4520f2ebe6dde4a6cc43ff556ecb025a2ccbd70c75bde5` /
+`456029c9274030af1f2af11c666d3713cc9a340b6a8a352ccfca0e53fe20cc64`.
+
+The new full-q8 clock probe retains byte-identical outputs and all FP32
+workspace elements for sixteen distinct layers at 128K and 261888. At 261888,
+aggregated tile-cycle fractions are K load 15.43%, QK with overlapped V load
+38.36%, online softmax 20.53%, and ordered PV 25.69%. These include probe
+and synchronization costs and are not wall-time fractions or hardware
+utilization. The next optimization should account for QK as the largest
+measured phase rather than assuming PV still dominates. The old generic-only
+probe regenerates to its original source hash after the builder refactor.
+Report: `p-swizzle-phase.json`; source/DSO SHA256:
+`de8a6520bae50e33ab7759501da864a69c7b57b13182abba2ef28f8d76a52f1c` /
+`444200120b6a3dd4f9bbed605f960eff4456a65de693019409bc347e27607ed4`.
+
+The selected layout completes one independent, same-startup service A/B
+(24 requests, 12 pairs). Every pair retains identical tokens, finish reason,
+sampling and draft acceptance. Both arms keep the existing compact scalar q1
+route; graph replay counters establish actual q8 control/candidate route hits
+on all four ranks. The five-repeat medians exclude the retained cold request.
+
+| Unprofiled endpoint | Visible-q8 control | P layout + lookup |
+| --- | ---: | ---: |
+| 1K complete round, ms | 15.829 | 15.774 |
+| 261888 complete round, ms | 36.134 | 33.263 |
+| 261888 pure decode, tokens/s | 128.310 | 139.384 |
+| 261888 accepted drafts/round | 3.563636 | 3.563636 |
+| 261888 emitted tokens/round | 4.654545 | 4.654545 |
+
+Report: `p-swizzle-early-model-1-paired.json`. This startup's generated
+trajectory differs from the earlier lookup-only startup; do not use those
+two startups for an unpaired speed claim. The measured service gain includes
+all consequences of replacing q8 within the same runtime. It does not assign
+the entire 2.871-ms round reduction to attention-kernel service time.
+The **22-ms complete-round target is still unmet**. Repeated-startup and
+new-candidate natural-output corpus admission remain incomplete.
+
 ## Reproduction and promotion gates
 
 Build the lookup using the measured parent's options:
@@ -114,6 +232,19 @@ Build the lookup using the measured parent's options:
   --output "$REPORT" --performance-page 3296 \
   --performance-contexts 131072 261888 --extended-boundary 262144
 ```
+
+Build the probability layout from that exact-LUT manifest:
+
+```bash
+.venv/bin/python -m benchmarks.kernels.build_sm70_grouped_attention_swizzle \
+  --base-manifest "$LOOKUP/manifest.json" --output-dir "$CANDIDATE" \
+  --probabilities --early-store --build
+```
+
+The optional Q, K and wider-PV switches are independent screens, not defaults.
+The phase-clock builder supports both the generic partial kernel and the
+full-q8 specialization. Its extra clock writes and synchronization affect
+timing; phase-cycle fractions must not be called wall-time or occupancy data.
 
 Set the CUDA 12.8 toolkit, `TORCH_CUDA_ARCH_LIST=7.0`, owned compiler caches
 and the GPU lease explicitly. For each sanitizer use the complete CUDA 12.8
