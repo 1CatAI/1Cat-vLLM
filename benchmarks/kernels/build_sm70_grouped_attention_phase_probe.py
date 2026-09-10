@@ -16,12 +16,7 @@ from pathlib import Path
 from benchmarks.kernels.build_sm70_grouped_attention_candidate import replace_once
 
 
-def phase_source(source: str) -> str:
-    start = source.index(
-        "template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE"
-    )
-    end = source.index("void flash_attention_grouped_verify_e5m2_combine_kernel(")
-    partial = source[start:end]
+def phase_partial(partial: str) -> str:
     partial = replace_once(
         partial,
         "const int* row_lengths = nullptr) {",
@@ -64,8 +59,18 @@ def phase_source(source: str) -> str:
         "    __syncthreads();\n  }",
         "    __syncthreads();\n" + stamp(4) + "  }",
     )
-    partial = partial[:loop_start] + loop + partial[loop_end:]
-    source = source[:start] + partial + source[end:]
+    return partial[:loop_start] + loop + partial[loop_end:]
+
+
+def phase_source(source: str) -> str:
+    marker = "template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE"
+    start = source.index(marker)
+    end = source.index("void flash_attention_grouped_verify_e5m2_combine_kernel(")
+    pieces = source[start:end].split(marker)
+    if pieces[0] or len(pieces) not in (2, 3):
+        raise ValueError("Expected generic partial and optional full-q8 kernels")
+    partials = "".join(phase_partial(marker + p) for p in pieces[1:])
+    source = source[:start] + partials + source[end:]
     host_start = source.index("at::Tensor private_grouped_e4m3_fp32_paged(")
     host_end = source.index("PYBIND11_MODULE(", host_start)
     host = source[host_start:host_end]
