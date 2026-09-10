@@ -26,6 +26,7 @@ from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm import envs
 from vllm.distributed import get_tp_group, get_world_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.mem_utils import get_cpu_memory
 from vllm.video.metrics import DenoiseWorkCounter
 
@@ -95,7 +96,11 @@ from .transformer import MiniMaxH3DiTBlock, MiniMaxH3DiTModel
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 from .vsa import h3_vsa_workspace
 from .weight_cache import FP16WeightCache
-from .weights import iter_checkpoint_weights, resolve_model_root
+from .weights import (
+    checkpoint_tensor_count,
+    iter_checkpoint_weights,
+    resolve_model_root,
+)
 
 logger = init_logger(__name__)
 
@@ -439,7 +444,7 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         self.config = config
         self.partition = config.partition
-        from vllm.media.progress import report_loading
+        from vllm.media.progress import LoadingProgress, report_loading
 
         def loading(done, component):
             group = get_tp_group()
@@ -552,13 +557,11 @@ class MiniMaxH3Pipeline(nn.Module):
             for module in self.transformer.modules():
                 if isinstance(module, MiniMaxH3DiTBlock):
                     module.residual_reducer = self._residual_reduction
-        if self._host_backing is not None:
-            PinnedModuleStager.map_cpu_weights(
-                self.transformer, self._host_backing, preserve_parameters=False
-            )
-        weights = iter_checkpoint_weights(transformer_path)
-        if restore_adaln:
-            weights = restore_dense_adaln_weights(weights, path / "transformer")
+        group = get_tp_group()
+        self._prepared_caches = {}
+        dit_progress = LoadingProgress(
+            "transformer", 0, group.rank_in_group, group.world_size
+        )
         fusion = None
         if isinstance(adapter_spec, FastH3Spec):
             if adapter_spec.requires_vsa:
@@ -569,23 +572,86 @@ class MiniMaxH3Pipeline(nn.Module):
                 head_dim=self.transformer.arch.attention_head_dim,
                 device=self.device,
             )
-            weights = fusion.apply(weights)
-        loaded = self.transformer.load_weights(weights)
-        if fusion is not None:
-            fusion.validate_fully_applied(loaded)
-        required = set(dict(self.transformer.named_parameters()))
-        required.update(dict(self.transformer.named_buffers()))
-        missing = required - loaded
-        if missing:
-            raise RuntimeError(f"H3 DiT checkpoint missing tensors: {sorted(missing)}")
-        for layer in self.transformer.modules():
-            method = getattr(layer, "quant_method", None)
-            if method is not None:
+        if config.prepared_weight_cache:
+            for layer in self.transformer.modules():
+                method = getattr(layer, "quant_method", None)
                 layer.h3_fp16_weight_layout = config.fp16_weight_layout
-                method.process_weights_after_loading(layer)
-                if self._host_backing is not None:
-                    PinnedModuleStager.map_cpu_weights(layer, self._host_backing)
-        self.transformer.post_load_weights()
+                prepare = getattr(method, "prepare_weights_before_loading", None)
+                if prepare is not None:
+                    prepare(layer)
+        dit_cache = None
+        if config.prepared_weight_cache and not isinstance(adapter_spec, FlashGenSpec):
+            files = [
+                transformer_path,
+                path / "model_index.json",
+                path / "transformer/config.json",
+            ]
+            if fusion is not None:
+                files.append(select_adapter_file(config.lora_path))
+            dit_cache = self._prepared_component(
+                "transformer",
+                self.transformer,
+                files,
+                dit_progress,
+                options={
+                    "partition": config.partition,
+                    "attention": config.attention_backend,
+                    "int8_layout": config.int8_weight_layout,
+                    "fp16_layout": config.fp16_weight_layout,
+                    "residual_sp": config.residual_sequence_parallel,
+                    "tf32": torch.backends.cuda.matmul.allow_tf32,
+                    "architecture": current_platform.get_device_capability(
+                        self.device.index
+                    ),
+                },
+            )
+        dit_backing = dit_cache or self._host_backing
+        if dit_cache is None or not dit_cache.restore(self.transformer):
+            dit_progress("preparing_weight_storage")
+            if dit_backing is not None:
+                PinnedModuleStager.map_cpu_weights(
+                    self.transformer, dit_backing, preserve_parameters=False
+                )
+            weights = iter_checkpoint_weights(transformer_path)
+            total = checkpoint_tensor_count(transformer_path)
+            if restore_adaln:
+                weights = restore_dense_adaln_weights(weights, path / "transformer")
+                total = None
+            if fusion is not None:
+                weights = fusion.apply(weights)
+                if total is not None:
+                    total += sum(
+                        p.assigned is not None for p in fusion.patches.values()
+                    )
+            loaded = self.transformer.load_weights(dit_progress.weights(weights, total))
+            if fusion is not None:
+                fusion.validate_fully_applied(loaded)
+            required = set(dict(self.transformer.named_parameters()))
+            required.update(dict(self.transformer.named_buffers()))
+            missing = required - loaded
+            if missing:
+                raise RuntimeError(
+                    f"H3 DiT checkpoint missing tensors: {sorted(missing)}"
+                )
+            layers = [
+                layer
+                for layer in self.transformer.modules()
+                if getattr(layer, "quant_method", None) is not None
+            ]
+            dit_progress("preparing_weight_layout", 0, len(layers))
+            for index, layer in enumerate(layers, 1):
+                layer.h3_fp16_weight_layout = config.fp16_weight_layout
+                layer.quant_method.process_weights_after_loading(layer)
+                if dit_backing is not None:
+                    PinnedModuleStager.map_cpu_weights(layer, dit_backing)
+                if dit_cache is not None:
+                    dit_cache.release_unused(self.transformer)
+                dit_progress("preparing_weight_layout", index, len(layers))
+            self.transformer.post_load_weights()
+            if dit_cache is not None:
+                dit_cache.publish(self.transformer)
+        else:
+            self.transformer.validate_restored_host_weights()
         self.turbo_spec = None
         if fusion is not None:
             self.turbo_spec = fusion.spec
@@ -599,7 +665,7 @@ class MiniMaxH3Pipeline(nn.Module):
             self.transformer,
             self.device,
             pin_memory=config.host_weight_pin_memory,
-            host_backing=self._host_backing,
+            host_backing=dit_backing,
         )
         self._weight_cache = FP16WeightCache(
             self.transformer,
@@ -622,16 +688,40 @@ class MiniMaxH3Pipeline(nn.Module):
             load_model=True,
             encoder_group=self.text_encoder_group,
         )
-        if self._host_backing is not None:
-            PinnedModuleStager.map_cpu_weights(
-                self.text_encoder, self._host_backing, preserve_parameters=False
+        encoder_progress = LoadingProgress(
+            "text_encoder", 1, group.rank_in_group, group.world_size
+        )
+        encoder_cache = (
+            self._prepared_component(
+                "text_encoder",
+                self.text_encoder,
+                [shared / "text_encoder"],
+                encoder_progress,
+                options={},
             )
-        self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
+            if config.prepared_weight_cache
+            else None
+        )
+        encoder_backing = encoder_cache or self._host_backing
+        if encoder_cache is None or not encoder_cache.restore(self.text_encoder):
+            encoder_progress("preparing_weight_storage")
+            if encoder_backing is not None:
+                PinnedModuleStager.map_cpu_weights(
+                    self.text_encoder, encoder_backing, preserve_parameters=False
+                )
+            self.text_encoder.load_weights(
+                encoder_progress.weights(
+                    iter_checkpoint_weights(shared / "text_encoder"),
+                    checkpoint_tensor_count(shared / "text_encoder"),
+                )
+            )
+            if encoder_cache is not None:
+                encoder_cache.publish(self.text_encoder)
         self._encoder_stager = PinnedModuleStager(
             self.text_encoder,
             self.device,
             pin_memory=config.host_weight_pin_memory,
-            host_backing=self._host_backing,
+            host_backing=encoder_backing,
         )
         self._dit_layer_stager: LayerwiseModuleStager | None = None
         self._encoder_layer_stager: LayerwiseModuleStager | None = None
@@ -673,6 +763,27 @@ class MiniMaxH3Pipeline(nn.Module):
         self.actual_dit_calls = 0
         self.eval()
         loading(4, "ready")
+
+    def _prepared_component(self, name, module, paths, progress, *, options):
+        from .prepared_weights import PreparedWeights, preparation_key
+
+        group = get_tp_group()
+        key = preparation_key(
+            paths,
+            component=name,
+            rank=group.rank_in_group,
+            world_size=group.world_size,
+            options=options,
+        )
+        cache = PreparedWeights(
+            Path(envs.VLLM_CACHE_ROOT) / "h3-prepared",
+            key,
+            module,
+            limit_bytes=int(self.config.prepared_weight_cache_gib * 2**30),
+            progress=progress,
+        )
+        self._prepared_caches[name] = cache
+        return cache
 
     def _transformer_for_task(self, task):
         return self.transformer

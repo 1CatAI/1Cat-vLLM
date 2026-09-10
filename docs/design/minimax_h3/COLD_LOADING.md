@@ -35,3 +35,28 @@ to finish; no active user task is interrupted. Real first-load/reload timing
 and output comparison are required before promotion.
 
 AI assistance: OpenAI Codex.
+
+## Candidate implementation
+
+`--prepared-weight-cache` enables exact rank-local prepared transformer and
+text-encoder storage under `VLLM_CACHE_ROOT/h3-prepared`. The default budget is
+128 GiB (`--prepared-weight-cache-gib`). Native callers remain opt-in. Studio
+uses the capability probe to enable it independently of generation fast mode.
+
+The initial fill allocates the final projection strides before loading. A
+completed entry includes checksums of all storage files, tensor metadata and
+its manifest. Subsequent loads validate it before binding private mappings.
+Keys include checkpoint identity, source, Torch/CUDA, processing configuration
+and TP rank/topology. Ordinary LoRA sidecars are applied after the base cache;
+FastH3 fusion is keyed by its exact adapter. Active entries are protected by
+lifetime leases. Only inactive prepared entries can be evicted; original model
+files are never removed. Missing, incomplete or corrupt entries are rebuilt.
+
+Loading reports actual tensor or byte counts separately from component counts.
+No overall time percentage or performance prediction is synthesized.
+
+CPU validation: 80 passed, 3 skipped across prepared weights, host residency,
+service, progress, FastH3 and Studio fast-path suites. These cover exact signed
+INT8 bytes, FP16 layout, shared storage offsets, cache corruption and active
+lease protection. Real GPU startup, output parity and speed remain pending;
+this candidate must not be promoted based only on the CPU result.

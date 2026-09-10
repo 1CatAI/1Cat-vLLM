@@ -54,8 +54,18 @@ class H3Config:
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
     host_memory_mode: Literal["auto", "pinned", "mmap"] = "auto"
     host_memory_directory: str | None = None
+    prepared_weight_cache: bool = False
+    prepared_weight_cache_gib: float = 128.0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.prepared_weight_cache, bool):
+            raise H3InputError("prepared weight cache must be a boolean")
+        if (
+            isinstance(self.prepared_weight_cache_gib, bool)
+            or not math.isfinite(self.prepared_weight_cache_gib)
+            or not 0 < self.prepared_weight_cache_gib <= 1024 * 1024
+        ):
+            raise H3InputError("prepared weight cache size must be finite and positive")
         if self.residual_reduction not in ("native", "peer"):
             raise H3InputError("residual reduction must be native or peer")
         if self.residual_reduction == "peer" and not self.residual_sequence_parallel:

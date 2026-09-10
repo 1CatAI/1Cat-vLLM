@@ -56,6 +56,16 @@ def iter_checkpoint_weights(path: str | Path, *, include: set[str] | None = None
                 yield name, checkpoint.get_tensor(name)
 
 
+def checkpoint_tensor_count(path: str | Path):
+    path = Path(path)
+    files = [path] if path.is_file() else sorted(path.glob("*.safetensors"))
+    total = 0
+    for file in files:
+        with safe_open(file, framework="pt", device="cpu") as checkpoint:
+            total += len(checkpoint.keys())
+    return total
+
+
 def write_checkpoint_manifest(root: str | Path, output: str | Path, *, revision: str):
     root = Path(root)
     records = []
