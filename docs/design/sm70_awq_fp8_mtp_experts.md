@@ -4,7 +4,7 @@ Qwen4Exp MTP experts can retain FP8 storage independently of the AWQ or NVFP4 ta
 
 The checkpoint route backports [vLLM #55513](https://github.com/vllm-project/vllm/pull/55513): ModelOpt `FP8_PB_WO` / `FP8_BLOCK_SCALES` dispatch and AMD/NVIDIA MTP quantization-metadata remapping. This PR adds SM70 storage and TP alignment to that upstream loading support. It does not use the resident-FP16 fallback from [1Cat #553](https://github.com/1CatAI/1Cat-vLLM/pull/553).
 
-**Validation status:** the online AWQ results below are complete. Checkpoint-native CPU loading and real-weight V100 kernel checks have passed; complete-model checkpoint-native AWQ and NVFP4 comparison runs are still in progress. The online results do not establish NVFP4 or native-checkpoint end-to-end acceptance.
+**Validation status:** online and checkpoint-native routes have completed full-model generation tests with both AWQ and NVFP4 targets. CPU loading and real-weight V100 kernel checks have passed. Same-source FP16 controls establish checkpoint-native memory savings for both target formats; the NVFP4 online arm is an additional integration test using that target checkpoint's own unquantized MTP.
 
 ## Configuration
 
@@ -30,7 +30,7 @@ For the tested TP4 model, the expert intermediate width is 160. Both gate/up hal
 
 The online route temporarily needs FP16 weights and conversion buffers. The checkpoint-native route allocates FP8 expert parameters directly and retains the original quantized bytes. At TP4, logical slices begin at offsets 0/32/64/96 within their original 128-wide blocks. Leading zero padding preserves these coordinates in both gate/up rows and down columns, keeping the original scales correctly associated without requantization. Each rank uses a physical width of 256; ordinary vLLM TP loading handles the expanded checkpoint tensors.
 
-The reused SM70 kernel stores scales as FP16. Source scales that become infinite or underflow to zero are rejected. The original BF16 scales in the real-weight probe are exactly representable in FP16; FP32 source scales may round to kernel precision. No reduction in loading peak or increase in speed is claimed.
+The reused SM70 kernel stores scales as FP16. Source scales that become infinite or underflow to zero are rejected. All 1536 original expert scale tensors in the tested NVIDIA draft are exactly representable in FP16; FP32 source scales may round to kernel precision. No reduction in loading peak or increase in speed is claimed.
 
 ## Answer-quality contract
 
@@ -49,14 +49,21 @@ Tests use the native SM70 runtime from commit `752f86495f`, with the changed Pyt
 
 Full-model results from matched testing are recorded below. No throughput improvement or broad benchmark-quality guarantee is inferred from the smoke suite.
 
-### Checkpoint-native validation in progress
+### Checkpoint-native validation
 
-- CPU: 47 tests passed across the online and checkpoint suites. The checkpoint suite covers original byte/scale preservation at TP1/2/4/8, invalid scales, both ModelOpt block-FP8 names, excluded layers, metadata remapping in both backends, complete weight/scale streams and normal TP loading under AWQ/ModelOpt NVFP4/mixed config names.
+- CPU: 48 tests passed across the online and checkpoint suites. The checkpoint suite covers original byte/scale preservation at TP1/2/4/8, invalid scales, both ModelOpt block-FP8 names, excluded layers, metadata remapping in both backends, complete weight/scale streams and normal TP loading under AWQ/ModelOpt NVFP4/mixed config names. Online conversion also covers unquantized ModelOpt experts omitted from mixed quantization metadata.
 - V100: the expanded GPU suite passed 20 tests: four online cases and sixteen checkpoint cases covering TP4 offsets at M=1/2/8/64. All compare reconstructed reference weights and exact CUDA Graph replay.
 - Two original experts from `nvidia/Qwen3.8-Flash-Next-NVFP4` revision `fc694b54fb0174e0913e6adf86691ef85a4ead47` passed the real loader/packer/kernel in four separate V100 processes at M=1/2/8/64. Maximum absolute error versus FP16 reconstruction was 0.0008544921875, relative L2 below 0.00082; graph replay was exact. The original BF16 scales were exactly representable in the kernel's FP16 scale format.
-- A compact draft containing unchanged source MTP, embedding and head tensors loaded alongside the AWQ target and completed 16 greedy plus 16 stochastic requests. The same-source FP16 expert control and NVFP4 target comparisons are pending. Whole-GPU memory for this first native AWQ run is recorded separately; no paired native-checkpoint saving is established yet.
+- A compact draft containing unchanged source MTP, embedding and head tensors loaded alongside the AWQ target. Its control reconstructs only the same source experts into FP16 using their original block scales. Each arm completed 16 greedy and 16 stochastic requests. Idle whole-GPU memory decreased from 30992 to 29982 MiB on every rank, both after greedy and after stochastic requests: **1010 MiB per rank saved**. Complete response choices matched in 14/16 cases and usage in 15/16. The differences were explanatory wording in the probability and list-versus-tuple answers; both retained the answer essentials. Serial retests on the unchanged FP16 control also changed the list-versus-tuple wording, but did not reproduce the FP8 text. The original paired results are retained rather than replaced with selected retests.
+- The same native draft and same-source FP16 control were paired with the full NVFP4 target. All 16 complete greedy response choices and token usage matched exactly; each arm also completed 16 stochastic/top-p requests with finite token logprobs. Idle whole-GPU usage was **31960 MiB with FP16 versus 31068 MiB with FP8**, on every rank after both campaigns: **892 MiB per rank saved**. Runtime inspection confirmed 975 MiB of packed MTP expert weights/scales per rank and absence of the original expert parameters. These measurements use the same fixed 5-GiB KV/rank, TP4/MTP3/C2 and graph settings as the AWQ comparisons. The NVFP4 target is `RadixArk/Qwen3.8-Flash-Next-NVFP4`, revision `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 
-The native full-model run preceded two additional input guards (excluded ModelOpt layers and out-of-range kernel scales), while the 20 GPU tests use the current code. Neither guard changes numerical execution for the validated checkpoint. No native-checkpoint throughput or loading-peak claim is made.
+The first native AWQ FP8 run preceded two additional input guards (excluded ModelOpt layers and out-of-range kernel scales), while the 20 GPU tests and both NVFP4 arms include them. Neither guard changes numerical execution for the validated checkpoint. No native-checkpoint throughput or loading-peak claim is made.
+
+### NVFP4 online-conversion integration
+
+The NVFP4 checkpoint's own unquantized MTP also loaded with `mtp_expert_quantization=fp8`. All four ranks selected the online method, retained 975 MiB of packed expert weights/scales and removed the original FP16 expert parameters. The server completed 16 full greedy answers and 16 stochastic requests with finite logprobs. Idle whole-GPU usage was 31048 MiB on every rank after both campaigns.
+
+All 16 complete greedy choices and token usage matched the NVFP4 control above. This comparison keeps the same target and serving settings, but uses a different MTP source: the control expands NVIDIA's FP8 experts, while this online arm quantizes the NVFP4 checkpoint's own original experts. It is an integration and unchanged-target output check, not a same-source quantization comparison. The 892-MiB saving established by the native paired run remains the controlled NVFP4 memory result.
 
 ### Runtime weight inspection
 
