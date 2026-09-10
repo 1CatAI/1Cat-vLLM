@@ -2,11 +2,14 @@
 
 ## Current campaign direction
 
-The latest user instruction narrows current delivery to already working H3
-dense workflows using retained FA. Further slower Attention prototypes and
-new workflow expansion are paused. No experimental replacement is installed.
-See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the current report. Historical
-experiments and the unfinished full campaign remain below for reference.
+The user authorized integrating the implemented H3 SM70 and VSA source stack
+through PR #583 on 2026-09-10. The retained dense workflows use FA; new FI
+optimization and workflow expansion remain paused. See
+[CURRENT_STATUS.md](CURRENT_STATUS.md) for the dense report and
+[VSA_QUALITY_SPEED.md](VSA_QUALITY_SPEED.md) for the subsequent VSA stage and
+merge validation. No VSA configuration passes both quality and speed, and no
+experimental replacement enters default/AUTO selection. Historical experiments
+and the unfinished full campaign remain below for reference.
 
 New Attention development and exhaustive workflow acceptance concentrate on
 FlashAttention-V100 at the user's request. The already validated FlashInfer
@@ -24,7 +27,7 @@ gates may enter automatic selection.
 
 See [FA_DEVELOPMENT.md](FA_DEVELOPMENT.md) for current bottleneck evidence and
 rejected kernel candidates, and [CAMPAIGN_RESULTS.md](CAMPAIGN_RESULTS.md)
-for the per-workflow qualification table. The owned stack remains Draft;
+for the per-workflow qualification table. Source integration is authorized;
 local operator results are not end-to-end model acceptance.
 
 Latest FlashInfer change:

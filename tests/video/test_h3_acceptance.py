@@ -72,6 +72,100 @@ def measurements(calls=49, api_steps=50, tp=4):
     return warmup, runs
 
 
+def sparse_measurements():
+    warmup, runs = measurements(calls=4, api_steps=4)
+    heads, gated, calls = 14, 50, 4
+    selected_pairs = heads * (33 + 32 * 17)
+    selected_blocks = heads * (3 + 2 * 2)
+    compression = 4 * heads * 3**2 * 128
+    dense_pairs = heads * 33**2
+    for run in (warmup, *runs):
+        run["config"].update(attention_backend="FASTVIDEO_VSA", vsa_topk=1)
+        for rank in run["ranks"]:
+            rank["denoise_workload"].update(
+                work_accounting="sparse_tp_v1",
+                attention_algorithm="vsa",
+                used_length=33,
+                actual_backends=["FASTVIDEO_VSA", "FLASH_ATTN_V100"],
+                sparse_config=dict(
+                    topk=1,
+                    gated_blocks=gated,
+                    heads=heads,
+                    head_size=128,
+                    prefix_segments=[1],
+                    video_shape=[1, 4, 8],
+                ),
+            )
+            rank["denoise_sparse_work_by_layer"] = {}
+            for i in range(gated):
+                name = f"blocks.{i}.attn.attention"
+                rank["denoise_sparse_work_by_layer"][name] = dict(
+                    head_size=128,
+                    heads=heads,
+                    selected_blocks=calls * selected_blocks,
+                    selected_token_pairs=calls * selected_pairs,
+                    compression_flops=calls * compression,
+                    dense_token_pairs=calls * dense_pairs,
+                )
+                flops = 4 * calls * selected_pairs * 128
+                rank["denoise_flops_by_layer"][name] = flops
+                rank["denoise_flops_by_layer"][name + ".compression"] = (
+                    calls * compression
+                )
+                rank["denoise_flops_by_layer"]["example"] -= flops + calls * compression
+            for step in rank["denoise_steps"]:
+                step.update(
+                    sparse_blocks=gated * selected_blocks,
+                    sparse_token_pairs=gated * selected_pairs,
+                    sparse_compression_flops=gated * compression,
+                    attention_avoided_flops=4
+                    * 128
+                    * gated
+                    * (dense_pairs - selected_pairs),
+                )
+    return warmup, runs
+
+
+def test_sparse_acceptance_keeps_algorithm_savings_out_of_numerator():
+    warmup, runs = sparse_measurements()
+    report = evaluate_performance(runs, warmup=warmup)
+    assert report["rank_median_tflops"] == [100.0] * 4
+    assert report["performance_passed"]
+    assert all(n > 0 for n in report["attention_avoided_flops_by_run_and_rank"][0])
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "padded_pairs",
+        "block_count",
+        "missing_gate",
+        "compression",
+        "savings",
+        "backend",
+    ],
+)
+def test_sparse_acceptance_rejects_invented_or_incomplete_work(invalid):
+    warmup, runs = sparse_measurements()
+    rank = runs[0]["ranks"][0]
+    layers = rank["denoise_sparse_work_by_layer"]
+    name = next(iter(layers))
+    if invalid == "padded_pairs":
+        layers[name]["selected_token_pairs"] = layers[name]["selected_blocks"] * 64**2
+    elif invalid == "block_count":
+        rank["denoise_steps"][0]["sparse_blocks"] += 1
+    elif invalid == "missing_gate":
+        layers.pop(name)
+    elif invalid == "compression":
+        layers[name]["compression_flops"] += 1
+    elif invalid == "savings":
+        rank["denoise_steps"][0]["attention_avoided_flops"] += 1
+    else:
+        rank["denoise_workload"]["actual_backends"] = ["FLASH_ATTN_V100"]
+    with pytest.raises(ValueError):
+        evaluate_performance(runs, warmup=warmup)
+
+
 def test_all_ranks_use_slowest_rank_wall_time_and_strict_threshold():
     warmup, runs = measurements()
     report = evaluate_performance(runs, warmup=warmup)

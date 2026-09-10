@@ -84,6 +84,7 @@ def inputs(tokens, heads, amplitude, weight_dtype):
     return q, k, *weights, rope, 1e-5
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("tokens,heads", [(1, 1), (65, 3), (129, 14), (12323, 14)])
 @pytest.mark.parametrize(
     "amplitude,weight_dtype", [(1, torch.float16), (2000, torch.float32)]
@@ -98,6 +99,7 @@ def test_rounding_and_partial_rotation(tokens, heads, amplitude, weight_dtype):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_graph_replay_reads_changed_inputs_and_rope():
     args = inputs(65, 3, 1000, torch.float16)
@@ -120,6 +122,7 @@ def test_graph_replay_reads_changed_inputs_and_rope():
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_other_rotary_width_keeps_reference_path():
     args = list(inputs(65, 3, 1, torch.float16))

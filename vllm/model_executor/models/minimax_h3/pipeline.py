@@ -93,6 +93,7 @@ from .time_request import (
 )
 from .transformer import MiniMaxH3DiTBlock, MiniMaxH3DiTModel
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vsa import h3_vsa_workspace
 from .weight_cache import FP16WeightCache
 from .weights import iter_checkpoint_weights, resolve_model_root
 
@@ -537,10 +538,6 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         finally:
             attention_backend.reset(token)
-        if self._host_backing is not None:
-            PinnedModuleStager.map_cpu_weights(
-                self.transformer, self._host_backing, preserve_parameters=False
-            )
         for module in self.transformer.modules():
             if isinstance(module, Attention):
                 module.query_tile = config.attention_query_tile
@@ -555,11 +552,17 @@ class MiniMaxH3Pipeline(nn.Module):
             for module in self.transformer.modules():
                 if isinstance(module, MiniMaxH3DiTBlock):
                     module.residual_reducer = self._residual_reduction
+        if self._host_backing is not None:
+            PinnedModuleStager.map_cpu_weights(
+                self.transformer, self._host_backing, preserve_parameters=False
+            )
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")
         fusion = None
         if isinstance(adapter_spec, FastH3Spec):
+            if adapter_spec.requires_vsa:
+                self.transformer.enable_vsa_gates(config.vsa_topk)
             fusion = FastH3Fusion(
                 select_adapter_file(config.lora_path),
                 partition=config.partition,
@@ -595,8 +598,8 @@ class MiniMaxH3Pipeline(nn.Module):
         self._dit_stager = PinnedModuleStager(
             self.transformer,
             self.device,
-            host_backing=self._host_backing,
             pin_memory=config.host_weight_pin_memory,
+            host_backing=self._host_backing,
         )
         self._weight_cache = FP16WeightCache(
             self.transformer,
@@ -1667,11 +1670,12 @@ class MiniMaxH3Pipeline(nn.Module):
             video_outputs=int(branch.update_mask.sum()),
             audio_outputs=int(branch.audio_update_mask.sum()),
         )
-        from vllm.media.progress import report
-
-        report("staging_model")
         self.denoise_workload = {
-            "work_accounting": "dense_tp_lora_v2",
+            "work_accounting": (
+                "sparse_tp_v1"
+                if self.config.attention_backend == "FASTVIDEO_VSA"
+                else "dense_tp_lora_v2"
+            ),
             "partition": self.partition,
             "task": task,
             "adapter": (
@@ -1681,7 +1685,9 @@ class MiniMaxH3Pipeline(nn.Module):
             "audio_sigmas": list(inputs["sigmas_audio"]),
             "used_length": branch.used_len,
             "blocks_per_call": counter.blocks_per_call,
-            "attention_algorithm": "dense",
+            "attention_algorithm": (
+                "vsa" if self.config.attention_backend == "FASTVIDEO_VSA" else "dense"
+            ),
             "cache_algorithm": None,
             "actual_backends": sorted(
                 {
@@ -1691,7 +1697,26 @@ class MiniMaxH3Pipeline(nn.Module):
                 }
             ),
         }
-        with counter, self._resident_dit_layers_on_device(enabled=True):
+        if self.config.attention_backend == "FASTVIDEO_VSA":
+            layout = branch.static_kwargs["video_token_layout"]
+            self.denoise_workload["sparse_config"] = {
+                "topk": self.config.vsa_topk,
+                "prefix_segments": list(
+                    branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"]
+                ),
+                "video_shape": list(layout.video_spans[-1].latent_grid),
+                "gated_blocks": len(transformer.blocks),
+                "heads": transformer.blocks[0].attn.num_heads,
+                "head_size": transformer.blocks[0].attn.head_dim,
+            }
+        from vllm.media.progress import report
+
+        report("staging_model")
+        with (
+            counter,
+            h3_vsa_workspace(),
+            self._resident_dit_layers_on_device(enabled=True),
+        ):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()
@@ -1724,6 +1749,7 @@ class MiniMaxH3Pipeline(nn.Module):
                     step_profiler=counter.step,
                 )
             torch.accelerator.synchronize()
+            counter.finish_sparse()
             dist.barrier()
             torch.accelerator.synchronize()
             self.stage_durations["denoise"] = time.perf_counter() - started
@@ -1734,6 +1760,7 @@ class MiniMaxH3Pipeline(nn.Module):
             self.redundant_flops_by_layer = counter.redundant_by_layer
             self.denoise_steps = counter.finish_steps()
             self.denoise_executed_blocks = dict(counter.blocks)
+            self.denoise_sparse_work_by_layer = counter.sparse_by_layer
 
         return self._unpack_denoised_rows(
             branch,

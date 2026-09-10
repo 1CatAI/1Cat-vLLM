@@ -26,7 +26,9 @@ from vllm.model_executor.models.minimax_h3.lora import (
 from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
 
 
-def artifact(tmp_path, *, mutate=None, metadata_updates=None, dtype=torch.bfloat16):
+def artifact(
+    tmp_path, *, mutate=None, metadata_updates=None, dtype=torch.bfloat16, vsa=False
+):
     generator = torch.Generator().manual_seed(519)
 
     def rand(*shape):
@@ -80,11 +82,20 @@ def artifact(tmp_path, *, mutate=None, metadata_updates=None, dtype=torch.bfloat
         name: (weight.float() + deltas[name]).to(dtype) if name in deltas else weight
         for name, weight in base.items()
     }
+    if vsa:
+        for i in range(50):
+            gate = rand(8, 8)
+            tensors[f"transformer_blocks.{i}.attn.to_gate_compress.set_weight"] = gate
+            expected[f"blocks.{i}.attn.to_gate_compress.weight"] = gate
     if mutate:
         mutate(tensors)
     metadata = {
         "format": "fastvideo-lora-v2",
-        "finetuned_model": "FastVideo/FastVideo-FastH3-Dense-4-step-v1",
+        "finetuned_model": (
+            "FastVideo/FastVideo-FastH3-4-step-v1"
+            if vsa
+            else "FastVideo/FastVideo-FastH3-Dense-4-step-v1"
+        ),
         "base_model": "MiniMaxAI/MiniMax-H3",
         "rank": "64",
         "low_rank_tensors": str(
@@ -93,7 +104,9 @@ def artifact(tmp_path, *, mutate=None, metadata_updates=None, dtype=torch.bfloat
         "diff_tensors": str(
             sum(name.endswith((".diff", ".diff_b")) for name in tensors)
         ),
-        "set_weight_tensors": "0",
+        "set_weight_tensors": str(
+            sum(name.endswith(".set_weight") for name in tensors)
+        ),
         **(metadata_updates or {}),
     }
     path = tmp_path / "adapter_model.safetensors"
@@ -267,7 +280,8 @@ def test_fasth3_api_defaults_and_unavailable_dynamic_lora(tmp_path):
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
-def test_fused_weights_enter_native_tp_loaders_and_host_snapshot(tmp_path, tp):
+@pytest.mark.parametrize("vsa", [False, True])
+def test_fused_weights_enter_native_tp_loaders_and_host_snapshot(tmp_path, tp, vsa):
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.linear import (
         ColumnParallelLinear,
@@ -277,7 +291,7 @@ def test_fused_weights_enter_native_tp_loaders_and_host_snapshot(tmp_path, tp):
     from vllm.model_executor.models.minimax_h3.residency import PinnedModuleStager
     from vllm.model_executor.models.minimax_h3.transformer import MiniMaxH3DiTModel
 
-    path, base, expected = artifact(tmp_path)
+    path, base, expected = artifact(tmp_path, vsa=vsa)
     fused = dict(FastH3Fusion(path, head_dim=2).apply(base.items()))
     # The native loader converts serialized [head, Q/K/V, channel] to Q/K/V.
     qkv = expected["blocks.0.attn.qkv_proj.weight"]
@@ -347,6 +361,13 @@ def test_fused_weights_enter_native_tp_loaders_and_host_snapshot(tmp_path, tp):
             model.video_patch_proj = ColumnParallelLinear(
                 8, 8, bias=True, params_dtype=torch.float32
             )
+            if vsa:
+                for block in model.blocks:
+                    if not hasattr(block, "attn"):
+                        block.attn = nn.Module()
+                    block.attn.to_gate_compress = ColumnParallelLinear(
+                        8, 8, bias=False, params_dtype=torch.float16
+                    )
             loaded = MiniMaxH3DiTModel.load_weights(model, fused.items())
             assert loaded == set(fused) - {"untouched.weight"}
             for name, param in model.named_parameters():
@@ -373,3 +394,27 @@ def test_fused_weights_enter_native_tp_loaders_and_host_snapshot(tmp_path, tp):
             stager._restore_masters()
             for name, param in model.named_parameters():
                 torch.testing.assert_close(param, before[name], atol=0, rtol=0)
+
+
+def test_vsa_gates_require_complete_inventory_and_matching_backend(tmp_path):
+    path, base, expected = artifact(tmp_path, vsa=True)
+    spec = inspect_adapter(path, "fl2va")
+    assert spec.requires_vsa
+    fused = dict(FastH3Fusion(path, head_dim=2).apply(base.items()))
+    for name, value in expected.items():
+        torch.testing.assert_close(fused[name], value, rtol=0, atol=0)
+    with pytest.raises(H3InputError, match="FASTVIDEO_VSA"):
+        sampling_for_deployment(H3Config(lora_path=str(path)))
+    sampling = sampling_for_deployment(
+        H3Config(lora_path=str(path), attention_backend="FASTVIDEO_VSA")
+    )
+    assert sampling.num_inference_steps == 4
+    path, _, _ = artifact(
+        tmp_path,
+        vsa=True,
+        mutate=lambda tensors: tensors.pop(
+            "transformer_blocks.49.attn.to_gate_compress.set_weight"
+        ),
+    )
+    with pytest.raises(H3InputError, match="every main-block compression gate"):
+        inspect_adapter(path, "fl2va")

@@ -40,6 +40,7 @@ from .modulation import (
 )
 from .ops import RMSNorm, RotaryEmbedding, fused_qk_norm_rope
 from .quantization import (
+    FP16LinearMethod,
     H3MergedColumnParallelLinear,
     H3QKVParallelLinear,
     H3RowParallelLinear,
@@ -405,6 +406,9 @@ class MiniMaxH3Attention(nn.Module):
             prefix=f"{prefix}.out_proj",
         )
         preserve_fp32_output(self.out_proj)
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        self._gate_dimensions = (arch.hidden_size, inner_dim)
+        self._gate_prefix = f"{prefix}.to_gate_compress"
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -418,6 +422,18 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
         )
+
+    def enable_vsa_gate(self, topk: int) -> None:
+        if self.to_gate_compress is None:
+            self.to_gate_compress = ColumnParallelLinear(
+                *self._gate_dimensions,
+                bias=False,
+                params_dtype=_COMPUTE_DTYPE,
+                prefix=self._gate_prefix,
+            )
+            self.to_gate_compress.quant_method = FP16LinearMethod()
+            nn.init.zeros_(self.to_gate_compress.weight)
+        self.attention.vsa_topk = topk
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -444,6 +460,8 @@ class MiniMaxH3Attention(nn.Module):
         packed_total: int,
         num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
+        gate_compress: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -529,6 +547,14 @@ class MiniMaxH3Attention(nn.Module):
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
                 "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+                **(
+                    {
+                        "gate_compress": gate_compress.unsqueeze(0),
+                        "vsa_h3_prefix_segments": vsa_prefix_segments,
+                    }
+                    if gate_compress is not None
+                    else {}
+                ),
             },
             video_layout=video_layout,
         )
@@ -551,6 +577,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         input_is_rotated: bool = False,
+        vsa_prefix_segments: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -587,6 +614,13 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
 
+        gate_compress = None
+        if self.to_gate_compress is not None:
+            if input_is_rotated:
+                raise ValueError("VSA gate requires its original unrotated activation")
+            gate_compress, _ = self.to_gate_compress(x)
+            gate_compress = gate_compress.view(total, self.num_heads, self.head_dim)
+
         # Each request contributes a document for its rows plus one for any
         # nonempty alignment padding. Local/Ulysses backends unpad it, while
         # Ring keeps aligned rows for fixed-size P2P buffers.
@@ -602,6 +636,8 @@ class MiniMaxH3Attention(nn.Module):
             packed_total=packed_total if packed_total is not None else q.shape[0],
             num_requests=num_requests,
             video_layout=video_layout,
+            vsa_prefix_segments=vsa_prefix_segments,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -862,6 +898,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -922,6 +959,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             input_is_rotated=input_is_rotated,
+            vsa_prefix_segments=vsa_prefix_segments,
         )
         if group is not None:
             if self.residual_reducer is not None:
@@ -1189,6 +1227,16 @@ class MiniMaxH3DiTModel(nn.Module):
         validate_bindings = getattr(quant_config, "validate_model_bindings", None)
         if callable(validate_bindings):
             validate_bindings(self)
+
+    def enable_vsa_gates(self, topk: int) -> None:
+        for block in self.blocks:
+            if block.attn.attention.backend != "FASTVIDEO_VSA":
+                raise ValueError("VSA gates require the explicit sparse backend")
+            block.attn.enable_vsa_gate(topk)
+        # The official adapter has no token-refiner gates or video tile layout.
+        for block in self.token_refiner.blocks:
+            block.attn.attention.backend = "FLASH_ATTN_V100"
+        self._mark_missing_params_required()
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1516,6 +1564,9 @@ class MiniMaxH3DiTModel(nn.Module):
         )
 
         psp = _required_kwarg(kwargs, "packed_seq_params")
+        vsa_prefix_segments = tuple(
+            int(n) for n in self._psp_optional(psp, "vsa_prefix_segments", ())
+        )
         cu_seqlens = self._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(
             torch.int32
         )
@@ -1626,6 +1677,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 packed_total=seq_len,
                 num_requests=num_requests,
                 video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
             )
         if residual_group is not None:
             # Final heads and the existing padding boundary consume full FP32 rows.

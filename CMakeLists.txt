@@ -789,6 +789,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
+  define_extension_target(
+    _sm70_sparse_attention_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "flash-attention-v100/kernel/h3/forward_sparse.cu"
+    INCLUDE_DIRECTORIES
+      "${CUTLASS_INCLUDE_DIR}"
+      "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")

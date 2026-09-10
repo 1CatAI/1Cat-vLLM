@@ -449,12 +449,17 @@ struct H3FMHAKernel {
     int keys;
     int heads;
     float scale;
+    const int* block_indices = nullptr;
+    const int* block_counts = nullptr;
+    const int* block_sizes = nullptr;
+    int blocks = 0;
     static constexpr bool causal = false;
   };
 
   /// Executes one GEMM
-  CUTLASS_DEVICE
-  void operator()(DirectParams const& params, SharedStorage& shared_storage) {
+  template <bool Sparse = false>
+  CUTLASS_DEVICE void operator()(DirectParams const& params,
+                                 SharedStorage& shared_storage) {
     auto& m_prime = shared_storage.m_prime;
     auto& s_prime = shared_storage.s_prime;
     [[maybe_unused]] auto& si = shared_storage.after_mm0.si;
@@ -488,7 +493,8 @@ struct H3FMHAKernel {
       static_assert(kKeepOutputInRF);
       ElementOAccum* ptr_O_accum = nullptr;
       const int num_queries =
-          TileParams::num_queries(threadblock_idx, problem_size0);
+          Sparse ? params.block_sizes[threadblock_idx]
+                 : TileParams::num_queries(threadblock_idx, problem_size0);
 
       auto createOutputIter = [&](int col) -> typename MM1::OutputTileIterator {
         using OutputTileIterator = typename MM1::OutputTileIterator;
@@ -516,12 +522,22 @@ struct H3FMHAKernel {
       const int num_keys =
           TileParams::num_keys(threadblock_idx, problem_size0, params.causal);
 
-      for (int32_t iter_key_start = 0; iter_key_start < num_keys;
-           iter_key_start += kKeysPerBlock) {
+      const int block_row = group * params.blocks + threadblock_idx;
+      const int key_tiles =
+          Sparse ? params.block_counts[block_row]
+                 : (num_keys + kKeysPerBlock - 1) / kKeysPerBlock;
+      for (int key_tile = 0; key_tile < key_tiles; ++key_tile) {
+        const int selected_block =
+            Sparse ? params.block_indices[int64_t(block_row) * params.blocks +
+                                          key_tile]
+                   : key_tile;
+        const int iter_key_start = selected_block * kKeysPerBlock;
+        const int keys_remaining = Sparse ? params.block_sizes[selected_block]
+                                          : num_keys - iter_key_start;
         int32_t problem_size_0_m =
             cutlass::fast_min((int32_t)kQueriesPerBlock, num_queries);
-        int32_t problem_size_0_n = cutlass::fast_min((int32_t)kKeysPerBlock,
-                                                     num_keys - iter_key_start);
+        int32_t problem_size_0_n =
+            cutlass::fast_min((int32_t)kKeysPerBlock, keys_remaining);
         int32_t const& problem_size_0_k = problem_size0.k();
         int32_t const& problem_size_1_n = problem_size1.n();
         int32_t const& problem_size_1_k = problem_size_0_n;
@@ -591,7 +607,7 @@ struct H3FMHAKernel {
                                      (warp_id() / MM0::Mma::WarpCount::kM)};
 
         // Mask out last if causal
-        if (params.causal && num_keys - iter_key_start <= kKeysPerBlock) {
+        if (params.causal && keys_remaining <= kKeysPerBlock) {
           auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
               lane_id(), warp_id(), iteratorC_tile_offset);
           int32_t last_col;
@@ -609,9 +625,9 @@ struct H3FMHAKernel {
               },
               [&](int accum_m) {});
         }
-        // DISPATCH_BOOL(iter_key_start == 0, kIsFirst, ([&] {
+        // DISPATCH_BOOL(key_tile == 0, kIsFirst, ([&] {
         //         DISPATCH_BOOL(
-        //             num_keys - iter_key_start >= kKeysPerBlock,
+        //             keys_remaining >= kKeysPerBlock,
         //             kFullColumns,
         //             ([&] {
         //               // Update `mi` from accum stored in registers
@@ -628,7 +644,7 @@ struct H3FMHAKernel {
         //                   lane_id(),
         //                   thread_id(),
         //                   warp_id(),
-        //                   num_keys - iter_key_start,
+        //                   keys_remaining,
         //                   iteratorC_tile_offset,
         //                   kSupportsBias ? 1.0f : params.scale);
         //             }));
@@ -646,18 +662,18 @@ struct H3FMHAKernel {
         }
         // Update `mi` from accum stored in registers
         // Also does accum[i] <- exp(accum[i] - mi)
-        if (num_keys - iter_key_start >= kKeysPerBlock) {
+        if (keys_remaining >= kKeysPerBlock) {
           iterative_softmax<typename MM0::Mma::Operator::IteratorC, true>(
               accum_o, accum, mi, m_prime, s_prime, out_rescale,
               shared_storage.addition_storage, lane_id(), thread_id(),
-              warp_id(), num_keys - iter_key_start, iter_key_start == 0,
-              iteratorC_tile_offset, kSupportsBias ? 1.0f : params.scale);
+              warp_id(), keys_remaining, key_tile == 0, iteratorC_tile_offset,
+              kSupportsBias ? 1.0f : params.scale);
         } else {
           iterative_softmax<typename MM0::Mma::Operator::IteratorC, false>(
               accum_o, accum, mi, m_prime, s_prime, out_rescale,
               shared_storage.addition_storage, lane_id(), thread_id(),
-              warp_id(), num_keys - iter_key_start, iter_key_start == 0,
-              iteratorC_tile_offset, kSupportsBias ? 1.0f : params.scale);
+              warp_id(), keys_remaining, key_tile == 0, iteratorC_tile_offset,
+              kSupportsBias ? 1.0f : params.scale);
         }
 
         // Output results to shared-memory
@@ -725,10 +741,9 @@ struct H3FMHAKernel {
           if (!kKeepOutputInRF) {
             MM1::Mma::drain_cp_asyncs();
             DISPATCH_BOOL(
-                iter_key_start == 0, kIsFirst, ([&] {
+                key_tile == 0, kIsFirst, ([&] {
                   DISPATCH_BOOL(
-                      (iter_key_start + kKeysPerBlock) >= num_keys, kIsLast,
-                      ([&] {
+                      key_tile + 1 >= key_tiles, kIsLast, ([&] {
                         using DefaultEpilogue = typename MM1::DefaultEpilogue;
                         using DefaultOp =
                             typename MM1::DefaultConfig::EpilogueOutputOp;

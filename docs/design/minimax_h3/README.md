@@ -1,12 +1,11 @@
 # Native MiniMax H3 (development)
 
-The latest optional residual-sharded FlashInfer development run completes
-39 frames and 20 denoise updates in 61.538397 seconds, with unchanged
-video/audio latents and fresh MP4. See
-[FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md) for local ConvRot,
-the current bottleneck trace, validation and remaining gates.
-The numerical-drift overlap experiment is rejected; see
-[FLASHINFER_OVERLAP.md](FLASHINFER_OVERLAP.md).
+The retained dense workflows use FlashAttention-V100; see
+[CURRENT_STATUS.md](CURRENT_STATUS.md) for measured coverage. The subsequent
+[VSA quality/speed stage](VSA_QUALITY_SPEED.md) reaches 30.990756 seconds on the
+native path with failing independent quality, or 60.353224 seconds with passing
+primary numerical checks in the acceptance-only FP32 diagnostic. No VSA
+configuration passes the combined stage or enters default/AUTO selection.
 
 This is an in-progress native integration. Full checkpoint video quality and
 four-card 80 useful TFLOPS acceptance are not yet established. The control log

@@ -70,9 +70,16 @@ class DenoiseWorkCounter:
         self.flops = 0
         self.redundant_flops = 0
         self.calls = 0
+        self.sparse_blocks = 0
+        self.sparse_pairs = 0
+        self.sparse_compression_flops = 0
+        self.attention_avoided_flops = 0
+        self.sparse_by_layer: dict[str, dict] = {}
         self.blocks: dict[str, int] = {}
         self.steps: list[dict] = []
         self._step_events = []
+        self._pending_sparse: list[tuple[int | None, str, int, dict]] = []
+        self._active_step: int | None = None
         self.by_layer: dict[str, int] = {}
         self.redundant_by_layer: dict[str, int] = {}
         self.handles = []
@@ -132,7 +139,15 @@ class DenoiseWorkCounter:
                 def attention_hook(layer, inputs, output, name=name):
                     q, k, v, metadata = inputs
                     used = metadata.extra.get("valid_kv_length", q.shape[1])
-                    count = 4 * q.shape[0] * q.shape[2] * used * used * q.shape[3]
+                    if layer.backend == "FASTVIDEO_VSA":
+                        work = metadata.extra["sparse_work"]
+                        # Dynamic counts remain on the GPU while layers enqueue.
+                        self._pending_sparse.append(
+                            (self._active_step, name, q.shape[3], dict(work))
+                        )
+                        return
+                    else:
+                        count = 4 * q.shape[0] * q.shape[2] * used * used * q.shape[3]
                     self.flops += count
                     self.by_layer[name] = self.by_layer.get(name, 0) + count
 
@@ -149,9 +164,19 @@ class DenoiseWorkCounter:
 
         start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         before = self.flops, self.calls, sum(self.blocks.values()), self.redundant_flops
+        sparse_before = self.sparse_blocks
+        pairs_before = self.sparse_pairs
+        compression_before = self.sparse_compression_flops
+        avoided_before = self.attention_avoided_flops
+        if self._active_step is not None:
+            raise RuntimeError("denoise counter steps cannot be nested")
+        self._active_step = len(self.steps)
         start.record()
         started = time.perf_counter()
-        yield
+        try:
+            yield
+        finally:
+            self._active_step = None
         end.record()
         self.steps.append(
             {
@@ -161,15 +186,78 @@ class DenoiseWorkCounter:
                 "redundant_flops": self.redundant_flops - before[3],
                 "dit_calls": self.calls - before[1],
                 "executed_blocks": sum(self.blocks.values()) - before[2],
-                # This counter currently instruments dense, uncached execution.
-                "sparse_blocks": 0,
+                "sparse_blocks": self.sparse_blocks - sparse_before,
+                "sparse_token_pairs": self.sparse_pairs - pairs_before,
+                "sparse_compression_flops": self.sparse_compression_flops
+                - compression_before,
+                "attention_avoided_flops": self.attention_avoided_flops
+                - avoided_before,
                 "cache_hits": 0,
             }
         )
         self._step_events.append((start, end))
 
+    def finish_sparse(self):
+        """Resolve all dynamic counters once, inside complete-denoise timing."""
+        if not self._pending_sparse:
+            return
+        import torch
+
+        tensors = []
+        for _, _, _, work in self._pending_sparse:
+            for key in ("selected_token_pairs", "selected_blocks"):
+                value = work[key]
+                if isinstance(value, torch.Tensor):
+                    if value.ndim != 0 or value.dtype != torch.int64:
+                        raise ValueError("sparse work counters must be int64 scalars")
+                    tensors.append(value)
+        values = iter(torch.stack(tensors).cpu().tolist() if tensors else [])
+        pending, self._pending_sparse = self._pending_sparse, []
+        for step_index, name, head_size, work in pending:
+            for key in ("selected_token_pairs", "selected_blocks"):
+                if isinstance(work[key], torch.Tensor):
+                    work[key] = next(values)
+            pairs, blocks = work["selected_token_pairs"], work["selected_blocks"]
+            compression = work["compression_flops"]
+            count = 4 * pairs * head_size
+            avoided = 4 * (work["dense_token_pairs"] - pairs) * head_size
+            self.flops += count + compression
+            self.sparse_pairs += pairs
+            self.sparse_blocks += blocks
+            self.sparse_compression_flops += compression
+            self.attention_avoided_flops += avoided
+            self.by_layer[name] = self.by_layer.get(name, 0) + count
+            key = name + ".compression"
+            self.by_layer[key] = self.by_layer.get(key, 0) + compression
+            record = self.sparse_by_layer.setdefault(
+                name,
+                dict(
+                    head_size=head_size,
+                    heads=work["heads"],
+                    selected_blocks=0,
+                    selected_token_pairs=0,
+                    compression_flops=0,
+                    dense_token_pairs=0,
+                ),
+            )
+            for key in (
+                "selected_blocks",
+                "selected_token_pairs",
+                "compression_flops",
+                "dense_token_pairs",
+            ):
+                record[key] += work[key]
+            if step_index is not None:
+                step = self.steps[step_index]
+                step["useful_flops"] += count + compression
+                step["sparse_blocks"] += blocks
+                step["sparse_token_pairs"] += pairs
+                step["sparse_compression_flops"] += compression
+                step["attention_avoided_flops"] += avoided
+
     def finish_steps(self):
         """Read events only after the caller's complete-denoise synchronization."""
+        self.finish_sparse()
         for record, (start, end) in zip(self.steps, self._step_events):
             record["gpu_seconds"] = start.elapsed_time(end) / 1000
         return self.steps
@@ -177,12 +265,17 @@ class DenoiseWorkCounter:
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, exc_type, *_):
+        try:
+            if exc_type is None:
+                self.finish_sparse()
+        finally:
+            self.close()
 
     def close(self):
         for handle in self.handles:
             handle.remove()
+        self._pending_sparse.clear()
 
 
 class NVMLMonitor:
@@ -268,12 +361,99 @@ class NVMLMonitor:
             self.thread.join(timeout=5)
 
 
-def _validate_dense_workload(rank):
+def _validate_sparse_work(rank, calls):
     workload = rank["denoise_workload"]
-    if workload.get("work_accounting") != "dense_tp_lora_v2":
+    config = workload["sparse_config"]
+    for key in ("topk", "gated_blocks", "heads", "head_size"):
+        if type(config[key]) is not int or config[key] <= 0:
+            raise ValueError("invalid sparse execution configuration")
+    if (
+        config["head_size"] != 128
+        or config["gated_blocks"] != workload["blocks_per_call"] - 2
+        or "FASTVIDEO_VSA" not in workload["actual_backends"]
+    ):
+        raise ValueError("sparse execution must cover the actual gated H3 blocks")
+    prefix, shape = config["prefix_segments"], config["video_shape"]
+    if len(shape) != 3 or any(type(n) is not int or n <= 0 for n in (*prefix, *shape)):
+        raise ValueError("invalid sparse geometry")
+    if sum(prefix) + math.prod(shape) != workload["used_length"]:
+        raise ValueError("sparse geometry disagrees with valid token count")
+    prefix_blocks = sum((n + 63) // 64 for n in prefix)
+    video_blocks = math.prod((n + 3) // 4 for n in shape)
+    blocks = prefix_blocks + video_blocks
+    per_layer_blocks = config["heads"] * (
+        prefix_blocks * blocks
+        + video_blocks * (prefix_blocks + min(config["topk"], video_blocks))
+    )
+    per_layer_dense_pairs = config["heads"] * workload["used_length"] ** 2
+    per_layer_compression = 4 * config["heads"] * blocks**2 * config["head_size"]
+    layers = rank["denoise_sparse_work_by_layer"]
+    if len(layers) != config["gated_blocks"]:
+        raise ValueError("missing sparse layer execution records")
+    sums = dict(
+        selected_blocks=0,
+        selected_token_pairs=0,
+        compression_flops=0,
+        dense_token_pairs=0,
+    )
+    for name, layer in layers.items():
+        if any(type(layer[key]) is not int or layer[key] <= 0 for key in sums):
+            raise ValueError("sparse work must use positive integer counts")
+        if (
+            layer["head_size"] != config["head_size"]
+            or layer["heads"] != config["heads"]
+            or layer["selected_blocks"] != calls * per_layer_blocks
+            or layer["dense_token_pairs"] != calls * per_layer_dense_pairs
+            or layer["compression_flops"] != calls * per_layer_compression
+            or not layer["selected_blocks"]
+            <= layer["selected_token_pairs"]
+            <= min(layer["dense_token_pairs"], layer["selected_blocks"] * 64**2)
+            or rank["denoise_flops_by_layer"][name]
+            != 4 * layer["selected_token_pairs"] * config["head_size"]
+            or rank["denoise_flops_by_layer"][name + ".compression"]
+            != layer["compression_flops"]
+        ):
+            raise ValueError("sparse layer pairs, blocks or compression disagree")
+        for key in sums:
+            sums[key] += layer[key]
+    steps = rank["denoise_steps"]
+    for step in steps:
+        if (
+            step["sparse_blocks"] != per_layer_blocks * config["gated_blocks"]
+            or type(step["sparse_token_pairs"]) is not int
+            or not 0
+            < step["sparse_token_pairs"]
+            <= per_layer_dense_pairs * config["gated_blocks"]
+            or step["sparse_compression_flops"]
+            != per_layer_compression * config["gated_blocks"]
+            or step["attention_avoided_flops"]
+            != 4
+            * config["head_size"]
+            * (
+                per_layer_dense_pairs * config["gated_blocks"]
+                - step["sparse_token_pairs"]
+            )
+        ):
+            raise ValueError("sparse step counters disagree with executed geometry")
+    if any(
+        sum(step[key] for step in steps) != sums[target]
+        for key, target in (
+            ("sparse_blocks", "selected_blocks"),
+            ("sparse_token_pairs", "selected_token_pairs"),
+            ("sparse_compression_flops", "compression_flops"),
+        )
+    ):
+        raise ValueError("sparse step and layer totals disagree")
+
+
+def _validate_workload(rank):
+    workload = rank["denoise_workload"]
+    sparse = workload["attention_algorithm"] == "vsa"
+    expected_version = "sparse_tp_v1" if sparse else "dense_tp_lora_v2"
+    if workload.get("work_accounting") != expected_version:
         raise ValueError("legacy work counts may include replicated LoRA projections")
     if (
-        workload["attention_algorithm"] != "dense"
+        workload["attention_algorithm"] not in ("dense", "vsa")
         or workload["cache_algorithm"] is not None
     ):
         raise ValueError(
@@ -302,7 +482,7 @@ def _validate_dense_workload(rank):
             step["dit_calls"] != 1
             or step["executed_blocks"] != blocks
             or step["cache_hits"] != 0
-            or step["sparse_blocks"] != 0
+            or (not sparse and step["sparse_blocks"] != 0)
         ):
             raise ValueError("dense step work does not match the workflow")
         if type(step["useful_flops"]) is not int or step["useful_flops"] <= 0:
@@ -323,6 +503,8 @@ def _validate_dense_workload(rank):
         != rank["redundant_denoise_flops"]
     ):
         raise ValueError("step, layer and complete-denoise work counts disagree")
+    if sparse:
+        _validate_sparse_work(rank, calls)
     return workload
 
 
@@ -372,7 +554,7 @@ def evaluate_performance(runs, *, warmup):
         ):
             raise ValueError("invalid end-to-end duration")
         for rank in run["ranks"]:
-            if _validate_dense_workload(rank) != descriptor:
+            if _validate_workload(rank) != descriptor:
                 raise ValueError(
                     "all ranks and requests must execute the same workflow"
                 )
@@ -412,6 +594,16 @@ def evaluate_performance(runs, *, warmup):
             for rank in range(tp)
         ],
         "memory_passed": memory_passed,
+        "attention_avoided_flops_by_run_and_rank": [
+            [
+                sum(
+                    step.get("attention_avoided_flops", 0)
+                    for step in rank["denoise_steps"]
+                )
+                for rank in ranks
+            ]
+            for ranks in ordered
+        ],
         "performance_passed": all(value > 80 for value in medians) and cv <= 0.05,
         "quality_status": "requires_separate_numerical_and_human_review",
     }

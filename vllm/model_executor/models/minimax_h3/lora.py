@@ -155,6 +155,11 @@ def inspect_deployment_adapter(config):
         raise H3InputError(
             "FastH3 Dense fusion requires original weights; omit --transformer-path"
         )
+    sparse = isinstance(spec, FastH3Spec) and spec.requires_vsa
+    if sparse != (config.attention_backend == "FASTVIDEO_VSA"):
+        raise H3InputError(
+            "FastH3 VSA artifacts require the FASTVIDEO_VSA backend together"
+        )
     return spec
 
 

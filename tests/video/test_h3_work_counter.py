@@ -42,11 +42,16 @@ def test_row_lora_partial_products_are_distinct_work(tp):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a leased GPU")
+@pytest.mark.parametrize("sparse", [False, True])
 @torch.inference_mode()
 def test_real_block_work_excludes_padding_and_preserves_outputs(
-    dist_init, default_vllm_config
+    dist_init, default_vllm_config, sparse
 ):
-    from vllm.model_executor.models.minimax_h3.attention import attention_backend
+    from vllm.model_executor.models.minimax_h3.attention import (
+        VideoTokenLayout,
+        VideoTokenSpan,
+        attention_backend,
+    )
     from vllm.model_executor.models.minimax_h3.transformer import (
         MiniMaxH3DiTArchConfig,
         MiniMaxH3DiTBlock,
@@ -64,11 +69,13 @@ def test_real_block_work_excludes_padding_and_preserves_outputs(
         def __init__(self):
             super().__init__()
             self.block = MiniMaxH3DiTBlock(arch, None, prefix="block")
+            if sparse:
+                self.block.attn.enable_vsa_gate(1)
 
         def forward(self, x, **kwargs):
             return self.block(x, **kwargs)
 
-    token = attention_backend.set("FLASH_ATTN_V100")
+    token = attention_backend.set("FASTVIDEO_VSA" if sparse else "FLASH_ATTN_V100")
     try:
         model = Model().cuda().eval()
     finally:
@@ -89,6 +96,14 @@ def test_real_block_work_excludes_padding_and_preserves_outputs(
         max_seqlen=valid,
         packed_total=padded,
     )
+    if sparse:
+        kwargs.update(
+            video_layout=VideoTokenLayout(
+                used_len=valid,
+                video_spans=(VideoTokenSpan(1, (1, 4, 8), "target"),),
+            ),
+            vsa_prefix_segments=(1,),
+        )
     expected = model(x, **kwargs)
     # Independent geometry: QKV + output + gate/up + down + AdaLN + QK/PV.
     flops = (
@@ -96,6 +111,13 @@ def test_real_block_work_excludes_padding_and_preserves_outputs(
         + 2 * 8 * (18 * 512)
         + 4 * 4 * valid * valid * 128
     )
+    if sparse:
+        # A one-token dense prefix and two 16-token video tiles. Each video
+        # query selects the prefix and exactly one video tile; four heads.
+        flops -= 4 * 4 * valid * valid * 128
+        flops += 4 * 4 * (33 + 32 * 17) * 128
+        flops += 2 * valid * 512 * 512  # learned gate projection
+        flops += 4 * 4 * 3**2 * 128  # pooled QK and pooled PV
     with DenoiseWorkCounter(
         model, used_length=valid, video_outputs=valid, audio_outputs=1
     ) as counter:
@@ -111,5 +133,14 @@ def test_real_block_work_excludes_padding_and_preserves_outputs(
         assert sum(counter.by_layer.values()) == counter.flops
         assert [step["useful_flops"] for step in steps] == [flops, flops]
         assert all(step["gpu_seconds"] > 0 for step in steps)
+        assert [step["sparse_blocks"] for step in steps] == (
+            [4 * (3 + 2 * 2)] * 2 if sparse else [0, 0]
+        )
+        if sparse:
+            record = counter.sparse_by_layer["block.attn.attention"]
+            assert record["selected_token_pairs"] == 2 * 4 * (33 + 32 * 17)
+            assert record["dense_token_pairs"] == 2 * 4 * 33**2
+            assert record["compression_flops"] == 2 * 4 * 4 * 3**2 * 128
+            assert sum(step["attention_avoided_flops"] for step in steps) == 2097152
     model(x, **kwargs)
     assert counter.calls == 2  # Hooks must not leak into the following request.

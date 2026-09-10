@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Report packaged dense H3 capabilities without allocating a CUDA context.
+"""Report packaged H3 capabilities without allocating a CUDA context.
 
 Studio selects this profile only on a dedicated TP4 V100 group. Native CLI
-options remain explicit; this does not enable sparse attention or step caches.
+options remain explicit. Experimental VSA must be selected separately.
 """
 
 from importlib import import_module
@@ -18,7 +18,7 @@ def studio_capabilities():
         reduction = import_module("vllm._sm70_exact_reduce_C")
     except (ImportError, OSError, RuntimeError):
         return {"profile": PROFILE, "available": False}
-    return {
+    result = {
         "profile": PROFILE,
         "available": bool(
             hasattr(projection, "scaled_add_")
@@ -31,3 +31,18 @@ def studio_capabilities():
             )
         ),
     }
+    # VSA has a different official adapter and has not passed joint quality /
+    # speed acceptance. Presence is not qualification or AUTO admission.
+    try:
+        sparse = import_module("vllm._sm70_sparse_attention_C")
+        available = result["available"] and hasattr(sparse, "forward")
+    except (ImportError, OSError, RuntimeError):
+        available = False
+    result["fasth3"] = {
+        "available": result["available"],
+        "vsa_available": available,
+        "experimental": True,
+        "quality_status": "not_accepted",
+        "tasks": ["t2va"],
+    }
+    return result

@@ -36,9 +36,15 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument("--tensor-parallel-size", "-tp", type=int, default=4)
             mode.add_argument(
                 "--attention-backend",
-                choices=("FLASH_ATTN_V100", "FLASHINFER_SM70", "TORCH_SDPA"),
+                choices=(
+                    "FLASH_ATTN_V100",
+                    "FLASHINFER_SM70",
+                    "TORCH_SDPA",
+                    "FASTVIDEO_VSA",
+                ),
                 default="FLASH_ATTN_V100",
             )
+            mode.add_argument("--fastvideo-vsa-topk", type=int, default=64)
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument(
                 "--attention-query-tile", type=int, choices=(64, 128), default=64
@@ -147,6 +153,7 @@ class VideoSubcommand(CLISubcommand):
             transformer_path=args.transformer_path,
             tensor_parallel_size=args.tensor_parallel_size,
             attention_backend=args.attention_backend,
+            vsa_topk=args.fastvideo_vsa_topk,
             attention_query_tile=args.attention_query_tile,
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
@@ -157,11 +164,11 @@ class VideoSubcommand(CLISubcommand):
             residual_reduction=args.residual_reduction,
             residual_reduction_memory_gib=args.residual_reduction_memory_gib,
             video_encoder=args.video_encoder,
-            host_memory_mode=args.host_memory_mode,
-            host_memory_directory=args.host_memory_directory,
             host_weight_pin_memory=args.host_weight_pin_memory,
             share_host_vae_weights=args.share_host_vae_weights,
             weight_offload=args.weight_offload,
+            host_memory_mode=args.host_memory_mode,
+            host_memory_directory=args.host_memory_directory,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

@@ -106,6 +106,9 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
                     "denoise_workload": pipeline.denoise_workload,
                     "denoise_steps": pipeline.denoise_steps,
                     "denoise_executed_blocks": pipeline.denoise_executed_blocks,
+                    "denoise_sparse_work_by_layer": (
+                        pipeline.denoise_sparse_work_by_layer
+                    ),
                     "kernel_provenance": kernel_provenance,
                     "peak_allocated_bytes": torch_peak + raw_peak,
                 }

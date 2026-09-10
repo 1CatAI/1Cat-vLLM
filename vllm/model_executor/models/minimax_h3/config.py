@@ -38,6 +38,7 @@ class H3Config:
     transformer_path: str | None = None
     tensor_parallel_size: int = 4
     attention_backend: str = "FLASH_ATTN_V100"
+    vsa_topk: int = 64
     attention_query_tile: Literal[64, 128] = 64
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
@@ -55,8 +56,6 @@ class H3Config:
     host_memory_directory: str | None = None
 
     def __post_init__(self) -> None:
-        if self.host_memory_mode not in ("auto", "pinned", "mmap"):
-            raise H3InputError("host memory mode must be auto, pinned or mmap")
         if self.residual_reduction not in ("native", "peer"):
             raise H3InputError("residual reduction must be native or peer")
         if self.residual_reduction == "peer" and not self.residual_sequence_parallel:
@@ -89,6 +88,8 @@ class H3Config:
             and self.host_weight_pin_memory
         ):
             raise H3InputError("shared host VAE weights require pageable host masters")
+        if self.host_memory_mode not in ("auto", "pinned", "mmap"):
+            raise H3InputError("host memory mode must be auto, pinned or mmap")
         if self.video_encoder not in ("libx264", "h264_nvenc"):
             raise H3InputError("video encoder must be libx264 or h264_nvenc")
         if self.partition not in ("fl2va", "ref2va"):
@@ -103,8 +104,17 @@ class H3Config:
             "FLASH_ATTN_V100",
             "FLASHINFER_SM70",
             "TORCH_SDPA",
+            "FASTVIDEO_VSA",
         ):
             raise H3InputError(f"unsupported H3 attention: {self.attention_backend}")
+        if (
+            isinstance(self.vsa_topk, bool)
+            or not isinstance(self.vsa_topk, int)
+            or self.vsa_topk <= 0
+        ):
+            raise H3InputError("VSA topk must be a positive integer")
+        if self.attention_backend == "FASTVIDEO_VSA" and not self.lora_path:
+            raise H3InputError("H3 VSA requires an explicit FastH3 VSA artifact")
         if (
             not math.isfinite(self.fp16_weight_cache_gib)
             or self.fp16_weight_cache_gib < 0
