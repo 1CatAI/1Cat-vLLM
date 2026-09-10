@@ -277,3 +277,117 @@ process ownership and service results. Native correctness and compiler-resource
 counts do not establish full-model quality, repeatability, or the 22-ms target.
 Promotion requires actual route hits, matching output tokens and acceptance,
 natural-output gates, repeated unprofiled startups and the context sweep.
+
+## Seven-millisecond attention target
+
+The user tightened the acceptance target to **at most 7 ms for all sixteen
+full-context target attention layers at 256K**. The complete-round target is
+still 22 ms. Neither target has been met. The service-checked attention result
+remains 13.077 ms; later producer timings below exclude softmax, PV and merge.
+All screens retain the original K16 compensated FP32 arithmetic, N32 online
+updates and 80 logical splits. No changed numerical contract is admitted.
+
+The optional `--xor-planes` probability layout passes all 65 complete
+output/workspace/canary checks against the selected P-layout DSO. Its paired
+sixteen-layer costs are 6.760 to 6.662 ms at 128K and 13.004 to 12.827 ms at
+261888. Applying XOR to K as well also passes 65 checks but costs 6.861 and
+13.219 ms. Retain P-only XOR as a small native-only candidate; reject combined
+K/P XOR. Neither has new sanitizer or service admission.
+Report: `p-kp-xor-screen.json`.
+
+### Independent QK producer
+
+`build_sm70_grouped_attention_direct_qk.py` copies the hashed service-checked
+P-layout source and exposes a separate `qk_stage` entrypoint. Its reference
+arm is the original independent shared-panel QK producer. The ordinary `run`
+entrypoint remains the parent full-attention kernel; timing it would not
+measure these producer changes. Full FP32 scores use the original N32 tile
+layout. A separate guard tile at each end and unused capacity retain sentinels.
+
+Every row below passes **24 complete score-buffer comparisons**, including
+zero/restored lengths, page boundaries, page sizes 3296/1648/848, 8-byte-only
+stride padding, and lengths through 262144. Timing uses sixteen distinct layer
+KV allocations, five warmup graph replays and five alternating trials of eight
+replays. These are **QK-only** costs, not complete attention or service latency.
+
+| Producer candidate | Paired reference at 261888, ms | Candidate, ms |
+| --- | ---: | ---: |
+| Direct operands, one warp per tile | 6.520 | 11.320 |
+| Direct operands, context-major grid | 6.506 | 10.764 |
+| Direct operands, six warps per CTA | 6.506 | 10.446 |
+| Six warps, exactly decoded FP16 K mirror | 6.505 | 10.420 |
+| Shared N64 / D128 panels | 6.522 | 8.737 |
+| Shared N128 / D128 panels | 6.506 | 7.089 |
+| N64 with coalesced output | 6.505 | 8.632 |
+| N128 with coalesced output | 6.503 | 6.996 |
+| N64 with K-fragment reuse across three Q tiles | 6.506 | 5.870 |
+| N128 with K-fragment reuse across three Q tiles | 6.520 | 5.593 |
+| N128 with reuse and separate independent products | 6.521 | **5.545** |
+
+The FP16 mirror is a diagnostic that excludes conversion cost and consumes
+additional memory. It does not justify changing the serving KV format.
+Coalesced output reuses dead shared Q/K storage. Reusing each K fragment across
+three M16 tiles gives the first substantial gain; computing their independent
+products before compensated additions adds only a small further improvement.
+Each output still accumulates its K16 products in the original order.
+
+The last candidate's 128K result is 3.539 to 3.040 ms. Its source/DSO SHA256:
+`70e79fc0dec2ff65bbf531dd976890c446532a60c9d5c1fc53d25bef39f8e114` /
+`2f36e317be77e930a02c6cd674ef4d313d438807e166c7ff5af4477b72d08475`.
+Reports are named `<candidate>-scores.json`; the local handoff maps every
+candidate to its flags, full source manifest and library hash. The measured
+runner was subsequently packaged as
+`benchmark_sm70_grouped_attention_qk_stage.py` with explicit input/output paths.
+The packaged runner also passes all 24 comparisons under CUDA 12.8 memcheck,
+with zero errors (`panel-qk-n128-products-memcheck.json`). Racecheck,
+synccheck, full-attention and model admission are not complete. The selected
+3296-page paired producer uses 118 registers and 48384 static shared bytes,
+with no reported stack or spills; its 8-byte-only fallback uses 122 registers
+and also reports no stack or spills.
+
+Ten later QK sources regenerate byte for byte from the checked-in builder.
+The first `direct-qk` measurement used automatic shared-memory carveout; its
+frozen source and manifest are retained. Later direct arms explicitly request
+L1 preference, while their reference arms request shared-memory preference.
+The historical first source also predates line-wrapping changes. Do not use
+the current default builder to claim reproduction of that first source hash.
+
+### Rejected unpadded head groups
+
+`build_sm70_grouped_attention_compact_cta.py` specializes q8 into three groups
+of two heads, with sixteen real rows and 256 threads per CTA. It retains the
+P layout and the original logical partitions. A warp shares P across two D
+output tiles. The smaller shared allocation permits two CTAs by shared-memory
+capacity, but this is not an achieved-occupancy measurement.
+
+All 65 output/workspace/canary checks pass. The paired complete-attention costs
+are **6.735 to 12.034 ms at 128K**, and **13.002 to 23.632 ms at 261888**.
+Reject before sanitizer or service trials. This smaller unpadded layout still
+does not overcome its extra KV traffic and changed execution schedule.
+Report: `compact-cta-screen.json`. Source/DSO SHA256:
+`d7ee5ea2ef1c4b3c899f326e23aa8895b830ebab72977f660755990c783ec802` /
+`fb87dac36992c9cf67c773950d50d73a357d3d5a8088ba7ef5437c8c158635cb`.
+
+### Reproduction and remaining work
+
+Under the same toolkit, cache and GPU lease settings documented above:
+
+```bash
+.venv/bin/python -m benchmarks.kernels.build_sm70_grouped_attention_direct_qk \
+  --base-manifest "$P_LAYOUT/manifest.json" --output-dir "$CANDIDATE" \
+  --context-panel 128 --coalesced-output --reuse-k --separate-products --build
+.venv/bin/python -m benchmarks.kernels.benchmark_sm70_grouped_attention_qk_stage \
+  --candidate "$CANDIDATE/manifest.json" --output "$REPORT"
+```
+
+The next useful milestone is a complete attention implementation benefiting
+from independent QK production while accounting for score publication,
+ordered softmax/PV, temporary storage and merge cost. A 5.545-ms QK result
+alone leaves less than 1.5 ms of the requested budget for all remaining work;
+it does not establish feasibility of a 7-ms complete kernel.
+Nsight Compute counters remain unavailable under the current driver policy.
+Do not infer long-scoreboard stalls, bank conflicts or achieved occupancy from
+compiler limits, or introduce another software pipeline on that assumption.
+Keep the numerical acceptance clarification pending and preserve the current
+arithmetic order. Service defaults and the selected service-checked DSO remain
+unchanged; the 7-ms attention and 22-ms round targets remain open.

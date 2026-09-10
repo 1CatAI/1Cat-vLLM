@@ -334,6 +334,33 @@ def pipeline_qk_products(source: str) -> str:
     return source[:begin] + qk + source[end:]
 
 
+def xor_swizzle_planes(source: str) -> str:
+    """Distribute vector stores across banks while retaining native fragments."""
+    source = replace_once(
+        source,
+        "((col & 15) / 8) * 128 + slot * 8 + (col & 7);",
+        "((col & 15) / 8) * 128 + (slot ^ ((col / 8) & 7)) * 8 + (col & 7);",
+    )
+    old = "(k_offset / 16) * 256 + slot * 8"
+    count = source.count(old)
+    if count not in (1, 2):
+        raise ValueError("Expected M16 A and optional column-major B loads")
+    source = source.replace(
+        old, "(k_offset / 16) * 256 + (slot ^ ((k_offset / 8) & 7)) * 8"
+    )
+    old = "address += 128 * sizeof(__half);"
+    if source.count(old) != count:
+        raise ValueError("Unexpected fragment second-plane addresses")
+    source = source.replace(old, "address += (136 - 16 * (slot & 1)) * sizeof(__half);")
+    if count == 2:
+        source = replace_once(
+            source,
+            "shared_vec[shared_offset + 16]",
+            "shared_vec[grouped_a_offset(row, vec_pair * 16 + 8, 256) / 8]",
+        )
+    return source
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-manifest", required=True, type=Path)
@@ -344,6 +371,7 @@ def main() -> None:
     parser.add_argument("--early-store", action="store_true")
     parser.add_argument("--pv-m8n32", action="store_true")
     parser.add_argument("--qk-register-pipeline", action="store_true")
+    parser.add_argument("--xor-planes", action="store_true")
     parser.add_argument("--build", action="store_true")
     args = parser.parse_args()
     if not (args.query or args.key or args.probabilities):
@@ -352,6 +380,8 @@ def main() -> None:
         parser.error("--early-store requires the probability-layout screen")
     if args.pv_m8n32 and not args.probabilities:
         parser.error("--pv-m8n32 requires the probability-layout screen")
+    if args.xor_planes and args.pv_m8n32:
+        parser.error("--xor-planes currently binds the M16 fragment map")
     base = json.loads(args.base_manifest.read_text())
     if base["source_sha256"] not in (
         "3b0c9688ce17e1870408ef81fb5cd9b63a677b7cfd7d4777b8df77dd0fc24132",
@@ -377,6 +407,8 @@ def main() -> None:
         path.write_text(swizzle_key(path.read_text()))
     if args.qk_register_pipeline:
         path.write_text(pipeline_qk_products(path.read_text()))
+    if args.xor_planes:
+        path.write_text(xor_swizzle_planes(path.read_text()))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     module_name = "sm70_grouped_swizzle_" + digest[:12]
     manifest = {
@@ -390,6 +422,7 @@ def main() -> None:
         "early_probability_store": args.early_store,
         "pv_m8n32": args.pv_m8n32,
         "qk_register_pipeline": args.qk_register_pipeline,
+        "xor_planes": args.xor_planes,
         "scope": "Private layout screen; byte and full-model admission required",
         "source_files": {
             str(p.relative_to(sources)): hashlib.sha256(p.read_bytes()).hexdigest()
