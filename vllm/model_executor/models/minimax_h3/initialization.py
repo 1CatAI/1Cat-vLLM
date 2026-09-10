@@ -6,7 +6,7 @@ import weakref
 from functools import wraps
 from threading import RLock
 
-from torch import nn
+from torch import Tensor, nn, strided
 
 from vllm.logger import init_logger
 
@@ -24,10 +24,47 @@ _RANDOM_INITIALIZERS = (
 )
 
 
+def _can_assign_checkpoint(module, state_dict):
+    targets = module.state_dict(keep_vars=True)
+    if targets.keys() != state_dict.keys():
+        return False
+    storages, source_storages = set(), set()
+    for name, target in targets.items():
+        value = state_dict[name]
+        if (
+            not isinstance(target, Tensor)
+            or not isinstance(value, Tensor)
+            or type(target) not in (Tensor, nn.Parameter)
+            or target.__dict__
+            or target.layout != strided
+            or value.layout != strided
+            or target.device.type != "cpu"
+            or value.device.type != "cpu"
+            or target.dtype != value.dtype
+            or target.shape != value.shape
+            or target.stride() != value.stride()
+            or target.storage_offset() != value.storage_offset()
+        ):
+            return False
+        storage = target.untyped_storage()
+        if storage.nbytes():
+            identity = storage.data_ptr()
+            if identity in storages:
+                return False  # Preserve tied parameters and storage aliases.
+            storages.add(identity)
+            source_identity = value.untyped_storage().data_ptr()
+            if source_identity in source_storages:
+                return False
+            source_storages.add(source_identity)
+    return True
+
+
 def load_without_random_parameter_init(factory):
     """For the isolated H3 loading worker, skip only replaced Parameters.
 
     Buffers and ordinary tensors still receive their normal initialization.
+    Complete CPU checkpoints with matching dtypes/layouts and no target aliases
+    can be assigned directly, avoiding another full per-worker weight copy.
     Track actual successful state-dict loads, rather than trusting the factory
     to load every parameter. Unsupported/custom partial loaders retry normally.
     The process-local patch is restored before returning or propagating errors.
@@ -49,6 +86,12 @@ def load_without_random_parameter_init(factory):
 
         @wraps(load_state_dict)
         def load(module, state_dict, *args, **kwargs):
+            if (
+                len(args) < 2
+                and "assign" not in kwargs
+                and _can_assign_checkpoint(module, state_dict)
+            ):
+                kwargs["assign"] = True
             result = load_state_dict(module, state_dict, *args, **kwargs)
             missing = set(result.missing_keys)
             for name, parameter in module.named_parameters():
