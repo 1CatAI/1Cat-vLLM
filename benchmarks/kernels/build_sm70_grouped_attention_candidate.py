@@ -20,6 +20,68 @@ def replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new)
 
 
+def use_e4m3_shared_lut(source: str) -> str:
+    """Decode both halves of vector KV loads through an exact 512-byte table.
+
+    Build the table with the existing bit decoder and publish it with the
+    initial CTA barrier. QK, softmax, PV and split reduction are unchanged.
+    This is a private screen: extra shared loads can outweigh saved decoding.
+    """
+    source = replace_once(
+        source,
+        "    static_assert(!E4M3_SHARED_LUT,\n"
+        '                  "Paired E4M3 conversion does not use the shared LUT");',
+        "    static_assert(!E4M3_SHARED_LUT ||\n"
+        "                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,\n"
+        '                  "Paired LUT conversion requires E4M3");',
+    )
+    for half in ("lo", "hi"):
+        old = f"? fp8_e4m3fn_vector_to_half8_fast(raw_{half})"
+        new = (
+            "? (E4M3_SHARED_LUT\n"
+            f"                     ? fp8_e4m3fn_vector_to_half8_lut(raw_{half}, "
+            "e4m3_lut)\n"
+            f"                     : fp8_e4m3fn_vector_to_half8_fast(raw_{half}))"
+        )
+        source = replace_once(source, old, new)
+    start = source.index("__launch_bounds__(kGroupedVerifyThreads, 1) void ")
+    end = source.index(
+        "void flash_attention_grouped_verify_e5m2_combine_kernel(", start
+    )
+    partials = source[start:end]
+    marker = "  extern __shared__ char grouped_verify_smem_raw[];"
+    if partials.count(marker) != 2:
+        raise ValueError("Expected generic and full-q8 partial kernels")
+    partials = partials.replace(
+        marker,
+        "  __shared__ uint16_t e4m3_lut[256];\n"
+        "  if (tid < 256)\n"
+        "    e4m3_lut[tid] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));\n"
+        + marker,
+    )
+    template_tail = "(!ROW_SEQLENS || PAIR_E4M3))>"
+    if partials.count(template_tail) != 6:
+        raise ValueError("Expected three KV loads in each partial kernel")
+    partials = partials.replace(template_tail, template_tail[:-1] + ", true>")
+    for old, new, count in (
+        (
+            "k_block_stride, k_token_stride, k_head_stride, 0);",
+            "k_block_stride, k_token_stride, k_head_stride, 0, tid, e4m3_lut);",
+            4,
+        ),
+        (
+            "v_block_stride, v_token_stride, v_head_stride, 0, value_load_tid);",
+            "v_block_stride, v_token_stride, v_head_stride, 0, "
+            "value_load_tid, e4m3_lut);",
+            2,
+        ),
+    ):
+        if partials.count(old) != count:
+            raise ValueError(f"Unexpected KV load arguments: {old}")
+        partials = partials.replace(old, new)
+    return source[:start] + partials + source[end:]
+
+
 def prefetch_values(source: str) -> str:
     """Fill a disjoint V panel with idle QK warps before the existing barrier."""
     start = source.index("__launch_bounds__(kGroupedVerifyThreads, 1) void ")
@@ -599,6 +661,7 @@ def main() -> None:
     parser.add_argument("--qk-fp64-sum", action="store_true")
     parser.add_argument("--specialize-full-q8", action="store_true")
     parser.add_argument("--all-visible-tiles", action="store_true")
+    parser.add_argument("--e4m3-shared-lut", action="store_true")
     parser.add_argument("--register-softmax-state", action="store_true")
     parser.add_argument("--qk-head-rows", action="store_true")
     parser.add_argument("--qk-operand-pipeline", action="store_true")
@@ -624,6 +687,12 @@ def main() -> None:
         parser.error("Full-q8 specialization requires the six-head PV-reuse path")
     if args.all_visible_tiles and not args.specialize_full_q8:
         parser.error("Visible-tile specialization requires --specialize-full-q8")
+    if args.e4m3_shared_lut and not (
+        args.specialize_full_q8 and args.vector_load and args.splits == 80
+    ):
+        parser.error(
+            "The KV lookup screen requires fixed q8, vector loads and 80 splits"
+        )
     if args.register_softmax_state and not args.specialize_full_q8:
         parser.error("Register softmax state requires --specialize-full-q8")
     if args.qk_head_rows and not (
@@ -807,6 +876,8 @@ def main() -> None:
         source = qk_head_rows(source)
     if args.qk_operand_pipeline:
         source = pipeline_qk_operands(source)
+    if args.e4m3_shared_lut:
+        source = use_e4m3_shared_lut(source)
     if args.diagnostic_output_fp32:
         source = retain_fp32_output(source)
     source = replace_once(
@@ -867,6 +938,7 @@ def main() -> None:
         "qk_head_rows": args.qk_head_rows,
         "qk_operand_pipeline": args.qk_operand_pipeline,
         "all_visible_tiles": args.all_visible_tiles,
+        "e4m3_shared_lut": args.e4m3_shared_lut,
         "qk_fp64_sum": args.qk_fp64_sum,
         "arithmetic_change": args.qk_fp64_sum or args.splits != 80,
         "diagnostic_output_fp32": args.diagnostic_output_fp32,
