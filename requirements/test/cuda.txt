@@ -141,7 +141,7 @@ dataproperty==1.0.1
     # via
     #   pytablewriter
     #   tabledata
-datasets==3.3.0
+datasets==5.0.1
     # via
     #   -r requirements/test/cuda.in
     #   evaluate
