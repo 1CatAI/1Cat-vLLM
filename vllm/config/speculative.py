@@ -152,6 +152,10 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
+    mtp_expert_quantization: Literal["fp8"] | None = None
+    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ
+    checkpoint whose MTP experts are unquantized. Target weights are unchanged.
+    """
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only

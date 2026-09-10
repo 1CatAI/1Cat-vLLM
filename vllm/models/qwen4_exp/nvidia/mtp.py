@@ -173,6 +173,23 @@ def _make_draft_vllm_config(
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
+    if getattr(speculative_config, "mtp_expert_quantization", None) == "fp8":
+        from vllm.model_executor.layers.quantization.sm70_turbomind import (
+            is_exact_sm70_cuda_platform,
+        )
+
+        from .mtp_fp8_experts import MTPExpertFp8Config
+
+        if (
+            not is_exact_sm70_cuda_platform()
+            or draft_vllm_config.model_config.dtype != torch.float16
+            or draft_quant_config is None
+            or draft_quant_config.get_name() != "awq"
+        ):
+            raise ValueError(
+                "MTP FP8 experts require SM70, FP16, and an AWQ checkpoint"
+            )
+        draft_quant_config = MTPExpertFp8Config(draft_quant_config)
     draft_vllm_config.quant_config = draft_quant_config
     return draft_vllm_config
 
