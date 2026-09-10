@@ -60,3 +60,25 @@ service, progress, FastH3 and Studio fast-path suites. These cover exact signed
 INT8 bytes, FP16 layout, shared storage offsets, cache corruption and active
 lease protection. Real GPU startup, output parity and speed remain pending;
 this candidate must not be promoted based only on the CPU result.
+
+## Video VAE loading
+
+The native video component is a 2.60-billion-element FP32 checkpoint. Its
+reference factory initializes parameters and then replaces them with a strict
+state-dict load. Prepared loading skips random fills only for Parameters that
+are subsequently covered by a successful checkpoint load. Other tensors and
+buffers keep their normal initialization; incomplete/custom loaders retry
+normally. Temporary initialization hooks are always restored.
+
+A complete CPU state dict can also be assigned without copying when dtype,
+shape, strides and storage offsets match and neither side has tied storage.
+Custom parameter metadata, non-strided tensors, explicit assignment options,
+precision conversions and incomplete dictionaries retain normal semantics.
+The checkpoint's private mappings do not allow writes to change the file.
+Audio VAE loading is unchanged.
+
+An isolated V100-host CPU check of the actual video component produced the
+same full parameter-and-buffer SHA256 with and without this optimization:
+`3145d6a4c1b6576045991a36cf7b3606ec327c0c36d4152b91cf4498e3a9dfed`.
+The final loader selected assignment and took 1.67 seconds in that component
+check. This excludes downstream staging and is not a full-model startup time.
