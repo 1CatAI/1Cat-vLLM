@@ -393,7 +393,9 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
 
         # Online FP8 changes the draft expert kernels and padded weight layout.
-        if self.mtp_expert_quantization is not None:
+        # Include None too: old MTP artifacts may have been compiled with FP8
+        # under the same key as FP16, before this field was hashed.
+        if self.method == "mtp":
             factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
 
         # The specific layers used also affect the computation graph

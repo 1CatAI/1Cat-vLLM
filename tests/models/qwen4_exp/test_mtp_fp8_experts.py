@@ -9,6 +9,7 @@ import torch
 
 from vllm.config.speculative import SpeculativeConfig
 from vllm.models.qwen4_exp.nvidia import mtp_fp8_experts as impl
+from vllm.utils.hashing import safe_hash
 
 
 @pytest.fixture
@@ -84,9 +85,13 @@ def test_online_fp8_has_a_distinct_compilation_hash():
         use_dflash_ddtree=lambda: False,
     )
     original = SpeculativeConfig.compute_hash(config)
+    # Before this fix, both modes used this key. Neither may reuse its artifacts.
+    legacy = safe_hash(str([False, False]).encode(), usedforsecurity=False).hexdigest()
+    assert original != legacy
     config.mtp_expert_quantization = "fp8"
     fp8 = SpeculativeConfig.compute_hash(config)
     assert fp8 != original
+    assert fp8 != legacy
     assert SpeculativeConfig.compute_hash(config) == fp8
     config.mtp_expert_quantization = None
     assert SpeculativeConfig.compute_hash(config) == original
