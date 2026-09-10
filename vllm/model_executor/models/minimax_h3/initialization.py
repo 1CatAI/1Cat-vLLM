@@ -69,7 +69,7 @@ def load_without_random_parameter_init(factory):
     to load every parameter. Unsupported/custom partial loaders retry normally.
     The process-local patch is restored before returning or propagating errors.
     """
-    skipped, loaded = {}, {}
+    skipped, loaded, assigned = {}, {}, {}
     with _LOCK:
         originals = {name: getattr(nn.init, name) for name in _RANDOM_INITIALIZERS}
         load_state_dict = nn.Module.load_state_dict
@@ -97,6 +97,8 @@ def load_without_random_parameter_init(factory):
             for name, parameter in module.named_parameters():
                 if name in state_dict and name not in missing:
                     loaded[id(parameter)] = weakref.ref(parameter)
+                    if kwargs.get("assign"):
+                        assigned[id(parameter)] = weakref.ref(parameter)
             return result
 
         try:
@@ -119,6 +121,14 @@ def load_without_random_parameter_init(factory):
             )
         ]
         if not uncovered:
+            parameters = list(model.parameters())
+            if parameters and all(
+                id(p) in assigned and assigned[id(p)]() is p for p in parameters
+            ):
+                model._h3_assigned_checkpoint_storage = {
+                    name: (p.data_ptr(), p.dtype, p.device, tuple(p.shape), p.stride())
+                    for name, p in model.named_parameters()
+                }
             return model
         logger.warning(
             "VAE loader did not replace all skipped parameters; "
@@ -127,3 +137,14 @@ def load_without_random_parameter_init(factory):
         )
         del model
         return factory()
+
+
+def uses_assigned_checkpoint_storage(model):
+    expected = getattr(model, "_h3_assigned_checkpoint_storage", None)
+    if not expected:
+        return False
+    actual = {
+        name: (p.data_ptr(), p.dtype, p.device, tuple(p.shape), p.stride())
+        for name, p in model.named_parameters()
+    }
+    return expected == actual

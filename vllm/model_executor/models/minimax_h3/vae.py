@@ -64,6 +64,34 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
     return config
 
 
+def _checkpoint_file_identity(component_path, config):
+    if not all(key in config for key in ("source_path", "source_safetensors_path")):
+        return None
+    path = (
+        Path(component_path) / config["source_path"] / config["source_safetensors_path"]
+    ).resolve()
+    stat = path.stat()
+    return (
+        str(path),
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _same_checkpoint_replicas(identity):
+    if not dist.is_initialized():
+        return identity is not None
+    identities = [None] * dist.get_world_size()
+    dist.all_gather_object(identities, identity)
+    known = [value for value in identities if value is not None]
+    if known and any(value != known[0] for value in known):
+        raise ValueError("Video VAE checkpoint changed between loading workers")
+    return len(known) == len(identities)
+
+
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
@@ -88,9 +116,14 @@ def _load_remote_component(
         if skip_parameter_init:
             from .initialization import load_without_random_parameter_init
 
-            return load_without_random_parameter_init(
+            before = _checkpoint_file_identity(component_path, config)
+            model = load_without_random_parameter_init(
                 lambda: component_cls.from_pretrained(component_path)
             )
+            if before != _checkpoint_file_identity(component_path, config):
+                raise ValueError("Video VAE checkpoint changed while loading")
+            model._h3_checkpoint_file_identity = before
+            return model
         return component_cls.from_pretrained(component_path)
 
 
@@ -170,7 +203,20 @@ class MiniMaxH3VideoVAE(nn.Module):
                 pin_memory=pin_memory,
             )
             if shared_weights_dir is not None:
-                self._stager.share_cpu_storage(Path(shared_weights_dir) / "video")
+                from .initialization import uses_assigned_checkpoint_storage
+
+                identity = (
+                    getattr(self.remote, "_h3_checkpoint_file_identity", None)
+                    if uses_assigned_checkpoint_storage(self.remote)
+                    else None
+                )
+                if _same_checkpoint_replicas(identity):
+                    logger.info(
+                        "H3 video VAE reuses private checkpoint mappings; "
+                        "no duplicate host replica snapshot"
+                    )
+                else:
+                    self._stager.share_cpu_storage(Path(shared_weights_dir) / "video")
         self.model = self.remote.model
         self.use_tiling = True
         self.use_slicing = False
