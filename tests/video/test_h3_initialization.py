@@ -124,3 +124,38 @@ def test_assignment_does_not_introduce_new_parameter_aliases():
 
     model = load_without_random_parameter_init(factory)
     assert model[0].weight.data_ptr() != model[1].weight.data_ptr()
+
+
+def test_storage_marker_expires_after_parameter_conversion():
+    from vllm.model_executor.models.minimax_h3.initialization import (
+        uses_assigned_checkpoint_storage,
+    )
+
+    def factory():
+        model = nn.Linear(3, 4, bias=False)
+        model.load_state_dict({"weight": torch.ones(4, 3)})
+        return model
+
+    model = load_without_random_parameter_init(factory)
+    assert uses_assigned_checkpoint_storage(model)
+    model.double()
+    assert not uses_assigned_checkpoint_storage(model)
+
+
+def test_replica_identity_requires_all_workers_and_rejects_replacement(monkeypatch):
+    from vllm.model_executor.models.minimax_h3 import vae
+
+    monkeypatch.setattr(vae.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(vae.dist, "get_world_size", lambda: 2)
+    values: list[tuple[str, int] | None] = [("same", 1), ("same", 1)]
+    monkeypatch.setattr(
+        vae.dist,
+        "all_gather_object",
+        lambda result, value: result.__setitem__(slice(None), values),
+    )
+    assert vae._same_checkpoint_replicas(values[0])
+    values[1] = None
+    assert not vae._same_checkpoint_replicas(values[0])
+    values[1] = ("replacement", 2)
+    with pytest.raises(ValueError, match="changed between"):
+        vae._same_checkpoint_replicas(values[0])
