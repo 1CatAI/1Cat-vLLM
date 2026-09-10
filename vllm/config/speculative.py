@@ -153,8 +153,10 @@ class SpeculativeConfig:
 
     # Draft model configuration
     mtp_expert_quantization: Literal["fp8"] | None = None
-    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ
-    checkpoint whose MTP experts are unquantized. Target weights are unchanged.
+    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ or
+    ModelOpt checkpoint whose MTP experts are unquantized. Serialized block-FP8
+    MTP experts use their checkpoint scales without this online-conversion flag.
+    Target weights are unchanged.
     """
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.

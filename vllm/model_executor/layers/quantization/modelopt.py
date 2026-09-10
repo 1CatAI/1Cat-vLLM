@@ -54,6 +54,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
@@ -97,6 +98,9 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
+# Backported from vllm-project/vllm#55513: canonical name and legacy alias.
+_BLOCK_FP8_MOE_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 
 QUANT_ALGOS = [
     # FP8 (per-tensor weight + optional static activation scale).
@@ -2366,6 +2370,29 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
 
+        block_sizes = {
+            int(layer_info.get("group_size", 128))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
+        }
+        if len(block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all block-FP8 MoE layers "
+                f"to use one group_size, got {sorted(block_sizes)}."
+            )
+        block_size = next(iter(block_sizes), 128)
+        self.fp8_block_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[block_size, block_size],
+        )
+
+    def has_blocked_weights(self) -> bool:
+        return any(
+            info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
+            for info in self.quantized_layers.values()
+        )
+
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
 
@@ -2564,6 +2591,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
+            if quant_algo in _BLOCK_FP8_MOE_ALGOS:
+                return Fp8MoEMethod(self.fp8_block_config, layer)
             if quant_algo == "FP8":
                 return ModelOptFp8MoEMethod(
                     quant_config=self.fp8_config,
