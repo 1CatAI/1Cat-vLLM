@@ -49,6 +49,24 @@ def cpu_request_slots(values: torch.Tensor, indices: torch.Tensor) -> torch.Tens
     return values.index_select(0, indices.to(torch.int64)).detach().cpu().clone()
 
 
+def target_auxiliary_states(owner, batch) -> list[torch.Tensor]:
+    """Find the matching runner frame through opt-in sampling wrappers."""
+    frame = sys._getframe(1)
+    try:
+        for _ in range(12):
+            values = frame.f_locals
+            if values.get("self") is owner and values.get("input_batch") is batch:
+                auxiliary = values.get("aux_hidden_states")
+                if auxiliary is not None:
+                    return auxiliary
+            frame = frame.f_back
+            if frame is None:
+                break
+    finally:
+        del frame
+    raise RuntimeError("Natural audit requires matching target auxiliary states")
+
+
 def install() -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gd
     from vllm.model_executor.models import qwen3_next as qn
@@ -358,10 +376,7 @@ def install() -> None:
             # token IDs or acceptance decisions. Still diagnostic-only: CPU
             # snapshots synchronize execution and cannot measure performance.
             result["control"] = "natural_sampling"
-            frame = sys._getframe(1)
-            aux = frame.f_locals.get("aux_hidden_states")
-            if aux is None:
-                raise RuntimeError("Natural audit requires target auxiliary states")
+            aux = target_auxiliary_states(self, batch)
             result["aux_hidden_states"] = [cpu(t) for t in aux]
             if batch.num_draft_tokens:
                 result["draft_logits"] = cpu(

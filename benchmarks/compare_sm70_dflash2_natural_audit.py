@@ -19,6 +19,10 @@ from benchmarks.compare_sm70_dflash2_state_audit import (
     sampling_difference,
     tensor_difference,
 )
+from benchmarks.sm70_dflash2_state_layout import (
+    check_slot_mapping,
+    explain_state_difference,
+)
 
 
 def _load(directory: Path) -> dict:
@@ -104,21 +108,36 @@ def _proposal_tensors(row: dict) -> dict[str, torch.Tensor]:
     return values
 
 
-def compare_natural(left_dir: Path, right_dir: Path) -> dict:
+def compare_natural(
+    left_dir: Path, right_dir: Path, *, conv_width: int | None = None
+) -> dict:
     left, right = _load(left_dir), _load(right_dir)
     cases = {k[0] for k in left}
     if cases != {k[0] for k in right}:
         raise ValueError("Case coverage differs")
-    result = {"left": str(left_dir), "right": str(right_dir), "cases": []}
+    result = {
+        "left": str(left_dir),
+        "right": str(right_dir),
+        "conv_width": conv_width,
+        "cases": [],
+    }
     for case in sorted(cases):
         lengths = [len({k[1] for k in arm if k[0] == case}) for arm in (left, right)]
         first = None
         mappings = []
+        state_mappings = {rank: ({}, {}) for rank in range(4)}
+        explained_storage = []
         for step in range(min(lengths)):
             for phase_index, phase in enumerate(("target", "proposal")):
                 differences = []
                 for rank in range(4):
                     rows = [arm[case, step, rank][phase_index] for arm in (left, right)]
+                    if phase == "target" and conv_width is not None:
+                        check_slot_mapping(
+                            rows[0]["states"],
+                            rows[1]["states"],
+                            *state_mappings[rank],
+                        )
                     values = [
                         _target_tensors(row)
                         if phase == "target"
@@ -152,7 +171,20 @@ def compare_natural(left_dir: Path, right_dir: Path) -> dict:
                                 continue
                             if name == "native_logits":
                                 diff.update(sampling_difference(a, b))
-                        differences.append({"rank": rank, "name": name, **diff})
+                        observation = {"rank": rank, "name": name, **diff}
+                        if name.startswith("states/") and conv_width is not None:
+                            reason = explain_state_difference(
+                                name.removeprefix("states/"),
+                                rows[0]["states"],
+                                rows[1]["states"],
+                                conv_width,
+                            )
+                            if reason is not None:
+                                explained_storage.append(
+                                    {"step": step, "reason": reason, **observation}
+                                )
+                                continue
+                        differences.append(observation)
                 if differences:
                     first = {"step": step, "phase": phase, "differences": differences}
                     break
@@ -164,6 +196,7 @@ def compare_natural(left_dir: Path, right_dir: Path) -> dict:
                 "steps_per_arm": lengths,
                 "first_observed_difference": first,
                 "different_request_slot_mappings": mappings,
+                "explained_storage_differences": explained_storage,
                 "all_logical_tensors_equal": first is None and lengths[0] == lengths[1],
             }
         )
@@ -175,9 +208,10 @@ def main() -> None:
     parser.add_argument("left", type=Path)
     parser.add_argument("right", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--conv-width", type=int, choices=range(2, 7))
     args = parser.parse_args()
     torch.set_num_threads(4)
-    result = compare_natural(args.left, args.right)
+    result = compare_natural(args.left, args.right, conv_width=args.conv_width)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     for case in result["cases"]:
         first = case["first_observed_difference"]

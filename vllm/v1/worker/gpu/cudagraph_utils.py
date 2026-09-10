@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
 import torch
@@ -100,6 +100,7 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
+    attention_context_bucket: int | None = None
 
 
 def _is_compatible(
@@ -405,6 +406,47 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self._long_attention_graphs: dict[
+            BatchExecutionDescriptor, BatchExecutionDescriptor
+        ] = {}
+        from vllm.v1.attention.ops.sm70_e4m3_long import (
+            MAX_CONTEXT,
+            long_attention_enabled,
+        )
+
+        if (
+            long_attention_enabled()
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and self.dp_size == 1
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        ):
+            descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+            for desc in list(descs):
+                if (desc.num_tokens, desc.num_reqs, desc.uniform_token_count) == (
+                    8,
+                    1,
+                    8,
+                ):
+                    variant = replace(desc, attention_context_bucket=MAX_CONTEXT)
+                    self._long_attention_graphs[desc] = variant
+                    descs.append(variant)
+
+    def select_attention_graph(
+        self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
+    ) -> BatchExecutionDescriptor:
+        variant = self._long_attention_graphs.get(desc)
+        if variant is None or variant not in self.graphs:
+            return desc
+        # Never materialize device lengths on the host. A missing or oversized
+        # CPU hint conservatively selects the existing full-context graph.
+        if cpu_upper_bounds.device.type != "cpu" or cpu_upper_bounds.numel() != 1:
+            return desc
+        upper = int(cpu_upper_bounds[0])
+        limit = variant.attention_context_bucket
+        if limit is not None and 0 < upper <= limit:
+            return variant
+        return desc
 
     def capture(
         self,
@@ -461,10 +503,16 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
-                if cg_mode == CUDAGraphMode.PIECEWISE:
-                    assert attn_metadata is None
+                if (
+                    cg_mode == CUDAGraphMode.PIECEWISE
+                    or desc.attention_context_bucket is not None
+                ):
+                    if cg_mode == CUDAGraphMode.PIECEWISE:
+                        assert attn_metadata is None
                     batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens, has_lora=has_lora
+                        num_tokens=num_tokens,
+                        has_lora=has_lora,
+                        attention_context_bucket=desc.attention_context_bucket,
                     )
                 with (
                     sm70_decode_graph_compilation(desc.cg_mode == CUDAGraphMode.FULL),

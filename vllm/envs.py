@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
+    VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
@@ -1876,6 +1877,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
     "VLLM_SM70_SAMPLER_LIBRARY": lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
     "VLLM_SM70_FA2_D256_LIBRARY": lambda: os.getenv("VLLM_SM70_FA2_D256_LIBRARY", None),
+    # Experimental q8 long attention; unset preserves the full-context route.
+    "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST": lambda: os.getenv(
+        "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", None
+    ),
     "VLLM_SM70_FP8_PREFILL_CUTLASS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))
     ),

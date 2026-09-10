@@ -17,7 +17,9 @@ def load_grouped_e4m3_fp32():
         return None
     if not flash_attn_grouped_e4m3_fp32_available():
         return None
-    return flash_attn_grouped_e4m3_fp32_paged
+    from vllm.v1.attention.ops.sm70_e4m3_long import wrap_long_attention
+
+    return wrap_long_attention(flash_attn_grouped_e4m3_fp32_paged)
 
 
 def grouped_e4m3_fp32_allowed(

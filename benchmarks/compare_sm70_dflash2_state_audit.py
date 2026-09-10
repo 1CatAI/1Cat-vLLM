@@ -10,6 +10,11 @@ from pathlib import Path
 
 import torch
 
+from benchmarks.sm70_dflash2_state_layout import (
+    check_slot_mapping,
+    explain_state_difference,
+)
+
 
 def tensor_difference(left: torch.Tensor, right: torch.Tensor) -> dict:
     if left.shape != right.shape or left.dtype != right.dtype:
@@ -37,7 +42,9 @@ def tensor_difference(left: torch.Tensor, right: torch.Tensor) -> dict:
     }
 
 
-def sampling_difference(left: torch.Tensor, right: torch.Tensor) -> dict:
+def sampling_difference(
+    left: torch.Tensor, right: torch.Tensor, eos_token_ids: tuple[int, ...] = ()
+) -> dict:
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
     if left.shape != right.shape:
@@ -52,17 +59,37 @@ def sampling_difference(left: torch.Tensor, right: torch.Tensor) -> dict:
         ).softmax(-1)
 
     p, q = probabilities(left), probabilities(right)
-    full_tv = (left.float().softmax(-1) - right.float().softmax(-1)).abs().sum(-1) / 2
-    return {
+    full_p, full_q = left.float().softmax(-1), right.float().softmax(-1)
+    full_tv = (full_p - full_q).abs().sum(-1) / 2
+    result = {
         "full_softmax_tv": full_tv.tolist(),
         "sampling_tv": ((p - q).abs().sum(-1) / 2).tolist(),
         "support_changed": ((p > 0) != (q > 0)).any(-1).tolist(),
         "top1_changed": (left.argmax(-1) != right.argmax(-1)).tolist(),
     }
+    if eos_token_ids:
+        if any(token < 0 or token >= left.shape[-1] for token in eos_token_ids):
+            raise ValueError("EOS token ID outside the captured vocabulary")
+        ids = list(eos_token_ids)
+        result["eos_token_ids"] = ids
+        result["full_eos_probabilities_left"] = full_p[:, ids].tolist()
+        result["full_eos_probabilities_right"] = full_q[:, ids].tolist()
+        result["sampling_eos_probabilities_left"] = p[:, ids].tolist()
+        result["sampling_eos_probabilities_right"] = q[:, ids].tolist()
+        result["max_eos_probability_abs_difference"] = max(
+            (full_p[:, ids] - full_q[:, ids]).abs().max().item(),
+            (p[:, ids] - q[:, ids]).abs().max().item(),
+        )
+    return result
 
 
 def compare(
-    left_dir: Path, right_dir: Path, *, right_verifier_route: str | None = None
+    left_dir: Path,
+    right_dir: Path,
+    *,
+    right_verifier_route: str | None = None,
+    eos_token_ids: tuple[int, ...] = (),
+    conv_width: int | None = None,
 ) -> dict:
     left_files = {p.name: p for p in left_dir.glob("*-rank*-step*.pt")}
     right_files = {p.name: p for p in right_dir.glob("*-rank*-step*.pt")}
@@ -73,7 +100,10 @@ def compare(
         "right": str(right_dir),
         "comparisons": [],
         "logits": [],
+        "explained_storage_differences": [],
+        "conv_width": conv_width,
     }
+    mappings: dict[tuple[str, int], tuple[dict[int, int], dict[int, int]]] = {}
     coverage: dict[tuple[str, int], set[int]] = {}
     seen_states: dict[tuple[str, int, str], set[str]] = {}
     for name in sorted(left_files):
@@ -83,6 +113,11 @@ def compare(
             if left[key] != right[key]:
                 raise ValueError(f"{name}: {key} differs")
         identity = {key: left[key] for key in ("case", "rank", "step", "phase")}
+        if conv_width is not None:
+            mapping, reverse = mappings.setdefault(
+                (left["case"], left["rank"]), ({}, {})
+            )
+            check_slot_mapping(left["states"], right["states"], mapping, reverse)
         if right_verifier_route is not None and right["phase"] == "verify":
             expected = {
                 f"route/verify/layer{layer}/{right_verifier_route}"
@@ -134,6 +169,14 @@ def compare(
                     result["comparisons"].append(
                         {**identity, "group": group, "label": label, **difference}
                     )
+                    if group == "state" and conv_width is not None:
+                        reason = explain_state_difference(
+                            label, left["states"], right["states"], conv_width
+                        )
+                        if reason is not None:
+                            result["explained_storage_differences"].append(
+                                {**identity, "label": label, "reason": reason}
+                            )
         if left["rank"] == 0:
             if not all(torch.isfinite(d["native_logits"]).all() for d in (left, right)):
                 raise ValueError(f"{name}: nonfinite native logits")
@@ -143,7 +186,7 @@ def compare(
                     "positions": left["positions"].tolist(),
                     **tensor_difference(left["native_logits"], right["native_logits"]),
                     **sampling_difference(
-                        left["native_logits"], right["native_logits"]
+                        left["native_logits"], right["native_logits"], eos_token_ids
                     ),
                 }
             )
@@ -171,6 +214,8 @@ def compare(
     result["summary"] = {
         "files_per_arm": len(left_files),
         "differing_intermediates": len(result["comparisons"]),
+        "unexplained_intermediates": len(result["comparisons"])
+        - len(result["explained_storage_differences"]),
         "max_sampling_tv": max(max(row["sampling_tv"]) for row in result["logits"]),
         "support_changed_rows": sum(
             sum(row["support_changed"]) for row in result["logits"]
@@ -179,6 +224,11 @@ def compare(
         "all_logits_bitwise_equal": all(
             row["bitwise_equal"] for row in result["logits"]
         ),
+        "max_eos_probability_abs_difference": max(
+            row["max_eos_probability_abs_difference"] for row in result["logits"]
+        )
+        if eos_token_ids
+        else None,
     }
     return result
 
@@ -189,10 +239,21 @@ def main() -> None:
     parser.add_argument("right", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--right-verifier-route", choices=("split", "packed"))
+    parser.add_argument("--eos-token-ids", type=int, nargs="+", default=[])
+    parser.add_argument(
+        "--conv-width",
+        type=int,
+        choices=range(2, 7),
+        help="Frozen model convolution width; explain raw storage differences",
+    )
     args = parser.parse_args()
     torch.set_num_threads(4)
     result = compare(
-        args.left, args.right, right_verifier_route=args.right_verifier_route
+        args.left,
+        args.right,
+        right_verifier_route=args.right_verifier_route,
+        eos_token_ids=tuple(args.eos_token_ids),
+        conv_width=args.conv_width,
     )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["summary"], indent=2))
