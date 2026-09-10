@@ -80,8 +80,12 @@ diagnostic fails. TeaCache and Cache-DiT/SCM have request-lifecycle and
 small-shape GPU evidence; primary-shape official quality and performance are
 incomplete. The 243-frame and 15-second runs establish generation/memory
 compatibility only. Human audiovisual review and independent official-model
-controls remain pending. The implementation stack remains Draft, not merged
-to main.
+controls remain pending. The user authorized source integration through
+PR #583 on 2026-09-10; this does not close those acceptance gates. See
+[VSA_QUALITY_SPEED.md](VSA_QUALITY_SPEED.md) for the subsequent VSA stage:
+the native path reaches 30.990756 seconds but fails independent quality;
+the acceptance-only exact FP32 path passes primary numerical checks at
+60.353224 seconds and fails the speed target. Neither enters automatic selection.
 
 Evidence: [CAMPAIGN_RESULTS.md](CAMPAIGN_RESULTS.md),
 [FA_DEVELOPMENT.md](FA_DEVELOPMENT.md), and artifact root

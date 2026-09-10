@@ -52,6 +52,8 @@ class H3Config:
     share_host_vae_weights: bool = False
     weight_offload: Literal["component", "layer"] = "component"
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
+    host_memory_mode: Literal["auto", "pinned", "mmap"] = "auto"
+    host_memory_directory: str | None = None
 
     def __post_init__(self) -> None:
         if self.residual_reduction not in ("native", "peer"):
@@ -86,6 +88,8 @@ class H3Config:
             and self.host_weight_pin_memory
         ):
             raise H3InputError("shared host VAE weights require pageable host masters")
+        if self.host_memory_mode not in ("auto", "pinned", "mmap"):
+            raise H3InputError("host memory mode must be auto, pinned or mmap")
         if self.video_encoder not in ("libx264", "h264_nvenc"):
             raise H3InputError("video encoder must be libx264 or h264_nvenc")
         if self.partition not in ("fl2va", "ref2va"):

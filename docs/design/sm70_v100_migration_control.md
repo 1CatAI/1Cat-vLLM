@@ -2,6 +2,38 @@
 
 Date: 2026-05-30
 
+## DFlash2 TP2 accepted endpoint, 2026-09-10
+
+The user closed TP2 optimization at **31.884546/29.279787 ms** complete rounds
+for release1k/MBPP28, retiring the earlier approximately 25-ms goal. The
+[TP2 worklog](sm70_dflash2_tp2_verifier.md) retains the frozen contract,
+development history, rejected candidates and source/library provenance.
+TP4 remains a separate campaign.
+
+Three independent unprofiled startups each run one warmup and five paired
+requests per fixture. All fifteen pairs preserve token IDs, acceptance and
+natural EOS. Accepted drafts per round are 2.010638/3.569231; emitted tokens
+per round are 3.010638/4.569231. A separate same-startup diagnostic preserves
+hidden states, full FP32 vocabulary logits and valid acceptance records.
+These short-context measurements are not 256K performance evidence.
+
+PR566 integrates the exact revision-2 scalar E4M3 decoder/PV schedule, the
+independently gated TP2 q8 BV2 GDN schedule and the matched QPN2 builder.
+Main already contains the FP32-beta and row-stride repairs from PR556;
+integration keeps those repairs and the TP4 fallback. The observed K64 split,
+effective FP16 scale rounding, FP32 state/logits and E4M3 KV are unchanged.
+The complete measured combination also uses the retained single-layout
+QPN2/context worker harness; merging the kernel components does not enable
+that whole combination by default. New TP2 switches remain opt-in.
+
+The later combined-projection copy experiment is withdrawn from this PR's
+source. Its local copy and live byte-oracle gates pass, but its model A/B
+harness fails before generation due to a ctypes graph-binding conflict.
+It contributes no accepted whole-round improvement. Changed draft GEMM
+arithmetic is also excluded: better local FP64 error still changes proposal
+distributions. Historical failed numerical, memory-budget, route-coverage,
+sanitizer-timeout and slower-kernel results remain recorded in the worklog.
+
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 
 [The precision-default change](sm70_dflash2_fp32_defaults.md) is based on

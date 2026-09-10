@@ -18,14 +18,15 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast
 
+from vllm.media.progress import DeviceProgress, ProgressCallback, reporting
 from vllm.model_executor.models.minimax_h3.config import H3Config, H3Request
 
-from .gpu import acquire_gpu_group
+from .gpu import acquire_gpu_group, worker_device_mask
 from .gpu import select_gpu_group as select_gpu_group
 
 
 def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None):
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    os.environ["CUDA_VISIBLE_DEVICES"] = worker_device_mask(gpu_ids)
     from datetime import timedelta
 
     import torch
@@ -71,9 +72,18 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
                 command = connection.recv()
                 if command is None:
                     break
-                request, output_dir = command
+                request, output_dir, track_progress = command
                 torch.accelerator.reset_peak_memory_stats()
-                video, audio = pipeline(request)
+                callback = (
+                    (lambda event: connection.send({"event": "progress", **event}))
+                    if rank == 0 and track_progress
+                    else None
+                )
+                with (
+                    DeviceProgress(callback, device=rank) as observer,
+                    reporting(observer),
+                ):
+                    video, audio = pipeline(request)
                 if kernel_provenance is None:
                     from .metrics import loaded_kernel_provenance
 
@@ -105,6 +115,8 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
                 if rank == 0:
                     from .media import export_video
 
+                    if callback:
+                        callback({"stage": "packaging"})
                     started = time.perf_counter()
                     result.update(
                         export_video(
@@ -192,7 +204,7 @@ class H3Engine:
             self.close()
             raise
 
-    def _receive_all(self, *, timeout):
+    def _receive_all(self, *, timeout, on_progress: ProgressCallback | None = None):
         from multiprocessing.connection import wait
 
         pending = set(self.connections)
@@ -206,6 +218,10 @@ class H3Engine:
                 message = connection.recv()
                 if "error" in message:
                     raise RuntimeError(message["error"])
+                if message.get("event") == "progress":
+                    if on_progress is not None:
+                        on_progress({k: v for k, v in message.items() if k != "event"})
+                    continue
                 results.append(message)
                 pending.remove(connection)
             for worker, connection in zip(self.workers, self.connections):
@@ -215,7 +231,13 @@ class H3Engine:
                     )
         return sorted(results, key=lambda result: result["rank"])
 
-    def generate(self, request: H3Request, output_dir: str | Path):
+    def generate(
+        self,
+        request: H3Request,
+        output_dir: str | Path,
+        *,
+        on_progress: ProgressCallback | None = None,
+    ):
         import json
 
         from vllm.model_executor.models.minimax_h3.validation import validate_request
@@ -232,9 +254,11 @@ class H3Engine:
             started = time.perf_counter()
             try:
                 for connection in self.connections:
-                    connection.send((request, str(output_dir)))
+                    connection.send((request, str(output_dir), on_progress is not None))
                 with NVMLMonitor(self.gpu_ids, output_dir / "nvml.jsonl"):
-                    ranks = self._receive_all(timeout=24 * 3600)
+                    ranks = self._receive_all(
+                        timeout=24 * 3600, on_progress=on_progress
+                    )
             except BaseException:
                 # A failing rank invalidates the whole communicator. Release
                 # only owned workers instead of reusing a partially alive group.

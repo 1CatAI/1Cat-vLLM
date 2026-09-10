@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
+from vllm.media.progress import update_metadata
 from vllm.model_executor.models.minimax_h3.config import H3Config, H3Request
 
 from .protocol import VideoRequest as VideoRequest
@@ -61,11 +62,20 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
         while True:
             identity = await queue.get()
             job = jobs.get(identity)
-            if job is None:
+            if job is None or job.metadata["status"] == "cancelled":
                 queue.task_done()
                 continue
             metadata = job.metadata
             metadata.update(status="in_progress", started_at=time.time())
+            loop = asyncio.get_running_loop()
+
+            def apply_progress(event, metadata=metadata):
+                if metadata["status"] == "in_progress":
+                    update_metadata(metadata, event, time.time())
+
+            def on_progress(event, loop=loop, apply_progress=apply_progress):
+                loop.call_soon_threadsafe(apply_progress, event)
+
             try:
                 outputs = []
                 for index in range(job.output_count):
@@ -81,7 +91,12 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
                         else job.output_dir / f"output_{index}"
                     )
                     result = await asyncio.to_thread(
-                        state["engine"].generate, request, directory
+                        state["engine"].generate,
+                        request,
+                        directory,
+                        on_progress=on_progress
+                        if metadata.get("progress_reporting", True)
+                        else None,
                     )
                     outputs.append(
                         {
@@ -94,6 +109,7 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
                         }
                     )
                     metadata["progress"] = round(100 * (index + 1) / job.output_count)
+                update_metadata(metadata, {"stage": "completed"}, time.time())
                 metadata.update(
                     status="completed",
                     completed_at=time.time(),
@@ -103,6 +119,7 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
                 )
                 state["completed"] += 1
             except Exception as exc:
+                update_metadata(metadata, {"stage": "failed"}, time.time())
                 metadata.update(
                     status="failed",
                     error={"code": "generation_failed", "message": str(exc)},
@@ -190,6 +207,15 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
                     "model": config.model,
                     "status": "queued",
                     "progress": 0,
+                    "stage": "queued",
+                    "stage_started_at": time.time(),
+                    "updated_at": time.time(),
+                    "stage_progress": None,
+                    "denoise_progress": None,
+                    "progress_reporting": request.headers.get(
+                        "X-1Cat-Progress", "true"
+                    ).lower()
+                    != "false",
                     "created_at": int(time.time()),
                     "partition": config.partition,
                     "size": f"{generation.sampling.width}x{generation.sampling.height}",
@@ -313,6 +339,20 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
             media_type="video/mp4",
             filename=f"{identity}_{output_index}.mp4",
         )
+
+    @app.post("/v1/videos/{identity}/cancel")
+    async def cancel_video(identity: str):
+        job = find_job(identity)
+        if job.metadata["status"] == "in_progress":
+            raise HTTPException(
+                409, "Running generation cannot be interrupted; output will be retained"
+            )
+        if job.metadata["status"] == "queued":
+            update_metadata(job.metadata, {"stage": "cancelled"}, time.time())
+            job.metadata.update(status="cancelled", completed_at=time.time())
+            job.done.set()
+        # A late cancellation never deletes a completed result.
+        return job.metadata
 
     @app.delete("/v1/videos/{identity}")
     async def delete_video(identity: str):

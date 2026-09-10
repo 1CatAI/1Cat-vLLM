@@ -92,6 +92,13 @@ class VideoSubcommand(CLISubcommand):
             )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             mode.add_argument(
+                "--host-memory-mode",
+                choices=("auto", "pinned", "mmap"),
+                default="auto",
+                help="Use disk-backed CPU weights on hosts below 128 GiB RAM",
+            )
+            mode.add_argument("--host-memory-directory")
+            mode.add_argument(
                 "--video-encoder",
                 choices=("libx264", "h264_nvenc"),
                 default="libx264",
@@ -160,6 +167,8 @@ class VideoSubcommand(CLISubcommand):
             host_weight_pin_memory=args.host_weight_pin_memory,
             share_host_vae_weights=args.share_host_vae_weights,
             weight_offload=args.weight_offload,
+            host_memory_mode=args.host_memory_mode,
+            host_memory_directory=args.host_memory_directory,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

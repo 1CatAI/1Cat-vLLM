@@ -643,16 +643,20 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     match_recurrent_numerics: bool = False,
     precomputed_g: torch.Tensor | None = None,
     precomputed_beta: torch.Tensor | None = None,
+    sm70_tp2_q8_bv2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mixed-QKV update that writes into a caller-provided output buffer.
 
     ``precomputed_g`` and ``precomputed_beta`` retain the split verifier's
     exact gating materialization while still removing the packed-QKV rearrange.
     Omitting both computes gating inside the recurrent kernel.
+    Row-strided QKV views with contiguous features are consumed without a copy.
     """
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
-    if not mixed_qkv.is_contiguous():
+    # Qwen's QKV view shares rows with Z/b/a; convolution preserves that
+    # row stride. The native mixed-QKV loader already accepts QKV_STRIDE.
+    if mixed_qkv.stride(1) != 1:
         mixed_qkv = mixed_qkv.contiguous()
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for mixed_qkv_out.")
@@ -672,11 +676,12 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     q_size = H * K
     k_size = H * K
     v_size = HV * V
-    qkv_stride = q_size + k_size + v_size
-    if mixed_qkv.shape[1] != qkv_stride:
+    qkv_width = q_size + k_size + v_size
+    if mixed_qkv.shape[1] != qkv_width:
         raise ValueError(
-            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_stride}."
+            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_width}."
         )
+    qkv_stride = mixed_qkv.stride(0)
     if out.shape != (T, 1, HV, V):
         raise ValueError(f"out must have shape {(T, 1, HV, V)}, got {out.shape}.")
     if scale is None:
@@ -725,6 +730,24 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         mixed_qkv.device,
         match_recurrent_schedule=match_recurrent_schedule,
     )
+    if (
+        sm70_tp2_q8_bv2
+        and (N, T, H, HV, K, V) == (1, 8, 8, 24, 128, 128)
+        and (BV, num_warps) == (16, 1)
+        and match_recurrent_schedule
+        and match_recurrent_numerics
+        and use_precomputed_gating
+        and kernel_a.dtype == kernel_b.dtype == torch.float32
+        and initial_state.dtype == torch.float32
+        and mixed_qkv.dtype == out.dtype == torch.float16
+        and num_accepted_tokens is not None
+        and use_qk_l2norm_in_kernel
+        and not quantize_state_each_step
+        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+    ):
+        # Same K128 reduction, one warp, gating and recurrent arithmetic.
+        # Split the independent V columns across more CTAs for this q8 case.
+        BV = 2
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 

@@ -10,6 +10,31 @@ promotion. Official GPU-kernel validation and >80 useful TFLOP/s/card remain
 separate unfinished objectives. No quality threshold or official sampling/
 selection rule is relaxed.
 
+## Main integration
+
+On 2026-09-10 the user authorized integrating #583 and its dependencies
+(#571, #578 and #581) into `main`. The synchronization base is
+`24220ca0eb4a02b2376cf48feb430bb4d5c5c3d7`. Source integration does not change the
+numerical/performance or human-review status above and does not register the
+FP32 diagnostic in default/AUTO selection. Historical benchmark records retain
+their original source and binary identities.
+
+The merge retains main's mmap host weights, media progress and physical-device
+mask handling alongside prepared FP16 execution, layer offload, shared VAE host
+storage, work counters and VSA layout/diagnostic changes. Tests combine mmap
+masters with layerwise adapter/alias roundtrips on the GPU. No numerical CUDA
+kernel is changed by this synchronization.
+
+The merged candidate passes the complete CPU video suite: 359 passed and
+251 GPU/opt-in checks skipped. The focused leased-V100 integration suite passes
+73 checks, including mmap/layer staging, aliases, VSA geometry/layout, strict
+sparse validation and work counters; all 24 QK/RoPE GPU checks also pass.
+Ten existing GPU-only cases now skip explicitly when CUDA is unavailable.
+Source-integration logs and GPU lease records are retained under
+`/home/ymzx/h3-sm70-artifacts-20260909/vsa-merge-main-20260910/`.
+These integration checks do not replace complete model quality or performance
+acceptance. All applicable pre-commit checks pass before source publication.
+
 ## Frozen baseline and diagnosis
 
 The source baseline is `970c5fb3f86d59440a3431e53029e98f8d690778`, which merges
@@ -358,5 +383,5 @@ has been asked to review the playable sample. No human pass is recorded.
 Seeds 43/44, 243 frames, the 15-second boundary, TP1/TP2 complete compatibility,
 and representative Dense/LightX2V/Ref2VA output regression remain **not
 completed**. The implementation, numerical primary evidence and formal speed
-failure are delivered in Draft #583; the requested combined acceptance remains
+failure are delivered in PR #583; the requested combined acceptance remains
 **not completed**, with no default/AUTO promotion.

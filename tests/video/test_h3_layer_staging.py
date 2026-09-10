@@ -12,6 +12,7 @@ from vllm.model_executor.models.minimax_h3.config import H3Config, H3InputError
 from vllm.model_executor.models.minimax_h3.residency import (
     BoundedAllocatorCache,
     LayerwiseModuleStager,
+    MMapHostWeights,
     PinnedModuleStager,
 )
 
@@ -148,7 +149,8 @@ def test_layer_policy_cli(mode):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_gpu_layerwise_adapter_and_alias_roundtrips(dtype):
+@pytest.mark.parametrize("mapped", [False, True])
+def test_gpu_layerwise_adapter_and_alias_roundtrips(dtype, mapped, tmp_path):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.manual_seed(96)
     model = Model(128).to(device="cuda", dtype=dtype).eval()
@@ -159,13 +161,20 @@ def test_gpu_layerwise_adapter_and_alias_roundtrips(dtype):
     inputs = [torch.randn(65, 128, device="cuda", dtype=dtype) for _ in range(3)]
     with torch.inference_mode():
         expected = [model(x).clone() for x in inputs]
-        snapshot = PinnedModuleStager(model, torch.device("cuda"), pin_memory=False)
+        snapshot = PinnedModuleStager(
+            model,
+            torch.device("cuda"),
+            pin_memory=False,
+            host_backing=MMapHostWeights(tmp_path) if mapped else None,
+        )
         plan = LayerwiseModuleStager(snapshot, model.blocks)
         for x, reference in zip(inputs, expected):
             with plan.on_device():
                 actual = model(x)
             torch.testing.assert_close(actual, reference, atol=0, rtol=0)
             assert all(p.device.type == "cpu" for p in model.parameters())
+            if mapped:
+                assert all(p.untyped_storage().filename for p in model.parameters())
             assert (
                 model.shared.untyped_storage().data_ptr()
                 == model.blocks[0].adapter_a.untyped_storage().data_ptr()

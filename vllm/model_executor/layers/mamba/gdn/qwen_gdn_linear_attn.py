@@ -2433,6 +2433,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
+            self.enable_sm70_dflash2_fused_gdn_verify
+            and self.tp_size == 2
+            and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
+        )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_GDN_NORM
             and current_platform.is_device_capability(70)
@@ -2442,6 +2447,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
+        )
+        self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+            and self.tp_size == 4
+            and self.hidden_size == 5120
         )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
@@ -3858,8 +3870,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ):
                 conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                     layer_name,
-                    output,
+                    hidden_states if output is None else output,
                 )
+                if output is None:
+                    return torch.ops.vllm.qwen_gdn_full_forward_direct(
+                        hidden_states,
+                        conv_state_cache,
+                        ssm_state_cache,
+                        layer_name,
+                    )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
                     output,
@@ -3873,7 +3892,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _full_forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ):
         return self._forward_method(hidden_states, output)
 
@@ -5181,7 +5200,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # The supported verifier contract keeps recurrent state in FP32;
             # an explicit FP16 cache override is also supported.
             and ssm_state.dtype in (torch.float16, torch.float32)
-            and mixed_qkv.is_contiguous()
+            and mixed_qkv.ndim == 2
+            # Qwen3.5's fused projection and in-place convolution retain the
+            # wider QKVZBA row stride. The packed consumer can read it directly.
+            and mixed_qkv.stride(1) == 1
+            and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
             and a.is_contiguous()
             and b.is_contiguous()
             and core_attn_out.is_contiguous()
@@ -5202,7 +5225,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        # Match the ordinary speculative verifier's FP32 beta materialization.
+        # The gating helper otherwise defaults to the FP16 dtype of b.
+        g, beta = fused_gdn_gating(
+            self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
+        )
         fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             A_log=self.A_log,
             a=a,
@@ -5229,6 +5256,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quantize_state_each_step=False,
             match_recurrent_schedule=True,
             match_recurrent_numerics=True,
+            sm70_tp2_q8_bv2=getattr(self, "enable_sm70_dflash2_tp2_gdn_bv2", False),
         )
         return out.transpose(0, 1)
 
@@ -7145,6 +7173,34 @@ def qwen_gdn_full_forward_fake(
     """Fake implementation for torch.compile."""
 
 
+def qwen_gdn_full_forward_direct(
+    hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Keep the full-forward order while returning its projection allocation."""
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    # Match the original opaque op's explicit recurrent-state dependencies.
+    # Its eager body accesses these same caches through the layer object.
+    _ = conv_state_cache, ssm_state_cache
+    output = layer._full_forward(hidden_states, None)
+    if output is None:
+        raise RuntimeError("Direct GDN full-forward did not return a projection")
+    _log_runtime_route_once("SM70 Qwen GDN direct full-forward output route hit.")
+    return output
+
+
+def qwen_gdn_full_forward_direct_fake(
+    hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 def qwen_gdn_output_projection(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -7448,6 +7504,14 @@ direct_register_custom_op(
     op_func=qwen_gdn_full_forward,
     mutates_args=["output", "conv_state_cache", "ssm_state_cache"],
     fake_impl=qwen_gdn_full_forward_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_full_forward_direct",
+    op_func=qwen_gdn_full_forward_direct,
+    mutates_args=["conv_state_cache", "ssm_state_cache"],
+    fake_impl=qwen_gdn_full_forward_direct_fake,
 )
 
 

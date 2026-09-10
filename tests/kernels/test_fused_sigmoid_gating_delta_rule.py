@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,7 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update_mixed_qkv_out,
 )
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
     fused_gdn_gating,
 )
 from vllm.platforms import current_platform
@@ -347,10 +350,12 @@ def test_fused_sigmoid_gating_delta_rule_update_spec(
 @pytest.mark.parametrize("num_reqs", [1, 2])
 @pytest.mark.parametrize("num_speculative_tokens", [3, 7])
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.float32])
-def test_dflash2_packed_verify_matches_split_fp16_contract(
+@pytest.mark.parametrize("runtime_bridge", [False, True])
+def test_dflash2_packed_verify_matches_split_contract(
     num_reqs: int,
     num_speculative_tokens: int,
     state_dtype: torch.dtype,
+    runtime_bridge: bool,
 ) -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("the DFlash2 verifier fast path is SM70-only")
@@ -365,7 +370,11 @@ def test_dflash2_packed_verify_matches_split_fp16_contract(
     num_tokens = num_reqs * tokens_per_req
     qkv_width = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
 
-    mixed_qkv = torch.randn(num_tokens, qkv_width, dtype=dtype)
+    # Runtime Qwen3.5 retains the QKVZBA projection row stride after conv.
+    padding = num_v_heads * head_v_dim + 2 * num_v_heads if runtime_bridge else 0
+    projection = torch.randn(num_tokens, qkv_width + padding, dtype=dtype)
+    mixed_qkv = projection[:, :qkv_width]
+    projection_before = projection.clone()
     query, key, value = torch.split(
         mixed_qkv,
         [
@@ -397,7 +406,9 @@ def test_dflash2_packed_verify_matches_split_fp16_contract(
         dtype=state_dtype,
     )
 
-    g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+    g, beta = fused_gdn_gating(
+        A_log, a, b, dt_bias, beta_dtype=torch.float32 if runtime_bridge else dtype
+    )
     reference_state = initial_state.clone()
     reference_out, _ = fused_recurrent_gated_delta_rule(
         q=query,
@@ -415,29 +426,55 @@ def test_dflash2_packed_verify_matches_split_fp16_contract(
 
     fused_state = initial_state.clone()
     fused_out = torch.empty(num_tokens, 1, num_v_heads, head_v_dim, dtype=dtype)
-    fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
-        A_log=A_log,
-        a=a,
-        b=b,
-        dt_bias=dt_bias,
-        mixed_qkv=mixed_qkv,
-        num_q_heads=num_k_heads,
-        num_v_heads=num_v_heads,
-        head_k_dim=head_k_dim,
-        head_v_dim=head_v_dim,
-        out=fused_out,
-        initial_state=fused_state,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=state_indices,
-        num_accepted_tokens=num_accepted_tokens,
-        use_qk_l2norm_in_kernel=True,
-        precomputed_g=g,
-        precomputed_beta=beta,
-        match_recurrent_schedule=True,
-        match_recurrent_numerics=True,
-    )
+    if runtime_bridge:
+        module = SimpleNamespace(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            num_k_heads=num_k_heads * 4,
+            num_v_heads=num_v_heads * 4,
+            tp_size=4,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+        )
+        QwenGatedDeltaNetAttention._forward_dflash2_packed_gdn_verify(
+            module,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            core_attn_out=fused_out.squeeze(1),
+            ssm_state=fused_state,
+            spec_query_start_loc=cu_seqlens,
+            spec_state_indices_tensor=state_indices,
+            spec_state_slot_selectors=num_accepted_tokens,
+            num_spec_decodes=num_reqs,
+        )
+    else:
+        fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
+            A_log=A_log,
+            a=a,
+            b=b,
+            dt_bias=dt_bias,
+            mixed_qkv=mixed_qkv,
+            num_q_heads=num_k_heads,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            out=fused_out,
+            initial_state=fused_state,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=True,
+            precomputed_g=g,
+            precomputed_beta=beta,
+            match_recurrent_schedule=True,
+            match_recurrent_numerics=True,
+        )
     torch.accelerator.synchronize()
 
+    assert torch.equal(
+        projection.view(torch.uint8), projection_before.view(torch.uint8)
+    )
     torch.testing.assert_close(fused_out.transpose(0, 1), reference_out, rtol=0, atol=0)
     torch.testing.assert_close(fused_state, reference_state, rtol=0, atol=0)
 
