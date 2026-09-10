@@ -218,6 +218,27 @@ the entire 2.871-ms round reduction to attention-kernel service time.
 The **22-ms complete-round target is still unmet**. Repeated-startup and
 new-candidate natural-output corpus admission remain incomplete.
 
+The actual service CUDA graph-node trace now corroborates the operator
+result: target grouped attention consumes **13.077 ms per rank/round** across
+eight interior q8 rounds on four ranks (steps 9–16 of ten captured steps).
+Every rank/round contains sixteen full-q8 kernels and sixteen combine kernels.
+All 512 observed full-q8 launches use the intended 3296-page specialization,
+80 CTAs, 512 threads, 118 registers, 72192 dynamic shared bytes, 512 static
+shared bytes and zero reported local bytes per thread. Control/candidate
+DSO hashes and graph route counters remain in the service capture report.
+The warm and captured requests retain identical tokens, finish reason and
+acceptance. These instrumented kernel timings corroborate route behavior;
+they do not replace the unprofiled complete-round A/B above.
+
+Reports: `p-swizzle-early-service-trace.json` and
+`p-swizzle-early-service-attribution.json`. The SQLite trace has SHA256
+`95601fc2228f963a2864c076e89cb5a4632fbc4186df8f80bafe90e97b4513e3`.
+Collection used Nsight Systems 2022.4.2.50. The system package lacked its
+importer, so the retained raw trace was converted offline with the matching
+official NVIDIA 2022.4.2.50 bundle; no service rerun was needed. The local
+worklog records tool/archive hashes and the conversion failure/recovery.
+The profiling driver now binds the complete tool path explicitly.
+
 ## Reproduction and promotion gates
 
 Build the lookup using the measured parent's options:
