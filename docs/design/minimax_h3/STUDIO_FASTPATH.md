@@ -63,12 +63,12 @@ establish the historical request's power or clock conditions.
 
 ## Acceptance status
 
-Four packaged SM70 extension targets compile with Torch 2.10.0+cu128 and
-CUDA 12.8. Offline integration/ABI checks pass. Remote same-contract GPU speed,
-complete output preservation and frontend generation remain pending: the first
-control task was cancelled as the machine switched to an active chat model.
-Do not treat inherited development-host performance as a measured Studio gain
-or promote this integration until the allocated-GPU control is complete.
+All five packaged H3/SM70 extension targets compile locally and on the remote
+V100 machine with Torch 2.10.0+cu128 and CUDA 12.8. Focused CPU tests pass;
+remote validation additionally passes nine sparse-kernel GPU tests and three
+Studio-capability checks. The real Studio frontend campaign below completes
+both explicit modes. This validates executable integration and output media;
+it does not qualify VSA numerical quality or change the native AUTO default.
 
 ## Explicit experimental Fast VSA
 
@@ -100,5 +100,51 @@ Those are the retained development-host measurements, not a new remote Studio
 benchmark. See VSA_QUALITY_SPEED.md for the failed independent FP32 quality
 comparison and exact workload/source/binary evidence. Do not claim half the
 complete generation time or combine the fast kernel's timing with the slower
-FP32 diagnostic's quality pass. New remote frontend/media acceptance remains
-pending; no new quality or AUTO qualification is introduced.
+FP32 diagnostic's quality pass. The remote campaign below is separate from that development-host evidence;
+no new quality or AUTO qualification is introduced.
+
+## Remote Studio campaign (2026-09-10)
+
+Native executable source `5e50ef0df7`, Studio inference orchestration
+`10557b383a`, frontend regression `7f76ae57f7`. Four V100 SXM2 32 GB cards,
+TP4, 300 W limits, dynamic clocks; Python 3.12.13, Torch 2.10.0+cu128,
+CUDA 12.8, 62 GiB host RAM, disk-backed DiT/text masters and shared VAEs.
+No GPU power/clock writes were performed. Original FL2VA checkpoint and both
+official Data-Free adapters were downloaded from ModelScope and SHA256-checked.
+
+The UI submits the same paper-boat/yellow-duck prompt, seed 42, 1280x736,
+120 requested frames at 24 FPS, four denoiser intervals. Each mode uses its
+corresponding official adapter, one excluded cold warmup and three measurements.
+Actual output is 124 aligned video frames with audio (about 5.17 seconds).
+
+| Median of three warm UI submissions | Dense / FA | Fast / VSA | Ratio |
+| --- | ---: | ---: | ---: |
+| Complete denoise | 51.578823 s | 29.007658 s | 1.778x |
+| Complete native generation | 122.276137 s | 97.195463 s | 1.258x |
+| Studio submission through result save | 124.251130 s | 99.709044 s | 1.246x |
+
+Measured native request seconds: Dense 122.797036 / 117.617351 / 122.276137;
+VSA 102.989798 / 97.195463 / 95.907317. All four ranks reported the requested
+FA/VSA backend and four DiT calls. Peer residual communication stayed on its
+measured route without a native all-reduce fallback. Warm outputs were bitwise
+repeatable within each mode. This is not Dense/VSA output equivalence or a
+comparison with INT8/LightX2V; VSA still fails the inherited FP32 quality gate.
+
+Native job IDs (measured, in order):
+
+- Dense: `video_16f1c29d6ce7428886270e2368f59c98`,
+  `video_2e48e29f0ebc4e5e8a4be678bec41d9b`,
+  `video_7c36a88bdc7640b4864d62a9136b8c9e`.
+- VSA: `video_febaf428e1bd4b47b05e7d0e54b043ce`,
+  `video_1f94aaa8e9114f389d0cc833f2d9a9f0`,
+  `video_09c73ec3b05343d498fa823dc3009e94`.
+
+The retained `live-browser/results.json` report has SHA256
+`88c62a1a2378099a892a42f1585a4ab253500395a30e65fb55a22e35fde69ee7`.
+All eight outputs pass browser playback/download, full FFmpeg decode and
+frame/dimension/audio checks. Screenshots and frame inspection show playable
+outputs, not numerical quality qualification. Studio retains elapsed time,
+restores the generation button, and references the same saved asset on canvas.
+Cold adapter switching/loading is not included in these warm medians; the
+remote VSA preparation took 944.26 seconds. The workbench exposes preparation
+and generation separately rather than treating loading as denoising speed.
