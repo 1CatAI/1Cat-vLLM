@@ -50,6 +50,36 @@ inference, LMCache eviction, or restart acceptance. The native offloading
 scratch filter does not change the separate LMCache connector path; this PR
 does not claim QSA serving support through LMCache.
 
+### Unmerged LMCache PR compatibility checks
+
+LMCache [#5042](https://github.com/LMCache/LMCache/pull/5042), tested at
+`322fecf84a6cac2d126fb3de3ea91fa5ac177945`, fixes the scratch metadata case:
+all five downstream metadata tests pass with `--runxfail`. Its native
+transfer/shape tests pass on V100 (81 cases), and its native filesystem tests
+pass (two cases). Relevant upstream CPU tests report 119 passed and two
+GLM-specific failures because this fork lacks the newer `tokens_per_state`
+constructor argument.
+
+Real Flash-Next AWQ TP4/FP16-KV/MTP0 initialization nevertheless fails during
+LMCache registration. The new MLA view rule rejects the compressed QSA NHD
+shape `(124, 196, 1, 128)`. This fork represents compression with
+`compress_ratio=4` and `storage_block_size=196`; the rule's legacy fallback
+uses the logical block size 784 instead. A minimal CPU reproducer fails for
+both NHD and HND, while the PR-base group-edits module passes both cases.
+The [upstream test report](https://github.com/LMCache/LMCache/pull/5042#issuecomment-5639817810)
+includes the reproducer. No real-model store/retrieve or MTP acceptance was
+reached. The separate tracker relocation issue addressed by LMCache #5004
+also remains on that head.
+
+LMCache [#5059](https://github.com/LMCache/LMCache/pull/5059), tested at
+`616484d156f2ae97f77ec9fadac27c8e5bbbaa60`, deliberately rejects scratch
+groups. Its 24 related upstream CPU tests and six additional real-fork
+validation cases pass, including direct/wrapped scratch rejection at both
+validation and registration, with attention/Mamba positive controls. The
+[validation report](https://github.com/LMCache/LMCache/pull/5059#issuecomment-5639752221)
+records the scope. Its rejection policy conflicts with #5042's support
+policy; the two heads were tested independently, not combined.
+
 ## CPU filesystem composition test
 
 `tests/v1/kv_offload/cpu/test_grouped_tiering.py` composes one existing
