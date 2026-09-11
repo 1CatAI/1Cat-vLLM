@@ -165,22 +165,27 @@ class CudaGraphManager:
                     "query lengths %s.",
                     self.decode_query_lens,
                 )
-            if (
-                envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
-                and current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
-            ):
-                # The final verifier iterations can contain six or one token
-                # after draft acceptance. Capture those exact uniform B1
-                # shapes so they replay the target graph instead of entering
-                # the eager fallback.
-                self.decode_query_lens = tuple(
-                    dict.fromkeys((*self.decode_query_lens, 6, 1))
-                )
-                logger.info_once(
-                    "Capturing SM70 DFlash2 tail query lengths %s.",
-                    self.decode_query_lens,
-                )
+        self._sm70_dflash2_tail_graphs = bool(
+            envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+            and isinstance(self, ModelCudaGraphManager)
+            and speculative_config is not None
+            and speculative_config.method == "dflash"
+            and decode_query_len == 8
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and not self.compilation_config.pass_config.enable_sp
+        )
+        if self._sm70_dflash2_tail_graphs:
+            # Target verifier tails are independent of adaptive lookup. The
+            # drafter always produces its trained block width and must not
+            # capture these target-only shapes.
+            self.decode_query_lens = tuple(
+                dict.fromkeys((*self.decode_query_lens, *range(7, 0, -1)))
+            )
+            logger.info_once(
+                "Capturing SM70 DFlash2 target tail query lengths %s.",
+                self.decode_query_lens,
+            )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -248,6 +253,14 @@ class CudaGraphManager:
                         query_len <= num_tokens <= self.max_num_reqs * query_len
                         and num_tokens % query_len == 0
                     ):
+                        if (
+                            self._sm70_dflash2_tail_graphs
+                            and query_len < self.decode_query_len
+                            and num_tokens != query_len
+                        ):
+                            # Only single-request tails are admitted. Avoid
+                            # changing batching routes or multiplying captures.
+                            continue
                         desc = BatchExecutionDescriptor(
                             cg_mode=decode_mode,
                             num_tokens=num_tokens,
@@ -426,8 +439,8 @@ class ModelCudaGraphManager(CudaGraphManager):
             BatchExecutionDescriptor, BatchExecutionDescriptor
         ] = {}
         from vllm.v1.attention.ops.sm70_e4m3_long import (
-            MAX_CONTEXT,
             long_attention_enabled,
+            long_attention_graph_contract,
         )
 
         if (
@@ -437,14 +450,21 @@ class ModelCudaGraphManager(CudaGraphManager):
             and self.dp_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
         ):
+            context_limit, query_rows = long_attention_graph_contract()
+            if (
+                self._sm70_dflash2_tail_graphs
+                and envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
+                and context_limit == 262144
+            ):
+                query_rows = (1, *query_rows)
             descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
             for desc in list(descs):
                 if (
                     desc.num_reqs == 1
-                    and desc.uniform_token_count in (1, 6, 8)
+                    and desc.uniform_token_count in query_rows
                     and desc.num_tokens == desc.uniform_token_count
                 ):
-                    variant = replace(desc, attention_context_bucket=MAX_CONTEXT)
+                    variant = replace(desc, attention_context_bucket=context_limit)
                     self._long_attention_graphs[desc] = variant
                     descs.append(variant)
 
@@ -459,6 +479,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         if cpu_upper_bounds.device.type != "cpu" or cpu_upper_bounds.numel() != 1:
             return desc
         upper = int(cpu_upper_bounds[0])
+        if desc.uniform_token_count == 1 and upper < 131072:
+            # The compact scalar route is admitted for long-context tails.
+            # Short q1 uses the ordinary graph and its original attention.
+            return desc
         limit = variant.attention_context_bucket
         if limit is not None and 0 < upper <= limit:
             return variant

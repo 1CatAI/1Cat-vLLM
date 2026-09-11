@@ -2,6 +2,24 @@
 
 Date: 2026-05-30
 
+## DFlash2 TP4 capacity tails, 2026-09-11
+
+[The capacity-tail worklog](sm70_dflash2_tail_graphs_20260911.md) tracks PR596.
+Ordinary q8 DFlash2 did not enter the inherited lookup-only tail capture
+branch. Explicit target B1 q1-q7 graphs and manifest-bounded grouped/scalar
+attention now recover that path while retaining default-off behavior.
+Three independent starts, 96 requests and 48 exact pairs give 37.403 to
+31.335 ms at 261888/256 seed2, including q1/q6/q7 tail cost. Pure decode
+improves 154.899 to 184.953 tokens/s; 1K and 128K differences are under
+0.01 ms. A late short-prefill guard and its separate service check are
+tracked in the worklog; original repeated measurements remain identified.
+
+Do not repeat a capture-placeholder/live-state comparison as a GDN bug:
+PAD_SLOT_ID is intentional and runtime preparation refreshes the captured
+storage. Do not skip draft solely on proposals=0 or discard q1 time from
+the endpoint metric. No arithmetic, capacity guard or scheduler change is
+included. The complete-round 22-ms and attention 7-ms goals remain open.
+
 ## DFlash2 TP2 accepted endpoint, 2026-09-10
 
 The user closed TP2 optimization at **31.884546/29.279787 ms** complete rounds

@@ -1058,6 +1058,62 @@ def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model
     assert meta.num_spec_decodes == 0
 
 
+@pytest.mark.parametrize("query_len", range(1, 9))
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_dflash_tail_capture_matches_runtime_metadata(
+    local_gdn_model, query_len, cache_mode
+):
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=7,
+            use_full_cuda_graph=True,
+            mamba_cache_mode=cache_mode,
+            max_cudagraph_capture_size=8,
+        )
+        for _ in range(2)
+    ]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[262143], query_lens=[query_len]), BLOCK_SIZE, DEVICE
+    ).replace(
+        block_table_tensor=torch.arange(
+            10, 10 + 262144 // BLOCK_SIZE + 8, dtype=torch.int32
+        ).reshape(1, -1)
+    )
+    drafts = torch.tensor([-1 if query_len == 1 else query_len - 1])
+    runtime_kwargs = dict(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=torch.tensor([query_len], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=drafts,
+        common_gdn_metadata=compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=drafts,
+            query_start_loc=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc_cpu,
+            num_spec_state_tokens=7,
+            legacy_mixed_decode_routing=False,
+        ),
+    )
+    runtime = builders[0].build(**runtime_kwargs)
+    captured = builders[1].build_for_cudagraph_capture(common)
+    # Capture deliberately poisons state indices. Runtime preparation must
+    # refresh the same storage referenced by the captured graph.
+    tensor = (
+        captured.non_spec_state_indices_tensor
+        if query_len == 1
+        else captured.spec_state_indices_tensor
+    )
+    pointer = tensor.data_ptr()
+    refreshed = builders[1].build(**runtime_kwargs)
+    refreshed_tensor = (
+        refreshed.non_spec_state_indices_tensor
+        if query_len == 1
+        else refreshed.spec_state_indices_tensor
+    )
+    assert refreshed_tensor.data_ptr() == pointer
+    _assert_gdn_metadata_equal(captured, runtime)
+
+
 def test_full_cuda_graph_capture_keeps_spec_state_selector(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,

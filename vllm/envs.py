@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = False
+    VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
@@ -1882,10 +1883,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST": lambda: os.getenv(
         "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", None
     ),
-    # Capture exact B1 q1/q6 verifier tails for SM70 DFlash2. Default-off keeps
+    # Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. Default-off keeps
     # the existing eager fallback and its memory footprint unchanged.
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "0"))
+    ),
+    "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": lambda: os.getenv(
+        "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None
     ),
     "VLLM_SM70_FP8_PREFILL_CUTLASS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))
