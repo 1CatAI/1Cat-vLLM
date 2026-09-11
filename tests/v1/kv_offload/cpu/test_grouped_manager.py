@@ -221,3 +221,121 @@ def test_private_cpu_allocations_obey_group_budget(monkeypatch):
     assert torch.all(cpu[1][0] == 3)
     assert torch.all(cpu[0][1] == 0)
     assert handlers.cpu_to_gpu_handler.cpu_tensors is cpu
+
+
+def test_grouped_worker_views_share_scheduler_rows(monkeypatch):
+    import uuid
+
+    import vllm.v1.kv_offload.cpu.gpu_worker as worker
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    monkeypatch.setattr(worker, "is_pin_memory_available", lambda: False)
+    monkeypatch.setattr(
+        worker, "SingleDirectionOffloadingHandler", lambda **kw: SimpleNamespace(**kw)
+    )
+    tensor = CanonicalKVCacheTensor(torch.zeros((4, 16), dtype=torch.int8), 16)
+    caches = CanonicalKVCaches(
+        [tensor],
+        [[CanonicalKVCacheRef(0, 16)], [], [CanonicalKVCacheRef(0, 8)]],
+    )
+    scheduler = {}
+    regions = []
+    handlers = []
+    try:
+        for group in (0, 2):
+            instance = f"grouped-worker-test-{uuid.uuid4().hex}"
+            args = dict(
+                instance_id=instance,
+                total_size_bytes=8192,
+                num_blocks=2,
+                num_workers=2,
+                cpu_page_size=2048,
+            )
+            scheduler[group] = SharedOffloadRegion(rank=None, **args)
+            regions.append(
+                {rank: SharedOffloadRegion(rank=rank, **args) for rank in (0, 1)}
+            )
+        for rank in (0, 1):
+            handler = worker.CpuGpuOffloadingHandlers(
+                caches,
+                2,
+                2,
+                group_page_sizes={0: 2048, 2: 2048},
+                group_mmap_regions={g: regions[i][rank] for i, g in enumerate((0, 2))},
+            )
+            handlers.append(handler)
+            for i, cpu in enumerate(handler.gpu_to_cpu_handler.cpu_tensors):
+                assert cpu.stride() == (4096, 1)
+                cpu[1].fill_(10 + rank + i * 20)
+        for i, group in enumerate((0, 2)):
+            with scheduler[group].create_kv_memoryview().cast("B") as view:
+                for rank in (0, 1):
+                    offset = 4096 + rank * 2048
+                    assert (
+                        bytes(view[offset : offset + 32])
+                        == bytes([10 + rank + i * 20]) * 32
+                    )
+                    view[offset : offset + 32] = bytes([90 + rank]) * 32
+            for rank in (0, 1):
+                assert torch.all(
+                    handlers[rank].gpu_to_cpu_handler.cpu_tensors[i][1] == 90 + rank
+                )
+    finally:
+        for handler in handlers:
+            handler.gpu_to_cpu_handler.cpu_tensors.clear()
+        for group_regions in regions:
+            for region in group_regions.values():
+                region.cleanup()
+        for region in scheduler.values():
+            region.cleanup()
+
+
+@pytest.mark.parametrize("failure", ["pin", "view", "handler"])
+def test_grouped_worker_initialization_failure_releases_regions(monkeypatch, failure):
+    import uuid
+    from pathlib import Path
+
+    import vllm.v1.kv_offload.cpu.gpu_worker as worker
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected initialization failure")
+
+    tensor = CanonicalKVCacheTensor(torch.zeros((4, 16), dtype=torch.int8), 16)
+    caches = CanonicalKVCaches(
+        [tensor], [[CanonicalKVCacheRef(0, 16)], [], [CanonicalKVCacheRef(0, 16)]]
+    )
+    regions = {
+        group: SharedOffloadRegion(
+            instance_id=f"grouped-failure-test-{uuid.uuid4().hex}",
+            total_size_bytes=4096,
+            num_blocks=2,
+            rank=0,
+            num_workers=1,
+            cpu_page_size=2048,
+        )
+        for group in (0, 2)
+    }
+    mappings = [region.mmap_obj for region in regions.values()]
+    monkeypatch.setattr(worker, "is_pin_memory_available", lambda: failure == "pin")
+    monkeypatch.setattr(worker, "pin_mmap_region", fail)
+    monkeypatch.setattr(worker, "SingleDirectionOffloadingHandler", fail)
+    if failure == "view":
+        monkeypatch.setattr(regions[2], "create_next_view", fail)
+    try:
+        with pytest.raises(RuntimeError, match="injected initialization failure"):
+            worker.CpuGpuOffloadingHandlers(
+                caches,
+                2,
+                2,
+                group_page_sizes={0: 2048, 2: 2048},
+                group_mmap_regions=regions,
+            )
+        assert all(mapping.closed for mapping in mappings)
+        for region in regions.values():
+            assert region.fd is None
+            assert region.mmap_obj is None
+            assert not Path(region.mmap_path).exists()
+    finally:
+        for region in regions.values():
+            region.cleanup()

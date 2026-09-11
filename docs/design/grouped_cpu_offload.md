@@ -50,9 +50,13 @@ and FileMapper identify persisted data independently of those locations.
 
 This test is a scheduler/storage composition proof. It is not an implementation
 of grouped tiering in `TieringOffloadingSpec`, which still requires a single
-group. The GPU worker's grouped CPU path still uses private tensors and rejects
-mmap backing. Keep these guards until the worker integration is implemented and
-validated.
+group. The GPU worker now accepts explicit per-group mmap regions and uses the
+existing strided views for each worker slice. CPU tests verify writes in both
+directions against the scheduler mapping. The spec does not yet construct these
+regions for serving. Worker initialization failures release all supplied regions;
+CPU fault-injection tests check closed mappings and removed files. Spec-side
+partial initialization cleanup and GPU validation remain required before
+removing the serving guard.
 
 Before enabling grouped tiering in serving:
 
