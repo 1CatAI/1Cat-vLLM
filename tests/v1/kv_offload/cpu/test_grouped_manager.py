@@ -86,6 +86,10 @@ def test_group_pool_lifecycle_and_order(policy):
     m.touch([keys[0]], CTX)
     out = store(m, [key(5, 4)])
     assert out.evicted_keys == [keys[2]]
+    # Eviction recycles the old slot within the bounded group pool.
+    assert list(out.store_spec.block_ids) == [1]
+    assert m.lookup(keys[0], CTX) is True
+    assert m.lookup(keys[2], CTX) is False
     assert m.lookup(keys[1], CTX) is True
     assert list(m.take_events())
     assert not list(m.take_events())
