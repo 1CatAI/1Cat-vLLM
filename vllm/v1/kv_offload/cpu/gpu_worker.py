@@ -126,6 +126,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         mmap_region: SharedOffloadRegion | None = None,
+        group_mmap_regions: dict[int, SharedOffloadRegion] | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -171,6 +172,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.transfer_type = ("GPU", "CPU") if self.gpu_to_cpu else ("CPU", "GPU")
         # mmap_region to clean up on shutdown (gpu_to_cpu handler owns it)
         self._mmap_region = mmap_region
+        self._group_mmap_regions = dict(group_mmap_regions or {})
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
@@ -389,6 +391,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         if self._mmap_region is not None:
             self._mmap_region.cleanup()
             self._mmap_region = None
+        for region in self._group_mmap_regions.values():
+            region.cleanup()
+        self._group_mmap_regions.clear()
 
 
 def partition_kv_caches(
@@ -438,61 +443,96 @@ class CpuGpuOffloadingHandlers:
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
         group_page_sizes: dict[int, int] | None = None,
+        group_mmap_regions: dict[int, SharedOffloadRegion] | None = None,
     ):
-        if group_page_sizes is not None:
-            assert mmap_region is None, "Grouped CPU pools do not use tiering mmap"
-            kv_caches = partition_kv_caches(
-                kv_caches, group_page_sizes, block_size_factor
-            )
-        pin_memory = is_pin_memory_available()
-        logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
-        self._mmap_region = mmap_region
-        if mmap_region is not None and pin_memory:
-            pin_mmap_region(mmap_region)
-
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
-        for kv_cache_tensor in kv_caches.tensors:
-            gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
-            gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
-                (-1, gpu_page_size_bytes)
+        cpu_tensor: torch.Tensor | None = None
+        try:
+            if group_page_sizes is not None:
+                assert mmap_region is None, (
+                    "Grouped pools require per-group mmap regions"
+                )
+                kv_caches = partition_kv_caches(
+                    kv_caches, group_page_sizes, block_size_factor
+                )
+            tensor_regions: dict[int, SharedOffloadRegion] = {}
+            if group_mmap_regions is not None:
+                assert group_page_sizes is not None
+                assert set(group_mmap_regions) == set(group_page_sizes)
+                for group_idx, region in group_mmap_regions.items():
+                    assert region.num_blocks == num_cpu_blocks
+                    assert region.rank is not None
+                    assert (
+                        region._worker_area_end - region._worker_offset
+                        == (group_page_sizes[group_idx])
+                    )
+                    for ref in kv_caches.group_data_refs[group_idx]:
+                        tensor_regions[ref.tensor_idx] = region
+            pin_memory = is_pin_memory_available()
+            logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
+            self._mmap_region = mmap_region
+            if mmap_region is not None and pin_memory:
+                pin_mmap_region(mmap_region)
+
+            if pin_memory and group_mmap_regions:
+                for region in group_mmap_regions.values():
+                    pin_mmap_region(region)
+
+            for tensor_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
+                gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
+                gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
+                    (-1, gpu_page_size_bytes)
+                )
+                cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
+
+                tensor_region = tensor_regions.get(tensor_idx, mmap_region)
+                if tensor_region is not None:
+                    cpu_tensor = tensor_region.create_next_view(cpu_page_size_bytes)
+                else:
+                    t0 = time.monotonic()
+                    cpu_tensor = torch.zeros(
+                        (num_cpu_blocks, cpu_page_size_bytes),
+                        dtype=torch.int8,
+                        device="cpu",
+                        pin_memory=pin_memory,
+                    )
+                    logger.debug(
+                        "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
+                        num_cpu_blocks,
+                        cpu_page_size_bytes,
+                        num_cpu_blocks * cpu_page_size_bytes / 1e9,
+                        time.monotonic() - t0,
+                    )
+
+                gpu_tensors.append(gpu_tensor)
+                cpu_tensors.append(cpu_tensor)
+
+            self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
+                gpu_tensors=gpu_tensors,
+                cpu_tensors=cpu_tensors,
+                block_size_factor=block_size_factor,
+                kv_cache_groups_data_refs=kv_caches.group_data_refs,
+                gpu_to_cpu=True,
+                mmap_region=mmap_region,
+                group_mmap_regions=group_mmap_regions,
             )
-            cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
+            self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
+                gpu_tensors=gpu_tensors,
+                cpu_tensors=cpu_tensors,
+                block_size_factor=block_size_factor,
+                kv_cache_groups_data_refs=kv_caches.group_data_refs,
+                gpu_to_cpu=False,
+            )
+        except Exception:
+            # No transfers can have been submitted before construction returns.
+            # Drop tensor views before releasing shared mappings and registration.
+            cpu_tensor = None
+            cpu_tensors.clear()
+            gpu_tensors.clear()
             if mmap_region is not None:
-                cpu_tensor = mmap_region.create_next_view(cpu_page_size_bytes)
-            else:
-                t0 = time.monotonic()
-                cpu_tensor = torch.zeros(
-                    (num_cpu_blocks, cpu_page_size_bytes),
-                    dtype=torch.int8,
-                    device="cpu",
-                    pin_memory=pin_memory,
-                )
-                logger.debug(
-                    "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
-                    num_cpu_blocks,
-                    cpu_page_size_bytes,
-                    num_cpu_blocks * cpu_page_size_bytes / 1e9,
-                    time.monotonic() - t0,
-                )
-
-            gpu_tensors.append(gpu_tensor)
-            cpu_tensors.append(cpu_tensor)
-
-        self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors,
-            cpu_tensors=cpu_tensors,
-            block_size_factor=block_size_factor,
-            kv_cache_groups_data_refs=kv_caches.group_data_refs,
-            gpu_to_cpu=True,
-            mmap_region=mmap_region,
-        )
-
-        self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors,
-            cpu_tensors=cpu_tensors,
-            block_size_factor=block_size_factor,
-            kv_cache_groups_data_refs=kv_caches.group_data_refs,
-            gpu_to_cpu=False,
-        )
+                mmap_region.cleanup()
+            for region in (group_mmap_regions or {}).values():
+                region.cleanup()
+            raise
