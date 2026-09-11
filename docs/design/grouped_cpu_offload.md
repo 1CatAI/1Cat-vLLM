@@ -88,10 +88,63 @@ a separate backend policy; the bounded LRU/ARC budget applies to RAM. Cache
 files must be isolated when model weights or their physical representation
 change, including replacing weights in place under the same model path.
 
+### Complete-image regression
+
+A clean native build at `0f0139b23d` was packaged with the matching Python
+source; all 1,954 packaged Python/native files were hash-verified before each
+server start. The image used CUDA 12.8, Torch 2.10.0+cu128, and V100/SM70.
+No runtime source overlay was used.
+
+On Flash-Next AWQ, TP4, FP16 KV, a 4 GiB CPU budget and CUDA Graphs, MTP0
+and MTP3 each passed six RAM requests with 16,000-token contexts. Clearing GPU
+prefix state before each request exposed 15,680 external tokens with MTP0 and
+15,200 with MTP3 on a repeat. After distinct
+B/C contexts exceeded RAM capacity, C still hit while the older A had zero
+external hits. Cold, restored and recomputed output token IDs matched exactly, including
+across MTP0/MTP3. MTP3 drafted and accepted tokens during these requests.
+
+The same complete image passed MTP0 filesystem restart and capacity pressure:
+a fresh reader restored 15,680 tokens with zero local hits and the writer's
+identical eight output token IDs. After two more approximately 16K contexts,
+A restored with the same hit count and output IDs. Writer and reader both
+exited zero and removed all five group mmap files.
+
+After the host-registration error handling follow-up at `9c47de86a6`, a new
+complete image with unchanged native sources passed MTP3 filesystem restart
+and pressure. Both restored A requests had 15,200 external tokens, zero local
+hits and the writer's identical eight output token IDs; each reported six
+drafted and six accepted tokens. The writer and reader both exited zero and removed all five
+mmap files. These images contain the complete matching Python source and
+verified native artifacts; no runtime source overlay was used.
+
+The ordinary single-group regression used Qwen3-0.6B on one V100 with FP16,
+CUDA Graphs and a 256 MiB CPU budget. Three distinct 1,597-token prompts served
+with offload disabled established the baseline. With native CPU offload enabled,
+a repeat restored 1,584 tokens; after B/C pressure, recent C still hit and old A
+missed. All 24 generated token IDs matched the corresponding disabled-offload
+baseline. GPU prefix state was reset between requests.
+
 LMCache is an alternative connector path with its own cache objects and
 backends. Keeping the public connector contract compatible enables evaluating
 that path; it does not imply that LMCache can read native FS files or attach
 directly to the native group pools.
+
+## Host registration failures
+
+Shared mmap regions must be successfully registered with `cudaHostRegister`
+before native batch KV transfers can use them. An MTP3 filesystem startup
+exposed a registration failure: the previous warning-and-continue branch left
+a CUDA error pending and the next unrelated kernel failed. A separate GPU
+probe also confirmed that the native batch transfer rejected unregistered host
+memory. Registration failure now raises immediately with rank, path, size and
+error code, using the existing construction cleanup path, consistent with the
+other native CPU offload path. It does not introduce a pageable-memory transfer
+fallback or guarantee that host memory registration always succeeds.
+
+The follow-up CPU regression passed 167 tests with two skips, including
+registration error codes 1/2 and partial-construction cleanup. Four-GPU probes
+also passed 100 registrations of five shared regions per process over five
+iterations; this does not establish the cause of the one serving-time failure.
 
 ## Reproducible block keys across restarts
 
