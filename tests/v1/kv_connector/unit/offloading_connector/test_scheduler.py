@@ -836,7 +836,11 @@ def _make_exact_boundary_scheduler() -> OffloadingConnectorScheduler:
         block_size_factor=1,
         num_workers=1,
         offload_prompt_only=False,
+        num_kv_cache_groups=2,
     )
+    scheduler._group_config_by_idx = {
+        group.group_idx: group for group in scheduler.config.kv_group_configs
+    }
     scheduler.manager = MagicMock(spec=OffloadingManager)
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
@@ -1498,3 +1502,162 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
             (1, 7),
         ),
     )
+
+
+def _make_scratch_scheduler():
+    from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+    kv_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["ring"],
+                CircularBufferSpec(
+                    block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    config = MagicMock()
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.world_size = 1
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.block_size = 16
+    config.cache_config.hash_block_size = None
+    config.kv_transfer_config.kv_connector_extra_config = {"offload_prompt_only": False}
+    spec = MockOffloadingSpec(config, kv_config)
+    scheduler = OffloadingConnectorScheduler(spec)
+    scheduler.manager.prepare_store.side_effect = lambda keys, ctx: (
+        generate_store_output(keys)
+    )
+    req = MagicMock()
+    req.request_id = "scratch"
+    req.kv_transfer_params = None
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(4)]
+    req.num_computed_tokens = 0
+    req.num_prompt_tokens = req.num_tokens = 16
+    req.is_finished.return_value = False
+    scheduler.on_new_request(req)
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    state.update_block_id_groups(([11], [31], [21]))
+    return scheduler, req, spec
+
+
+def test_scratch_group_config_and_keys_preserve_original_indices():
+    scheduler, req, spec = _make_scratch_scheduler()
+    assert spec.gpu_block_size == (16, 4, 16)
+    assert [g.group_idx for g in scheduler.config.kv_group_configs] == [0, 2]
+    assert scheduler._lookup_groups == (0, 2)
+    state = scheduler._req_status[req.request_id]
+    assert len(state.group_states) == 3
+    assert state.group_states[1].offload_keys == []
+    assert len(state.group_states[2].offload_keys) == 1
+    assert scheduler.config.kv_group_configs[1].requires_exact_boundary_source
+
+
+def test_scratch_group_normal_store_keeps_full_worker_layout():
+    scheduler, req, _ = _make_scratch_scheduler()
+    jobs = scheduler._build_store_jobs(
+        _empty_store_output(
+            scheduled_new_reqs=[SimpleNamespace(req_id=req.request_id, block_ids=None)],
+            num_scheduled_tokens={req.request_id: 16},
+        )
+    )
+    [job] = jobs.values()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [11]
+    assert src.group_sizes == [1, 0, 0]
+    assert src.block_indices == [0, 0, 0]
+
+
+def test_scratch_group_boundary_store_keeps_source_and_fence():
+    scheduler, req, _ = _make_scratch_scheduler()
+    jobs = scheduler._build_boundary_state_store_jobs(
+        _empty_store_output(
+            num_scheduled_tokens={req.request_id: 16},
+            boundary_state_offloads={req.request_id: [(2, 99, 16)]},
+        )
+    )
+    [(job_id, job)] = jobs.items()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [99]
+    assert src.group_sizes == [0, 0, 1]
+    assert src.block_indices == [0, 0, 0]
+    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
+
+
+def test_scratch_group_load_keeps_full_worker_layout():
+    scheduler, req, _ = _make_scratch_scheduler()
+    blocks = SimpleNamespace(
+        blocks=tuple(
+            [SimpleNamespace(block_id=i, is_null=False, block_hash=None)]
+            for i in (11, 31, 21)
+        )
+    )
+    scheduler.update_state_after_alloc(req, blocks, 16)
+    [job] = scheduler._current_batch_load_jobs.values()
+    _, dst = job.transfer_spec
+    assert dst.block_ids.tolist() == [11, 21]
+    assert dst.group_sizes == [1, 0, 1]
+    assert dst.block_indices == [0, 0, 0]
+
+
+def test_scratch_group_lookup_and_touch_skip_ring():
+    scheduler, req, _ = _make_scratch_scheduler()
+    req.num_tokens = 17
+    scheduler.manager.lookup.return_value = True
+    state = scheduler._req_status[req.request_id]
+    assert scheduler._lookup(state) == 16
+    scheduler._touch(state)
+    assert not state.group_states[1].offload_keys
+    state.advance_stored_idx(16)
+    state.update_num_hit_blocks(16)
+    assert state.group_states[1].num_hit_blocks == 0
+    assert state.group_states[2].num_hit_blocks == 1
+
+
+@pytest.mark.parametrize("resolved_hash", [4, 16])
+def test_scratch_group_explicit_offload_block_size(monkeypatch, resolved_hash):
+    from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
+
+    _, _, original = _make_scratch_scheduler()
+    config = original.vllm_config
+    config.kv_transfer_config.kv_connector_extra_config["block_size"] = 32
+    # Exercise the offload contract independently of core hash-size policy.
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.base.resolve_kv_cache_block_sizes",
+        lambda *_: (16, resolved_hash),
+    )
+    spec = MockOffloadingSpec(config, original.kv_cache_config)
+    assert spec.block_size_factor == 2
+    assert spec.gpu_block_size == (16, 4, 16)
+
+
+def test_cacheable_misalignment_still_rejected(monkeypatch):
+    from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
+
+    _, _, original = _make_scratch_scheduler()
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.base.resolve_kv_cache_block_sizes", lambda *_: (32, 32)
+    )
+    with pytest.raises(AssertionError, match="not divisible"):
+        MockOffloadingSpec(original.vllm_config, original.kv_cache_config)
