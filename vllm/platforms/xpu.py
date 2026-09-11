@@ -138,7 +138,7 @@ class XPUPlatform(Platform):
     @classmethod
     def get_device_capability(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> DeviceCapability | None:
         # capacity format differs from cuda's and will cause unexpected
         # failure, so use None directly
