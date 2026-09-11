@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from typing import Literal
 
 from vllm.v1.kv_offload.base import (
@@ -9,6 +9,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingManager,
     OffloadKey,
+    OffloadPolicy,
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
@@ -253,11 +254,26 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     repeat across groups; the GPU transfer spec carries the original group ID.
     """
 
-    def __init__(self, managers: dict[int, CPUOffloadingManager]):
+    def __init__(self, managers: Mapping[int, OffloadingManager]):
         self.managers = managers
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        return RequestOffloadingContext()
+        contexts = [m.on_new_request(req_context) for m in self.managers.values()]
+        return RequestOffloadingContext(
+            policy=(
+                OffloadPolicy.REQUEST_LEVEL
+                if any(c.policy == OffloadPolicy.REQUEST_LEVEL for c in contexts)
+                else OffloadPolicy.BLOCK_LEVEL
+            )
+        )
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        for manager in self.managers.values():
+            manager.on_request_finished(req_context)
+
+    def shutdown(self) -> None:
+        for manager in self.managers.values():
+            manager.shutdown()
 
     def _partition(self, keys: Collection[OffloadKey]) -> dict[int, list[OffloadKey]]:
         groups: dict[int, list[OffloadKey]] = {}
