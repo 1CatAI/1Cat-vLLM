@@ -351,3 +351,28 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, inva
     cache.num_blocks *= 2
     cache.kv_cache_tensors[0].size *= 2
     assert spec_module.TieringOffloadingSpec(config, cache).persistent_layout == layout
+
+
+def test_scheduler_unlinks_region_created_by_worker():
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    args = dict(
+        instance_id=f"scheduler-unlink-test-{uuid.uuid4().hex}",
+        total_size_bytes=4096,
+        num_blocks=1,
+        num_workers=1,
+        cpu_page_size=4096,
+    )
+    worker = SharedOffloadRegion(rank=0, **args)
+    scheduler = SharedOffloadRegion(rank=None, **args)
+    try:
+        assert worker._creator and not scheduler._creator
+        scheduler.cleanup()
+        assert not Path(worker.mmap_path).exists()
+        # Unlink does not invalidate an already open worker mapping.
+        assert worker.mmap_obj is not None and not worker.mmap_obj.closed
+        worker.cleanup()
+        scheduler.cleanup()
+    finally:
+        worker.cleanup()
+        scheduler.cleanup()
