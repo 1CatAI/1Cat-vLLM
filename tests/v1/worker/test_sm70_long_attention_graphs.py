@@ -67,3 +67,19 @@ def test_disabled_operator_preserves_original_binding(monkeypatch):
         raise AssertionError("Binding inspection must not launch an operator")
 
     assert wrap_long_attention(original) is original
+
+
+@pytest.mark.parametrize("query_len", [1, 6, 8])
+def test_tail_shapes_use_bounded_graph(query_len):
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, query_len, 1, query_len)
+    bounded = replace(ordinary, attention_context_bucket=MAX_CONTEXT)
+    manager._long_attention_graphs = {ordinary: bounded}
+    manager.graphs = {ordinary: object(), bounded: object()}
+    assert (
+        manager.select_attention_graph(ordinary, torch.tensor([MAX_CONTEXT])) == bounded
+    )
+    assert (
+        manager.select_attention_graph(ordinary, torch.tensor([MAX_CONTEXT + 1]))
+        == ordinary
+    )

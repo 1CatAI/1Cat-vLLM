@@ -165,6 +165,22 @@ class CudaGraphManager:
                     "query lengths %s.",
                     self.decode_query_lens,
                 )
+            if (
+                envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+                and current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+            ):
+                # The final verifier iterations can contain six or one token
+                # after draft acceptance. Capture those exact uniform B1
+                # shapes so they replay the target graph instead of entering
+                # the eager fallback.
+                self.decode_query_lens = tuple(
+                    dict.fromkeys((*self.decode_query_lens, 6, 1))
+                )
+                logger.info_once(
+                    "Capturing SM70 DFlash2 tail query lengths %s.",
+                    self.decode_query_lens,
+                )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -203,10 +219,10 @@ class CudaGraphManager:
             # B1 short verification can still replay a graph when
             # max_num_seqs=1.
             if len(self.decode_query_lens) > 1:
-                short_query_len = min(self.decode_query_lens)
-                if short_query_len not in self._capture_sizes:
-                    self._capture_sizes.append(short_query_len)
-                    self._capture_sizes.sort()
+                for query_len in self.decode_query_lens:
+                    if query_len not in self._capture_sizes:
+                        self._capture_sizes.append(query_len)
+                self._capture_sizes.sort()
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -423,10 +439,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         ):
             descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
             for desc in list(descs):
-                if (desc.num_tokens, desc.num_reqs, desc.uniform_token_count) == (
-                    8,
-                    1,
-                    8,
+                if (
+                    desc.num_reqs == 1
+                    and desc.uniform_token_count in (1, 6, 8)
+                    and desc.num_tokens == desc.uniform_token_count
                 ):
                     variant = replace(desc, attention_context_bucket=MAX_CONTEXT)
                     self._long_attention_graphs[desc] = variant
