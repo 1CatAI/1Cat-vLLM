@@ -21,6 +21,35 @@ The regular CPU manager and transfer implementation are not duplicated.
 This is source-level interface compatibility. It does not certify any
 particular LMCache release with this fork, model, or GPU stack.
 
+### External LMCache metadata validation
+
+`tests/v1/kv_connector/unit/test_lmcache_group_metadata.py` optionally loads
+the real LMCache group converter and native extension, using this fork's
+`KVCacheConfig` and spec classes with small synthetic CPU tensors. It checks
+engine IDs, layer mapping, recurrent windows, DCP token spans, and block-ID
+routing. It skips when the optional LMCache dependency is absent.
+
+Against LMCache `b5d109ea99a89b4d8a670ee4fc2e8cb76411ee5c`, four dense/hybrid
+metadata cases pass. The QSA scratch-exclusion case is a **known failure**,
+recorded with strict xfail: LMCache returns engine groups `[0, 1, 2]` for
+attention/scratch/Mamba, rather than excluding scratch while retaining IDs
+`[0, 2]`. Its converter does not honor `prefix_cacheable=False`. The converter
+file is unchanged in LMCache dev `fcb67c0ab1db2a4bad78e085b3a2df33da003b7c`.
+An unexpected pass deliberately fails the test so this limitation can be
+reassessed after a third-party update.
+
+Run in an environment with the compiled LMCache dependency installed:
+
+```bash
+.venv/bin/python -m pytest --noconftest -q -rx \
+  tests/v1/kv_connector/unit/test_lmcache_group_metadata.py
+```
+
+This is metadata compatibility evidence, not GPU transfer, real-model
+inference, LMCache eviction, or restart acceptance. The native offloading
+scratch filter does not change the separate LMCache connector path; this PR
+does not claim QSA serving support through LMCache.
+
 ## CPU filesystem composition test
 
 `tests/v1/kv_offload/cpu/test_grouped_tiering.py` composes one existing
