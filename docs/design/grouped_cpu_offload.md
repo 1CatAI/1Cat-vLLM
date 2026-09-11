@@ -48,15 +48,20 @@ and FileMapper identify persisted data independently of those locations.
 
 ## Serving gate and remaining work
 
-This test is a scheduler/storage composition proof. It is not an implementation
-of grouped tiering in `TieringOffloadingSpec`, which still requires a single
-group. The GPU worker now accepts explicit per-group mmap regions and uses the
-existing strided views for each worker slice. CPU tests verify writes in both
-directions against the scheduler mapping. The spec does not yet construct these
-regions for serving. Worker initialization failures release all supplied regions;
-CPU fault-injection tests check closed mappings and removed files. Spec-side
-partial initialization cleanup and GPU validation remain required before
-removing the serving guard.
+The composition test now enters `TieringOffloadingSpec.get_manager()`. The spec
+creates one primary/secondary manager per group and binds worker tensors to
+matching shared regions. Construction unwinds partially created tiers and
+mappings on failure. The grouped path requires single-node TP and an explicitly
+selected attention backend; other layouts retain their existing path.
+
+FileMapper accepts optional persistent layout metadata. Grouped tiering supplies
+a version tag, the existing vLLM configuration hash, attention backend, model
+revision, group page sizes, and physical tensor order/sharing information.
+Legacy paths are unchanged when no layout metadata is supplied. This separates
+group-row files from old full-row files without changing the FS byte format.
+
+These are CPU validations. The new serving path still requires GPU acceptance,
+including verification that layout metadata captures the actual worker format.
 
 Before enabling grouped tiering in serving:
 

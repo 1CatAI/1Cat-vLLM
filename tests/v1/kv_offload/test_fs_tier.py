@@ -47,6 +47,7 @@ _MOCK_OFFLOADING_SPEC = MagicMock()
 _MOCK_OFFLOADING_SPEC.vllm_config = _MOCK_VLLM_CONFIG
 _MOCK_OFFLOADING_SPEC.kv_cache_config = _MOCK_KV_CACHE_CONFIG
 _MOCK_OFFLOADING_SPEC.block_size_factor = 1
+_MOCK_OFFLOADING_SPEC.persistent_layout = None
 
 
 def key(n: int) -> OffloadKey:
