@@ -94,11 +94,12 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
+        # The batch transfer path requires registered host memory. Continuing
+        # also leaves the CUDA error pending for an unrelated later kernel.
+        raise RuntimeError(
+            f"cudaHostRegister failed for rank={rank}, "
+            f"region={region.mmap_path}, bytes={region.total_size_bytes} "
+            f"(code={result.value}); KV batch transfers require pinned memory"
         )
     else:
         logger.debug(

@@ -30,6 +30,32 @@ CTX = ReqContext("test")
 GROUPS = (0, 2, 3, 4, 5)
 
 
+@pytest.mark.parametrize("error_code", [1, 2])
+def test_mmap_registration_failure_is_fatal(monkeypatch, error_code):
+    from vllm.v1.kv_offload.cpu import gpu_worker as worker
+
+    region = SimpleNamespace(
+        rank=3,
+        mmap_path="/dev/shm/test-offload.mmap",
+        total_size_bytes=4096,
+        _base=torch.zeros(4096, dtype=torch.int8),
+        is_pinned=False,
+    )
+    calls = []
+
+    def register(ptr, size, flags):
+        calls.append((ptr, size, flags))
+        return SimpleNamespace(value=error_code)
+
+    monkeypatch.setattr(
+        torch.cuda, "cudart", lambda: SimpleNamespace(cudaHostRegister=register)
+    )
+    with pytest.raises(RuntimeError, match="KV batch transfers require pinned memory"):
+        worker.pin_mmap_region(region)
+    assert calls == [(region._base.data_ptr(), 4096, 0)]
+    assert not region.is_pinned
+
+
 def key(group, index):
     return make_offload_key(index.to_bytes(8, "big"), group)
 
