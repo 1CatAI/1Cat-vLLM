@@ -84,3 +84,12 @@ LMCache is an alternative connector path with its own cache objects and
 backends. Keeping the public connector contract compatible enables evaluating
 that path; it does not imply that LMCache can read native FS files or attach
 directly to the native group pools.
+
+## Reproducible block keys across restarts
+
+Set a fixed `PYTHONHASHSEED` (for example, `PYTHONHASHSEED=0`) before starting
+both the writer and reader engines, and retain the same prefix hashing
+algorithm. vLLM initializes the prefix chain's first hash from random bytes when
+this variable is absent. Matching file layout metadata alone therefore cannot
+produce restart hits: the same prompt will have different block keys. Use the
+existing seed configuration; do not replace vLLM's hashing algorithm.
