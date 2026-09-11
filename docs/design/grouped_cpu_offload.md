@@ -60,25 +60,33 @@ revision, group page sizes, and physical tensor order/sharing information.
 Legacy paths are unchanged when no layout metadata is supplied. This separates
 group-row files from old full-row files without changing the FS byte format.
 
-These are CPU validations. The new serving path still requires GPU acceptance,
-including verification that layout metadata captures the actual worker format.
+## Validation scope
 
-Before enabling grouped tiering in serving:
+CPU tests cover scheduler/worker shared views, independent group rows,
+noncontiguous group IDs, different destination slots after restart, capacity
+pressure, truncated-file isolation, and partial construction cleanup.
+The related connector, CPU, shared-region, tiering, FileMapper and FS regression
+suite passed 165 tests with two skips. Legacy FS tests used buffered I/O because
+their ordinary Torch buffers were not O_DIRECT-aligned; the grouped mmap/spawn
+cases retained real O_DIRECT.
 
-1. Bind the grouped worker tensors to the same per-group shared regions used
-   by the scheduler, preserving TP rank slices, completion fences, and the total
-   CPU byte budget. Verify cleanup after partial initialization failures.
-2. Define an explicit persistent layout namespace. Existing group tags prevent
-   cross-group collisions, but do not by themselves distinguish legacy full-row
-   files from new group-row files or every physical-layout change. Do not read
-   old incompatible bytes just because their content hash matches. Reuse the
-   backend format with a distinct, validated configuration namespace.
-3. Validate GPU -> RAM -> filesystem -> fresh process -> RAM -> GPU with real
-   model output checks, Mamba boundaries, MTP, and eviction pressure. CPU byte
-   equality alone cannot establish inference correctness.
-4. Define storage capacity/cleanup and crash-durability requirements separately.
-   Process-restart reuse is not a power-loss durability guarantee, and a real
-   temporary filesystem test is not an SSD throughput benchmark.
+On four V100 GPUs with Flash-Next AWQ, TP4 and CUDA Graphs, fresh-process
+restoration of a 16,000-token prompt restored 15,680 tokens with MTP disabled
+and 15,200 with MTP3. Local prefix hits were zero. Both restored outputs matched
+the writer's eight output token IDs exactly. MTP3 reported six drafted and six
+accepted tokens. Additional distinct approximately 16K prompts exceeded the
+4 GiB CPU budget; after resetting GPU prefix state, the original prompt still
+restored with the same external-hit count and identical output token IDs.
+MTP3 writer and reader shutdowns removed all five group mmap files.
+
+The GPU runs used the Python implementation at `2b98bec016` over a verified
+`b8aa829785` image, rather than a full rebuilt image. File storage was NFS.
+These tests establish the tested restart/pressure path, not SSD throughput,
+power-loss durability, arbitrary backend/layout interoperability, or maximum
+production context acceptance. Persistent disk quota/garbage collection remains
+a separate backend policy; the bounded LRU/ARC budget applies to RAM. Cache
+files must be isolated when model weights or their physical representation
+change, including replacing weights in place under the same model path.
 
 LMCache is an alternative connector path with its own cache objects and
 backends. Keeping the public connector contract compatible enables evaluating
@@ -93,3 +101,17 @@ algorithm. vLLM initializes the prefix chain's first hash from random bytes when
 this variable is absent. Matching file layout metadata alone therefore cannot
 produce restart hits: the same prompt will have different block keys. Use the
 existing seed configuration; do not replace vLLM's hashing algorithm.
+
+## Shutdown and resource lifetime
+
+For file-backed serving, allow normal engine shutdown to finish, for example
+with `--shutdown-timeout 60`, and give the container runtime a longer stop grace
+period. A zero engine shutdown timeout can terminate the process before its
+scheduler cleanup runs. The scheduler performs final unlink even when a worker
+created a shared region first; already open mappings remain valid until closed.
+
+The TP4/MTP3 GPU test verified exit code zero and removal of all five group mmap
+files with a 60-second engine timeout and a 90-second container stop grace.
+SIGKILL, host failure, or an insufficient stop grace can still leave files in
+`/dev/shm`; this is not a crash-recovery mechanism. Never delete a live instance's
+shared regions while treating them as stale cache files.
