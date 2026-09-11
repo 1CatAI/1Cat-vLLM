@@ -1504,7 +1504,7 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
     )
 
 
-def _make_scratch_scheduler():
+def _make_scratch_scheduler(*, full_attention_only=False):
     from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
     from vllm.v1.kv_cache_interface import CircularBufferSpec
 
@@ -1531,6 +1531,10 @@ def _make_scratch_scheduler():
                     shapes=((1, 1),),
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
+                )
+                if not full_attention_only
+                else FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
                 ),
             ),
         ],
@@ -1661,3 +1665,34 @@ def test_cacheable_misalignment_still_rejected(monkeypatch):
     )
     with pytest.raises(AssertionError, match="not divisible"):
         MockOffloadingSpec(original.vllm_config, original.kv_cache_config)
+
+
+@pytest.mark.parametrize("blocked_group", [0, 2])
+def test_grouped_deferred_store_preserves_scheduler_retry(blocked_group):
+    from vllm.v1.kv_offload.base import make_offload_key
+    from vllm.v1.kv_offload.cpu.manager import (
+        CPUOffloadingManager,
+        GroupedCPUOffloadingManager,
+    )
+
+    scheduler, req, _ = _make_scratch_scheduler(full_attention_only=True)
+    manager = GroupedCPUOffloadingManager({g: CPUOffloadingManager(1) for g in (0, 2)})
+    scheduler.manager = manager
+    state = scheduler._req_status[req.request_id]
+    ctx = state.req_context
+    pinned = make_offload_key(b"pinned", blocked_group)
+    manager.prepare_store([pinned], ctx)
+    manager.complete_store([pinned], ctx)
+    manager.prepare_load([pinned], ctx)
+    output = _empty_store_output(
+        scheduled_new_reqs=[SimpleNamespace(req_id=req.request_id, block_ids=None)],
+        num_scheduled_tokens={req.request_id: 16},
+    )
+    assert scheduler._build_store_jobs(output) == {}
+    assert all(s.next_stored_block_idx == 0 for s in state.group_states)
+    manager.complete_load([pinned], ctx)
+    [job] = scheduler._build_store_jobs(output).values()
+    src, _ = job.transfer_spec
+    assert src.block_ids.tolist() == [11, 21]
+    assert src.group_sizes == [1, 0, 1]
+    assert [state.group_states[g].next_stored_block_idx for g in (0, 2)] == [1, 1]

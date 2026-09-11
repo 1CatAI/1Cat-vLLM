@@ -309,21 +309,20 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     ) -> PrepareStoreOutput | None:
         block_ids: dict[OffloadKey, int] = {}
         evicted_keys: list[OffloadKey] = []
-        deferred = False
         for group_idx, group_keys in self._partition(keys).items():
             output = self.managers[group_idx].prepare_store(group_keys, req_context)
             if output is None:
-                deferred = True
-                continue
+                # The scheduler advances every group's store cursor on success.
+                # Release only this call's new reservations so all groups retry.
+                # Already performed evictions are not undone; pre-existing
+                # in-flight stores must not be cancelled.
+                self.complete_store(list(block_ids), req_context, success=False)
+                return None
             assert isinstance(output.store_spec, CPULoadStoreSpec)
             block_ids.update(
                 zip(output.keys_to_store, map(int, output.store_spec.block_ids))
             )
             evicted_keys.extend(output.evicted_keys)
-        # A partial store is supported by the scheduler. Never discard successful
-        # reservations when a different, disjoint group pool is temporarily full.
-        if deferred and not block_ids:
-            return None
         stored = [key for key in keys if key in block_ids]
         return PrepareStoreOutput(
             keys_to_store=stored,

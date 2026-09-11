@@ -103,10 +103,9 @@ def test_group_pool_lifecycle_and_order(policy):
     assert m.lookup(keys[0], CTX) is None
     m.complete_store(keys, CTX)
     assert list(m.prepare_load(keys, CTX).block_ids) == [0, 0, 1]
-    # Both group-5 slots are pinned; group 0 can still accept its own data.
+    # A blocked group defers the entire operation, releasing other reservations.
     partial = m.prepare_store([key(5, 4), key(0, 4)], CTX)
-    assert partial.keys_to_store == [key(0, 4)]
-    m.complete_store(partial.keys_to_store, CTX, success=False)
+    assert partial is None
     assert m.lookup(key(0, 4), CTX) is False
     m.complete_load(keys, CTX)
     m.touch([keys[0]], CTX)
@@ -365,3 +364,41 @@ def test_grouped_worker_initialization_failure_releases_regions(monkeypatch, fai
     finally:
         for region in regions.values():
             region.cleanup()
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+@pytest.mark.parametrize("blocked_first", [True, False])
+def test_deferred_group_releases_reservations_and_retries(policy, blocked_first):
+    m = manager(capacity=1, policy=policy)
+    pinned = key(5, 1)
+    store(m, [pinned])
+    m.prepare_load([pinned], CTX)
+    keys = [key(5, 2), key(0, 2)]
+    if not blocked_first:
+        keys.reverse()
+    for _ in range(3):
+        assert m.prepare_store(keys, CTX) is None
+        assert all(m.lookup(k, CTX) is False for k in keys)
+        assert m.lookup(pinned, CTX) is True
+    m.complete_load([pinned], CTX)
+    out = store(m, keys)
+    assert out.keys_to_store == keys
+    assert all(m.lookup(k, CTX) is True for k in keys)
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_deferred_store_preserves_existing_and_inflight_keys(policy):
+    m = manager(capacity=3, policy=policy)
+    ready, inflight, fresh = [key(0, i) for i in range(3)]
+    pinned = [key(5, i) for i in range(3)]
+    store(m, [ready, *pinned])
+    m.prepare_store([inflight], CTX)
+    m.prepare_load(pinned, CTX)
+    assert m.prepare_store([ready, inflight, fresh, key(5, 3)], CTX) is None
+    assert m.lookup(ready, CTX) is True
+    assert m.lookup(inflight, CTX) is None
+    assert m.lookup(fresh, CTX) is False
+    m.complete_store([inflight], CTX)
+    assert m.lookup(inflight, CTX) is True
+    m.complete_load(pinned, CTX)
+    assert store(m, [fresh, key(5, 3)]).keys_to_store == [fresh, key(5, 3)]
