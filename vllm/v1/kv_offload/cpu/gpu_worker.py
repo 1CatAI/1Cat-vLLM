@@ -15,6 +15,7 @@ from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
     CanonicalKVCacheRef,
     CanonicalKVCaches,
+    CanonicalKVCacheTensor,
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -390,6 +391,45 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             self._mmap_region = None
 
 
+def partition_kv_caches(
+    kv_caches: CanonicalKVCaches,
+    group_page_sizes: dict[int, int],
+    block_size_factor: int,
+) -> CanonicalKVCaches:
+    """Give each group private CPU backing while retaining its GPU views.
+
+    Canonical GPU tensors can be shared across groups. Duplicate only their
+    references here: CPU allocations must not alias across those group pools.
+    """
+    tensors: list[CanonicalKVCacheTensor] = []
+    group_refs: list[list[CanonicalKVCacheRef]] = []
+    for group_idx, refs in enumerate(kv_caches.group_data_refs):
+        new_refs: list[CanonicalKVCacheRef] = []
+        tensor_indices: dict[int, int] = {}
+        allocated_page_size = 0
+        if group_idx in group_page_sizes:
+            for ref in refs:
+                if ref.tensor_idx not in tensor_indices:
+                    tensor_indices[ref.tensor_idx] = len(tensors)
+                    tensor = kv_caches.tensors[ref.tensor_idx]
+                    tensors.append(tensor)
+                    allocated_page_size += tensor.page_size_bytes * block_size_factor
+                new_refs.append(
+                    CanonicalKVCacheRef(
+                        tensor_idx=tensor_indices[ref.tensor_idx],
+                        page_size_bytes=ref.page_size_bytes,
+                    )
+                )
+            assert allocated_page_size <= group_page_sizes[group_idx], (
+                f"CPU group {group_idx} exceeds its byte budget: "
+                f"{allocated_page_size} > {group_page_sizes[group_idx]}"
+            )
+        # Scratch groups can have canonical GPU refs, but never receive an
+        # offload key. Keep their group position with no CPU allocation.
+        group_refs.append(new_refs)
+    return CanonicalKVCaches(tensors=tensors, group_data_refs=group_refs)
+
+
 class CpuGpuOffloadingHandlers:
     def __init__(
         self,
@@ -397,7 +437,13 @@ class CpuGpuOffloadingHandlers:
         block_size_factor: int,
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
+        group_page_sizes: dict[int, int] | None = None,
     ):
+        if group_page_sizes is not None:
+            assert mmap_region is None, "Grouped CPU pools do not use tiering mmap"
+            kv_caches = partition_kv_caches(
+                kv_caches, group_page_sizes, block_size_factor
+            )
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         self._mmap_region = mmap_region

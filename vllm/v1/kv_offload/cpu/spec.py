@@ -4,7 +4,7 @@ from collections.abc import Iterator
 
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -14,7 +14,10 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.manager import (
+    CPUOffloadingManager,
+    GroupedCPUOffloadingManager,
+)
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
@@ -28,25 +31,58 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
-        # calculate kv_bytes_per_offloaded_block
-        assert kv_cache_config is not None
-        if kv_cache_config.num_blocks > 0:
-            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
-            kv_bytes_per_block = (
-                total_gpu_kv_bytes // kv_cache_config.num_blocks
-            ) * vllm_config.parallel_config.world_size
+        cacheable_groups = {
+            i: group
+            for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable
+        }
+        # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
+        # Keep the existing layout for single groups and mixed block geometry.
+        self.partition_by_group = (
+            kv_cache_config.num_blocks > 0
+            and len(cacheable_groups) > 1
+            and any(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                for group in cacheable_groups.values()
+            )
+            and len(
+                {group.kv_cache_spec.block_size for group in cacheable_groups.values()}
+            )
+            == 1
+        )
+        self.cpu_group_page_sizes: dict[int, int] = {}
+        if self.partition_by_group:
+            for i, group in cacheable_groups.items():
+                layer_names = set(group.layer_names)
+                # Scheduler specs can replace a heterogeneous UniformType spec
+                # by its largest layer spec. Physical tensor sizes/shared_by are
+                # preserved and give identical budgets on scheduler and workers.
+                page_size = sum(
+                    tensor.size // kv_cache_config.num_blocks
+                    for tensor in kv_cache_config.kv_cache_tensors
+                    if not layer_names.isdisjoint(tensor.shared_by)
+                )
+                self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
+            # Each pool has the same number of token blocks. Physical storage
+            # contains only that group's tensors, rather than every shared GPU
+            # tensor for each independently allocated group key.
+            self.cpu_page_size_per_worker = sum(self.cpu_group_page_sizes.values())
         else:
-            kv_bytes_per_block = 0
-
-        kv_bytes_per_offloaded_block = kv_bytes_per_block * self.block_size_factor
+            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+            self.cpu_page_size_per_worker = (
+                total_gpu_kv_bytes
+                // kv_cache_config.num_blocks
+                * self.block_size_factor
+                if kv_cache_config.num_blocks > 0
+                else 0
+            )
+        kv_bytes_per_offloaded_block = (
+            self.cpu_page_size_per_worker * vllm_config.parallel_config.world_size
+        )
         self.num_blocks = (
             int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block
             if kv_bytes_per_offloaded_block > 0
             else 0
-        )
-        world_size = vllm_config.parallel_config.world_size
-        self.cpu_page_size_per_worker: int = (
-            kv_bytes_per_offloaded_block // world_size if world_size > 0 else 0
         )
 
         # scheduler-side
@@ -72,12 +108,21 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
-            self._manager = CPUOffloadingManager(
-                num_blocks=self.num_blocks,
-                cache_policy=self.eviction_policy,  # type: ignore[arg-type]
-                enable_events=enable_events,
-                store_threshold=store_threshold,
-                max_tracker_size=max_tracker_size,
+            def create_manager() -> CPUOffloadingManager:
+                return CPUOffloadingManager(
+                    num_blocks=self.num_blocks,
+                    cache_policy=self.eviction_policy,  # type: ignore[arg-type]
+                    enable_events=enable_events,
+                    store_threshold=store_threshold,
+                    max_tracker_size=max_tracker_size,
+                )
+
+            self._manager = (
+                GroupedCPUOffloadingManager(
+                    {i: create_manager() for i in self.cpu_group_page_sizes}
+                )
+                if self.partition_by_group
+                else create_manager()
             )
         return self._manager
 
@@ -86,6 +131,9 @@ class CPUOffloadingSpec(OffloadingSpec):
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
+            group_page_sizes=(
+                self.cpu_group_page_sizes if self.partition_by_group else None
+            ),
         )
 
     def get_handlers(
