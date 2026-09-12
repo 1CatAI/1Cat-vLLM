@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -203,6 +204,8 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        # Experimental (1CatAI/1Cat-vLLM#490): see VLLM_1CAT_PREFILL_PACE_STEPS.
+        self._prefill_pace_steps = max(0, int(envs.VLLM_1CAT_PREFILL_PACE_STEPS))
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -507,6 +510,12 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Prefill pacing applies only while some running request is decoding;
+        # a lone prefill keeps its full budget.
+        pace_prefills = self._prefill_pace_steps > 0 and any(
+            r.num_computed_tokens >= r.num_prompt_tokens for r in self.running
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -717,6 +726,15 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            if (
+                pace_prefills
+                and request.num_computed_tokens + num_new_tokens
+                < request.num_prompt_tokens
+            ):
+                # Still prefilling after this chunk: skip the next N-1 steps.
+                request.next_decode_eligible_step = (
+                    self.current_step + self._prefill_pace_steps
+                )
 
             # Speculative decode related.
             if request.spec_token_ids:

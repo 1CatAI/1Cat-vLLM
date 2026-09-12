@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_1CAT_PREFILL_PACE_STEPS: int = 0
     VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
@@ -401,6 +402,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
+    VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS: bool = False
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
     VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
@@ -1641,6 +1643,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
     # not warn users that our own documented knobs are unknown.
+    # Experimental (1CatAI/1Cat-vLLM#490): while another running request is
+    # decoding, a request that is still prefilling is scheduled a chunk only
+    # every N engine steps; the other N-1 steps are decode-only. 0 = off.
+    "VLLM_1CAT_PREFILL_PACE_STEPS": lambda: int(
+        os.getenv("VLLM_1CAT_PREFILL_PACE_STEPS", "0")
+    ),
     "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": lambda: bool(
         int(os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS", "0"))
     ),
@@ -2888,6 +2896,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_ROUTE_SUMMARY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))
+    ),
+    # Experimental (1CatAI/1Cat-vLLM#490): inside a mixed prefill+decode batch,
+    # run the q=1 rows through the paged decode kernels instead of the
+    # per-sequence paged prefill kernel. Default off; default path unchanged.
+    "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS", "0"))
     ),
     "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))
