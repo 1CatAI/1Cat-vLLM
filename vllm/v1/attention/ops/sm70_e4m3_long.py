@@ -16,15 +16,49 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Include generation headroom after a 128K prompt. Larger CPU upper bounds use
-# the existing full-context graph; device row lengths remain authoritative.
-MAX_CONTEXT = 132096
+# Upper bound the accelerated route admits. The operator s extended-boundary
+# screen covers 262152 physical-page and stride boundaries byte-exactly, so the
+# route covers the full 262144 service capacity plus generation headroom instead
+# of stopping at a 128K prompt. Device row lengths remain authoritative.
+MAX_CONTEXT = 262152
 MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
+DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
+# The grouped long-context route is compiled into the shipped FA2 extension, so
+# it is available without any environment variable. The manifest variable stays
+# as an explicit override for an unqualified experimental candidate.
+BUILTIN_OP = "sm70_grouped_long_fwd"
+BUILTIN_MANIFEST = {
+    "module_name": "_vllm_fa2_C",
+    "source_sha256": BUILTIN_OP,
+    "splits": 80,
+    "head_groups": 1,
+    "max_context": MAX_CONTEXT,
+    "query_rows": [8],
+}
+
+
+@lru_cache(maxsize=1)
+def builtin_long_attention():
+    try:
+        return getattr(torch.ops._vllm_fa2_C, BUILTIN_OP)
+    except AttributeError:
+        return None
+
+
+# Explicit opt-out. The accelerated route is on by default, so an operator needs
+# a way back to the full-context route without rebuilding, and the paired A/B
+# validation needs both arms from one build. An explicit off wins over a
+# manifest override.
+DISABLE_VALUES = {"0", "false", "no", "off"}
+
+
 def long_attention_enabled() -> bool:
-    return bool(os.environ.get(MANIFEST_ENV))
+    if os.environ.get(DISABLE_ENV, "").strip().lower() in DISABLE_VALUES:
+        return False
+    return bool(os.environ.get(MANIFEST_ENV)) or builtin_long_attention() is not None
 
 
 @lru_cache(maxsize=4)
@@ -77,9 +111,13 @@ def load_long_attention(manifest_name: str):
 def long_attention_contract(manifest):
     context_limit = manifest.get("max_context", MAX_CONTEXT)
     query_rows = tuple(manifest.get("query_rows", [8]))
+    # No ceiling on the declared context. A bound larger than the captured graph
+    # simply never equals a real descriptor bucket, so the route falls back on
+    # its own; the operator requirement that actually matters is the query-row
+    # range, which mirrors the native q.size(0) in [2, 8] check.
     if (
         type(context_limit) is not int
-        or not 0 < context_limit <= 262144
+        or context_limit <= 0
         or not query_rows
         or any(type(q) is not int or not 2 <= q <= 8 for q in query_rows)
     ):
@@ -87,16 +125,38 @@ def long_attention_contract(manifest):
     return context_limit, query_rows
 
 
+def resolve_long_attention():
+    """The route in effect: an explicit manifest candidate, else the shipped one."""
+    if not long_attention_enabled():
+        return None, None
+    manifest_name = os.environ.get(MANIFEST_ENV)
+    if manifest_name:
+        return load_long_attention(manifest_name)
+    operator = builtin_long_attention()
+    if operator is None:
+        return None, None
+    logger.info_once(
+        "Using the shipped SM70 E4M3 q8 long-context route (%s): max_context=%d "
+        "query_rows=%s; 80 splits, compensated FP32 state.",
+        BUILTIN_OP,
+        MAX_CONTEXT,
+        (8,),
+        scope="process",
+    )
+    return operator, BUILTIN_MANIFEST
+
+
 def long_attention_graph_contract():
-    _, manifest = load_long_attention(os.environ[MANIFEST_ENV])
+    _, manifest = resolve_long_attention()
+    if manifest is None:
+        return MAX_CONTEXT, (8,)
     return long_attention_contract(manifest)
 
 
 def wrap_long_attention(fallback):
-    manifest_name = os.environ.get(MANIFEST_ENV)
-    if not manifest_name:
+    operator, manifest = resolve_long_attention()
+    if operator is None:
         return fallback
-    operator, manifest = load_long_attention(manifest_name)
     context_limit, query_rows = long_attention_contract(manifest)
 
     def run(
