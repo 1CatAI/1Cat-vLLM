@@ -87,3 +87,59 @@ with the accepted reference, per-worker runtime hashes and FP32 SSM checks,
 and shutdown after the test. It reports launch settings and resolved worker
 settings so an inherited fast-path flag cannot silently count as a default.
 The long-context option adds 261631+513 and 262143+1 boundary cases.
+
+## SM70 concurrency switch audit (TP4, Qwen3.8-27B-NVFP4 dense)
+
+Every concurrency switch below was measured rather than assumed, because the
+defaults live in three different places and only one of them is `envs.py`.
+
+Protocol: 4 x V100-SXM2-32GB, TP4, `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`,
+`fp8_e4m3` KV, 32768 context, `max_num_batched_tokens=8192`,
+`max_num_seqs=16`, prefix caching on, fixed 256-token outputs with
+`ignore_eos` and `min_tokens`, identical compile cache, one server per arm.
+Reported as aggregate tok/s at C=1/4/8/16.
+
+### Measured effects
+
+| Switch | C=1 | C=4 | C=8 | C=16 | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| `VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY` | — | — | — | **+3.4%** | default on |
+| `VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES` | — | — | — | **+1.0%** | default on |
+| both, against both off | +7.8%* | 0% | -0.9%* | **+4.3%** | merged |
+| `VLLM_SM70_USE_BREAKABLE_CUDAGRAPH` | **-29.2%** | **-17.6%** | **-18.8%** | **-12.7%** | keep off |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | n/a | n/a | n/a | n/a | inapplicable |
+
+`*` the C=1 and C=8 deltas are marked because their off/on ranges overlap.
+Only the C=16 effect is separable from run-to-run spread: off measured
+807.5/812.7/813.8/820.6, on measured 830.8/848.3/849.2/855.4/857.6 over the
+campaign, and those two intervals do not intersect.
+
+### Why the switches were invisible
+
+`csrc/custom_all_reduce.cuh` reads the two push all-reduce switches with
+`std::getenv` at kernel-launch time. The declarations in `vllm/envs.py` were
+never consumed by anything, so enabling the paths required exporting the
+variables by hand and no default deployment ever ran them. `envs.py` now
+publishes its resolved values into `os.environ`, so the native path follows the
+declaration. Any future C++/Python switch pair needs the same treatment.
+
+### Scope limits
+
+- `VLLM_SM70_USE_BREAKABLE_CUDAGRAPH` was measured on the dense 27B path only.
+  The -13% to -29% regression is large enough that it should not be assumed
+  neutral elsewhere, but it has not been measured on MoE or speculative paths.
+- `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` gates on an exact
+  `(num_experts, hidden, intermediate, top_k) == (512, 2560, 160, 10)` shape.
+  This checkpoint has no experts at all, so the switch cannot fire; no
+  conclusion is drawn about its effect on checkpoints that do match.
+- AWQ, FP8-MoE and DFlash2 switches were not exercised: this checkpoint is
+  neither AWQ nor MoE, and the runs carried no speculative config.
+- C=1 spread across the campaign reached 22% (57.9-70.8) for one and the same
+  configuration, which is wider than the effect being measured. Any default
+  decision that rests on C=1 needs at least ten repeats per arm first.
+
+### Not run
+
+The closed-loop numerical and mixed-size graph replay gates referenced by the
+original opt-in restriction on the two push all-reduce switches. The evidence
+here is throughput only.
