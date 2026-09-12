@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
+    VLLM_SM70_NVFP4_QPN2_PACK: str = "auto"
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
@@ -1905,6 +1906,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QPN2_M16_NATIVE", "1"))
     ),
+    # Block-packed activations of the QPN2 kernels (read by the C++ op):
+    # "auto" packs from M=7 on Turing and M=8 on Volta, "0" never, "1" always.
+    # Bit-identical either way; kept out of the compile factors for that reason.
+    "VLLM_SM70_NVFP4_QPN2_PACK": lambda: os.getenv("VLLM_SM70_NVFP4_QPN2_PACK", "auto"),
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
@@ -4878,6 +4883,9 @@ def compile_factors() -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        # Activation layout of the QPN2 kernels; bit-identical with and
+        # without, and the compiled graph only sees the opaque op.
+        "VLLM_SM70_NVFP4_QPN2_PACK",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
