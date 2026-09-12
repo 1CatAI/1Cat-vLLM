@@ -263,6 +263,19 @@ def _any_participating_device_is_capability(
     )
 
 
+def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
+    """Whether any participating CUDA device is Volta or Turing.
+
+    The SM70 Flash-V100 baseline is a pre-Ampere tuning, not a Volta tuning:
+    both capabilities take the same kernels, the same fp16 accumulation
+    contract and the same compile graph. Gating it on exactly (7, 0) leaves a
+    Turing-only deployment unconfigured, and that does not merely run slower.
+    """
+    return _any_participating_device_is_capability(
+        cfg, (7, 0)
+    ) or _any_participating_device_is_capability(cfg, (7, 5))
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -1828,7 +1841,7 @@ class VllmConfig:
         )
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
-            and _any_participating_device_is_capability(self, (7, 0))
+            and _any_participating_device_is_pre_ampere(self)
             and envs.VLLM_SM70_FLASH_ATTN_V100
             and sm70_flash_v100_backend
         )
