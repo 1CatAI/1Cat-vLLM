@@ -48,6 +48,12 @@ class BaselineWorker:
             "max_model_len": int(cfg.model_config.max_model_len),
             "graph_mode": str(cfg.compilation_config.cudagraph_mode),
             "mamba_cache_mode": str(cfg.cache_config.mamba_cache_mode),
+            "resolved_vllm_env": {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith("VLLM_")
+            },
+            "compilation_config": str(cfg.compilation_config),
             "binaries": binaries,
             "native_dependencies": native,
             "qsa_specialization_version": (
