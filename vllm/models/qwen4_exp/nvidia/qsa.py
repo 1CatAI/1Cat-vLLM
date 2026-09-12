@@ -443,6 +443,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         self.topk_indices_buffer = topk_indices_buffer
 
+    def adopt_default_kv_scales(self) -> None:
+        """Use the module's own unit scales when the checkpoint has none.
+
+        The calibrated overlay exists to keep FP8 E4M3 K/V inside range; a
+        checkpoint that was never calibrated has no such overlay, so the layer
+        keeps the 1.0 defaults set at construction instead of the -1.0 loading
+        sentinel and is marked finalized so nothing re-validates it.
+        """
+        set_default_quant_scales(self, register_buffer=False)
+        self._qsa_kv_scales_finalized = True
+
     def validate_loaded_kv_scales(self) -> None:
         if self.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
             return
