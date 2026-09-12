@@ -169,13 +169,29 @@ def _validate_qsa_e4m3_scale_load(
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return
     missing_scales = sorted(required_scales - loaded)
-    if missing_scales:
+    if not missing_scales:
+        return set()
+    if envs.VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES:
         raise ValueError(
             "QSA E4M3 scale overlay is incomplete; refusing to start. "
             f"Loaded {len(required_scales) - len(missing_scales)}/"
             f"{len(required_scales)} local K/V scales. Missing: "
             + ", ".join(missing_scales)
         )
+    # An uncalibrated checkpoint has no k_scale/v_scale at all; the loader
+    # already ignores them by design. Serve it on the module's 1.0 defaults
+    # rather than refusing, and say plainly what that costs. Set
+    # VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 to keep the old hard failure.
+    logger.warning_once(
+        "QSA E4M3 scale overlay is incomplete: %d/%d local K/V scales loaded. "
+        "Falling back to unit scales for the missing layers, which can "
+        "saturate FP8 E4M3 values that a calibrated overlay would rescale. "
+        "Missing: %s",
+        len(required_scales) - len(missing_scales),
+        len(required_scales),
+        ", ".join(missing_scales[:8]) + (" ..." if len(missing_scales) > 8 else ""),
+    )
+    return set(missing_scales)
 
 
 def _finalize_qsa_e4m3_scale_load(
@@ -196,14 +212,23 @@ def _finalize_qsa_e4m3_scale_load(
     required_scales = {
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
-    _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
-    logger.info_once(
-        "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",
-        len(required_scales),
-        len(required_scales),
+    missing_scales = _validate_qsa_e4m3_scale_load(
+        required_scales, loaded, cache_dtype
     )
-    for module in qsa_modules.values():
-        module.validate_loaded_kv_scales()
+    if not missing_scales:
+        logger.info_once(
+            "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",
+            len(required_scales),
+            len(required_scales),
+        )
+    for name, module in qsa_modules.items():
+        uncovered = any(
+            f"{name}.{kind}_scale" in missing_scales for kind in ("k", "v")
+        )
+        if uncovered:
+            module.adopt_default_kv_scales()
+        else:
+            module.validate_loaded_kv_scales()
 
 
 # The checkpoint keeps down and injection projections separate; runtime packs
