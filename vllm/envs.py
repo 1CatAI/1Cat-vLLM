@@ -273,11 +273,11 @@ if TYPE_CHECKING:
     VLLM_GLM53_PP_MHC_MATERIALIZE: bool = False
     VLLM_SM70_DFLASH2_QUANT_LM_HEAD: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
-    VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
-    VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -2391,7 +2391,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in Qwen3.8 DFlash2 extension of the TP4 push collective from the
     # accepted M8 payload to M16/M32 verifier payloads.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY", "0"))
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY", "1"))
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
@@ -2417,7 +2417,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM70, fully connected TP4 and captured FP16 only; default off until the
     # mixed-size graph replay, numerical and full-model quality gates pass.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "0"))
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "1"))
     ),
     # Optional task-built custom-AR fragment. Operators present in the sidecar
     # override the production namespace; every other operator falls back.
@@ -5003,3 +5003,17 @@ def compile_factors() -> dict[str, object]:
         factors[var] = normalize_value(os.getenv(var))
 
     return factors
+
+
+# The SM70 native all-reduce reads these two switches with std::getenv at
+# kernel-launch time instead of through this module, so a default declared here
+# would never reach the kernel and the optimization would stay silently off.
+# Publish the resolved values so the native path follows this module.
+for _sm70_native_allreduce in (
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES",
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY",
+):
+    if _sm70_native_allreduce not in os.environ:
+        os.environ[_sm70_native_allreduce] = (
+            "1" if environment_variables[_sm70_native_allreduce]() else "0"
+        )
