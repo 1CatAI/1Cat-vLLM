@@ -167,7 +167,7 @@ def _validate_qsa_e4m3_scale_load(
     required_scales: set[str], loaded: set[str], cache_dtype: str
 ) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
-        return
+        return set()
     missing_scales = sorted(required_scales - loaded)
     if not missing_scales:
         return set()
