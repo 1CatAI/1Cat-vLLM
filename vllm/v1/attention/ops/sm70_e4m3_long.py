@@ -180,6 +180,29 @@ def long_attention_graph_contract(capacity: int | None = None):
     return long_attention_contract(manifest, capacity)
 
 
+# Paged-KV page sizes the shipped operator has compiled specializations for.
+# The host entry dispatch only instantiates these two, so a different page size
+# has no kernel to run and the route must fall back. The page size follows the
+# served window, so this is what makes the route available at one window and
+# unavailable at another.
+ADMITTED_PAGE_SIZES = (1648, 3296)
+_REPORTED_PAGE_SIZES: set[int] = set()
+
+
+def _report_unadmitted_page_size(page_size: int) -> None:
+    if page_size in _REPORTED_PAGE_SIZES:
+        return
+    _REPORTED_PAGE_SIZES.add(page_size)
+    logger.warning(
+        "SM70 E4M3 long-context route declined: the paged-KV page size is %d "
+        "tokens and the shipped operator only has compiled specializations for "
+        "%s. The route falls back to the ordinary path. Adjust --max-model-len "
+        "so the derived page size matches, or compile the specialization.",
+        page_size,
+        ADMITTED_PAGE_SIZES,
+    )
+
+
 def wrap_long_attention(fallback):
     operator, manifest = resolve_long_attention()
     if operator is None:
@@ -206,10 +229,12 @@ def wrap_long_attention(fallback):
             and q.shape[0] in query_rows
             and q.shape[1:] == (6, 256)
             and k.ndim == 4
-            and k.shape[1] in (1648, 3296)
+            and k.shape[1] in ADMITTED_PAGE_SIZES
             and k.shape[2:] == (1, 256)
             and v.shape == k.shape
         ):
+            if k.ndim == 4 and k.shape[1] not in ADMITTED_PAGE_SIZES:
+                _report_unadmitted_page_size(int(k.shape[1]))
             return fallback(
                 q,
                 k,
