@@ -21,7 +21,10 @@ repos:
   rev: v21.1.2
   hooks:
   - id: clang-format
-    exclude: 'csrc/(moe/topk_softmax_kernels.cu|quantization/gguf/(ggml-common.h|dequantize.cuh|vecdotq.cuh|mmq.cuh|mmvq.cuh))|vllm/third_party/.*'
+    # The sm70_grouped_long kernels are ported verbatim from qualified native
+    # candidates and are checked against the source digests recorded in their
+    # manifests, so they stay byte-comparable instead of being reformatted.
+    exclude: 'csrc/(moe/topk_softmax_kernels.cu|quantization/gguf/(ggml-common.h|dequantize.cuh|vecdotq.cuh|mmq.cuh|mmvq.cuh)|attention/sm70_grouped_long/kernel/(grouped|scalar)-attention.cu)|vllm/third_party/.*'
     types_or: [c++, cuda]
     args: [--style=file, --verbose]
 - repo: https://github.com/DavidAnson/markdownlint-cli2

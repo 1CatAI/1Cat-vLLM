@@ -95,6 +95,9 @@ def test_native_capability_fail_closed(monkeypatch, available):
         flash_attn_grouped_e4m3_fp32_paged=sentinel,
     )
     monkeypatch.setitem(sys.modules, "flash_attn_v100", module)
+    # With the long-context route off the loader must hand back the native
+    # binding untouched; the wrapping itself is covered by the tail graph tests.
+    monkeypatch.setenv("VLLM_SM70_E4M3_LONG_ATTENTION", "0")
     assert load_grouped_e4m3_fp32() is (sentinel if available else None)
 
 
