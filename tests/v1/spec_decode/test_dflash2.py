@@ -666,10 +666,15 @@ def test_glm5_dflash_acceptance_policy_preserves_materialize_diagnostic(
 def test_sm70_dflash2_bf16_emulation_has_explicit_ab_switch(monkeypatch):
     config = SimpleNamespace(dtype=torch.bfloat16)
     monkeypatch.setattr(dflash2_model.current_platform, "is_cuda", lambda: True)
+    # The gate asks the worker's own device whether it has SM80; mock a Volta
+    # worker so the switch, not the device query, is under test here.
     monkeypatch.setattr(
         dflash2_model.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 70,
+        "has_device_capability",
+        lambda capability, device_id=0: False,
+    )
+    monkeypatch.setattr(
+        dflash2_model.torch.accelerator, "current_device_index", lambda: 0
     )
     monkeypatch.delenv("VLLM_SM70_DFLASH2_BF16_EMULATION", raising=False)
     assert dflash2_model._use_sm70_bf16_emulation(config)
@@ -1557,7 +1562,10 @@ def test_flashinfer_topk_is_capability_gated_on_sm70(monkeypatch):
     monkeypatch.setattr(
         dflash2_model.current_platform,
         "has_device_capability",
-        lambda capability: capability <= 70,
+        lambda capability, device_id=0: capability <= 70,
+    )
+    monkeypatch.setattr(
+        dflash2_model.torch.accelerator, "current_device_index", lambda: 0
     )
     monkeypatch.setattr(dflash2_model, "has_flashinfer", lambda: True)
     assert dflash2_model._flashinfer_topk() is None
