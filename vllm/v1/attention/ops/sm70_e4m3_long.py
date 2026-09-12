@@ -16,11 +16,12 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Upper bound the accelerated route admits, and the value the route matches a
-# descriptor bucket against. It must stay exactly the 262144 service capacity:
-# the compact scalar tail route and the q1 long-context graph variant both gate
-# on equality with 262144, so a larger bound silently disables them.
-MAX_CONTEXT = 262144
+# Capacity the shipped operator was qualified for. This is a claim about the
+# compiled kernel, not a service limit: the graph bound the route is captured at
+# is the smaller of this and the context the model is actually served with, so a
+# deployment with a different window is routed on its own value and the operator
+# is never asked for more context than it was admitted for.
+BUILTIN_MAX_CONTEXT = 262144
 MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
 DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -44,7 +45,7 @@ BUILTIN_MANIFEST = {
     "source_sha256": BUILTIN_SOURCE_SHA256,
     "splits": 80,
     "head_groups": 1,
-    "max_context": MAX_CONTEXT,
+    "max_context": BUILTIN_MAX_CONTEXT,
     "query_rows": list(BUILTIN_QUERY_ROWS),
 }
 
@@ -117,21 +118,37 @@ def load_long_attention(manifest_name: str):
     return module.run, manifest
 
 
-def long_attention_contract(manifest):
-    context_limit = manifest.get("max_context", MAX_CONTEXT)
+def long_attention_capability(manifest) -> int:
+    """The context the operator was qualified for, as its manifest declares it."""
+    capability = manifest.get("max_context", BUILTIN_MAX_CONTEXT)
+    if type(capability) is not int or capability <= 0:
+        raise ValueError("Unsupported long-attention operator capacity")
+    return capability
+
+
+def long_attention_query_rows(manifest) -> tuple[int, ...]:
+    """The query widths the route admits, mirroring the native [2, 8] check."""
     query_rows = tuple(manifest.get("query_rows", [8]))
-    # No ceiling on the declared context. A bound larger than the captured graph
-    # simply never equals a real descriptor bucket, so the route falls back on
-    # its own; the operator requirement that actually matters is the query-row
-    # range, which mirrors the native q.size(0) in [2, 8] check.
-    if (
-        type(context_limit) is not int
-        or context_limit <= 0
-        or not query_rows
-        or any(type(q) is not int or not 2 <= q <= 8 for q in query_rows)
-    ):
-        raise ValueError("Unsupported long-attention context or query-row contract")
-    return context_limit, query_rows
+    if not query_rows or any(type(q) is not int or not 2 <= q <= 8 for q in query_rows):
+        raise ValueError("Unsupported long-attention query-row contract")
+    return query_rows
+
+
+def long_attention_contract(manifest, capacity: int | None = None):
+    """The bound the long-context graph is captured at, and its query widths.
+
+    ``capacity`` is the context the model is served with. The bound is the
+    smaller of that and the operator's declared capability, so the served window
+    decides the route and the operator is never driven past what it covers.
+    ``None`` means no service window is known, which leaves the capability.
+    """
+    capability = long_attention_capability(manifest)
+    if capacity is None:
+        return capability, long_attention_query_rows(manifest)
+    return (
+        max(min(capability, int(capacity)), 1),
+        long_attention_query_rows(manifest),
+    )
 
 
 def resolve_long_attention():
@@ -145,28 +162,30 @@ def resolve_long_attention():
     if operator is None:
         return None, None
     logger.info_once(
-        "Using the shipped SM70 E4M3 q8 long-context route (%s): max_context=%d "
+        "Using the shipped SM70 E4M3 q8 long-context route (%s): capability=%d "
         "query_rows=%s; 80 splits, compensated FP32 state.",
         BUILTIN_OP,
-        MAX_CONTEXT,
+        BUILTIN_MAX_CONTEXT,
         BUILTIN_QUERY_ROWS,
         scope="process",
     )
     return operator, BUILTIN_MANIFEST
 
 
-def long_attention_graph_contract():
+def long_attention_graph_contract(capacity: int | None = None):
+    """The captured bound for ``capacity``, or ``(None, ())`` when route is off."""
     _, manifest = resolve_long_attention()
     if manifest is None:
-        return MAX_CONTEXT, (8,)
-    return long_attention_contract(manifest)
+        return None, ()
+    return long_attention_contract(manifest, capacity)
 
 
 def wrap_long_attention(fallback):
     operator, manifest = resolve_long_attention()
     if operator is None:
         return fallback
-    context_limit, query_rows = long_attention_contract(manifest)
+    capability = long_attention_capability(manifest)
+    query_rows = long_attention_query_rows(manifest)
 
     def run(
         q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
@@ -176,9 +195,13 @@ def wrap_long_attention(fallback):
             if is_forward_context_available()
             else None
         )
+        bucket = getattr(descriptor, "attention_context_bucket", None)
+        # The graph builder owns the served window: it stamps the bound it
+        # captured the variant at onto the descriptor. The wrapper only has to
+        # refuse a bound the operator was not qualified for.
         if not (
-            descriptor is not None
-            and descriptor.attention_context_bucket == context_limit
+            bucket is not None
+            and bucket <= capability
             and q.ndim == 3
             and q.shape[0] in query_rows
             and q.shape[1:] == (6, 256)
@@ -202,7 +225,7 @@ def wrap_long_attention(fallback):
         # replay never allocates. Layers reuse it in stream order; different
         # streams and versions never share the legacy 80-split buffers.
         stream = torch.cuda.current_stream(q.device).cuda_stream
-        key = (manifest["source_sha256"], context_limit, 80, q.device, stream)
+        key = (manifest["source_sha256"], bucket, 80, q.device, stream)
         if key not in _WORKSPACES:
             _WORKSPACES[key] = (
                 torch.empty((80, 8, 6, 256), dtype=torch.float32, device=q.device),

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
-from vllm.v1.attention.ops.sm70_e4m3_long import MAX_CONTEXT
+from vllm.v1.attention.ops.sm70_e4m3_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.worker.gpu import cudagraph_utils as cg
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -21,7 +21,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 def graph_pair():
     manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1, 8)
-    bounded = replace(ordinary, attention_context_bucket=MAX_CONTEXT)
+    bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
     return manager, ordinary, bounded
@@ -31,9 +31,8 @@ def test_context_boundary_and_switch_back(graph_pair):
     manager, ordinary, bounded = graph_pair
     for upper, expected in (
         (1024, bounded),
-        (MAX_CONTEXT, bounded),
-        (MAX_CONTEXT + 1, ordinary),
-        (262144, ordinary),
+        (BUILTIN_MAX_CONTEXT, bounded),
+        (BUILTIN_MAX_CONTEXT + 1, ordinary),
         (32768, bounded),
         (0, ordinary),
     ):
@@ -76,9 +75,17 @@ def test_other_batch_shapes_and_missing_capture_fall_back(graph_pair):
 
 
 def test_disabled_operator_preserves_original_binding(monkeypatch):
-    from vllm.v1.attention.ops.sm70_e4m3_long import MANIFEST_ENV, wrap_long_attention
+    from vllm.v1.attention.ops.sm70_e4m3_long import (
+        DISABLE_ENV,
+        MANIFEST_ENV,
+        wrap_long_attention,
+    )
 
+    # The shipped operator makes the route available without any variable, so
+    # the explicit opt-out is what turns it off. The manifest variable is not a
+    # switch: unsetting it only selects the shipped operator.
     monkeypatch.delenv(MANIFEST_ENV, raising=False)
+    monkeypatch.setenv(DISABLE_ENV, "0")
 
     def original(*args, **kwargs):
         raise AssertionError("Binding inspection must not launch an operator")
@@ -117,6 +124,7 @@ def test_tail_capture_and_dispatch_from_real_initialization(
     compilation.pass_config.enable_sp = sequence_parallel
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=4),
+        model_config=SimpleNamespace(max_model_len=BUILTIN_MAX_CONTEXT),
         compilation_config=compilation,
         parallel_config=SimpleNamespace(
             data_parallel_size=1, tensor_parallel_size=4, pipeline_parallel_size=1
@@ -144,8 +152,9 @@ def test_tail_capture_and_dispatch_from_real_initialization(
 @pytest.mark.parametrize(
     "manifest",
     [
-        {"max_context": 262145},
         {"max_context": 0},
+        {"max_context": -1},
+        {"max_context": "262144"},
         {"query_rows": [1, 8]},
         {"query_rows": [9]},
         {"query_rows": []},
@@ -161,10 +170,24 @@ def test_reject_unadmitted_attention_manifest(manifest):
 def test_explicit_attention_manifest_preserves_default_and_extends_tail_domain():
     from vllm.v1.attention.ops.sm70_e4m3_long import long_attention_contract
 
-    assert long_attention_contract({}) == (132096, (8,))
+    assert long_attention_contract({}) == (BUILTIN_MAX_CONTEXT, (8,))
+    assert long_attention_contract({"max_context": 262144}) == (262144, (8,))
     assert long_attention_contract(
         {"max_context": 262144, "query_rows": list(range(2, 9))}
     ) == (262144, tuple(range(2, 9)))
+
+
+def test_served_window_bounds_the_route_and_never_exceeds_capability():
+    from vllm.v1.attention.ops.sm70_e4m3_long import long_attention_contract
+
+    # The served window decides the bound, so a smaller deployment routes on its
+    # own value instead of the operator's ceiling.
+    assert long_attention_contract({}, 32768) == (32768, (8,))
+    assert long_attention_contract({"max_context": 262144}, 131072) == (131072, (8,))
+    # A window wider than the operator covers stays at the capability: the route
+    # is never driven past what the manifest was admitted for.
+    assert long_attention_contract({"max_context": 131072}, 262144) == (131072, (8,))
+    assert long_attention_contract({}, None) == (BUILTIN_MAX_CONTEXT, (8,))
 
 
 @pytest.mark.parametrize("query_len", [1, 6, 7])

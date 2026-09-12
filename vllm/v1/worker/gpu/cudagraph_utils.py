@@ -453,22 +453,36 @@ class ModelCudaGraphManager(CudaGraphManager):
             and self.dp_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
         ):
-            context_limit, query_rows = long_attention_graph_contract()
-            if self._sm70_dflash2_tail_graphs and (
-                bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
-                or scalar_tail_attention_available()
-            ):
-                query_rows = (1, *query_rows)
-            descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
-            for desc in list(descs):
-                if (
-                    desc.num_reqs == 1
-                    and desc.uniform_token_count in query_rows
-                    and desc.num_tokens == desc.uniform_token_count
+            # The served window decides the bound, not a literal: the operator's
+            # manifest only says what it was qualified for. A caller that carries
+            # no model config leaves the bound at the declared capability.
+            model_config = getattr(vllm_config, "model_config", None)
+            served = int(getattr(model_config, "max_model_len", 0) or 0)
+            context_limit, query_rows = long_attention_graph_contract(served or None)
+            if context_limit is not None:
+                if self._sm70_dflash2_tail_graphs and (
+                    bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
+                    or scalar_tail_attention_available()
                 ):
-                    variant = replace(desc, attention_context_bucket=context_limit)
-                    self._long_attention_graphs[desc] = variant
-                    descs.append(variant)
+                    query_rows = (1, *query_rows)
+                descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+                for desc in list(descs):
+                    if (
+                        desc.num_reqs == 1
+                        and desc.uniform_token_count in query_rows
+                        and desc.num_tokens == desc.uniform_token_count
+                    ):
+                        variant = replace(desc, attention_context_bucket=context_limit)
+                        self._long_attention_graphs[desc] = variant
+                        descs.append(variant)
+                logger.info_once(
+                    "SM70 E4M3 long-context graph variants captured at bound=%d "
+                    "for query rows %s (served window=%s).",
+                    context_limit,
+                    tuple(query_rows),
+                    served or "unknown",
+                    scope="process",
+                )
 
     def select_attention_graph(
         self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
@@ -481,12 +495,15 @@ class ModelCudaGraphManager(CudaGraphManager):
         if cpu_upper_bounds.device.type != "cpu" or cpu_upper_bounds.numel() != 1:
             return desc
         upper = int(cpu_upper_bounds[0])
-        if desc.uniform_token_count == 1 and upper < 131072:
-            # The compact scalar route is admitted for long-context tails.
-            # Short q1 uses the ordinary graph and its original attention.
-            return desc
         limit = variant.attention_context_bucket
-        if limit is not None and 0 < upper <= limit:
+        if limit is None:
+            return desc
+        if desc.uniform_token_count == 1 and upper * 2 < limit:
+            # The compact scalar route is admitted for long-context tails only.
+            # "Long" is half the captured bound rather than a literal, so a
+            # different served window keeps the same behaviour.
+            return desc
+        if 0 < upper <= limit:
             return variant
         return desc
 

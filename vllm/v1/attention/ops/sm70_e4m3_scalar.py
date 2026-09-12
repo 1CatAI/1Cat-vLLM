@@ -9,9 +9,10 @@ import torch
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.v1.attention.ops.sm70_e4m3_long import (
-    MAX_CONTEXT,
+    BUILTIN_MAX_CONTEXT,
     load_attention_library,
-    long_attention_graph_contract,
+    long_attention_capability,
+    resolve_long_attention,
 )
 
 logger = init_logger(__name__)
@@ -29,7 +30,7 @@ BUILTIN_SCALAR_MANIFEST = {
     "e4m3_lut": True,
     # Capacity this kernel was qualified for, in the same units as the
     # long-context contract it is admitted against.
-    "max_context": MAX_CONTEXT,
+    "max_context": BUILTIN_MAX_CONTEXT,
 }
 
 
@@ -55,19 +56,27 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             raise ValueError("The compact scalar tail operator is not compiled in")
         builtin = type("_Builtin", (), {"run": operator})
         module, manifest = builtin, BUILTIN_SCALAR_MANIFEST
-    # The tail is admitted at the graph descriptor the long-context contract
-    # itself declares, so the two never drift apart. The manifest still has to
-    # cover that range: it records the capacity this kernel was qualified for.
-    context_limit, _ = long_attention_graph_contract()
+    # The tail rides the long-context graph variant, so it is only meaningful
+    # while that route is on, and the kernel has to cover every bound the graph
+    # can be captured at -- which never exceeds the long-context capability.
+    _, long_manifest = resolve_long_attention()
+    if long_manifest is None:
+        logger.info_once(
+            "SM70 compact scalar tail attention is inactive: the E4M3 "
+            "long-context route is disabled.",
+            scope="process",
+        )
+        return None
+    capability = long_attention_capability(long_manifest)
     if not (
         manifest.get("share_kv_six_heads")
         and manifest.get("compact_page_map")
         and manifest.get("e4m3_lut")
-        and manifest.get("max_context", 0) >= context_limit
+        and manifest.get("max_context", 0) >= capability
     ):
         raise ValueError(
             "Scalar tails require the compact E4M3 manifest covering the "
-            f"{context_limit}-token long-context contract"
+            f"{capability}-token long-context capability"
         )
     # Allocate before memory profiling and graph capture. Model layers execute
     # serially on the worker stream; all target graphs retain this same storage.
@@ -108,9 +117,10 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             if is_forward_context_available()
             else None
         )
+        bucket = getattr(descriptor, "attention_context_bucket", None)
         if not (
-            descriptor is not None
-            and descriptor.attention_context_bucket == context_limit
+            bucket is not None
+            and bucket <= capability
             and q.shape == (1, 6, 256)
             and q.dtype == torch.float16
             and q.device == device
@@ -125,7 +135,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             and anchored_window == 0
             and partition_size_hint in (None, 1024)
             and type(max_seq_len_hint) is int
-            and 0 < max_seq_len_hint <= context_limit
+            and 0 < max_seq_len_hint <= capability
         ):
             return False
         module.run(
