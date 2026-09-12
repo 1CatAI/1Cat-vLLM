@@ -22,6 +22,9 @@ logger = init_logger(__name__)
 # manifest and no environment variable. The manifest stays as an explicit
 # override for an unqualified experimental candidate.
 BUILTIN_SCALAR_OP = "sm70_scalar_attention_fwd"
+# Page size in tokens the compact scalar kernel was compiled for. It is fixed at
+# build time because the kernel bakes the page geometry into its indexing.
+SCALAR_PAGE_SIZE = 3296
 BUILTIN_SCALAR_MANIFEST = {
     "module_name": "_vllm_fa2_C",
     "library_sha256": BUILTIN_SCALAR_OP,
@@ -126,7 +129,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             and q.device == device
             and q.is_contiguous()
             and k.ndim == 4
-            and k.shape[1:] == (3296, 1, 256)
+            and k.shape[1:] == (SCALAR_PAGE_SIZE, 1, 256)
             and k.dtype == v.dtype == torch.uint8
             and v.shape == k.shape
             and kv_cache_dtype == "fp8_e4m3"
