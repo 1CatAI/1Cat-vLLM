@@ -368,32 +368,38 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hc_count = self.hc_count
         hidden_size = self.hidden_size
 
-        if get_pp_group().is_first_rank:
-            assert hidden_states is not None
-            if inputs_embeds is None:
-                assert input_ids is not None
-                inputs_embeds = self.embed_input_ids(input_ids)
-            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            inputs_embeds = self.fc_embedding(inputs_embeds)
+        # The drafter is stage-local, so this module is always a complete
+        # model: gpu_model_runner returns the IntermediateTensors on every
+        # non-final pipeline rank before speculation is reached, and the
+        # weights here are replicated rather than partitioned (embed_tokens,
+        # fc_embedding, fc_hidden and every MTP layer are built on all ranks).
+        # Branching on the TARGET model's pipeline position sent the final
+        # rank into the "receive from the previous stage" path and asserted on
+        # intermediate tensors that nobody sends -- with the fullgraph AOT
+        # compile of 1.5.0 that is a hard compile error, so no k > 0 boots at
+        # all under pipeline parallelism.
+        assert hidden_states is not None
+        if inputs_embeds is None:
+            assert input_ids is not None
+            inputs_embeds = self.embed_input_ids(input_ids)
+        # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        inputs_embeds = self.fc_embedding(inputs_embeds)
 
-            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-            # the main model truly emits the pre-final-mixer multi stream
-            # on the first step; subsequent steps reuse the prior draft
-            # step's multi stream).
-            num_tokens = hidden_states.shape[0]
-            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-                num_tokens, hc_count, hidden_size
-            )
-            hidden_states = self.fc_hidden(hidden_states)
-            # Add the embedding residual to every branch, then fold back
-            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-            hidden_states = hidden_states.flatten(-2)
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
+        # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
+        # the main model truly emits the pre-final-mixer multi stream
+        # on the first step; subsequent steps reuse the prior draft
+        # step's multi stream).
+        num_tokens = hidden_states.shape[0]
+        hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+            num_tokens, hc_count, hidden_size
+        )
+        hidden_states = self.fc_hidden(hidden_states)
+        # Add the embedding residual to every branch, then fold back
+        # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
+        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+        hidden_states = hidden_states.flatten(-2)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
@@ -406,14 +412,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             query_start_loc=None,
             ngram_context=None,
         )
-        if not get_pp_group().is_last_rank:
-            # As in the target model, PP carries a materialized tensor rather
-            # than the delayed hidden/output/injection tuple.
-            hidden_states = layer.mlp_hyper_connection.combine(
-                hidden_states, block_output, injection
-            )
-            return IntermediateTensors({"hidden_states": hidden_states})
-
         # Last PP rank finalize. Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
         #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
