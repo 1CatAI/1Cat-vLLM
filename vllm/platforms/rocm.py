@@ -653,8 +653,14 @@ class RocmPlatform(Platform):
         torch.cuda.manual_seed_all(seed)
 
     @classmethod
+    def get_device_capability(
+        cls, device_id: int | None = None
+    ) -> DeviceCapability | None:
+        return cls._device_capability(cls.resolve_device_id(device_id))
+
+    @classmethod
     @lru_cache(maxsize=8)
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+    def _device_capability(cls, device_id: int) -> DeviceCapability | None:
         cap = _capability_from_gcn_arch(_GCN_ARCH)
         if cap is not None:
             return DeviceCapability(major=cap[0], minor=cap[1])
