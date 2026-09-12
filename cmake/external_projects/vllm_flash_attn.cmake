@@ -119,7 +119,8 @@ if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
   set(SM70_GROUPED_LONG_DIR
       "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_grouped_long")
   set(SM70_GROUPED_LONG_SRC
-      "${SM70_GROUPED_LONG_DIR}/kernel/grouped-attention.cu")
+      "${SM70_GROUPED_LONG_DIR}/kernel/grouped-attention.cu"
+      "${SM70_GROUPED_LONG_DIR}/kernel/scalar-attention.cu")
   # Flags mirror the manifest the operator was qualified with. As with v37, the
   # properties must be set in the target scope or SM70 silently loses them.
   set_source_files_properties(${SM70_GROUPED_LONG_SRC}

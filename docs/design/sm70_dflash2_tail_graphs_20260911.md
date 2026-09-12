@@ -27,11 +27,12 @@ Inherited PR596 head: `9930ebe8e6bff1fb031740d5787f86f6193d2cd9`.
 
 ## Implementation
 
-`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=1` registers target-only B1 q1 through q7
+`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` registers target-only B1 q1 through q7
 alongside q8. It does not depend on lookup augmentation and does not add
 tail shapes to the drafter, other speculative methods or multi-request
 uniform batches. Sequence-parallel configurations retain the previous path.
-The flag remains disabled by default.
+The tail graph is on by default because the eager tail was the dominant round
+cost at the capacity; `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0` restores it.
 
 The grouped manifest can explicitly declare `max_context` and `query_rows`.
 Without those fields the contract remains 132096 and q8. A selected
@@ -40,9 +41,14 @@ The CPU bound controls graph selection; device row lengths remain
 authoritative. Oversized or device-only bounds use the ordinary graph.
 No attention truncation, capacity increase or arithmetic change is made.
 
-`VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST` optionally loads the existing
-compact E4M3 q1 library. The loader checks the DSO hash and the compact
-six-head/lookup/256K contract. Its persistent FP32 numerator, maximum and
+The compact E4M3 q1 operator is compiled into `_vllm_fa2_C` and selected with
+no environment variable. `VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST` stays
+as an explicit override that loads an externally built candidate instead; the
+loader then checks the DSO hash and the compact six-head/lookup/256K contract.
+Both paths are admitted at the descriptor the long-context contract itself
+declares, so a capacity change cannot silently disable them: the manifest has
+to cover the declared range, and the graph descriptor bucket is compared
+against that same value rather than a literal 262144. Its persistent FP32 numerator, maximum and
 sum buffers are allocated before profiling and capture, outside the graph
 pool. The operator requires the explicit 256K graph descriptor and the
 admitted B1/H6/D256/page3296 E4M3 layout. Short q1 contexts below 128K,
@@ -65,6 +71,19 @@ and complete FP32 partition buffers. No native source is changed here.
 | --- | --- | --- |
 | P layout, early store, E4M3 lookup | `eb7a85511f581fcd22cf13619c85ed2f42a8cbc8b216bb3e632bf448f6b820e1` | `9db33737adb880cd4198266ac4f29785ce3e709936aa47dcc79011a9bce4b811` |
 | Compact scalar, lookup, 4 KiB shared reservation | `5e68578c0252c7525496abab98aef5ed5f774528ac1dab6c5e1c587912cfa632` | `6d2b2b1ec5e0501de9abf49a81670cca2fb2ee700be66365f98db118a62fee21` |
+
+The shipped `csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu`
+carries the first source digest above, and `BUILTIN_MANIFEST` names it so a
+rebuilt kernel cannot inherit the workspace identity of a different layout.
+It differs from that candidate only in registration: `PYBIND11_MODULE` becomes
+`TORCH_LIBRARY_FRAGMENT` plus a `double`-signature adapter, and
+`torch/extension.h` is replaced by `torch/library.h` with an explicit
+`c10/cuda/CUDAException.h`. The other five files are byte-identical to the
+candidate. An earlier revision of this change shipped the
+`heads1-qk2-vector16-page-prefetch` source (`8459d57c6b72`) under this digest;
+that layout lacks the probability swizzle, early probability store,
+PV-value reuse, full-q8 specialization, all-visible tiles and shared E4M3 LUT,
+and is the reason the capacity round stayed near 38 ms instead of 31 ms.
 
 The existing builders are `build_sm70_grouped_attention_swizzle.py` and
 `build_sm70_scalar_attention_candidate.py`. Keep their frozen source inputs

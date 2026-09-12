@@ -16,11 +16,11 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Upper bound the accelerated route admits. The operator s extended-boundary
-# screen covers 262152 physical-page and stride boundaries byte-exactly, so the
-# route covers the full 262144 service capacity plus generation headroom instead
-# of stopping at a 128K prompt. Device row lengths remain authoritative.
-MAX_CONTEXT = 262152
+# Upper bound the accelerated route admits, and the value the route matches a
+# descriptor bucket against. It must stay exactly the 262144 service capacity:
+# the compact scalar tail route and the q1 long-context graph variant both gate
+# on equality with 262144, so a larger bound silently disables them.
+MAX_CONTEXT = 262144
 MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
 DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -30,13 +30,22 @@ _WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 # it is available without any environment variable. The manifest variable stays
 # as an explicit override for an unqualified experimental candidate.
 BUILTIN_OP = "sm70_grouped_long_fwd"
+# The compiled operator carries the probability-swizzle / early-store layout the
+# route was qualified with. The source digest names that layout so a rebuilt
+# kernel cannot silently inherit the workspace identity of a different one.
+BUILTIN_SOURCE_SHA256 = (
+    "eb7a85511f581fcd22cf13619c85ed2f42a8cbc8b216bb3e632bf448f6b820e1"
+)
+# Every B1 verifier tail width uses the long-context graph contract at this
+# capacity; q1 additionally has the compact scalar tail.
+BUILTIN_QUERY_ROWS = (2, 3, 4, 5, 6, 7, 8)
 BUILTIN_MANIFEST = {
     "module_name": "_vllm_fa2_C",
-    "source_sha256": BUILTIN_OP,
+    "source_sha256": BUILTIN_SOURCE_SHA256,
     "splits": 80,
     "head_groups": 1,
     "max_context": MAX_CONTEXT,
-    "query_rows": [8],
+    "query_rows": list(BUILTIN_QUERY_ROWS),
 }
 
 
@@ -140,7 +149,7 @@ def resolve_long_attention():
         "query_rows=%s; 80 splits, compensated FP32 state.",
         BUILTIN_OP,
         MAX_CONTEXT,
-        (8,),
+        BUILTIN_QUERY_ROWS,
         scope="process",
     )
     return operator, BUILTIN_MANIFEST

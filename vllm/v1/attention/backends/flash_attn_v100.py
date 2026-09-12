@@ -4454,18 +4454,24 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             load_grouped_e4m3_fp32() if use_e4m3_fp32 else None
         )
         self._sm70_scalar_tail_attention = None
+        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+            load_scalar_tail_attention,
+            scalar_tail_attention_available,
+        )
+
         if (
             use_e4m3_fp32
             and envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
-            and envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
+            and (
+                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
+                or scalar_tail_attention_available()
+            )
             and not os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
         ):
-            from vllm.v1.attention.ops.sm70_e4m3_scalar import (
-                load_scalar_tail_attention,
-            )
-
+            # An empty name selects the operator compiled into this extension;
+            # a manifest name keeps the explicit experimental override.
             self._sm70_scalar_tail_attention = load_scalar_tail_attention(
-                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST,
+                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST or "",
                 torch.device("cuda", torch.accelerator.current_device_index()),
             )
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:

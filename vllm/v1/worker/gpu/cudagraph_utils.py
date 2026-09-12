@@ -442,6 +442,9 @@ class ModelCudaGraphManager(CudaGraphManager):
             long_attention_enabled,
             long_attention_graph_contract,
         )
+        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+            scalar_tail_attention_available,
+        )
 
         if (
             long_attention_enabled()
@@ -451,10 +454,9 @@ class ModelCudaGraphManager(CudaGraphManager):
             and vllm_config.parallel_config.pipeline_parallel_size == 1
         ):
             context_limit, query_rows = long_attention_graph_contract()
-            if (
-                self._sm70_dflash2_tail_graphs
-                and envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
-                and context_limit == 262144
+            if self._sm70_dflash2_tail_graphs and (
+                bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
+                or scalar_tail_attention_available()
             ):
                 query_rows = (1, *query_rows)
             descs = self._capture_descs.get(CUDAGraphMode.FULL, [])

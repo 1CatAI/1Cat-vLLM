@@ -188,7 +188,7 @@ if TYPE_CHECKING:
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST: str | None = None
-    VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = False
+    VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS: bool = True
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
@@ -1885,8 +1885,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. Default-off keeps
     # the existing eager fallback and its memory footprint unchanged.
+    # Capturing the B1 q1..q7 verifier tails is on by default: the eager tail
+    # was the dominant round cost at 256K, and 1K/128K are unchanged (<0.01 ms).
+    # VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0 restores the eager-tail behaviour.
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "0"))
+        int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "1"))
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": lambda: os.getenv(
         "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None
