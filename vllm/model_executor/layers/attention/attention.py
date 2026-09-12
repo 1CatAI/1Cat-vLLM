@@ -8,7 +8,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
-from vllm.config.vllm import VllmConfig
+from vllm.config.vllm import VllmConfig, checkpoint_kv_quant_allowed
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
@@ -273,8 +273,15 @@ class Attention(nn.Module, AttentionLayerBase):
         # The "auto" case is normally resolved upstream in
         # resolve_kv_cache_dtype_string, but we re-apply here defensively in
         # case anything bypassed that path.
+        # The same pre-Ampere policy as VllmConfig applies here, so a
+        # compressed-tensors checkpoint cannot quantize the cache on a device
+        # where the resolve path just refused to.
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
-        if kv_cache_scheme is not None and kv_cache_dtype == "auto":
+        if (
+            kv_cache_scheme is not None
+            and kv_cache_dtype == "auto"
+            and checkpoint_kv_quant_allowed(vllm_config)
+        ):
             kv_cache_dtype = "fp8"
             calculate_kv_scales = False
             if cache_config is not None:
