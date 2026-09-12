@@ -152,6 +152,12 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
+    mtp_expert_quantization: Literal["fp8"] | None = None
+    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ or
+    ModelOpt checkpoint whose MTP experts are unquantized. Serialized block-FP8
+    MTP experts use their checkpoint scales without this online-conversion flag.
+    Target weights are unchanged.
+    """
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
@@ -385,6 +391,12 @@ class SpeculativeConfig:
             or self.use_dspark()
         )
         factors.append(uses_aux_hidden_states)
+
+        # Online FP8 changes the draft expert kernels and padded weight layout.
+        # Include None too: old MTP artifacts may have been compiled with FP8
+        # under the same key as FP16, before this field was hashed.
+        if self.method == "mtp":
+            factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -1392,6 +1404,7 @@ class SpeculativeConfig:
                     "dflash_ddtree tree verification is enabled."
                 )
 
+        self._verify_mtp_expert_quantization()
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1416,6 +1429,23 @@ class SpeculativeConfig:
 
         self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def _verify_mtp_expert_quantization(self):
+        if self.mtp_expert_quantization is None:
+            return
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda() or not current_platform.is_device_capability(
+            (7, 0)
+        ):
+            raise ValueError("mtp_expert_quantization currently requires CUDA SM70")
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if self.method != "mtp" or getattr(hf_config, "architectures", []) != [
+            "Qwen4ExpMTP"
+        ]:
+            raise ValueError("mtp_expert_quantization currently requires Qwen4Exp MTP")
+        if self.rejection_sample_method != "standard":
+            raise ValueError("FP8 MTP requires standard rejection sampling")
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
