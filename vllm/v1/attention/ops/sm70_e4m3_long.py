@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in compensated q8 scheduling with an explicit native build manifest."""
+"""Opt-in compensated attention with explicit native build manifests."""
 
 import hashlib
 import importlib.util
@@ -27,14 +27,10 @@ def long_attention_enabled() -> bool:
     return bool(os.environ.get(MANIFEST_ENV))
 
 
-@lru_cache(maxsize=1)
-def load_long_attention(manifest_name: str):
+@lru_cache(maxsize=4)
+def load_attention_library(manifest_name: str):
     manifest_path = Path(manifest_name).resolve()
     manifest = json.loads(manifest_path.read_text())
-    # Different split counts change arithmetic and workspace geometry. They
-    # must complete their own admission before extending this serving route.
-    if manifest.get("splits", 80) != 80 or manifest["head_groups"] != 1:
-        raise ValueError("The long-attention serving route requires 80 six-head splits")
     library = Path(manifest["library"])
     if not library.is_absolute():
         library = manifest_path.parent / library
@@ -56,15 +52,44 @@ def load_long_attention(manifest_name: str):
     loaded_file = module.__file__
     if loaded_file is None or Path(loaded_file).resolve() != library:
         raise RuntimeError("Long-attention native extension module alias")
+    return module, manifest
+
+
+@lru_cache(maxsize=1)
+def load_long_attention(manifest_name: str):
+    module, manifest = load_attention_library(manifest_name)
+    # Split counts change both arithmetic and workspace geometry.
+    if manifest.get("splits", 80) != 80 or manifest["head_groups"] != 1:
+        raise ValueError("The long-attention serving route requires 80 six-head splits")
+    context_limit, query_rows = long_attention_contract(manifest)
     logger.info_once(
         "Loaded experimental SM70 E4M3 q8 attention: module=%s SHA256=%s "
-        "max_context=%d; 80 splits, compensated FP32 state.",
-        name,
+        "max_context=%d query_rows=%s; 80 splits, compensated FP32 state.",
+        manifest["module_name"],
         manifest["library_sha256"],
-        MAX_CONTEXT,
+        context_limit,
+        query_rows,
         scope="process",
     )
     return module.run, manifest
+
+
+def long_attention_contract(manifest):
+    context_limit = manifest.get("max_context", MAX_CONTEXT)
+    query_rows = tuple(manifest.get("query_rows", [8]))
+    if (
+        type(context_limit) is not int
+        or not 0 < context_limit <= 262144
+        or not query_rows
+        or any(type(q) is not int or not 2 <= q <= 8 for q in query_rows)
+    ):
+        raise ValueError("Unsupported long-attention context or query-row contract")
+    return context_limit, query_rows
+
+
+def long_attention_graph_contract():
+    _, manifest = load_long_attention(os.environ[MANIFEST_ENV])
+    return long_attention_contract(manifest)
 
 
 def wrap_long_attention(fallback):
@@ -72,6 +97,7 @@ def wrap_long_attention(fallback):
     if not manifest_name:
         return fallback
     operator, manifest = load_long_attention(manifest_name)
+    context_limit, query_rows = long_attention_contract(manifest)
 
     def run(
         q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
@@ -83,8 +109,10 @@ def wrap_long_attention(fallback):
         )
         if not (
             descriptor is not None
-            and descriptor.attention_context_bucket == MAX_CONTEXT
-            and q.shape == (8, 6, 256)
+            and descriptor.attention_context_bucket == context_limit
+            and q.ndim == 3
+            and q.shape[0] in query_rows
+            and q.shape[1:] == (6, 256)
             and k.ndim == 4
             and k.shape[1] in (1648, 3296)
             and k.shape[2:] == (1, 256)
@@ -105,7 +133,7 @@ def wrap_long_attention(fallback):
         # replay never allocates. Layers reuse it in stream order; different
         # streams and versions never share the legacy 80-split buffers.
         stream = torch.cuda.current_stream(q.device).cuda_stream
-        key = (manifest["source_sha256"], MAX_CONTEXT, 80, q.device, stream)
+        key = (manifest["source_sha256"], context_limit, 80, q.device, stream)
         if key not in _WORKSPACES:
             _WORKSPACES[key] = (
                 torch.empty((80, 8, 6, 256), dtype=torch.float32, device=q.device),

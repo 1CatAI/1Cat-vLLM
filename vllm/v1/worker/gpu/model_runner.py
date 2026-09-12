@@ -1459,6 +1459,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        if (
+            not dummy_run
+            and getattr(self.cudagraph_manager, "_sm70_dflash2_tail_graphs", False)
+            and num_reqs == 1
+            and 1 <= num_toks < 8
+        ):
+            req_id = next(iter(scheduler_output.num_scheduled_tokens))
+            req_index = self.req_states.req_id_to_index[req_id]
+            if (
+                self.req_states.num_computed_prefill_tokens[req_index]
+                < self.req_states.prefill_len.np[req_index]
+            ):
+                # A short prompt/chunk must initialize GDN state rather than
+                # replay a graph captured for an already initialized decode.
+                uniform_tok_count = None
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
