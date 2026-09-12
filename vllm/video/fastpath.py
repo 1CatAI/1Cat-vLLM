@@ -45,4 +45,5 @@ def studio_capabilities():
         "quality_status": "not_accepted",
         "tasks": ["t2va"],
     }
+    result["prepared_weight_cache"] = {"format": 1, "available": True}
     return result
