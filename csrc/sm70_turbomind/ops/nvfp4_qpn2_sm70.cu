@@ -625,16 +625,35 @@ __global__ void nvfp4_qpn2_pack_rows_kernel(const half* __restrict__ x,
   }
 }
 
-// Where the pack pays end to end: from M=7 on Turing (64 KB L1; measured on
-// Qwen3.8-27B with MTP, M=5 and 6 neutral, M=7 +1.9 %, M=8 +3.7 %), from
-// M=8 on Volta and M=7 on Turing amortize the packing launch.
-int qpn2_pack_min_rows() {
-  const cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
-  return (prop->major == 7 && prop->minor == 5) ? 7 : 8;
+// Packing adds a launch and traffic. Admit enough reduction work per split
+// and enough CTAs to amortize it; a sparse gated row tile keeps the direct
+// path.
+constexpr int kQpn2PackMinGroupsPerSplit = 20;
+
+std::string qpn2_pack_layout_reason(int k, int n, int split_k) {
+  if (split_k <= 0 || (k / 16) / split_k < kQpn2PackMinGroupsPerSplit) {
+    return "too little reduction work per split to amortize activation packing";
+  }
+  const auto* prop = at::cuda::getCurrentDeviceProperties();
+  if ((n / 32) * split_k < 2 * prop->multiProcessorCount) {
+    return "too few projection CTAs to amortize activation packing";
+  }
+  return "";
 }
 
-bool qpn2_pack_enabled(int m, bool activation_pack) {
-  return activation_pack && m >= qpn2_pack_min_rows();
+bool qpn2_pack_enabled(int m, int k, int n, int split_k, bool gated,
+                       bool activation_pack) {
+  if (!activation_pack || split_k <= 0) return false;
+  const auto* prop = at::cuda::getCurrentDeviceProperties();
+  const int min_rows = (prop->major == 7 && prop->minor == 5) ? 7 : 9;
+  const int rows =
+      (m + kQpn2RowsPerCta - 1) / kQpn2RowsPerCta * kQpn2RowsPerCta;
+  // Ungated packing amortizes the extra buffer across two row tiles; larger
+  // row grids retain the direct or existing specialized batched kernels.
+  return m >= min_rows && (gated || rows <= 2 * kQpn2RowsPerCta) &&
+         (!gated || m * 4 >= rows * 3) &&
+         (k / 16) / split_k >= kQpn2PackMinGroupsPerSplit &&
+         (n / 32) * split_k >= 2 * prop->multiProcessorCount;
 }
 
 // Rows of the packed buffer: m rounded up to whole 8-row tiles.
@@ -822,7 +841,8 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
   }
 
-  const bool packed = qpn2_pack_enabled(m, activation_pack);
+  const bool packed =
+      qpn2_pack_enabled(m, k, n, split_k, false, activation_pack);
   const int packed_rows = packed ? qpn2_packed_rows(m) : 0;
   torch::Tensor xb;
   if (packed) {
@@ -922,7 +942,8 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
   }
 
-  const bool packed = qpn2_pack_enabled(m, activation_pack);
+  const bool packed =
+      qpn2_pack_enabled(m, k, hidden, split_k, true, activation_pack);
   const int packed_rows = packed ? qpn2_packed_rows(m) : 0;
   torch::Tensor xb;
   if (packed) {
@@ -959,6 +980,13 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
 #undef VLLM_LAUNCH_QPN2_GATED
 #undef VLLM_LAUNCH_QPN2_GATED_P
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::string nvfp4_qpn2_activation_pack_reason_sm70(torch::Tensor codes,
+                                                   int64_t k, int64_t n,
+                                                   int64_t split_k) {
+  const at::cuda::OptionalCUDAGuard guard(device_of(codes));
+  return qpn2_pack_layout_reason(k, n, split_k);
 }
 
 void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,

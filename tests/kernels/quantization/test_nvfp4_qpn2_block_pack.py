@@ -97,3 +97,33 @@ def test_block_pack_is_bit_identical_across_launch_configs(
     unpacked = _run(False, m, n, k, False, split_k, chains)
     packed = _run(False, m, n, k, True, split_k, chains)
     assert torch.equal(packed, unpacked)
+
+
+def test_packing_work_reasons_are_reported():
+    from vllm import _sm70_ops as sm70_ops
+
+    reason = torch.ops._C.nvfp4_qpn2_activation_pack_reason_sm70
+    codes = torch.zeros(1, device="cuda", dtype=torch.uint8)
+    assert "reduction work" in reason(codes, 1536, 5120, 16)
+    assert "projection CTAs" in reason(codes, 5120, 32, 16)
+    assert reason(codes, 5120, 3584, 16) == ""
+    assert sm70_ops.has_qpn2_activation_pack("nvfp4_qpn2_gemm_sm70_out")
+
+
+def test_native_abi_detection_preserves_full_graph_compilation():
+    from vllm import _sm70_ops as sm70_ops
+
+    n, k = 3584, 5120
+    codes, scales, generator = _prepared(n, k, seed=84322)
+    x = torch.randn(8, k, dtype=torch.float16, device="cuda", generator=generator)
+    out = torch.empty(8, n, dtype=x.dtype, device=x.device)
+
+    def run(x, out):
+        sm70_ops.nvfp4_qpn2_gemm_sm70_out(
+            out, x, codes, scales, 0.01, 16, 2, activation_pack=True
+        )
+        return out
+
+    expected = run(x, torch.empty_like(out)).clone()
+    compiled = torch.compile(run, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(x, out), expected)
