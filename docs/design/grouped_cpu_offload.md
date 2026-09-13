@@ -43,6 +43,37 @@ Requests shorter than `stride` blocks may occupy proportionally more state
 slots than the bound assumes; their Mamba states age out first and such
 prefixes then miss rather than restore a wrong state.
 
+### What the stride changes, and how to choose it
+
+The stride only changes how many Mamba state snapshots the offload tier keeps
+and how the RAM budget is split between token pages and state slots. It does
+not touch GPU allocation, kernels, hashing or outputs: token IDs were identical
+across cold, restored and recomputed runs in every configuration.
+
+- **Capacity.** Every snapshot skipped is RAM returned to token pages. On the
+  measured 16 GiB TP4 layout, 107 token blocks at stride 1 become 184 at
+  stride 4, 248 at stride 8 and 309 at stride 16.
+- **Full-prefix hits are unchanged.** The final prefill boundary of every
+  request is always stored, so a repeated prompt restores the same number of
+  tokens at any stride.
+- **Partial-prefix hits round down.** When a new prompt shares only part of a
+  stored prompt, the hit stops at the last stored boundary: at most
+  `stride - 1` blocks are recomputed (5.5K tokens at stride 8). Appending to a
+  conversation is a full-prefix hit and does not pay this; asking different
+  questions about the same long document does.
+- **Short requests.** The state pools are sized for requests of at least
+  `stride` blocks. Many prompts shorter than that (about 6K tokens at stride
+  8) can fill the state pools first; once their state is evicted the prefix
+  misses even though its attention blocks remain. Workloads dominated by short
+  prompts should keep the stride small.
+- **Transfer volume.** A 64K request writes 11 state snapshots per group
+  instead of 84 at stride 8, cutting GPU-to-host state traffic by about 85%.
+
+The default stays at 1 so existing deployments keep their validated behavior.
+Deployments serving long contexts should set the stride explicitly (8 is the
+validated value); the stride is a runtime option and can differ between
+restarts because keys do not encode it, only fewer of them are stored.
+
 ### V100 validation of stride 8
 
 Flash-Next AWQ, TP4, FP16 KV, CUDA Graphs, 16 GiB CPU budget, 1.19 GiB GPU
