@@ -5,6 +5,44 @@ avoid charging each offload key for every group's backing tensors. The native
 connector retains original KV group IDs, including empty positions for scratch
 groups. Group-local slot IDs may repeat because the CPU tensors are disjoint.
 
+## Mamba checkpoint stride
+
+Flash-Next's `align` Mamba mode materializes one recurrent-state snapshot per
+784-token block boundary during prefill. The GPU keeps only the latest state
+per request, but the offload tier received every boundary for each of the four
+Mamba groups. On the measured TP4 layout that is 29.7 MB of state per token
+block against 10.24 MB of attention/PLE data, so 74% of the RAM budget held
+state snapshots and 16 GiB fit about 1.3 contexts of 64K tokens.
+
+`mamba_checkpoint_stride` (kv_connector_extra_config, default `1`) keeps only
+every stride-th boundary plus the final prefill boundary of each request. The
+final boundary mirrors the core scheduler's last cache position, including the
+one-block EAGLE/MTP shift. Loads already fall back to the nearest stored state:
+the Mamba group lookup scans backwards from the attention hit and the outer
+lookup shrinks the hit window, so full-prefix hits stay exact and partial-prefix
+hits recompute at most `stride - 1` blocks. Intermediate states are never
+loaded; only the boundary state at the hit position is transferred.
+
+Group pools are sized by role. Token groups receive `N` slots and each Mamba
+group receives `cdiv(N * (2 * stride - 1), stride**2)` slots, the number of
+`cdiv(B, stride)` checkpoints that requests of at least `stride` blocks can
+occupy across `N` token blocks. `N` is the largest value whose token pages plus
+state slots fit `cpu_bytes_to_use`. With stride 1 this reproduces the equal
+107-slot layout. On the same 16 GiB budget:
+
+| stride | token slots | 64K contexts | state slots per group |
+|-------:|------------:|-------------:|----------------------:|
+| 1      | 107         | 1.3          | 107                   |
+| 4      | 184         | 2.2          | 81                    |
+| 8      | 248         | 3.0          | 59                    |
+| 16     | 309         | 3.7          | 38                    |
+
+Shared regions and mmap files carry the per-group slot count, so the worker
+views, the scheduler memoryviews and the FS tier rows use the same geometry.
+Requests shorter than `stride` blocks may occupy proportionally more state
+slots than the bound assumes; their Mamba states age out first and such
+prefixes then miss rather than restore a wrong state.
+
 ## Public interface boundary
 
 The generic KV connector base classes, connector factory, LMCache connectors,

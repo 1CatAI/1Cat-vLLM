@@ -112,6 +112,37 @@ def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
     return mamba_align_size
 
 
+def _use_eagle(spec: "OffloadingSpec") -> bool:
+    speculative_config = getattr(spec.vllm_config, "speculative_config", None)
+    return bool(speculative_config and speculative_config.use_eagle_kv_cache())
+
+
+def mamba_boundary_is_stored(
+    boundary_tokens: int,
+    offloaded_block_size: int,
+    num_prompt_tokens: int,
+    stride: int,
+    use_eagle: bool,
+) -> bool:
+    """Whether a materialized Mamba boundary state belongs in the offload tier.
+
+    With ``stride`` > 1 only every stride-th boundary is kept, plus the last
+    boundary the core scheduler materializes during prefill (mirroring
+    ``Scheduler._mamba_block_aligned_split``). Loads round down to the nearest
+    stored boundary, so full-prefix hits stay exact and partial-prefix hits
+    recompute at most ``stride - 1`` blocks.
+    """
+    if stride <= 1:
+        return True
+    if (boundary_tokens // offloaded_block_size) % stride == 0:
+        return True
+    last_token = max(num_prompt_tokens - 1, 0)
+    final_prefill_boundary = last_token - last_token % offloaded_block_size
+    if use_eagle:
+        final_prefill_boundary = max(final_prefill_boundary - offloaded_block_size, 0)
+    return boundary_tokens == final_prefill_boundary
+
+
 class SchedulerOffloadConfig(NamedTuple):
     kv_group_configs: tuple[GroupOffloadConfig, ...]
     block_size_factor: int
@@ -119,6 +150,11 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
+    # Keep every stride-th Mamba boundary state plus each request's final
+    # prefill boundary. 1 stores every materialized boundary.
+    mamba_checkpoint_stride: int = 1
+    # EAGLE/MTP materializes the final prefill state one block earlier.
+    use_eagle: bool = False
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -197,6 +233,10 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
+            mamba_checkpoint_stride=max(
+                1, int(getattr(spec, "mamba_checkpoint_stride", 1))
+            ),
+            use_eagle=_use_eagle(spec),
         )
 
 
@@ -955,6 +995,13 @@ class OffloadingConnectorScheduler:
                     block_id == 0
                     or boundary_tokens > num_offloadable_tokens
                     or boundary_tokens % group_config.offloaded_block_size != 0
+                    or not mamba_boundary_is_stored(
+                        boundary_tokens,
+                        group_config.offloaded_block_size,
+                        req.num_prompt_tokens,
+                        self.config.mamba_checkpoint_stride,
+                        self.config.use_eagle,
+                    )
                 ):
                     continue
 

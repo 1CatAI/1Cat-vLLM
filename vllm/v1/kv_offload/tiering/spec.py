@@ -115,10 +115,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         regions: dict[int, SharedOffloadRegion] = {}
         try:
             for group, page_size in self.cpu_group_page_sizes.items():
+                num_blocks = self.cpu_group_num_blocks[group]
                 regions[group] = SharedOffloadRegion(
                     instance_id=f"{self.vllm_config.instance_id}_g{group}",
-                    total_size_bytes=page_size * world_size * self.num_blocks,
-                    num_blocks=self.num_blocks,
+                    total_size_bytes=page_size * world_size * num_blocks,
+                    num_blocks=num_blocks,
                     rank=rank,
                     num_workers=world_size,
                     cpu_page_size=page_size,
@@ -142,7 +143,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             managers: dict[int, OffloadingManager] = {}
             for group, region in regions.items():
                 primary = CPUPrimaryTierOffloadingManager(
-                    num_blocks=self.num_blocks,
+                    num_blocks=self.cpu_group_num_blocks[group],
                     cache_policy=self.eviction_policy,  # type: ignore[arg-type]
                     enable_events=enable_events,
                     mmap_region=region,
@@ -267,6 +268,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 num_cpu_blocks=self.num_blocks,
                 group_page_sizes=self.cpu_group_page_sizes,
                 group_mmap_regions=self._create_group_regions(rank),
+                group_num_blocks=self.cpu_group_num_blocks,
             )
         worker_mmap = SharedOffloadRegion(
             instance_id=self.vllm_config.instance_id,

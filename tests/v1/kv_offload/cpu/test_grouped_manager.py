@@ -24,7 +24,7 @@ from vllm.v1.kv_offload.cpu.manager import (
     CPUOffloadingManager,
     GroupedCPUOffloadingManager,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, mamba_checkpoint_slots
 
 CTX = ReqContext("test")
 GROUPS = (0, 2, 3, 4, 5)
@@ -143,12 +143,20 @@ def test_group_views_preserve_gpu_aliases_but_separate_cpu_indices():
         partition_kv_caches(caches, {0: 31, 2: 32}, 2)
 
 
-@pytest.mark.parametrize("layout", ["equal", "scheduler", "mixed", "attention_only"])
-def test_actual_flash_next_group_budget(monkeypatch, layout):
+FLASH_NEXT_PAGES = {
+    0: 10235904,
+    2: 9633792,
+    3: 9633792,
+    4: 9633792,
+    5: 802816,
+}
+
+
+def _flash_next_spec(monkeypatch, layout="equal", **extra_config):
     def init(self, config, caches):
         self.vllm_config = config
         self.kv_cache_config = caches
-        self.extra_config = {"cpu_bytes_to_use": 16 * 1024**3}
+        self.extra_config = {"cpu_bytes_to_use": 16 * 1024**3, **extra_config}
         self.block_size_factor = 1
 
     monkeypatch.setattr(OffloadingSpec, "__init__", init)
@@ -195,7 +203,7 @@ def test_actual_flash_next_group_budget(monkeypatch, layout):
         groups[2] = group(replace(mamba, block_size=392), 12)
     elif layout == "attention_only":
         groups = [group(uniform, 24), group(uniform, 24)]
-    spec = CPUOffloadingSpec(
+    return CPUOffloadingSpec(
         SimpleNamespace(parallel_config=SimpleNamespace(world_size=4)),
         SimpleNamespace(
             kv_cache_groups=groups,
@@ -203,20 +211,68 @@ def test_actual_flash_next_group_budget(monkeypatch, layout):
             kv_cache_tensors=tensors,
         ),
     )
+
+
+@pytest.mark.parametrize("layout", ["equal", "scheduler", "mixed", "attention_only"])
+def test_actual_flash_next_group_budget(monkeypatch, layout):
+    spec = _flash_next_spec(monkeypatch, layout)
     if layout not in ("equal", "scheduler"):
         assert not spec.partition_by_group
         assert spec.num_blocks == 419
+        assert spec.cpu_group_num_blocks == {}
         return
-    assert spec.cpu_group_page_sizes == {
-        0: 10235904,
-        2: 9633792,
-        3: 9633792,
-        4: 9633792,
-        5: 802816,
-    }
+    assert spec.cpu_group_page_sizes == FLASH_NEXT_PAGES
     assert spec.num_blocks == 107
+    assert spec.mamba_checkpoint_stride == 1
+    assert spec.cpu_group_num_blocks == dict.fromkeys(FLASH_NEXT_PAGES, 107)
     assert spec.cpu_page_size_per_worker * 4 * spec.num_blocks <= 16 * 1024**3
     assert spec.num_blocks >= 2 * 48
+
+
+def _grouped_bytes(spec):
+    return 4 * sum(
+        spec.cpu_group_page_sizes[g] * n for g, n in spec.cpu_group_num_blocks.items()
+    )
+
+
+@pytest.mark.parametrize("stride", [2, 8, 84])
+def test_flash_next_checkpoint_stride_budget(monkeypatch, stride):
+    spec = _flash_next_spec(monkeypatch, mamba_checkpoint_stride=stride)
+    assert spec.partition_by_group
+    assert spec.mamba_checkpoint_stride == stride
+    token_slots = spec.num_blocks
+    state_slots = mamba_checkpoint_slots(token_slots, stride)
+    assert state_slots == -(-token_slots * (2 * stride - 1) // stride**2)
+    assert spec.cpu_group_num_blocks == {
+        0: token_slots,
+        2: state_slots,
+        3: state_slots,
+        4: state_slots,
+        5: state_slots,
+    }
+    # Same 16 GiB budget now buys more token blocks than equal slots did.
+    assert token_slots > 107
+    assert _grouped_bytes(spec) <= 16 * 1024**3
+    # Maximal: one more token block (with its state slots) would not fit.
+    spec.cpu_group_num_blocks[0] += 1
+    for g in (2, 3, 4, 5):
+        spec.cpu_group_num_blocks[g] = mamba_checkpoint_slots(token_slots + 1, stride)
+    assert _grouped_bytes(spec) > 16 * 1024**3
+    # A 64K request (84 blocks) stores cdiv(84, stride) states per group.
+    assert -(-84 // stride) <= state_slots
+
+
+def test_flash_next_stride_eight_capacity(monkeypatch):
+    spec = _flash_next_spec(monkeypatch, mamba_checkpoint_stride=8)
+    # 16 GiB: 107 token blocks with equal slots vs. more than 2x with stride 8.
+    assert spec.num_blocks >= 240
+    assert spec.cpu_group_num_blocks[2] == -(-spec.num_blocks * 15 // 64)
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_invalid_checkpoint_stride_rejected(monkeypatch, stride):
+    with pytest.raises(ValueError, match="mamba_checkpoint_stride"):
+        _flash_next_spec(monkeypatch, mamba_checkpoint_stride=stride)
 
 
 def test_private_cpu_allocations_obey_group_budget(monkeypatch):
@@ -246,6 +302,31 @@ def test_private_cpu_allocations_obey_group_budget(monkeypatch):
     assert torch.all(cpu[1][0] == 3)
     assert torch.all(cpu[0][1] == 0)
     assert handlers.cpu_to_gpu_handler.cpu_tensors is cpu
+
+
+def test_private_cpu_allocations_use_group_slot_counts(monkeypatch):
+    import vllm.v1.kv_offload.cpu.gpu_worker as worker
+
+    monkeypatch.setattr(worker, "is_pin_memory_available", lambda: False)
+    monkeypatch.setattr(
+        worker, "SingleDirectionOffloadingHandler", lambda **kw: SimpleNamespace(**kw)
+    )
+    tensor = CanonicalKVCacheTensor(torch.zeros((4, 16), dtype=torch.int8), 16)
+    caches = CanonicalKVCaches(
+        [tensor],
+        [[CanonicalKVCacheRef(0, 16)], [], [CanonicalKVCacheRef(0, 8)]],
+    )
+    handlers = worker.CpuGpuOffloadingHandlers(
+        caches,
+        2,
+        4,
+        group_page_sizes={0: 32, 2: 32},
+        group_num_blocks={0: 4, 2: 1},
+    )
+    cpu = handlers.gpu_to_cpu_handler.cpu_tensors
+    assert [t.shape for t in cpu] == [(4, 32), (1, 32)]
+    with pytest.raises(AssertionError):
+        worker.CpuGpuOffloadingHandlers(caches, 2, 4, group_num_blocks={0: 4})
 
 
 def test_grouped_worker_views_share_scheduler_rows(monkeypatch):

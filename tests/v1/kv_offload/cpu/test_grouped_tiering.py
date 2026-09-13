@@ -74,6 +74,7 @@ def _build(root):
     spec.block_size_factor = 1
     spec.cpu_group_page_sizes = GROUP_PAGES
     spec.num_blocks = 2
+    spec.cpu_group_num_blocks = {group: 2 for group in GROUP_PAGES}
     spec.partition_by_group = True
     spec.eviction_policy = "lru"
     spec.extra_config = {}
@@ -241,6 +242,7 @@ def test_spec_group_regions_share_geometry_and_cleanup_partial_failure(monkeypat
     )
     spec.cpu_group_page_sizes = GROUP_PAGES
     spec.num_blocks = 2
+    spec.cpu_group_num_blocks = {group: 2 for group in GROUP_PAGES}
     scheduler = spec._create_group_regions(None)
     worker = {}
     try:

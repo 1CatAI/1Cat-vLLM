@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
     SchedulerOffloadConfig,
+    mamba_boundary_is_stored,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
@@ -1696,3 +1697,116 @@ def test_grouped_deferred_store_preserves_scheduler_retry(blocked_group):
     assert src.block_ids.tolist() == [11, 21]
     assert src.group_sizes == [1, 0, 1]
     assert [state.group_states[g].next_stored_block_idx for g in (0, 2)] == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("boundary", "prompt", "stride", "use_eagle", "expected"),
+    [
+        (16, 190, 1, False, True),
+        (32, 190, 1, False, True),
+        (16, 190, 4, False, False),
+        (64, 190, 4, False, True),
+        (128, 190, 4, False, True),
+        # Final prefill boundary: ((190 - 1) // 16) * 16 = 176.
+        (176, 190, 4, False, True),
+        (160, 190, 4, False, False),
+        # EAGLE/MTP materializes the final state one block earlier.
+        (176, 190, 4, True, False),
+        (160, 190, 4, True, True),
+        # Block-aligned prompt: last cache position is one block before n.
+        (192, 192, 4, False, True),
+        (176, 192, 4, False, True),
+        (16, 16, 4, False, False),
+    ],
+)
+def test_mamba_boundary_is_stored(boundary, prompt, stride, use_eagle, expected):
+    assert mamba_boundary_is_stored(boundary, 16, prompt, stride, use_eagle) is (
+        expected
+    )
+
+
+def _make_strided_boundary_scheduler(stride: int, num_blocks: int, prompt: int):
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.config = scheduler.config._replace(mamba_checkpoint_stride=stride)
+    req_status = scheduler._req_status["req"]
+    request = req_status.req
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(4 * num_blocks)]
+    request.num_prompt_tokens = prompt
+    request.num_tokens = prompt
+    req_status.update_offload_keys()
+    assert len(req_status.group_states[1].offload_keys) == num_blocks
+    return scheduler
+
+
+@pytest.mark.parametrize("stride", [1, 4])
+def test_boundary_store_honors_checkpoint_stride(stride):
+    scheduler = _make_strided_boundary_scheduler(stride, num_blocks=12, prompt=190)
+    entries = [(1, 100 + i, 16 * i) for i in range(1, 13)]
+    output = _empty_store_output(
+        num_scheduled_tokens={"req": 190},
+        boundary_state_offloads={"req": entries},
+    )
+
+    jobs = scheduler._build_boundary_state_store_jobs(output)
+
+    stored = sorted(
+        src.block_indices[1] + 1
+        for src, _ in (job.transfer_spec for job in jobs.values())
+    )
+    if stride == 1:
+        # Boundary 192 exceeds the 190 offloadable tokens.
+        assert stored == list(range(1, 12))
+    else:
+        # Every 4th block plus the final prefill boundary at block 11.
+        assert stored == [4, 8, 11]
+    assert set(scheduler._block_id_to_pending_jobs) == {100 + b for b in stored}
+
+
+def test_scheduler_config_reads_stride_and_eagle_from_spec():
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    speculative = SimpleNamespace(use_eagle_kv_cache=lambda: True)
+    spec = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=4),
+            speculative_config=speculative,
+        ),
+        kv_cache_config=kv_cache_config,
+        gpu_block_size=(block_size, block_size),
+        block_size_factor=1,
+        hash_block_size=block_size,
+        offload_prompt_only=False,
+        mamba_checkpoint_stride=8,
+    )
+    config = SchedulerOffloadConfig.from_spec(spec)
+    assert config.mamba_checkpoint_stride == 8
+    assert config.use_eagle is True
+
+    del spec.mamba_checkpoint_stride
+    spec.vllm_config.speculative_config = None
+    config = SchedulerOffloadConfig.from_spec(spec)
+    assert config.mamba_checkpoint_stride == 1
+    assert config.use_eagle is False
