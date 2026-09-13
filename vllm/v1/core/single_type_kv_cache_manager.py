@@ -311,6 +311,9 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         alignment_tokens: int | None = None,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+        use_eagle: bool = False,
     ) -> None:
         """
         Cache the blocks for the request.
@@ -320,11 +323,19 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens: The total number of tokens that need to be cached
                 (including tokens that are already cached).
             alignment_tokens: The cache-hit alignment (in tokens) used by the
-                coordinator's ``find_longest_cache_hit``. When greater than
-                this group's ``block_size``, managers whose hit logic only
-                returns a subset of blocks per alignment-aligned segment
-                (SWA) skip the rest since they can never participate in a
-                future cache hit.
+                coordinator's ``find_longest_cache_hit``. Managers whose hit
+                logic only returns a subset of blocks per aligned segment (SWA,
+                Mamba) skip the rest since they can never serve a hit.
+            retention_interval: Sparse checkpoint retention for SWA / Mamba
+                groups. ``None`` keeps dense checkpointing; ``0`` keeps only
+                ``reachable_boundaries``; a positive multiple of
+                ``alignment_tokens`` additionally keeps one checkpoint per
+                that-sized segment.
+            reachable_boundaries: Token positions whose state must be kept
+                under sparse retention: the replay boundaries of this prompt
+                and any detected shared-prefix junction.
+            use_eagle: Whether this group's hits drop the EAGLE/MTP lookahead
+                block (SWA keeps one extra block per tail).
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
@@ -332,13 +343,15 @@ class SingleTypeKVCacheManager(ABC):
         if num_cached_blocks >= num_full_blocks:
             return
 
-        # Fast path: when the coordinator imposes no alignment constraint
-        if alignment_tokens is None or alignment_tokens <= self.block_size:
-            block_mask = None
-        else:
-            block_mask = self._cache_block_mask(
-                num_cached_blocks, num_full_blocks, alignment_tokens
-            )
+        block_mask = self.reachable_block_mask(
+            start_block=num_cached_blocks,
+            end_block=num_full_blocks,
+            alignment_tokens=alignment_tokens,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=use_eagle,
+            retention_interval=retention_interval,
+            reachable_boundaries=reachable_boundaries,
+        )
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=self.req_to_blocks[request.request_id],
@@ -351,20 +364,42 @@ class SingleTypeKVCacheManager(ABC):
 
         self.num_cached_block[request.request_id] = num_full_blocks
 
-    def _cache_block_mask(
-        self,
-        num_cached_blocks: int,
-        num_full_blocks: int,
-        alignment_tokens: int,
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
     ) -> list[bool] | None:
-        """Per-block mask for ``cache_full_blocks``. ``None`` means cache
-        every (non-null) block — the default for full attention.
+        """Per-block mask for ``cache_full_blocks`` over
+        ``[start_block, end_block)``. ``None`` means cache every non-null
+        block, the default for full attention.
 
-        Subclasses with sparse hit semantics (SWA) override this to skip
-        blocks that can never serve a hit at any alignment-aligned prefix
-        length.
+        Subclasses with sparse hit semantics (SWA / Mamba) override this to skip
+        blocks that can never serve a hit at any aligned prefix length, and to
+        apply ``retention_interval`` / ``reachable_boundaries``. The same mask
+        decides which blocks native KV offloading stores, so GPU retention and
+        host retention agree.
         """
         return None
+
+    def _free_blocks_by_cache_value(self, blocks: list[KVCacheBlock]) -> None:
+        """Return blocks to the pool, reusing unhashed ones first.
+
+        Blocks without a hash carry no prefix-cache value (transient state or
+        masked-out checkpoints). Prepending them keeps a request's own churn
+        from flushing older cached prefixes out of the free queue.
+        """
+        cached = [block for block in blocks if block.block_hash is not None]
+        uncached = [block for block in blocks if block.block_hash is None]
+        if cached:
+            self.block_pool.free_blocks(cached)
+        if uncached:
+            self.block_pool.free_blocks(uncached, prepend=True)
 
     def free(self, request_id: str) -> None:
         """
@@ -476,7 +511,7 @@ class SingleTypeKVCacheManager(ABC):
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
-            self.block_pool.free_blocks(freed)
+            self._free_blocks_by_cache_value(freed)
 
     def remove_skipped_blocks(
         self,
@@ -670,6 +705,9 @@ class CircularBufferManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         alignment_tokens: int | None = None,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+        use_eagle: bool = False,
     ) -> None:
         del request, num_tokens, alignment_tokens
 
@@ -832,18 +870,77 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                     computed.pop()
         return computed_blocks
 
-    def _cache_block_mask(
-        self, num_cached_blocks: int, num_full_blocks: int, alignment_tokens: int
+    @staticmethod
+    def _contiguous_blocks_for_hit(
+        window_size: int, block_size: int, use_eagle: bool
+    ) -> int:
+        """Contiguous blocks a hit needs at a boundary, incl. the EAGLE peek."""
+        return cdiv(window_size - 1, block_size) + int(use_eagle)
+
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
     ) -> list[bool] | None:
-        assert alignment_tokens > self.block_size
-        per_segment = alignment_tokens // self.block_size
-        tail = cdiv(self.sliding_window - 1, self.block_size)
-        if tail >= per_segment:
+        assert isinstance(kv_cache_spec, SlidingWindowSpec)
+        if alignment_tokens is None:
+            # No alignment constraint imposed by the coordinator.
             return None
-        skip = per_segment - tail
-        return [
-            i % per_segment >= skip for i in range(num_cached_blocks, num_full_blocks)
-        ]
+        block_size = kv_cache_spec.block_size
+        if alignment_tokens % block_size != 0:
+            # The mask is block-granular; a sub-block alignment cannot be
+            # represented exactly, so fall back to dense (never drops a block
+            # that could serve a hit).
+            return None
+        need = cls._contiguous_blocks_for_hit(
+            window_size=kv_cache_spec.sliding_window,
+            block_size=block_size,
+            use_eagle=use_eagle,
+        )
+        # The matched run's right edge sits on the aligned boundary block when
+        # EAGLE peeks one block past it (shift=1), otherwise on the last block
+        # before the boundary (shift=0).
+        shift = 1 if use_eagle else 0
+        mask = [False] * (end_block - start_block)
+        # (1) Segment-boundary tails. ``retention_interval``:
+        #   None -> dense (a tail at every ``alignment_tokens`` boundary);
+        #   0    -> no periodic tails (only the reachable boundaries below);
+        #   >0   -> a tail once per ``retention_interval``-sized segment.
+        segment_tokens = (
+            alignment_tokens
+            if retention_interval is None
+            else (None if retention_interval == 0 else retention_interval)
+        )
+        if segment_tokens is not None:
+            per_segment = segment_tokens // block_size
+            if need >= per_segment:
+                # Every block is reachable; cache them all.
+                return None
+            for i in range(start_block, end_block):
+                if i >= shift and (i - shift) % per_segment >= per_segment - need:
+                    mask[i - start_block] = True
+        # (2) Reachable-boundary tails: the replay boundaries and any
+        # shared-prefix junction, which sparse retention would otherwise skip.
+        if retention_interval is not None:
+            for boundary_tokens in reachable_boundaries:
+                aligned = boundary_tokens // alignment_tokens * alignment_tokens
+                end = aligned // block_size + shift
+                for j in range(max(start_block, end - need), min(end_block, end)):
+                    mask[j - start_block] = True
+        return mask
+
+    def free(self, request_id: str) -> None:
+        # Uncached window blocks are reused first; cached tails stay behind them
+        # as best-effort prefix-cache entries (see _free_blocks_by_cache_value).
+        req_blocks = self.req_to_blocks.pop(request_id, [])
+        self.num_cached_block.pop(request_id, None)
+        self._free_blocks_by_cache_value(list(reversed(req_blocks)))
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -916,6 +1013,9 @@ class KpoolTailManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         alignment_tokens: int | None = None,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+        use_eagle: bool = False,
     ) -> None:
         del request, num_tokens, alignment_tokens
 
@@ -1394,7 +1494,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
-        super().free(request_id)
+        # Unhashed state blocks (masked-out or running state) are reused before
+        # cached checkpoints of other requests.
+        req_blocks = self.req_to_blocks.pop(request_id, [])
+        self.num_cached_block.pop(request_id, None)
+        self._free_blocks_by_cache_value(list(reversed(req_blocks)))
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -1404,22 +1508,84 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return num_computed_tokens - 1
 
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+    ) -> list[bool] | None:
+        """Sparse Mamba state-snapshot retention.
+
+        ``retention_interval``:
+          ``None`` -> dense (cache every materialized boundary state)
+          ``0``    -> keep only the ``reachable_boundaries`` states
+          ``> 0``  -> additionally keep one state per ``retention_interval``
+                      tokens
+
+        ``reachable_boundaries`` are proven reuse points: the replay boundaries
+        of this prompt and any cross-request shared-prefix junction. A Mamba
+        hit needs exactly the single state block ending on the boundary, so
+        no window or EAGLE shift applies (draft models have no Mamba layers).
+        """
+        if retention_interval is None or alignment_tokens is None:
+            return None
+        assert isinstance(kv_cache_spec, MambaSpec)
+        block_size = kv_cache_spec.block_size
+        mask = [False] * (end_block - start_block)
+        # (1) Periodic states. Block ``i`` ends at token ``(i + 1) * block_size``.
+        segment_tokens = None if retention_interval == 0 else retention_interval
+        if segment_tokens is not None:
+            per_segment = segment_tokens // block_size
+            if per_segment <= 1:
+                # Interval at/below the block size: every block is a boundary.
+                return None
+            first_boundary = (
+                start_block + per_segment
+            ) // per_segment * per_segment - 1
+            for i in range(first_boundary - start_block, len(mask), per_segment):
+                mask[i] = True
+        # (2) Reachable-boundary states.
+        for boundary_tokens in reachable_boundaries:
+            aligned = boundary_tokens // alignment_tokens * alignment_tokens
+            boundary_block = aligned // block_size - 1
+            if start_block <= boundary_block < end_block:
+                mask[boundary_block - start_block] = True
+        return mask
+
     def cache_blocks(
         self,
         request: Request,
         num_tokens: int,
         alignment_tokens: int | None = None,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+        use_eagle: bool = False,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            alignment_tokens=alignment_tokens,
+            retention_interval=retention_interval,
+            reachable_boundaries=reachable_boundaries,
+            use_eagle=use_eagle,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for block_idx in range(num_cached_blocks_before, num_cached_blocks_after):
                 block = blocks[block_idx]
-                if block.is_null:
+                # Skip null blocks (align-mode skipped states) and states the
+                # retention mask left unhashed: they are neither shareable nor
+                # offloadable, and the offload hand-off must only carry keyed
+                # boundary states.
+                if block.is_null or block.block_hash is None:
                     continue
-                assert block.block_hash is not None
                 self.cached_blocks_this_step.add(block.block_hash)
                 if self.mamba_cache_mode == "align":
                     self._pending_boundary_state_offloads.append(
@@ -1454,6 +1620,9 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         alignment_tokens: int | None = None,
+        retention_interval: int | None = None,
+        reachable_boundaries: Sequence[int] = (),
+        use_eagle: bool = False,
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.

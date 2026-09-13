@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -22,18 +23,40 @@ from vllm.v1.kv_offload.cpu.manager import (
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 
-def mamba_checkpoint_slots(num_token_blocks: int, stride: int) -> int:
-    """Recurrent-state slots needed for ``num_token_blocks`` attention slots.
+def mamba_state_slots(
+    num_token_blocks: int,
+    block_size: int,
+    alignment_tokens: int,
+    mamba_spec: MambaSpec,
+    retention_interval: int | None,
+    reference_tokens: int,
+) -> int:
+    """Recurrent-state slots needed alongside ``num_token_blocks`` token slots.
 
-    A request of ``B`` token blocks stores ``cdiv(B, stride)`` Mamba
-    checkpoints: every stride-th boundary plus its final prefill boundary. For
-    requests of at least ``stride`` blocks that sums to at most
-    ``N * (2 * stride - 1) / stride**2`` states over ``N`` token blocks, so the
-    state pools never run out before the token pools do for such requests.
+    The demand is read off the same ``reachable_block_mask`` the GPU and the
+    store path use: for a request of ``reference_tokens`` tokens, count the
+    boundary states the mask retains (its replay boundary plus periodic
+    checkpoints), allow one shared-prefix junction per request, and multiply
+    by the number of such requests the token pool can hold. Dense retention
+    keeps every boundary and therefore one state slot per token slot.
     """
-    if stride == 1:
+    if retention_interval is None:
         return num_token_blocks
-    return cdiv(num_token_blocks * (2 * stride - 1), stride * stride)
+    blocks_per_request = max(1, cdiv(reference_tokens, block_size))
+    mask = MambaManager.reachable_block_mask(
+        start_block=0,
+        end_block=blocks_per_request,
+        alignment_tokens=alignment_tokens,
+        kv_cache_spec=mamba_spec,
+        use_eagle=False,
+        retention_interval=retention_interval,
+        reachable_boundaries=(max(reference_tokens - 1, 0),),
+    )
+    states_per_request = blocks_per_request if mask is None else sum(mask)
+    # A request may additionally pin one shared-prefix junction state.
+    states_per_request += 1
+    requests_in_pool = max(1, cdiv(num_token_blocks, blocks_per_request))
+    return min(num_token_blocks, requests_in_pool * states_per_request)
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -65,20 +88,28 @@ class CPUOffloadingSpec(OffloadingSpec):
             )
             == 1
         )
-        # Mamba ``align`` groups materialize one recurrent-state snapshot per
-        # block boundary. A stride of ``k`` keeps only every k-th boundary plus
-        # the final prefill boundary of each request in the offload tier; the
-        # load path already falls back to the nearest stored state.
-        stride = int(self.extra_config.get("mamba_checkpoint_stride", 1))
-        if stride < 1:
-            raise ValueError("mamba_checkpoint_stride must be a positive integer")
-        self.mamba_checkpoint_stride = stride
+        # Mamba state slots follow the prefix-cache retention policy (see
+        # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
+        # only reachable boundary states, so the state pools are sized from the
+        # retention mask for a reference request length instead of one slot
+        # per token block. The reference defaults to the model's max length;
+        # workloads dominated by shorter prompts can lower it.
+        self.retention_interval = kv_cache_config.prefix_cache_retention_interval
+        self.state_slots_reference_tokens = int(
+            self.extra_config.get(
+                "mamba_state_slots_reference_tokens",
+                vllm_config.model_config.max_model_len,
+            )
+        )
+        if self.state_slots_reference_tokens <= 0:
+            raise ValueError("mamba_state_slots_reference_tokens must be positive")
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
             mamba_groups: set[int] = set()
+            mamba_spec: MambaSpec | None = None
             for i, group in cacheable_groups.items():
                 layer_names = set(group.layer_names)
                 # Scheduler specs can replace a heterogeneous UniformType spec
@@ -92,6 +123,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
                 if isinstance(group.kv_cache_spec, MambaSpec):
                     mamba_groups.add(i)
+                    mamba_spec = group.kv_cache_spec
             # Physical storage contains only that group's tensors, rather than
             # every shared GPU tensor for each independently allocated group key.
             self.cpu_page_size_per_worker = sum(self.cpu_group_page_sizes.values())
@@ -103,31 +135,41 @@ class CPUOffloadingSpec(OffloadingSpec):
             state_page = sum(self.cpu_group_page_sizes[i] for i in mamba_groups)
             budget_per_worker = int(cpu_bytes_to_use) // world_size
 
+            assert mamba_spec is not None
+            block_size = mamba_spec.block_size * self.block_size_factor
+            alignment_tokens = block_size
+
+            def state_slots(num_token_blocks: int) -> int:
+                return mamba_state_slots(
+                    num_token_blocks,
+                    block_size,
+                    alignment_tokens,
+                    mamba_spec,
+                    self.retention_interval,
+                    self.state_slots_reference_tokens,
+                )
+
             def bytes_per_worker(num_token_blocks: int) -> int:
                 return (
                     num_token_blocks * token_page
-                    + mamba_checkpoint_slots(num_token_blocks, stride) * state_page
+                    + state_slots(num_token_blocks) * state_page
                 )
 
-            # Largest token-block count whose token pages plus the matching
-            # state slots fit the per-worker budget.
+            # Largest token-block count whose token pages plus the state slots
+            # the retention mask demands fit the per-worker budget.
             num_blocks = 0
             if token_page + state_page > 0:
-                num_blocks = budget_per_worker // (
-                    token_page + cdiv(state_page * (2 * stride - 1), stride * stride)
-                )
+                num_blocks = budget_per_worker // (token_page + state_page)
+                while bytes_per_worker(num_blocks + 1) <= budget_per_worker:
+                    num_blocks += 1
                 while (
                     num_blocks > 0 and bytes_per_worker(num_blocks) > budget_per_worker
                 ):
                     num_blocks -= 1
-                while bytes_per_worker(num_blocks + 1) <= budget_per_worker:
-                    num_blocks += 1
             self.num_blocks = num_blocks
             for i in self.cpu_group_page_sizes:
                 self.cpu_group_num_blocks[i] = (
-                    mamba_checkpoint_slots(num_blocks, stride)
-                    if i in mamba_groups
-                    else num_blocks
+                    state_slots(num_blocks) if i in mamba_groups else num_blocks
                 )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)

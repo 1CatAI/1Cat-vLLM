@@ -5,109 +5,81 @@ avoid charging each offload key for every group's backing tensors. The native
 connector retains original KV group IDs, including empty positions for scratch
 groups. Group-local slot IDs may repeat because the CPU tensors are disjoint.
 
-## Mamba checkpoint stride
+## Sparse Mamba checkpoint retention
 
 Flash-Next's `align` Mamba mode materializes one recurrent-state snapshot per
-784-token block boundary during prefill. The GPU keeps only the latest state
-per request, but the offload tier received every boundary for each of the four
-Mamba groups. On the measured TP4 layout that is 29.7 MB of state per token
-block against 10.24 MB of attention/PLE data, so 74% of the RAM budget held
-state snapshots and 16 GiB fit about 1.3 contexts of 64K tokens.
+chunk end during prefill. The fork used to end a chunk at every 784-token
+block boundary and the offload tier stored every boundary for all four Mamba
+groups. On the measured TP4 layout that is 29.7 MB of state per token block
+against 10.24 MB of attention/PLE data, so 74% of the RAM budget held state
+snapshots and 16 GiB fit about 1.3 contexts of 64K tokens, while the GPU keeps
+a single state per request.
 
-`mamba_checkpoint_stride` (kv_connector_extra_config, default `1`) keeps only
-every stride-th boundary plus the final prefill boundary of each request. The
-final boundary mirrors the core scheduler's last cache position, including the
-one-block EAGLE/MTP shift. Loads already fall back to the nearest stored state:
-the Mamba group lookup scans backwards from the attention hit and the outer
-lookup shrinks the hit window, so full-prefix hits stay exact and partial-prefix
-hits recompute at most `stride - 1` blocks. Intermediate states are never
-loaded; only the boundary state at the hit position is transferred.
+This branch ports upstream vLLM's retention policy instead of adding an
+offload-only stride (upstream #43447, #45845, #37898, #52216, #54713, and the
+store-side wiring of #51886/#54362):
 
-Group pools are sized by role. Token groups receive `N` slots and each Mamba
-group receives `cdiv(N * (2 * stride - 1), stride**2)` slots, the number of
-`cdiv(B, stride)` checkpoints that requests of at least `stride` blocks can
-occupy across `N` token blocks. `N` is the largest value whose token pages plus
-state slots fit `cpu_bytes_to_use`. With stride 1 this reproduces the equal
-107-slot layout. On the same 16 GiB budget:
+- `--prefix-cache-retention-interval` (`CacheConfig`, default `0`) decides
+  which sliding-window tails and Mamba states stay in the prefix cache.
+  `0` keeps only semantic checkpoints: the replay boundary of each prompt
+  (with the EAGLE/MTP shift) and detected shared-prefix junctions. `N > 0`
+  additionally keeps one checkpoint per `N` tokens (a multiple of the cache-hit
+  alignment). `None` keeps every boundary, the previous behavior.
+- `Request.shared_prefix_boundary` is the Marconi-style junction: when a
+  request's attention groups hit a longer prefix than its Mamba groups, the
+  hybrid coordinator reports the uncached common prefix, the scheduler records
+  it on the request, ends a prefill chunk there so the state materializes, and
+  the mask keeps it. The third request sharing that prefix hits it.
+- `SingleTypeKVCacheManager.reachable_block_mask` is the single source of
+  truth: the coordinator passes it to `cache_full_blocks` on the GPU and the
+  offloading scheduler applies the same mask when choosing which blocks to
+  store, so host retention follows GPU retention exactly. Mamba `align`
+  boundary hand-offs only carry hashed states, which the mask already filtered.
+- `_mamba_block_aligned_split` ends chunks only where a state must exist:
+  every block boundary under dense retention, every interval boundary under
+  periodic retention, and always the replay boundary and the junction.
+  With the default policy a 64K prefill runs in 8K chunks instead of 784-token
+  steps.
+- Unhashed blocks (running state, masked-out checkpoints, SWA scratch) are
+  returned to the front of the free queue so a request's own churn does not
+  flush older cached prefixes.
 
-| stride | token slots | 64K contexts | state slots per group |
-|-------:|------------:|-------------:|----------------------:|
-| 1      | 107         | 1.3          | 107                   |
-| 4      | 184         | 2.2          | 81                    |
-| 8      | 248         | 3.0          | 59                    |
-| 16     | 309         | 3.7          | 38                    |
+### Group pool sizing
 
-Shared regions and mmap files carry the per-group slot count, so the worker
-views, the scheduler memoryviews and the FS tier rows use the same geometry.
-Requests shorter than `stride` blocks may occupy proportionally more state
-slots than the bound assumes; their Mamba states age out first and such
-prefixes then miss rather than restore a wrong state.
+Group pools are sized from the same mask. Token groups receive `N` slots. Each
+Mamba group receives the number of states the retention mask keeps for a
+request of `mamba_state_slots_reference_tokens` tokens (default
+`max_model_len`), plus one junction allowance per request, multiplied by the
+number of such requests the token pool holds; `N` is the largest value whose
+token pages and state slots fit `cpu_bytes_to_use`. Dense retention keeps one
+state slot per token slot, reproducing the previous equal layout. Workloads
+dominated by prompts shorter than the reference should lower the reference so
+the state pools do not run out before the token pools.
 
-### What the stride changes, and how to choose it
+On the measured 16 GiB TP4 layout (784-token blocks, 64K reference):
 
-The stride only changes how many Mamba state snapshots the offload tier keeps
-and how the RAM budget is split between token pages and state slots. It does
-not touch GPU allocation, kernels, hashing or outputs: token IDs were identical
-across cold, restored and recomputed runs in every configuration.
+| retention | token slots | 64K contexts | state slots per group |
+|---|---:|---:|---:|
+| None (dense) | 107 | 1.3 | 107 |
+| 8 blocks (6272) | 280 | 3.3 | 48 |
+| 0 (semantic, default) | 390 | 4.6 | 10 |
+| 0 with a 16K reference | 326 | 3.9 | 32 |
 
-- **Capacity.** Every snapshot skipped is RAM returned to token pages. On the
-  measured 16 GiB TP4 layout, 107 token blocks at stride 1 become 184 at
-  stride 4, 248 at stride 8 and 309 at stride 16.
-- **Full-prefix hits are unchanged.** The final prefill boundary of every
-  request is always stored, so a repeated prompt restores the same number of
-  tokens at any stride.
-- **Partial-prefix hits round down.** When a new prompt shares only part of a
-  stored prompt, the hit stops at the last stored boundary: at most
-  `stride - 1` blocks are recomputed (5.5K tokens at stride 8). Appending to a
-  conversation is a full-prefix hit and does not pay this; asking different
-  questions about the same long document does.
-- **Short requests.** The state pools are sized for requests of at least
-  `stride` blocks. Many prompts shorter than that (about 6K tokens at stride
-  8) can fill the state pools first; once their state is evicted the prefix
-  misses even though its attention blocks remain. Workloads dominated by short
-  prompts should keep the stride small.
-- **Transfer volume.** A 64K request writes 11 state snapshots per group
-  instead of 84 at stride 8, cutting GPU-to-host state traffic by about 85%.
+Requests still pay for their state only where the mask keeps it: a 64K
+request stores one Mamba state per group under the default policy instead of
+84, and a partial-prefix reuse costs at most one recompute of the shared
+prefix before its junction state exists.
 
-The default stays at 1 so existing deployments keep their validated behavior.
-Deployments serving long contexts should set the stride explicitly (8 is the
-validated value); the stride is a runtime option and can differ between
-restarts because keys do not encode it, only fewer of them are stored.
+### Validation history
 
-### V100 validation of stride 8
-
-Flash-Next AWQ, TP4, FP16 KV, CUDA Graphs, 16 GiB CPU budget, 1.19 GiB GPU
-KV per rank, the production image `b8aa829785` with the eight PR Python files
-overlaid and hash-verified at start. GPU prefix state was reset before every
-restore, so all hits below are external (local hits were zero throughout) and
-output token IDs were compared against the cold run of the same prompt.
-
-| mode | scenario | result |
-|---|---|---|
-| MTP0 | 64K cold, 20K pressure, restore, rehit | 63,504 external tokens (81 blocks, the final prefill boundary); IDs identical |
-| MTP0 | partial prefix: 40K prompt sharing 39,983 tokens (50 blocks) with a stored prompt, offload disabled for the probe | 37,632 external tokens = 48 blocks, rounded down to the stride; IDs identical to its cold run |
-| MTP0 | three distinct 64K contexts stored, then each restored | 63,504 external tokens for all three |
-| MTP3 | 64K cold, pressure, restore, rehit | 62,400 external tokens = 78 x 800-token blocks, the MTP-shifted final boundary; six drafted/accepted; IDs identical |
-| MTP3 | three distinct 60K contexts stored, then each restored | 58,400 external tokens for all three |
-| MTP0, stride 1 | same three 64K contexts (107 slots per group) | all three restores missed, see below |
-
-Why every restore missed at stride 1: 107 slots hold 1.3 contexts of 81
-blocks, and LRU evicts the oldest blocks first, which are the head of the
-oldest request. A prefix lookup must hit contiguously from block 0, so once
-C2 and C3 are stored C1's head is gone and its restore becomes a cold
-prefill. That prefill re-stores 81 blocks and evicts C2's remainder and C3's
-head, so C2 and C3 miss in turn. The diag log shows each of the six requests
-storing 405 keys (81 blocks x 5 groups) and evicting 275 to 405. This is the
-capacity limit, not a defect: any rotation larger than the pool misses
-entirely, which is exactly the "zero external hits" symptom that started this
-work.
-
-Pool geometry at stride 8: MTP0 248 token slots and 59 state slots per Mamba
-group (3.996 GiB pinned per rank); MTP3 232 token slots and 55 state slots
-because its speculative padding makes 800-token blocks. Restores of 60K-64K
-took 1.1-1.4 s against 27-35 s cold. Evidence:
-`/mnt/llm_hfs/builds/qsa-stride-validation-20260912` (diag JSONL, raw
-requests, result JSON, server logs, acceptance summary).
+The stride prototype (superseded by this retention port) was validated on
+four V100s on 2026-09-13: with 8-block sparsity MTP0 and MTP3 restored 64K
+prompts at their final boundary with identical token IDs, partial prefixes
+rounded down to the stride, and three distinct 60K-64K contexts restored from
+RAM, while dense retention thrashed the 107-slot pools. Evidence:
+`/mnt/llm_hfs/builds/qsa-stride-validation-20260912`. The retention port
+replaces the stride with the upstream policy; its own V100 validation is
+recorded below when available.
 
 ## Public interface boundary
 

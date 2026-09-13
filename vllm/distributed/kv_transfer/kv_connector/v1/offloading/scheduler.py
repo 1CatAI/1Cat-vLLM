@@ -18,6 +18,10 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import (
+    SingleTypeKVCacheManager,
+    spec_manager_map,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -67,16 +71,15 @@ class GroupOffloadConfig(NamedTuple):
     hash_block_size_factor: int
     # None below means full attention
     sliding_window_size_in_blocks: int | None
-    # Number of this group's offloaded blocks per full-attention alignment
-    # segment. Used to skip storing SWA blocks that can never serve a load
-    # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
-    # than the MLA full-attention group).
-    # None for full-attention groups or when the optimization doesn't apply.
-    alignment_block_count: int | None = None
     # Mamba ``align`` tables mutate existing logical positions. Such groups
     # must be stored from exact core-provided boundary block IDs instead of the
     # connector's append-only positional mirror.
     requires_exact_boundary_source: bool = False
+    # The group's KV cache spec and its core manager class: the store path
+    # reuses the manager's ``reachable_block_mask`` so host retention follows
+    # GPU retention (sparse SWA tails, Mamba checkpoints, retention interval).
+    kv_cache_spec: KVCacheSpec | None = None
+    manager_cls: type[SingleTypeKVCacheManager] | None = None
 
 
 def get_sliding_window_size_in_blocks(
@@ -112,37 +115,6 @@ def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
     return mamba_align_size
 
 
-def _use_eagle(spec: "OffloadingSpec") -> bool:
-    speculative_config = getattr(spec.vllm_config, "speculative_config", None)
-    return bool(speculative_config and speculative_config.use_eagle_kv_cache())
-
-
-def mamba_boundary_is_stored(
-    boundary_tokens: int,
-    offloaded_block_size: int,
-    num_prompt_tokens: int,
-    stride: int,
-    use_eagle: bool,
-) -> bool:
-    """Whether a materialized Mamba boundary state belongs in the offload tier.
-
-    With ``stride`` > 1 only every stride-th boundary is kept, plus the last
-    boundary the core scheduler materializes during prefill (mirroring
-    ``Scheduler._mamba_block_aligned_split``). Loads round down to the nearest
-    stored boundary, so full-prefix hits stay exact and partial-prefix hits
-    recompute at most ``stride - 1`` blocks.
-    """
-    if stride <= 1:
-        return True
-    if (boundary_tokens // offloaded_block_size) % stride == 0:
-        return True
-    last_token = max(num_prompt_tokens - 1, 0)
-    final_prefill_boundary = last_token - last_token % offloaded_block_size
-    if use_eagle:
-        final_prefill_boundary = max(final_prefill_boundary - offloaded_block_size, 0)
-    return boundary_tokens == final_prefill_boundary
-
-
 class SchedulerOffloadConfig(NamedTuple):
     kv_group_configs: tuple[GroupOffloadConfig, ...]
     block_size_factor: int
@@ -150,11 +122,10 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
-    # Keep every stride-th Mamba boundary state plus each request's final
-    # prefill boundary. 1 stores every materialized boundary.
-    mamba_checkpoint_stride: int = 1
-    # EAGLE/MTP materializes the final prefill state one block earlier.
-    use_eagle: bool = False
+    # Cache-hit alignment (full-attention offloaded block size) and the
+    # sparse retention policy shared with the GPU prefix cache.
+    alignment_tokens: int | None = None
+    retention_interval: int | None = None
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -182,18 +153,12 @@ class SchedulerOffloadConfig(NamedTuple):
         if len(full_attn_offloaded_block_sizes) == 1:
             alignment_tokens = full_attn_offloaded_block_sizes.pop()
 
-        def _alignment_block_count(
-            offloaded_block_size: int,
-            sliding_window_size_in_blocks: int | None,
-        ) -> int | None:
-            if alignment_tokens is None or sliding_window_size_in_blocks is None:
-                return None
-            if alignment_tokens <= offloaded_block_size:
-                return None
-            per_segment = alignment_tokens // offloaded_block_size
-            if sliding_window_size_in_blocks >= per_segment:
-                return None
-            return per_segment
+        retention_interval = spec.kv_cache_config.prefix_cache_retention_interval
+        if retention_interval is not None and retention_interval < 0:
+            raise ValueError(
+                f"prefix_cache_retention_interval ({retention_interval}) must be "
+                "non-negative."
+            )
 
         def _requires_exact_boundary_source(group_idx: int) -> bool:
             kv_spec = spec.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
@@ -218,12 +183,15 @@ class SchedulerOffloadConfig(NamedTuple):
                             gpu_block_size * spec.block_size_factor,
                         )
                     ),
-                    alignment_block_count=_alignment_block_count(
-                        gpu_block_size * spec.block_size_factor, sw
-                    ),
                     requires_exact_boundary_source=(
                         _requires_exact_boundary_source(idx)
                     ),
+                    kv_cache_spec=(
+                        kv_spec := spec.kv_cache_config.kv_cache_groups[
+                            idx
+                        ].kv_cache_spec
+                    ),
+                    manager_cls=spec_manager_map[type(kv_spec)],
                 )
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
                 if spec.kv_cache_config.kv_cache_groups[
@@ -233,10 +201,8 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
-            mamba_checkpoint_stride=max(
-                1, int(getattr(spec, "mamba_checkpoint_stride", 1))
-            ),
-            use_eagle=_use_eagle(spec),
+            alignment_tokens=alignment_tokens,
+            retention_interval=retention_interval,
         )
 
 
@@ -754,6 +720,26 @@ class OffloadingConnectorScheduler:
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
 
+    def _reachable_store_block_mask(
+        self,
+        group_config: GroupOffloadConfig,
+        start_block: int,
+        end_block: int,
+        reachable_boundaries: tuple[int, ...],
+    ) -> list[bool] | None:
+        """Block mask for candidate offload blocks, from the core manager."""
+        if group_config.manager_cls is None or group_config.kv_cache_spec is None:
+            return None
+        return group_config.manager_cls.reachable_block_mask(
+            start_block=start_block,
+            end_block=end_block,
+            alignment_tokens=self.config.alignment_tokens,
+            kv_cache_spec=group_config.kv_cache_spec,
+            use_eagle=False,
+            retention_interval=self.config.retention_interval,
+            reachable_boundaries=reachable_boundaries,
+        )
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -806,6 +792,11 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            reachable_boundaries: tuple[int, ...] = ()
+            if self.config.retention_interval is not None:
+                reachable_boundaries = (req.num_prompt_tokens - 1,)
+                if req.shared_prefix_boundary:
+                    reachable_boundaries += (req.shared_prefix_boundary,)
             for group_config in self.config.kv_group_configs:
                 group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
@@ -830,25 +821,30 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
-                alignment_block_count = group_config.alignment_block_count
-                tail = group_config.sliding_window_size_in_blocks
+                # Blocks that can never serve a load hit are not stored: the
+                # group's core manager decides which blocks are reachable under
+                # the alignment and retention policy (SWA tails per segment,
+                # sparse Mamba checkpoints), so host and GPU retention agree.
+                # The mask is in KV-block coordinates.
+                block_mask = self._reachable_store_block_mask(
+                    group_config,
+                    start_block_idx * block_size_factor,
+                    num_blocks * block_size_factor,
+                    reachable_boundaries,
+                )
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
                         continue
-                    # Skip SWA blocks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing `tail` blocks are reachable by
-                    # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
-                    if alignment_block_count is not None:
-                        assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_block_count
-                        if pos_in_segment < alignment_block_count - tail:
-                            continue
+                    # An offloaded block is reachable if any of its GPU
+                    # blocks is reachable.
+                    if block_mask is not None and not any(
+                        block_mask[key_idx * block_size_factor + i]
+                        for i in range(block_size_factor)
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
@@ -995,13 +991,6 @@ class OffloadingConnectorScheduler:
                     block_id == 0
                     or boundary_tokens > num_offloadable_tokens
                     or boundary_tokens % group_config.offloaded_block_size != 0
-                    or not mamba_boundary_is_stored(
-                        boundary_tokens,
-                        group_config.offloaded_block_size,
-                        req.num_prompt_tokens,
-                        self.config.mamba_checkpoint_stride,
-                        self.config.use_eagle,
-                    )
                 ):
                     continue
 

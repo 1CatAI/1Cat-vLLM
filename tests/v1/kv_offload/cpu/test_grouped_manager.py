@@ -24,7 +24,7 @@ from vllm.v1.kv_offload.cpu.manager import (
     CPUOffloadingManager,
     GroupedCPUOffloadingManager,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, mamba_checkpoint_slots
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, mamba_state_slots
 
 CTX = ReqContext("test")
 GROUPS = (0, 2, 3, 4, 5)
@@ -152,7 +152,9 @@ FLASH_NEXT_PAGES = {
 }
 
 
-def _flash_next_spec(monkeypatch, layout="equal", **extra_config):
+def _flash_next_spec(
+    monkeypatch, layout="equal", retention_interval=None, **extra_config
+):
     def init(self, config, caches):
         self.vllm_config = config
         self.kv_cache_config = caches
@@ -204,11 +206,15 @@ def _flash_next_spec(monkeypatch, layout="equal", **extra_config):
     elif layout == "attention_only":
         groups = [group(uniform, 24), group(uniform, 24)]
     return CPUOffloadingSpec(
-        SimpleNamespace(parallel_config=SimpleNamespace(world_size=4)),
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=4),
+            model_config=SimpleNamespace(max_model_len=65536),
+        ),
         SimpleNamespace(
             kv_cache_groups=groups,
             num_blocks=104,
             kv_cache_tensors=tensors,
+            prefix_cache_retention_interval=retention_interval,
         ),
     )
 
@@ -222,8 +228,9 @@ def test_actual_flash_next_group_budget(monkeypatch, layout):
         assert spec.cpu_group_num_blocks == {}
         return
     assert spec.cpu_group_page_sizes == FLASH_NEXT_PAGES
+    # Dense retention (None): one state slot per token slot, 107 each.
     assert spec.num_blocks == 107
-    assert spec.mamba_checkpoint_stride == 1
+    assert spec.retention_interval is None
     assert spec.cpu_group_num_blocks == dict.fromkeys(FLASH_NEXT_PAGES, 107)
     assert spec.cpu_page_size_per_worker * 4 * spec.num_blocks <= 16 * 1024**3
     assert spec.num_blocks >= 2 * 48
@@ -235,14 +242,16 @@ def _grouped_bytes(spec):
     )
 
 
-@pytest.mark.parametrize("stride", [2, 8, 84])
-def test_flash_next_checkpoint_stride_budget(monkeypatch, stride):
-    spec = _flash_next_spec(monkeypatch, mamba_checkpoint_stride=stride)
+def test_flash_next_semantic_retention_budget(monkeypatch):
+    # retention 0 keeps only the replay boundary (+ one junction allowance)
+    # per request. Sized for 64K requests (84 blocks): 2 states per request.
+    spec = _flash_next_spec(monkeypatch, retention_interval=0)
     assert spec.partition_by_group
-    assert spec.mamba_checkpoint_stride == stride
+    assert spec.retention_interval == 0
+    assert spec.state_slots_reference_tokens == 65536
     token_slots = spec.num_blocks
-    state_slots = mamba_checkpoint_slots(token_slots, stride)
-    assert state_slots == -(-token_slots * (2 * stride - 1) // stride**2)
+    requests = -(-token_slots // 84)
+    state_slots = requests * 2
     assert spec.cpu_group_num_blocks == {
         0: token_slots,
         2: state_slots,
@@ -250,29 +259,51 @@ def test_flash_next_checkpoint_stride_budget(monkeypatch, stride):
         4: state_slots,
         5: state_slots,
     }
-    # Same 16 GiB budget now buys more token blocks than equal slots did.
+    # Nearly the whole 16 GiB now buys token pages: > 3.5x the dense layout.
+    assert token_slots >= 380
+    assert _grouped_bytes(spec) <= 16 * 1024**3
+    spec.cpu_group_num_blocks[0] += 1
+    assert _grouped_bytes(spec) > 16 * 1024**3
+
+
+def test_flash_next_periodic_retention_budget(monkeypatch):
+    # retention 8 blocks: periodic states every 8 blocks plus replay/junction.
+    spec = _flash_next_spec(monkeypatch, retention_interval=8 * 784)
+    token_slots = spec.num_blocks
+    # 84-block reference request: boundaries at blocks 8,16,...,80 (10),
+    # the replay boundary at block 81 (index 80 already counted? no: replay
+    # boundary 65535 -> block 83 -> index 82) plus the junction allowance.
+    per_request = mamba_state_slots(
+        84,
+        784,
+        784,
+        spec.kv_cache_config.kv_cache_groups[2].kv_cache_spec,
+        8 * 784,
+        65536,
+    )
+    assert per_request == 10 + 1 + 1
+    assert spec.cpu_group_num_blocks[2] == min(
+        token_slots, -(-token_slots // 84) * per_request
+    )
     assert token_slots > 107
     assert _grouped_bytes(spec) <= 16 * 1024**3
-    # Maximal: one more token block (with its state slots) would not fit.
-    spec.cpu_group_num_blocks[0] += 1
-    for g in (2, 3, 4, 5):
-        spec.cpu_group_num_blocks[g] = mamba_checkpoint_slots(token_slots + 1, stride)
-    assert _grouped_bytes(spec) > 16 * 1024**3
-    # A 64K request (84 blocks) stores cdiv(84, stride) states per group.
-    assert -(-84 // stride) <= state_slots
 
 
-def test_flash_next_stride_eight_capacity(monkeypatch):
-    spec = _flash_next_spec(monkeypatch, mamba_checkpoint_stride=8)
-    # 16 GiB: 107 token blocks with equal slots vs. more than 2x with stride 8.
-    assert spec.num_blocks >= 240
-    assert spec.cpu_group_num_blocks[2] == -(-spec.num_blocks * 15 // 64)
-
-
-@pytest.mark.parametrize("stride", [0, -1])
-def test_invalid_checkpoint_stride_rejected(monkeypatch, stride):
-    with pytest.raises(ValueError, match="mamba_checkpoint_stride"):
-        _flash_next_spec(monkeypatch, mamba_checkpoint_stride=stride)
+def test_state_slots_follow_reference_length(monkeypatch):
+    # A shorter sizing reference reserves more state slots per token slot.
+    long = _flash_next_spec(monkeypatch, retention_interval=0)
+    short = _flash_next_spec(
+        monkeypatch,
+        retention_interval=0,
+        mamba_state_slots_reference_tokens=8 * 784,
+    )
+    assert short.cpu_group_num_blocks[2] > long.cpu_group_num_blocks[2]
+    assert short.num_blocks < long.num_blocks
+    assert _grouped_bytes(short) <= 16 * 1024**3
+    with pytest.raises(ValueError, match="reference_tokens"):
+        _flash_next_spec(
+            monkeypatch, retention_interval=0, mamba_state_slots_reference_tokens=0
+        )
 
 
 def test_private_cpu_allocations_obey_group_budget(monkeypatch):

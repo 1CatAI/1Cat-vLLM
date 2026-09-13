@@ -285,6 +285,9 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.prefix_cache_retention_interval = (
+            self.cache_config.prefix_cache_retention_interval
+        )
         # A Mamba state is materialized only when a scheduler chunk ends on
         # the Mamba group's own block grid. The global cache block size can be
         # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
@@ -457,17 +460,23 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         # The align allocator materializes one recurrent-state column per
-        # scheduler step. A step spanning multiple state blocks leaves the
-        # interior slots null, so every crossed boundary must end a chunk.
-        next_block_boundary = (start // block_size + 1) * block_size
-        end = min(
-            (
-                stop
-                for stop in (next_block_boundary, last_cache_position)
-                if start < stop < end
-            ),
-            default=end,
-        )
+        # scheduler step, at the chunk end. A step spanning several state
+        # blocks leaves the interior slots null, so a chunk must end wherever
+        # a state has to exist:
+        #   - dense retention (None): at every crossed block boundary;
+        #   - periodic retention (N > 0): at every crossed multiple of N;
+        #   - always: at the replay boundary and at a detected shared-prefix
+        #     junction (Marconi-style), block-floored.
+        retention = self.prefix_cache_retention_interval
+        stops = [last_cache_position]
+        if retention is None:
+            stops.append((start // block_size + 1) * block_size)
+        elif retention > 0:
+            stops.append((start // retention + 1) * retention)
+        junction = request.shared_prefix_boundary
+        if junction:
+            stops.append(start + (junction - start) // block_size * block_size)
+        end = min((stop for stop in stops if start < stop < end), default=end)
         return max(end - start, 0)
 
     def schedule(self) -> SchedulerOutput:
@@ -843,9 +852,15 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    (
+                        new_computed_blocks,
+                        num_new_local_computed_tokens,
+                        shared_prefix_boundary,
+                    ) = self.kv_cache_manager.get_computed_blocks(request)
+                    if self.need_mamba_block_aligned_split:
+                        # Marconi-style admission: remember the uncached shared
+                        # prefix so its Mamba state is materialized and kept.
+                        request.shared_prefix_boundary = shared_prefix_boundary
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
