@@ -295,6 +295,53 @@ registration error codes 1/2 and partial-construction cleanup. Four-GPU probes
 also passed 100 registrations of five shared regions per process over five
 iterations; this does not establish the cause of the one serving-time failure.
 
+### Concurrent registration and long-term page migration
+
+A subsequent TP4/MTP3 serving reproduction with a 32 GiB total RAM tier
+identified a concrete failure mechanism. Kernel tracing showed
+`pin_user_pages()` returning `-ENOMEM` after `MR_LONGTERM_PIN` migration
+failed (0 succeeded / 71 failed pages on one worker, then 40 / 31 on another).
+Other workers subsequently migrated the remaining pages and registered the
+same shared region successfully. No new cgroup OOM kill occurred in this run;
+this `ENOMEM` was a migration failure, not evidence that RAM was exhausted.
+
+`pin_mmap_region` now holds an exclusive `flock` on the region's independently
+opened file descriptor while calling `cudaHostRegister`. This serializes
+registration of the same backing file across workers, allowing page migration
+to finish before another worker pins it. The lock is released in `finally`,
+including when registration raises. KV transfers and inference do not hold
+the lock. Registration errors remain fatal; there is no retry or pageable
+fallback. Tests use independent file descriptors to verify contention during
+registration and release on success and exceptions.
+
+The updated stacked PR branch passed 302 CPU tests with two skips using the
+existing CPU-admission and legacy unaligned-FS fixtures, including
+`tests/v1/core/test_mamba_sparse_retention.py`. The grouped mmap/spawn tests
+retain real direct I/O. This CPU run is distinct from the GPU integration
+results below.
+
+Two diagnostic starts changing only registration order and two starts of the
+formal image with the equivalent source fix passed registration and CUDA
+Graph capture on four V100s. The formal image was built from integration
+`3fcc73b208` (upstream `7217bb5d4f` plus #624/#617/#598 and this fix), with
+matching Python hashes and previously rebuilt, verified native extensions.
+This is integration evidence, not a separate native rebuild of every stacked
+PR revision.
+
+| Check (TP4, MTP3, 32 GiB total RAM, FS, FP16 KV) | Result |
+|---|---|
+| Diagnostic cold prompt, 63,999 tokens | 28.823 s; correct marker |
+| GPU prefix reset, same-process RAM restore | 62,400 external tokens, zero local; 1.359 s |
+| Two concurrent cold prompts, 170,000 tokens each | Both correct; 233.145 / 233.103 s |
+| Diagnostic fresh-process FS restore | 63,200 external tokens, zero local; 2.602 s |
+| Formal image, same-version fresh-process FS restore | 62,400 external tokens, zero local; 2.967 s |
+
+Restored output token IDs matched the relevant cold controls. There were no
+preemptions or new cgroup OOM kills. The long-prompt timings are dominated by
+prefill and are not decode throughput measurements. Positive retention
+intervals and arbitrary model/backend combinations are not covered by this
+follow-up.
+
 ## Reproducible block keys across restarts
 
 Set a fixed `PYTHONHASHSEED` (for example, `PYTHONHASHSEED=0`) before starting
@@ -303,6 +350,13 @@ algorithm. vLLM initializes the prefix chain's first hash from random bytes when
 this variable is absent. Matching file layout metadata alone therefore cannot
 produce restart hits: the same prompt will have different block keys. Use the
 existing seed configuration; do not replace vLLM's hashing algorithm.
+
+The physical layout's configuration hash also incorporates the vLLM version.
+Changing the engine version therefore selects a separate FS namespace. In the
+above validation, the formal image correctly cold-computed a prompt stored by
+the older diagnostic version; its own subsequent same-version restart hit.
+Do not remove this compatibility boundary or rename directories to force
+cross-version reuse.
 
 ## Shutdown and resource lifetime
 
@@ -317,3 +371,17 @@ files with a 60-second engine timeout and a 90-second container stop grace.
 SIGKILL, host failure, or an insufficient stop grace can still leave files in
 `/dev/shm`; this is not a crash-recovery mechanism. Never delete a live instance's
 shared regions while treating them as stale cache files.
+
+A later serving test also encountered an independent RAM OOM caused by
+approximately 93 GiB of stale host-IPC mappings accumulated across stopped
+instances. Docker's per-container `OOMKilled=false` did not rule out a worker
+being killed in the enclosing LXC cgroup. Use parent-cgroup memory events and
+kernel logs when diagnosing this situation.
+
+For a single-container deployment, private IPC with sufficient shared-memory
+capacity isolates these mappings to the container lifetime. The 32 GiB RAM
+offload test used a 128 GiB private `/dev/shm` ceiling to accommodate additional
+model host allocations; the ceiling is not a preallocation or a universal
+recommendation. Repeated exits reclaimed the private mappings. This deployment
+mitigation is separate from the registration code fix and does not make
+host-IPC mappings crash-safe.
