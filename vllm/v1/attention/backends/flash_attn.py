@@ -200,7 +200,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability >= DeviceCapability(8, 0)
+        # SM75 enablement: Turing runs the fp16-only FA2 build
+        # (see supports_combination for the dtype gate).
+        return capability >= DeviceCapability(7, 5)
 
     @classmethod
     def supports_combination(
@@ -216,6 +218,8 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
+        if device_capability < DeviceCapability(8, 0) and dtype != torch.float16:
+            return "the sm75 FA2 build is fp16-only"
         return None
 
 
