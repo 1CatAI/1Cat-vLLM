@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit, opt-in reproduction contract for the quality-repaired M1 baseline."""
+"""Explicit-baseline and model-default contracts for the quality-repaired M1 lane."""
 
 import hashlib
 import json
@@ -151,13 +151,16 @@ def validate_bundle(bundle: Path) -> dict:
     return manifest
 
 
-def configure_environment(bundle: Path, cache: Path, native_dir: Path | None) -> dict:
+def configure_environment(
+    bundle: Path, cache: Path, native_dir: Path | None, *, use_defaults: bool = False
+) -> dict:
     manifest = validate_bundle(bundle)
     # Do not inherit another experiment's optional VLLM route switches.
     for name in list(os.environ):
         if name.startswith("VLLM_"):
             del os.environ[name]
-    os.environ.update(BASELINE_ENV)
+    if not use_defaults:
+        os.environ.update(BASELINE_ENV)
     for component, name in LIBRARY_ENVS.items():
         os.environ[name] = manifest["libraries"][component]["path"]
     if native_dir is not None:
@@ -203,8 +206,8 @@ def configure_environment(bundle: Path, cache: Path, native_dir: Path | None) ->
     return manifest
 
 
-def engine_args(model: str) -> dict:
-    return {
+def engine_args(model: str, *, use_defaults: bool = False) -> dict:
+    args = {
         "model": model,
         "tensor_parallel_size": 4,
         "dtype": "half",
@@ -251,3 +254,14 @@ def engine_args(model: str) -> dict:
         },
         "worker_extension_cls": "benchmarks.sm70_qwen38_baseline_worker.BaselineWorker",
     }
+    if use_defaults:
+        # Keep model, precision and capacity fixed; let ordinary configuration
+        # select the backend, optimization flags and graph/kernel policy.
+        for name in (
+            "quantization",
+            "attention_backend",
+            "kernel_config",
+            "compilation_config",
+        ):
+            args.pop(name)
+    return args

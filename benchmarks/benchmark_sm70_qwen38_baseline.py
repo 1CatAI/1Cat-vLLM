@@ -37,6 +37,8 @@ def run(args):
     from vllm import LLM, SamplingParams
 
     bundle = validate_bundle(args.runtime_dir)
+    use_defaults = getattr(args, "use_defaults", False)
+    model_args = engine_args(args.model, use_defaults=use_defaults)
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     config = json.loads((Path(args.model) / "generation_config.json").read_text())
     natural = SamplingParams(
@@ -68,7 +70,11 @@ def run(args):
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
         "bundle": bundle,
-        "contract": engine_args(args.model),
+        "contract": model_args,
+        "use_defaults": use_defaults,
+        "launch_vllm_env": {
+            k: v for k, v in os.environ.items() if k.startswith("VLLM_")
+        },
         "gpu_group": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "started_unix": time.time(),
         "health": [],
@@ -102,7 +108,7 @@ def run(args):
     llm = None
     try:
         save()
-        llm = LLM(**engine_args(args.model))
+        llm = LLM(**model_args)
         for name, prompt, pattern in (
             (
                 "arithmetic",
@@ -264,13 +270,21 @@ def main():
     parser.add_argument("--reference-json", type=Path)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--long-context", action="store_true")
+    parser.add_argument(
+        "--use-defaults",
+        action="store_true",
+        help="Use model-aware defaults, without baseline optimization/graph overrides.",
+    )
     parser.add_argument("--configured", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.repeats < 2:
         parser.error("At least two repeats are required")
     if not args.configured:
         configure_environment(
-            args.runtime_dir, args.output.parent / "cache", args.native_extension_dir
+            args.runtime_dir,
+            args.output.parent / "cache",
+            args.native_extension_dir,
+            use_defaults=args.use_defaults,
         )
         # The fresh interpreter installs the same import path in spawned workers.
         os.execv(

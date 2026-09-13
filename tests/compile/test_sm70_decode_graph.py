@@ -4,6 +4,7 @@
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.compilation.sm70_decode_graph import (
@@ -14,6 +15,7 @@ from vllm.compilation.sm70_decode_graph import (
 from vllm.config.parallel import ParallelConfig
 from vllm.config.vllm import (
     _apply_sm70_qwen38_hybrid_ple_defaults,
+    _apply_sm70_qwen38_nomtp_defaults,
     _is_sm70_qwen38_nomtp_dual_compile_contract,
 )
 
@@ -111,6 +113,100 @@ def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> Non
     assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
         model_config, None, parallel_config
     )
+
+
+def _nomtp_default_config():
+    return SimpleNamespace(
+        model_config=_qwen38_model_config(
+            "Qwen4ExpForConditionalGeneration",
+            language_model_only=True,
+            quantization="modelopt_fp4",
+        ),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            enable_expert_parallel=False,
+            enable_dbo=False,
+            data_parallel_size=1,
+            nnodes_within_dp=1,
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype="float16", mamba_ssm_cache_dtype="float32"
+        ),
+        lora_config=None,
+    )
+
+
+def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    disabled = "VLLM_SM70_QWEN38_FP16_GEMV"
+    os.environ[disabled] = "0"
+    applied = _apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=True)
+    assert disabled not in applied and os.environ[disabled] == "0"
+    assert len(applied) == 4
+    assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
+    assert _apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=True) == ()
+    assert "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8" not in os.environ
+    assert "VLLM_SM70_NVFP4_QPN2" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "device",
+        "model",
+        "dtype",
+        "quantization",
+        "mtp",
+        "tp",
+        "pp",
+        "ep",
+        "dbo",
+        "dp",
+        "nodes",
+        "kv",
+        "ssm",
+        "lora",
+        "multimodal",
+    ],
+)
+def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch):
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    if mismatch == "model":
+        cfg.model_config.hf_text_config.hidden_size = 5120
+    elif mismatch == "dtype":
+        cfg.model_config.dtype = torch.bfloat16
+    elif mismatch == "quantization":
+        cfg.model_config.quantization = "awq"
+    elif mismatch == "mtp":
+        cfg.speculative_config = SimpleNamespace(method="mtp")
+    elif mismatch in ("tp", "pp", "dp", "nodes"):
+        field = {
+            "tp": "tensor_parallel_size",
+            "pp": "pipeline_parallel_size",
+            "dp": "data_parallel_size",
+            "nodes": "nnodes_within_dp",
+        }[mismatch]
+        setattr(cfg.parallel_config, field, 2)
+    elif mismatch in ("ep", "dbo"):
+        setattr(
+            cfg.parallel_config,
+            "enable_expert_parallel" if mismatch == "ep" else "enable_dbo",
+            True,
+        )
+    elif mismatch == "kv":
+        cfg.cache_config.cache_dtype = "fp8_e4m3"
+    elif mismatch == "ssm":
+        cfg.cache_config.mamba_ssm_cache_dtype = "float16"
+    elif mismatch == "lora":
+        cfg.lora_config = SimpleNamespace()
+    elif mismatch == "multimodal":
+        cfg.model_config.multimodal_config.language_model_only = False
+    assert _apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=mismatch != "device") == ()
+    assert not os.environ
 
 
 def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(

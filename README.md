@@ -1158,15 +1158,12 @@ Current directions include:
 
 # 💬 WeChat Community
 
-Join the **1Cat-vLLM Open-Source Community Group 5** by scanning the latest QR code below. Click the image to open it at full resolution.
+Join the **1Cat-vLLM Open-Source Community Group 8** by scanning the latest QR code below. Click the image to open it at full resolution.
 
-<p align="center">
-  <a href="./assets/wechat-group-5.jpg">
-    <img src="./assets/wechat-group-5.jpg" alt="WeChat QR code for 1Cat-vLLM Open-Source Community Group 5" width="420">
-  </a>
-</p>
+<img width="966" height="1518" alt="472f168308d5e697058d30e51ffb2f4c" src="https://github.com/user-attachments/assets/fa8c71be-6a81-491e-895a-04bca665cceb" />
 
-> This QR code is valid through **September 7, 2026**. WeChat group QR codes expire periodically; if it has expired, add WeChat ID **`YM_isi`** to request the latest invitation.
+
+> This QR code is valid through **September 20, 2026**. WeChat group QR codes expire periodically; if it has expired, add WeChat ID **`YM_isi`** to request the latest invitation.
 
 ---
 

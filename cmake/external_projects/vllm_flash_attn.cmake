@@ -113,6 +113,24 @@ if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
     "${SM70_V37_DIR}/register.cpp")
 endif()
 
+# The grouped E4M3 FP32 long-context route ships inside the same extension, so
+# the accelerated path is available without an externally built DSO.
+if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
+  set(SM70_GROUPED_LONG_DIR
+      "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_grouped_long")
+  set(SM70_GROUPED_LONG_SRC
+      "${SM70_GROUPED_LONG_DIR}/kernel/grouped-attention.cu"
+      "${SM70_GROUPED_LONG_DIR}/kernel/scalar-attention.cu")
+  # Flags mirror the manifest the operator was qualified with. As with v37, the
+  # properties must be set in the target scope or SM70 silently loses them.
+  set_source_files_properties(${SM70_GROUPED_LONG_SRC}
+    TARGET_DIRECTORY _vllm_fa2_C
+    PROPERTIES COMPILE_OPTIONS
+      "-gencode=arch=compute_70,code=sm_70;-O3;-std=c++17;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_HALF2_OPERATORS__")
+  target_include_directories(_vllm_fa2_C PRIVATE "${SM70_GROUPED_LONG_DIR}/include")
+  target_sources(_vllm_fa2_C PRIVATE ${SM70_GROUPED_LONG_SRC})
+endif()
+
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)

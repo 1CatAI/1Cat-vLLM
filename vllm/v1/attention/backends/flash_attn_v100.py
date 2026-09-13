@@ -4453,6 +4453,27 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.flash_attn_grouped_e4m3_fp32_paged = (
             load_grouped_e4m3_fp32() if use_e4m3_fp32 else None
         )
+        self._sm70_scalar_tail_attention = None
+        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+            load_scalar_tail_attention,
+            scalar_tail_attention_available,
+        )
+
+        if (
+            use_e4m3_fp32
+            and envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+            and (
+                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
+                or scalar_tail_attention_available()
+            )
+            and not os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+        ):
+            # An empty name selects the operator compiled into this extension;
+            # a manifest name keeps the explicit experimental override.
+            self._sm70_scalar_tail_attention = load_scalar_tail_attention(
+                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST or "",
+                torch.device("cuda", torch.accelerator.current_device_index()),
+            )
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
             logger.warning_once(
                 "E4M3 grouped FP32 requires Flash-V100 precision revision 4; "
@@ -5307,6 +5328,26 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
     ) -> None:
+        scalar_tail = getattr(self, "_sm70_scalar_tail_attention", None)
+        if scalar_tail is not None and scalar_tail(
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            out=out,
+            softmax_scale=softmax_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kv_cache_dtype=kv_cache_dtype,
+            window_size=window_size,
+            max_seq_len_hint=max_seq_len_hint,
+            partition_size_hint=partition_size_hint,
+            anchor_lens=anchor_lens,
+            anchored_window=anchored_window,
+        ):
+            _record_route("decode_e4m3_compact_scalar_tail")
+            return
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
             "out": out,

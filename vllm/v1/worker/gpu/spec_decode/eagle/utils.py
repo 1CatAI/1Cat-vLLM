@@ -63,7 +63,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
 
-    target_lm_head = getattr(target_model, "lm_head", None)
+    target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(eagle_model, "lm_head", None)
     if target_lm_head is not None and _should_share(
         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head

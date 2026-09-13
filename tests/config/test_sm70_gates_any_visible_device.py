@@ -22,6 +22,7 @@ from vllm.config.vllm import apply_prefix_anchored_swa_constraints
 
 SM70 = (7, 0)
 SM75 = (7, 5)
+SM80 = (8, 0)
 
 # The unconditional part of the SM70 Flash-V100 baseline defaults.
 BASELINE_ENV = (
@@ -81,6 +82,26 @@ def test_any_participating_device_is_capability(monkeypatch, capabilities, expec
     monkeypatch.setattr(platforms, "current_platform", _fake_platform(capabilities))
     cfg = _placement_config(world_size=len(capabilities))
     assert _any_participating_device_is_capability(cfg, SM70) is expected
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "expected"),
+    [
+        pytest.param([SM70], True, id="volta"),
+        pytest.param([SM75], True, id="turing"),
+        pytest.param([SM80], False, id="ampere"),
+        pytest.param([SM80, SM75], True, id="turing-behind-ampere"),
+        pytest.param([SM75, SM70], True, id="mixed-pre-ampere"),
+        pytest.param([], False, id="no-devices"),
+    ],
+)
+def test_any_participating_device_is_pre_ampere(monkeypatch, capabilities, expected):
+    """The SM70 baseline is a pre-Ampere tuning: Turing counts, Ampere does not."""
+    from vllm.config.vllm import _any_participating_device_is_pre_ampere
+
+    monkeypatch.setattr(platforms, "current_platform", _fake_platform(capabilities))
+    cfg = _placement_config(world_size=len(capabilities))
+    assert _any_participating_device_is_pre_ampere(cfg) is expected
 
 
 def test_any_participating_device_is_capability_requires_cuda(monkeypatch):
@@ -155,15 +176,19 @@ def _build_vllm_config(pp_size: int = 1) -> VllmConfig:
     ("capabilities", "pp_size", "expected"),
     [
         pytest.param([SM75, SM70], 2, True, id="sm70-stage-behind-sm75"),
-        pytest.param([SM75, SM75], 2, False, id="homogeneous-sm75"),
-        pytest.param([SM75, SM70], 1, False, id="unused-sm70-must-not-change-defaults"),
+        pytest.param([SM75, SM75], 2, True, id="homogeneous-sm75-is-pre-ampere"),
+        pytest.param([SM70, SM70], 2, True, id="homogeneous-sm70"),
+        pytest.param([SM80, SM70], 1, False, id="unused-sm70-must-not-change-defaults"),
+        pytest.param([SM80, SM80], 2, False, id="ampere-must-stay-clean"),
     ],
 )
 def test_sm70_baseline_defaults_follow_any_visible_device(
     monkeypatch, isolated_baseline_env, capabilities, pp_size, expected
 ):
-    """PP stage 0 on an sm75 card, stage 1 on sm70: the Flash-V100 baseline
-    defaults must still be applied; a homogeneous sm75 box must stay clean."""
+    """The Flash-V100 baseline follows the participating devices, and it is a
+    pre-Ampere tuning: a mixed sm75/sm70 deployment gets it, and so does a
+    homogeneous sm75 one. An sm70 card that no rank uses must not pull it in,
+    and Ampere and later must stay clean."""
     _patch_visible_devices(monkeypatch, capabilities)
 
     _build_vllm_config(pp_size)
