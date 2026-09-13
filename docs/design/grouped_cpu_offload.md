@@ -43,6 +43,30 @@ Requests shorter than `stride` blocks may occupy proportionally more state
 slots than the bound assumes; their Mamba states age out first and such
 prefixes then miss rather than restore a wrong state.
 
+### V100 validation of stride 8
+
+Flash-Next AWQ, TP4, FP16 KV, CUDA Graphs, 16 GiB CPU budget, 1.19 GiB GPU
+KV per rank, the production image `b8aa829785` with the eight PR Python files
+overlaid and hash-verified at start. GPU prefix state was reset before every
+restore, so all hits below are external (local hits were zero throughout) and
+output token IDs were compared against the cold run of the same prompt.
+
+| mode | scenario | result |
+|---|---|---|
+| MTP0 | 64K cold, 20K pressure, restore, rehit | 63,504 external tokens (81 blocks, the final prefill boundary); IDs identical |
+| MTP0 | partial prefix: 40K prompt sharing 39,983 tokens (50 blocks) with a stored prompt, offload disabled for the probe | 37,632 external tokens = 48 blocks, rounded down to the stride; IDs identical to its cold run |
+| MTP0 | three distinct 64K contexts stored, then each restored | 63,504 external tokens for all three |
+| MTP3 | 64K cold, pressure, restore, rehit | 62,400 external tokens = 78 x 800-token blocks, the MTP-shifted final boundary; six drafted/accepted; IDs identical |
+| MTP3 | three distinct 60K contexts stored, then each restored | 58,400 external tokens for all three |
+| MTP0, stride 1 | same three 64K contexts (107 slots per group) | all three restores missed: each miss re-stores 81 blocks and evicts the others |
+
+Pool geometry at stride 8: MTP0 248 token slots and 59 state slots per Mamba
+group (3.996 GiB pinned per rank); MTP3 232 token slots and 55 state slots
+because its speculative padding makes 800-token blocks. Restores of 60K-64K
+took 1.1-1.4 s against 27-35 s cold. Evidence:
+`/mnt/llm_hfs/builds/qsa-stride-validation-20260912` (diag JSONL, raw
+requests, result JSON, server logs, acceptance summary).
+
 ## Public interface boundary
 
 The generic KV connector base classes, connector factory, LMCache connectors,
