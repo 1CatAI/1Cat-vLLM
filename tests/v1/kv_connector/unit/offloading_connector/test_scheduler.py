@@ -876,21 +876,26 @@ def _make_exact_boundary_scheduler() -> OffloadingConnectorScheduler:
     return scheduler
 
 
-def test_mamba_align_group_requires_exact_boundary_source():
+def _hybrid_align_spec(
+    *,
+    block_size_factor: int = 1,
+    retention_interval: int | None = None,
+    with_mamba: bool = True,
+) -> SimpleNamespace:
     block_size = 16
-    kv_cache_config = KVCacheConfig(
-        num_blocks=32,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
             ),
+        )
+    ]
+    if with_mamba:
+        groups.append(
             KVCacheGroupSpec(
                 ["mamba"],
                 MambaSpec(
@@ -899,22 +904,59 @@ def test_mamba_align_group_requires_exact_boundary_source():
                     dtypes=(torch.float32,),
                     mamba_cache_mode="align",
                 ),
-            ),
-        ],
+            )
+        )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups
     )
-    spec = SimpleNamespace(
-        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(world_size=4)),
+    return SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=4),
+            cache_config=SimpleNamespace(
+                prefix_cache_retention_interval=retention_interval
+            ),
+        ),
         kv_cache_config=kv_cache_config,
-        gpu_block_size=(block_size, block_size),
-        block_size_factor=1,
+        gpu_block_size=(block_size,) * len(groups),
+        block_size_factor=block_size_factor,
         hash_block_size=block_size,
         offload_prompt_only=False,
     )
 
-    config = SchedulerOffloadConfig.from_spec(spec)
+
+def test_mamba_align_group_requires_exact_boundary_source():
+    config = SchedulerOffloadConfig.from_spec(_hybrid_align_spec())
 
     assert not config.kv_group_configs[0].requires_exact_boundary_source
     assert config.kv_group_configs[1].requires_exact_boundary_source
+
+
+@pytest.mark.parametrize("retention_interval", [0, 32])
+def test_sparse_retention_rejects_offloaded_block_size_factor(retention_interval):
+    # Sparse retention keeps Mamba states on the GPU block grid; boundary
+    # stores need offloaded-block alignment, so a factor above one would
+    # offload attention blocks without their Mamba state.
+    with pytest.raises(ValueError, match="block_size=32"):
+        SchedulerOffloadConfig.from_spec(
+            _hybrid_align_spec(
+                block_size_factor=2, retention_interval=retention_interval
+            )
+        )
+
+    # Factor one, dense retention, or no align Mamba group are all fine.
+    SchedulerOffloadConfig.from_spec(
+        _hybrid_align_spec(block_size_factor=1, retention_interval=retention_interval)
+    )
+    SchedulerOffloadConfig.from_spec(
+        _hybrid_align_spec(block_size_factor=2, retention_interval=None)
+    )
+    SchedulerOffloadConfig.from_spec(
+        _hybrid_align_spec(
+            block_size_factor=2,
+            retention_interval=retention_interval,
+            with_mamba=False,
+        )
+    )
 
 
 def _empty_store_output(**overrides):
@@ -991,6 +1033,97 @@ def test_mamba_boundary_store_flushes_before_source_block_reuse():
     second_meta = scheduler.build_connector_meta(second)
 
     assert second_meta.jobs_to_flush == {job_id}
+
+
+def test_mamba_boundary_store_retries_while_host_tier_is_busy():
+    # The core offers a boundary state once; with a few state slots per
+    # group the host tier can be fully pinned by in-flight transfers.
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None, None]
+    first = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+
+    assert scheduler.build_connector_meta(first).store_jobs == {}
+    req_status = scheduler._req_status["req"]
+    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+    assert scheduler._block_id_to_pending_jobs == {}
+    assert req_status.transfer_jobs == set()
+
+    # Still busy on a step where the request is not scheduled at all.
+    req_status.req.num_computed_tokens = 16
+    idle = _empty_store_output()
+    assert scheduler.build_connector_meta(idle).store_jobs == {}
+    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    meta = scheduler.build_connector_meta(_empty_store_output())
+
+    [job_id] = meta.store_jobs
+    src_spec, _ = meta.store_jobs[job_id].transfer_spec
+    assert src_spec.block_ids.tolist() == [99]
+    assert src_spec.group_sizes == [0, 1]
+    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
+    assert req_status.pending_boundary_offloads == []
+    assert req_status.transfer_jobs == {job_id}
+    assert scheduler.manager.prepare_store.call_count == 3
+
+
+def test_mamba_boundary_reoffer_supersedes_pending_entry():
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None]
+    scheduler.build_connector_meta(
+        _empty_store_output(
+            num_scheduled_tokens={"req": 16},
+            boundary_state_offloads={"req": [(1, 99, 16)]},
+        )
+    )
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    scheduler._req_status["req"].req.num_computed_tokens = 16
+    meta = scheduler.build_connector_meta(
+        _empty_store_output(boundary_state_offloads={"req": [(1, 77, 16)]})
+    )
+
+    [job] = meta.store_jobs.values()
+    src_spec, _ = job.transfer_spec
+    assert src_spec.block_ids.tolist() == [77]
+    assert scheduler._req_status["req"].pending_boundary_offloads == []
+
+
+@pytest.mark.parametrize("how", ["preempted", "finished"])
+def test_pending_boundary_offloads_dropped_when_blocks_are_freed(how):
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None]
+    scheduler.build_connector_meta(
+        _empty_store_output(
+            num_scheduled_tokens={"req": 16},
+            boundary_state_offloads={"req": [(1, 99, 16)]},
+        )
+    )
+    req_status = scheduler._req_status["req"]
+    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    if how == "preempted":
+        meta = scheduler.build_connector_meta(
+            _empty_store_output(preempted_req_ids={"req"})
+        )
+        assert meta.store_jobs == {}
+        assert req_status.pending_boundary_offloads == []
+    else:
+        req_status.req.is_finished.return_value = True
+        assert scheduler.request_finished(req_status.req) == (False, None)
+        assert "req" not in scheduler._req_status
+        assert req_status.pending_boundary_offloads == []
+    # The freed source block must never be read by a late store.
+    assert scheduler._block_id_to_pending_jobs == {}
 
 
 def test_pending_job_cleanup_deduplicates_block_ids():

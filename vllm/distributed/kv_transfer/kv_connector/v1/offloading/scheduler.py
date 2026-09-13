@@ -165,6 +165,32 @@ class SchedulerOffloadConfig(NamedTuple):
                 isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align"
             )
 
+        # Sparse retention (see CacheConfig.prefix_cache_retention_interval)
+        # keeps Mamba ``align`` states on the GPU block grid: the replay and
+        # junction boundaries of a request. Boundary stores can only take
+        # states at offloaded-block boundaries, so with a block-size factor
+        # above one most prompts would offload their attention blocks but no
+        # Mamba state, and the prefix could never be restored. Retaining
+        # offload-aligned checkpoints needs the core mask to learn the
+        # offload alignment; until then reject the combination up front.
+        retention_interval = (
+            spec.vllm_config.cache_config.prefix_cache_retention_interval
+        )
+        if retention_interval is not None and spec.block_size_factor > 1:
+            for idx, gpu_block_size in enumerate(spec.gpu_block_size):
+                if not _requires_exact_boundary_source(idx):
+                    continue
+                raise ValueError(
+                    "Sparse prefix-cache retention "
+                    f"(prefix_cache_retention_interval={retention_interval}) "
+                    "keeps Mamba align states at GPU block boundaries "
+                    f"({gpu_block_size} tokens), but kv_connector_extra_config "
+                    f"block_size={gpu_block_size * spec.block_size_factor} can "
+                    "only offload states at offloaded-block boundaries. Omit "
+                    "'block_size' (factor 1) or use "
+                    "--prefix-cache-retention-interval none."
+                )
+
         return cls(
             num_workers=spec.vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
@@ -227,6 +253,12 @@ class RequestOffloadState:
     # served to the scheduler, a sparse group (Mamba / sliding window) lacks
     # its checkpoint there: an externally discovered shared-prefix junction.
     external_full_attention_hit_tokens: int = 0
+    # Mamba ``align`` boundary-state hand-offs ``(group_idx, block_id,
+    # boundary_tokens)`` the host tier could not accept yet. The core offers
+    # each hand-off once; the source block stays owned by the request, so the
+    # store is retried every step until it is accepted, the request finishes
+    # or it is preempted.
+    pending_boundary_offloads: list[tuple[int, int, int]] = field(default_factory=list)
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
@@ -943,20 +975,68 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _queue_boundary_state_offloads(self, scheduler_output: SchedulerOutput) -> None:
+        """Move this step's exact Mamba boundary-state hand-offs onto requests."""
+        handoffs = scheduler_output.boundary_state_offloads
+        if not handoffs:
+            return
+        for req_id, entries in handoffs.items():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            pending = req_status.pending_boundary_offloads
+            for group_idx, block_id, boundary_tokens in entries:
+                group_config = self._group_config_by_idx.get(group_idx)
+                if (
+                    group_config is None
+                    or not group_config.requires_exact_boundary_source
+                    or block_id == 0
+                ):
+                    continue
+                # A boundary re-offered (e.g. after preemption and resume)
+                # supersedes an older pending offer for the same state.
+                pending[:] = [
+                    entry
+                    for entry in pending
+                    if entry[0] != group_idx or entry[2] != boundary_tokens
+                ]
+                pending.append((group_idx, block_id, boundary_tokens))
+
+    def _drop_pending_boundary_offloads(
+        self, req_status: RequestOffloadState, reason: str
+    ) -> None:
+        pending = req_status.pending_boundary_offloads
+        if not pending:
+            return
+        logger.warning(
+            "Request %s: dropping %d Mamba boundary state(s) at %s tokens "
+            "never accepted by the host tier (%s)",
+            req_status.req.request_id,
+            len(pending),
+            [entry[2] for entry in pending],
+            reason,
+        )
+        pending.clear()
+
     def _build_boundary_state_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
-        """Build stores from exact committed Mamba boundary-state blocks."""
-        handoffs = scheduler_output.boundary_state_offloads
-        if not handoffs:
-            return {}
+        """Build stores from exact committed Mamba boundary-state blocks.
+
+        Hand-offs that the host tier cannot accept this step (its state slots
+        are pinned by in-flight loads, stores or a filesystem cascade) stay
+        pending on the request and are retried on later steps: the normal
+        store path retries by not advancing ``next_stored_block_idx``, while a
+        hand-off is offered by the core only once.
+        """
+        self._queue_boundary_state_offloads(scheduler_output)
 
         store_jobs: dict[int, TransferJob] = {}
         num_groups = self.config.num_kv_cache_groups
-        for req_id, entries in handoffs.items():
-            req_status = self._req_status.get(req_id)
-            if req_status is None:
+        for req_id, req_status in self._req_status.items():
+            pending = req_status.pending_boundary_offloads
+            if not pending:
                 continue
             req_status.update_offload_keys()
             req = req_status.req
@@ -974,13 +1054,14 @@ class OffloadingConnectorScheduler:
                     num_offloadable_tokens, req.num_prompt_tokens
                 )
 
-            for group_idx, block_id, boundary_tokens in entries:
+            still_pending: list[tuple[int, int, int]] = []
+            for entry in pending:
+                group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
-                if not group_config.requires_exact_boundary_source:
-                    continue
+                # Neither the offload cap nor the block alignment changes
+                # later: these offers can never be stored.
                 if (
-                    block_id == 0
-                    or boundary_tokens > num_offloadable_tokens
+                    boundary_tokens > num_offloadable_tokens
                     or boundary_tokens % group_config.offloaded_block_size != 0
                 ):
                     continue
@@ -996,11 +1077,13 @@ class OffloadingConnectorScheduler:
                     [offload_key], req_status.req_context
                 )
                 if store_output is None:
-                    logger.warning(
-                        "Request %s: cannot store Mamba boundary at %d tokens",
+                    logger.debug(
+                        "Request %s: host tier busy, retrying Mamba boundary "
+                        "state at %d tokens next step",
                         req_id,
                         boundary_tokens,
                     )
+                    still_pending.append(entry)
                     continue
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
@@ -1033,6 +1116,7 @@ class OffloadingConnectorScheduler:
                     req_id=req_id,
                     transfer_spec=(src_spec, store_output.store_spec),
                 )
+            req_status.pending_boundary_offloads = still_pending
 
         return store_jobs
 
@@ -1041,7 +1125,12 @@ class OffloadingConnectorScheduler:
     ) -> KVConnectorMetadata:
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
-            if req_status is None or not req_status.transfer_jobs:
+            if req_status is None:
+                continue
+            # Preemption returns the request's blocks to the pool, so
+            # boundary states not yet handed to a store job are gone.
+            self._drop_pending_boundary_offloads(req_status, "preempted")
+            if not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
             assert self._jobs[any_jid].is_store
@@ -1141,6 +1230,9 @@ class OffloadingConnectorScheduler:
 
         if req_status is None:
             return False, None
+        # Blocks are freed right after this call; a store for a still
+        # pending boundary offer could not be issued before block reuse.
+        self._drop_pending_boundary_offloads(req_status, "request finished")
         if not req_status.transfer_jobs:
             del self._req_status[request.request_id]
             return False, None

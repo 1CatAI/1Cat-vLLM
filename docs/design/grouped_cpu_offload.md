@@ -30,6 +30,17 @@ consumes it on the offload side:
   cache does), so the scheduler ends a chunk there, the mask keeps the state
   and the hand-off offloads it; the next sibling hits after a restart or GPU
   eviction.
+- Hand-offs are offered by the core once. When the host tier cannot accept
+  one (its few state slots are pinned by in-flight loads, stores or a
+  filesystem cascade) the connector keeps the offer on the request and
+  retries it every step; the source block stays owned by the request. Offers
+  still pending when the request finishes or is preempted are dropped with a
+  warning, since the block is about to be reused.
+- Sparse retention keeps states on the GPU block grid, while boundary stores
+  need offloaded-block alignment. A `block_size` factor above one with an
+  `align` Mamba group is therefore rejected at connector start-up under
+  sparse retention (dense `None` still works); retaining offload-aligned
+  checkpoints would need the core mask to learn the offload alignment.
 
 ### Group pool sizing
 
