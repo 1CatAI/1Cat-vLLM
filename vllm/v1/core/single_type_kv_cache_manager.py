@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -1139,6 +1140,16 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.sparse_checkpoint_interval = int(
+            os.environ.get("VLLM_MAMBA_SPARSE_CACHE_INTERVAL", "0")
+        )
+        if (
+            self.sparse_checkpoint_interval < 0
+            or self.sparse_checkpoint_interval % self.block_size
+        ):
+            raise ValueError(
+                "Mamba sparse interval must be zero or a positive block multiple"
+            )
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1411,13 +1422,44 @@ class MambaManager(SingleTypeKVCacheManager):
         alignment_tokens: int | None = None,
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
+        sparse_enabled = (
+            self.sparse_checkpoint_interval > 0
+            and self.mamba_cache_mode == "align"
+            and alignment_tokens == self.block_size
+        )
+        if sparse_enabled:
+            num_full_blocks = num_tokens // self.block_size
+            # Preserve both the ordinary replay boundary and its one-block
+            # speculative backoff. Keeping both avoids duplicating the
+            # coordinator's per-group EAGLE classification in this manager.
+            replay_block = max(0, (request.num_tokens - 1) // self.block_size)
+            mask = [
+                ((i + 1) * self.block_size % self.sparse_checkpoint_interval == 0)
+                or (i + 1 in (replay_block, replay_block - 1))
+                for i in range(num_cached_blocks_before, num_full_blocks)
+            ]
+            self.block_pool.cache_full_blocks(
+                request=request,
+                blocks=self.req_to_blocks[request.request_id],
+                num_cached_blocks=num_cached_blocks_before,
+                num_full_blocks=num_full_blocks,
+                block_size=self.block_size,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_mask=mask,
+            )
+            self.num_cached_block[request.request_id] = max(
+                num_cached_blocks_before, num_full_blocks
+            )
+        else:
+            super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for block_idx in range(num_cached_blocks_before, num_cached_blocks_after):
                 block = blocks[block_idx]
                 if block.is_null:
+                    continue
+                if sparse_enabled and block.block_hash is None:
                     continue
                 assert block.block_hash is not None
                 self.cached_blocks_this_step.add(block.block_hash)
