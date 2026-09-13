@@ -24,7 +24,7 @@ We describe two example workloads, where APC can provide huge performance benefi
 
 ### Sparse checkpoints for aligned Mamba caches
 
-On this release branch, `VLLM_MAMBA_SPARSE_CACHE_INTERVAL` opts into sparse
+In 1Cat, `VLLM_MAMBA_SPARSE_CACHE_INTERVAL` opts into sparse
 checkpoint admission for aligned Mamba prefix caches. Its default is `0`, which
 retains dense checkpoint admission. A positive value is measured in tokens and
 must be a multiple of each Mamba manager's block size; invalid values fail at
