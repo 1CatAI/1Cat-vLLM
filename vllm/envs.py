@@ -412,6 +412,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE: bool = True
+    VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P: bool = True
     VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH: bool = True
     VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268: bool = True
@@ -2929,6 +2930,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1"))
+    ),
+    # Experimental (1CatAI/1Cat-vLLM#490): let the D256 BM32 phase paged-prefill
+    # kernel run at any KV page size that is a multiple of 16 (MTP makes the
+    # align-mode block 816, which otherwise falls off the page-784 fast path).
+    "VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE", "0"))
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P", "1"))
