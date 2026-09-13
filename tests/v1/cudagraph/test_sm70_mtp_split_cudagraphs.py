@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.config import CompilationConfig, CUDAGraphMode
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 
 
@@ -31,6 +32,7 @@ def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
     )
 
 
+@pytest.mark.parametrize("capability", [(7, 0), (7, 5)], ids=["volta", "turing"])
 @pytest.mark.parametrize(
     ("max_num_seqs", "request_sizes", "verifier_sizes"),
     [
@@ -43,15 +45,21 @@ def test_split_managers_keep_exact_full_graph_shapes(
     max_num_seqs: int,
     request_sizes: list[int],
     verifier_sizes: list[int],
+    capability: tuple[int, int],
 ):
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "1")
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.cudagraph_utils.current_platform.is_cuda",
         lambda: True,
     )
+    # The gate asks the worker's own device; answer for it only.
     monkeypatch.setattr(
-        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.is_device_capability",
-        lambda capability: capability == (7, 0),
+        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_device_capability",
+        lambda device_id=0: DeviceCapability(*capability),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.torch.accelerator.current_device_index",
+        lambda: 0,
     )
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_global_graph_pool",
