@@ -24,34 +24,49 @@ We describe two example workloads, where APC can provide huge performance benefi
 
 ### Sparse checkpoints for aligned Mamba caches
 
-In 1Cat, `VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS` opts into sparse
-checkpoint admission for aligned Mamba prefix caches. Its default is `0`, which
-retains dense checkpoint admission. A positive integer selects every Nth block
-boundary in each Mamba manager; `1` admits every eligible boundary. Negative values
-fail at initialization. For example, `20` corresponds to 16000 tokens with
-800-token blocks, or 10240 tokens with 512-token blocks. The token spacing adapts
-to the model's block size; the physical block size and pool capacity do not change.
-Smaller intervals retain more recovery points, while larger intervals reduce
-checkpoint pressure but can require more replay. Compare values such as `5`,
-`10`, `20`, and `40` for the intended workload.
+`--prefix-cache-retention-interval` (the `CacheConfig.prefix_cache_retention_interval`
+field) controls Mamba checkpoint retention. Its name, token unit, and value
+semantics follow upstream vLLM:
 
-Sparse admission applies only when the cache mode is `align` and the coordinator's
-alignment equals the manager's block size. Other geometries use dense admission.
-It retains periodic checkpoints and both prompt replay boundaries needed by
-ordinary and speculative lookups. It preserves the speculative one-block backoff
-and does not change state computation. Free uncached scratch blocks are recycled
-before cached blocks whenever prefix caching is enabled, including when the
-sparse interval is zero.
+| Value | Retained checkpoints |
+| --- | --- |
+| `None` | Every eligible state, preserving dense admission |
+| `0` (default) | Necessary replay boundaries and detected shared-prefix junctions |
+| Positive integer | Those boundaries plus periodic checkpoints at this token interval |
 
-This reduces checkpoint churn that can evict another request's reusable prefix
-during a long prefill. It does not pin conversation caches: finite capacity and
-changed prefixes can still cause misses. A prefix that ends between retained
-checkpoints can require additional replay. Cold-prefill contention with active
-decoders also remains possible.
+A positive interval must be a multiple of the resolved cache-hit alignment, not
+necessarily a power of two. For 800-token alignment, `16000` selects a checkpoint
+every 20 blocks. The former draft environment variables
+`VLLM_MAMBA_SPARSE_CACHE_INTERVAL` and
+`VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS` are replaced by this configuration field;
+the old value `0` maps to `None`, not to the new default `0`.
 
-Real-model validation used Flash-Next AWQ with four V100 GPUs and MTP3. Shared
-manager code does not imply that other models, including 27B variants, have
-completed real-weight validation.
+This is a Mamba-focused adaptation of upstream
+[#43447](https://github.com/vllm-project/vllm/pull/43447),
+[#45845](https://github.com/vllm-project/vllm/pull/45845),
+[#47782](https://github.com/vllm-project/vllm/pull/47782), and the replay-boundary
+fixes [#53945](https://github.com/vllm-project/vllm/pull/53945) /
+[#54713](https://github.com/vllm-project/vllm/pull/54713).
+Other cache types retain their existing 1Cat admission policy. Sparse Mamba
+admission applies in `align` mode when the manager block size matches the
+coordinator alignment; other geometries keep dense admission.
+
+Free uncached blocks are reused before cached blocks. The retention mask keeps
+both model-level MTP/EAGLE replay positions when required, without removing the
+existing speculative safety backoff. When a group has a longer cached prefix than
+the combined hit, the request records that shared junction; scheduling
+materializes its aligned state and admission keeps it for later sibling requests.
+The first newly observed fork can still require replay. This does not predict
+future forks or pin caches against eventual capacity eviction.
+
+The parameter changes retention, not state computation, block size, or allocated
+VRAM. Smaller positive intervals retain more recovery points; larger intervals
+reduce checkpoint pressure but may require more replay. Cold-prefill contention
+with active decoders remains possible.
+
+The earlier custom-policy GPU experiments used Flash-Next AWQ on four V100 GPUs
+with native FP8 MTP3. They do not constitute GPU acceptance of this revised
+upstream-aligned implementation or of other models such as 27B variants.
 
 ### Workloads without reusable prefixes
 
