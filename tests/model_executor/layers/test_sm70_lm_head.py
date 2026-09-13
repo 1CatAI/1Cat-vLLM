@@ -155,6 +155,33 @@ def test_packed_lm_head_routes_still_prepare_layout(
     prepare_qpn8.assert_called_once_with(layer)
 
 
+@pytest.mark.parametrize("dense", [False, True])
+@pytest.mark.parametrize("tc_top1", [False, True])
+def test_fp32_qpn8_only_packs_for_explicit_tc_top1(monkeypatch, dense, tc_top1) -> None:
+    _set_lm_head_routes(monkeypatch, qpn8=True, dense=dense, tc_top1=tc_top1)
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_FP32_LOGITS", True)
+    monkeypatch.setattr(
+        vocab_embedding, "_is_sm70_lm_head_fastpath_eligible", lambda _layer: True
+    )
+    layer = SimpleNamespace(weight=_FakeCudaTensor((62080, 5120)), tp_size=4)
+    prepare = Mock(return_value=(object(), torch.tensor([5120])))
+    monkeypatch.setattr(torch.ops._C, "sm70_f16_prepare", Mock(), raising=False)
+    monkeypatch.setattr(vocab_embedding.sm70_ops, "sm70_f16_prepare", prepare)
+    prepare_qpn8 = Mock(return_value=True)
+    monkeypatch.setattr(
+        vocab_embedding, "_prepare_sm70_dflash2_qpn8_rerank", prepare_qpn8
+    )
+
+    assert vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer)
+    assert layer._sm70_dflash2_fp32_logits
+    prepare_qpn8.assert_called_once_with(layer)
+    assert hasattr(layer, "_sm70_f16_tm_weight") == tc_top1
+    if tc_top1:
+        prepare.assert_called_once_with(layer.weight)
+    else:
+        prepare.assert_not_called()
+
+
 def test_raw_top1_readiness_does_not_enable_dense_fastpath(monkeypatch) -> None:
     _set_lm_head_routes(monkeypatch, raw_top1=True, dense=True)
     layer = SimpleNamespace(_sm70_f16_raw_top1_ready=True)

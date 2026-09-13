@@ -1319,6 +1319,104 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_prepare_sm70"):
         return [codes, scales]
 
 
+def nvfp4_qpn2_prepare_scales_sm70(weight_scale: torch.Tensor) -> torch.Tensor:
+    """Pack E4M3 scales, padding N to 32, without allocating weight codes."""
+    return _op("nvfp4_qpn2_prepare_scales_sm70")(weight_scale)
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_prepare_scales_sm70"):
+
+    @register_fake("_C::nvfp4_qpn2_prepare_scales_sm70")
+    def _nvfp4_qpn2_prepare_scales_sm70_fake(
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        n, groups = weight_scale.shape
+        return torch.empty(
+            ((n + 31) // 32 * 32, groups),
+            device=weight_scale.device,
+            dtype=torch.uint8,
+        )
+
+
+def nvfp4_qpn2_compact_tm_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    """Restore temporary TurboMind scales from the retained QPN2 scale codes."""
+    _op("nvfp4_qpn2_compact_tm_gemm_sm70_out")(
+        out, input, weight, scales, global_scale, k_ld, q_ld, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_compact_tm_gemm_sm70_out")
+    def _nvfp4_qpn2_compact_tm_gemm_sm70_out_fake(
+        out, input, weight, scales, global_scale, k_ld, q_ld, gated_silu
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn2_tm_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    tm_weight: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    accumulator_chains: int,
+    tm_scales: torch.Tensor,
+    tm_group_size: int,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    gated_silu: bool,
+    min_prefill_m: int,
+) -> None:
+    """Use shared TurboMind codes for QPN2, TurboMind and dense prefill."""
+    _op("nvfp4_qpn2_tm_dispatch_sm70_out")(
+        out,
+        input,
+        tm_weight,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+        tm_scales,
+        tm_group_size,
+        tm_k_ld,
+        tm_q_ld,
+        gated_silu,
+        min_prefill_m,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_tm_dispatch_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_tm_dispatch_sm70_out")
+    def _nvfp4_qpn2_tm_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        tm_weight: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        split_k: int,
+        accumulator_chains: int,
+        tm_scales: torch.Tensor,
+        tm_group_size: int,
+        tm_k_ld: int,
+        tm_q_ld: int,
+        gated_silu: bool,
+        min_prefill_m: int,
+    ) -> None:
+        return None
+
+
 def nvfp4_qpn2_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,

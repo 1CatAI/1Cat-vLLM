@@ -447,6 +447,16 @@ def apply_prepared_linear(
             state.k_ld,
             state.q_ld,
         )
+    elif state.op_kind == "nvfp4" and state.use_scale_code:
+        sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+            out,
+            reshaped_x,
+            state.weight,
+            state.scales,
+            state.global_scale,
+            state.k_ld,
+            state.q_ld,
+        )
     elif state.op_kind == "nvfp4":
         sm70_ops.nvfp4_gemm_sm70_out(
             out,
