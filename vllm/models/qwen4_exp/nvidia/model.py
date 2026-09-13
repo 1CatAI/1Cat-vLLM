@@ -165,7 +165,7 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
 
 def _validate_qsa_e4m3_scale_load(
     required_scales: set[str], loaded: set[str], cache_dtype: str
-) -> set[str]:
+) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return set()
     missing_scales = sorted(required_scales - loaded)
@@ -212,7 +212,9 @@ def _finalize_qsa_e4m3_scale_load(
     required_scales = {
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
-    missing_scales = _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
+    missing_scales = _validate_qsa_e4m3_scale_load(
+        required_scales, loaded, cache_dtype
+    )
     if not missing_scales:
         logger.info_once(
             "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",
@@ -220,7 +222,9 @@ def _finalize_qsa_e4m3_scale_load(
             len(required_scales),
         )
     for name, module in qsa_modules.items():
-        uncovered = any(f"{name}.{kind}_scale" in missing_scales for kind in ("k", "v"))
+        uncovered = any(
+            f"{name}.{kind}_scale" in missing_scales for kind in ("k", "v")
+        )
         if uncovered:
             module.adopt_default_kv_scales()
         else:
