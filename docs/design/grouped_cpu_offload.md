@@ -60,8 +60,40 @@ IDs, GPU-side and externally discovered junctions served to a third request
 from RAM, four distinct 60K-64K contexts restored, dense retention thrashing
 the 107-slot pools). Evidence: `/mnt/llm_hfs/builds/qsa-stride-validation-20260912`
 and `/mnt/llm_hfs/builds/qsa-retention-validation-20260913`. That core port was
-dropped in favor of PR #617; the offload-side pieces above are unchanged, and a
-re-validation on top of #617's core is recorded here when available.
+dropped in favor of PR #617. The converged implementation at `eef147cafd`
+was revalidated on 2026-09-13 with #617's `a9ab97a755` core.
+
+| Check | MTP0 | MTP3 |
+|---|---|---|
+| Token slots / state slots per group | 390 / 10 | 352 / 10 |
+| 63,999-token prompt: first RAM restore | 63,504 tokens, 1.044 s | 62,400 tokens, 1.402 s |
+| GPU-discovered junction restored from RAM | 39,200 tokens | 39,200 tokens |
+| Externally discovered junction restored from RAM | 39,200 tokens | 39,200 tokens |
+| Four distinct contexts restored | 4 x 63,999; each hits 63,504 | 4 x 59,999; each hits 58,400 |
+| Four-context restore request time | 1.103-1.542 s | 1.435-1.448 s |
+
+All restore checks reset GPU prefix state first and report zero local hits.
+Restored output token IDs match their cold controls. MTP3 draft/accept counters
+are nonzero. Each worker allocates approximately 3.99 GiB of pinned cache;
+these are preallocated pools, not one-context minimum RAM. Independent CPU
+regression on the converged source: **300 passed, 2 skipped**.
+
+One old probe assertion required MTP3's second restore to match its first hit
+exactly. The first restore instead materializes the longer Attention boundary,
+so the second hits 63,200 rather than 62,400 tokens. All four newly stored Mamba
+keys were confirmed as hits on that second request, with identical output IDs.
+The original failed assertion and evidence-backed recheck are both retained.
+MTP3 junction probes use distinct long tails so the earlier replay checkpoint
+cannot substitute for a missing shared-prefix state. An initial tail fixture
+misplaced the output instruction; its uncached control failed before any
+restore. Corrected inputs passed both junction scenarios.
+
+This is a joint-source regression: 18 hash-verified Python files over the
+verified `b8aa829785` image, plus two diagnostic wrappers. It is not a clean
+complete-image acceptance of `eef147cafd`. No engine/CUDA/OOM errors occurred
+in either test run. Sparse-retention filesystem restart, positive-interval GPU
+coverage, and a complete rebuilt image remain outside this round's scope.
+Evidence: `/mnt/llm_hfs/builds/pr598-on617-validation-20260913`.
 
 ## Public interface boundary
 
