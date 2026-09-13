@@ -486,13 +486,25 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
+        from vllm.distributed.utils import (
+            get_cpu_distributed_timeout_or_none,
+            get_distributed_timeout_or_none,
+        )
 
         timeout = get_cpu_distributed_timeout_or_none()
+        # --distributed-timeout-seconds reaches init_process_group (the world
+        # group) and the gloo CPU groups, but the NCCL subgroups were created
+        # without it, so TP and PP silently kept PyTorch's 600 s default. On a
+        # cold boot under pipeline parallelism the first stage compiles Triton
+        # kernels for minutes while the next stage sits in its receive; the
+        # watchdog then kills the waiting rank and the boot dies at a timeout
+        # instead of an error. The subgroups follow the configured value;
+        # unset keeps PyTorch's default.
+        device_timeout = get_distributed_timeout_or_none()
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks, backend=torch_distributed_backend, timeout=device_timeout
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
