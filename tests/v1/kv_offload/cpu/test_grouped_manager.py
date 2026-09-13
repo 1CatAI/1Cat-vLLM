@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -31,10 +32,12 @@ GROUPS = (0, 2, 3, 4, 5)
 
 
 @pytest.mark.parametrize("error_code", [1, 2])
-def test_mmap_registration_failure_is_fatal(monkeypatch, error_code):
+def test_mmap_registration_failure_is_fatal(monkeypatch, tmp_path, error_code):
     from vllm.v1.kv_offload.cpu import gpu_worker as worker
 
+    backing = (tmp_path / "offload.mmap").open("w+b")
     region = SimpleNamespace(
+        fd=backing.fileno(),
         rank=3,
         mmap_path="/dev/shm/test-offload.mmap",
         total_size_bytes=4096,
@@ -54,6 +57,46 @@ def test_mmap_registration_failure_is_fatal(monkeypatch, error_code):
         worker.pin_mmap_region(region)
     assert calls == [(region._base.data_ptr(), 4096, 0)]
     assert not region.is_pinned
+    backing.close()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_mmap_registration_holds_and_releases_shared_file_lock(
+    monkeypatch, tmp_path, raises
+):
+    from vllm.v1.kv_offload.cpu import gpu_worker as worker
+
+    path = tmp_path / "offload.mmap"
+    with path.open("w+b") as backing, path.open("r+b") as contender:
+        region = SimpleNamespace(
+            fd=backing.fileno(),
+            rank=0,
+            mmap_path=str(path),
+            total_size_bytes=4096,
+            _base=torch.zeros(4096, dtype=torch.int8),
+            is_pinned=False,
+        )
+
+        def register(ptr, size, flags):
+            # Independently opened descriptors contend even in one process.
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if raises:
+                raise RuntimeError("registration raised")
+            return SimpleNamespace(value=0)
+
+        monkeypatch.setattr(
+            torch.cuda, "cudart", lambda: SimpleNamespace(cudaHostRegister=register)
+        )
+        if raises:
+            with pytest.raises(RuntimeError, match="registration raised"):
+                worker.pin_mmap_region(region)
+        else:
+            worker.pin_mmap_region(region)
+        assert region.is_pinned is not raises
+        # Both successful and exceptional registration must release the lock.
+        fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
 
 
 def key(group, index):

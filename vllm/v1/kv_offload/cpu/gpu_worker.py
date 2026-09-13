@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import fcntl
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -92,7 +93,19 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    # Long-term pinning can migrate pages. Concurrent registrations of the
+    # same shared region can hold pins that prevent another worker's migration
+    # and make pin_user_pages return ENOMEM despite sufficient free RAM.
+    # Each worker opens this file independently, so flock serializes registration
+    # across processes without keeping a lock during KV transfers.
+    assert region.fd is not None
+    fcntl.flock(region.fd, fcntl.LOCK_EX)
+    try:
+        result = torch.cuda.cudart().cudaHostRegister(
+            base_ptr, region.total_size_bytes, 0
+        )
+    finally:
+        fcntl.flock(region.fd, fcntl.LOCK_UN)
     if result.value != 0:
         # The batch transfer path requires registered host memory. Continuing
         # also leaves the CUDA error pending for an unrelated later kernel.
