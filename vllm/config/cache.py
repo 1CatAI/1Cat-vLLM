@@ -94,6 +94,15 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_cache_retention_interval: int | None = Field(default=0, ge=0)
+    """Token interval between retained sliding-window and Mamba prefix-cache
+    checkpoints. ``0`` retains only semantic checkpoints: the latest replay
+    boundary of each prompt and detected shared-prefix junctions. Positive
+    values additionally retain periodic checkpoints at the specified interval,
+    which must be a multiple of the cache-hit alignment (the Mamba state block
+    size for hybrid models). ``None`` retains checkpoints densely at every
+    block boundary. Applies only to sliding-window and Mamba cache groups, on
+    the GPU and in native KV offloading alike."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -198,6 +207,7 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",

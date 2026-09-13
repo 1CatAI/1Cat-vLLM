@@ -51,6 +51,7 @@ class SharedOffloadRegion:
         self._creator = False  # set True only if this worker creates the file
         self.num_blocks = num_blocks
         self.rank = rank
+        self._scheduler_unlink = rank is None
         # interleaved-layout stride: one row = all workers' data for one block
         self._row_stride = cpu_page_size * num_workers
         if rank is not None:
@@ -195,12 +196,19 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
-        if self._creator and getattr(self, "mmap_path", None):
+        # Engine shutdown stops workers before the scheduler. The scheduler
+        # therefore owns final unlink even if a worker won the creation race.
+        if (self._creator or self._scheduler_unlink) and getattr(
+            self, "mmap_path", None
+        ):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
                 )
             self._creator = False
+            self._scheduler_unlink = False

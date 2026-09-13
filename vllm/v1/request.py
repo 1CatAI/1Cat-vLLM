@@ -175,6 +175,12 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Block-aligned token position of a shared prefix that a sparse-retention
+        # group (Mamba / sliding window) has not cached yet; 0 means none. Set at
+        # admission for hybrid models when a longer attention hit reveals a
+        # common prefix (Marconi-style), so its state gets materialized and kept.
+        self.shared_prefix_boundary = 0
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []

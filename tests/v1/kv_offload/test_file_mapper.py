@@ -125,3 +125,46 @@ def test_get_config_file_path():
     fm = make_mapper_from_offloading_spec()
     config_path = fm.get_config_file_path()
     assert config_path == f"{fm.base_path}/config.json"
+
+
+def test_persistent_layout_isolates_physical_bytes():
+    from copy import deepcopy
+
+    args = dict(
+        root_dir="/tmp/cache",
+        model_name="model",
+        hash_block_size=16,
+        gpu_blocks_per_file=1,
+        tp_size=2,
+        pp_size=1,
+        pcp_size=1,
+        dcp_size=1,
+        rank=0,
+        dtype="float16",
+    )
+    layout: dict = {
+        "version": "grouped-row-v1",
+        "pages": [4096, 8192],
+        "tensor_order": ["attention", "mamba"],
+    }
+    legacy = FileMapper(**args)
+    grouped = FileMapper(**args, persistent_layout=layout)
+    key = make_offload_key(b"same-prefix", 2)
+    assert legacy.get_file_name(key) != grouped.get_file_name(key)
+    assert (
+        FileMapper(**args, persistent_layout=deepcopy(layout)).base_path
+        == grouped.base_path
+    )
+    for field, value in (
+        ("version", "grouped-row-v2"),
+        ("pages", [8192, 8192]),
+        ("tensor_order", ["mamba", "attention"]),
+    ):
+        changed = deepcopy(layout)
+        changed[field] = value
+        assert (
+            FileMapper(**args, persistent_layout=changed).base_path != grouped.base_path
+        )
+    layout["pages"][0] = 1
+    assert grouped.get_run_config()["persistent_layout"]["pages"][0] == 4096
+    assert "persistent_layout" not in legacy.get_run_config()

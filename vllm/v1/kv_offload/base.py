@@ -406,7 +406,16 @@ class OffloadingSpec(ABC):
             kv_cache_config, vllm_config
         )
 
-        for block_size in self.gpu_block_size:
+        # Keep the full worker layout, but scratch rings have no offload keys
+        # and must not constrain offload/hash geometry.
+        cacheable_block_sizes = {
+            block_size
+            for block_size, group in zip(
+                self.gpu_block_size, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable
+        }
+        for block_size in cacheable_block_sizes:
             assert block_size % self.hash_block_size == 0, (
                 f"gpu_block_size={block_size} not divisible by "
                 f"hash_block_size={self.hash_block_size}. "
@@ -420,11 +429,11 @@ class OffloadingSpec(ABC):
         offloaded_block_size = self.extra_config.get("block_size")
         if offloaded_block_size is not None:
             offloaded_block_size_int = int(offloaded_block_size)
-            gpu_block_sizes = set(self.gpu_block_size)
+            gpu_block_sizes = cacheable_block_sizes.copy()
             assert len(gpu_block_sizes) == 1, (
                 "If 'block_size' is specified in kv_connector_extra_config, "
-                "there must be at least one KV cache group, "
-                "and all groups must have the same block size."
+                "there must be at least one prefix-cacheable KV cache group, "
+                "and all prefix-cacheable groups must have the same block size."
             )
             gpu_block_size = gpu_block_sizes.pop()
 

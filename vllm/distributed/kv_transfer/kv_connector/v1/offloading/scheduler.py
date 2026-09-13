@@ -18,6 +18,10 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import (
+    SingleTypeKVCacheManager,
+    spec_manager_map,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -67,16 +71,15 @@ class GroupOffloadConfig(NamedTuple):
     hash_block_size_factor: int
     # None below means full attention
     sliding_window_size_in_blocks: int | None
-    # Number of this group's offloaded blocks per full-attention alignment
-    # segment. Used to skip storing SWA blocks that can never serve a load
-    # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
-    # than the MLA full-attention group).
-    # None for full-attention groups or when the optimization doesn't apply.
-    alignment_block_count: int | None = None
     # Mamba ``align`` tables mutate existing logical positions. Such groups
     # must be stored from exact core-provided boundary block IDs instead of the
     # connector's append-only positional mirror.
     requires_exact_boundary_source: bool = False
+    # The group's KV cache spec and its core manager class: the store path
+    # reuses the manager's ``reachable_block_mask`` so host retention follows
+    # GPU retention (sparse SWA tails, Mamba checkpoints, retention interval).
+    kv_cache_spec: KVCacheSpec | None = None
+    manager_cls: type[SingleTypeKVCacheManager] | None = None
 
 
 def get_sliding_window_size_in_blocks(
@@ -117,6 +120,12 @@ class SchedulerOffloadConfig(NamedTuple):
     block_size_factor: int
     num_workers: int
     offload_prompt_only: bool
+    # Worker/state arrays retain original group indices, including scratch.
+    num_kv_cache_groups: int
+    # Cache-hit alignment (full-attention offloaded block size) and the
+    # sparse retention policy shared with the GPU prefix cache.
+    alignment_tokens: int | None = None
+    retention_interval: int | None = None
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -128,6 +137,8 @@ class SchedulerOffloadConfig(NamedTuple):
         full_attn_offloaded_block_sizes: set[int] = set()
         for idx, gpu_block_size in enumerate(spec.gpu_block_size):
             kv_spec = spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec
+            if not kv_spec.prefix_cacheable:
+                continue
             sw = get_sliding_window_size_in_blocks(
                 kv_spec, gpu_block_size * spec.block_size_factor
             )
@@ -142,18 +153,12 @@ class SchedulerOffloadConfig(NamedTuple):
         if len(full_attn_offloaded_block_sizes) == 1:
             alignment_tokens = full_attn_offloaded_block_sizes.pop()
 
-        def _alignment_block_count(
-            offloaded_block_size: int,
-            sliding_window_size_in_blocks: int | None,
-        ) -> int | None:
-            if alignment_tokens is None or sliding_window_size_in_blocks is None:
-                return None
-            if alignment_tokens <= offloaded_block_size:
-                return None
-            per_segment = alignment_tokens // offloaded_block_size
-            if sliding_window_size_in_blocks >= per_segment:
-                return None
-            return per_segment
+        retention_interval = spec.kv_cache_config.prefix_cache_retention_interval
+        if retention_interval is not None and retention_interval < 0:
+            raise ValueError(
+                f"prefix_cache_retention_interval ({retention_interval}) must be "
+                "non-negative."
+            )
 
         def _requires_exact_boundary_source(group_idx: int) -> bool:
             kv_spec = spec.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
@@ -178,17 +183,26 @@ class SchedulerOffloadConfig(NamedTuple):
                             gpu_block_size * spec.block_size_factor,
                         )
                     ),
-                    alignment_block_count=_alignment_block_count(
-                        gpu_block_size * spec.block_size_factor, sw
-                    ),
                     requires_exact_boundary_source=(
                         _requires_exact_boundary_source(idx)
                     ),
+                    kv_cache_spec=(
+                        kv_spec := spec.kv_cache_config.kv_cache_groups[
+                            idx
+                        ].kv_cache_spec
+                    ),
+                    manager_cls=spec_manager_map[type(kv_spec)],
                 )
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
+                if spec.kv_cache_config.kv_cache_groups[
+                    idx
+                ].kv_cache_spec.prefix_cacheable
             ),
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
+            num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
+            alignment_tokens=alignment_tokens,
+            retention_interval=retention_interval,
         )
 
 
@@ -220,7 +234,7 @@ class RequestOffloadState:
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
-            RequestGroupState() for _ in self.config.kv_group_configs
+            RequestGroupState() for _ in range(self.config.num_kv_cache_groups)
         )
         params = self.req.kv_transfer_params
 
@@ -239,9 +253,8 @@ class RequestOffloadState:
             )
 
     def update_offload_keys(self) -> None:
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, self.group_states
-        ):
+        for group_config in self.config.kv_group_configs:
+            group_state = self.group_states[group_config.group_idx]
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hash_block_size_factor * len(group_state.offload_keys)
@@ -265,16 +278,14 @@ class RequestOffloadState:
             group_state.block_ids.extend(new_blocks)
 
     def advance_stored_idx(self, num_offloadable_tokens: int) -> None:
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, self.group_states
-        ):
+        for group_config in self.config.kv_group_configs:
+            group_state = self.group_states[group_config.group_idx]
             num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
             group_state.next_stored_block_idx = num_blocks
 
     def update_num_hit_blocks(self, num_cached_tokens: int) -> None:
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, self.group_states
-        ):
+        for group_config in self.config.kv_group_configs:
+            group_state = self.group_states[group_config.group_idx]
             group_state.num_hit_blocks = (
                 num_cached_tokens // group_config.offloaded_block_size
             )
@@ -292,6 +303,9 @@ class OffloadingConnectorScheduler:
 
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
+        self._group_config_by_idx = {
+            group.group_idx: group for group in self.config.kv_group_configs
+        }
         self.manager: OffloadingManager = spec.get_manager()
 
         full_attention_groups: list[int] = []
@@ -304,7 +318,7 @@ class OffloadingConnectorScheduler:
 
         # sort sliding window groups by window size in decreasing order
         def _sliding_window_sort_key(i: int) -> int:
-            val = self.config.kv_group_configs[i].sliding_window_size_in_blocks
+            val = self._group_config_by_idx[i].sliding_window_size_in_blocks
             assert val is not None
             return val
 
@@ -399,9 +413,8 @@ class OffloadingConnectorScheduler:
         return consecutive_hits if not defer_lookup else None
 
     def _touch(self, req_status: RequestOffloadState):
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, req_status.group_states
-        ):
+        for group_config in self.config.kv_group_configs:
+            group_state = req_status.group_states[group_config.group_idx]
             if group_config.sliding_window_size_in_blocks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -446,9 +459,7 @@ class OffloadingConnectorScheduler:
             groups_iter = iter(lookup_groups)
             lookup_groups = ()
             for group_idx in groups_iter:
-                group_config: GroupOffloadConfig = self.config.kv_group_configs[
-                    group_idx
-                ]
+                group_config: GroupOffloadConfig = self._group_config_by_idx[group_idx]
                 group_state: RequestGroupState = req_status.group_states[group_idx]
                 offloaded_block_size = group_config.offloaded_block_size
                 offload_keys = group_state.offload_keys
@@ -527,9 +538,8 @@ class OffloadingConnectorScheduler:
 
         # possibly delay request if any of the hit blocks is already being loaded
         if self._blocks_being_loaded:
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
-            ):
+            for group_config in self.config.kv_group_configs:
+                group_state = req_status.group_states[group_config.group_idx]
                 offloaded_block_size = group_config.offloaded_block_size
                 sliding_window_size_in_blocks = (
                     group_config.sliding_window_size_in_blocks
@@ -622,13 +632,11 @@ class OffloadingConnectorScheduler:
         keys_to_load: list[OffloadKey] = []
         dst_block_ids: list[int] = []
         # per group
-        group_sizes: list[int] = []
-        block_indices: list[int] = []
-        for group_config, group_state, group_blocks in zip(
-            self.config.kv_group_configs,
-            req_status.group_states,
-            blocks.blocks,
-        ):
+        group_sizes: list[int] = [0] * self.config.num_kv_cache_groups
+        block_indices: list[int] = [0] * self.config.num_kv_cache_groups
+        for group_config in self.config.kv_group_configs:
+            group_state = req_status.group_states[group_config.group_idx]
+            group_blocks = blocks.blocks[group_config.group_idx]
             gpu_block_size = group_config.gpu_block_size
             offloaded_block_size = group_config.offloaded_block_size
             offload_keys = group_state.offload_keys
@@ -669,8 +677,8 @@ class OffloadingConnectorScheduler:
                     num_locally_computed_gpu_blocks:num_gpu_blocks
                 ]
             )
-            group_sizes.append(num_pending_gpu_blocks)
-            block_indices.append(num_locally_computed_gpu_blocks)
+            group_sizes[group_config.group_idx] = num_pending_gpu_blocks
+            block_indices[group_config.group_idx] = num_locally_computed_gpu_blocks
 
             # Skip prefix-hit blocks for block-level policy; for
             # request-level, next_stored_block_idx stays at 0 so all
@@ -711,6 +719,26 @@ class OffloadingConnectorScheduler:
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
+
+    def _reachable_store_block_mask(
+        self,
+        group_config: GroupOffloadConfig,
+        start_block: int,
+        end_block: int,
+        reachable_boundaries: tuple[int, ...],
+    ) -> list[bool] | None:
+        """Block mask for candidate offload blocks, from the core manager."""
+        if group_config.manager_cls is None or group_config.kv_cache_spec is None:
+            return None
+        return group_config.manager_cls.reachable_block_mask(
+            start_block=start_block,
+            end_block=end_block,
+            alignment_tokens=self.config.alignment_tokens,
+            kv_cache_spec=group_config.kv_cache_spec,
+            use_eagle=False,
+            retention_interval=self.config.retention_interval,
+            reachable_boundaries=reachable_boundaries,
+        )
 
     def _build_store_jobs(
         self,
@@ -764,9 +792,13 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
-            ):
+            reachable_boundaries: tuple[int, ...] = ()
+            if self.config.retention_interval is not None:
+                reachable_boundaries = (req.num_prompt_tokens - 1,)
+                if req.shared_prefix_boundary:
+                    reachable_boundaries += (req.shared_prefix_boundary,)
+            for group_config in self.config.kv_group_configs:
+                group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
                     continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
@@ -789,25 +821,30 @@ class OffloadingConnectorScheduler:
                 ]
                 assert len(offload_keys) == len(offload_block_ids)
 
-                alignment_block_count = group_config.alignment_block_count
-                tail = group_config.sliding_window_size_in_blocks
+                # Blocks that can never serve a load hit are not stored: the
+                # group's core manager decides which blocks are reachable under
+                # the alignment and retention policy (SWA tails per segment,
+                # sparse Mamba checkpoints), so host and GPU retention agree.
+                # The mask is in KV-block coordinates.
+                block_mask = self._reachable_store_block_mask(
+                    group_config,
+                    start_block_idx * block_size_factor,
+                    num_blocks * block_size_factor,
+                    reachable_boundaries,
+                )
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
                         continue
-                    # Skip SWA blocks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing `tail` blocks are reachable by
-                    # _sliding_window_lookup. For DeepSeek V4 with 100K
-                    # tokens this reduces SWA stores by ~78%.
-                    if alignment_block_count is not None:
-                        assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
-                        pos_in_segment = abs_block_idx % alignment_block_count
-                        if pos_in_segment < alignment_block_count - tail:
-                            continue
+                    # An offloaded block is reachable if any of its GPU
+                    # blocks is reachable.
+                    if block_mask is not None and not any(
+                        block_mask[key_idx * block_size_factor + i]
+                        for i in range(block_size_factor)
+                    ):
+                        continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
@@ -829,17 +866,14 @@ class OffloadingConnectorScheduler:
 
             keys_to_store = set(store_output.keys_to_store)
 
-            group_sizes: list[int] = []
-            block_indices: list[int] = []
+            group_sizes: list[int] = [0] * self.config.num_kv_cache_groups
+            block_indices: list[int] = [0] * self.config.num_kv_cache_groups
             src_block_ids: list[int] = []
             sliding_window_block_ids: list[int] = []
             non_sliding_window_block_ids: list[int] = []
-            for group_config, group_state in zip(
-                self.config.kv_group_configs, req_status.group_states
-            ):
+            for group_config in self.config.kv_group_configs:
+                group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
-                    group_sizes.append(0)
-                    block_indices.append(0)
                     continue
                 is_sliding_window = (
                     group_config.sliding_window_size_in_blocks is not None
@@ -872,8 +906,8 @@ class OffloadingConnectorScheduler:
                         else:
                             non_sliding_window_block_ids.append(block_id)
 
-                group_sizes.append(num_group_blocks)
-                block_indices.append(start_gpu_block_idx or 0)
+                group_sizes[group_config.group_idx] = num_group_blocks
+                block_indices[group_config.group_idx] = start_gpu_block_idx or 0
                 group_state.next_stored_block_idx = num_blocks
 
             src_spec = GPULoadStoreSpec(
@@ -928,7 +962,7 @@ class OffloadingConnectorScheduler:
             return {}
 
         store_jobs: dict[int, TransferJob] = {}
-        num_groups = len(self.config.kv_group_configs)
+        num_groups = self.config.num_kv_cache_groups
         for req_id, entries in handoffs.items():
             req_status = self._req_status.get(req_id)
             if req_status is None:
@@ -950,7 +984,7 @@ class OffloadingConnectorScheduler:
                 )
 
             for group_idx, block_id, boundary_tokens in entries:
-                group_config = self.config.kv_group_configs[group_idx]
+                group_config = self._group_config_by_idx[group_idx]
                 if not group_config.requires_exact_boundary_source:
                     continue
                 if (
