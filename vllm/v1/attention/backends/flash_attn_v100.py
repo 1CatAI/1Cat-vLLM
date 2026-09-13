@@ -533,6 +533,7 @@ _logged_prefill_prefix_bfla = False
 _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
+_logged_prefill_prefix_decode_rows = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
@@ -7822,6 +7823,219 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return eligible
 
+    def _prefill_prefix_decode_rows_allowed(
+        self,
+        *,
+        causal: bool,
+        anchor_lens: torch.Tensor | None,
+        num_seqs: int,
+        query: torch.Tensor,
+        window_size: tuple[int, int],
+    ) -> bool:
+        return (
+            envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS
+            and causal
+            and anchor_lens is None
+            and num_seqs > 1
+            and self.use_flash_v100_decode
+            and self.use_flash_v100_prefill_paged
+            and not self.use_decode_paged_prefill
+            and not self.use_decode_dense_cache
+            and not self.use_decode_dense_reference
+            and window_size == (-1, -1)
+            and not _is_cuda_graph_capturing(query)
+        )
+
+    def _run_prefill_prefix_decode_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        out_view: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_size: tuple[int, int],
+    ) -> set[int]:
+        """Run the small-query rows of a mixed batch as one paged-decode batch.
+
+        Inside a chunked-prefill batch every row takes the prefill route, and
+        ``prefill_paged_fwd`` gives a small-q row one CTA per query head for
+        the whole context (kernel/fused_mha_api.cpp launches ``grid(ceil(q/BM),
+        1, B*H)``). A resident decoder at 240K pays ~58 ms per layer that way
+        versus ~1.8 ms on the partitioned decode kernel (1CatAI/1Cat-vLLM#490),
+        and an MTP/DFlash verify row (q = K+1) has the same grid. Every query
+        token of a selected row becomes one decode row whose visible KV length
+        grows by one, the expansion _flash_v100_small_query_prefill_as_decode
+        uses for the verifier, so the causal mask is preserved. Returns the row
+        indices consumed here; the caller's per-sequence loop skips them.
+        """
+        global _logged_prefill_prefix_decode_rows
+        num_seqs = len(query_start_loc) - 1
+        qsl = query_start_loc[: num_seqs + 1].tolist()
+        seq_lens_host = seq_lens[:num_seqs].tolist()
+        max_q = max(1, int(self.smallq_decode_max_query_len))
+        rows = [
+            i
+            for i in range(num_seqs)
+            if 1 <= qsl[i + 1] - qsl[i] <= max_q
+            and int(seq_lens_host[i]) > qsl[i + 1] - qsl[i]
+        ]
+        if not rows or len(rows) == num_seqs:
+            return set()
+
+        token_idx: list[int] = []
+        token_rows: list[int] = []
+        token_seq_lens: list[int] = []
+        for i in rows:
+            q_len = qsl[i + 1] - qsl[i]
+            seq_len = int(seq_lens_host[i])
+            for j in range(q_len):
+                token_idx.append(qsl[i] + j)
+                token_rows.append(i)
+                token_seq_lens.append(seq_len - q_len + 1 + j)
+        device = query.device
+        start_idx = torch.tensor(token_idx, device=device, dtype=torch.long)
+        q_rows = query.index_select(0, start_idx)
+        out_rows = torch.empty_like(q_rows)
+        block_table = attn_metadata.block_table.index_select(
+            0, torch.tensor(token_rows, device=device, dtype=torch.long)
+        )
+        seq_lens_rows = torch.tensor(
+            token_seq_lens, device=device, dtype=attn_metadata.seq_lens.dtype
+        )
+        max_seq_len_hint = max(token_seq_lens)
+        max_query_len_rows = max(qsl[i + 1] - qsl[i] for i in rows)
+
+        num_kv_heads = int(key_cache.shape[2])
+        q_per_kv = (
+            int(q_rows.shape[1]) // num_kv_heads
+            if num_kv_heads > 0 and int(q_rows.shape[1]) % num_kv_heads == 0
+            else 0
+        )
+        fp16_kv = (
+            self.kv_cache_dtype in ("auto", "float16", "bfloat16")
+            and key_cache.dtype == torch.float16
+            and value_cache.dtype == torch.float16
+        )
+        fp8_e5m2_kv = (
+            self.kv_cache_dtype == "fp8_e5m2"
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+        )
+        fp8_e4m3_kv = (
+            self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+            # The E4M3 XQA wave route retains half partials; a DFlash2 target
+            # keeps the FP32 state policy of the scalar route.
+            and not getattr(attn_metadata, "is_dflash_selector_target", False)
+        )
+        # Same selection as the uniform-decode path (_flash_v100_decode), with
+        # the sequence hint taken from this batch's rows because build() only
+        # attaches decode shape hints when max_query_len == 1.
+        use_xqa = (
+            self.use_decode_xqa
+            and self.flash_attn_decode_paged_xqa is not None
+            and (fp16_kv or fp8_e5m2_kv or fp8_e4m3_kv)
+            and int(q_rows.shape[2]) == 256
+            and (
+                q_per_kv in (6, 8)
+                or (q_per_kv == 4 and max_seq_len_hint >= _decode_xqa_q4_min_seq_len())
+            )
+            and (
+                not fp8_e4m3_kv
+                or (
+                    q_per_kv == 6
+                    and (q_rows.shape[0] == 1 or _e4m3_batch_xqa_allowed(q_rows))
+                )
+            )
+            and (
+                not fp8_e5m2_kv
+                or (q_per_kv != 4 and max_seq_len_hint >= _decode_fp8_xqa_min_seq_len())
+            )
+        )
+        partition_size_hint = (
+            _g6_aligned_page_partition_size_hint(
+                q_rows, key_cache, value_cache, self.kv_cache_dtype
+            )
+            if use_xqa
+            else None
+        )
+        k_scale = float(layer._k_scale_float)
+        v_scale = float(layer._v_scale_float)
+        if use_xqa:
+            route = "prefill_prefix_decode_rows_xqa"
+
+            def run() -> torch.Tensor:
+                self.flash_attn_decode_paged_xqa(
+                    q_rows,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seq_lens_rows,
+                    softmax_scale=self.scale,
+                    out=out_rows,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    window_size=window_size,
+                    max_seq_len_hint=max_seq_len_hint,
+                    partition_size_hint=partition_size_hint,
+                )
+                return out_rows
+
+        else:
+            route = "prefill_prefix_decode_rows_scalar"
+
+            def run() -> torch.Tensor:
+                self._call_flash_attn_decode_paged(
+                    q_rows,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seq_lens_rows,
+                    softmax_scale=self.scale,
+                    out=out_rows,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    window_size=window_size,
+                    max_seq_len_hint=max_seq_len_hint,
+                )
+                return out_rows
+
+        if not _logged_prefill_prefix_decode_rows:
+            logger.info(
+                "FLASH_ATTN_V100 mixed-batch small-query rows take the paged "
+                "decode route (%s, rows=%d of %d, max_q=%d, max_seq_len=%d).",
+                route,
+                len(rows),
+                num_seqs,
+                max_query_len_rows,
+                max_seq_len_hint,
+            )
+            _logged_prefill_prefix_decode_rows = True
+        self._run_prefill_paged_call(
+            route=route,
+            q_len=max_query_len_rows,
+            seq_len=max_seq_len_hint,
+            heads_q=int(q_rows.shape[1]),
+            heads_kv=num_kv_heads,
+            head_dim=int(q_rows.shape[2]),
+            block_size=int(key_cache.shape[1]),
+            fn=run,
+        )
+        _log_fp8_kv_cache_route(
+            "decode",
+            self.kv_cache_dtype,
+            "xqa_paged" if use_xqa else "scalar_paged",
+        )
+        _record_route(route)
+        out_view.index_copy_(0, start_idx, out_rows)
+        return set(rows)
+
     def _run_prefill_paged_call(
         self,
         *,
@@ -7981,7 +8195,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 seq_lens,
             )
 
+        decode_rows: set[int] = set()
+        if self._prefill_prefix_decode_rows_allowed(
+            causal=causal,
+            anchor_lens=anchor_lens,
+            num_seqs=num_seqs,
+            query=query,
+            window_size=window_size,
+        ):
+            decode_rows = self._run_prefill_prefix_decode_rows(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out_view,
+                query_start_loc,
+                seq_lens,
+                window_size,
+            )
+
         for i in range(num_seqs):
+            if i in decode_rows:
+                continue
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
             if end <= start:

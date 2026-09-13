@@ -2529,7 +2529,8 @@ flash_attention_forward_paged_d256_bm32_phase_body(
     const __half* __restrict__ V_cache, __half* __restrict__ Out,
     float* __restrict__ softmax_lse, const int* __restrict__ block_table,
     const int* __restrict__ seqused_k, int H, int M, int max_num_blocks_per_seq,
-    int num_kv_heads, int64_t k_block_stride, int64_t k_token_stride,
+    int page_block_size, int num_kv_heads, int64_t k_block_stride,
+    int64_t k_token_stride,
     int64_t k_head_stride, int64_t v_block_stride, int64_t v_token_stride,
     int64_t v_head_stride, float softmax_scale,
     float* __restrict__ split_tmp_out, float* __restrict__ split_tmp_row_max,
@@ -2607,14 +2608,12 @@ flash_attention_forward_paged_d256_bm32_phase_body(
       const int token_offset = tid * D256_BM32_PHASE_PAGE_SIZE;
       if (token_offset < valid_k_rows) {
         const int global_token_idx = start_col + token_offset;
-        const int virtual_block_idx =
-            global_token_idx / D256_BM32_PHASE_PAGE_BLOCK_SIZE;
+        const int virtual_block_idx = global_token_idx / page_block_size;
         shared.page_idx[tid] =
             __ldg(&block_table[shared.batch_id * max_num_blocks_per_seq +
                                virtual_block_idx]);
         shared.page_offset[tid] =
-            global_token_idx -
-            virtual_block_idx * D256_BM32_PHASE_PAGE_BLOCK_SIZE;
+            global_token_idx - virtual_block_idx * page_block_size;
         shared.k_tile_ptr[tid] = reinterpret_cast<uint64_t>(
             K_cache + (int64_t)shared.page_idx[tid] * k_block_stride +
             (int64_t)shared.page_offset[tid] * k_token_stride +
@@ -2933,15 +2932,16 @@ __launch_bounds__(D256_BM32_PHASE_THREADS, 2) void flash_attention_forward_paged
     const __half* __restrict__ V_cache, __half* __restrict__ Out,
     float* __restrict__ softmax_lse, const int* __restrict__ block_table,
     const int* __restrict__ seqused_k, int H, int M, int max_num_blocks_per_seq,
-    int num_kv_heads, int64_t k_block_stride, int64_t k_token_stride,
+    int page_block_size, int num_kv_heads, int64_t k_block_stride,
+    int64_t k_token_stride,
     int64_t k_head_stride, int64_t v_block_stride, int64_t v_token_stride,
     int64_t v_head_stride, float softmax_scale) {
   flash_attention_forward_paged_d256_bm32_phase_body<IS_CAUSAL, ALL_P,
                                                      PAIR_SCRATCH, false>(
       Q, K_cache, V_cache, Out, softmax_lse, block_table, seqused_k, H, M,
-      max_num_blocks_per_seq, num_kv_heads, k_block_stride, k_token_stride,
-      k_head_stride, v_block_stride, v_token_stride, v_head_stride,
-      softmax_scale, nullptr, nullptr, nullptr, 0);
+      max_num_blocks_per_seq, page_block_size, num_kv_heads, k_block_stride,
+      k_token_stride, k_head_stride, v_block_stride, v_token_stride,
+      v_head_stride, softmax_scale, nullptr, nullptr, nullptr, 0);
 }
 
 template <bool CHECK_SPLIT_EMPTY>
@@ -2949,8 +2949,9 @@ __global__
 __launch_bounds__(D256_BM32_PHASE_THREADS, 2) void flash_attention_forward_paged_d256_bm32_splitkv3_partial_kernel(
     const __half* __restrict__ Q, const __half* __restrict__ K_cache,
     const __half* __restrict__ V_cache, const int* __restrict__ block_table,
-    int H, int M, int actual_n, int max_num_blocks_per_seq, int num_kv_heads,
-    int64_t k_block_stride, int64_t k_token_stride, int64_t k_head_stride,
+    int H, int M, int actual_n, int max_num_blocks_per_seq, int page_block_size,
+    int num_kv_heads, int64_t k_block_stride, int64_t k_token_stride,
+    int64_t k_head_stride,
     int64_t v_block_stride, int64_t v_token_stride, int64_t v_head_stride,
     float softmax_scale, float* __restrict__ split_tmp_out,
     float* __restrict__ split_tmp_row_max,
@@ -2958,10 +2959,10 @@ __launch_bounds__(D256_BM32_PHASE_THREADS, 2) void flash_attention_forward_paged
   flash_attention_forward_paged_d256_bm32_phase_body<true, true, true, true,
                                                      CHECK_SPLIT_EMPTY>(
       Q, K_cache, V_cache, nullptr, nullptr, block_table, nullptr, H, M,
-      max_num_blocks_per_seq, num_kv_heads, k_block_stride, k_token_stride,
-      k_head_stride, v_block_stride, v_token_stride, v_head_stride,
-      softmax_scale, split_tmp_out, split_tmp_row_max, split_tmp_row_sum,
-      actual_n);
+      max_num_blocks_per_seq, page_block_size, num_kv_heads, k_block_stride,
+      k_token_stride, k_head_stride, v_block_stride, v_token_stride,
+      v_head_stride, softmax_scale, split_tmp_out, split_tmp_row_max,
+      split_tmp_row_sum, actual_n);
 }
 
 template <bool IS_CAUSAL, bool ALL_P, bool PAIR_SCRATCH>
@@ -2991,9 +2992,10 @@ void launch_flash_attention_forward_paged_d256_bm32_phase_kernel(
           reinterpret_cast<const __half*>(V_cache.data_ptr()),
           reinterpret_cast<__half*>(Out.data_ptr()),
           softmax_lse.data_ptr<float>(), block_table.data_ptr<int>(),
-          seq_lens.data_ptr<int>(), H, M, max_num_blocks_per_seq, num_kv_heads,
-          k_block_stride, k_token_stride, k_head_stride, v_block_stride,
-          v_token_stride, v_head_stride, softmax_scale);
+          seq_lens.data_ptr<int>(), H, M, max_num_blocks_per_seq,
+          static_cast<int>(K_cache.size(1)), num_kv_heads, k_block_stride,
+          k_token_stride, k_head_stride, v_block_stride, v_token_stride,
+          v_head_stride, softmax_scale);
 }
 
 __global__
@@ -3086,7 +3088,8 @@ void launch_flash_attention_forward_paged_d256_bm32_splitkv3_kernel(
             reinterpret_cast<const __half*>(K_cache.data_ptr()),
             reinterpret_cast<const __half*>(V_cache.data_ptr()),
             block_table.data_ptr<int>(), H, M, actual_n, max_num_blocks_per_seq,
-            num_kv_heads, k_block_stride, k_token_stride, k_head_stride,
+            static_cast<int>(K_cache.size(1)), num_kv_heads, k_block_stride,
+            k_token_stride, k_head_stride,
             v_block_stride, v_token_stride, v_head_stride, softmax_scale,
             split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
@@ -3098,7 +3101,8 @@ void launch_flash_attention_forward_paged_d256_bm32_splitkv3_kernel(
             reinterpret_cast<const __half*>(K_cache.data_ptr()),
             reinterpret_cast<const __half*>(V_cache.data_ptr()),
             block_table.data_ptr<int>(), H, M, actual_n, max_num_blocks_per_seq,
-            num_kv_heads, k_block_stride, k_token_stride, k_head_stride,
+            static_cast<int>(K_cache.size(1)), num_kv_heads, k_block_stride,
+            k_token_stride, k_head_stride,
             v_block_stride, v_token_stride, v_head_stride, softmax_scale,
             split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
@@ -3210,7 +3214,10 @@ void launcher_flash_attention_forward_paged(
     if (use_low_smem) {
       const bool use_d256_bm32_phase =
           env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE") &&
-          page_block_size == D256_BM32_PHASE_PAGE_BLOCK_SIZE &&
+          (page_block_size == D256_BM32_PHASE_PAGE_BLOCK_SIZE ||
+           (page_block_size % D256_BM32_PHASE_PAGE_SIZE == 0 &&
+            env_flag_enabled(
+                "VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE"))) &&
           M >= D256_BM32_PHASE_BLOCK_M && bfla_mask_ptr == nullptr &&
           window_size_left < 0 && window_size_right < 0;
       if (use_d256_bm32_phase) {
