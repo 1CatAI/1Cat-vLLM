@@ -1297,6 +1297,10 @@ class FusedMoEConfig:
     # cannot silently select one and drop the clamp.
     swiglu_limit: float | None = None
 
+    # Backported field (upstream FusedMoEConfig) required by the ported
+    # RoutedExperts layer; always False on this fork (no ROCm aiter).
+    rocm_aiter_fmoe_enabled: bool = False
+
     def __post_init__(self):
         if self.dp_size > 1:
             logger.debug_once(
