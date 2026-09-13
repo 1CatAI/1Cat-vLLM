@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -46,6 +47,8 @@ class KVCacheCoordinator(ABC):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.retention_interval: int | None = None
+        self.shared_prefix_boundary = 0
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -76,6 +79,61 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+    def configure_prefix_cache_retention(self, interval: int | None) -> None:
+        """Validate after 1Cat has resolved the heterogeneous cache geometry."""
+        self.retention_interval = interval
+        if interval is None or not self.enable_caching:
+            return
+        mamba = [m for m in self.single_type_managers if isinstance(m, MambaManager)]
+        if not mamba:
+            if interval == 0:
+                return
+            raise ValueError(
+                "prefix_cache_retention_interval requires a Mamba cache group "
+                "in this backport"
+            )
+        alignment = getattr(self, "lcm_block_size", mamba[0].block_size)
+        if interval < 0 or interval % alignment:
+            raise ValueError(
+                f"prefix_cache_retention_interval ({interval}) must be a non-negative "
+                f"multiple of the resolved alignment ({alignment})"
+            )
+
+    def get_replay_boundaries(
+        self, request: Request, alignment: int
+    ) -> tuple[int, ...]:
+        """Retain both identical resend and longer-sibling resume positions.
+
+        Adapted from upstream #53945/#54713. Use the current request length so
+        resumed output-token prefills follow 1Cat's existing scheduler behavior.
+        """
+        if not self.eagle_group_ids:
+            return (request.num_tokens - 1,)
+        resend = (request.num_tokens - 1) // alignment * alignment
+        extension = request.num_tokens // alignment * alignment
+        return tuple(
+            sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
+        )
+
+    def _cache_manager_blocks(
+        self,
+        manager: SingleTypeKVCacheManager,
+        request: Request,
+        num_tokens: int,
+        alignment: int | None = None,
+    ) -> None:
+        if isinstance(manager, MambaManager):
+            alignment = alignment or manager.block_size
+            manager.cache_blocks(
+                request,
+                num_tokens,
+                alignment_tokens=alignment,
+                retention_interval=self.retention_interval,
+                replay_boundaries=self.get_replay_boundaries(request, alignment),
+            )
+        else:
+            manager.cache_blocks(request, num_tokens, alignment_tokens=alignment)
 
     def get_num_blocks_to_allocate(
         self,
@@ -206,7 +264,7 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
         """
         for manager in self.single_type_managers:
-            manager.cache_blocks(request, num_computed_tokens)
+            self._cache_manager_blocks(manager, request, num_computed_tokens)
 
     def free(self, request_id: str) -> None:
         """
@@ -514,10 +572,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             num_computed_tokens // self.lcm_block_size * self.lcm_block_size
         )
         for manager in self.single_type_managers:
-            manager.cache_blocks(
-                request,
-                num_computed_tokens,
-                alignment_tokens=self.lcm_block_size,
+            self._cache_manager_blocks(
+                manager, request, num_computed_tokens, self.lcm_block_size
             )
 
     def find_longest_cache_hit(
@@ -550,6 +606,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
 
+        self.shared_prefix_boundary = 0
+        longest_hit_length = 0
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
@@ -599,6 +657,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     alignment_tokens=self.lcm_block_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
+                longest_hit_length = max(longest_hit_length, _new_hit_length)
                 if use_eagle:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -613,6 +672,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hit_length = curr_hit_length
             if is_simple_hybrid:
                 break
+
+        if longest_hit_length > hit_length:
+            self.shared_prefix_boundary = longest_hit_length
 
         # Truncate full attention blocks to final hit_length (if present)
         spec, group_ids, _ = self.attention_groups[0]

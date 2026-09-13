@@ -428,9 +428,20 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        freed_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        if self.enable_caching:
+            # Uncached scratch has no reusable prefix to evict. Recycle it
+            # before consuming the queue's older cached entries.
+            self.free_block_queue.prepend_n(
+                [block for block in freed_blocks if block.block_hash is None]
+            )
+            self.free_block_queue.append_n(
+                [block for block in freed_blocks if block.block_hash is not None]
+            )
+        else:
+            self.free_block_queue.append_n(freed_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
