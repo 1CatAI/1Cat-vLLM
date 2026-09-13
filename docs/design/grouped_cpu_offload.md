@@ -78,8 +78,29 @@ prompts at their final boundary with identical token IDs, partial prefixes
 rounded down to the stride, and three distinct 60K-64K contexts restored from
 RAM, while dense retention thrashed the 107-slot pools. Evidence:
 `/mnt/llm_hfs/builds/qsa-stride-validation-20260912`. The retention port
-replaces the stride with the upstream policy; its own V100 validation is
-recorded below when available.
+replaces the stride with the upstream policy; its V100 validation follows.
+
+### V100 validation of the retention port (default policy)
+
+Flash-Next AWQ, TP4, FP16 KV, CUDA Graphs, 16 GiB CPU budget, 1.19 GiB GPU
+KV per rank, `--prefix-cache-retention-interval 0`, production image
+`b8aa829785` with the 18 branch Python files overlaid and hash-verified at
+start (the branch was merged with 1CatAI `main` first; none of the upstream
+commits touch these files). GPU prefix state was reset before every restore,
+so hits below are external, and output token IDs were compared with the cold
+run of the same prompt.
+
+| mode | scenario | result |
+|---|---|---|
+| MTP0 | 64K cold, 20K pressure, restore, rehit | 63,504 external tokens (the replay boundary); IDs identical |
+| MTP0 | junction: A stored, B shares 39,983 tokens with A while A is still on the GPU, GPU reset, C (not offloaded) shares the same prefix | B had no complete hit and materialized the junction state; C restored 39,200 tokens = 50 blocks from RAM via B's junction state; IDs identical to its cold run |
+| MTP0 | four distinct 64K contexts stored, then each restored | 63,504 external tokens for all four |
+| MTP3 | 64K cold, pressure, restore, rehit | 62,400 external tokens = 78 x 800-token blocks, the MTP-shifted replay boundary; drafted/accepted nonzero; IDs identical |
+| MTP3 | four distinct 60K contexts stored, then each restored | 58,400 external tokens for all four |
+
+Pool geometry under the default policy: MTP0 390 token slots and 10 state
+slots per Mamba group (3.99 GiB pinned per rank), MTP3 352 token slots and 10 state slots (800-token blocks from its speculative padding). Each 64K request stored one Mamba state per group instead of 84, and restores of 60K-64K took about 1.1-1.4 s against 27-35 s cold.
+Evidence: `/mnt/llm_hfs/builds/qsa-retention-validation-20260913`.
 
 ## Public interface boundary
 
