@@ -2942,3 +2942,83 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
 
     assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
+
+
+@pytest.mark.parametrize("hash_size", [4, 8])
+@pytest.mark.parametrize("start", [0, 2])
+@pytest.mark.parametrize("null_indices", [set(), {1, 3}])
+@pytest.mark.parametrize(
+    "mask", [None, [False] * 6, [True, False, True, True, False, True]]
+)
+def test_sparse_store_events_preserve_logical_ranges(
+    hash_size, start, null_indices, mask
+):
+    block_size = 8
+    pool = BlockPool(20, True, hash_size, enable_kv_cache_events=True)
+    lora = LoRARequest("adapter", 7, "/unused")
+    req = make_request(
+        "sparse_events",
+        list(range(48)),
+        hash_size,
+        sha256,
+        mm_positions=[
+            PlaceholderRange(offset=9, length=4),
+            PlaceholderRange(offset=23, length=12),
+        ],
+        mm_hashes=["first-image", "second-image"],
+        cache_salt="event-salt",
+        lora_request=lora,
+    )
+    blocks = [
+        pool.null_block if i in null_indices else pool.get_new_blocks(1)[0]
+        for i in range(6)
+    ]
+    pool.cache_full_blocks(
+        req,
+        blocks,
+        start,
+        6,
+        block_size,
+        3,
+        block_mask=None if mask is None else mask[start:],
+    )
+    events = pool.take_events()
+    expected_indices = [
+        i
+        for i in range(start, 6)
+        if i not in null_indices and (mask is None or mask[i])
+    ]
+    logical_hashes = kv_cache_utils.BlockHashListWithBlockSize(
+        req.block_hashes, hash_size, block_size
+    )
+    actual_indices = []
+    for event in events:
+        assert isinstance(event, BlockStored)
+        assert event.block_hashes
+        assert len(event.token_ids) == block_size * len(event.block_hashes)
+        first = event.token_ids[0] // block_size
+        indices = list(range(first, first + len(event.block_hashes)))
+        actual_indices.extend(indices)
+        assert (
+            event.token_ids
+            == req.all_token_ids[first * block_size : (indices[-1] + 1) * block_size]
+        )
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(logical_hashes[i]) for i in indices
+        ]
+        assert event.parent_block_hash == (
+            kv_cache_utils.maybe_convert_block_hash(logical_hashes[first - 1])
+            if first
+            else None
+        )
+        assert event.extra_keys == [
+            kv_cache_utils.generate_block_hash_extra_keys(
+                req, i * block_size, (i + 1) * block_size, 0
+            )[0]
+            for i in indices
+        ]
+        assert event.group_idx == 3
+        assert event.lora_id == 7 and event.lora_name == "adapter"
+    assert actual_indices == expected_indices
+    # Dense runs remain batched; only logical gaps create new events.
+    assert len(events) == sum(i - 1 not in expected_indices for i in expected_indices)

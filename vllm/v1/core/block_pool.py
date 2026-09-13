@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from itertools import groupby
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -17,7 +18,6 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
-    ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
     generate_block_hash_extra_keys,
@@ -261,7 +261,7 @@ class BlockPool:
             )
 
         new_block_hashes = block_hashes[num_cached_blocks:]
-        new_hashes: list[ExternalBlockHash] | None = (
+        event_block_indices: list[int] | None = (
             [] if self.enable_kv_cache_events else None
         )
         for i, blk in enumerate(new_full_blocks):
@@ -279,56 +279,55 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
-            if new_hashes is not None:
-                new_hashes.append(maybe_convert_block_hash(block_hash))
+            if event_block_indices is not None:
+                event_block_indices.append(num_cached_blocks + i)
 
-        if self.enable_kv_cache_events:
-            if num_cached_blocks == 0:
-                parent_block_hash: ExternalBlockHash | None = None
-            else:
-                parent_block_hash = maybe_convert_block_hash(
-                    block_hashes[num_cached_blocks - 1]
-                )
-
-            # Calculate token range for the blocks being cached
-            start_token_idx = num_cached_blocks * block_size
-            end_token_idx = num_full_blocks * block_size
-
-            # Generate extra keys for each block individually.
-            # Each block may have different extra_keys (e.g., different MM
-            # features, or cache_salt only for the first block).
-            # Skip null/masked-out blocks to match the length of new_hashes.
-            extra_keys_list: list[tuple[Any, ...] | None] = []
+        if event_block_indices:
+            # A BlockStored describes one contiguous logical token range. Sparse
+            # retention/null blocks can leave gaps; each run needs its own tokens
+            # and logical parent hash, including when that parent is not resident.
             curr_mm_idx = 0
-            for i in range(num_cached_blocks, num_full_blocks):
-                if blocks[i].is_null:
-                    continue
-                if block_mask is not None and not block_mask[i - num_cached_blocks]:
-                    continue
-                block_start = i * block_size
-                block_end = block_start + block_size
-                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                    request, block_start, block_end, curr_mm_idx
+            for _, run in groupby(
+                enumerate(event_block_indices), lambda item: item[1] - item[0]
+            ):
+                indices = [block_idx for _, block_idx in run]
+                start, end = indices[0], indices[-1] + 1
+                parent_block_hash = (
+                    maybe_convert_block_hash(block_hashes[start - 1])
+                    if start > 0
+                    else None
                 )
-                extra_keys_list.append(extra_keys)
+                extra_keys_list: list[tuple[Any, ...] | None] = []
+                for block_idx in indices:
+                    extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                        request,
+                        block_idx * block_size,
+                        (block_idx + 1) * block_size,
+                        curr_mm_idx,
+                    )
+                    extra_keys_list.append(extra_keys)
 
-            self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=new_hashes,
-                    parent_block_hash=parent_block_hash,
-                    token_ids=request.all_token_ids[start_token_idx:end_token_idx],
-                    block_size=block_size,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
-                    medium=MEDIUM_GPU,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
-                    extra_keys=extra_keys_list if extra_keys_list else None,
-                    group_idx=kv_cache_group_id,
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[
+                            maybe_convert_block_hash(block_hashes[i]) for i in indices
+                        ],
+                        parent_block_hash=parent_block_hash,
+                        token_ids=request.all_token_ids[
+                            start * block_size : end * block_size
+                        ],
+                        block_size=block_size,
+                        lora_id=request.lora_request.adapter_id
+                        if request.lora_request
+                        else None,
+                        medium=MEDIUM_GPU,
+                        lora_name=request.lora_request.name
+                        if request.lora_request
+                        else None,
+                        extra_keys=extra_keys_list,
+                        group_idx=kv_cache_group_id,
+                    )
                 )
-            )
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.

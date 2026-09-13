@@ -109,7 +109,10 @@ class KVCacheCoordinator(ABC):
         resumed output-token prefills follow 1Cat's existing scheduler behavior.
         """
         if not self.eagle_group_ids:
-            return (request.num_tokens - 1,)
+            # At an exact boundary, retain the completed extension block now.
+            # Once the cache horizon advances, the next decode token cannot
+            # retroactively admit it. The preceding boundary serves a resend.
+            return (request.num_tokens - 1, request.num_tokens)
         resend = (request.num_tokens - 1) // alignment * alignment
         extension = request.num_tokens // alignment * alignment
         return tuple(

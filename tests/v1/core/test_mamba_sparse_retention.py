@@ -235,7 +235,7 @@ def test_hybrid_identical_resend_and_longer_sibling(length, eagle, interval):
     sibling = _request("same", length + 64)
     _, extension = cm.get_computed_blocks(sibling)
     assert resend == max(0, (length - 1) // 32 - int(eagle)) * 32
-    assert extension == (max(0, length // 32 - 1) if eagle else (length - 1) // 32) * 32
+    assert extension == max(0, length // 32 - int(eagle)) * 32
     assert cm.block_pool.get_num_free_blocks() == 999
 
 
@@ -294,3 +294,61 @@ def test_mixed_main_and_draft_groups_retain_joint_restore_point(eagle_groups, le
     assert hit == max(0, (length - 1) // 32 - 1) * 32
     _, extension = cm.get_computed_blocks(_request("mixed", length + 64))
     assert extension == max(0, length // 32 - 1) * 32
+
+
+@pytest.mark.parametrize("block_size", [32, 800])
+@pytest.mark.parametrize("interval_blocks", [0, 5])
+@pytest.mark.parametrize("decode_extra", [0, 1, 2])
+def test_non_eagle_decode_preserves_new_completed_boundary(
+    block_size, interval_blocks, decode_extra
+):
+    cm = _cache_manager(
+        block_size=block_size, interval=interval_blocks * block_size, eagle=False
+    )
+    request = _request("growing", 2 * block_size + 1)
+
+    def step(start, end):
+        for manager in cm.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start)
+            manager.allocate_new_blocks(request.request_id, end, end)
+        cm.coordinator.cache_blocks(request, end)
+
+    for start in range(0, request.num_tokens, block_size):
+        step(start, min(start + block_size, request.num_tokens))
+    final_length = 4 * block_size + decode_extra
+    for length in range(request.num_tokens + 1, final_length + 1):
+        request.num_tokens = length
+        request.block_hashes = _request("growing", length).block_hashes
+        step(length - 1, length)
+    cm.coordinator.free(request.request_id)
+    _, hit = cm.get_computed_blocks(_request("growing", final_length + block_size))
+    assert hit == 4 * block_size
+    assert cm.block_pool.get_num_free_blocks() == 999
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+def test_sparse_mamba_publishes_only_retained_state_tokens(eagle):
+    config = _cache_manager().coordinator.kv_cache_config
+    cm = KVCacheManager(
+        config,
+        100000,
+        8,
+        use_eagle=eagle,
+        prefix_cache_retention_interval=0,
+        enable_kv_cache_events=True,
+    )
+    request = _request("events", 97)
+    request.all_token_ids = list(range(97))
+    request.lora_request = None
+    request.mm_features = []
+    request.cache_salt = None
+    request.prompt_embeds = None
+    _coordinated_prefill(cm, request)
+    events = [
+        e for e in cm.block_pool.take_events() if getattr(e, "group_idx", None) == 1
+    ]
+    boundary = 64 if eagle else 96
+    assert len(events) == 1
+    assert len(events[0].block_hashes) == 1
+    assert events[0].token_ids == list(range(boundary - 32, boundary))
