@@ -24,7 +24,7 @@ from vllm.v1.kv_offload.cpu.manager import (
     CPUOffloadingManager,
     GroupedCPUOffloadingManager,
 )
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, mamba_state_slots
 
 CTX = ReqContext("test")
 GROUPS = (0, 2, 3, 4, 5)
@@ -143,12 +143,22 @@ def test_group_views_preserve_gpu_aliases_but_separate_cpu_indices():
         partition_kv_caches(caches, {0: 31, 2: 32}, 2)
 
 
-@pytest.mark.parametrize("layout", ["equal", "scheduler", "mixed", "attention_only"])
-def test_actual_flash_next_group_budget(monkeypatch, layout):
+FLASH_NEXT_PAGES = {
+    0: 10235904,
+    2: 9633792,
+    3: 9633792,
+    4: 9633792,
+    5: 802816,
+}
+
+
+def _flash_next_spec(
+    monkeypatch, layout="equal", retention_interval=None, **extra_config
+):
     def init(self, config, caches):
         self.vllm_config = config
         self.kv_cache_config = caches
-        self.extra_config = {"cpu_bytes_to_use": 16 * 1024**3}
+        self.extra_config = {"cpu_bytes_to_use": 16 * 1024**3, **extra_config}
         self.block_size_factor = 1
 
     monkeypatch.setattr(OffloadingSpec, "__init__", init)
@@ -195,28 +205,107 @@ def test_actual_flash_next_group_budget(monkeypatch, layout):
         groups[2] = group(replace(mamba, block_size=392), 12)
     elif layout == "attention_only":
         groups = [group(uniform, 24), group(uniform, 24)]
-    spec = CPUOffloadingSpec(
-        SimpleNamespace(parallel_config=SimpleNamespace(world_size=4)),
+    return CPUOffloadingSpec(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=4),
+            model_config=SimpleNamespace(max_model_len=65536),
+            cache_config=SimpleNamespace(
+                prefix_cache_retention_interval=retention_interval
+            ),
+        ),
         SimpleNamespace(
             kv_cache_groups=groups,
             num_blocks=104,
             kv_cache_tensors=tensors,
         ),
     )
+
+
+@pytest.mark.parametrize("layout", ["equal", "scheduler", "mixed", "attention_only"])
+def test_actual_flash_next_group_budget(monkeypatch, layout):
+    spec = _flash_next_spec(monkeypatch, layout)
     if layout not in ("equal", "scheduler"):
         assert not spec.partition_by_group
         assert spec.num_blocks == 419
+        assert spec.cpu_group_num_blocks == {}
         return
-    assert spec.cpu_group_page_sizes == {
-        0: 10235904,
-        2: 9633792,
-        3: 9633792,
-        4: 9633792,
-        5: 802816,
-    }
+    assert spec.cpu_group_page_sizes == FLASH_NEXT_PAGES
+    # Dense retention (None): one state slot per token slot, 107 each.
     assert spec.num_blocks == 107
+    assert spec.retention_interval is None
+    assert spec.cpu_group_num_blocks == dict.fromkeys(FLASH_NEXT_PAGES, 107)
     assert spec.cpu_page_size_per_worker * 4 * spec.num_blocks <= 16 * 1024**3
     assert spec.num_blocks >= 2 * 48
+
+
+def _grouped_bytes(spec):
+    return 4 * sum(
+        spec.cpu_group_page_sizes[g] * n for g, n in spec.cpu_group_num_blocks.items()
+    )
+
+
+def test_flash_next_semantic_retention_budget(monkeypatch):
+    # retention 0 keeps only the replay boundary (+ one junction allowance)
+    # per request. Sized for 64K requests (84 blocks): 2 states per request.
+    spec = _flash_next_spec(monkeypatch, retention_interval=0)
+    assert spec.partition_by_group
+    assert spec.retention_interval == 0
+    assert spec.state_slots_reference_tokens == 65536
+    token_slots = spec.num_blocks
+    requests = -(-token_slots // 84)
+    state_slots = requests * 2
+    assert spec.cpu_group_num_blocks == {
+        0: token_slots,
+        2: state_slots,
+        3: state_slots,
+        4: state_slots,
+        5: state_slots,
+    }
+    # Nearly the whole 16 GiB now buys token pages: > 3.5x the dense layout.
+    assert token_slots >= 380
+    assert _grouped_bytes(spec) <= 16 * 1024**3
+    spec.cpu_group_num_blocks[0] += 1
+    assert _grouped_bytes(spec) > 16 * 1024**3
+
+
+def test_flash_next_periodic_retention_budget(monkeypatch):
+    # retention 8 blocks: periodic states every 8 blocks plus replay/junction.
+    spec = _flash_next_spec(monkeypatch, retention_interval=8 * 784)
+    token_slots = spec.num_blocks
+    # 84-block reference request: boundaries at blocks 8,16,...,80 (10),
+    # the replay boundary at block 81 (index 80 already counted? no: replay
+    # boundary 65535 -> block 83 -> index 82) plus the junction allowance.
+    per_request = mamba_state_slots(
+        84,
+        784,
+        784,
+        spec.kv_cache_config.kv_cache_groups[2].kv_cache_spec,
+        8 * 784,
+        65536,
+    )
+    assert per_request == 10 + 1 + 1
+    assert spec.cpu_group_num_blocks[2] == min(
+        token_slots, -(-token_slots // 84) * per_request
+    )
+    assert token_slots > 107
+    assert _grouped_bytes(spec) <= 16 * 1024**3
+
+
+def test_state_slots_follow_reference_length(monkeypatch):
+    # A shorter sizing reference reserves more state slots per token slot.
+    long = _flash_next_spec(monkeypatch, retention_interval=0)
+    short = _flash_next_spec(
+        monkeypatch,
+        retention_interval=0,
+        mamba_state_slots_reference_tokens=8 * 784,
+    )
+    assert short.cpu_group_num_blocks[2] > long.cpu_group_num_blocks[2]
+    assert short.num_blocks < long.num_blocks
+    assert _grouped_bytes(short) <= 16 * 1024**3
+    with pytest.raises(ValueError, match="reference_tokens"):
+        _flash_next_spec(
+            monkeypatch, retention_interval=0, mamba_state_slots_reference_tokens=0
+        )
 
 
 def test_private_cpu_allocations_obey_group_budget(monkeypatch):
@@ -246,6 +335,31 @@ def test_private_cpu_allocations_obey_group_budget(monkeypatch):
     assert torch.all(cpu[1][0] == 3)
     assert torch.all(cpu[0][1] == 0)
     assert handlers.cpu_to_gpu_handler.cpu_tensors is cpu
+
+
+def test_private_cpu_allocations_use_group_slot_counts(monkeypatch):
+    import vllm.v1.kv_offload.cpu.gpu_worker as worker
+
+    monkeypatch.setattr(worker, "is_pin_memory_available", lambda: False)
+    monkeypatch.setattr(
+        worker, "SingleDirectionOffloadingHandler", lambda **kw: SimpleNamespace(**kw)
+    )
+    tensor = CanonicalKVCacheTensor(torch.zeros((4, 16), dtype=torch.int8), 16)
+    caches = CanonicalKVCaches(
+        [tensor],
+        [[CanonicalKVCacheRef(0, 16)], [], [CanonicalKVCacheRef(0, 8)]],
+    )
+    handlers = worker.CpuGpuOffloadingHandlers(
+        caches,
+        2,
+        4,
+        group_page_sizes={0: 32, 2: 32},
+        group_num_blocks={0: 4, 2: 1},
+    )
+    cpu = handlers.gpu_to_cpu_handler.cpu_tensors
+    assert [t.shape for t in cpu] == [(4, 32), (1, 32)]
+    with pytest.raises(AssertionError):
+        worker.CpuGpuOffloadingHandlers(caches, 2, 4, group_num_blocks={0: 4})
 
 
 def test_grouped_worker_views_share_scheduler_rows(monkeypatch):

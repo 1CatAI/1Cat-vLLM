@@ -5,6 +5,64 @@ avoid charging each offload key for every group's backing tensors. The native
 connector retains original KV group IDs, including empty positions for scratch
 groups. Group-local slot IDs may repeat because the CPU tensors are disjoint.
 
+## Sparse Mamba checkpoint retention
+
+Flash-Next's `align` Mamba mode materializes one recurrent-state snapshot per
+block boundary during prefill. Before sparse retention, the offload tier
+stored every boundary for all four Mamba groups: on the measured TP4 layout
+that is 29.7 MB of state per token block against 10.24 MB of attention/PLE
+data, so 74% of the RAM budget held state snapshots and 16 GiB fit about 1.3
+contexts of 64K tokens, while the GPU keeps a single state per request.
+
+The retention policy itself lives in the core prefix cache
+(`--prefix-cache-retention-interval`, ported from upstream vLLM in 1Cat
+PR #617: `0` keeps the replay boundaries and detected shared-prefix junctions,
+`N > 0` adds periodic checkpoints, `None` keeps every boundary). This PR only
+consumes it on the offload side:
+
+- Mamba `align` boundary hand-offs carry hashed states only, so the host tier
+  stores exactly the states the GPU mask admits; no offload-specific policy.
+- Group pools are sized from the same mask (see below) instead of one state
+  slot per token slot.
+- Junctions discovered in the external tier are propagated: when the host tier
+  holds a longer full-attention prefix than a sparse group can serve, the
+  connector records `Request.shared_prefix_boundary` (like the GPU prefix
+  cache does), so the scheduler ends a chunk there, the mask keeps the state
+  and the hand-off offloads it; the next sibling hits after a restart or GPU
+  eviction.
+
+### Group pool sizing
+
+Token groups receive `N` slots. Each Mamba group receives the number of states
+the retention mask keeps for a request of `mamba_state_slots_reference_tokens`
+tokens (default `max_model_len`), plus one junction allowance per request,
+multiplied by the number of such requests the token pool holds; `N` is the
+largest value whose token pages and state slots fit `cpu_bytes_to_use`. Dense
+retention keeps one state slot per token slot, reproducing the previous equal
+layout. Workloads dominated by prompts shorter than the reference should lower
+the reference so the state pools do not run out before the token pools.
+
+On the measured 16 GiB TP4 layout (784-token blocks, 64K reference):
+
+| retention | token slots | 64K contexts | state slots per group |
+|---|---:|---:|---:|
+| None (dense) | 107 | 1.3 | 107 |
+| 8 blocks (6272) | 280 | 3.3 | 48 |
+| 0 (semantic, default) | 390 | 4.6 | 10 |
+| 0 with a 16K reference | 326 | 3.9 | 32 |
+
+### Validation history
+
+An earlier revision of this branch carried its own core port of the retention
+policy and an offload-only checkpoint stride; both were validated on four
+V100s on 2026-09-13 (64K restores at the replay boundary with identical token
+IDs, GPU-side and externally discovered junctions served to a third request
+from RAM, four distinct 60K-64K contexts restored, dense retention thrashing
+the 107-slot pools). Evidence: `/mnt/llm_hfs/builds/qsa-stride-validation-20260912`
+and `/mnt/llm_hfs/builds/qsa-retention-validation-20260913`. That core port was
+dropped in favor of PR #617; the offload-side pieces above are unchanged, and a
+re-validation on top of #617's core is recorded here when available.
+
 ## Public interface boundary
 
 The generic KV connector base classes, connector factory, LMCache connectors,

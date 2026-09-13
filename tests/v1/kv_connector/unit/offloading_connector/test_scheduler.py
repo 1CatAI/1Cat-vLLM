@@ -1558,6 +1558,7 @@ def _make_scratch_scheduler(*, full_attention_only=False):
     req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(4)]
     req.num_computed_tokens = 0
     req.num_prompt_tokens = req.num_tokens = 16
+    req.shared_prefix_boundary = 0
     req.is_finished.return_value = False
     scheduler.on_new_request(req)
     state = scheduler._req_status[req.request_id]
@@ -1696,3 +1697,46 @@ def test_grouped_deferred_store_preserves_scheduler_retry(blocked_group):
     assert src.block_ids.tolist() == [11, 21]
     assert src.group_sizes == [1, 0, 1]
     assert [state.group_states[g].next_stored_block_idx for g in (0, 2)] == [1, 1]
+
+
+def test_external_junction_is_recorded_when_sparse_group_misses():
+    """A longer full-attention hit than the Mamba group's in the external
+    tier is a shared-prefix junction; record it on the request so the state
+    gets materialized, kept and stored (Codex P1 on 3ebe71d389)."""
+    scheduler, req, _ = _make_scratch_scheduler()
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(12)]
+    req.num_prompt_tokens = req.num_tokens = 48
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    full_keys = set(state.group_states[0].offload_keys[:2])
+    # Full attention: first two blocks stored; Mamba: nothing stored.
+    scheduler.manager.lookup.side_effect = lambda key, ctx: key in full_keys
+
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+
+    assert num_hit == 0
+    assert state.external_full_attention_hit_tokens == 32
+    assert req.shared_prefix_boundary == 32
+
+    # A complete hit (Mamba state present at block 2) is not a junction.
+    req.shared_prefix_boundary = 0
+    mamba_key = state.group_states[2].offload_keys[1]
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        key in full_keys or key == mamba_key
+    )
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_hit == 32
+    assert req.shared_prefix_boundary == 0
+
+
+def test_external_junction_not_recorded_without_sparse_groups():
+    scheduler, req, _ = _make_scratch_scheduler(full_attention_only=True)
+    req.block_hashes = [BlockHash(f"s{i}".encode()) for i in range(8)]
+    req.num_prompt_tokens = req.num_tokens = 32
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    first = set(state.group_states[0].offload_keys[:1])
+    scheduler.manager.lookup.side_effect = lambda key, ctx: key in first
+    num_hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    assert num_hit == 0
+    assert req.shared_prefix_boundary == 0

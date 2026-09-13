@@ -445,10 +445,14 @@ class CpuGpuOffloadingHandlers:
         mmap_region: SharedOffloadRegion | None = None,
         group_page_sizes: dict[int, int] | None = None,
         group_mmap_regions: dict[int, SharedOffloadRegion] | None = None,
+        group_num_blocks: dict[int, int] | None = None,
     ):
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
         cpu_tensor: torch.Tensor | None = None
+        # Group pools may hold different slot counts (e.g. strided Mamba
+        # checkpoints). Private tensors belong to exactly one group.
+        tensor_num_blocks: dict[int, int] = {}
         try:
             if group_page_sizes is not None:
                 assert mmap_region is None, (
@@ -457,12 +461,20 @@ class CpuGpuOffloadingHandlers:
                 kv_caches = partition_kv_caches(
                     kv_caches, group_page_sizes, block_size_factor
                 )
+                for group_idx, refs in enumerate(kv_caches.group_data_refs):
+                    slots = (group_num_blocks or {}).get(group_idx, num_cpu_blocks)
+                    for ref in refs:
+                        tensor_num_blocks[ref.tensor_idx] = slots
+            else:
+                assert group_num_blocks is None
             tensor_regions: dict[int, SharedOffloadRegion] = {}
             if group_mmap_regions is not None:
                 assert group_page_sizes is not None
                 assert set(group_mmap_regions) == set(group_page_sizes)
                 for group_idx, region in group_mmap_regions.items():
-                    assert region.num_blocks == num_cpu_blocks
+                    assert region.num_blocks == (group_num_blocks or {}).get(
+                        group_idx, num_cpu_blocks
+                    )
                     assert region.rank is not None
                     assert (
                         region._worker_area_end - region._worker_offset
@@ -492,17 +504,18 @@ class CpuGpuOffloadingHandlers:
                     cpu_tensor = tensor_region.create_next_view(cpu_page_size_bytes)
                 else:
                     t0 = time.monotonic()
+                    tensor_slots = tensor_num_blocks.get(tensor_idx, num_cpu_blocks)
                     cpu_tensor = torch.zeros(
-                        (num_cpu_blocks, cpu_page_size_bytes),
+                        (tensor_slots, cpu_page_size_bytes),
                         dtype=torch.int8,
                         device="cpu",
                         pin_memory=pin_memory,
                     )
                     logger.debug(
                         "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
-                        num_cpu_blocks,
+                        tensor_slots,
                         cpu_page_size_bytes,
-                        num_cpu_blocks * cpu_page_size_bytes / 1e9,
+                        tensor_slots * cpu_page_size_bytes / 1e9,
                         time.monotonic() - t0,
                     )
 

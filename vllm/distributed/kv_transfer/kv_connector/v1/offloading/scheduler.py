@@ -222,6 +222,11 @@ class RequestOffloadState:
     max_offload_tokens: int | None = None
     # number of hits in the GPU cache
     num_locally_computed_tokens: int = 0
+    # Longest full-attention prefix (absolute tokens) the external tier holds
+    # for this request, recorded by the last lookup. When it exceeds the hit
+    # served to the scheduler, a sparse group (Mamba / sliding window) lacks
+    # its checkpoint there: an externally discovered shared-prefix junction.
+    external_full_attention_hit_tokens: int = 0
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
@@ -434,6 +439,7 @@ class OffloadingConnectorScheduler:
         happens until num_hit_tokens converges.
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
+        req_status.external_full_attention_hit_tokens = 0
         max_hit_size_tokens: int = req_status.req.num_tokens
         if self._sliding_window_groups:
             # the last prompt token has to be recomputed to get the logprobs
@@ -499,10 +505,15 @@ class OffloadingConnectorScheduler:
                 if num_hit_blocks is None:
                     defer_lookup = True
                 else:
-                    max_hit_size_tokens = min(
-                        max_hit_size_tokens,
-                        offloaded_block_size * (start_block_idx + num_hit_blocks),
+                    group_hit_tokens = offloaded_block_size * (
+                        start_block_idx + num_hit_blocks
                     )
+                    if sliding_window_size_in_blocks is None:
+                        req_status.external_full_attention_hit_tokens = max(
+                            req_status.external_full_attention_hit_tokens,
+                            group_hit_tokens,
+                        )
+                    max_hit_size_tokens = min(max_hit_size_tokens, group_hit_tokens)
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < offloaded_block_size:
@@ -606,7 +617,23 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens = self._lookup(req_status)
-        req_status.update_num_hit_blocks(num_computed_tokens + (num_hit_tokens or 0))
+        served_tokens = num_computed_tokens + (num_hit_tokens or 0)
+        req_status.update_num_hit_blocks(served_tokens)
+
+        # Marconi-style junction discovered in the external tier: the full
+        # attention prefix reaches further than the sparse groups can serve.
+        # Record it on the request (like the GPU prefix cache does) so the
+        # scheduler ends a chunk there, the retention mask keeps the state and
+        # the boundary hand-off offloads it; the next sibling then hits.
+        if (
+            num_hit_tokens is not None
+            and self._sliding_window_groups
+            and req_status.external_full_attention_hit_tokens > served_tokens
+        ):
+            request.shared_prefix_boundary = max(
+                request.shared_prefix_boundary,
+                req_status.external_full_attention_hit_tokens,
+            )
 
         self._touch(req_status)
 
