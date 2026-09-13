@@ -89,7 +89,18 @@ output token IDs were compared against the cold run of the same prompt.
 | MTP0 | three distinct 64K contexts stored, then each restored | 63,504 external tokens for all three |
 | MTP3 | 64K cold, pressure, restore, rehit | 62,400 external tokens = 78 x 800-token blocks, the MTP-shifted final boundary; six drafted/accepted; IDs identical |
 | MTP3 | three distinct 60K contexts stored, then each restored | 58,400 external tokens for all three |
-| MTP0, stride 1 | same three 64K contexts (107 slots per group) | all three restores missed: each miss re-stores 81 blocks and evicts the others |
+| MTP0, stride 1 | same three 64K contexts (107 slots per group) | all three restores missed, see below |
+
+Why every restore missed at stride 1: 107 slots hold 1.3 contexts of 81
+blocks, and LRU evicts the oldest blocks first, which are the head of the
+oldest request. A prefix lookup must hit contiguously from block 0, so once
+C2 and C3 are stored C1's head is gone and its restore becomes a cold
+prefill. That prefill re-stores 81 blocks and evicts C2's remainder and C3's
+head, so C2 and C3 miss in turn. The diag log shows each of the six requests
+storing 405 keys (81 blocks x 5 groups) and evicting 275 to 405. This is the
+capacity limit, not a defect: any rotation larger than the pool misses
+entirely, which is exactly the "zero external hits" symptom that started this
+work.
 
 Pool geometry at stride 8: MTP0 248 token slots and 59 state slots per Mamba
 group (3.996 GiB pinned per rank); MTP3 232 token slots and 55 state slots
