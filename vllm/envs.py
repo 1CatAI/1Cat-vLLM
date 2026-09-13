@@ -615,7 +615,6 @@ if TYPE_CHECKING:
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
     VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
-    VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL: bool = False
@@ -856,12 +855,7 @@ def maybe_convert_json_str_or_file(value: str | None) -> dict[str, Any] | None:
 
 
 def disable_compile_cache() -> bool:
-    sm70_compile_graph = os.getenv(
-        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
-        "0",
-    ).strip().lower() in ("1", "true", "yes", "on")
-    default_value = "1" if sm70_compile_graph else "0"
-    return bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", default_value)))
+    return bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", "0")))
 
 
 def use_aot_compile() -> bool:
@@ -3698,10 +3692,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
     # disables AOT cache reload by default due known token drift, but long
     # profiler runs need an explicit way to reuse compile artifacts.
-    "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": lambda: bool(
-        os.getenv("VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING", "0").strip().lower()
-        in ("1", "true", "yes", "on")
-    ),
     "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD": lambda: bool(
         os.getenv(
             "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",

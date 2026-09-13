@@ -2192,28 +2192,6 @@ class VllmConfig:
                             "configuration: regular torch.compile reproduced "
                             "deterministic greedy token drift."
                         )
-                if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
-                    logger.warning_once(
-                        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "
-                        "leaving VLLM_DISABLE_COMPILE_CACHE unset for "
-                        "diagnostic profiling. This reuses compile artifacts "
-                        "and is not a quality-parity baseline."
-                    )
-                elif "VLLM_DISABLE_COMPILE_CACHE" not in os.environ:
-                    os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-                    logger.info_once(
-                        "Auto-setting VLLM_DISABLE_COMPILE_CACHE=1 for SM70 "
-                        "Flash-V100 0.0.3 compile graph quality parity; "
-                        "decode throughput is preserved, but AOT artifact "
-                        "reload stays disabled until its token drift is fixed."
-                    )
-                elif os.environ.get("VLLM_DISABLE_COMPILE_CACHE") == "0":
-                    logger.warning_once(
-                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
-                        "explicit VLLM_DISABLE_COMPILE_CACHE=0 is a "
-                        "diagnostic-only configuration: cached AOT artifact "
-                        "reload reproduced deterministic greedy token drift."
-                    )
                 self.compilation_config.inductor_compile_config["combo_kernels"] = True
                 self.compilation_config.inductor_compile_config[
                     "benchmark_combo_kernel"
