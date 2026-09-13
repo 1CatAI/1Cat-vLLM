@@ -4,20 +4,83 @@
 # ruff: noqa: E501
 
 
+import importlib.util
+import os
+import sys
+
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 # isort: off
-# We need to import the CUDA kernels after importing torch
-# Use relative import to support build-from-source installation in vLLM
+# FA2 ships one library per architecture: the CMake build for the target list
+# and, on mixed Volta/Turing rigs, a separate Turing build next to it. Both
+# export the same module and op namespace, so a process can hold only one of
+# them, and the choice has to follow the GPU the ops run on. Importing here
+# would decide before a worker has selected its device, so the library loads
+# on first use instead (load_fa2_library).
+_FA2_MODULE = f"{__package__}._vllm_fa2_C"
+_FA2_TURING_CAPABILITY = (7, 5)
+_FA2_TURING_PATH = os.path.join(os.path.dirname(__file__), "_vllm_fa2_C_sm75.abi3.so")
+_FA2_DEFAULT_SPEC = importlib.util.find_spec(_FA2_MODULE)
+_fa2_loaded_capability: tuple[int, int] | None = None
 
-try:
-    from . import _vllm_fa2_C  # type: ignore[attr-defined]  # noqa: F401
-
+if _FA2_DEFAULT_SPEC is not None or os.path.exists(_FA2_TURING_PATH):
     FA2_UNAVAILABLE_REASON = None
     FA2_AVAILABLE = True
-except ImportError as e:
-    FA2_UNAVAILABLE_REASON = str(e)
+else:
+    FA2_UNAVAILABLE_REASON = f"no {_FA2_MODULE} library is installed"
     FA2_AVAILABLE = False
+
+
+def _fa2_library_path(capability: tuple[int, int]) -> str | None:
+    """Return the FA2 library installed for ``capability``, or None."""
+    if capability == _FA2_TURING_CAPABILITY:
+        return _FA2_TURING_PATH if os.path.exists(_FA2_TURING_PATH) else None
+    return _FA2_DEFAULT_SPEC.origin if _FA2_DEFAULT_SPEC is not None else None
+
+
+def load_fa2_library(device: torch.device) -> None:
+    """Load the FA2 library built for ``device``'s architecture.
+
+    A process holds one FA2 library; the first call decides which.
+    """
+    global _fa2_loaded_capability
+    if _fa2_loaded_capability is not None:
+        return
+    capability = torch.cuda.get_device_capability(device)
+    path = _fa2_library_path(capability)
+    if path is None:
+        raise ImportError(
+            f"No {_FA2_MODULE} library is installed for compute capability "
+            f"{capability[0]}.{capability[1]}"
+        )
+    spec = importlib.util.spec_from_file_location(_FA2_MODULE, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_FA2_MODULE] = module
+    spec.loader.exec_module(module)
+    _fa2_loaded_capability = capability
+    logger.info(
+        "Loaded FA2 library %s for compute capability %d.%d.",
+        os.path.basename(path),
+        *capability,
+    )
+
+
+def ensure_fa2_library_loaded() -> None:
+    """Load the FA2 library for this process's current device, once.
+
+    For code that resolves operators from ``torch.ops._vllm_fa2_C`` before the
+    first attention call goes through this module (the SM70 backend looks its
+    prefill and tail operators up at initialisation). Importing this module no
+    longer loads a library, so those lookups ask here first.
+    """
+    if _fa2_loaded_capability is None:
+        load_fa2_library(torch.device("cuda", torch.accelerator.current_device_index()))
+
 
 try:
     from . import _vllm_fa3_C  # type: ignore[attr-defined]  # noqa: F401
@@ -54,8 +117,19 @@ def _is_fa2_supported() -> tuple[bool, str | None]:
         return False, f"FA2 is unavailable due to: {FA2_UNAVAILABLE_REASON}"
     from vllm.platforms import current_platform
 
-    if not current_platform.has_device_capability(80):
-        return False, "FA2 is only supported on devices with compute capability >= 8"
+    # SM75 enablement: Turing runs the fp16-only FA2 build; bf16 inputs are
+    # rejected by the C++ entry points.
+    # Mixed rigs: ask this worker's own GPU, not device 0 -- otherwise the
+    # weakest card in the grid decides for every stage.
+    device = torch.accelerator.current_device_index()
+    if not current_platform.has_device_capability(75, device):
+        return False, "FA2 is only supported on devices with compute capability >= 7.5"
+    capability = current_platform.get_device_capability(device)
+    if (
+        capability is None
+        or _fa2_library_path((capability.major, capability.minor)) is None
+    ):
+        return False, "no FA2 library is installed for this GPU's architecture"
     return True, None
 
 
@@ -297,6 +371,7 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
+        load_fa2_library(q.device)
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q,
             k,
@@ -449,6 +524,7 @@ def sparse_attn_func(
         softmax_scale = q.shape[-1] ** (-0.5)
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    load_fa2_library(q.device)
     out, softmax_lse = torch.ops._vllm_fa2_C.fwd_sparse(
         q,
         k,
@@ -535,6 +611,7 @@ def sparse_attn_varlen_func(
         softmax_scale = q.shape[-1] ** (-0.5)
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    load_fa2_library(q.device)
     out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd_sparse(
         q,
         k,
