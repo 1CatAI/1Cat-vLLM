@@ -1140,16 +1140,11 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
-        self.sparse_checkpoint_interval = int(
-            os.environ.get("VLLM_MAMBA_SPARSE_CACHE_INTERVAL", "0")
+        self.sparse_checkpoint_interval_blocks = int(
+            os.environ.get("VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS", "0")
         )
-        if (
-            self.sparse_checkpoint_interval < 0
-            or self.sparse_checkpoint_interval % self.block_size
-        ):
-            raise ValueError(
-                "Mamba sparse interval must be zero or a positive block multiple"
-            )
+        if self.sparse_checkpoint_interval_blocks < 0:
+            raise ValueError("Mamba sparse interval must be a non-negative block count")
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1423,7 +1418,7 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         sparse_enabled = (
-            self.sparse_checkpoint_interval > 0
+            self.sparse_checkpoint_interval_blocks > 0
             and self.mamba_cache_mode == "align"
             and alignment_tokens == self.block_size
         )
@@ -1434,7 +1429,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # coordinator's per-group EAGLE classification in this manager.
             replay_block = max(0, (request.num_tokens - 1) // self.block_size)
             mask = [
-                ((i + 1) * self.block_size % self.sparse_checkpoint_interval == 0)
+                ((i + 1) % self.sparse_checkpoint_interval_blocks == 0)
                 or (i + 1 in (replay_block, replay_block - 1))
                 for i in range(num_cached_blocks_before, num_full_blocks)
             ]

@@ -24,11 +24,16 @@ We describe two example workloads, where APC can provide huge performance benefi
 
 ### Sparse checkpoints for aligned Mamba caches
 
-In 1Cat, `VLLM_MAMBA_SPARSE_CACHE_INTERVAL` opts into sparse
+In 1Cat, `VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS` opts into sparse
 checkpoint admission for aligned Mamba prefix caches. Its default is `0`, which
-retains dense checkpoint admission. A positive value is measured in tokens and
-must be a multiple of each Mamba manager's block size; invalid values fail at
-initialization. For example, an interval of `16000` is valid for 800-token blocks.
+retains dense checkpoint admission. A positive integer selects every Nth block
+boundary in each Mamba manager; `1` admits every eligible boundary. Negative values
+fail at initialization. For example, `20` corresponds to 16000 tokens with
+800-token blocks, or 10240 tokens with 512-token blocks. The token spacing adapts
+to the model's block size; the physical block size and pool capacity do not change.
+Smaller intervals retain more recovery points, while larger intervals reduce
+checkpoint pressure but can require more replay. Compare values such as `5`,
+`10`, `20`, and `40` for the intended workload.
 
 Sparse admission applies only when the cache mode is `align` and the coordinator's
 alignment equals the manager's block size. Other geometries use dense admission.

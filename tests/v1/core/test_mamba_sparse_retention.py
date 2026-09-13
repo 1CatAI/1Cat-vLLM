@@ -77,7 +77,7 @@ def _hit(manager, request, pool, block_size, eagle):
 )
 @pytest.mark.parametrize("eagle", [False, True])
 def test_sparse_retains_both_prompt_replay_boundaries(monkeypatch, length, eagle):
-    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL", "16000")
+    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS", "20")
     pool = BlockPool(80, True, 8)
     manager = _mamba(pool, 800, 1)
     request = _request("boundary", length)
@@ -89,9 +89,9 @@ def test_sparse_retains_both_prompt_replay_boundaries(monkeypatch, length, eagle
     assert pool.get_num_free_blocks() == 79
 
 
-@pytest.mark.parametrize("interval,expected", [(0, 0), (320, 169 * 16)])
+@pytest.mark.parametrize("interval,expected", [(0, 0), (20, 169 * 16)])
 def test_long_b_does_not_flush_a_when_sparse_enabled(monkeypatch, interval, expected):
-    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL", str(interval))
+    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS", str(interval))
     pool = BlockPool(650, True, 8)
     full = FullAttentionManager(
         FullAttentionSpec(
@@ -113,7 +113,7 @@ def test_long_b_does_not_flush_a_when_sparse_enabled(monkeypatch, interval, expe
 @pytest.mark.parametrize("alignment", [800, 1600])
 def test_admission_falls_back_for_different_alignment(monkeypatch, alignment):
     def retained(interval):
-        monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL", str(interval))
+        monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS", str(interval))
         pool = BlockPool(80, True, 8)
         manager = _mamba(pool, 800, 1)
         request = _request("fallback", 16001)
@@ -121,17 +121,17 @@ def test_admission_falls_back_for_different_alignment(monkeypatch, alignment):
         hashes = BlockHashListWithBlockSize(request.block_hashes, 8, 800)
         return [i for i, h in enumerate(hashes) if pool.get_cached_block(h, [1])]
 
-    dense, sparse = retained(0), retained(16000)
+    dense, sparse = retained(0), retained(20)
     if alignment == 800:
         assert len(sparse) < len(dense)
     else:
         assert sparse == dense
 
 
-@pytest.mark.parametrize("interval", [-1, 1000])
+@pytest.mark.parametrize("interval", [-1, -20])
 def test_invalid_interval_fails_early(monkeypatch, interval):
-    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL", str(interval))
-    with pytest.raises(ValueError, match="block multiple"):
+    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS", str(interval))
+    with pytest.raises(ValueError, match="non-negative block count"):
         _mamba(BlockPool(80, True, 8), 800, 1)
 
 
@@ -153,3 +153,24 @@ def test_scratch_reuse_preserves_cached_and_shared_blocks(enable_caching):
         assert pool.get_cached_block(request.block_hashes[0], [0]) == [cached]
     pool.free_blocks(reused + [shared])
     assert pool.get_num_free_blocks() == 6
+
+
+@pytest.mark.parametrize("block_size", [16, 512, 800, 1024])
+@pytest.mark.parametrize("interval", [0, 1, 5, 10, 20, 40])
+def test_block_interval_is_independent_of_token_block_size(
+    monkeypatch, block_size, interval
+):
+    monkeypatch.setenv("VLLM_MAMBA_SPARSE_CACHE_INTERVAL_BLOCKS", str(interval))
+    pool = BlockPool(100, True, 8)
+    manager = _mamba(pool, block_size, 1)
+    request = _request("portable", 45 * block_size + 3)
+    _prefill([manager], request, block_size)
+    hashes = BlockHashListWithBlockSize(request.block_hashes, 8, block_size)
+    retained = [i + 1 for i, h in enumerate(hashes) if pool.get_cached_block(h, [1])]
+    expected = (
+        list(range(1, 46))
+        if interval == 0
+        else sorted(set(range(interval, 46, interval)) | {44, 45})
+    )
+    assert retained == expected
+    assert pool.get_num_free_blocks() == 99
