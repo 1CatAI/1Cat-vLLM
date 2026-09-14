@@ -192,6 +192,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = False
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
@@ -1904,6 +1906,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+    # Share TurboMind B/Pack1 codes with QPN2, preserving both scale formats.
+    # Opt in until same-contract GPU correctness and performance gates pass.
+    "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "0"))
+    ),
+    "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "0"))
+    ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
     "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": lambda: bool(

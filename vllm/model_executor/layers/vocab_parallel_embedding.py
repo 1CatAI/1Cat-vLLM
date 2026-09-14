@@ -65,11 +65,15 @@ def _sm70_dflash2_qpn8_rerank_requested() -> bool:
     )
 
 
-def _sm70_lm_head_packed_layout_requested() -> bool:
-    return (
-        _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
-        or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
-        or _sm70_dflash2_qpn8_rerank_requested()
+def _sm70_lm_head_packed_layout_requested(fp32_logits: bool = False) -> bool:
+    # FP32 dense logits and candidate rerank read the original FP16 parameter.
+    # Only an explicitly enabled packed top1 still consumes this layout.
+    return _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False) or (
+        not fp32_logits
+        and (
+            _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
+            or _sm70_dflash2_qpn8_rerank_requested()
+        )
     )
 
 
@@ -177,6 +181,8 @@ def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
 
 @torch.inference_mode()
 def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
+    if getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
+        return True
     if not _is_sm70_dflash2_qpn8_rerank_eligible(layer):
         return False
 
@@ -230,32 +236,33 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
         torch.empty((max_rows, candidates), dtype=rerank_dtype, device=device),
         persistent=False,
     )
-    selected_rows = max_rows * candidates
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_selected_raw",
-        torch.empty((selected_rows, hidden), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_selected_packed",
-        torch.empty((selected_rows, hidden), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_expanded",
-        torch.empty((max_rows, selected_rows), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_partials",
-        torch.empty((max_rows, selected_rows), dtype=torch.float32, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_barriers",
-        torch.zeros(64, dtype=torch.int32, device=device),
-        persistent=False,
-    )
+    if not fp32_logits:
+        selected_rows = max_rows * candidates
+        layer.register_buffer(
+            "_sm70_dflash2_rerank_selected_raw",
+            torch.empty((selected_rows, hidden), dtype=torch.float16, device=device),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_rerank_selected_packed",
+            torch.empty((selected_rows, hidden), dtype=torch.float16, device=device),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_rerank_expanded",
+            torch.empty((max_rows, selected_rows), dtype=torch.float16, device=device),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_rerank_partials",
+            torch.empty((max_rows, selected_rows), dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_rerank_barriers",
+            torch.zeros(64, dtype=torch.int32, device=device),
+            persistent=False,
+        )
     layer.register_buffer(
         "_sm70_dflash2_rerank_dense_logits",
         torch.empty((max_rows, rows), dtype=rerank_dtype, device=device),
@@ -383,12 +390,15 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     raw_top1_requested = _sm70_env_bool(
         "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
     )
-    packed_layout_requested = _sm70_lm_head_packed_layout_requested()
+    packed_layout_requested = _sm70_lm_head_packed_layout_requested(
+        getattr(layer, "_sm70_dflash2_fp32_logits", False)
+    )
     if raw_top1_requested:
         layer._sm70_f16_raw_top1_ready = True
 
     if not packed_layout_requested:
-        logger.info_once("SM70 raw-weight LM head top1 path prepared.")
+        _prepare_sm70_dflash2_qpn8_rerank(layer)
+        logger.info_once("SM70 original-weight LM head path prepared.")
         return True
 
     if not hasattr(torch.ops._C, "sm70_f16_prepare"):
