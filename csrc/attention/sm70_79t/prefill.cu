@@ -1174,13 +1174,16 @@ struct ExpRowSumTransformAImpl {
     #if defined(PREFIX_QK_LOG2_SCORES)
                 float weight = exp2f(value);
     #else
-                float weight = exp2f((value - row_max[
       #if defined(PREFIX_TRANSPOSED_SCORE_WORKSPACE)
-                                                  e
+                float const maximum = row_max[e];
       #else
-                                                  s
+                float const maximum = row_max[s];
       #endif
-            ]) * kLog2E);
+      #if defined(PREFIX_TORCH_STABLE_ROWS)
+            float weight = stable_exp(value, maximum);
+      #else
+            float weight = exp2f((value - maximum) * kLog2E);
+      #endif
     #endif
   #endif
             if (blockIdx.y == 0) {
@@ -5929,7 +5932,8 @@ struct Sm70GqaHalf2Workspace {
   at::Tensor tail_pv_params;
 
     #if defined(PREFIX_TORCH_STABLE_ROWS)
-  at::Tensor value_scaled, value_max, block_sum, block_max, prefix_max;
+  at::Tensor value_scaled, value_center, value_max, block_sum, block_max,
+      prefix_max;
   at::Tensor prefix_accumulator, max_partials, tail_max_partials;
     #endif
   std::vector<Element*> host_tail_q_ptrs;
@@ -6021,6 +6025,7 @@ struct Sm70GqaHalf2Workspace {
     #if defined(PREFIX_TORCH_STABLE_ROWS)
     auto fp32 = q.options().dtype(at::ScalarType::Float);
     value_scaled = at::empty({kMaxTotalKV, kHeadDim}, q.options());
+    value_center = at::empty({kHeadDim}, fp32);
     value_max = at::empty({1}, fp32);
     block_sum = at::empty({kRows}, fp32);
     block_max = at::empty({kRows}, fp32);
@@ -6118,18 +6123,21 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   float* prefix_max = workspace->prefix_max.data_ptr<float>();
   float* prefix_accumulator = workspace->prefix_accumulator.data_ptr<float>();
   float* maximum_value = workspace->value_max.data_ptr<float>();
+  float* value_center = workspace->value_center.data_ptr<float>();
   auto* scaled_value =
       reinterpret_cast<__half*>(workspace->value_scaled.data_ptr<at::Half>());
   C10_CUDA_CHECK(cudaMemsetAsync(block_sum, 0, Workspace::kRows * sizeof(float),
                                  prefix_stream));
   C10_CUDA_CHECK(
       cudaMemsetAsync(maximum_value, 0, sizeof(float), prefix_stream));
+  stable_value_center<<<1, 256, 0, prefix_stream>>>(
+      reinterpret_cast<__half const*>(value), value_center, total_kv);
   stable_value_amax<<<1024, 256, 0, prefix_stream>>>(
-      reinterpret_cast<__half const*>(value), maximum_value,
+      reinterpret_cast<__half const*>(value), value_center, maximum_value,
       total_kv * Workspace::kHeadDim);
   stable_scale_values<<<1024, 256, 0, prefix_stream>>>(
-      reinterpret_cast<__half const*>(value), scaled_value, maximum_value,
-      total_kv * Workspace::kHeadDim);
+      reinterpret_cast<__half const*>(value), scaled_value, value_center,
+      maximum_value, total_kv * Workspace::kHeadDim);
   value = reinterpret_cast<Element*>(scaled_value);
   C10_CUDA_CHECK(
       cudaMemcpyToSymbolAsync(g_row_max, &block_max, sizeof(block_max), 0,
@@ -6339,13 +6347,13 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         reinterpret_cast<__half*>(tail_scores), Workspace::kTailTileRows,
         Workspace::kTailTileTokens, 0);
     #if defined(PREFIX_TORCH_STABLE_ROWS)
-    dim3 max_grid((Workspace::kRows + 255) / 256, 16);
+    dim3 max_grid((Workspace::kRows + 255) / 256, 1);
     stable_row_max_partials<true><<<max_grid, 128, 0, tail_stream>>>(
         reinterpret_cast<__half const*>(tail_scores),
         workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows, 8000);
     stable_finish_max<<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
         workspace->tail_max_partials.data_ptr<float>(), tail_max,
-        Workspace::kRows, 16);
+        Workspace::kRows, 1);
     #endif
     if (direct_tail_debug) {
       set_pv_task_base_kernel<<<1, 1, 0, tail_stream>>>(0);
@@ -6391,7 +6399,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     #if defined(PREFIX_TORCH_STABLE_ROWS)
     int width =
         std::min(Workspace::kBlockN, prefix - block * Workspace::kBlockN);
-    int tiles = (width + 511) / 512;
+    int tiles = 1;
     dim3 max_grid((Workspace::kRows + 255) / 256, tiles);
     stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(
         reinterpret_cast<__half const*>(scores),
@@ -6544,8 +6552,8 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   stable_merge_final<<<Workspace::kRows, 256, 0, prefix_stream>>>(
       prefix_accumulator, prefix_sum, prefix_max,
       reinterpret_cast<__half const*>(tail_numerator), tail_sum, tail_max,
-      maximum_value, reinterpret_cast<__half*>(output), repaired_rows,
-      prefix > 0);
+      value_center, maximum_value, reinterpret_cast<__half*>(output),
+      repaired_rows, prefix > 0);
     #else
       #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
   merge_float_prefix_direct_round_major_tail<<<

@@ -5,6 +5,16 @@
 // Model scores violate both assumptions. Keep block masses and the online
 // accumulator in FP32, and bound each FP16 PV operation by scaling V.
 __device__ float const* g_79t_tail_row_max = nullptr;
+constexpr int kStableScoreSampleStride = 8;
+constexpr float kStableScoreMargin = 4.0f;
+constexpr float kStableValueCenterThreshold = 0.05f;
+constexpr float kStableMaxExpInput = 10.0f;
+constexpr float kStableValueHeadroom = 64.0f;
+
+__device__ __forceinline__ float stable_exp(float value, float maximum) {
+  return exp2f(fminf(value - maximum, kStableMaxExpInput) *
+               1.4426950408889634f);
+}
 
 __device__ __forceinline__ int stable_tail_query_tile() {
   int task = pv_task_index();
@@ -22,15 +32,27 @@ __device__ __forceinline__ float stable_value_scale(float maximum) {
   maximum = fmaxf(maximum, 1.0f);
   int exponent;
   float mantissa = frexpf(maximum, &exponent);
-  return ldexpf(1.0f, exponent - (mantissa == 0.5f));
+  return ldexpf(1.0f, exponent - (mantissa == 0.5f)) * kStableValueHeadroom;
 }
 
-__global__ void stable_value_amax(__half const* values, float* maximum,
-                                  int elements) {
+__global__ void stable_value_center(__half const* values, float* center,
+                                    int total_kv) {
+  int d = threadIdx.x;
+  if (d >= 256) return;
+  int samples = min(total_kv, 4096);
+  float sum = 0.0f;
+  for (int token = 0; token < samples; ++token)
+    sum += __half2float(values[int64_t(token) * 256 + d]);
+  float mean = sum / samples;
+  center[d] = fabsf(mean) >= kStableValueCenterThreshold ? mean : 0.0f;
+}
+
+__global__ void stable_value_amax(__half const* values, float const* center,
+                                  float* maximum, int elements) {
   float local = 0.0f;
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < elements;
        i += blockDim.x * gridDim.x) {
-    local = fmaxf(local, fabsf(__half2float(values[i])));
+    local = fmaxf(local, fabsf(__half2float(values[i]) - center[i & 255]));
   }
   for (int offset = 16; offset; offset >>= 1)
     local = fmaxf(local, __shfl_down_sync(0xffffffffu, local, offset));
@@ -45,13 +67,15 @@ __global__ void stable_value_amax(__half const* values, float* maximum,
 }
 
 __global__ void stable_scale_values(__half const* input, __half* output,
-                                    float const* maximum, int elements) {
+                                    float const* center, float const* maximum,
+                                    int elements) {
   __shared__ float inverse;
   if (threadIdx.x == 0) inverse = 1.0f / stable_value_scale(*maximum);
   __syncthreads();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < elements;
        i += blockDim.x * gridDim.x)
-    output[i] = __float2half_rn(__half2float(input[i]) * inverse);
+    output[i] =
+        __float2half_rn((__half2float(input[i]) - center[i & 255]) * inverse);
 }
 
 // Each lane reads a pair of adjacent query rows. K tiles stay independent,
@@ -73,9 +97,10 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
     base = int64_t(tile_rows) * 320 * tile * (tile + 1) / 2;
   }
   float2 maximum = {-CUDART_INF_F, -CUDART_INF_F};
-  int end = min(width, int(blockIdx.y + 1) * 512);
+  int end = min(width, int(blockIdx.y + 1) * 8192);
 #pragma unroll 4
-  for (int col = int(blockIdx.y) * 512; col < end; ++col) {
+  for (int col = int(blockIdx.y) * 8192; col < end;
+       col += kStableScoreSampleStride) {
     float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
         scores + base + int64_t(col) * stride + local_row));
     maximum.x = fmaxf(maximum.x, value.x);
@@ -93,7 +118,7 @@ __global__ void stable_finish_max(float const* partials, float* maxima,
   float value = -CUDART_INF_F;
   for (int tile = 0; tile < tiles; ++tile)
     value = fmaxf(value, partials[int64_t(tile) * rows + row]);
-  maxima[row] = value;
+  maxima[row] = value + kStableScoreMargin;
 }
 
 __global__ void stable_merge_prefix(__half const* partial, float* block_sum,
@@ -121,6 +146,7 @@ __global__ void stable_merge_prefix(__half const* partial, float* block_sum,
 __global__ void stable_merge_final(float const* prefix, float const* prefix_sum,
                                    float const* prefix_max, __half const* tail,
                                    float const* tail_sum, float const* tail_max,
+                                   float const* value_center,
                                    float const* value_max, __half* output,
                                    int repaired_rows, bool has_prefix) {
   int row = blockIdx.x;
@@ -142,5 +168,6 @@ __global__ void stable_merge_final(float const* prefix, float const* prefix_sum,
   int64_t index = int64_t(row) * 256 + d;
   float p = has_prefix ? prefix[index] * coefficients[0] : 0.0f;
   output[index] = __float2half_rn(
-      (p + __half2float(tail[index]) * coefficients[1]) * coefficients[2]);
+      (p + __half2float(tail[index]) * coefficients[1]) * coefficients[2] +
+      value_center[d]);
 }
