@@ -440,19 +440,12 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": os.environ.get(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY"
         ),
-        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": os.environ.get(
-            "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING"
-        ),
         "awq_preserve_default_splits_effective": _env_bool(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS",
             True,
         ),
         "awq_preserve_default_splits_only_effective": _env_bool(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY",
-            False,
-        ),
-        "allow_compile_cache_for_profiling_effective": _env_bool(
-            "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING",
             False,
         ),
         "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": os.environ.get(
