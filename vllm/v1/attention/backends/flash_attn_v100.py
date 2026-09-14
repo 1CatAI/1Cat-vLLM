@@ -1408,8 +1408,7 @@ def _get_sm70_d256_gqa_architecture_op():
 
 def _get_sm70_v37_e4m3_bridge_op():
     """Resolve the format-specific bridge from the same FA2 runtime."""
-    if not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
-        return None
+    # E4M3 storage conversion is independent of the dense compute kernel.
     _get_sm70_splitd_d256_ops()
     return getattr(torch.ops._vllm_fa2_C, "sm70_v37_e4m3_bridge", None)
 
@@ -1745,12 +1744,14 @@ def _try_sm70_fa2_d256_prefill(
                                 "long-prefill architecture route active (%s).",
                                 "v37 FP32"
                                 if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
-                                else "legacy",
+                                else "Q8000 FP32 75T",
                             )
                             _logged_prefill_d256_gqa_architecture = True
                         _record_route("prefill_dense_d256_gqa_arch_long")
                         if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
                             _record_route("prefill_dense_d256_gqa_v37")
+                        else:
+                            _record_route("prefill_dense_d256_gqa_79t_fp32")
                 if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
@@ -2268,7 +2269,7 @@ def _get_paged_kv_utils():
     global _paged_kv_utils
     if _paged_kv_utils is None:
         try:
-            from flash_attn_v100 import paged_kv_utils
+            from flash_attn_v100 import paged_kv_utils  # type: ignore[attr-defined]
 
             _paged_kv_utils = paged_kv_utils
         except ImportError:

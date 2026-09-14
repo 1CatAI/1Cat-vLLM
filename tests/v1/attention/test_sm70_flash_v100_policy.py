@@ -250,6 +250,19 @@ def test_sm70_d256_gqa_architecture_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL is False
 
 
+def test_sm70_d256_gqa_v37_env_is_default_off(monkeypatch):
+    import vllm.envs as envs
+
+    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_V37"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37 is False
+
+    monkeypatch.setenv(name, "1")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37 is True
+
+
 def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
     import vllm.envs as envs
 
