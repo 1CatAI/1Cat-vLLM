@@ -117,6 +117,53 @@ and bridge. The optimized route reduces that wall-clock anomaly by about
 10.8x. The reported 62.73-second second request hit prefix cache and is not
 a cold-prefill result.
 
+## Broader NVFP4 plus DFlash2 serving sample
+
+A separate serving-quality run checked whether the guarded attention build
+remains healthy in the Qwen3.8-27B-NVFP4 plus DFlash2 stack. This is a
+compatibility and output-health result, not a matched comparison with the FP8
+target-only cold-prefill contract above. It used TP4, E4M3 target KV,
+Flash-V100 for target and draft attention, seven probabilistic draft tokens,
+four concurrent requests, max length 262144, and a 65536-token output cap.
+Sampling used temperature 0.6, top-p 0.95, top-k 20, seed 0, and xhigh
+reasoning. The selected 96-case corpus SHA256 is
+`46fcb5e990bfeb01069b9d676f87285e5672edcb8557eeada98d0a35d8b9af1e`.
+
+The run was stopped after 78 complete cases at the operator's request. The 18
+unstarted or interrupted AIME cases are excluded from every score:
+
+| Suite | Complete / selected | Raw pass | Output tokens | Suite wall | Aggregate output tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MMLU-Pro, category-balanced | 32 / 32 | **29 / 32** | 134370 | 1044.38 s | **128.66** |
+| MBPP sanitized | 32 / 32 | **31 / 32** | 101776 | 522.75 s | **194.69** |
+| AIME 2024/2025 | 14 / 32 | **13 / 14** | 183238 | interrupted | not reported |
+| Total complete | 78 / 96 | **73 / 78** | 419384 | mixed | not reported |
+
+All 78 complete requests reached natural EOS, returned a nonempty final
+answer, and contained no replacement characters. None hit the output cap.
+The service log contains no NaN, Inf, overflow, traceback, CUDA error, or dead
+engine/worker report. The three MMLU-Pro misses and one completed AIME miss
+are coherent wrong answers rather than malformed output. The only raw MBPP
+failure is task 229 (`mbpp:102`): its prose requires stable order within both
+sign groups, while its first public assertion moves the value 2 behind values
+4, 5, and 6. The model follows the prose, so this is retained as a raw failure
+but classified as a dirty evaluation case.
+
+Across all active ten-second service windows, including smoke cases and the
+four interrupted requests, median aggregate generation throughput was 141.4
+tok/s and p90 was 218.72 tok/s. Median DFlash2 acceptance length was 4.08 and
+p90 was 4.62; median draft-token acceptance was 44.0%. The completed MMLU-Pro,
+MBPP, and AIME output lengths reached 46458, 20699, and 30371 tokens. These
+long natural-EOS traces show that the stack remains coherent deep into decode,
+but they also expose costly xhigh overthinking tails.
+
+The selected dataset prompts contain only 125-713 tokens. Setting max length
+to 262144 verifies service capacity and long-decode compatibility; it does not
+exercise the Q8000 architecture prefill route or constitute another near-256K
+cold-prefill measurement. The 256K speed claim remains the matched target-only
+result in the preceding section. A combined NVFP4 plus DFlash2 near-256K cold
+request would be a separate acceptance item.
+
 ## Numerical gates and rejected variants
 
 - 18 route/bridge policy tests pass.
