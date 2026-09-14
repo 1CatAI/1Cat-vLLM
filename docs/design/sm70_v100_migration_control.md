@@ -46609,3 +46609,33 @@ has launched no full model. Details and artifacts are in
   13.62%/13.43%/13.90%/20.10%, so every recorded percentile clears the 10%
   target. The current endpoint remains healthy after collection; request-level
   throughput remains excluded from acceptance.
+
+## 2026-09-14 Qwen3.8-27B-FP8 TP4 C32 8K decode decay
+
+- The matched long-context criterion is 32 concurrent requests, exactly 8192
+  input and 256 generated tokens per request, temperature zero, ignore-EOS,
+  and full decode ordinals 2-251. Prefill, TTFT, padded tail, and request-level
+  throughput remain excluded. Two V100 and two A800 traces each contribute 250
+  stable steps, for 500 steps per device configuration.
+- The two complete V100 traces measure `36.183 ms` and `36.122 ms`; pooled
+  rank-max mean/p50/p90/p99 are `36.152/36.152/36.198/36.220 ms`. The two A800
+  traces measure `39.674 ms` and `39.772 ms`; pooled values are
+  `39.723/39.678/39.994/40.529 ms`. V100 decode-step rate is higher by
+  9.88%/9.75%/10.49%/11.90%. The 10%-faster mean threshold is `36.112 ms`, so
+  V100 currently misses it by `0.040 ms`; do not claim robust 10% superiority
+  at 8K from these traces.
+- From 2K to 8K, V100 step latency rises 22.54% while A800 rises 18.50%; the
+  V100 rate advantage narrows from 13.62% to 9.88%. V100 full-attention service
+  grows from `2.901 ms` to `9.350 ms`, accounting for about 97% of its
+  `6.650 ms` step increase. The inter-graph gap stays approximately
+  `1.664 ms`, and projection, GDN, norm, and layout costs are nearly flat.
+- At 8K, V100 attention is `0.424 ms` slower than A800 attention. Recover at
+  least `0.2-0.3 ms/step` for a repeatable margin. Test context-qualified
+  partition 256/384/512 choices before another communication change; the
+  previously rejected global partition-512 route regressed 2K and must not be
+  enabled unconditionally.
+- Two initial V100 four-second traces covered only the early 106/107 decode
+  positions and are diagnostic only. They understate the full 8192-to-8447
+  attention window and are excluded from the accepted comparison. The final
+  report and raw Nsight artifacts are under
+  `bench_results/27b_fp8_concurrency_a800_review_20260914/c32_8k/`.
