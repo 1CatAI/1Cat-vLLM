@@ -296,18 +296,35 @@ class Platform:
         return AttentionBackendEnum.TORCH_SDPA
 
     @classmethod
+    def resolve_device_id(cls, device_id: int | None) -> int:
+        """Turn an unspecified device index into a concrete one.
+
+        ``None`` means "the device this process runs on". The base platform
+        cannot know that device and keeps the historical answer, index 0 of
+        the visibility list. Accelerator platforms override this so that a
+        worker which has already selected its device answers for that device
+        rather than for whichever card happens to be listed first.
+        """
+        return 0 if device_id is None else device_id
+
+    @classmethod
     def get_device_capability(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> DeviceCapability | None:
-        """Stateless version of [torch.cuda.get_device_capability][]."""
+        """Stateless version of [torch.cuda.get_device_capability][].
+
+        ``device_id=None`` answers for the current device of this process
+        where the platform can tell (see
+        [`resolve_device_id`][vllm.platforms.interface.Platform.resolve_device_id]).
+        """
         return None
 
     @classmethod
     def has_device_capability(
         cls,
         capability: tuple[int, int] | int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         """
         Test whether this platform is compatible with a device capability.
@@ -318,7 +335,9 @@ class Platform:
         - An integer `<major><minor>`. (See
         [`DeviceCapability.to_int`][vllm.platforms.interface.DeviceCapability.to_int])
         """
-        current_capability = cls.get_device_capability(device_id=device_id)
+        current_capability = cls.get_device_capability(
+            device_id=cls.resolve_device_id(device_id)
+        )
         if current_capability is None:
             return False
 
@@ -331,7 +350,7 @@ class Platform:
     def is_device_capability(
         cls,
         capability: tuple[int, int] | int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         """
         Test whether this platform has exactly the specified device capability.
@@ -342,7 +361,9 @@ class Platform:
         - An integer `<major><minor>`. (See
         [`DeviceCapability.to_int`][vllm.platforms.interface.DeviceCapability.to_int])
         """
-        current_capability = cls.get_device_capability(device_id=device_id)
+        current_capability = cls.get_device_capability(
+            device_id=cls.resolve_device_id(device_id)
+        )
         if current_capability is None:
             return False
 
@@ -355,13 +376,15 @@ class Platform:
     def is_device_capability_family(
         cls,
         capability: int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         """
         Returns True if the device capability is any <major>.x.
         Mirrors CUDA 13 'family' architecture semantics (e.g. 10.x, 11.x, 12.x).
         """
-        current_capability = cls.get_device_capability(device_id=device_id)
+        current_capability = cls.get_device_capability(
+            device_id=cls.resolve_device_id(device_id)
+        )
         if current_capability is None:
             return False
         return (current_capability.to_int() // 10) == (capability // 10)
