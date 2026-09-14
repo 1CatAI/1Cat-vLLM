@@ -433,7 +433,11 @@ using QKDirectKernel =
 #ifndef PV_STAGES
   #define PV_STAGES 2
 #endif
-#if defined(PREFIX_TORCH_EXTENSION) && PV_TB_M == 128
+#ifndef PREFIX_TORCH_BLOCK_N
+  #define PREFIX_TORCH_BLOCK_N 8192
+#endif
+#if defined(PREFIX_TORCH_EXTENSION) && PV_TB_M == 128 && PV_TB_N == 256 && \
+    PV_WARP_M == 64 && PV_WARP_N == 64
   // M128/W64 uses two contiguous A accesses per thread.  Keep both 64-row
   // groups distinct and reduce their K partitions across the eight warps.
   #define PREFIX_PV_M128_W64_ROW_SUM
@@ -910,7 +914,11 @@ struct ExpRowSumTransformAImpl {
   }
 
   #if defined(PREFIX_TRANSPOSED_SCORE_WORKSPACE)
+    #if defined(PREFIX_PV_M128_W64_ROW_SUM)
+  float row_max[kContiguousIterations * kElementsPerAccess];
+    #else
   float row_max[kElementsPerAccess];
+    #endif
     #if defined(PREFIX_PV_SKIP_ROW_SUM)
       // Performance diagnostic: retain the exact exp transform but omit the
       // denominator state and final reduction.
@@ -942,9 +950,33 @@ struct ExpRowSumTransformAImpl {
   CUTLASS_DEVICE
   ExpRowSumTransformAImpl() {
   #if defined(PREFIX_TRANSPOSED_SCORE_WORKSPACE)
-    #pragma unroll
+    #if defined(PREFIX_PV_M128_W64_ROW_SUM)
+    auto offset = ThreadMap::initial_offset(threadIdx.x);
+      #pragma unroll
+    for (int contiguous = 0; contiguous < kContiguousIterations; ++contiguous) {
+      #pragma unroll
+      for (int element = 0; element < kElementsPerAccess; ++element) {
+      #if defined(PREFIX_TORCH_STABLE_ROWS)
+        int row = int(blockIdx.x) * PVThreadblockShape::kM +
+                  offset.contiguous() +
+                  contiguous * ThreadMap::Delta::kContiguous + element;
+        if constexpr (FuseCausalMask) {
+          row += stable_tail_query_tile() * 320 * 6;
+          row_max[contiguous * kElementsPerAccess + element] =
+              __ldg(g_79t_tail_row_max + row);
+        } else {
+          row_max[contiguous * kElementsPerAccess + element] =
+              __ldg(g_row_max + row);
+        }
+      #else
+        row_max[contiguous * kElementsPerAccess + element] = 0.0f;
+      #endif
+      }
+    }
+    #else
+      #pragma unroll
     for (int element = 0; element < kElementsPerAccess; ++element) {
-    #if defined(PREFIX_TORCH_STABLE_ROWS)
+      #if defined(PREFIX_TORCH_STABLE_ROWS)
       auto offset = ThreadMap::initial_offset(threadIdx.x);
       int row = int(blockIdx.x) * PVThreadblockShape::kM + offset.contiguous() +
                 element;
@@ -954,10 +986,11 @@ struct ExpRowSumTransformAImpl {
       } else {
         row_max[element] = __ldg(g_row_max + row);
       }
-    #else
+      #else
       row_max[element] = 0.0f;
-    #endif
+      #endif
     }
+    #endif
     #if defined(PREFIX_PV_SKIP_ROW_SUM)
     #elif defined(PREFIX_PV_COMPACT_DISTRIBUTED_ROW_SUM)
     static_assert(
@@ -1175,7 +1208,13 @@ struct ExpRowSumTransformAImpl {
                 float weight = exp2f(value);
     #else
       #if defined(PREFIX_TRANSPOSED_SCORE_WORKSPACE)
-                float const maximum = row_max[e];
+                float const maximum = row_max[
+        #if defined(PREFIX_PV_M128_W64_ROW_SUM)
+                    index * kElementsPerAccess + e
+        #else
+                    e
+        #endif
+            ];
       #else
                 float const maximum = row_max[s];
       #endif
@@ -5891,7 +5930,7 @@ struct Sm70GqaHalf2Workspace {
   static constexpr int kHeadDim = 256;
   static constexpr int kMinTotalKV = 8000;
   static constexpr int kMaxTotalKV = 256000;
-  static constexpr int kBlockN = 8192;
+  static constexpr int kBlockN = PREFIX_TORCH_BLOCK_N;
   static constexpr int kTailTileTokens = PREFIX_BATCHED_TAIL_TILE_TOKENS;
   static constexpr int kTailTiles = 8000 / kTailTileTokens;
   static constexpr int kTailTileRows = kTailTileTokens * 6;
@@ -5985,6 +6024,8 @@ struct Sm70GqaHalf2Workspace {
     static_assert(kTailTiles == 25);
     static_assert(kFinePVGroupTiles == 4);
     static_assert(kFinePVTasks == 91);
+    static_assert(kBlockN >= 8192 && kBlockN <= 16 * 8192 &&
+                  kBlockN % 8192 == 0);
     static_assert(kTailScoreElements <= size_t(kBlockN) * kRows);
     static_assert(PVThreadblockShape::kM == 64 ||
                   PVThreadblockShape::kM == 96 ||
@@ -6399,7 +6440,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     #if defined(PREFIX_TORCH_STABLE_ROWS)
     int width =
         std::min(Workspace::kBlockN, prefix - block * Workspace::kBlockN);
-    int tiles = 1;
+    int tiles = (width + 8191) / 8192;
     dim3 max_grid((Workspace::kRows + 255) / 256, tiles);
     stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(
         reinterpret_cast<__half const*>(scores),
@@ -6411,9 +6452,10 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     #endif
     prefix_pv[block]->launch(prefix_stream);
     #if defined(PREFIX_TORCH_STABLE_ROWS)
-    stable_merge_prefix<<<Workspace::kRows, 256, 0, prefix_stream>>>(
-        reinterpret_cast<__half const*>(prefix_numerator), block_sum, block_max,
-        prefix_accumulator, prefix_sum, prefix_max, block == 0);
+    stable_merge_prefix<<<(Workspace::kRows + 3) / 4, 256, 0, prefix_stream>>>(
+        reinterpret_cast<StablePrefixPartial const*>(prefix_numerator),
+        block_sum, block_max, prefix_accumulator, prefix_sum, prefix_max,
+        block == 0);
     #endif
     if (block == 0 && !exact_tail_debug && concurrent_tail_scores) {
       C10_CUDA_CHECK(

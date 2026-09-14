@@ -11,6 +11,18 @@ constexpr float kStableValueCenterThreshold = 0.05f;
 constexpr float kStableMaxExpInput = 10.0f;
 constexpr float kStableValueHeadroom = 64.0f;
 
+#if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+using StablePrefixPartial = float;
+__device__ __forceinline__ float stable_partial_to_float(float value) {
+  return value;
+}
+#else
+using StablePrefixPartial = __half;
+__device__ __forceinline__ float stable_partial_to_float(__half value) {
+  return __half2float(value);
+}
+#endif
+
 __device__ __forceinline__ float stable_exp(float value, float maximum) {
   return exp2f(fminf(value - maximum, kStableMaxExpInput) *
                1.4426950408889634f);
@@ -121,26 +133,36 @@ __global__ void stable_finish_max(float const* partials, float* maxima,
   maxima[row] = value + kStableScoreMargin;
 }
 
-__global__ void stable_merge_prefix(__half const* partial, float* block_sum,
-                                    float const* block_max, float* accumulator,
-                                    float* sum, float* maximum, bool first) {
-  int row = blockIdx.x;
-  int d = threadIdx.x;
-  __shared__ float scales[2];
-  if (d == 0) {
+__global__ void stable_merge_prefix(StablePrefixPartial const* partial,
+                                    float* block_sum, float const* block_max,
+                                    float* accumulator, float* sum,
+                                    float* maximum, bool first) {
+  constexpr int kRowsPerBlock = 4;
+  constexpr int kThreadsPerRow = 64;
+  int group = threadIdx.x / kThreadsPerRow;
+  int lane = threadIdx.x % kThreadsPerRow;
+  int row = blockIdx.x * kRowsPerBlock + group;
+  bool valid = row < g_rows;
+  __shared__ float scales[kRowsPerBlock][2];
+  if (lane == 0 && valid) {
     float old_max = first ? -CUDART_INF_F : maximum[row];
     float next = fmaxf(old_max, block_max[row]);
-    scales[0] = first ? 0.0f : expf(old_max - next);
-    scales[1] = expf(block_max[row] - next);
-    sum[row] =
-        (first ? 0.0f : sum[row] * scales[0]) + block_sum[row] * scales[1];
+    scales[group][0] = first ? 0.0f : expf(old_max - next);
+    scales[group][1] = expf(block_max[row] - next);
+    sum[row] = (first ? 0.0f : sum[row] * scales[group][0]) +
+               block_sum[row] * scales[group][1];
     maximum[row] = next;
     block_sum[row] = 0.0f;
   }
   __syncthreads();
-  int64_t index = int64_t(row) * 256 + d;
-  accumulator[index] = (first ? 0.0f : accumulator[index] * scales[0]) +
-                       __half2float(partial[index]) * scales[1];
+  if (!valid) return;
+#pragma unroll
+  for (int d = lane; d < 256; d += kThreadsPerRow) {
+    int64_t index = int64_t(row) * 256 + d;
+    accumulator[index] =
+        (first ? 0.0f : accumulator[index] * scales[group][0]) +
+        stable_partial_to_float(partial[index]) * scales[group][1];
+  }
 }
 
 __global__ void stable_merge_final(float const* prefix, float const* prefix_sum,
