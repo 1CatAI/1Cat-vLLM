@@ -84,7 +84,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
     get_explicit_cudagraph_memory_reserve,
-    get_uniform_token_count,
+    get_uniform_decode_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -1430,6 +1430,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+    def _get_uniform_decode_token_count(
+        self, scheduler_output: SchedulerOutput, dummy_run: bool
+    ) -> int | None:
+        num_tokens_per_req = scheduler_output.num_scheduled_tokens
+        num_reqs = len(num_tokens_per_req)
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(num_tokens_per_req.values())
+        uniform_count = get_uniform_decode_token_count(
+            num_reqs, num_tokens, max_query_len, has_prefill=False
+        )
+        if dummy_run or uniform_count is None:
+            # Capture/profile batches have no live request state. Non-uniform
+            # batches already miss the FULL decode graphs without a state scan.
+            return uniform_count
+        for req_id in num_tokens_per_req:
+            req_index = self.req_states.req_id_to_index[req_id]
+            if (
+                self.req_states.num_computed_prefill_tokens[req_index]
+                < self.req_states.prefill_len.np[req_index]
+            ):
+                # K+1 prompt tokens can have the shape of speculative decode,
+                # but must initialize/update state using prefill semantics.
+                return None
+        return uniform_count
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1457,23 +1482,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
-        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
-        uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
-        if (
-            not dummy_run
-            and getattr(self.cudagraph_manager, "_sm70_dflash2_tail_graphs", False)
-            and num_reqs == 1
-            and 1 <= num_toks < 8
-        ):
-            req_id = next(iter(scheduler_output.num_scheduled_tokens))
-            req_index = self.req_states.req_id_to_index[req_id]
-            if (
-                self.req_states.num_computed_prefill_tokens[req_index]
-                < self.req_states.prefill_len.np[req_index]
-            ):
-                # A short prompt/chunk must initialize GDN state rather than
-                # replay a graph captured for an already initialized decode.
-                uniform_tok_count = None
+        uniform_tok_count = self._get_uniform_decode_token_count(
+            scheduler_output, dummy_run
+        )
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
