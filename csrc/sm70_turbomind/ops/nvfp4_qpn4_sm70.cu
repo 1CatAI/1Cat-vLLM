@@ -16,6 +16,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "nvfp4_qpn2_layout.cuh"
+
 namespace {
 
 constexpr int kPrepareThreads = 256;
@@ -137,7 +139,7 @@ __device__ __forceinline__ half nvfp4_scale_code_to_half(uint8_t scale_code,
   return __hfma(raw_scale, scale_hi, correction);
 }
 
-template <bool UseScaleCode>
+template <bool UseScaleCode, bool TurboMindLayout = false>
 __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
     half* __restrict__ output, const uint8_t* __restrict__ codes,
     const void* __restrict__ packed_scales, half scale_hi, half scale_lo, int n,
@@ -164,7 +166,13 @@ __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
     scale = reinterpret_cast<const half*>(packed_scales)[word_index];
   }
   half2 weights[8];
-  fp4x16_to_half2x8(reinterpret_cast<const uint2*>(codes)[word_index], weights);
+  if constexpr (TurboMindLayout) {
+    const Nvfp4Qpn2CodeReader<true> reader(codes, tile, groups_k16, lane);
+    fp4x16_to_half2x8(reader.load(group), weights);
+  } else {
+    fp4x16_to_half2x8(reinterpret_cast<const uint2*>(codes)[word_index],
+                      weights);
+  }
   const half2 scale2 = __halves2half2(scale, scale);
 #pragma unroll
   for (int pair = 0; pair < 8; ++pair) {
@@ -554,9 +562,10 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
   return {packed_codes, packed_scale_codes};
 }
 
-void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
-                                    torch::Tensor scales, double global_scale,
-                                    bool use_scale_code) {
+template <bool TurboMindLayout>
+void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
+                                     torch::Tensor scales, double global_scale,
+                                     bool use_scale_code) {
   TORCH_CHECK(out.is_cuda() && codes.is_cuda() && scales.is_cuda(),
               "nvfp4_qpn4_dequantize_sm70_out: tensors must be CUDA");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
@@ -589,14 +598,14 @@ void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
       split_half_scale(static_cast<float>(global_scale) * kFp4Bias);
   const half zero_scale = __float2half_rn(0.0f);
   if (use_scale_code) {
-    nvfp4_qpn4_dequantize_sm70_kernel<true>
+    nvfp4_qpn4_dequantize_sm70_kernel<true, TurboMindLayout>
         <<<blocks, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<half*>(out.data_ptr<at::Half>()),
             codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
             split_scale.hi, split_scale.lo, static_cast<int>(n),
             static_cast<int>(k));
   } else {
-    nvfp4_qpn4_dequantize_sm70_kernel<false>
+    nvfp4_qpn4_dequantize_sm70_kernel<false, TurboMindLayout>
         <<<blocks, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<half*>(out.data_ptr<at::Half>()),
             codes.data_ptr<uint8_t>(), scales.data_ptr<at::Half>(), zero_scale,
@@ -605,10 +614,18 @@ void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
-                                 torch::Tensor input, torch::Tensor codes,
-                                 torch::Tensor scales, double global_scale,
-                                 bool use_scale_code, bool gated_silu) {
+void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
+                                    torch::Tensor scales, double global_scale,
+                                    bool use_scale_code) {
+  nvfp4_qpn4_dequantize_sm70_impl<false>(out, codes, scales, global_scale,
+                                         use_scale_code);
+}
+
+template <bool TurboMindLayout>
+void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
+                                  torch::Tensor input, torch::Tensor codes,
+                                  torch::Tensor scales, double global_scale,
+                                  bool use_scale_code, bool gated_silu) {
   TORCH_CHECK(input.is_cuda() && out.is_cuda(),
               "nvfp4_qpn4_prefill_sm70_out: input and output must be CUDA");
   TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
@@ -635,8 +652,8 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
           ? torch::empty({k, n}, input.options())
           : torch::from_blob(reinterpret_cast<void*>(dense_weight_ptr), {k, n},
                              input.options());
-  nvfp4_qpn4_dequantize_sm70_out(dense_weight, codes, scales, global_scale,
-                                 use_scale_code);
+  nvfp4_qpn4_dequantize_sm70_impl<TurboMindLayout>(
+      dense_weight, codes, scales, global_scale, use_scale_code);
   if (!gated_silu) {
     at::mm_out(out, input, dense_weight);
     return;
@@ -652,7 +669,54 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
+                                 torch::Tensor input, torch::Tensor codes,
+                                 torch::Tensor scales, double global_scale,
+                                 bool use_scale_code, bool gated_silu) {
+  nvfp4_qpn4_prefill_sm70_impl<false>(out, dense_weight_ptr, input, codes,
+                                      scales, global_scale, use_scale_code,
+                                      gated_silu);
+}
+
 #ifndef VLLM_QPN4_STANDALONE
+void nvfp4_qpn2_shared_decode_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu);
+
+// This distinct operator is the layout capability gate. Old binaries never
+// consume TurboMind codes as QPN2. A zero threshold disables dense prefill.
+void nvfp4_qpn2_tm_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor tm_weight,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_scales, int64_t tm_group_size,
+    int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m) {
+  TORCH_CHECK(min_prefill_m == 0 || min_prefill_m > 8,
+              "Shared QPN2 prefill threshold must be zero or exceed M=8");
+  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && tm_weight.dim() == 2 &&
+                  tm_weight.is_cuda() && tm_weight.is_contiguous() &&
+                  tm_weight.scalar_type() == torch::kInt32,
+              "Shared QPN2 expects a packed TurboMind int32 matrix");
+  const int64_t k = input.size(1);
+  const int64_t n = gated_silu ? out.size(1) * 2 : out.size(1);
+  TORCH_CHECK(
+      tm_group_size == 16 && tm_weight.size(0) == k &&
+          tm_weight.size(1) * 8 == n,
+      "Shared QPN2 requires non-interleaved SM70 NVFP4 B/Pack1 weights");
+  auto codes = tm_weight.view(torch::kUInt8);
+  if (min_prefill_m != 0 && input.size(0) >= min_prefill_m) {
+    auto prefill_scales = scales.view({k / 16, n});
+    nvfp4_qpn4_prefill_sm70_impl<true>(out, 0, input, codes, prefill_scales,
+                                       global_scale, true, gated_silu);
+    return;
+  }
+  nvfp4_qpn2_shared_decode_sm70_out(
+      out, input, codes, scales, global_scale, split_k, accumulator_chains,
+      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+}
+
 void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor codes, torch::Tensor scales,
                                   double global_scale, int64_t split_k,

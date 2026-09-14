@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <mutex>
 
+#include "nvfp4_qpn2_layout.cuh"
+
 #ifndef VLLM_NVFP4_QPN2_STANDALONE
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
@@ -76,7 +78,7 @@ __global__ void nvfp4_qpn2_prepack_codes_kernel(
 
 __global__ void nvfp4_qpn2_prepack_scales_kernel(
     uint8_t* __restrict__ output, const uint8_t* __restrict__ scales, int n,
-    int k) {
+    int k, int logical_n) {
   const size_t index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t numel = static_cast<size_t>(n) * k / 16;
@@ -90,7 +92,9 @@ __global__ void nvfp4_qpn2_prepack_scales_kernel(
   const int group = static_cast<int>(outer % groups_k16);
   const int tile = static_cast<int>(outer / groups_k16);
   const int column = tile * 32 + qpn2_col_from_lane(lane);
-  output[index] = scales[static_cast<size_t>(column) * groups_k16 + group];
+  output[index] = column < logical_n
+                      ? scales[static_cast<size_t>(column) * groups_k16 + group]
+                      : 0;
 }
 
 __device__ __forceinline__ half2 fp8e4m3_to_half2(uint8_t value) {
@@ -100,6 +104,25 @@ __device__ __forceinline__ half2 fp8e4m3_to_half2(uint8_t value) {
   const half converted =
       __hmul(__ushort_as_half(bits), __ushort_as_half(0x5c00));
   return __halves2half2(converted, converted);
+}
+
+// QPN2 stores [N/32, K/16, lane], while TurboMind V/Pack1 stores
+// [K/16, N] in logical column order. Preserve FP32 multiply then FP16 RNE.
+__global__ void nvfp4_qpn2_restore_tm_scales_kernel(half* output,
+                                                    const uint8_t* scales,
+                                                    float global_scale, int n,
+                                                    int groups) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= n * groups) {
+    return;
+  }
+  const int group = index / n;
+  const int column = index % n;
+  const int col = column % 32;
+  const int lane = ((col & 24) >> 1) | (col & 3) | ((col & 4) << 2);
+  const int source = ((column / 32) * groups + group) * 32 + lane;
+  const half raw = __low2half(fp8e4m3_to_half2(scales[source]));
+  output[index] = __float2half_rn(__fmul_rn(__half2float(raw), global_scale));
 }
 
 __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
@@ -126,7 +149,8 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <int SplitK, int NAcc, int RowTiles = 1>
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
+          bool CacheCodes = false>
 __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
                                        const uint8_t* __restrict__ group_scales,
                                        const half* __restrict__ input,
@@ -138,15 +162,16 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int tile = blockIdx.x;
+  const int tile = TurboMindLayout ? blockIdx.y : blockIdx.x;
   const int quadpair = (lane >> 2) & 3;
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int row_base = blockIdx.y * kQpn2RowsPerCta * RowTiles;
+  const int row_base =
+      (TurboMindLayout ? blockIdx.x : blockIdx.y) * kQpn2RowsPerCta * RowTiles;
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
-  const uint2* code_ptr = reinterpret_cast<const uint2*>(codes) +
-                          static_cast<size_t>(tile) * groups_k16 * 32 + lane;
+  const Nvfp4Qpn2CodeReader<TurboMindLayout, CacheCodes> reader(
+      codes, tile, groups_k16, lane);
   const uint8_t* scale_ptr =
       group_scales + static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const half2 global_scale2 = __float2half2_rn(global_scale * 16384.0f);
@@ -166,7 +191,7 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
 #pragma unroll 4
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
-    const uint2 packed = __ldcs(code_ptr + static_cast<size_t>(group) * 32);
+    const uint2 packed = reader.load(group);
     const half2 scale = __hmul2(
         fp8e4m3_to_half2(__ldg(scale_ptr + static_cast<size_t>(group) * 32)),
         global_scale2);
@@ -235,7 +260,7 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
   }
 }
 
-template <int SplitK, int NAcc, int RowTiles = 1>
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false>
 __global__ void nvfp4_qpn2_gated_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output, int hidden,
@@ -249,15 +274,17 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
   const int projection = warp_in_block / SplitK;
   const int warp = warp_in_block - projection * SplitK;
   const int hidden_tiles = hidden >> 5;
-  const int tile = blockIdx.x + projection * hidden_tiles;
+  const int output_tile = TurboMindLayout ? blockIdx.y : blockIdx.x;
+  const int tile = output_tile + projection * hidden_tiles;
   const int quadpair = (lane >> 2) & 3;
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int row_base = blockIdx.y * kQpn2RowsPerCta * RowTiles;
+  const int row_base =
+      (TurboMindLayout ? blockIdx.x : blockIdx.y) * kQpn2RowsPerCta * RowTiles;
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
-  const uint2* code_ptr = reinterpret_cast<const uint2*>(codes) +
-                          static_cast<size_t>(tile) * groups_k16 * 32 + lane;
+  const Nvfp4Qpn2CodeReader<TurboMindLayout> reader(codes, tile, groups_k16,
+                                                    lane);
   const uint8_t* scale_ptr =
       group_scales + static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const half2 global_scale2 = __float2half2_rn(global_scale * 16384.0f);
@@ -277,7 +304,7 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
 #pragma unroll 4
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
-    const uint2 packed = __ldcs(code_ptr + static_cast<size_t>(group) * 32);
+    const uint2 packed = reader.load(group);
     const half2 scale = __hmul2(
         fp8e4m3_to_half2(__ldg(scale_ptr + static_cast<size_t>(group) * 32)),
         global_scale2);
@@ -350,30 +377,46 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
       const half up_half = __float2half(up);
       const float gate_float = __half2float(gate_half);
       const half silu = __float2half(gate_float / (1.0f + expf(-gate_float)));
-      output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
+      output[static_cast<size_t>(output_row) * hidden + output_tile * 32 +
              output_col] = __hmul(silu, up_half);
     }
   }
 }
 
-template <int SplitK, int NAcc, int RowTiles = 1>
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false>
 void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                  half* output, int n, int k, int m, float global_scale,
                  cudaStream_t stream) {
   constexpr int kRowsPerCta = kQpn2RowsPerCta * RowTiles;
-  const dim3 grid(n / 32, (m + kRowsPerCta - 1) / kRowsPerCta);
-  nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles>
+  const int row_blocks = (m + kRowsPerCta - 1) / kRowsPerCta;
+  // Schedule adjacent row blocks against the same TurboMind weight tile.
+  // Reusing it before traversing N improves cache locality without repacking.
+  const dim3 grid =
+      TurboMindLayout ? dim3(row_blocks, n / 32) : dim3(n / 32, row_blocks);
+  if constexpr (TurboMindLayout) {
+    // Cache the TP4 GDN/attention output weights (3.75 MiB). The larger
+    // QKV and MLP projections retain streaming loads; caching regresses them.
+    if (k == 1536 && n == 5120) {
+      nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles, true, true>
+          <<<grid, (32 * SplitK), 0, stream>>>(codes, scales, input, output, n,
+                                               k, m, global_scale);
+      return;
+    }
+  }
+  nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles, TurboMindLayout>
       <<<grid, (32 * SplitK), 0, stream>>>(codes, scales, input, output, n, k,
                                            m, global_scale);
 }
 
-template <int SplitK, int NAcc, int RowTiles = 1>
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false>
 void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
                        const half* input, half* output, int hidden, int k,
                        int m, float global_scale, cudaStream_t stream) {
   constexpr int kRowsPerCta = kQpn2RowsPerCta * RowTiles;
-  const dim3 grid(hidden / 32, (m + kRowsPerCta - 1) / kRowsPerCta);
-  nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc, RowTiles>
+  const int row_blocks = (m + kRowsPerCta - 1) / kRowsPerCta;
+  const dim3 grid = TurboMindLayout ? dim3(row_blocks, hidden / 32)
+                                    : dim3(hidden / 32, row_blocks);
+  nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc, RowTiles, TurboMindLayout>
       <<<grid, (64 * SplitK), 0, stream>>>(codes, scales, input, output, hidden,
                                            k, m, global_scale);
 }
@@ -465,15 +508,39 @@ std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                      stream>>>(
       scales.data_ptr<uint8_t>(),
       reinterpret_cast<const uint8_t*>(weight_scale.data_ptr()),
-      static_cast<int>(n), static_cast<int>(k));
+      static_cast<int>(n), static_cast<int>(k), static_cast<int>(n));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {codes, scales};
 }
 
-void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
-                              torch::Tensor codes, torch::Tensor scales,
-                              double global_scale, int64_t split_k,
-                              int64_t accumulator_chains) {
+torch::Tensor nvfp4_qpn2_prepare_scales_sm70(torch::Tensor weight_scale) {
+  TORCH_CHECK(weight_scale.is_cuda() && weight_scale.dim() == 2 &&
+                  weight_scale.is_contiguous() &&
+                  weight_scale.scalar_type() == at::ScalarType::Float8_e4m3fn,
+              "QPN2 scale preparation expects a contiguous CUDA E4M3 matrix");
+  const int64_t logical_n = weight_scale.size(0);
+  const int64_t n = (logical_n + 31) / 32 * 32;
+  const int64_t k = weight_scale.size(1) * 16;
+  TORCH_CHECK(logical_n > 0 && k > 0 && k % 64 == 0,
+              "QPN2 scale preparation shape alignment mismatch");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(weight_scale));
+  auto scales =
+      torch::empty({n, k / 16}, weight_scale.options().dtype(torch::kUInt8));
+  const int blocks = (scales.numel() + kPrepareThreads - 1) / kPrepareThreads;
+  nvfp4_qpn2_prepack_scales_kernel<<<blocks, kPrepareThreads, 0,
+                                     at::cuda::getCurrentCUDAStream()>>>(
+      scales.data_ptr<uint8_t>(),
+      reinterpret_cast<const uint8_t*>(weight_scale.data_ptr()),
+      static_cast<int>(n), static_cast<int>(k), static_cast<int>(logical_n));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return scales;
+}
+
+template <bool TurboMindLayout>
+void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor codes, torch::Tensor scales,
+                               double global_scale, int64_t split_k,
+                               int64_t accumulator_chains) {
   check_qpn2_tensors(out, input, codes, scales, false);
   TORCH_CHECK(split_k == 8 || split_k == 16 || split_k == 32,
               "NVFP4 QPN2 split_k must be 8, 16, or 32");
@@ -493,11 +560,12 @@ void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   const int k = static_cast<int>(input.size(1));
   const int m = static_cast<int>(input.size(0));
 
-#define VLLM_LAUNCH_QPN2(ROWS, SPLIT, NACC)                                  \
-  launch_qpn2<SPLIT, NACC, ROWS>(code_ptr, scale_ptr, input_ptr, output_ptr, \
-                                 n, k, m, static_cast<float>(global_scale),  \
-                                 stream)
-  const bool native_two_tile = qpn2_m16_native_enabled(m);
+#define VLLM_LAUNCH_QPN2(ROWS, SPLIT, NACC)                \
+  launch_qpn2<SPLIT, NACC, ROWS, TurboMindLayout>(         \
+      code_ptr, scale_ptr, input_ptr, output_ptr, n, k, m, \
+      static_cast<float>(global_scale), stream)
+  // Separate 8-row CTAs pair better with the shared layout's tile ordering.
+  const bool native_two_tile = !TurboMindLayout && qpn2_m16_native_enabled(m);
   if (native_two_tile && split_k == 8 && accumulator_chains == 1) {
     VLLM_LAUNCH_QPN2(2, 8, 1);
   } else if (native_two_tile && split_k == 8) {
@@ -523,10 +591,11 @@ void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
-                               torch::Tensor codes, torch::Tensor scales,
-                               double global_scale, int64_t split_k,
-                               int64_t accumulator_chains) {
+template <bool TurboMindLayout>
+void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor codes, torch::Tensor scales,
+                                double global_scale, int64_t split_k,
+                                int64_t accumulator_chains) {
   check_qpn2_tensors(out, input, codes, scales, true);
   TORCH_CHECK(split_k == 8 || split_k == 16,
               "NVFP4 QPN2 gated split_k must be 8 or 16");
@@ -547,10 +616,10 @@ void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
   const int m = static_cast<int>(input.size(0));
 
 #define VLLM_LAUNCH_QPN2_GATED(ROWS, SPLIT, NACC)               \
-  launch_qpn2_gated<SPLIT, NACC, ROWS>(                         \
+  launch_qpn2_gated<SPLIT, NACC, ROWS, TurboMindLayout>(        \
       code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k, m, \
       static_cast<float>(global_scale), stream)
-  const bool native_two_tile = qpn2_m16_native_enabled(m);
+  const bool native_two_tile = !TurboMindLayout && qpn2_m16_native_enabled(m);
   if (native_two_tile && split_k == 8 && accumulator_chains == 1) {
     VLLM_LAUNCH_QPN2_GATED(2, 8, 1);
   } else if (native_two_tile && split_k == 8) {
@@ -568,26 +637,94 @@ void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                              torch::Tensor codes, torch::Tensor scales,
+                              double global_scale, int64_t split_k,
+                              int64_t accumulator_chains) {
+  nvfp4_qpn2_gemm_sm70_impl<false>(out, input, codes, scales, global_scale,
+                                   split_k, accumulator_chains);
+}
+
+void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor codes, torch::Tensor scales,
+                               double global_scale, int64_t split_k,
+                               int64_t accumulator_chains) {
+  nvfp4_qpn2_gated_sm70_impl<false>(out, input, codes, scales, global_scale,
+                                    split_k, accumulator_chains);
+}
+
 #ifndef VLLM_NVFP4_QPN2_STANDALONE
-void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor codes, torch::Tensor scales,
-                                  double global_scale, int64_t split_k,
-                                  int64_t accumulator_chains,
-                                  torch::Tensor tm_weight,
-                                  torch::Tensor tm_scales,
-                                  int64_t tm_group_size, int64_t tm_k_ld,
-                                  int64_t tm_q_ld, bool gated_silu) {
+void nvfp4_qpn2_restore_tm_scales_sm70_out(torch::Tensor out,
+                                           torch::Tensor scales,
+                                           double global_scale) {
+  TORCH_CHECK(out.is_cuda() && scales.is_cuda() &&
+                  out.device() == scales.device() && out.is_contiguous() &&
+                  scales.is_contiguous(),
+              "QPN2 scale restore requires contiguous tensors on one GPU");
+  TORCH_CHECK(
+      out.dim() == 2 && out.scalar_type() == torch::kFloat16 &&
+          scales.scalar_type() == torch::kUInt8 &&
+          out.numel() == scales.numel() && out.size(1) % 32 == 0,
+      "QPN2 scale restore expects FP16 [K/16,N] and packed uint8 scales");
+  const at::cuda::OptionalCUDAGuard guard(device_of(out));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  nvfp4_qpn2_restore_tm_scales_kernel<<<(out.numel() + 255) / 256, 256, 0,
+                                        stream>>>(
+      reinterpret_cast<half*>(out.data_ptr()), scales.data_ptr<uint8_t>(),
+      static_cast<float>(global_scale), out.size(1), out.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_qpn2_compact_tm_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor weight,
+                                         torch::Tensor scales,
+                                         double global_scale, int64_t k_ld,
+                                         int64_t q_ld, bool gated_silu) {
+  // Only the fallback needs these scales. Serial calls reuse the allocator's
+  // temporary block; model admission excludes fallback-sized CUDA graphs.
+  auto expanded = torch::empty({input.size(1) / 16, weight.size(1) * 8},
+                               input.options().dtype(torch::kFloat16));
+  nvfp4_qpn2_restore_tm_scales_sm70_out(expanded, scales, global_scale);
+  nvfp4_gemm_sm70_out(out, input, weight, expanded, 16, k_ld, q_ld, gated_silu);
+}
+
+template <bool TurboMindLayout>
+void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor codes, torch::Tensor scales,
+                                   double global_scale, int64_t split_k,
+                                   int64_t accumulator_chains,
+                                   torch::Tensor tm_weight,
+                                   torch::Tensor tm_scales,
+                                   int64_t tm_group_size, int64_t tm_k_ld,
+                                   int64_t tm_q_ld, bool gated_silu) {
   if (input.size(0) <= kQpn2DispatchMaxRows) {
     if (gated_silu) {
-      nvfp4_qpn2_gated_sm70_out(out, input, codes, scales, global_scale,
-                                split_k, accumulator_chains);
+      nvfp4_qpn2_gated_sm70_impl<TurboMindLayout>(
+          out, input, codes, scales, global_scale, split_k, accumulator_chains);
     } else {
-      nvfp4_qpn2_gemm_sm70_out(out, input, codes, scales, global_scale, split_k,
-                               accumulator_chains);
+      nvfp4_qpn2_gemm_sm70_impl<TurboMindLayout>(
+          out, input, codes, scales, global_scale, split_k, accumulator_chains);
     }
     return;
   }
 
+  if constexpr (TurboMindLayout) {
+    if (tm_scales.scalar_type() == torch::kUInt8) {
+      if (!gated_silu) {
+        nvfp4_qpn2_compact_tm_gemm_sm70_out(out, input, tm_weight, tm_scales,
+                                            global_scale, tm_k_ld, tm_q_ld,
+                                            false);
+      } else {
+        auto gate_up =
+            torch::empty({input.size(0), out.size(1) * 2}, input.options());
+        nvfp4_qpn2_compact_tm_gemm_sm70_out(gate_up, input, tm_weight,
+                                            tm_scales, global_scale, tm_k_ld,
+                                            tm_q_ld, false);
+        silu_and_mul(out, gate_up);
+      }
+      return;
+    }
+  }
   if (!gated_silu) {
     nvfp4_gemm_sm70_out(out, input, tm_weight, tm_scales, tm_group_size,
                         tm_k_ld, tm_q_ld, false);
@@ -598,6 +735,31 @@ void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
   nvfp4_gemm_sm70_out(gate_up, input, tm_weight, tm_scales, tm_group_size,
                       tm_k_ld, tm_q_ld, false);
   silu_and_mul(out, gate_up);
+}
+
+void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor codes, torch::Tensor scales,
+                                  double global_scale, int64_t split_k,
+                                  int64_t accumulator_chains,
+                                  torch::Tensor tm_weight,
+                                  torch::Tensor tm_scales,
+                                  int64_t tm_group_size, int64_t tm_k_ld,
+                                  int64_t tm_q_ld, bool gated_silu) {
+  nvfp4_qpn2_dispatch_sm70_impl<false>(
+      out, input, codes, scales, global_scale, split_k, accumulator_chains,
+      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+}
+
+// Internal entry for the shared-layout dispatcher, also used with prefill off.
+void nvfp4_qpn2_shared_decode_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu) {
+  nvfp4_qpn2_dispatch_sm70_impl<true>(
+      out, input, codes, scales, global_scale, split_k, accumulator_chains,
+      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
 }
 #endif
 
