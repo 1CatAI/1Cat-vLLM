@@ -46595,13 +46595,17 @@ has launched no full model. Details and artifacts are in
   max-model-length 4096 did not reduce active attention time, partition 512
   regressed, and direct TP4 all-reduce+RMS graph fusion did not match; these
   routes are rejected for this milestone.
-- A fresh model launch with the rebuilt minimum-batch extension logged all
-  five automatic defaults and the same 35 coordinated FP8 tuning records on
-  all four ranks. Its first FULL decode-graph compilation did not finish
-  within the diagnostic's 360-second startup bound, so it was stopped before
-  any request and contributes no speed or quality sample. Do not repeat that
-  unchanged cold compile as a benchmark; use a prebuilt wheel or a deliberately
-  longer compile-only preparation if another end-to-end binary trace is
-  required. The two completed full traces above used the identical C32
-  6-warp kernel path; the rebuilt-extension batch sweep validates the new
-  low-batch selector separately.
+- The rebuilt minimum-batch extension was subsequently exercised in a complete
+  source endpoint. All four workers mapped DSO
+  `eea5fdd5...cbc1a0`, all five automatic defaults were logged, and every rank
+  loaded the same 35 coordinated FP8 tuning records. With the compile cache
+  prepared, CUDA graph capture finished in 92 seconds. A deterministic
+  2048-input/256-output request returned HTTP 200, `finish_reason=length`, and
+  exactly 256 output tokens (token-id SHA256 `5be973bb...eeca9f`).
+- Two rebuilt-source C32 traces measured rank-max replay intervals of
+  `29.535 ms` and `29.502 ms`. The cleaner repeat selected 244 stable full-batch
+  steps and measured p50 `29.489 ms`, p90 `29.511 ms`, and p99 `29.877 ms`.
+  Relative to the A800 mean/p50/p90/p99, decode-step rate is higher by
+  13.62%/13.43%/13.90%/20.10%, so every recorded percentile clears the 10%
+  target. The current endpoint remains healthy after collection; request-level
+  throughput remains excluded from acceptance.
