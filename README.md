@@ -1162,7 +1162,6 @@ Join the **1Cat-vLLM Open-Source Community Group 8** by scanning the latest QR c
 
 <img width="966" height="1518" alt="472f168308d5e697058d30e51ffb2f4c" src="https://github.com/user-attachments/assets/fa8c71be-6a81-491e-895a-04bca665cceb" />
 
-
 > This QR code is valid through **September 20, 2026**. WeChat group QR codes expire periodically; if it has expired, add WeChat ID **`YM_isi`** to request the latest invitation.
 
 ---
