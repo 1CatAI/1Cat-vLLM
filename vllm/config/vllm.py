@@ -312,6 +312,23 @@ def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
     ) or _any_participating_device_is_capability(cfg, (7, 5))
 
 
+def checkpoint_kv_quant_allowed(cfg: "VllmConfig") -> bool:
+    """May the checkpoint's own metadata select a quantized KV cache here?
+
+    A checkpoint that declares ``kv_cache_quant_algo`` or ``kv_cache_scheme``
+    describes how its weights were produced. With ``--kv-cache-dtype auto``
+    vLLM reads that as permission to also store the KV cache in FP8. On
+    Volta and Turing there is no FP8 hardware: the cache is unpacked in
+    software and decode attention loses its tensor-core route (measured on
+    4x V100 with Qwen3.8-27B: +4.82 ms per decode round, 4.5x the cost of
+    the FP8 weights the checkpoint ships with), and on Turing the FP8 cast
+    is not compiled at all. So the directive is honored only when every
+    participating device is Ampere or newer. An explicit ``--kv-cache-dtype``
+    never reaches this policy.
+    """
+    return not _any_participating_device_is_pre_ampere(cfg)
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -1479,6 +1496,20 @@ class VllmConfig:
 
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
+
+        if (
+            self.cache_config.cache_dtype_from_checkpoint
+            and not checkpoint_kv_quant_allowed(self)
+        ):
+            logger.info_once(
+                "Ignoring the checkpoint's KV-cache quantization directive (%s): "
+                "a participating device is Volta or Turing, which has no FP8 "
+                "hardware, so the KV cache keeps the model dtype. Pass "
+                "--kv-cache-dtype explicitly to override.",
+                self.cache_config.cache_dtype,
+            )
+            self.cache_config.cache_dtype = "auto"
+            self.cache_config.cache_dtype_from_checkpoint = False
 
         self.try_verify_and_update_config()
 
