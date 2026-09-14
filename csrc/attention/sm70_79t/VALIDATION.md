@@ -1,5 +1,12 @@
 # SM70 Q8000/Q8192 integration validation (2026-09-14)
 
+The first integration measurements below are retained as historical evidence
+and explicitly identify their eager configuration. Follow-up validation from
+the E4M3 route-parity work uses normal CUDA graphs. The current
+`benchmark_sm70_79t_cold.py` fixes `enforce_eager=False`; future results from
+this benchmark must not be compared with an eager run without labeling the
+mode difference.
+
 ## Contract
 
 Base `7217bb5d4f3866f87bf6a961204c894af3b03261`; optimized kernel
@@ -274,6 +281,20 @@ The decoded answer is `校验词是「海蓝石榴」，太阳系最大的行星
 both retrieval and knowledge checks pass, `cached_tokens` is zero, and the log
 has no NaN, Inf, overflow, OOM, CUDA error, or worker failure.
 
+A follow-up TP4 full-model gate verifies that the same architecture is reached
+from an NVFP4/compressed-tensors checkpoint with E4M3 KV and normal
+`FULL_AND_PIECEWISE` CUDA graphs. With Q8192 chunks, maximum length 262144,
+one live request, prefix caching off, and no speculative decoding, the 256000-
+token cold request measures 102.7519-second TTFT and **2491.44 prompt tok/s**.
+It returns the same complete 16-token answer above; both quality checks pass
+and `cached_tokens=0`. Its 15 token intervals are too short for a decode-speed
+claim. A separate 256000-input/256-output fixed run measures 255 intervals in
+5.3902 seconds, or **47.308 tok/s** and **21.138 ms TPOT**. Its TTFT is
+102.9135 seconds and uncached prefill is 2487.53 tok/s. Every rank records 480
+native Q8192 calls and 496 E4M3 bridge calls. The final route summary records
+48 dynamic page-800 E4M3 XQA decode calls per rank. Neither run enables eager
+mode.
+
 For concurrent full chunks, 8192 is a per-request scheduling threshold rather
 than the total batch limit. Two chunks use `max_num_batched_tokens=16384`,
 `max_num_seqs=2`, and `long_prefill_token_threshold=8192`; larger total token
@@ -321,3 +342,31 @@ the architecture to other head layouts or unaligned prefix PV tiles requires
 separate numerical and end-to-end qualification because FP16 score/probability
 storage remains approximate even though PV accumulation and prefix output are
 FP32.
+
+## B2-B32 CUDA-graph serving promotion gate
+
+The final TP4 NVFP4/E4M3 server uses normal `FULL_AND_PIECEWISE` CUDA graphs,
+prefix caching off, 262144 maximum context, 65536 batched tokens, and 32
+maximum sequences. The no-MTP default full-graph capture set is expanded from
+`[1, 2, 4, 8, 16]` to `[1, 2, 4, 8, 16, 32]`. This removes the pre-existing
+B16 capture ceiling. It does not add an attention batch ceiling: larger
+scheduler batches retain the existing piecewise graph and the same E4M3
+attention routes.
+
+Standard `vllm bench serve` exact-2048-input/exact-256-output rows complete
+with zero failures:
+
+| Concurrency | Median TTFT | Pure decode* | Median/P90 ITL | Output TPS | Median request wall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| C2 | 0.8554 s | 115.725 tok/s | 17.282 / 17.406 ms | 92.288 tok/s | 5.539 s |
+| C4 | 1.6962 s | 223.730 tok/s | 17.879 / 18.038 ms | 151.222 tok/s | 6.761 s |
+| C8 | 5.2214 s | 418.723 tok/s | 19.106 / 19.248 ms | 203.168 tok/s | 10.076 s |
+| C16 | 10.7109 s | 708.450 tok/s | 22.585 / 22.837 ms | 248.859 tok/s | 16.451 s |
+| C32 | 21.7727 s | **983.986 tok/s** | 32.521 / 32.824 ms | **272.868 tok/s** | 30.008 s |
+
+`Pure decode` is concurrency times 1000 divided by pooled median ITL. All 62
+requests generate the full 256 tokens, and a separate 32-request
+natural-language burst passes both retrieval and knowledge checks on every
+request. The B2/B4/B8/B16/B32 page-800 256K CUDA-graph operator matrix is
+finite throughout, differs from scalar E4M3 by at most `4.77e-7`, and reaches
+3.64x/6.12x/6.35x/6.46x/6.59x speedup, respectively.

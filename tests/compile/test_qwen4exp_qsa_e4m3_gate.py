@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The QSA E4M3 scale gate must degrade to a warning, not refuse to start.
 
 A checkpoint that was never calibrated for the E4M3 QSA KV cache carries no
