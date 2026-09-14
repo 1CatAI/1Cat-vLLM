@@ -1572,6 +1572,14 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
         "Skipping QuTLASS external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
     endif()
 
+    # Turing gets its own FA2 build (see the file for why it is a separate
+    # project). Independent of which FA2 tree the block below fetches.
+    cuda_archs_loose_intersection(VLLM_FLASH_ATTN_SM75_ARCHS
+      "7.5" "${CUDA_ARCHS}")
+    if(VLLM_FLASH_ATTN_SM75_ARCHS)
+      include(cmake/external_projects/vllm_flash_attn_sm75.cmake)
+    endif()
+
     cuda_archs_loose_intersection(VLLM_FLASH_ATTN_ARCHS
       "8.0+PTX" "${CUDA_ARCHS}")
     if(VLLM_FLASH_ATTN_ARCHS)
