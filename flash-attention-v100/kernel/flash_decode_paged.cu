@@ -156,6 +156,11 @@ bool xqa_g6_dual_cta_enabled() {
   return value != nullptr && value[0] == '1';
 }
 
+int xqa_g6_dual_cta_min_batch() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH");
+  return value == nullptr ? 1 : std::max(1, std::atoi(value));
+}
+
 bool xqa_e4m3_batch_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA");
   return value == nullptr || value[0] != '0';
@@ -5554,7 +5559,8 @@ at::Tensor flash_attention_decode_paged_xqa(
       use_mtp5_dual_cta || use_e5m2_g6_dual_cta ||
       batch_context_route == XQABatchContextRoute::kDualCta ||
       batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
-      (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
+      (q.size(0) >= xqa_g6_dual_cta_min_batch() && xqa_g6_dual_cta_enabled() &&
+       (use_padded_smem || use_g6_dual_cta_dense));
   const bool use_split_reduce =
       use_g6_p1024_auto || use_g6_p1024_sawtooth || use_e5m2_g6_dual_cta ||
       batch_context_route == XQABatchContextRoute::kDualCtaSplit ||

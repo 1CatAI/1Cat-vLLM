@@ -84,6 +84,20 @@ _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
+_SM70_QWEN38_27B_FP8_C32_DEFAULTS = {
+    # C32 must be present in both the coordinated warmup and the runtime
+    # selector. Otherwise M32 silently falls back to the untuned tactic.
+    "VLLM_SM70_AWQ_WARMUP_MAX_M": "32",
+    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "32",
+    # These two routes preserve the established FP16 result while cutting the
+    # C32 graph's normalization nodes and raising XQA residency, respectively.
+    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": "1",
+    # The 6-warp route wins at B16/B32 but loses at B1-B8. Keep the existing
+    # 8-warp route for latency-oriented graphs captured by the same server.
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH": "16",
+}
+
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     # Preserve candidate and dense logits in FP32 through sampling.
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
@@ -282,6 +296,47 @@ def _apply_sm70_qwen38_nomtp_defaults(
     }
     applied = []
     for name, value in defaults.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            applied.append(name)
+    return tuple(applied)
+
+
+def _apply_sm70_qwen38_27b_fp8_c32_defaults(
+    cfg: "VllmConfig", *, is_sm70: bool
+) -> tuple[str, ...]:
+    """Apply the measured TP4 C32 decode routes to their exact model contract."""
+    model = cfg.model_config
+    parallel = cfg.parallel_config
+    scheduler = cfg.scheduler_config
+    compilation = cfg.compilation_config
+    if not is_sm70 or model is None or cfg.speculative_config is not None:
+        return ()
+
+    hf_text_config = getattr(model, "hf_text_config", None)
+    architectures = set(getattr(model, "architectures", ()) or ())
+    capture_sizes = set(compilation.cudagraph_capture_sizes or ())
+    if not (
+        "Qwen3_5ForConditionalGeneration" in architectures
+        and getattr(model, "dtype", None) == torch.float16
+        and getattr(model, "quantization", None) == "fp8"
+        and getattr(hf_text_config, "hidden_size", None) == 5120
+        and getattr(hf_text_config, "num_hidden_layers", None) == 64
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 4
+        and getattr(hf_text_config, "head_dim", None) == 256
+        and getattr(hf_text_config, "full_attention_interval", None) == 4
+        and parallel.tensor_parallel_size == 4
+        and parallel.pipeline_parallel_size == 1
+        and not parallel.enable_dbo
+        and scheduler.max_num_seqs >= 32
+        and 32 in capture_sizes
+        and cfg.cache_config.cache_dtype in ("auto", "float16")
+    ):
+        return ()
+
+    applied = []
+    for name, value in _SM70_QWEN38_27B_FP8_C32_DEFAULTS.items():
         if name not in os.environ:
             os.environ[name] = value
             applied.append(name)
@@ -1882,6 +1937,19 @@ class VllmConfig:
             and sm70_flash_v100_backend
         )
         if sm70_flash_v100_baseline:
+            for env_name in _apply_sm70_qwen38_27b_fp8_c32_defaults(
+                self,
+                is_sm70=all(
+                    current_platform.is_device_capability((7, 0), device_id=i)
+                    for i in _participating_cuda_device_ids(self)
+                ),
+            ):
+                logger.info_once(
+                    "Auto-setting %s=%s for the SM70 Qwen3.8-27B-FP8 "
+                    "TP4 C32 decode route. Set it explicitly to override.",
+                    env_name,
+                    os.environ[env_name],
+                )
             if (
                 self.model_config is not None
                 and self.model_config.multimodal_config is not None

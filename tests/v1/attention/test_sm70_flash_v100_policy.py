@@ -266,6 +266,19 @@ def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
     assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED is False
 
 
+def test_sm70_g6_dual_cta_min_batch_env_contract(monkeypatch):
+    import vllm.envs as envs
+
+    name = "VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH == 1
+
+    monkeypatch.setenv(name, "16")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH == 16
+
+
 def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     import vllm.envs as envs
 

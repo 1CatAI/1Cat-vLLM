@@ -46555,3 +46555,53 @@ has launched no full model. Details and artifacts are in
   with the CUDA-12.8 Flash-V100 extension.
 - Model admission and human review remain outstanding. PR524 stays Draft;
   no auto-merge, production default change, or private long-prefill promotion.
+
+## 2026-09-14 Qwen3.8-27B-FP8 TP4 C32 pure-decode recovery
+
+- The accepted comparison window is concurrency 32, 2048 input tokens, 256
+  generated tokens, FP16 KV, no speculative decoding, TP4 on GPUs 0-3, and a
+  32768-token CUDA-graph capacity. Stable graph-replay intervals exclude
+  prefill and request-level throughput. The A800 reference interval is
+  `33.521 ms/step`; a 10% higher decode-step rate requires at most
+  `30.474 ms/step`.
+- The original V100 trace measured `36.285 ms/step`. Its largest C1-to-C32
+  expansions were FP8 projections (`+6.846 ms`), GDN (`+3.317 ms`), full
+  attention (`+2.837 ms`), and TP communication (`+2.413 ms`). Direct C32
+  comparison showed the V100 projection and GDN were already faster than the
+  A800 reference, while TP communication, layout/elementwise work, and full
+  attention accounted for the remaining absolute gap.
+- Coordinated M32 FP8 tuning reduced the interval to `34.235 ms`. Enabling the
+  established fused Gemma add+RMS route reduced it to `31.330 ms`. The
+  existing 6-warp dual-resident G6/D256 attention route then produced two
+  independent full traces at `30.140 ms` and `30.124 ms`; the repeat has p90
+  `30.143 ms` and p99 `30.158 ms`. This is 11.27% more decode steps per second
+  than the A800 reference and clears the target by `0.350 ms/step`.
+- The repeat trace reduced full-attention rank-mean service from `4.113 ms` to
+  `2.897 ms`, FP8 projection service from `17.176 ms` to `14.868 ms`, and the
+  fragmented elementwise/layout category from `3.534 ms` to `1.312 ms`.
+  TP communication remains `2.990 ms` and is the next independent source
+  target. The optimized graph contains 1076 nodes versus the original 1696.
+- Defaults apply only to the exact Qwen3.8-27B-FP8, FP16, TP4, no-speculative,
+  graph-captured C32 contract and preserve explicit environment overrides.
+  They warm and tune M24/M32, select the fused Gemma RMS route, and enable the
+  6-warp attention route at batch 16 or larger. An added minimum-batch selector
+  keeps B1-B8 on the established 8-warp path; a B1/2/4/8/16/24/32 operator
+  sweep found no low-batch route regression and measured 34.24% and 35.25%
+  attention speedups at B16 and B32.
+- The new Flash-V100 extension builds successfully with CUDA 12.8 and SM70.
+  The batch sweep is bit-exact against the 8-warp output at every tested
+  batch. Focused config, environment, and fused-RMS tests pass. A custom
+  all-reduce block-count sweep saved only 1.7% of the isolated collective,
+  max-model-length 4096 did not reduce active attention time, partition 512
+  regressed, and direct TP4 all-reduce+RMS graph fusion did not match; these
+  routes are rejected for this milestone.
+- A fresh model launch with the rebuilt minimum-batch extension logged all
+  five automatic defaults and the same 35 coordinated FP8 tuning records on
+  all four ranks. Its first FULL decode-graph compilation did not finish
+  within the diagnostic's 360-second startup bound, so it was stopped before
+  any request and contributes no speed or quality sample. Do not repeat that
+  unchanged cold compile as a benchmark; use a prebuilt wheel or a deliberately
+  longer compile-only preparation if another end-to-end binary trace is
+  required. The two completed full traces above used the identical C32
+  6-warp kernel path; the rebuilt-extension batch sweep validates the new
+  low-batch selector separately.
