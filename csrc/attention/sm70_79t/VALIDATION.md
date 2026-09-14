@@ -3,7 +3,7 @@
 ## Contract
 
 Base `7217bb5d4f3866f87bf6a961204c894af3b03261`; optimized kernel
-`7e3939f3e6`. The implementation is built into the normal
+`359ae7c30a`. The implementation is built into the normal
 `vllm.vllm_flash_attn._vllm_fa2_C` extension. It has no private DSO or
 preload dependency and remains experimental and opt-in.
 
@@ -43,7 +43,8 @@ overflowed independently on ranks 2 and 3 at KV152K. Sparse score maxima
 missed by the sampled shift were 15.31-16.00 above the sample. The largest
 observed FP16 PV partial was 75310, beyond the FP16 finite limit 65504.
 
-The qualified recipe retains FP16 tensor-core PV and applies four guards:
+The qualified recipe uses FP16 Tensor Core operands with FP32 MMA
+accumulation and applies four guards:
 
 - sample one score in eight, add a 4.0 shift margin, and cap positive
   exponent input at 10.0;
@@ -51,11 +52,16 @@ The qualified recipe retains FP16 tensor-core PV and applies four guards:
   is at least 0.05;
 - scan all residual V values and scale them by an exact power of two with
   64x additional headroom;
-- keep block masses and the online prefix/tail merge in FP32, then restore
-  the V center after normalization.
+- write each 24K prefix numerator block in FP32 and keep block masses and the
+  online prefix/tail merge in FP32, then restore the V center after
+  normalization.
 
 The 64x headroom makes all three captured failure tensors finite. It is a
-model-qualified bound, not a proof over arbitrary FP16 inputs.
+model-qualified bound, not a proof over arbitrary FP16 inputs. The
+128x256/64x64 PV topology has no local-memory spills in the admitted prefix
+kernel. Expanding the prefix block from 8K to 24K reduces the number of FP32
+online merges while keeping the score workspace within the 32-GiB V100
+end-to-end budget.
 
 ## Operator result
 
@@ -65,30 +71,28 @@ The following medians use the final source-built artifact, 30 warmups and
 
 | KV tokens | Median (ms) | p10 (ms) | p90 (ms) | TFLOP/s | Relative L2 | Worst-row relative L2 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128000 | 80.6114 | 80.2029 | 80.8609 | **75.6081** | 0.007129 | 0.008302 |
-| 256000 | 164.7010 | 163.6619 | 214.4517 | **75.2050** | 0.007052 | 0.008119 |
+| 128000 | 79.9700 | 79.6289 | 80.4487 | **76.2145** | 0.002364 | 0.003096 |
+| 256000 | 164.3465 | 163.5427 | 165.1093 | **75.3672** | 0.002317 | 0.003070 |
 
-Both medians clear the 75-TFLOP/s target. The 256K p90 includes transient
-host/GPU interference; the median and p10 remain consistent with the prior
-100-sample run at 75.27 TFLOP/s.
+Both medians clear the 75-TFLOP/s target. Relative L2 improves by about 3x
+from the guarded FP16-accumulator result while median throughput remains in
+the same 75-TFLOP/s band.
 
 ## Cold end-to-end result
 
 | Prompt tokens | TTFT (s) | Prompt tokens / TTFT | Full wall (s) | Subsequent decode (tok/s) |
 | ---: | ---: | ---: | ---: | ---: |
-| 16000 | 3.31870 | 4821.17 | 4.62378 | 11.4937 |
-| 128000 | 36.07453 | 3548.21 | 37.52012 | 10.3765 |
-| 256000 | 94.58807 | **2706.47** | 95.77519 | 12.6356 |
+| 256000 | 94.40737 | **2711.65** | 95.76525 | 11.0468 |
 
-These are single unprofiled cold requests, not confidence intervals. The
-256K row is a final rerun of the formatted artifact; the 16K/128K rows come
-from the immediately preceding formatting-equivalent build. TTFT includes
-prefill and first-token overhead. Subsequent decode uses the 15 intervals
-after the first token. `cached_tokens` is zero for every request. Every TP
-rank reports respectively 16/240/496 architecture calls and the same number
-of E4M3 bridge calls.
+This is a single unprofiled cold request, not a confidence interval. TTFT
+includes prefill and first-token overhead. Subsequent decode uses the 15
+intervals after the first token. `cached_tokens` is zero. All four TP ranks
+record 496 architecture calls and 496 E4M3 bridge calls, and the loaded FA2
+module is the source-built worktree artifact. An independent immediately
+preceding run measured 94.51140-second TTFT and 2708.67 prompt tok/s.
 
-All lengths emit the same 16 tokens, including EOS:
+The request emits the same 16 tokens as the guarded FP16 build, stable FP32
+control, and matched v37 control, including EOS:
 
 ```text
 119920 96919 95761 12512 96143 97460 115783 10119
@@ -104,13 +108,17 @@ long-context text-health gate, not broad model equivalence.
 
 | Route | 16K TTFT / tok/s | 128K TTFT / tok/s | 256K TTFT / tok/s |
 | --- | ---: | ---: | ---: |
-| Optimized guarded FP16 PV | 3.3187 / 4821.17 | 36.0745 / 3548.21 | **94.5881 / 2706.47** |
-| Stable FP32 PV | 3.3608 / 4760.75 | 40.0996 / 3192.05 | 111.3729 / 2298.58 |
+| Qualified FP32 MMA + FP32 block output | - | - | **94.4074 / 2711.65** |
+| Guarded FP16 MMA accumulator | 3.3187 / 4821.17 | 36.0745 / 3548.21 | 94.5881 / 2706.47 |
+| Earlier stable FP32 diagnostic | 3.3608 / 4760.75 | 40.0996 / 3192.05 | 111.3729 / 2298.58 |
 | v37 control | 3.3294 / 4805.64 | 38.7531 / 3302.96 | 105.6480 / 2423.14 |
 
-At 256K, the optimized route has 10.47% lower TTFT and 11.69% higher prompt
-throughput than the matched v37 control. It has 15.07% lower TTFT and 17.75%
-higher prompt throughput than the stable FP32 implementation.
+At 256K, the qualified FP32 route has 10.64% lower TTFT and 11.91% higher
+prompt throughput than the matched v37 control. It has 15.23% lower TTFT and
+17.97% higher prompt throughput than the earlier spill-heavy stable FP32
+implementation. It is 0.19% faster than the guarded FP16 route in this
+single-run comparison while cutting the operator's relative L2 by about
+threefold.
 
 The earlier 1032.23-second report did not select the intended architecture
 and bridge. The optimized route reduces that wall-clock anomaly by about
@@ -120,9 +128,12 @@ a cold-prefill result.
 ## Broader NVFP4 plus DFlash2 serving sample
 
 A separate serving-quality run checked whether the guarded attention build
-remains healthy in the Qwen3.8-27B-NVFP4 plus DFlash2 stack. This is a
-compatibility and output-health result, not a matched comparison with the FP8
-target-only cold-prefill contract above. It used TP4, E4M3 target KV,
+remains healthy in the Qwen3.8-27B-NVFP4 plus DFlash2 stack. It predates the
+FP32-accumulation change. The selected prompts are too short to enter the
+Q8000 architecture route, and the change does not affect decode, so rerunning
+them would not exercise the new code. This is a compatibility and
+output-health result, not a matched comparison with the FP8 target-only
+cold-prefill contract above. It used TP4, E4M3 target KV,
 Flash-V100 for target and draft attention, seven probabilistic draft tokens,
 four concurrent requests, max length 262144, and a 65536-token output cap.
 Sampling used temperature 0.6, top-p 0.95, top-k 20, seed 0, and xhigh
@@ -166,18 +177,31 @@ request would be a separate acceptance item.
 
 ## Numerical gates and rejected variants
 
-- 18 route/bridge policy tests pass.
+- Four focused architecture route-policy tests pass after the FP32 change.
+  The broader preceding integration run had 18 route/bridge policy tests
+  pass.
 - Three SM70 CUDA regressions pass. Two cover KV16K/KV128K large random
   scores with values biased by +8. The third places correlated score/value
   spikes at a fixed nonzero residue to reproduce numerator growth missed by
   sparse max sampling. All compare sampled rows with full-KV FP32 attention.
-- The three real failure captures are finite after the final guard. Sampled
-  relative L2 is 0.010756, 0.014670, and 0.006221; worst-row relative L2 is
-  0.051346, 0.039120, and 0.013341 respectively.
+- Seven real failure captures are finite after the final guard. The four
+  early captures have sampled relative L2 0.002513, 0.001059, 0.001085, and
+  0.001019. The first model-invalid capture is 0.001415. The two KV152K
+  overflow captures are 0.003546 and 0.001385, with worst-row relative L2
+  0.020091 and 0.007039. The guarded FP16 build measured 0.014670 and
+  0.006221 on those last two captures.
 - The raw recipe reached about 81.5/80.5 TFLOP/s at KV128K/256K on random
   inputs but emitted invalid model output. It is rejected.
-- Exact row maxima plus FP32 PV reached only about 54.1/54.0 TFLOP/s. It is
-  the stable diagnostic baseline, not the optimized endpoint.
+- Exact row maxima plus the earlier 32x64-warp FP32 PV reached only about
+  54.1/54.0 TFLOP/s. A source-rebuilt stable 32x64-warp route reached about
+  59 TFLOP/s because its 128-register cap caused heavy spills. Both are
+  diagnostic baselines.
+- The corrected 128x256/64x64 FP32 topology with exact scalar exponential and
+  8K blocks reached 73.39 TFLOP/s at KV128K. FP32 block output with 16K blocks
+  reached 75.19 TFLOP/s; 24K blocks provide the final margin.
+- A stable half2 degree-5 exponential with 16x range reduction fell to 67.31
+  TFLOP/s and raised relative L2 to 0.004941. Its repeated-square dependency
+  chain is slower than the SM70 scalar exponential, so it is rejected.
 - 4x value headroom failed the 16K model request. 16x passed 128K but failed
   at KV152K during the 256K request. Both are rejected.
 - Increasing the score margin from 4 to 6 kept output finite but raised the
@@ -188,7 +212,7 @@ request would be a separate acceptance item.
 ## Artifact identity and promotion decision
 
 Final formatted source-built FA2 SHA256:
-`c598bcf9ae0c866a7ba426f3c364a851ef205535fe3d4a8949658f935fcb6796`.
+`2e88f8c0fa177ab64c19fe0419a311a847aa10c9825eb6c94bf150e5f9c7c049`.
 ELF dependencies are standard Torch/CUDA/cuBLAS/system libraries. Build,
 pre-commit, route-policy tests, CUDA numerical tests, operator benchmark,
 and cold model runs all use the owned worktree. Raw logs and captured model
@@ -197,4 +221,5 @@ tensors remain in task-local `.artifacts` and are deliberately not committed.
 Keep this route experimental and opt-in. It meets the current 75-TFLOP/s,
 finite-output, and scoped end-to-end quality targets. Promotion beyond this
 prompt and model requires a broader long-context quality corpus or perplexity
-comparison because the sampled score shift and FP16 PV path are approximate.
+comparison because the sampled score shift and FP16 score/probability storage
+remain approximate even though PV accumulation and prefix output are FP32.

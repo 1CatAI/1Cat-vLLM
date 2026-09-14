@@ -21,16 +21,19 @@ kernel must not disable that storage conversion. Both architecture and
 E4M3 bridge route counters must appear on every rank in an E4M3 cold run.
 
 The historical 79T recipe uses zero-shift exponentials and unguarded FP16
-PV accumulation. Real model inputs overflow that recipe, although zero-mean
+accumulation. Real model inputs overflow that recipe, although zero-mean
 random-input tests pass. The qualified integration samples score maxima at
 stride 8 with a fixed margin and exponent cap, centers biased values, and
-scales value residuals by an exact power of two with 64x headroom. FP16
-tensor-core PV is retained for throughput; row masses and the online block
-merge use FP32 before the value center is restored. This is an approximate
-attention path and must pass both sampled FP32-oracle checks and cold model
-requests. Current qualified medians exceed 75 TFLOPS at KV128K and KV256K;
-see `VALIDATION.md` for the exact contract and quality limits. The build
-option is OFF by default.
+scales value residuals by an exact power of two with 64x headroom. PV uses
+FP16 Tensor Core operands with FP32 MMA accumulation, writes each 24K prefix
+block in FP32, and performs the online prefix/tail merge in FP32 before the
+value center is restored. The 128x256 threadblock and 64x64 warp shape avoid
+the register spills that made the earlier FP32 path slow. This remains an
+approximate attention path because scores and probabilities are stored in
+FP16 and score maxima are sampled. It must pass both sampled FP32-oracle
+checks and cold model requests. Current qualified medians exceed 75 TFLOPS
+at KV128K and KV256K; see `VALIDATION.md` for the exact contract and quality
+limits. The build option is OFF by default.
 
 The private `MmaPipelined79T` template retains transform `set_valid()` and
 `finalize()` hooks. Without finalization the tail row masses remain zero and
