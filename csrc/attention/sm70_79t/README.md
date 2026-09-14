@@ -20,14 +20,17 @@ the separately resolved `sm70_v37_e4m3_bridge`; selecting the architecture
 kernel must not disable that storage conversion. Both architecture and
 E4M3 bridge route counters must appear on every rank in an E4M3 cold run.
 
-The historical 79T recipe uses zero-shift exponentials and FP16 PV
-accumulation. Real model inputs overflow that recipe, although zero-mean
-random-input tests pass. This integration computes actual row maxima,
-merges block states in FP32, scales values by an exact power of two, and
-uses FP32 tensor-core accumulation for PV. FP16 scores and intermediate
-PV outputs remain. The corrected recipe needs its own performance and
-model-quality measurements; historical TFLOPS are not its performance.
-The build option is OFF by default.
+The historical 79T recipe uses zero-shift exponentials and unguarded FP16
+PV accumulation. Real model inputs overflow that recipe, although zero-mean
+random-input tests pass. The qualified integration samples score maxima at
+stride 8 with a fixed margin and exponent cap, centers biased values, and
+scales value residuals by an exact power of two with 64x headroom. FP16
+tensor-core PV is retained for throughput; row masses and the online block
+merge use FP32 before the value center is restored. This is an approximate
+attention path and must pass both sampled FP32-oracle checks and cold model
+requests. Current qualified medians exceed 75 TFLOPS at KV128K and KV256K;
+see `VALIDATION.md` for the exact contract and quality limits. The build
+option is OFF by default.
 
 The private `MmaPipelined79T` template retains transform `set_valid()` and
 `finalize()` hooks. Without finalization the tail row masses remain zero and

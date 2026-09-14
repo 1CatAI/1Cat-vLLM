@@ -2,105 +2,152 @@
 
 ## Contract
 
-Base `7217bb5d4f3866f87bf6a961204c894af3b03261`, implementation
-`35c7342560`; normal source-built FA2/vLLM/Flash-V100/FlashQLA extensions.
-Python 3.12, Torch 2.10.0+cu128, CUDA 12.8, four V100-SXM2-32GB GPUs
-(physical 4–7 in PCI order), TP4. Model: Qwen3.8-27B-FP8
-(`Qwen3_5ForConditionalGeneration`, 64 layers, 16 full-attention layers,
-24 query heads / 4 KV heads / D256). FP8 weights, FP16 compute,
-E4M3 KV, TurboMind quantization backend, FLASH_ATTN_V100 attention.
+Base `7217bb5d4f3866f87bf6a961204c894af3b03261`; optimized kernel
+`7e3939f3e6`. The implementation is built into the normal
+`vllm.vllm_flash_attn._vllm_fa2_C` extension. It has no private DSO or
+preload dependency and remains experimental and opt-in.
 
-Max length 262144, chunk size 8000, one sequence, memory utilization 0.85,
-FP16 Mamba cache/state, eager, graphs disabled, MTP off, prefix cache off.
-Greedy sampling (temperature 0, top_p 1, top_k -1), max output 32, EOS
-respected, thinking disabled. Engine initialization and short warmup are
-outside timing. The same exact-token natural-language prompt requests a
-marker placed at the beginning and the largest Solar System planet.
+The test host uses Python 3.12, Torch 2.10.0+cu128, CUDA 12.8, and four
+V100-SXM2-32GB GPUs (physical 4-7 in PCI order) at TP4. The model is
+Qwen3.8-27B-FP8 (`Qwen3_5ForConditionalGeneration`, 64 layers, 16
+full-attention layers, 24 query heads / 4 KV heads / D256). Weights are FP8,
+compute is FP16, KV storage is E4M3, the quantization backend is TurboMind,
+and the attention backend is FLASH_ATTN_V100.
 
-Run `benchmarks/benchmark_sm70_79t_cold.py --model "$MODEL" --lengths
-16000 128000 256000 --output-len 32 --out "$RESULT"` with the runtime
-flags in README, plus `VLLM_SM70_QUANT_BACKEND=turbomind`,
-`VLLM_FLASH_V100_PREFILL_USE_TRITON=0`, `VLLM_FLASH_V100_FP8_PREFILL_BRIDGE=1`,
-`VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1`, `VLLM_USE_AOT_COMPILE=0`, and the
-local RPC setting documented in README. Set V37=0 for the architecture,
-V37=1 for the control. Caches are owned by the task. No private library
-paths or preload overrides are used.
+End-to-end runs use max length 262144, chunk size 8000, one sequence, memory
+utilization 0.85, FP16 Mamba state/cache, eager execution, CUDA graphs off,
+MTP off, and prefix caching off. Sampling is greedy with a maximum of 32
+output tokens and EOS respected. Engine initialization and a short warmup
+are outside TTFT. A deterministic natural-language prompt places a marker
+at its beginning, then asks for that marker and the largest Solar System
+planet.
 
-## Corrected architecture cold requests
+Run `benchmarks/benchmark_sm70_79t_cold.py --model "$MODEL" --lengths 16000
+128000 256000 --output-len 32 --out "$RESULT"` with the runtime flags in
+README, plus `VLLM_SM70_QUANT_BACKEND=turbomind`,
+`VLLM_FLASH_V100_PREFILL_USE_TRITON=0`,
+`VLLM_FLASH_V100_FP8_PREFILL_BRIDGE=1`,
+`VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1`, and `VLLM_USE_AOT_COMPILE=0`.
+Set V37=0 for the architecture route and V37=1 for the matched control.
+
+## Failure mechanism and final guard
+
+The raw historical recipe assumes that unshifted exponentials and the FP16
+PV numerator fit in FP16. They do on zero-mean random tensors, but they do
+not on the model tensors. All captured Q/K/V inputs were finite while the
+raw output contained infinities and the model emitted invalid token ID -1.
+
+The first short-request failure occurred on rank 3, attention call 4. A
+later candidate with 16x value headroom remained finite through KV144K, then
+overflowed independently on ranks 2 and 3 at KV152K. Sparse score maxima
+missed by the sampled shift were 15.31-16.00 above the sample. The largest
+observed FP16 PV partial was 75310, beyond the FP16 finite limit 65504.
+
+The qualified recipe retains FP16 tensor-core PV and applies four guards:
+
+- sample one score in eight, add a 4.0 shift margin, and cap positive
+  exponent input at 10.0;
+- subtract a per-dimension V center when the first-4096-token mean magnitude
+  is at least 0.05;
+- scan all residual V values and scale them by an exact power of two with
+  64x additional headroom;
+- keep block masses and the online prefix/tail merge in FP32, then restore
+  the V center after normalization.
+
+The 64x headroom makes all three captured failure tensors finite. It is a
+model-qualified bound, not a proof over arbitrary FP16 inputs.
+
+## Operator result
+
+The following medians use the final source-built artifact, 30 warmups and
+100 CUDA-event samples on one V100. Useful causal FLOPs are
+`4*Hq*D*(Q*(KV-Q)+Q*(Q+1)/2)`.
+
+| KV tokens | Median (ms) | p10 (ms) | p90 (ms) | TFLOP/s | Relative L2 | Worst-row relative L2 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128000 | 80.6114 | 80.2029 | 80.8609 | **75.6081** | 0.007129 | 0.008302 |
+| 256000 | 164.7010 | 163.6619 | 214.4517 | **75.2050** | 0.007052 | 0.008119 |
+
+Both medians clear the 75-TFLOP/s target. The 256K p90 includes transient
+host/GPU interference; the median and p10 remain consistent with the prior
+100-sample run at 75.27 TFLOP/s.
+
+## Cold end-to-end result
 
 | Prompt tokens | TTFT (s) | Prompt tokens / TTFT | Full wall (s) | Subsequent decode (tok/s) |
-| --- | --- | --- | --- | --- |
-| 16000 | 3.36081 | 4760.75 | 4.69272 | 11.2623 |
-| 128000 | 40.09957 | 3192.05 | 41.51768 | 10.5775 |
-| 256000 | 111.37289 | 2298.58 | 112.75011 | 10.8916 |
+| ---: | ---: | ---: | ---: | ---: |
+| 16000 | 3.31870 | 4821.17 | 4.62378 | 11.4937 |
+| 128000 | 36.07453 | 3548.21 | 37.52012 | 10.3765 |
+| 256000 | 94.58807 | **2706.47** | 95.77519 | 12.6356 |
 
-These are single unprofiled requests, not confidence intervals. TTFT includes
-prefill and first-token overhead; it is not isolated GPU prefill time.
-Subsequent decode uses 15 intervals after the first token. Each request
-emitted the same 16 tokens, including EOS, answering both questions correctly.
-This is a scoped retrieval/text-health check, not broad model equivalence.
-Cached tokens are zero for all cases. Every TP rank reports respectively
-16/240/496 architecture calls and matching E4M3 bridge calls. The resolved
-FA2 module is the normal extension in the owned source tree.
+These are single unprofiled cold requests, not confidence intervals. The
+256K row is a final rerun of the formatted artifact; the 16K/128K rows come
+from the immediately preceding formatting-equivalent build. TTFT includes
+prefill and first-token overhead. Subsequent decode uses the 15 intervals
+after the first token. `cached_tokens` is zero for every request. Every TP
+rank reports respectively 16/240/496 architecture calls and the same number
+of E4M3 bridge calls.
 
-The previous 256000-token 1032.23-second report used a different runtime
-and failed to select the intended architecture/bridge. It is diagnostic
-context, not a matched benchmark baseline. The previous 62.73-second
-request hit prefix cache. Historical ~2460 tok/s used 261888 tokens and
-E5M2 KV, so it is also not a matched comparison.
+All lengths emit the same 16 tokens, including EOS:
+
+```text
+119920 96919 95761 12512 96143 97460 115783 10119
+3709 145551 99960 114931 95761 147482 1710 248046
+```
+
+The decoded output is `校验词是「海蓝石榴」，太阳系最大的行星是木星。`.
+Both retrieval and knowledge checks pass. The token sequence also matches
+the stable FP32 implementation and matched v37 control. This is a scoped
+long-context text-health gate, not broad model equivalence.
+
+## Matched comparison
+
+| Route | 16K TTFT / tok/s | 128K TTFT / tok/s | 256K TTFT / tok/s |
+| --- | ---: | ---: | ---: |
+| Optimized guarded FP16 PV | 3.3187 / 4821.17 | 36.0745 / 3548.21 | **94.5881 / 2706.47** |
+| Stable FP32 PV | 3.3608 / 4760.75 | 40.0996 / 3192.05 | 111.3729 / 2298.58 |
+| v37 control | 3.3294 / 4805.64 | 38.7531 / 3302.96 | 105.6480 / 2423.14 |
+
+At 256K, the optimized route has 10.47% lower TTFT and 11.69% higher prompt
+throughput than the matched v37 control. It has 15.07% lower TTFT and 17.75%
+higher prompt throughput than the stable FP32 implementation.
+
+The earlier 1032.23-second report did not select the intended architecture
+and bridge. The optimized route reduces that wall-clock anomaly by about
+10.8x. The reported 62.73-second second request hit prefix cache and is not
+a cold-prefill result.
 
 ## Numerical gates and rejected variants
 
 - 18 route/bridge policy tests pass.
-- Two CUDA regressions (KV16000 and KV128000, large scores, values biased
-  by +8) pass against sampled full-KV FP32 attention, rtol 0.01 / atol 0.03.
-- Captured real Q/K/V from all four ranks now produce finite output;
-  sampled relative L2 errors are 0.002482, 0.001103, 0.001107, 0.001025.
-- Raw historical recipe reached 81.50/80.45 TFLOPS at KV128K/256K on
-  zero-mean random inputs, but overflowed on real model inputs and emitted
-  invalid -1 token IDs. Those speeds are not qualified model results.
-- Adding row maxima and value scaling fixed overflow, but retaining FP16
-  MMA accumulation failed the biased-value oracle by 2–4%. Rejected.
-- FP32 MMA without a register bound produced 150-register/512-thread
-  kernels exceeding V100 register capacity. The corrected recipe uses a
-  128-register cap and checks launches.
-- Corrected operator median: 112.628 ms / 54.115 TFLOPS at KV128K;
-  229.575 ms / 53.953 TFLOPS at KV256K. Sampled relative L2 about 0.0023.
-  Ten timed CUDA-event samples after three warmups; useful causal FLOPs
-  follow `4*Hq*D*(Q*(KV-Q)+Q*(Q+1)/2)`.
+- Three SM70 CUDA regressions pass. Two cover KV16K/KV128K large random
+  scores with values biased by +8. The third places correlated score/value
+  spikes at a fixed nonzero residue to reproduce numerator growth missed by
+  sparse max sampling. All compare sampled rows with full-KV FP32 attention.
+- The three real failure captures are finite after the final guard. Sampled
+  relative L2 is 0.010756, 0.014670, and 0.006221; worst-row relative L2 is
+  0.051346, 0.039120, and 0.013341 respectively.
+- The raw recipe reached about 81.5/80.5 TFLOP/s at KV128K/256K on random
+  inputs but emitted invalid model output. It is rejected.
+- Exact row maxima plus FP32 PV reached only about 54.1/54.0 TFLOP/s. It is
+  the stable diagnostic baseline, not the optimized endpoint.
+- 4x value headroom failed the 16K model request. 16x passed 128K but failed
+  at KV152K during the 256K request. Both are rejected.
+- Increasing the score margin from 4 to 6 kept output finite but raised the
+  three captured relative-L2 errors from 1.08%/1.47%/0.62% to
+  3.91%/2.93%/1.25% because more weights lost FP16 dynamic range. It is
+  rejected.
 
-The build option remains off by default. This is a stable integration of
-that architecture, not a claim that the raw 79T recipe is model-safe.
+## Artifact identity and promotion decision
 
-## Artifact identity and checks
+Final formatted source-built FA2 SHA256:
+`c598bcf9ae0c866a7ba426f3c364a851ef205535fe3d4a8949658f935fcb6796`.
+ELF dependencies are standard Torch/CUDA/cuBLAS/system libraries. Build,
+pre-commit, route-policy tests, CUDA numerical tests, operator benchmark,
+and cold model runs all use the owned worktree. Raw logs and captured model
+tensors remain in task-local `.artifacts` and are deliberately not committed.
 
-End-to-end candidate FA2 SHA256:
-`be632ddc94777cd43798ea68d5f11b0cbd23b8bbeefd71f89a8505f4c4d8e855`.
-After formatting only, the normal installed artifact is
-`ed4e274c62d5e1be0439934bcdd36208304bc82e2bcc689cea2dab4f002c4f24`;
-the two CUDA regression tests pass again. No performance claim is inferred
-from formatting. ELF dependencies are standard Torch/CUDA/cuBLAS/system
-libraries; there is no task-cache DSO dependency.
-
-Applicable commit hooks pass except the skipped pre-existing mypy-local
-error on `flash_attn_v100.paged_kv_utils` in the unchanged backend import.
-Raw logs, full route counters/token IDs and captured tensors are retained
-in the task-local `.artifacts` directory and are deliberately not committed.
-
-## Promotion decision
-
-Keep the new route experimental and opt-in. Correcting the old dispatch
-recovers the anomalous end-to-end latency, but does not establish a speedup
-over a correctly selected v37 route. The raw 79T recipe cannot replace v37
-on the basis of random-input TFLOPS. Further optimization must preserve the
-new numerical regression and the matched 256K quality gate.
-
-## Matched v37 control
-
-| Prompt tokens | TTFT (s) | Prompt tokens / TTFT | Full wall (s) | Subsequent decode (tok/s) |
-| --- | --- | --- | --- | --- |
-| 16000 | 3.32942 | 4805.64 | 4.80879 | 10.1395 |
-| 128000 | 38.75308 | 3302.96 | 39.97518 | 12.2742 |
-| 256000 | 105.64800 | 2423.14 | 106.83766 | 12.6088 |
-
-The corrected architecture has 5.42% longer 256K TTFT than v37 in this single matched run. It is not a prefill speedup over v37. All three prompt hashes and output token sequences match, with zero cached tokens. The healthy v37 route remains the performance baseline.
+Keep this route experimental and opt-in. It meets the current 75-TFLOP/s,
+finite-output, and scoped end-to-end quality targets. Promotion beyond this
+prompt and model requires a broader long-context quality corpus or perplexity
+comparison because the sampled score shift and FP16 PV path are approximate.
