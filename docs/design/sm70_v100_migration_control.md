@@ -46639,3 +46639,37 @@ has launched no full model. Details and artifacts are in
   attention window and are excluded from the accepted comparison. The final
   report and raw Nsight artifacts are under
   `bench_results/27b_fp8_concurrency_a800_review_20260914/c32_8k/`.
+
+## 2026-09-14 Qwen3.8-27B-FP8 C32 32K vLLM serving baseline
+
+- The user changed the 32K criterion to standard `vllm bench serve`: random
+  dataset, seed 1234, fixed 32768 input and 256 output tokens, range ratio
+  zero, temperature zero, ignore EOS, 128 requests, request rate infinity,
+  and maximum concurrency 32. Both endpoints complete 128/128 requests with
+  zero failures and exactly 4,194,304 input plus 32,768 output tokens.
+- Tokenizer JSON hashes match across hosts. The vLLM 1.5.0 V100 and vLLM
+  0.29.0 A800 `RandomDataset` implementations have the same request-generation
+  path; their source diff is limited to typing and an unused embeddings-batch
+  field. This is a matched request workload, while each server retains its
+  native TP, compute/KV dtype, projection, and attention configuration.
+- V100 TP4 completes in `2972.63 s` at `0.04306 req/s` and `11.023 output
+  tok/s`; A800 TP1 completes in `2064.03 s` at `0.06201 req/s` and `15.876
+  output tok/s`. V100 output/request throughput is 30.57% lower. Reaching 10%
+  above A800 requires `17.463 output tok/s`, or a 58.42% improvement over the
+  current V100 result.
+- V100 versus A800 ITL mean/p50/p90/p99 is
+  `2059.92/61.94/4844.37/5103.26 ms` versus
+  `1151.94/46.64/3369.47/3593.90 ms`. Under-100-ms intervals form 53.43% of
+  V100 samples at a `60.84 ms` p50, versus 62.23% at `46.34 ms` on A800.
+  More importantly, 30.23% of V100 intervals exceed 4 seconds, versus 0.012%
+  on A800. Long-context decode and prefill interference are separate gaps.
+- TTFT mean/p50 is only 3.40%/3.08% higher on V100, while mean/p50 E2EL is
+  47.22%/53.44% higher. Prioritize chunked-prefill scheduling A/Bs at
+  max-batched-token sizes 1024/2048/4096/8192 and partial-prefill limits,
+  then isolate a C32 32K decode partition 256/384/512 sweep. Do not promote a
+  global partition-512 route because it already regressed the 2K criterion.
+- V100 records 32,609 ITL chunks rather than the theoretical 32,640 because
+  31 streams coalesced one adjacent token pair. Preserve this 0.095% client
+  measurement limitation; vLLM-bench ITL is not a strict CUDA-step trace.
+  Full JSON, logs, summary, and report are under
+  `bench_results/27b_fp8_concurrency_a800_review_20260914/c32_32k/`.
