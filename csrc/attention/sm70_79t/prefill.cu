@@ -68,6 +68,13 @@
 #include "cutlass/gemm/kernel/default_gemm.h"
 #include "cutlass/gemm/kernel/gemm.h"
 #include "cutlass/layout/matrix.h"
+
+#ifndef PREFIX_TORCH_QUERY_TOKENS
+  #define PREFIX_TORCH_QUERY_TOKENS 8000
+#endif
+#ifndef PREFIX_TORCH_ARCHITECTURE_FUNCTION
+  #define PREFIX_TORCH_ARCHITECTURE_FUNCTION sm70_d256_gqa_architecture_fwd
+#endif
 #include "cutlass/numeric_conversion.h"
 #include "gemm_with_softmax.h"
 
@@ -961,7 +968,7 @@ struct ExpRowSumTransformAImpl {
                   offset.contiguous() +
                   contiguous * ThreadMap::Delta::kContiguous + element;
         if constexpr (FuseCausalMask) {
-          row += stable_tail_query_tile() * 320 * 6;
+          row += stable_tail_query_tile() * PREFIX_BATCHED_TAIL_TILE_TOKENS * 6;
           row_max[contiguous * kElementsPerAccess + element] =
               __ldg(g_79t_tail_row_max + row);
         } else {
@@ -981,7 +988,7 @@ struct ExpRowSumTransformAImpl {
       int row = int(blockIdx.x) * PVThreadblockShape::kM + offset.contiguous() +
                 element;
       if constexpr (FuseCausalMask) {
-        row += stable_tail_query_tile() * 320 * 6;
+        row += stable_tail_query_tile() * PREFIX_BATCHED_TAIL_TILE_TOKENS * 6;
         row_max[element] = __ldg(g_79t_tail_row_max + row);
       } else {
         row_max[element] = __ldg(g_row_max + row);
@@ -2730,7 +2737,8 @@ __global__ void finalize_round_major_tail_state(float const* partial_sums,
     return;
   }
   constexpr int kGroupTiles = PREFIX_TAIL_FINE_PV_GROUP_TILES;
-  constexpr int kQueryTiles = 25;
+  constexpr int kQueryTiles =
+      PREFIX_TORCH_QUERY_TOKENS / PREFIX_BATCHED_TAIL_TILE_TOKENS;
   int query_tile = global_row / tile_rows;
   int local_row = global_row - query_tile * tile_rows;
   int rounds = (query_tile + 1 + kGroupTiles - 1) / kGroupTiles;
@@ -2859,12 +2867,14 @@ __global__ void merge_prefix_direct_round_major_tail_fused_state(
       tail_scale = tail_mass;
     } else {
       constexpr int kGroupTiles = PREFIX_TAIL_FINE_PV_GROUP_TILES;
-      constexpr int kQueryTiles = 25;
+      constexpr int kQueryTiles =
+          PREFIX_TORCH_QUERY_TOKENS / PREFIX_BATCHED_TAIL_TILE_TOKENS;
+      constexpr int kMaxRounds = (kQueryTiles + kGroupTiles - 1) / kGroupTiles;
       int query_tile = row / tile_rows;
       int local_row = row - query_tile * tile_rows;
       int rounds = (query_tile + 1 + kGroupTiles - 1) / kGroupTiles;
         #pragma unroll
-      for (int round = 0; round < 7; ++round) {
+      for (int round = 0; round < kMaxRounds; ++round) {
         if (round < rounds) {
           int first_task =
               round * kQueryTiles - kGroupTiles * round * (round - 1) / 2;
@@ -5926,13 +5936,14 @@ struct Sm70GqaHalf2Runtime {
 };
 
 struct Sm70GqaHalf2Workspace {
-  static constexpr int kRows = 48000;
+  static constexpr int kQuery = PREFIX_TORCH_QUERY_TOKENS;
+  static constexpr int kRows = kQuery * 6;
   static constexpr int kHeadDim = 256;
-  static constexpr int kMinTotalKV = 8000;
-  static constexpr int kMaxTotalKV = 256000;
+  static constexpr int kMinTotalKV = kQuery;
+  static constexpr int kMaxTotalKV = 262144;
   static constexpr int kBlockN = PREFIX_TORCH_BLOCK_N;
   static constexpr int kTailTileTokens = PREFIX_BATCHED_TAIL_TILE_TOKENS;
-  static constexpr int kTailTiles = 8000 / kTailTileTokens;
+  static constexpr int kTailTiles = kQuery / kTailTileTokens;
   static constexpr int kTailTileRows = kTailTileTokens * 6;
   static constexpr int kTailTasks = kTailTiles * (kTailTiles + 1) / 2;
   static constexpr int kFinePVGroupTiles = PREFIX_TAIL_FINE_PV_GROUP_TILES;
@@ -6020,10 +6031,12 @@ struct Sm70GqaHalf2Workspace {
         tail_pv_params(at::empty(
             {static_cast<int64_t>(kFinePVTasks * sizeof(TailPVKernel::Params))},
             q.options().dtype(at::ScalarType::Byte))) {
-    static_assert(kTailTileTokens == 320);
-    static_assert(kTailTiles == 25);
+    static_assert(kQuery % kTailTileTokens == 0);
+    static_assert(
+        (kQuery == 8000 && kTailTileTokens == 320 && kTailTiles == 25) ||
+        (kQuery == 8192 && kTailTileTokens == 256 && kTailTiles == 32));
     static_assert(kFinePVGroupTiles == 4);
-    static_assert(kFinePVTasks == 91);
+    static_assert(kFinePVTasks == (kQuery == 8000 ? 91 : 144));
     static_assert(kBlockN >= 8192 && kBlockN <= 16 * 8192 &&
                   kBlockN % 8192 == 0);
     static_assert(kTailScoreElements <= size_t(kBlockN) * kRows);
@@ -6111,7 +6124,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
                                           at::Tensor& out) {
   using Workspace = Sm70GqaHalf2Workspace;
   const int total_kv = static_cast<int>(k.size(1));
-  const int prefix = total_kv - 8000;
+  const int prefix = total_kv - Workspace::kQuery;
   auto workspace = get_sm70_gqa_half2_workspace(q);
   std::unique_lock<std::mutex> launch_lock(workspace->launch_mutex);
   cudaStream_t caller_stream = at::cuda::getCurrentCUDAStream();
@@ -6391,7 +6404,8 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     dim3 max_grid((Workspace::kRows + 255) / 256, 1);
     stable_row_max_partials<true><<<max_grid, 128, 0, tail_stream>>>(
         reinterpret_cast<__half const*>(tail_scores),
-        workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows, 8000);
+        workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows,
+        Workspace::kQuery);
     stable_finish_max<<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
         workspace->tail_max_partials.data_ptr<float>(), tail_max,
         Workspace::kRows, 1);
@@ -6475,7 +6489,8 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     C10_CUDA_CHECK(onecat_sm70_d256_dense_state_raw(
         query, key + size_t(prefix) * Workspace::kHeadDim,
         value + size_t(prefix) * Workspace::kHeadDim, tail_max, tail_sum,
-        tail_numerator, 8000, 8000, 6, 1, 0.0625f, prefix_stream));
+        tail_numerator, Workspace::kQuery, Workspace::kQuery, 6, 1, 0.0625f,
+        prefix_stream));
     repaired_rows = Workspace::kRows;
   } else {
     C10_CUDA_CHECK(cudaStreamWaitEvent(prefix_stream, workspace->tail_done, 0));
@@ -6503,11 +6518,13 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
       C10_CUDA_CHECK(cudaStreamSynchronize(prefix_stream));
       size_t query1_offset =
           size_t(Workspace::kTailTileRows) * Workspace::kTailTileTokens;
-      size_t query24_offset = size_t(Workspace::kTailTileRows) *
-                              Workspace::kTailTileTokens * 24 * 25 / 2;
-      size_t query24_diagonal = query24_offset + size_t(24) *
-                                                     Workspace::kTailTileRows *
-                                                     Workspace::kTailTileTokens;
+      constexpr int kLastTailTile = Workspace::kTailTiles - 1;
+      size_t query_last_offset = size_t(Workspace::kTailTileRows) *
+                                 Workspace::kTailTileTokens * kLastTailTile *
+                                 Workspace::kTailTiles / 2;
+      size_t query_last_diagonal =
+          query_last_offset + size_t(kLastTailTile) * Workspace::kTailTileRows *
+                                  Workspace::kTailTileTokens;
       constexpr int kScoreRows = Workspace::kTailTileRows;
       C10_CUDA_CHECK(cudaMemcpy(&score_samples[0], tail_scores, sizeof(__half),
                                 cudaMemcpyDeviceToHost));
@@ -6515,12 +6532,14 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
                                 sizeof(__half), cudaMemcpyDeviceToHost));
       C10_CUDA_CHECK(cudaMemcpy(
           &score_samples[2],
-          tail_scores + query24_offset + int64_t(123) * kScoreRows + 456,
+          tail_scores + query_last_offset + int64_t(123) * kScoreRows + 456,
           sizeof(__half), cudaMemcpyDeviceToHost));
-      C10_CUDA_CHECK(cudaMemcpy(
-          &score_samples[3],
-          tail_scores + query24_diagonal + int64_t(319) * kScoreRows + 1914,
-          sizeof(__half), cudaMemcpyDeviceToHost));
+      C10_CUDA_CHECK(
+          cudaMemcpy(&score_samples[3],
+                     tail_scores + query_last_diagonal +
+                         int64_t(Workspace::kTailTileTokens - 1) * kScoreRows +
+                         Workspace::kTailTileRows - 6,
+                     sizeof(__half), cudaMemcpyDeviceToHost));
       C10_CUDA_CHECK(cudaMemcpyFromSymbol(&observed_tail_rows, g_tail_rows,
                                           sizeof(observed_tail_rows)));
       C10_CUDA_CHECK(cudaMemcpyFromSymbol(&observed_task_base, g_pv_task_base,
@@ -6618,19 +6637,22 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
 
   #endif
 
-at::Tensor sm70_d256_gqa_architecture_fwd(const at::Tensor& q,
-                                          const at::Tensor& k,
-                                          const at::Tensor& v, at::Tensor& out,
-                                          double softmax_scale, bool causal) {
-  constexpr int kQuery = 8000;
-  constexpr int kRows = 48000;
+at::Tensor PREFIX_TORCH_ARCHITECTURE_FUNCTION(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal) {
+  constexpr int kQuery = PREFIX_TORCH_QUERY_TOKENS;
+  constexpr int kRows = kQuery * 6;
   constexpr int kHeadDim = 256;
   constexpr int kHeadsQ = 6;
   constexpr int kHeadsKV = 1;
-  constexpr int kTail = 8000;
-  constexpr int kMinTotalKV = 8000;
-  constexpr int kMaxTotalKV = 256000;
-  constexpr int kTotalKVStep = 8000;
+  constexpr int kTail = kQuery;
+  constexpr int kMinTotalKV = kQuery;
+  constexpr int kMaxTotalKV = 262144;
+  // The prefix PV Tensor Core mainloop consumes 32 FP16 values per K tile.
+  // Smaller remainders can read a partial score tile incorrectly, so keep the
+  // accelerated contract aligned to the full tile rather than accepting a
+  // merely launchable cuBLAS leading dimension.
+  constexpr int kTotalKVAlignment = 32;
   constexpr int kBlockN = 8192;
 
   TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && out.is_cuda(),
@@ -6644,14 +6666,13 @@ at::Tensor sm70_d256_gqa_architecture_fwd(const at::Tensor& q,
                   k.dim() == 4 && k.size(0) == 1 && k.size(2) == kHeadsKV &&
                   k.size(3) == kHeadDim && v.sizes() == k.sizes() &&
                   out.sizes() == q.sizes(),
-              "SM70 GQA architecture only accepts the validated "
-              "Q8000/Hq6/Hkv1/D256 dense shape family");
+              "SM70 GQA architecture only accepts Q", kQuery,
+              "/Hq6/Hkv1/D256 dense tensors");
   const int total_kv = static_cast<int>(k.size(1));
   TORCH_CHECK(total_kv >= kMinTotalKV && total_kv <= kMaxTotalKV &&
-                  total_kv % kTotalKVStep == 0,
-              "SM70 GQA architecture requires KV in [8000, 256000] "
-              "with an 8000-token step, got ",
-              total_kv);
+                  total_kv % kTotalKVAlignment == 0,
+              "SM70 GQA architecture requires KV in [", kMinTotalKV,
+              ", 262144] with 32-token alignment, got ", total_kv);
   const int prefix = total_kv - kTail;
   const int blocks = (prefix + kBlockN - 1) / kBlockN;
   TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
@@ -6671,7 +6692,8 @@ at::Tensor sm70_d256_gqa_architecture_fwd(const at::Tensor& q,
       defined(PREFIX_TAIL_FINE_PV_DIRECT_ACCUMULATE)
   TORCH_CHECK(total_kv >= Sm70GqaHalf2Workspace::kMinTotalKV &&
                   total_kv <= Sm70GqaHalf2Workspace::kMaxTotalKV,
-              "SM70 half2 architecture requires KV in [8000, 256000]");
+              "SM70 half2 architecture requires KV in [", kMinTotalKV,
+              ", 262144]");
   return sm70_d256_gqa_half2_family_fwd(q, k, v, out);
   #else
   const int qk_tiles_n =

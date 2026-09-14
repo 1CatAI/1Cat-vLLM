@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cold-cache client TTFT and decode measurement for Q8000 prefill.
+"""Cold-cache client TTFT and decode measurement for Q8192 prefill.
 
 Deterministic quality comparison; EOS is respected and thinking is disabled.
 Engine construction and a short warmup are excluded. Prefix caching and
@@ -43,7 +43,23 @@ def main():
     parser.add_argument("--output-len", type=int, default=32)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--kv-cache-dtype", default="fp8_e4m3")
+    parser.add_argument("--concurrent-requests", type=int, default=1)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--long-prefill-token-threshold", type=int, default=8192)
     args = parser.parse_args()
+    if args.concurrent_requests < 1:
+        parser.error("--concurrent-requests must be positive")
+    if args.concurrent_requests > args.max_num_seqs:
+        parser.error("--max-num-seqs must cover every concurrent request")
+    if (
+        args.concurrent_requests * args.long_prefill_token_threshold
+        > args.max_num_batched_tokens
+    ):
+        parser.error(
+            "--max-num-batched-tokens must cover one prefill threshold chunk "
+            "per concurrent request"
+        )
     llm = LLM(
         model=args.model,
         tensor_parallel_size=4,
@@ -51,8 +67,9 @@ def main():
         quantization="fp8",
         kv_cache_dtype=args.kv_cache_dtype,
         max_model_len=262144,
-        max_num_batched_tokens=8000,
-        max_num_seqs=1,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_seqs=args.max_num_seqs,
+        long_prefill_token_threshold=args.long_prefill_token_threshold,
         gpu_memory_utilization=0.85,
         enforce_eager=True,
         attention_backend="FLASH_ATTN_V100",
@@ -109,23 +126,36 @@ def main():
             engine = llm.llm_engine
             before = engine.collective_rpc(route_snapshot)
             start = time.perf_counter()
-            engine.add_request(f"cold-{length}", {"prompt_token_ids": ids}, params)
-            first = None
-            last = None
-            tokens = []
-            text = ""
-            cached = 0
+            request_ids = [
+                f"cold-{length}-{index}" for index in range(args.concurrent_requests)
+            ]
+            state = {
+                request_id: {
+                    "first": None,
+                    "last": None,
+                    "tokens": [],
+                    "text": "",
+                    "cached": 0,
+                }
+                for request_id in request_ids
+            }
+            for request_id in request_ids:
+                engine.add_request(request_id, {"prompt_token_ids": ids}, params)
             while engine.has_unfinished_requests():
                 for result in engine.step():
                     now = time.perf_counter()
-                    cached = max(cached, getattr(result, "num_cached_tokens", 0) or 0)
+                    request_state = state[result.request_id]
+                    request_state["cached"] = max(
+                        request_state["cached"],
+                        getattr(result, "num_cached_tokens", 0) or 0,
+                    )
                     for output in result.outputs:
                         if output.token_ids:
-                            if first is None:
-                                first = now
-                            last = now
-                            tokens.extend(output.token_ids)
-                            text += output.text
+                            if request_state["first"] is None:
+                                request_state["first"] = now
+                            request_state["last"] = now
+                            request_state["tokens"].extend(output.token_ids)
+                            request_state["text"] += output.text
             end = time.perf_counter()
             after = engine.collective_rpc(route_snapshot)
             route_deltas = []
@@ -141,32 +171,63 @@ def main():
                         },
                     }
                 )
-            if first is None:
-                raise RuntimeError("Request returned no token")
-            if cached:
-                raise RuntimeError(f"Cold request unexpectedly reused {cached} tokens")
+            request_rows = []
+            for request_id in request_ids:
+                request_state = state[request_id]
+                first = request_state["first"]
+                last = request_state["last"]
+                tokens = request_state["tokens"]
+                text = request_state["text"]
+                cached = request_state["cached"]
+                if first is None or last is None:
+                    raise RuntimeError(f"Request {request_id} returned no token")
+                if cached:
+                    raise RuntimeError(
+                        f"Cold request {request_id} unexpectedly reused {cached} tokens"
+                    )
+                request_rows.append(
+                    dict(
+                        request_id=request_id,
+                        prompt_tokens=len(ids),
+                        cached_tokens=cached,
+                        prompt_sha256=hashlib.sha256(
+                            json.dumps(ids).encode()
+                        ).hexdigest(),
+                        ttft_seconds=first - start,
+                        prompt_tokens_per_ttft_s=len(ids) / (first - start),
+                        decode_seconds=last - first,
+                        decode_tokens_per_s=(len(tokens) - 1) / (last - first)
+                        if last > first
+                        else None,
+                        output_token_ids=tokens,
+                        output_text=text,
+                        retrieval_pass="海蓝石榴" in text,
+                        knowledge_pass="木星" in text,
+                    )
+                )
+            batch_ttft = max(row["ttft_seconds"] for row in request_rows)
             row = dict(
                 routes=route_deltas,
-                prompt_tokens=len(ids),
-                cached_tokens=cached,
-                prompt_sha256=hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
-                ttft_seconds=first - start,
+                concurrent_requests=args.concurrent_requests,
+                aggregate_prompt_tokens=args.concurrent_requests * len(ids),
+                batch_ttft_seconds=batch_ttft,
                 wall_seconds=end - start,
-                prompt_tokens_per_ttft_s=len(ids) / (first - start),
-                decode_seconds=last - first,
-                decode_tokens_per_s=(len(tokens) - 1) / (last - first)
-                if last > first
-                else None,
-                output_token_ids=tokens,
-                output_text=text,
-                retrieval_pass="海蓝石榴" in text,
-                knowledge_pass="木星" in text,
+                aggregate_prompt_tokens_per_batch_ttft_s=(
+                    args.concurrent_requests * len(ids) / batch_ttft
+                ),
             )
+            if args.concurrent_requests == 1:
+                row.update(request_rows[0])
+            else:
+                row["requests"] = request_rows
             reports.append(row)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(reports, ensure_ascii=False, indent=2))
             print("COLD_RESULT " + json.dumps(row, ensure_ascii=False), flush=True)
-            if not row["retrieval_pass"] or not row["knowledge_pass"]:
+            if not all(
+                request["retrieval_pass"] and request["knowledge_pass"]
+                for request in request_rows
+            ):
                 raise RuntimeError("Quality gate failed; skip longer requests")
     finally:
         llm.llm_engine.engine_core.shutdown()

@@ -29,13 +29,16 @@ __device__ __forceinline__ float stable_exp(float value, float maximum) {
 }
 
 __device__ __forceinline__ int stable_tail_query_tile() {
+  constexpr int kTailTiles =
+      PREFIX_TORCH_QUERY_TOKENS / PREFIX_BATCHED_TAIL_TILE_TOKENS;
+  constexpr int kGroupTiles = PREFIX_TAIL_FINE_PV_GROUP_TILES;
   int task = pv_task_index();
   int first = 0;
-  int tasks = 25;
+  int tasks = kTailTiles;
   while (task >= tasks) {
     task -= tasks;
-    first += 4;
-    tasks -= 4;
+    first += kGroupTiles;
+    tasks -= kGroupTiles;
   }
   return first + task;
 }
@@ -101,12 +104,13 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   int local_row = row;
   int64_t base = 0;
   if constexpr (Tail) {
-    constexpr int tile_rows = 320 * 6;
+    constexpr int tile_tokens = PREFIX_BATCHED_TAIL_TILE_TOKENS;
+    constexpr int tile_rows = tile_tokens * 6;
     int tile = row / tile_rows;
     local_row = row % tile_rows;
     stride = tile_rows;
-    width = (tile + 1) * 320;
-    base = int64_t(tile_rows) * 320 * tile * (tile + 1) / 2;
+    width = (tile + 1) * tile_tokens;
+    base = int64_t(tile_rows) * tile_tokens * tile * (tile + 1) / 2;
   }
   float2 maximum = {-CUDART_INF_F, -CUDART_INF_F};
   int end = min(width, int(blockIdx.y + 1) * 8192);

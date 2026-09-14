@@ -1,10 +1,10 @@
-# Ship the qualified Q8000 route in SM70 FA2 builds while keeping unrelated
+# Ship the qualified Q8000-core route in SM70 FA2 builds while keeping unrelated
 # CUDA targets unchanged. The cache option remains available for rollback.
 set(_VLLM_SM70_79T_PREFILL_DEFAULT OFF)
 if(VLLM_FLASH_ATTN_SM70)
   set(_VLLM_SM70_79T_PREFILL_DEFAULT ON)
 endif()
-option(VLLM_SM70_79T_PREFILL "Build the SM70 Q8000 batched-tail prefill"
+option(VLLM_SM70_79T_PREFILL "Build the SM70 Q8000/Q8192 prefill dispatcher"
   ${_VLLM_SM70_79T_PREFILL_DEFAULT})
 unset(_VLLM_SM70_79T_PREFILL_DEFAULT)
 if(NOT VLLM_SM70_79T_PREFILL)
@@ -46,6 +46,10 @@ set_source_files_properties("${SM70_79T_DIR}/prefill.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_DEFINITIONS "${_79t_defs}"
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
+set_source_files_properties("${SM70_79T_DIR}/prefill_q8192.cu"
+  TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
+  COMPILE_DEFINITIONS "${_79t_defs}"
+  COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
 set_source_files_properties("${SM70_79T_DIR}/legacy_tail_adapter.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70")
@@ -55,5 +59,8 @@ set_property(SOURCE
   TARGET_DIRECTORY _vllm_fa2_C APPEND PROPERTY COMPILE_DEFINITIONS
   onecat_sm70_d256_dense_state_raw=onecat_sm70_d256_dense_state_legacy_raw)
 target_sources(_vllm_fa2_C PRIVATE
-  "${SM70_79T_DIR}/prefill.cu" "${SM70_79T_DIR}/legacy_tail_adapter.cu")
+  "${SM70_79T_DIR}/prefill.cu"
+  "${SM70_79T_DIR}/prefill_q8192.cu"
+  "${SM70_79T_DIR}/legacy_tail_adapter.cu"
+  "${SM70_79T_DIR}/register.cpp")
 target_link_libraries(_vllm_fa2_C PRIVATE CUDA::cublas)

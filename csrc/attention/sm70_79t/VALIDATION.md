@@ -1,4 +1,4 @@
-# SM70 Q8000 integration validation (2026-09-14)
+# SM70 Q8000/Q8192 integration validation (2026-09-14)
 
 ## Contract
 
@@ -210,9 +210,92 @@ request would be a separate acceptance item.
   3.91%/2.93%/1.25% because more weights lost FP16 dynamic range. It is
   rejected.
 
-## Artifact identity and promotion decision
+## Q8192 and concurrent-request expansion
 
-End-to-end-qualified formatted FA2 SHA256:
+The follow-up build keeps the same FP16 Tensor Core inputs and FP32 MMA
+accumulation, and adds a native Q8192 specialization beside Q8000. Its 256-token
+tail tiles cover all 8192 causal query rows without a residual. Q8001 through
+Q8191 are leading-padded to Q8192 and the matching leading output is discarded;
+this preserves bottom-right causal positions and adds at most 2.4% query work.
+
+The default architecture admission is now FP16 Q/K/V/output,
+Q8000 through Q8192, Hq6/Hkv1/D256, causal, scale 1/16, KV at least Q through
+262144, and KV length aligned to 32 tokens. The paged-to-dense integration
+has no single-request gate. It gathers and dispatches every eligible request in
+the scheduler batch. The reusable gather and architecture workspaces remain
+stream ordered, so requests share them without allocating one multi-gigabyte
+workspace per sequence.
+
+The 32-token KV alignment is also a correctness boundary for the prefix PV
+Tensor Core K tile. Direct boundary probes at KV=Q+8/Q+16/Q+24 stayed finite
+but had approximately 72%/48%/24% sampled relative L2 error; KV=Q and Q+32
+returned to roughly 0.001% and 0.034%. The earlier alignment-one performance
+probe was therefore insufficient to admit these shapes. Lengths not divisible
+by 32 retain the general attention route.
+
+Single-V100 operator medians below use 30 warmups and 100 CUDA-event samples
+from the final Q8192 build:
+
+| Q | KV | Median (ms) | TFLOP/s | Relative L2 | Max abs | Worst-row relative L2 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 | 128000 | 81.3069 | **76.7010** | 0.002387 | 0.0000606 | 0.003918 |
+| 8192 | 128032 | 82.4936 | **75.6171** | 0.002350 | 0.0000625 | 0.004003 |
+| 8192 | 256000 | 167.2011 | **75.8294** | 0.002607 | 0.0000794 | 0.003297 |
+| 8192 | 262144 | 171.9081 | **75.5520** | 0.002290 | 0.0000390 | 0.003106 |
+
+The Q8000 regression matrix remains in the same band: 76.27/75.54/75.77/75.83
+TFLOP/s at KV128000/128032/256000/262144. Padded Q8064 and Q8191 remain above
+76 TFLOP/s at KV128K and KV256K. The worst padding ratio, Q8001, reports
+74.31/74.56 useful TFLOP/s because useful FLOPs exclude the 191 padded rows;
+the native Q8192 work itself remains in the qualified band. All outputs are
+finite, with sampled relative L2 around 0.23%-0.26%.
+
+Calling one, two, and four independent Q8192/KV128000 operations from one
+batch-like caller stream took 80.8366, 161.8506, and 325.2469 ms. Aggregate
+throughput was **77.15, 77.06, and 76.70 TFLOP/s**, and every output was finite.
+A single long-attention operation already saturates V100, so safe stream-ordered
+sharing preserves aggregate throughput rather than trying to overlap several
+workspace-heavy kernels on the same GPU.
+
+A TP4 Qwen3.8-27B-FP8 cold request with Q8192 chunks, E4M3 KV, prefix caching
+off, and a 256000-token prompt measured 96.9743-second TTFT, 2639.88 prompt
+tok/s, and 98.3537-second wall time. This is 2.65% lower prompt throughput than
+the earlier Q8000 single run; it is a small single-run difference while the
+matched operator medians remain above 75 TFLOP/s. Every rank recorded 480
+native Q8192 architecture calls and 496 E4M3 bridge calls. It returned exactly
+the same 16 token IDs as Q8000 and the stable control, including EOS:
+
+```text
+119920 96919 95761 12512 96143 97460 115783 10119
+3709 145551 99960 114931 95761 147482 1710 248046
+```
+
+The decoded answer is `校验词是「海蓝石榴」，太阳系最大的行星是木星。`;
+both retrieval and knowledge checks pass, `cached_tokens` is zero, and the log
+has no NaN, Inf, overflow, OOM, CUDA error, or worker failure.
+
+For concurrent full chunks, 8192 is a per-request scheduling threshold rather
+than the total batch limit. Two chunks use `max_num_batched_tokens=16384`,
+`max_num_seqs=2`, and `long_prefill_token_threshold=8192`; larger total token
+budgets can admit more requests. Two simultaneous cold 128000-token prompts
+completed with a 74.2707-second batch TTFT and **3446.85 aggregate prompt
+tok/s** over 256000 input tokens. Both requests had zero cached tokens and
+returned the same 16-token answer shown above. Every TP rank recorded 448
+native Q8192 calls and 480 E4M3 bridge calls.
+
+That run also exposed and closed a pre-existing E4M3 batch-decode planner
+mismatch: the Python wrapper could select a 1024-token partition for B2 at long
+context while the native batch XQA kernel accepts 64, 128, or 256. The wrapper
+now caps its automatic B2-B16 plan at 256 and rejects an incompatible explicit
+override. The complete two-request run uses the repaired automatic plan rather
+than a benchmark-only partition override.
+
+The final FA2 artifact SHA256 is
+`9f55da1ae54d87b008cb3452e23e1e4b272dd66115d37620d63674f3841c0055`.
+
+## Original Q8000 artifact identity and promotion decision
+
+The original Q8000 end-to-end-qualified formatted FA2 SHA256 was:
 `2e88f8c0fa177ab64c19fe0419a311a847aa10c9825eb6c94bf150e5f9c7c049`.
 ELF dependencies are standard Torch/CUDA/cuBLAS/system libraries. Build,
 pre-commit, route-policy tests, CUDA numerical tests, operator benchmark,
@@ -230,9 +313,11 @@ finite; sampled relative-L2 errors remain 0.23644% and 0.23166%. Seven focused
 default/route tests and all three SM70 overflow regressions pass against this
 promotion state.
 
-Keep this route restricted to the qualified shape family. It meets the current
-75-TFLOP/s, finite-output, and scoped end-to-end quality targets and is now the
-default Q8000 route on SM70 builds. Promotion beyond this prompt and model
-requires a broader long-context quality corpus or perplexity comparison because
-the sampled score shift and FP16 score/probability storage remain approximate
-even though PV accumulation and prefix output are FP32.
+The expanded Q8000/Q8192 route remains restricted to the tensor and causal
+contract above, but no longer has a single-request gate or an 8000-token KV
+step. It is the default long-prefill architecture on SM70 builds for admitted
+shapes; all other shapes retain their existing attention fallback. Extending
+the architecture to other head layouts or unaligned prefix PV tiles requires
+separate numerical and end-to-end qualification because FP16 score/probability
+storage remains approximate even though PV accumulation and prefix output are
+FP32.

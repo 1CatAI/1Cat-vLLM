@@ -1,4 +1,4 @@
-# SM70 Q8000 batched-tail prefill
+# SM70 Q8000-core long prefill
 
 SM70 FlashAttention builds include this kernel by default. Build with
 `-DVLLM_FLASH_ATTN_SM70=ON`; pass `-DVLLM_SM70_79T_PREFILL=OFF` to omit it.
@@ -6,8 +6,8 @@ This replaces the legacy architecture implementation inside the normal
 `vllm.vllm_flash_attn._vllm_fa2_C` extension. It does not load a private DSO.
 The existing v37 implementation remains available in the same extension.
 
-The Q8000 route is selected by default for its admitted shapes. These are the
-corresponding explicit runtime settings; set V37 to 1 for rollback:
+The Q8000-core route is selected by default for its admitted shapes. These are
+the corresponding explicit runtime settings; set V37 to 1 for rollback:
 
 ```bash
 export VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1
@@ -15,13 +15,24 @@ export VLLM_FLASH_V100_PREFILL_D256_GQA_V37=0
 export VLLM_FLASH_V100_ROUTE_SUMMARY=1
 ```
 
-The admitted shape is FP16 Q8000/Hq6/Hkv1/D256, causal, scale 1/16,
-KV16000 through KV256000 in steps of 8000. Other shapes retain existing
-routes. For Qwen TP4 use `max_num_batched_tokens=8000`. E4M3 storage uses
+The admitted shape is FP16 Q8000 through Q8192/Hq6/Hkv1/D256, causal, scale
+1/16, with KV at least Q through 262144 and aligned to 32 tokens. The 32-token
+alignment is required by the prefix PV Tensor Core K tile; other KV lengths
+stay on the general path. Q8000 runs through its qualified 320-token
+tail specialization. Q8192 has a native 256-token tail specialization. Q8001
+through Q8191 are leading-padded to Q8192, which preserves bottom-right causal
+alignment while keeping the added work below 2.4%. Other shapes retain existing
+routes. For one full chunk, use a per-request long-prefill threshold of 8192.
+The total `max_num_batched_tokens` can be larger: for example, use 16384 plus
+`long_prefill_token_threshold=8192` to schedule two full Q8192 chunks in the
+same step. Non-contiguous paged KV is gathered into a reusable workspace for
+each request, including multi-request batches. E4M3 storage uses
 the separately resolved `sm70_v37_e4m3_bridge`; selecting the architecture
 kernel must not disable that storage conversion. Both architecture and
 E4M3 bridge route counters must appear on every rank in an E4M3 cold run.
-The `prefill_dense_d256_gqa_79t_fp32` counter identifies this compute kernel.
+The `prefill_dense_d256_gqa_79t_fp32` counter identifies this compute family;
+`prefill_dense_d256_gqa_79t_fp32_q8192` identifies the native Q8192 kernel and
+`prefill_dense_d256_gqa_79t_fp32_q8192_pad` identifies padded mixed chunks.
 
 The historical 79T recipe uses zero-shift exponentials and unguarded FP16
 accumulation. Real model inputs overflow that recipe, although zero-mean
