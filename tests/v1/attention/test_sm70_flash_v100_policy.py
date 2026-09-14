@@ -1764,7 +1764,8 @@ def test_flash_v100_smallq_replay_shape_overflow_fails_fast(
         (8, [1, 2, 4, 8]),
         (12, [1, 2, 4, 8, 12]),
         (16, [1, 2, 4, 8, 16]),
-        (256, [1, 2, 4, 8, 16]),
+        (32, [1, 2, 4, 8, 16, 32]),
+        (256, [1, 2, 4, 8, 16, 32]),
     ],
 )
 def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(

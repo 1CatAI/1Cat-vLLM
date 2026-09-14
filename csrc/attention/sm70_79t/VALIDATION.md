@@ -342,3 +342,31 @@ the architecture to other head layouts or unaligned prefix PV tiles requires
 separate numerical and end-to-end qualification because FP16 score/probability
 storage remains approximate even though PV accumulation and prefix output are
 FP32.
+
+## B2-B32 CUDA-graph serving promotion gate
+
+The final TP4 NVFP4/E4M3 server uses normal `FULL_AND_PIECEWISE` CUDA graphs,
+prefix caching off, 262144 maximum context, 65536 batched tokens, and 32
+maximum sequences. The no-MTP default full-graph capture set is expanded from
+`[1, 2, 4, 8, 16]` to `[1, 2, 4, 8, 16, 32]`. This removes the pre-existing
+B16 capture ceiling. It does not add an attention batch ceiling: larger
+scheduler batches retain the existing piecewise graph and the same E4M3
+attention routes.
+
+Standard `vllm bench serve` exact-2048-input/exact-256-output rows complete
+with zero failures:
+
+| Concurrency | Median TTFT | Pure decode* | Median/P90 ITL | Output TPS | Median request wall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| C2 | 0.8554 s | 115.725 tok/s | 17.282 / 17.406 ms | 92.288 tok/s | 5.539 s |
+| C4 | 1.6962 s | 223.730 tok/s | 17.879 / 18.038 ms | 151.222 tok/s | 6.761 s |
+| C8 | 5.2214 s | 418.723 tok/s | 19.106 / 19.248 ms | 203.168 tok/s | 10.076 s |
+| C16 | 10.7109 s | 708.450 tok/s | 22.585 / 22.837 ms | 248.859 tok/s | 16.451 s |
+| C32 | 21.7727 s | **983.986 tok/s** | 32.521 / 32.824 ms | **272.868 tok/s** | 30.008 s |
+
+`Pure decode` is concurrency times 1000 divided by pooled median ITL. All 62
+requests generate the full 256 tokens, and a separate 32-request
+natural-language burst passes both retrieval and knowledge checks on every
+request. The B2/B4/B8/B16/B32 page-800 256K CUDA-graph operator matrix is
+finite throughout, differs from scalar E4M3 by at most `4.77e-7`, and reaches
+3.64x/6.12x/6.35x/6.46x/6.59x speedup, respectively.

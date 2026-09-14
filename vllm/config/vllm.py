@@ -80,7 +80,7 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
-_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
+_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
@@ -336,7 +336,10 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
-    max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
+    # B32 is the largest concurrency with end-to-end SM70 graph validation.
+    # Keep larger scheduler capacities usable through the regular piecewise
+    # path without forcing an unvalidated, memory-heavy full-graph capture.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
     capture_sizes = {
         size for size in _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES if size <= max_graph_reqs
     }
