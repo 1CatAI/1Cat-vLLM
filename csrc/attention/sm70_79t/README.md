@@ -1,11 +1,13 @@
-# SM70 Q8000 batched-tail prefill (experimental)
+# SM70 Q8000 batched-tail prefill
 
-Build with `-DVLLM_FLASH_ATTN_SM70=ON -DVLLM_SM70_79T_PREFILL=ON`.
+SM70 FlashAttention builds include this kernel by default. Build with
+`-DVLLM_FLASH_ATTN_SM70=ON`; pass `-DVLLM_SM70_79T_PREFILL=OFF` to omit it.
 This replaces the legacy architecture implementation inside the normal
 `vllm.vllm_flash_attn._vllm_fa2_C` extension. It does not load a private DSO.
 The existing v37 implementation remains available in the same extension.
 
-Runtime selection:
+The Q8000 route is selected by default for its admitted shapes. These are the
+corresponding explicit runtime settings; set V37 to 1 for rollback:
 
 ```bash
 export VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=1
@@ -19,6 +21,7 @@ routes. For Qwen TP4 use `max_num_batched_tokens=8000`. E4M3 storage uses
 the separately resolved `sm70_v37_e4m3_bridge`; selecting the architecture
 kernel must not disable that storage conversion. Both architecture and
 E4M3 bridge route counters must appear on every rank in an E4M3 cold run.
+The `prefill_dense_d256_gqa_79t_fp32` counter identifies this compute kernel.
 
 The historical 79T recipe uses zero-shift exponentials and unguarded FP16
 accumulation. Real model inputs overflow that recipe, although zero-mean
@@ -33,7 +36,8 @@ approximate attention path because scores and probabilities are stored in
 FP16 and score maxima are sampled. It must pass both sampled FP32-oracle
 checks and cold model requests. Current qualified medians exceed 75 TFLOPS
 at KV128K and KV256K; see `VALIDATION.md` for the exact contract and quality
-limits. The build option is OFF by default.
+limits. The build option defaults to ON for SM70 FA2 builds, and the runtime
+route defaults to this FP32-accumulated kernel.
 
 The private `MmaPipelined79T` template retains transform `set_valid()` and
 `finalize()` hooks. Without finalization the tail row masses remain zero and

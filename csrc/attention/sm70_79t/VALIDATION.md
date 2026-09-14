@@ -5,7 +5,8 @@
 Base `7217bb5d4f3866f87bf6a961204c894af3b03261`; optimized kernel
 `359ae7c30a`. The implementation is built into the normal
 `vllm.vllm_flash_attn._vllm_fa2_C` extension. It has no private DSO or
-preload dependency and remains experimental and opt-in.
+preload dependency. SM70 FA2 builds and the admitted Q8000 runtime route
+enable it by default; explicit build and runtime switches retain rollback.
 
 The test host uses Python 3.12, Torch 2.10.0+cu128, CUDA 12.8, and four
 V100-SXM2-32GB GPUs (physical 4-7 in PCI order) at TP4. The model is
@@ -211,15 +212,27 @@ request would be a separate acceptance item.
 
 ## Artifact identity and promotion decision
 
-Final formatted source-built FA2 SHA256:
+End-to-end-qualified formatted FA2 SHA256:
 `2e88f8c0fa177ab64c19fe0419a311a847aa10c9825eb6c94bf150e5f9c7c049`.
 ELF dependencies are standard Torch/CUDA/cuBLAS/system libraries. Build,
 pre-commit, route-policy tests, CUDA numerical tests, operator benchmark,
 and cold model runs all use the owned worktree. Raw logs and captured model
 tensors remain in task-local `.artifacts` and are deliberately not committed.
 
-Keep this route experimental and opt-in. It meets the current 75-TFLOP/s,
-finite-output, and scoped end-to-end quality targets. Promotion beyond this
-prompt and model requires a broader long-context quality corpus or perplexity
-comparison because the sampled score shift and FP16 score/probability storage
-remain approximate even though PV accumulation and prefix output are FP32.
+Before default promotion, the branch was synchronized with `main` at
+`6def188c21`. Reconfiguring the SM70 build after removing the cached
+`VLLM_SM70_79T_PREFILL` value selected `ON` without an explicit option. The
+rebuilt FA2 SHA256 is
+`5a57d7349b65896d8d01f0f07a3f3c196ec3f06708be7bf718ea0f71ac774687`.
+With 30 warmups and 100 measurements, this default-built artifact reaches
+76.3245 TFLOP/s at KV128K and 75.6356 TFLOP/s at KV256K. Both outputs are
+finite; sampled relative-L2 errors remain 0.23644% and 0.23166%. Seven focused
+default/route tests and all three SM70 overflow regressions pass against this
+promotion state.
+
+Keep this route restricted to the qualified shape family. It meets the current
+75-TFLOP/s, finite-output, and scoped end-to-end quality targets and is now the
+default Q8000 route on SM70 builds. Promotion beyond this prompt and model
+requires a broader long-context quality corpus or perplexity comparison because
+the sampled score shift and FP16 score/probability storage remain approximate
+even though PV accumulation and prefix output are FP32.

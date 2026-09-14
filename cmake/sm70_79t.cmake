@@ -1,5 +1,12 @@
-# The historical Q8000 79T recipe is opt-in until model quality is qualified.
-option(VLLM_SM70_79T_PREFILL "Build the SM70 Q8000 batched-tail prefill" OFF)
+# Ship the qualified Q8000 route in SM70 FA2 builds while keeping unrelated
+# CUDA targets unchanged. The cache option remains available for rollback.
+set(_VLLM_SM70_79T_PREFILL_DEFAULT OFF)
+if(VLLM_FLASH_ATTN_SM70)
+  set(_VLLM_SM70_79T_PREFILL_DEFAULT ON)
+endif()
+option(VLLM_SM70_79T_PREFILL "Build the SM70 Q8000 batched-tail prefill"
+  ${_VLLM_SM70_79T_PREFILL_DEFAULT})
+unset(_VLLM_SM70_79T_PREFILL_DEFAULT)
 if(NOT VLLM_SM70_79T_PREFILL)
   return()
 endif()

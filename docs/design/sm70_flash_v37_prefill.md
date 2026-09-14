@@ -26,10 +26,12 @@ code triggers a warning and an exact fallback, never a false v37 route hit.
 We also join the private tail on exception before releasing its inputs and
 temporary state. The legacy architecture remains available for rollback.
 
-Set `VLLM_FLASH_V100_PREFILL_D256_GQA_V37=0` before starting workers to use
-the old architecture loader and disable the new E4M3 bridge. Runtime
-environment mutation in an already initialized engine is not a rollback
-mechanism.
+Set `VLLM_FLASH_V100_PREFILL_D256_GQA_V37=1` before starting workers to select
+this v37 operator as a rollback or matched control. The default value of 0
+selects the qualified Q8000 architecture operator on its narrow shape family;
+other shapes retain their existing fallback. The E4M3 bridge is independent of
+this compute-kernel selection. Runtime environment mutation in an already
+initialized engine is not a rollback mechanism.
 
 ### Preserve the E4M3 decode launch contract
 
