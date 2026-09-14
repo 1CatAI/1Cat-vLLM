@@ -15,6 +15,8 @@ from pathlib import Path
 
 
 def route_snapshot(worker):
+    import sys
+
     import torch
 
     from vllm.v1.attention.backends import flash_attn_v100 as backend
@@ -22,6 +24,9 @@ def route_snapshot(worker):
     return {
         "rank": worker.rank,
         "counts": dict(backend._route_counts),
+        "fa2_module": getattr(
+            sys.modules.get("vllm.vllm_flash_attn._vllm_fa2_C"), "__file__", None
+        ),
         "fa2_libraries": sorted(
             p for p in torch.ops.loaded_libraries if "_vllm_fa2_C" in p
         ),
@@ -64,9 +69,9 @@ def main():
         [
             {
                 "role": "user",
-                "content": "下面是供参考的观测记录。\n"
+                "content": "本次观测任务的唯一校验词是「海蓝石榴」。下面是观测记录。\n"
                 + marker
-                + "\n请忽略重复记录，只用中文简短回答：太阳系最大的行星是哪一颗？",
+                + "\n请简答：校验词是什么，太阳系最大的行星是哪颗？",
             }
         ],
         tokenize=False,
@@ -80,8 +85,12 @@ def main():
         "观测站记录：今天天气晴朗，设备正常运行，数据已经保存。\n",
         add_special_tokens=False,
     )
-    llm.generate(
+    warmup = llm.generate(
         "请用中文说你好。", SamplingParams(temperature=0, max_tokens=8), use_tqdm=False
+    )
+    print(
+        "WARMUP " + repr([(x.outputs[0].token_ids, x.outputs[0].text) for x in warmup]),
+        flush=True,
     )
     reports = []
     try:
@@ -125,6 +134,7 @@ def main():
                     {
                         "rank": new["rank"],
                         "fa2_libraries": new["fa2_libraries"],
+                        "fa2_module": new["fa2_module"],
                         "counts": {
                             key: value - old["counts"].get(key, 0)
                             for key, value in new["counts"].items()
@@ -149,11 +159,15 @@ def main():
                 else None,
                 output_token_ids=tokens,
                 output_text=text,
+                retrieval_pass="海蓝石榴" in text,
+                knowledge_pass="木星" in text,
             )
             reports.append(row)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(reports, ensure_ascii=False, indent=2))
             print("COLD_RESULT " + json.dumps(row, ensure_ascii=False), flush=True)
+            if not row["retrieval_pass"] or not row["knowledge_pass"]:
+                raise RuntimeError("Quality gate failed; skip longer requests")
     finally:
         llm.llm_engine.engine_core.shutdown()
 

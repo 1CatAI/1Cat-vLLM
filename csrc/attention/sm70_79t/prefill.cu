@@ -535,6 +535,9 @@ __device__ __forceinline__ int pv_task_index() {
 #endif
   return g_pv_task_base + local_task;
 }
+#if defined(PREFIX_TORCH_STABLE_ROWS)
+  #include "stable_rows.cuh"
+#endif
 __device__ __forceinline__ int64_t row_sum_output_index(int row) {
 #if defined(PREFIX_BATCHED_TRI_TAIL)
   return int64_t(pv_task_index()) * g_rows + row;
@@ -941,7 +944,19 @@ struct ExpRowSumTransformAImpl {
   #if defined(PREFIX_TRANSPOSED_SCORE_WORKSPACE)
     #pragma unroll
     for (int element = 0; element < kElementsPerAccess; ++element) {
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+      auto offset = ThreadMap::initial_offset(threadIdx.x);
+      int row = int(blockIdx.x) * PVThreadblockShape::kM + offset.contiguous() +
+                element;
+      if constexpr (FuseCausalMask) {
+        row += stable_tail_query_tile() * 320 * 6;
+        row_max[element] = __ldg(g_79t_tail_row_max + row);
+      } else {
+        row_max[element] = __ldg(g_row_max + row);
+      }
+    #else
       row_max[element] = 0.0f;
+    #endif
     }
     #if defined(PREFIX_PV_SKIP_ROW_SUM)
     #elif defined(PREFIX_PV_COMPACT_DISTRIBUTED_ROW_SUM)
@@ -1979,6 +1994,7 @@ struct PVLauncher {
 
   void launch(cudaStream_t stream) const {
     cutlass::Kernel<PVKernel><<<grid, block, smem_bytes, stream>>>(params);
+    check(cudaGetLastError(), "launch prefix PV");
   }
 
   #if defined(PREFIX_TAIL_WAVE_GATED)
@@ -2683,7 +2699,9 @@ __global__ void finalize_round_major_tail_state(float const* partial_sums,
     int task = first_task + query_tile - round * kGroupTiles;
     sum += partial_sums[int64_t(task) * tile_rows + local_row];
   }
+      #if !defined(PREFIX_TORCH_STABLE_ROWS)
   state_max[global_row] = 0.0f;
+      #endif
   state_sum[global_row] = sum;
 }
 
@@ -5910,6 +5928,10 @@ struct Sm70GqaHalf2Workspace {
   at::Tensor tail_score_ptrs;
   at::Tensor tail_pv_params;
 
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+  at::Tensor value_scaled, value_max, block_sum, block_max, prefix_max;
+  at::Tensor prefix_accumulator, max_partials, tail_max_partials;
+    #endif
   std::vector<Element*> host_tail_q_ptrs;
   std::vector<Element*> host_tail_k_ptrs;
   std::vector<ScoreElement*> host_tail_score_ptrs;
@@ -5996,6 +6018,17 @@ struct Sm70GqaHalf2Workspace {
       tail_scores = scores;
     }
 
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+    auto fp32 = q.options().dtype(at::ScalarType::Float);
+    value_scaled = at::empty({kMaxTotalKV, kHeadDim}, q.options());
+    value_max = at::empty({1}, fp32);
+    block_sum = at::empty({kRows}, fp32);
+    block_max = at::empty({kRows}, fp32);
+    prefix_max = at::empty({kRows}, fp32);
+    prefix_accumulator = at::empty({kRows, kHeadDim}, fp32);
+    max_partials = at::empty({16, kRows}, fp32);
+    tail_max_partials = at::empty({16, kRows}, fp32);
+    #endif
     host_tail_q_ptrs.reserve(kTailTasks);
     host_tail_k_ptrs.reserve(kTailTasks);
     host_tail_score_ptrs.reserve(kTailTasks);
@@ -6079,8 +6112,38 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
                                      Workspace::kTailTileRows * sizeof(float),
                                  prefix_stream));
 
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+  float* block_sum = workspace->block_sum.data_ptr<float>();
+  float* block_max = workspace->block_max.data_ptr<float>();
+  float* prefix_max = workspace->prefix_max.data_ptr<float>();
+  float* prefix_accumulator = workspace->prefix_accumulator.data_ptr<float>();
+  float* maximum_value = workspace->value_max.data_ptr<float>();
+  auto* scaled_value =
+      reinterpret_cast<__half*>(workspace->value_scaled.data_ptr<at::Half>());
+  C10_CUDA_CHECK(cudaMemsetAsync(block_sum, 0, Workspace::kRows * sizeof(float),
+                                 prefix_stream));
+  C10_CUDA_CHECK(
+      cudaMemsetAsync(maximum_value, 0, sizeof(float), prefix_stream));
+  stable_value_amax<<<1024, 256, 0, prefix_stream>>>(
+      reinterpret_cast<__half const*>(value), maximum_value,
+      total_kv * Workspace::kHeadDim);
+  stable_scale_values<<<1024, 256, 0, prefix_stream>>>(
+      reinterpret_cast<__half const*>(value), scaled_value, maximum_value,
+      total_kv * Workspace::kHeadDim);
+  value = reinterpret_cast<Element*>(scaled_value);
+  C10_CUDA_CHECK(
+      cudaMemcpyToSymbolAsync(g_row_max, &block_max, sizeof(block_max), 0,
+                              cudaMemcpyHostToDevice, prefix_stream));
+  C10_CUDA_CHECK(
+      cudaMemcpyToSymbolAsync(g_79t_tail_row_max, &tail_max, sizeof(tail_max),
+                              0, cudaMemcpyHostToDevice, prefix_stream));
+    #endif
   int prefix_rows = Workspace::kRows;
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+  float* prefix_sum_output = block_sum;
+    #else
   float* prefix_sum_output = prefix_sum;
+    #endif
   int tail_rows = Workspace::kTailTileRows;
   float* tail_sum_output = tail_row_sums;
   int task_base = 0;
@@ -6172,7 +6235,12 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     prefix_pv.push_back(std::make_unique<PVLauncher>(
     #endif
         scores, value + size_t(begin) * Workspace::kHeadDim, prefix_numerator,
-        Workspace::kRows, width, block != 0));
+        Workspace::kRows, width,
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+        false));
+    #else
+        block != 0));
+    #endif
   }
 
   workspace->host_tail_pv_params.clear();
@@ -6270,6 +6338,15 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     mask_batched_tri_tail_diagonal<<<mask_grid, 256, 0, tail_stream>>>(
         reinterpret_cast<__half*>(tail_scores), Workspace::kTailTileRows,
         Workspace::kTailTileTokens, 0);
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+    dim3 max_grid((Workspace::kRows + 255) / 256, 16);
+    stable_row_max_partials<true><<<max_grid, 128, 0, tail_stream>>>(
+        reinterpret_cast<__half const*>(tail_scores),
+        workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows, 8000);
+    stable_finish_max<<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
+        workspace->tail_max_partials.data_ptr<float>(), tail_max,
+        Workspace::kRows, 16);
+    #endif
     if (direct_tail_debug) {
       set_pv_task_base_kernel<<<1, 1, 0, tail_stream>>>(0);
       dim3 direct_grid = tail_pv_grid;
@@ -6288,6 +6365,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         batched_tri_tail_pv_kernel<<<round_grid, tail_pv_block,
                                      tail_pv_smem_bytes, tail_stream>>>(
             tail_pv_params);
+        C10_CUDA_CHECK(cudaGetLastError());
         direct_task_base += round_tasks;
       }
     }
@@ -6310,7 +6388,25 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
       C10_CUDA_CHECK(
           cudaEventRecord(workspace->prefix_pv_ready, prefix_stream));
     }
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+    int width =
+        std::min(Workspace::kBlockN, prefix - block * Workspace::kBlockN);
+    int tiles = (width + 511) / 512;
+    dim3 max_grid((Workspace::kRows + 255) / 256, tiles);
+    stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(
+        reinterpret_cast<__half const*>(scores),
+        workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
+    stable_finish_max<<<(Workspace::kRows + 255) / 256, 256, 0,
+                        prefix_stream>>>(
+        workspace->max_partials.data_ptr<float>(), block_max, Workspace::kRows,
+        tiles);
+    #endif
     prefix_pv[block]->launch(prefix_stream);
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+    stable_merge_prefix<<<Workspace::kRows, 256, 0, prefix_stream>>>(
+        reinterpret_cast<__half const*>(prefix_numerator), block_sum, block_max,
+        prefix_accumulator, prefix_sum, prefix_max, block == 0);
+    #endif
     if (block == 0 && !exact_tail_debug && concurrent_tail_scores) {
       C10_CUDA_CHECK(
           cudaStreamWaitEvent(tail_stream, workspace->prefix_pv_ready, 0));
@@ -6444,18 +6540,26 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         tail_numerator, PREFIX_BATCHED_TRI_REPAIR_TOKENS,
         PREFIX_BATCHED_TRI_REPAIR_TOKENS, 6, 1, 0.0625f, prefix_stream));
   }
-    #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+  stable_merge_final<<<Workspace::kRows, 256, 0, prefix_stream>>>(
+      prefix_accumulator, prefix_sum, prefix_max,
+      reinterpret_cast<__half const*>(tail_numerator), tail_sum, tail_max,
+      maximum_value, reinterpret_cast<__half*>(output), repaired_rows,
+      prefix > 0);
+    #else
+      #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
   merge_float_prefix_direct_round_major_tail<<<
       Workspace::kRows, Workspace::kHeadDim / 2, 0, prefix_stream>>>(
       prefix_numerator,
-    #else
+      #else
   merge_prefix_direct_round_major_tail<<<
       Workspace::kRows, Workspace::kHeadDim / 2, 0, prefix_stream>>>(
       reinterpret_cast<__half const*>(prefix_numerator),
-    #endif
+      #endif
       prefix_sum, reinterpret_cast<__half const*>(tail_numerator), tail_max,
       tail_sum, reinterpret_cast<__half*>(output), Workspace::kRows,
       repaired_rows);
+    #endif
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(cudaEventRecord(workspace->completion, prefix_stream));
   C10_CUDA_CHECK(cudaStreamWaitEvent(caller_stream, workspace->completion, 0));

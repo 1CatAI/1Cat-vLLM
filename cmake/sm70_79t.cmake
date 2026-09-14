@@ -17,7 +17,8 @@ get_target_property(_fa_defines _vllm_fa2_C COMPILE_DEFINITIONS)
 list(FILTER _fa_defines EXCLUDE REGEX "^(PREFIX_|QK_|PV_)")
 set_property(TARGET _vllm_fa2_C PROPERTY COMPILE_DEFINITIONS "${_fa_defines}")
 set(_79t_defs
-  PREFIX_TORCH_EXTENSION PREFIX_FULL_ENDPOINT
+  PREFIX_TORCH_EXTENSION PREFIX_FULL_ENDPOINT PREFIX_TORCH_STABLE_ROWS
+  PREFIX_PV_FP32_MMA_ACCUMULATE
   PREFIX_QK_PRETRANSPOSE_INPUTS PREFIX_TRANSPOSED_SCORE_WORKSPACE
   PREFIX_PV_COMPUTE_SUM PREFIX_PV_UNNORMALIZED
   PREFIX_PV_DIRECT_FP16_ACCUMULATE PREFIX_QK_CUBLAS_RAW
@@ -35,7 +36,7 @@ set(_79t_defs
 set_source_files_properties("${SM70_79T_DIR}/prefill.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_DEFINITIONS "${_79t_defs}"
-  COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda")
+  COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70;-O3;--use_fast_math;--maxrregcount=128;--expt-relaxed-constexpr;--expt-extended-lambda")
 set_source_files_properties("${SM70_79T_DIR}/legacy_tail_adapter.cu"
   TARGET_DIRECTORY _vllm_fa2_C PROPERTIES
   COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70")

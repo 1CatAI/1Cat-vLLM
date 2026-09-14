@@ -20,9 +20,14 @@ the separately resolved `sm70_v37_e4m3_bridge`; selecting the architecture
 kernel must not disable that storage conversion. Both architecture and
 E4M3 bridge route counters must appear on every rank in an E4M3 cold run.
 
-The historical recipe uses FP16 scores and FP16 PV accumulation. It is not
-numerically equivalent to v37 FP32. A finite random-input operator result
-alone does not qualify a model. The build option is OFF by default.
+The historical 79T recipe uses zero-shift exponentials and FP16 PV
+accumulation. Real model inputs overflow that recipe, although zero-mean
+random-input tests pass. This integration computes actual row maxima,
+merges block states in FP32, scales values by an exact power of two, and
+uses FP32 tensor-core accumulation for PV. FP16 scores and intermediate
+PV outputs remain. The corrected recipe needs its own performance and
+model-quality measurements; historical TFLOPS are not its performance.
+The build option is OFF by default.
 
 The private `MmaPipelined79T` template retains transform `set_valid()` and
 `finalize()` hooks. Without finalization the tail row masses remain zero and
@@ -35,6 +40,8 @@ and sampled FP32-oracle error. `benchmark_sm70_79t_cold.py` disables prefix
 caching, excludes engine load and a short warmup, and records client TTFT,
 request wall time, subsequent decode rate, and output token IDs separately.
 The deterministic sampling override is explicit; EOS is respected.
+Route snapshots use a benchmark-owned callable through local worker RPC;
+set `VLLM_ALLOW_INSECURE_SERIALIZATION=1` for this local benchmark only.
 
 Source lineage: the 2026-09-12/14 79T torch-port experiment based on the
 historical 7787-line architecture source, moved into the parent repository.
