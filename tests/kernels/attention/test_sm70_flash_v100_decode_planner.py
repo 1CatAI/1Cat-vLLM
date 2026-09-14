@@ -252,6 +252,43 @@ def test_xqa_batch_context_route_prefers_live_context(
     assert captured_hints == [expected_hint]
 
 
+def test_e4m3_batched_xqa_long_context_caps_partition_at_256(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1")
+    _clear_decode_caches()
+    captured_partitions: list[int] = []
+
+    def fake_xqa(*args):
+        captured_partitions.append(args[11])
+        return args[3]
+
+    monkeypatch.setattr(
+        flash_attn_v100.flash_attn_v100_cuda,
+        "decode_paged_xqa_fwd",
+        fake_xqa,
+    )
+    query = torch.empty((2, 6, 256), dtype=torch.float16)
+    key_cache = torch.empty((1, 16, 1, 256), dtype=torch.uint8)
+    value_cache = torch.empty_like(key_cache)
+    block_table = torch.zeros((2, 8192), dtype=torch.int32)
+    seq_lens = torch.full((2,), 128000, dtype=torch.int32)
+
+    flash_attn_v100.flash_attn_decode_paged_xqa(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        kv_cache_dtype="fp8_e4m3",
+        max_seq_len_hint=128000,
+        workspace_seq_capacity_hint=128000,
+    )
+
+    assert captured_partitions == [256]
+
+
 @torch.inference_mode()
 def test_stale_active_num_partitions_does_not_truncate_decode(
     monkeypatch,
