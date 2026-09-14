@@ -325,9 +325,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             else torch.Event(enable_timing=True)
         )
 
-        if self.gpu_to_cpu:
-            # wait for model computation to finish before offloading
-            stream.wait_stream(torch.cuda.current_stream())
+        # D2H must wait for computation to finish writing the source. H2D
+        # must also wait: the compute stream may still be zeroing freshly
+        # allocated destination blocks. Otherwise that zeroing can overwrite
+        # restored cache data after the transfer completes.
+        stream.wait_stream(torch.cuda.current_stream())
         if self._transfers:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
