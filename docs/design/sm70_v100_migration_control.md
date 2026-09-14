@@ -46677,8 +46677,11 @@ has launched no full model. Details and artifacts are in
   The 16K quality precheck returns `海蓝石榴；木星` at 4149.15 prompt
   tok/s. The uncached 256000-token request returns
   `校验词是「海蓝石榴」，太阳系最大的行星是木星。` with a 102.7519-second TTFT,
-  **2491.44 prompt tok/s**, and 74.73 decode tok/s. Both retrieval and
-  knowledge checks pass, and `cached_tokens=0`.
+  **2491.44 prompt tok/s**. Both retrieval and knowledge checks pass, and
+  `cached_tokens=0`. Its 15 decode intervals are a short quality observation,
+  not a throughput baseline. A separate graph-only 256000-input/256-output run
+  measures 255 intervals in 5.3902 seconds: **47.308 tok/s** and **21.138 ms
+  TPOT**, with a 102.9135-second TTFT and 2487.53 prompt tok/s.
 - Every rank records 480 Q8192 FP32-accumulated long-prefill calls and 496 E4M3
   bridge calls during the 256K request. The final route summary records 48
   dynamic page-800 E4M3 XQA decode calls per rank. The final source-built

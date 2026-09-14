@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cold-cache CUDA-graph TTFT and decode measurement for Q8192 prefill.
 
-Deterministic quality comparison; EOS is respected and thinking is disabled.
-Engine construction and a short warmup are excluded. Prefix caching,
-speculative decoding, and eager execution are disabled.
+Deterministic quality comparison; EOS is respected unless a fixed-length speed
+run explicitly requests ``--ignore-eos``, and thinking is disabled. Engine
+construction and a short warmup are excluded. Prefix caching, speculative
+decoding, and eager execution are disabled.
 """
 
 import argparse
@@ -41,6 +42,8 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--lengths", type=int, nargs="+", default=[128000, 256000])
     parser.add_argument("--output-len", type=int, default=32)
+    parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--min-decode-intervals", type=int, default=63)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--kv-cache-dtype", default="fp8_e4m3")
     parser.add_argument(
@@ -55,6 +58,8 @@ def main():
     args = parser.parse_args()
     if args.concurrent_requests < 1:
         parser.error("--concurrent-requests must be positive")
+    if args.min_decode_intervals < 1:
+        parser.error("--min-decode-intervals must be positive")
     if args.concurrent_requests > args.max_num_seqs:
         parser.error("--max-num-seqs must cover every concurrent request")
     if (
@@ -126,6 +131,7 @@ def main():
                 top_p=1,
                 top_k=-1,
                 max_tokens=args.output_len,
+                ignore_eos=args.ignore_eos,
                 output_kind=RequestOutputKind.DELTA,
             )
             engine = llm.llm_engine
@@ -190,6 +196,19 @@ def main():
                     raise RuntimeError(
                         f"Cold request {request_id} unexpectedly reused {cached} tokens"
                     )
+                decode_intervals = max(len(tokens) - 1, 0)
+                decode_seconds = last - first
+                observed_decode_tps = (
+                    decode_intervals / decode_seconds
+                    if decode_seconds > 0 and decode_intervals > 0
+                    else None
+                )
+                observed_decode_tpot = (
+                    decode_seconds / decode_intervals
+                    if decode_seconds > 0 and decode_intervals > 0
+                    else None
+                )
+                decode_qualified = decode_intervals >= args.min_decode_intervals
                 request_rows.append(
                     dict(
                         request_id=request_id,
@@ -200,10 +219,17 @@ def main():
                         ).hexdigest(),
                         ttft_seconds=first - start,
                         prompt_tokens_per_ttft_s=len(ids) / (first - start),
-                        decode_seconds=last - first,
-                        decode_tokens_per_s=(len(tokens) - 1) / (last - first)
-                        if last > first
-                        else None,
+                        decode_seconds=decode_seconds,
+                        decode_intervals=decode_intervals,
+                        observed_decode_tokens_per_s=observed_decode_tps,
+                        observed_decode_tpot_seconds=observed_decode_tpot,
+                        decode_measurement_qualified=decode_qualified,
+                        decode_tokens_per_s=(
+                            observed_decode_tps if decode_qualified else None
+                        ),
+                        decode_tpot_seconds=(
+                            observed_decode_tpot if decode_qualified else None
+                        ),
                         output_token_ids=tokens,
                         output_text=text,
                         retrieval_pass="海蓝石榴" in text,
@@ -216,6 +242,8 @@ def main():
                 graph=True,
                 weight_quantization_override=args.quantization,
                 kv_cache_dtype=args.kv_cache_dtype,
+                ignore_eos=args.ignore_eos,
+                min_decode_intervals=args.min_decode_intervals,
                 concurrent_requests=args.concurrent_requests,
                 aggregate_prompt_tokens=args.concurrent_requests * len(ids),
                 batch_ttft_seconds=batch_ttft,

@@ -411,13 +411,17 @@ FP16 model execution, E4M3 KV, Q8192 chunks, maximum length 262144, one live
 request, prefix caching disabled, and `FULL_AND_PIECEWISE` CUDA graphs. It does
 not enable speculative decoding or eager execution.
 
-| Prompt | TTFT | Prompt throughput | Decode throughput | Cached | Answer |
-|---:|---:|---:|---:|---:|---|
-| 16000 | 3.8562 s | 4149.15 tok/s | 78.47 tok/s | 0 | `海蓝石榴；木星` |
-| 256000 | 102.7519 s | **2491.44 tok/s** | 74.73 tok/s | 0 | `校验词是「海蓝石榴」，太阳系最大的行星是木星。` |
+| Purpose | Prompt | Output policy | Decode intervals | TTFT | Prompt throughput | Decode result |
+|---|---:|---|---:|---:|---:|---:|
+| Quality | 16000 | natural EOS | 5 | 3.8562 s | 4149.15 tok/s | short observation only |
+| Quality | 256000 | natural EOS | 15 | 102.7519 s | **2491.44 tok/s** | short observation only |
+| Speed | 256000 | fixed 256 tokens | 255 | 102.9135 s | 2487.53 tok/s | **47.308 tok/s / 21.138 ms TPOT** |
 
-Both retrieval and knowledge checks pass and both answers terminate naturally.
-For the 256K request, every TP rank records 480 Q8192 FP32-accumulated
+Both natural-EOS retrieval and knowledge checks pass and both answers terminate
+naturally. Their five- and fifteen-interval decode figures are deliberately not
+reported as speed baselines. The fixed-length run supplies the qualified 256K
+decode result; its post-EOS padding is not quality evidence. For the 256K
+request, every TP rank records 480 Q8192 FP32-accumulated
 long-prefill calls and 496 E4M3 bridge calls. The final route summary also
 records 48 `decode_xqa_e4m3_dynamic_page800` calls per rank. The run contains
 no prefix-cache hit, non-finite value, worker failure, or CUDA error.

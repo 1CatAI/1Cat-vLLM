@@ -286,10 +286,14 @@ from an NVFP4/compressed-tensors checkpoint with E4M3 KV and normal
 `FULL_AND_PIECEWISE` CUDA graphs. With Q8192 chunks, maximum length 262144,
 one live request, prefix caching off, and no speculative decoding, the 256000-
 token cold request measures 102.7519-second TTFT and **2491.44 prompt tok/s**.
-It returns the same complete 16-token answer above at 74.73 decode tok/s; both
-quality checks pass and `cached_tokens=0`. Every rank records 480 native Q8192
-calls and 496 E4M3 bridge calls. The final route summary records 48 dynamic
-page-800 E4M3 XQA decode calls per rank. This run never enables eager mode.
+It returns the same complete 16-token answer above; both quality checks pass
+and `cached_tokens=0`. Its 15 token intervals are too short for a decode-speed
+claim. A separate 256000-input/256-output fixed run measures 255 intervals in
+5.3902 seconds, or **47.308 tok/s** and **21.138 ms TPOT**. Its TTFT is
+102.9135 seconds and uncached prefill is 2487.53 tok/s. Every rank records 480
+native Q8192 calls and 496 E4M3 bridge calls. The final route summary records
+48 dynamic page-800 E4M3 XQA decode calls per rank. Neither run enables eager
+mode.
 
 For concurrent full chunks, 8192 is a per-request scheduling threshold rather
 than the total batch limit. Two chunks use `max_num_batched_tokens=16384`,
