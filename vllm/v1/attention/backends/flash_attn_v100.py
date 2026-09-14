@@ -1408,8 +1408,7 @@ def _get_sm70_d256_gqa_architecture_op():
 
 def _get_sm70_v37_e4m3_bridge_op():
     """Resolve the format-specific bridge from the same FA2 runtime."""
-    if not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
-        return None
+    # E4M3 storage conversion is independent of the dense compute kernel.
     _get_sm70_splitd_d256_ops()
     return getattr(torch.ops._vllm_fa2_C, "sm70_v37_e4m3_bridge", None)
 
