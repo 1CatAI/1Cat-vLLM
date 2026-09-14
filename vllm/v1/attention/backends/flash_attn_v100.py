@@ -797,7 +797,7 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
         logger.warning(
             "SM70 Flash-V100 received an unresolved `fp8` KV-cache dtype and "
             "will interpret it as upstream E4M3. Normal EngineArgs processing "
-            "rewrites the SM70 `fp8` shorthand to `fp8_e5m2`; this warning "
+            "rewrites the SM70 `fp8` shorthand to `fp8_e4m3`; this warning "
             "usually means the backend was constructed directly. KV-cache "
             "dtype is independent of model weight quantization."
         )
@@ -951,7 +951,7 @@ def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
     """Gate the exact SM70 E4M3 G6 batched XQA route."""
     return (
         envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
-        and 1 < query.shape[0] <= 16
+        and query.shape[0] > 1
         and query.shape[1:] == (6, 256)
     )
 

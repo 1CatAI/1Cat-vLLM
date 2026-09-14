@@ -240,8 +240,8 @@ class CudagraphDispatcher:
         self.sm70_e4m3_b1_wave_context_routing = bool(
             self.sm70_fp8_kv_batch_context_routing
             and cache_dtype in ("fp8", "fp8_e4m3")
-            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "0") == "1"
-            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS", "0") == "1"
+            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
+            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS", "1") != "0"
         )
         self.sm70_e4m3_b1_wave_context_min_seq_len = max(
             1,
