@@ -68,6 +68,26 @@ def test_missing_v37_does_not_select_legacy(monkeypatch):
     assert mod._get_sm70_d256_gqa_architecture_op() is None
 
 
+@pytest.mark.parametrize("v37", ["0", "1"])
+def test_e4m3_bridge_independent_of_compute_kernel(monkeypatch, v37):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", v37)
+    mod.envs.disable_envs_cache()
+    bridge = object()
+    monkeypatch.setattr(mod, "_get_sm70_splitd_d256_ops", lambda: None)
+    monkeypatch.setattr(
+        mod,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(
+                _vllm_fa2_C=SimpleNamespace(sm70_v37_e4m3_bridge=bridge)
+            )
+        ),
+    )
+    assert mod._get_sm70_v37_e4m3_bridge_op() is bridge
+
+
 @pytest.mark.parametrize("dtype", ["fp8_e4m3", "fp8_e5m2"])
 def test_explicit_fp8_bridge_routes(dtype):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl

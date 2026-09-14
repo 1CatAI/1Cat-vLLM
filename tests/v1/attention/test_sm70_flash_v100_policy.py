@@ -250,6 +250,19 @@ def test_sm70_d256_gqa_architecture_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL is False
 
 
+def test_sm70_d256_gqa_v37_env_is_default_off(monkeypatch):
+    import vllm.envs as envs
+
+    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_V37"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37 is False
+
+    monkeypatch.setenv(name, "1")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37 is True
+
+
 def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
     import vllm.envs as envs
 
@@ -593,8 +606,12 @@ def test_prefill_gather_dense_falls_back_when_workspace_is_out_of_memory(
         ({}, True),
         ({"q_len": 2048}, False),
         ({"seq_len": 4096}, False),
-        ({"seq_len": 8224}, False),
-        ({"num_seqs": 2}, False),
+        ({"seq_len": 8224}, True),
+        ({"seq_len": 8225}, False),
+        ({"num_seqs": 2}, True),
+        ({"q_len": 8192, "seq_len": 8192, "num_seqs": 2}, True),
+        ({"q_len": 8001, "seq_len": 128032, "num_seqs": 2}, True),
+        ({"q_len": 8001, "seq_len": 128008}, False),
         ({"causal": False}, False),
     ],
 )
@@ -622,7 +639,7 @@ def test_prefill_gather_dense_policy_is_evidence_bounded(overrides, expected):
     assert impl._should_use_prefill_gather_dense(**kwargs) is expected
 
 
-def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
+def test_prefix_prefill_gathered_exact_dense_supports_multi_request_batch(
     monkeypatch,
 ):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
@@ -656,21 +673,40 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
     impl.flash_attn_bhmd_func = None
     impl.flash_attn_func = None
 
-    query_len = 4096
+    num_seqs = 2
+    query_len = 8192
     seq_len = 8192
     page_size = 784
     num_pages = (seq_len + page_size - 1) // page_size
-    query = torch.empty((query_len, 6, 256), dtype=torch.float16)
+    query = torch.empty((num_seqs * query_len, 6, 256), dtype=torch.float16)
     output = torch.empty_like(query)
-    key_cache = torch.empty((num_pages, page_size, 1, 256), dtype=torch.float16)
+    key_cache = torch.empty(
+        (num_seqs * num_pages, page_size, 1, 256), dtype=torch.float16
+    )
     value_cache = torch.empty_like(key_cache)
-    block_table = torch.arange(num_pages - 1, -1, -1, dtype=torch.int32).unsqueeze(0)
-    seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    block_table = torch.stack(
+        [
+            torch.arange(
+                (i + 1) * num_pages - 1,
+                i * num_pages - 1,
+                -1,
+                dtype=torch.int32,
+            )
+            for i in range(num_seqs)
+        ]
+    )
+    seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32)
+    query_start_loc = torch.arange(
+        0,
+        (num_seqs + 1) * query_len,
+        query_len,
+        dtype=torch.int32,
+    )
     metadata = SimpleNamespace(
         causal=True,
-        num_actual_tokens=query_len,
-        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
-        query_start_loc_cpu=torch.tensor([0, query_len], dtype=torch.int32),
+        num_actual_tokens=num_seqs * query_len,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens,
         block_table=block_table,
@@ -679,8 +715,11 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
     )
     layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
     routes: list[str] = []
+    dense_calls = 0
 
     def exact_dense(query_arg, key_arg, value_arg, **kwargs):
+        nonlocal dense_calls
+        dense_calls += 1
         assert query_arg.shape == (1, query_len, 6, 256)
         assert key_arg.shape == (1, seq_len, 1, 256)
         assert value_arg.shape == key_arg.shape
@@ -720,7 +759,8 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
 
     assert result is output
     assert torch.equal(output, torch.full_like(output, 5))
-    assert routes == ["prefill_prefix_gather_splitd_d256"]
+    assert dense_calls == num_seqs
+    assert routes == ["prefill_prefix_gather_splitd_d256"] * num_seqs
 
 
 def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
@@ -935,13 +975,16 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
     )
 
 
-def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatch):
+def test_prefill_d256_gqa_architecture_policy_accepts_q8192_and_aligned_kv(
+    monkeypatch,
+):
     import vllm.envs as envs
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
     monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
     name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
     query = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
+    query_8192 = torch.empty((1, 8192, 6, 256), dtype=torch.float16, device="meta")
     key = torch.empty((1, 128000, 1, 256), dtype=torch.float16, device="meta")
     value = torch.empty_like(key)
 
@@ -972,13 +1015,41 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
             softmax_scale=0.0625,
             architecture_op=object(),
         )
+    for q_len, kv_len in ((8000, 12000), (8000, 128032), (8192, 262144)):
+        family_query = torch.empty(
+            (1, q_len, 6, 256), dtype=torch.float16, device="meta"
+        )
+        family_key = torch.empty(
+            (1, kv_len, 1, 256), dtype=torch.float16, device="meta"
+        )
+        assert flash_v100._should_use_prefill_d256_gqa_architecture(
+            family_query,
+            family_key,
+            torch.empty_like(family_key),
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            softmax_scale=0.0625,
+            architecture_op=object(),
+        )
     first_chunk_key = torch.empty((1, 8000, 1, 256), dtype=torch.float16, device="meta")
-    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+    assert flash_v100._should_use_prefill_d256_gqa_architecture(
         query,
         first_chunk_key,
         torch.empty_like(first_chunk_key),
         max_seqlen_q=8000,
         max_seqlen_k=8000,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+    key_aligned_to_32 = torch.empty(
+        (1, 128032, 1, 256), dtype=torch.float16, device="meta"
+    )
+    assert flash_v100._should_use_prefill_d256_gqa_architecture(
+        query_8192,
+        key_aligned_to_32,
+        torch.empty_like(key_aligned_to_32),
+        max_seqlen_q=8192,
+        max_seqlen_k=128032,
         softmax_scale=0.0625,
         architecture_op=object(),
     )
@@ -1000,12 +1071,23 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
         softmax_scale=0.0625,
         architecture_op=object(),
     )
+    query_8193 = torch.empty((1, 8193, 6, 256), dtype=torch.float16, device="meta")
     assert not flash_v100._should_use_prefill_d256_gqa_architecture(
-        query,
-        key[:, :12000],
-        value[:, :12000],
-        max_seqlen_q=8000,
-        max_seqlen_k=12000,
+        query_8193,
+        key,
+        value,
+        max_seqlen_q=8193,
+        max_seqlen_k=128000,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+    key_too_long = torch.empty((1, 262176, 1, 256), dtype=torch.float16, device="meta")
+    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
+        query_8192,
+        key_too_long,
+        torch.empty_like(key_too_long),
+        max_seqlen_q=8192,
+        max_seqlen_k=262176,
         softmax_scale=0.0625,
         architecture_op=object(),
     )
@@ -1018,6 +1100,94 @@ def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatc
         softmax_scale=1.0,
         architecture_op=object(),
     )
+
+
+@pytest.mark.parametrize("query_len", [8001, 8065, 8192])
+def test_sm70_79t_dispatch_keeps_q8000_core_and_exact_leading_fringe(query_len):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    architecture_calls = []
+    dense_calls = []
+
+    def architecture_op(query, key, value, out, softmax_scale, causal):
+        architecture_calls.append((query.shape, key.shape, softmax_scale, causal))
+        out.fill_(7)
+        return out
+
+    def dense_op(query, key, value, out, softmax_scale, causal):
+        dense_calls.append((query.shape, key.shape, softmax_scale, causal))
+        out.fill_(3)
+        return out
+
+    kv_len = 16384
+    query = torch.zeros((1, query_len, 6, 1), dtype=torch.float16)
+    key = torch.zeros((1, kv_len, 1, 1), dtype=torch.float16)
+    value = torch.zeros_like(key)
+    out = torch.empty_like(query)
+
+    result = flash_v100._run_sm70_d256_gqa_79t_dispatch(
+        query,
+        key,
+        value,
+        out,
+        softmax_scale=0.0625,
+        architecture_op=architecture_op,
+        dense_op=dense_op,
+    )
+
+    fringe_len = query_len - 8000
+    padded_fringe_len = ((fringe_len + 63) // 64) * 64
+    assert result is out
+    assert architecture_calls == [
+        (torch.Size([1, 8000, 6, 1]), key.shape, 0.0625, True)
+    ]
+    assert dense_calls == [
+        (
+            torch.Size([1, padded_fringe_len, 6, 1]),
+            torch.Size([1, kv_len - 8000, 1, 1]),
+            0.0625,
+            True,
+        )
+    ]
+    assert torch.all(out[:, :fringe_len] == 3)
+    assert torch.all(out[:, fringe_len:] == 7)
+
+
+@pytest.mark.parametrize("query_len", [8001, 8191, 8192])
+def test_sm70_79t_q8192_dispatch_leading_pads_mixed_chunks(query_len):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    calls = []
+
+    def architecture_op(query, key, value, out, softmax_scale, causal):
+        calls.append((query.clone(), key.shape, softmax_scale, causal))
+        out.fill_(11)
+        return out
+
+    query = torch.ones((1, query_len, 6, 1), dtype=torch.float16)
+    key = torch.zeros((1, 16384, 1, 1), dtype=torch.float16)
+    value = torch.zeros_like(key)
+    out = torch.empty_like(query)
+
+    result = flash_v100._run_sm70_d256_gqa_79t_q8192_dispatch(
+        query,
+        key,
+        value,
+        out,
+        softmax_scale=0.0625,
+        architecture_q8192_op=architecture_op,
+    )
+
+    padded_query, key_shape, scale, causal = calls[0]
+    leading_padding = 8192 - query_len
+    assert result is out
+    assert padded_query.shape == (1, 8192, 6, 1)
+    assert torch.all(padded_query[:, :leading_padding] == 0)
+    assert torch.all(padded_query[:, leading_padding:] == 1)
+    assert key_shape == key.shape
+    assert scale == 0.0625
+    assert causal is True
+    assert torch.all(out == 11)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

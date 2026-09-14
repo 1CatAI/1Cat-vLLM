@@ -581,6 +581,19 @@ def _warmup_fp4_dense_layers(
             elif state.op_kind == "nvfp4":
                 if not hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
                     continue
+                if getattr(state, "use_scale_code", False):
+                    sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+                        out,
+                        x,
+                        state.weight,
+                        state.scales,
+                        state.global_scale,
+                        int(state.k_ld),
+                        int(state.q_ld),
+                        gated_silu,
+                    )
+                    calls += 1
+                    continue
                 sm70_ops.nvfp4_gemm_sm70_out(
                     out,
                     x,

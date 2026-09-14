@@ -131,6 +131,8 @@ if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
   target_sources(_vllm_fa2_C PRIVATE ${SM70_GROUPED_LONG_SRC})
 endif()
 
+include("${CMAKE_CURRENT_LIST_DIR}/../sm70_79t.cmake")
+
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)

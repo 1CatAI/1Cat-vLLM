@@ -19,6 +19,7 @@ except ImportError:
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
+E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES = (64, 128, 256)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
@@ -190,14 +191,14 @@ def _get_decode_plan(
             effective_max_seq_len,
             effective_workspace_seq_capacity,
         )
-    partition_size = (
-        _validate_decode_partition_size(
+    if partition_size_hint is not None:
+        partition_size = _validate_decode_partition_size(
             int(partition_size_hint),
             "partition_size_hint",
             valid_partition_sizes,
         )
-        if partition_size_hint is not None
-        else _get_decode_partition_size(
+    else:
+        partition_size = _get_decode_partition_size(
             max_seq_capacity=max_seq_capacity,
             head_dim=head_dim,
             num_q_heads=num_heads,
@@ -205,7 +206,19 @@ def _get_decode_plan(
             max_seq_len_hint=effective_max_seq_len,
             batch_size_hint=batch_capacity,
         )
-    )
+        if partition_size not in valid_partition_sizes:
+            if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+                _validate_decode_partition_size(
+                    partition_size,
+                    "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
+                    valid_partition_sizes,
+                )
+            smaller_sizes = tuple(
+                size for size in valid_partition_sizes if size < partition_size
+            )
+            partition_size = (
+                max(smaller_sizes) if smaller_sizes else min(valid_partition_sizes)
+            )
     runtime_num_partitions = max(
         1,
         (effective_max_seq_len + partition_size - 1) // partition_size,
@@ -1246,20 +1259,23 @@ def flash_attn_decode_paged_xqa(
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
         valid_partition_sizes=(
-            E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+            E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
             if kv_cache_dtype in ("fp8", "fp8_e4m3")
             and q.ndim == 3
             and q.shape[1:] == (6, 256)
-            and (
-                q.shape[0] == 1
-                or (
-                    os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
-                    and 1 < q.shape[0] <= 16
-                )
-            )
+            and os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
+            and 1 < q.shape[0] <= 16
             and k_cache.dtype == torch.uint8
             and v_cache.dtype == torch.uint8
-            else VALID_DECODE_PARTITION_SIZES
+            else (
+                E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                and q.ndim == 3
+                and q.shape == (1, 6, 256)
+                and k_cache.dtype == torch.uint8
+                and v_cache.dtype == torch.uint8
+                else VALID_DECODE_PARTITION_SIZES
+            )
         ),
     )
     _assert_decode_launch_covers_seq_lens(
