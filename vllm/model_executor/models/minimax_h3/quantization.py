@@ -76,6 +76,16 @@ class FP16LinearMethod(UnquantizedLinearMethod):
     supports_prepared_fp16 = True
     supports_rotated_input = False
 
+    def prepare_weights_before_loading(self, layer):
+        if getattr(layer, "h3_fp16_weight_layout", "row") == "column":
+            rows, columns = layer.weight.shape
+            layer.weight.data = torch.empty_strided(
+                (rows, columns),
+                (1, rows),
+                dtype=layer.weight.dtype,
+                device=layer.weight.device,
+            )
+
     def process_weights_after_loading(self, layer):
         if getattr(layer, "h3_fp16_weight_layout", "row") == "column":
             layer.weight.data = layer.weight.data.t().contiguous().t()
@@ -378,6 +388,18 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
         else:
             layer.weight.data = layer.weight.data.contiguous()
         layer.weight_scale.data = scale.data.reshape(-1).contiguous()
+
+    def prepare_weights_before_loading(self, layer):
+        if self.quant_config.weight_layout == "column" and self.prefix.startswith(
+            "blocks."
+        ):
+            rows, columns = layer.weight.shape
+            layer.weight.data = torch.empty_strided(
+                (rows, columns),
+                (1, rows),
+                dtype=layer.weight.dtype,
+                device=layer.weight.device,
+            )
 
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
