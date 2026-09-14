@@ -1291,6 +1291,11 @@ def flash_attn_decode_paged_xqa(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            partial_dtype=(
+                torch.float32
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                else torch.float16
+            ),
         )
     )
 

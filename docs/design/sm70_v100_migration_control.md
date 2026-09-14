@@ -51,6 +51,7 @@ It contributes no accepted whole-round improvement. Changed draft GEMM
 arithmetic is also excluded: better local FP64 error still changes proposal
 distributions. Historical failed numerical, memory-budget, route-coverage,
 sanitizer-timeout and slower-kernel results remain recorded in the worklog.
+
 ## DFlash2 residual weight memory recovery, 2026-09-08
 
 Follow-up in the [shared NVFP4 report](sm70_dflash2_shared_nvfp4.md) removes
@@ -46651,3 +46652,38 @@ has launched no full model. Details and artifacts are in
   with the CUDA-12.8 Flash-V100 extension.
 - Model admission and human review remain outstanding. PR524 stays Draft;
   no auto-merge, production default change, or private long-prefill promotion.
+
+## 2026-09-14 E4M3 FP8-KV route parity
+
+- Base `a6f5e8347b` (`onecat/main`), owned branch
+  `codex/v100-fp8kv-fp16-route-parity-20260914-122513`.
+- Route E4M3 GQA6/D256 prefill through the shared FP16 workspace and default
+  Q8000/Q8192 FP32-accumulated attention kernel. Route uniform decode, batches
+  above 16, and resident small-query rows in mixed chunked-prefill batches
+  through E4M3 XQA. These paths are default on with explicit rollback flags.
+- Fix the page-800 wave loader, which previously addressed at most two logical
+  pages inside p896/p1664 partitions. The corrected B1 page-800 256K graph run
+  is bitwise equal to scalar and 6.82x faster. B32 page-800 256K is 6.60x faster
+  with `4.77e-7` maximum absolute difference. Page-1568 B1 256K is 6.92x
+  faster with `2.38e-7` maximum absolute difference.
+- Preserve E4M3 XQA softmax/PV state and partition outputs in FP32 until the
+  final FP16 output boundary. E5M2 retains its existing numerical contract.
+- All full-model validation for this line uses normal CUDA graphs; do not pass
+  `--enforce-eager`. Record first-request uncached prefill independently from
+  prefix-cache hits.
+- The TP4 Qwen3.8-27B NVFP4/compressed-tensors full-model gate uses FP16
+  execution, E4M3 KV, Q8192 chunks, maximum length 262144, one live request,
+  prefix caching off, no speculation, and `FULL_AND_PIECEWISE` CUDA graphs.
+  The 16K quality precheck returns `海蓝石榴；木星` at 4149.15 prompt
+  tok/s. The uncached 256000-token request returns
+  `校验词是「海蓝石榴」，太阳系最大的行星是木星。` with a 102.7519-second TTFT,
+  **2491.44 prompt tok/s**, and 74.73 decode tok/s. Both retrieval and
+  knowledge checks pass, and `cached_tokens=0`.
+- Every rank records 480 Q8192 FP32-accumulated long-prefill calls and 496 E4M3
+  bridge calls during the 256K request. The final route summary records 48
+  dynamic page-800 E4M3 XQA decode calls per rank. The final source-built
+  operator reaches 77.0142/75.9654 TFLOP/s at KV128K/KV256K with finite output.
+- CUDA 12.8 SM70 source build and local import pass. Final SHA256 values are
+  core `2557f6b7...fa4c4`, stable libtorch `622af596...d162`, FA2/79T
+  `aa657e16...5add`, and Flash-V100 `66df783d...70b3`. Runtime process maps
+  contain the attention DSOs from this owned worktree and no other checkout.

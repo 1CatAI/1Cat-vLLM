@@ -279,6 +279,19 @@ def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
     assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED is False
 
 
+def test_sm70_mixed_prefill_decode_rows_env_is_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    name = "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS is True
+
+    monkeypatch.setenv(name, "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS is False
+
+
 def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     import vllm.envs as envs
 
@@ -2473,9 +2486,15 @@ def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(monkeypatch, dflash_
 
 @pytest.mark.parametrize(
     ("batch_size", "enabled", "expected_route"),
-    ((2, False, "scalar"), (2, True, "xqa"), (16, True, "xqa"), (17, True, "scalar")),
+    (
+        (2, False, "scalar"),
+        (2, True, "xqa"),
+        (16, True, "xqa"),
+        (17, True, "xqa"),
+        (32, True, "xqa"),
+    ),
 )
-def test_flash_v100_e4m3_batched_xqa_is_exactly_gated(
+def test_flash_v100_e4m3_batched_xqa_has_no_artificial_batch_cap(
     monkeypatch, batch_size, enabled, expected_route
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl

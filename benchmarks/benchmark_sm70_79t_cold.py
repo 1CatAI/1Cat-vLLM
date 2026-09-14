@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cold-cache client TTFT and decode measurement for Q8192 prefill.
+"""Cold-cache CUDA-graph TTFT and decode measurement for Q8192 prefill.
 
 Deterministic quality comparison; EOS is respected and thinking is disabled.
-Engine construction and a short warmup are excluded. Prefix caching and
-speculative decoding are disabled.
+Engine construction and a short warmup are excluded. Prefix caching,
+speculative decoding, and eager execution are disabled.
 """
 
 import argparse
@@ -43,6 +43,11 @@ def main():
     parser.add_argument("--output-len", type=int, default=32)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--kv-cache-dtype", default="fp8_e4m3")
+    parser.add_argument(
+        "--quantization",
+        default=None,
+        help="Optional weight-quantization override; default to checkpoint metadata.",
+    )
     parser.add_argument("--concurrent-requests", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -64,14 +69,14 @@ def main():
         model=args.model,
         tensor_parallel_size=4,
         dtype="half",
-        quantization="fp8",
+        quantization=args.quantization,
         kv_cache_dtype=args.kv_cache_dtype,
         max_model_len=262144,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         long_prefill_token_threshold=args.long_prefill_token_threshold,
         gpu_memory_utilization=0.85,
-        enforce_eager=True,
+        enforce_eager=False,
         attention_backend="FLASH_ATTN_V100",
         seed=20260825,
         enable_prefix_caching=False,
@@ -208,6 +213,9 @@ def main():
             batch_ttft = max(row["ttft_seconds"] for row in request_rows)
             row = dict(
                 routes=route_deltas,
+                graph=True,
+                weight_quantization_override=args.quantization,
+                kv_cache_dtype=args.kv_cache_dtype,
                 concurrent_requests=args.concurrent_requests,
                 aggregate_prompt_tokens=args.concurrent_requests * len(ids),
                 batch_ttft_seconds=batch_ttft,
