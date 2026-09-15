@@ -40,3 +40,33 @@ so the sharding math itself is TP=4-ready. What is missing for TP=4:
    plugin's Exl3Config registered — install the plugin
    (pip install -e references/vllm-exl3) or add the entry point.
 3. vllm serve with --tensor-parallel-size 4.
+
+
+## Verified install path (2026-09-15)
+
+- Plugin installed editable: `pip install -e references/vllm-exl3
+  --no-deps --no-build-isolation` (required a setup.py fix: relative
+  source paths — committed a317eb3 upstream). `VLLM_EXL3_NO_CUDA=1`
+  skips the CUDA extension build; the native p2b kernels are
+  optional and the loop backend does not need them.
+- Verified: `vllm.plugins.load_general_plugins()` registers exl3,
+  `get_quantization_config("exl3")` resolves to Exl3Config, and the
+  E2E test passes through the registered path (loop backend,
+  EXL3_FUSED_MOE=0).
+- The E2E test requires `EXL3_FUSED_MOE=0` on V100: the fused
+  exl3_moe kernel is sm80+ and the plugin's fused path does not
+  arch-gate before calling it (it relies on exl3_moe's own
+  TORCH_CHECK). Loop backend is the correct sm70 default.
+
+## TP=4 serving command (ready to test)
+
+    vllm serve /home/nvidia/Dev/model/DeepSeek-V4-Flash-Vision-Exp-exl3-3.04bpw \
+        --tensor-parallel-size 4
+
+Open items before a real TP=4 run:
+1. The plugin's TP sharding (_narrow_tp) is size-agnostic but only
+   exercised at tp_size=1 by the E2E test.
+2. Model memory: 110 GiB weights / 4 GPUs = ~27.5 GiB per GPU +
+   KV — fits 32 GiB V100s, but KV cache size needs tuning.
+3. The loop backend is slow (per-token expert loop); TP=4 e2e
+   numbers will be launch-bound until the sm70 fused path lands.
