@@ -699,7 +699,11 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = config.quantization_config["scale_fmt"]
+        # exl3 packs omit scale_fmt from the outer quant config; fall back
+        # to the original (fp8) config's value, defaulting to ue8m0.
+        _qc = config.quantization_config
+        self.scale_fmt = _qc.get("scale_fmt") or _qc.get(
+            "original_quantization_config", {}).get("scale_fmt", "ue8m0")
 
         self.rope_parameters = config.rope_scaling
 
