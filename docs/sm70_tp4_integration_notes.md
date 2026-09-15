@@ -485,3 +485,45 @@ Then: buffer-shape-vs-index-range check — the workspace specs
 at sparse.py:212-235 vs the kernel's index math at
 sparse_kernels.py:919 (main_width/num_partials derivation
 source: layer attribute vs actual index buffer width).
+
+
+## IMA root-cause narrowing (2026-09-15 late, tuning session)
+
+Discriminator results:
+- CUDA_LAUNCH_BLOCKING=1: the IMA reports AT the exl3 GEMV
+  launch (exl3_gemv.cu:284, the cooperative launch in
+  exl3_gemv_try_launch) — the faulting kernel IS the sm70
+  trellis GEMV, NOT the sparse attention kernel (the earlier
+  sparse_kernels.py:919 traceback was the next sync point).
+- VLLM_EXL3_RECONSTRUCT_MIN_ROWS=1 (GEMV bypassed): the FULL
+  pipeline runs — tokens generated end-to-end (2.91 toks/s,
+  gibberish text). The GEMV is the sole crash site.
+- EXL3_GEMV_SMEM=1: same IMA — not the extraction-style
+  variant.
+- VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=0: same IMA — not
+  the stream-overlap race.
+- Standalone sweeps (random + REAL checkpoint tensors, all
+  traced shapes incl. out=256/32384, rows 1-2): ALL PASS.
+  The IMA needs the full-runtime context.
+- compute-sanitizer: blocked — NCCL fails under the
+  sanitizer (cudaErrorNoKernelImageForDevice at nccl init),
+  the model never loads.
+
+Failing call signature (per-worker last GEMV before the
+assert): K=5 in=4096 out=512 mul1 — the wkv shard shape;
+but standalone passes with real tensors, so the trigger is
+runtime state, not shape alone.
+
+Static bounds verified: C/A/B indexing bounded by size_m/k/n
+and the grid cap; the ws partial buffer unused at cfg 0
+(KS=1); the locks buffer sized MAX_TILES_C + barriers.
+
+Working config for a green pipeline (reconstruct-only):
+VLLM_EXL3_RECONSTRUCT_MIN_ROWS=1 + the 0.95/256/4 harness.
+~3 toks/s — the GEMV is ~10x faster per the dispatch
+docstring, so fixing the IMA is the perf lever.
+
+Next tool: kernel-level debug asserts (printf the OOB index
++ thread/block) in exl3_gemv_sm70_kernel.cuh, rebuild the
+ext, rerun — a build+run cycle. Alternatively cuda-gdb on a
+minimal multi-layer repro that still IMAs.
