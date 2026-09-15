@@ -726,3 +726,30 @@ exl3_gemv_sm70_kernel.cuh are the prepared next step
 
 All changes committed across the three repos (1Cat-vLLM-sm70,
 references/vllm-exl3, exllamav3-sm70).
+
+
+## mhc staging verified (correctness narrowing continues)
+
+The sm70 mhc prenorm staging (sm70_mhc_prenorm_staging)
+compared against a torch reference (split-K GEMM + sqrsum):
+max relative error 0.000000 on both outputs — EXACT. The
+custom V100 port's staging kernel is correct. (Test
+contract: x (tokens, hc_mult*hidden) fp16, fn (mix_hc,
+hc_mult*hidden) fp32, outputs (n_splits, tokens, mix_hc)
+and (n_splits, tokens) fp32.)
+
+Correctness scoreboard after this round:
+- Weight representation: EXACT (round-trip 0.0)
+- Linear fused compute: parity 0.0005 ✓
+- MoE w13/w2 slicing: shape-verified ✓
+- mhc prenorm staging: exact ✓
+- Vocab trim: verified ✓
+
+Remaining suspects for the first-token garbage: the mhc
+sinkhorn/mixing shared code, the attention compute (the
+group-paired apply integration, the compressor, the sparse
+attention topk, the rotary), or model wiring. The next
+experiment is the forward-hook harness: per-layer hidden
+norms on a constant input (norm explosion/collapse
+localizes the broken component), then the layer-level
+parity test.
