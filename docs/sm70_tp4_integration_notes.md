@@ -110,3 +110,33 @@ Automatic entry-point loading verified through the engine path:
 `import vllm` does NOT load plugins (by design — plugins load at
 engine-config time), so the earlier bare-import probe failing was
 expected behavior, not a gap.
+
+
+## Real-model load test (2026-09-15) — precise gap identified
+
+Attempting the actual TP=4 weight load surfaced the real blocker,
+in sequence:
+
+1. `KeyError: 'scale_fmt'` — the dsv4 model reads
+   `config.quantization_config["scale_fmt"]`, which exl3 packs
+   omit (the value lives in original_quantization_config: ue8m0).
+   Trivial fix, reverted pending the larger work.
+2. `DeepseekV4 only supports fp8 kv-cache` — needs
+   `kv_cache_dtype='fp8'` (the model's DSA attention requires it).
+3. **The real gap**: OOM in `UnquantizedFusedMoEMethod.create_weights`.
+   The dsv4 nvidia model's MoE layer is `FusedMoE` (model.py:533),
+   but `Exl3Config.get_quant_method` only handles `RoutedExperts`
+   and `LinearBase` — FusedMoE falls through to the unquantized
+   method, which allocates BF16 expert weights (hundreds of GiB).
+
+Closing it means one of:
+- (a) adapt `Exl3MoEMethod` to FusedMoE's param contract
+  (w13/w2 shard shapes, expert_map, weight_loader) — the trellis
+  tensors don't map 1:1 onto FusedMoE's param shapes; or
+- (b) switch the dsv4 model's MoE to `RoutedExperts` (backported
+  in c5293fd8c for exactly this) — changes the model's
+  weight-load and forward paths.
+
+Either is real engineering (days, not config). The verified state:
+config parse + quant resolution + TP=4 acceptance all work; the
+blocker is precisely the Exl3MoEMethod↔FusedMoE param contract.
