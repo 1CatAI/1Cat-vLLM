@@ -159,3 +159,34 @@ Two checks decide adapter-vs-rewrite:
 
 Validation template: tests/exl3_sm70_moe_e2e.py (loop backend,
 EXL3_FUSED_MOE=0, rel err 7.3e-4 baseline).
+
+
+## FusedMoE bridge landed (2026-09-15) — next gap: per-shard bits
+
+Two plugin fixes committed (vllm-exl3):
+1. `get_quant_method` accepts FusedMoE layers (isinstance branch
+   extended; create_weights signature-compatible via
+   **extra_weight_attrs — audited, bodies are layer-agnostic).
+2. Dense linears default to exl3 when the pack carries no
+   non_routed_exl3 spec (exllamav3 end-to-end packs quantize all
+   linears; the old default crashed weight loading with
+   KeyError fused_wqa_wkv.mul1).
+
+Load test progression after the fixes: TP=4 load now reaches
+shard-1 weight matching on the fused attention linear and fails
+with a REAL shape mismatch:
+
+    EXL3 linear load shape mismatch shard=1 suffix=trellis:
+    dest (256, 32, 48) != loaded (256, 32, 80)
+
+k_words 48 = 3bpw (global bits), 80 = 5bpw (head_bits). The fused
+fused_wqa_wkv linear merges wq_a (3bpw) and wkv (5bpw) — the
+checkpoint uses per-tensor bits (head_bits=5 for attention output
+projections), but Exl3LinearMethod sizes ONE param set with the
+global bits for all shards.
+
+Next step: per-output-partition bits in Exl3LinearMethod —
+k_words per shard (the trellis param is already per-shard sized
+via out_tiles_list; bits must become per-shard too). The bits
+per shard are derivable from the checkpoint tensor shapes
+(loaded k_words / 16) or from a per-layer bits map.
