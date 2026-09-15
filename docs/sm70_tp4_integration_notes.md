@@ -527,3 +527,36 @@ Next tool: kernel-level debug asserts (printf the OOB index
 + thread/block) in exl3_gemv_sm70_kernel.cuh, rebuild the
 ext, rerun — a build+run cycle. Alternatively cuda-gdb on a
 minimal multi-layer repro that still IMAs.
+
+
+## Correctness finding (tuning session close)
+
+The reconstruct-only pipeline generates tokens but the text
+is GIBBERISH (mixed-script garbage, repeated tokens like
+'awsze', consistent across runs and prompts). This is a REAL
+correctness bug, not an untrained model — the checkpoint is
+a quantized production model.
+
+Ruled out: the padded-vocab leak (the LogitsProcessor trims
+logits[..., :org_vocab_size] after the all-gather — the pad
+rows never reach sampling).
+
+Suspects (in order of tractability):
+1. Weight-layout corruption in loading/slicing — a wrong
+   tile order or shard span silently produces valid-shaped
+   but wrong weights. Check: round-trip test — dequantize
+   the loaded trellis via ext.reconstruct, requantize with
+   the dsv4 compressor's quantize path, compare error
+   magnitude. A transposed tile order shows as a huge
+   round-trip error.
+2. The batched wo_a group-paired apply (slice i ↔ group i)
+   — if the pairing or the group dim is wrong, attention
+   output is garbage.
+3. The K=3 cb=2 reconstruct path (the K=3 layers dominate
+   the GEMV trace).
+
+The IMA work (GEMV kernel) and the correctness bug are
+INDEPENDENT tracks: the GEMV IMA blocks the fast decode
+path; the correctness bug affects even the reconstruct-only
+path. Fix order: correctness FIRST (fast tokens are
+worthless if wrong), then the GEMV IMA for throughput.
