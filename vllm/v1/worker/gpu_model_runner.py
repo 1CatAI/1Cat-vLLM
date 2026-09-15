@@ -10233,6 +10233,24 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
+                if os.environ.get("VLLM_HOOK_PROBE"):
+                    # Diagnostic: register file-writing hooks on every
+                    # decoder layer (per-layer hidden norms).
+                    import torch as _t
+                    layers = self.model.model.layers
+                    rank = self.rank if hasattr(self, "rank") else 0
+                    probe_f = open(f"/tmp/mhc_layer_stats_r{rank}.txt", "w")
+
+                    def _make_hook(idx, fh):
+                        def hook(module, inp, out):
+                            o = out[0] if isinstance(out, tuple) else out
+                            fh.write(f"{idx} {o.float().norm().item():.6f}\n")
+                            fh.flush()
+                        return hook
+
+                    for i, layer in enumerate(layers):
+                        layer.register_forward_hook(_make_hook(i, probe_f))
+                    logger.info_once("Hook probe registered on %d layers", len(layers))
                 if (drafter := getattr(self, "drafter", None)) is not None:
                     logger.info_once("Loading drafter model...")
                     if hasattr(drafter, "load_model"):

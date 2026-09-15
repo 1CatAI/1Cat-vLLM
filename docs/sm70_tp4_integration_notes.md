@@ -856,3 +856,34 @@ model.model.layers[i] (the decoder layers), record
 out.float().norm() per layer on a constant input, then
 walk the norm profile: explosion/collapse localizes the
 broken component (attention vs MoE vs mhc wiring).
+
+
+## Hook harness deployed — first norm profile captured
+
+The env-gated hook probe (VLLM_HOOK_PROBE=1 in
+gpu_model_runner.py's load_model) works: file-based
+per-layer stats at /tmp/mhc_layer_stats_rN.txt. The rpc
+channel (collective_rpc) hung consistently — the env-gated
+in-process hook is the reliable channel.
+
+First profile (43 layers = the full model, greedy 1-token
+run, rank 0):
+- Norms grow steadily 35 → 207 through the layers
+- One extreme ratio: layer 19 (5.01x jump)
+- min 8.6 (layer ~4), max 207.4 (final layers)
+
+Interpretation: steady growth may be normal for mHC
+(unbounded residual mixing) or the bug; the layer-19 jump
+is the standout. Without a reference profile, ambiguous —
+the decisive test is the LAYER-19 PARITY: run layer 19's
+forward with the exl3 weights vs the same layer with
+dequantized bf16 weights on identical input (the hook
+harness can capture the layer's input tensor for the
+replay).
+
+Next session's concrete steps:
+1. Capture layer 19's input tensor via the hook.
+2. Replay layer 19 with dequantized bf16 weights (the
+   get_weight_tensor path) — compare outputs.
+3. Diverge ⇒ bisect layer 19's components (attention vs
+   MoE); agree ⇒ walk to the next extreme-ratio layer.

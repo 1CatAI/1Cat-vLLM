@@ -1,6 +1,13 @@
+"""Forward-hook probe: per-layer hidden norms written to a file.
+
+Run from the repo directory (sys.path[0] must be the repo so the
+workers import the repo vllm, not site-packages). Requires
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 for the callable-class RPC.
+"""
 import torch
 from vllm import LLM, SamplingParams
-from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+STATS_PATH = "/tmp/mhc_layer_stats.txt"
 
 llm = LLM(model='/home/nvidia/Dev/model/DeepSeek-V4-Flash-Vision-Exp-exl3-3.04bpw',
           tensor_parallel_size=4, max_model_len=256,
@@ -8,28 +15,32 @@ llm = LLM(model='/home/nvidia/Dev/model/DeepSeek-V4-Flash-Vision-Exp-exl3-3.04bp
           gpu_memory_utilization=0.95, enforce_eager=True,
           disable_log_stats=True, kv_cache_dtype='fp8')
 
-# Register hooks on the decoder layers via the collective_rpc path
-from vllm.distributed.parallel_state import get_tp_group
 
 class Probe:
-    def __init__(self):
-        self.stats = []
+    """Register file-writing hooks on every decoder layer."""
 
     def __call__(self, worker):
         model = worker.model_runner.model
         layers = model.model.layers
+        rank = worker.rank if hasattr(worker, "rank") else -1
+        f = open(f"/tmp/mhc_layer_stats_r{rank}.txt", "w")
+
         def make_hook(idx):
             def hook(module, inp, out):
                 o = out[0] if isinstance(out, tuple) else out
-                self.stats.append((idx, o.float().norm().item()))
+                n = o.float().norm().item()
+                f.write(f"{idx} {n:.6f}\n")
+                f.flush()
             return hook
-        self.handles = [layers[i].register_forward_hook(make_hook(i)) for i in range(len(layers))]
-        return f"hooked {len(layers)} layers"
 
-probe = Probe()
-results = llm.collective_rpc(probe)
-print("HOOKS REGISTERED:", results[0])
+        handles = [layers[i].register_forward_hook(make_hook(i)) for i in range(len(layers))]
+        return f"hooked {len(layers)} layers on rank {rank}"
+
+
+results = llm.collective_rpc(Probe())
+print("HOOKS:", results[0])
 
 sp = SamplingParams(max_tokens=1, temperature=0.0)
 gen = llm.generate(['The capital of France is'], sp)
 print('OUT:', repr(gen[0].outputs[0].text[:40]))
+print('STATS:', STATS_PATH)
