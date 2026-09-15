@@ -443,10 +443,13 @@ OOMs the workspace); the IMA is the current blocker, not
 capacity.
 
 Next session's opening item: the IMA in the sparse paged fp8
-decode kernel — check the paged KV index bounds under
-max_model_len=256 (4841 KV tokens, 4 seqs) and the fp8 page
-table indexing; the crash reproduces immediately on the
-first decode step.
+decode kernel — FIRST rerun with CUDA_LAUNCH_BLOCKING=1 to
+confirm the faulting kernel ("crashes on the first decode
+step" is exactly the scenario where the fault may be DELAYED
+from a prefill-side kernel, reported at the next sync). Once
+the faulting kernel is confirmed: check the paged KV index
+bounds under max_model_len=256 (4841 KV tokens, 4 seqs) and
+the fp8 page table indexing.
 
 
 ## IMA diagnostic plan (carry-forward, next session's opening)
