@@ -831,3 +831,28 @@ input, then layer-level parity) is THE next experiment —
 it localizes the broken component in one or two runs. All
 component-level differential tests available without
 hooks have passed.
+
+
+## Hook-probe channel recipe (prepared for next session)
+
+The forward-hook probe needs these pieces (each was a
+failure mode this session):
+1. Script placement: the probe script must live IN the repo
+   directory (sys.path[0] = the script's dir for file
+   scripts; a /tmp script imports the STALE site-packages
+   vllm without routed_experts.py).
+2. Serialization: llm.collective_rpc(callable) requires
+   VLLM_ALLOW_INSECURE_SERIALIZATION=1 and a callable CLASS
+   instance (a plain function fails serialization).
+3. Stats channel: the rpc return path hung in testing —
+   write the per-layer stats to a FILE from the worker
+   instead of returning them.
+4. GPU cleanup: a timed-out run leaves workers holding
+   31 GiB/GPU — kill the PIDs from
+   nvidia-smi --query-compute-apps before rerunning.
+
+The probe itself: register forward hooks on
+model.model.layers[i] (the decoder layers), record
+out.float().norm() per layer on a constant input, then
+walk the norm profile: explosion/collapse localizes the
+broken component (attention vs MoE vs mhc wiring).
