@@ -390,3 +390,26 @@ Check the layer's in_features/out_features attrs against the
 trellis dims — likely a doubled or swapped geometry from the
 create_weights args (MergedColumnParallelLinear output_sizes
 [2048, 2048]).
+
+
+## Apply-time diagnostic plan (next session's opening item)
+
+The failing view: `x.view(rows, self.in_features)` at
+reconstruct_hgemm (exllamav3 exl3.py:176). in_features comes from
+the LinearEXL3 object built at apply-side construction
+(exl3.py:3172-3184, make_linear_exl3 with in_features =
+int(suh.numel())).
+
+Diagnostic: print self.in_features and x.shape at the failing call.
+The mismatch direction traces to what suh slice the shared_experts
+shard got at construction — suspects: (a) merged gate_up suh
+handling (gate+up share one suh or have distinct ones), (b) padded
+suh derivation.
+
+Carry-forward cleanup items (pre-ship, non-blocking):
+- span-math round() fragility: shard counts computed via round() on
+  padded sizes — correct for this geometry, fragile for other
+  pad/TP combinations; use true (unpadded) sizes when threaded
+- vision-key filter duplicates: inner-model filter at 1192-1199 is
+  dead code (the ForCausalLM filter at 1476-1478 is operative);
+  consolidate at next touch
