@@ -266,6 +266,12 @@ row=False merged=False tp=4`. The wo_a layer at TP=4: 8 groups / 4
 ranks = 2 groups per rank → the rank's param covers 2048 out (2
 slices × 1024), allocated as ONE shard (n_shards=1).
 
+Slice count corrected: 8 slices (slice.0..7, one per o_group) —
+an earlier listing truncated at 12 keys and showed only 4. The 2×
+arithmetic is resolved: constructed n_groups(8) × o_lora_rank(1024)
+= 8192 = checkpoint 8 slices × 1024 ✓; per-rank at TP=4 = 2048 =
+dest ✓.
+
 The slice mapping: checkpoint slice N belongs to rank N//2, local
 index N%2. The model's slice branch must:
 1. Skip slices not owned by this rank (N//2 != tp_rank).
