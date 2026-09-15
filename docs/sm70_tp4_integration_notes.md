@@ -560,3 +560,34 @@ INDEPENDENT tracks: the GEMV IMA blocks the fast decode
 path; the correctness bug affects even the reconstruct-only
 path. Fix order: correctness FIRST (fast tokens are
 worthless if wrong), then the GEMV IMA for throughput.
+
+
+## Correctness narrowing (round-trip + scale-correlation results)
+
+The quantize_tiles round-trip test is INVALID as a weight
+validator: its `quantized_tiles` return is the pre-embedding
+quantized value in a coded space, not the decoded
+reconstruction — even random control data shows ~1.0
+'device' error. Dead end as designed.
+
+Scale-correlation check (PASSES): the dequantized W's
+column norms correlate with |svh| at cosine 1.0000 and row
+norms with |suh| at 1.0000. The tile layout is NOT
+scrambled — a transposed/shifted tile order would
+decorrelate the per-column norms from the output scales.
+The weight dequantize path (trellis → tiles → Hadamard →
+scales) is self-consistent.
+
+Correctness suspicion shifts to the COMPUTE path:
+1. The Hadamard sign/phase convention between quantize-time
+   and dequantize/apply-time — a phase flip keeps scale
+   correlation but corrupts activations (the correlation
+   check cannot catch it).
+2. The attention compute graph (the group-paired batched
+   apply, the compressor path).
+3. The GEMV/reconstruct decode math for K=3/K=5.
+
+Next experiment: apply the dequantized W as a dense fp16
+matmul vs the fused path on the same input — if they
+disagree, the fused compute (Hadamard convention) is the
+bug; if they agree, the attention graph is the suspect.
