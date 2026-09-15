@@ -653,3 +653,25 @@ Next session's plan:
 2. Layer-level probe: hidden-state norms per layer on a
    constant input (norm explosion/collapse localizes).
 3. If MoE clears: the attention compute graph.
+
+
+## MoE w2 slicing verified (correctness narrowing continues)
+
+The w2 trellis param (E, out_tiles=32, in_tiles=256, 48)
+matches the narrowed loaded (32, 256, 48) exactly: the
+create_weights' tile vars are named for the w13 orientation
+(in=hidden, out=intermediate) and the w2 param reuses them
+swapped — dim1 = intermediate-local tiles, dim2 = hidden
+tiles. shard_exl3_row narrows the checkpoint's dim 0
+(intermediate FULL 128 → 32 per rank) ✓. The strict shape
+check (dest vs sharded, raising on mismatch) passed during
+the load — the w2 slicing is correct.
+
+w13 similarly: shard_exl3_col narrows the OUT dim (128 → 32
+per rank) matching (E, 2, 256, 32, 48) ✓.
+
+MoE weight path CLEARED. The first-token garbage lives in
+the attention compute or model wiring. Next: the
+layer-level parity test (exl3 weights vs dequantized bf16
+weights through one decoder layer) and the hidden-state
+norm probe — the plan documented above.
