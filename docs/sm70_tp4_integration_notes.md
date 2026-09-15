@@ -234,3 +234,26 @@ Fix design (next session):
   the decoder reads exactly bits*16 words per tile; padding works
   only if apply passes per-shard K to the kernel, which is the
   same per-shard-bits plumbing as option 1 with wasted memory.
+
+
+## wo_a slice loading — marker stage passed, geometry next (2026-09-15)
+
+Slice-name branch added to the model's load loop (committed):
+checkpoint `wo_a.slice.N.{suffix}` names strip to the flat param
+(`wo_a.{suffix}`) with the slice index passed as loaded_shard_id —
+the plugin's weight_loader already handles marker span (mul1/mcg
+apply to all shards) and trellis shard splits.
+
+Progression: the mul1 marker KeyError is gone; the load now fails
+at svh geometry — `shard=0 suffix=svh: dest (2048,) != loaded (256,)`.
+The checkpoint's per-slice geometry differs from the plugin's
+uniform model: slice.0.suh is (4096,) = full input, slice.0.svh is
+(1024,) = per-group output. The batched-linear layout (in-sharded
+suh, out-per-group svh) needs the loader to understand the slice's
+own geometry rather than the layer's uniform shard model.
+
+Remaining work: teach the plugin's linear weight_loader the
+batched-linear geometry (per-slice in/out sizes), or model-side
+narrowing before the loader call. The checkpoint shapes are the
+authority: slice.suh covers the full input; slice.svh covers the
+slice's output partition.
