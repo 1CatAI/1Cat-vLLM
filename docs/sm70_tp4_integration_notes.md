@@ -591,3 +591,31 @@ Next experiment: apply the dequantized W as a dense fp16
 matmul vs the fused path on the same input — if they
 disagree, the fused compute (Hadamard convention) is the
 bug; if they agree, the attention graph is the suspect.
+
+
+## Fused-vs-dense parity (correctness narrowing complete for the linear path)
+
+The fused GEMV and the dequantized-weight dense matmul AGREE
+on the same input: relative diff 0.0005 (fp16 noise floor).
+The quantized linear compute — Hadamard convention, GEMV
+math, reconstruct math, scale application — is CONSISTENT
+end-to-end at the single-layer level.
+
+Correctness conclusion: the linear/quantization stack is
+CLEARED. The gibberish output originates at the attention
+or model-wiring level: the group-paired batched apply's
+integration, the compressor path, the sparse attention, the
+KV cache, rotary embeddings, or residual/norm wiring.
+
+Next session's correctness plan (in order):
+1. Layer-level parity: one decoder layer's forward with exl3
+   weights vs the same layer with dequantized bf16 weights
+   on identical input — diverge ⇒ the layer's compute graph;
+   agree ⇒ higher (model wiring).
+2. Hidden-state probe: constant input, track per-layer
+   hidden norms — norm explosion/collapse localizes the
+   broken component (attention vs MLP vs norm).
+3. The attention path suspects in order: the group-paired
+   batched apply integration, the compressor's kv-score
+   guard change (the quantized fallback path), the sparse
+   attention's topk indices.
