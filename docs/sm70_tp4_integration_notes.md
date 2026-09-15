@@ -190,3 +190,28 @@ k_words per shard (the trellis param is already per-shard sized
 via out_tiles_list; bits must become per-shard too). The bits
 per shard are derivable from the checkpoint tensor shapes
 (loaded k_words / 16) or from a per-layer bits map.
+
+
+## Per-shard bits — scoped design (2026-09-15)
+
+The fused trellis param is one tensor (in_tiles, total_out_tiles,
+k_words) with uniform k_words = bits*16. The fused_wqa_wkv layer
+merges wq_a (3bpw) and wkv (5bpw = head_bits) — per-shard bits
+cannot fit the uniform layout.
+
+Fix design (next session):
+- Per-shard trellis params: list of tensors, one per shard, each
+  with its own k_words. Changes:
+  1. create_weights: allocate per-shard trellis (out_tiles_list
+     already exists per shard; k_words per shard from a bits map)
+  2. weight loader: dest shape check per shard (already per-shard
+     in the loader — the mismatch error proves it)
+  3. apply: run the GEMV per shard with each shard's K (the fused
+     linear's apply already iterates shards for suh/svh)
+- Bits per shard source: the checkpoint tensor shapes (loaded
+  k_words / 16) at load time, or a per-layer bits map in the
+  config. Deriving from shapes is robust — no config change.
+- Alternative rejected: padding shard 0 to 80 k_words with zeros —
+  the decoder reads exactly bits*16 words per tile; padding works
+  only if apply passes per-shard K to the kernel, which is the
+  same per-shard-bits plumbing as option 1 with wasted memory.
