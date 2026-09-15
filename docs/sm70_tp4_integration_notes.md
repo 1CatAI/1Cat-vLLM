@@ -377,3 +377,16 @@ Fixes landed this round (vllm-exl3 + 1Cat model.py):
   correction_bias), unconditional noaux_tc bias registration
 - vision-side key filter (aligner./image_/vision.) at the
   ForCausalLM level
+
+
+## Next session's opening item: apply-time reshape at shared_experts
+
+The load path is green; the first forward fails at
+reconstruct_hgemm (exllamav3 exl3.py:176): reshape [8192, 2048]
+invalid for 33554432-element input. The shared_experts gate_up
+layer's registered in/out geometry doesn't match the loaded
+trellis's decoded shape (in 4096, out 4096 = gate 2048 + up 2048).
+Check the layer's in_features/out_features attrs against the
+trellis dims — likely a doubled or swapped geometry from the
+create_weights args (MergedColumnParallelLinear output_sizes
+[2048, 2048]).
