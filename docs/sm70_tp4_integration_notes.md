@@ -192,6 +192,25 @@ per shard are derivable from the checkpoint tensor shapes
 (loaded k_words / 16) or from a per-layer bits map.
 
 
+## Per-shard bits — DISPROVED; actual fix: head_bits selection (2026-09-15)
+
+Checkpoint shapes decided it: wq_a.trellis (256,64,80) and
+wkv.trellis (256,32,80) — BOTH 80 k_words = 5bpw (head_bits).
+Uniform K; the mismatch was bits SELECTION (dense default used
+global bits=3). Fixed: head_bits stashed in Exl3Config, selected
+for attention/compressor prefixes in the dense-default path.
+Committed in vllm-exl3 (head_bits selection + duplicate-kwarg fix).
+
+## Load progression after head_bits fix
+
+Next failure: KeyError 'layers.0.attn.wo_a.slice.0.mul1' — wo_a is
+a BATCHED linear (bmm_batch_size = n_local_groups); the checkpoint
+stores per-group tensors under wo_a.slice.N.{trellis,suh,svh,mul1}.
+Same param-class gap as fused_wqa_wkv: the plugin's flat
+single-linear param layout vs the model's batched/merged attention
+linears. The per-shard/per-slice param design (recorded below)
+applies to both, with slice-index routing in the loader.
+
 ## Per-shard bits — scoped design (2026-09-15)
 
 The fused trellis param is one tensor (in_tiles, total_out_tiles,
