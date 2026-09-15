@@ -753,3 +753,24 @@ experiment is the forward-hook harness: per-layer hidden
 norms on a constant input (norm explosion/collapse
 localizes the broken component), then the layer-level
 parity test.
+
+
+## mhc post verified (correctness narrowing continues)
+
+sm70_mhc_post vs mhc_post_torch reference on identical
+input: max relative error 0.00021 (fp16 noise floor) — the
+comb indexing convention ([input, output] with the
+einsum '...ij,...ih->...jh' pairing) matches the reference
+exactly. The mhc port's both custom kernels (prenorm
+staging, post) are verified.
+
+Correctness scoreboard: weight representation EXACT,
+linear compute parity ✓, MoE slicing ✓, mhc prenorm
+staging EXACT, mhc post consistent ✓, vocab trim ✓.
+
+Remaining untested: the sinkhorn mixing (shared code), the
+attention compute (group-paired apply integration,
+compressor, sparse attention topk, rotary), model wiring.
+The forward-hook harness (per-layer hidden norms on
+constant input) is the next experiment — it localizes the
+broken component in one run.
