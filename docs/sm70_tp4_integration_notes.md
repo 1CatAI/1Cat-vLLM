@@ -140,3 +140,22 @@ Closing it means one of:
 Either is real engineering (days, not config). The verified state:
 config parse + quant resolution + TP=4 acceptance all work; the
 blocker is precisely the Exl3MoEMethod↔FusedMoE param contract.
+
+
+## FusedMoE bridge — starting-point analysis (for next session)
+
+Two checks decide adapter-vs-rewrite:
+
+1. **create_weights signature**: compare FusedMoE's call site
+   (what kwargs it passes to quant_method.create_weights) against
+   Exl3MoEMethod.create_weights' expectations. If the kwargs map,
+   the bridge is thin.
+2. **Expert-params naming**: model.py's make_expert_params_mapping
+   (line 121-127) generates `experts.{id}.{weight_name}.` prefixes;
+   the plugin's weight loaders already match this pattern —
+   evidence the plugin was designed for this model's FusedMoE
+   naming, suggesting the isinstance check (RoutedExperts-only)
+   is the actual gap, not the weight-loading machinery.
+
+Validation template: tests/exl3_sm70_moe_e2e.py (loop backend,
+EXL3_FUSED_MOE=0, rel err 7.3e-4 baseline).
