@@ -805,3 +805,29 @@ per-layer hidden norms on a constant input, then the
 layer-level parity test. The attention's components are
 testable the same way the mhc stack was: differential
 tests against torch references.
+
+
+## Inverse RoPE verified (correctness narrowing continues)
+
+The sm70 inverse RoPE kernel's rotation (even' = even*cos +
+odd*sin; odd' = odd*cos - even*sin) is the exact transpose
+of the standard forward RoPE convention, and the cos_sin
+cache layout (cos at [pos*rope_dim + pair], sin at
+[pos*rope_dim + half_rope + pair]) matches the standard
+vLLM layout. The grouped projection's slice↔group pairing
+is also confirmed: contiguous head sharding makes local
+group 0 ↔ global slice 2r, matching the loader's
+global%gpr → local mapping.
+
+Attention internals status: inverse RoPE ✓ (convention
+analysis), grouped projection pairing ✓ (sharding
+analysis), compressor kv-score guard ✓ (mathematically the
+same projection). Remaining untested: the sparse
+attention's topk indices and the full attention
+integration — both need the forward-hook harness.
+
+The hook harness (per-layer hidden norms on constant
+input, then layer-level parity) is THE next experiment —
+it localizes the broken component in one or two runs. All
+component-level differential tests available without
+hooks have passed.
