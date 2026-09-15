@@ -332,3 +332,13 @@ math). The per-slice param redesign is confirmed REQUIRED:
   (trellis (256, 64, 80), suh (4096,), svh (1024,), markers)
 - loader: slice.N → param[N_local], direct write per suffix
 - apply: per-slice GEMV (the model's bmm forward structure)
+
+
+## Redesign perf note (for implementation)
+
+The per-slice apply path (8 sequential GEMVs per layer vs one merged
+GEMM) costs throughput — the merged-GEMM optimization is why
+fused_wqa_wkv exists. Preserve it where possible: group same-K
+slices into batched GEMV calls rather than fully sequential
+per-slice applies. Correctness first (the notes' design), then this
+perf refinement once the load path is green.
