@@ -10241,11 +10241,21 @@ class GPUModelRunner(
                     rank = self.rank if hasattr(self, "rank") else 0
                     probe_f = open(f"/tmp/mhc_layer_stats_r{rank}.txt", "w")
 
+                    _capture_layer = int(os.environ.get("VLLM_HOOK_CAPTURE_LAYER", "-1"))
+                    _captured = {}
+
                     def _make_hook(idx, fh):
                         def hook(module, inp, out):
                             o = out[0] if isinstance(out, tuple) else out
                             fh.write(f"{idx} {o.float().norm().item():.6f}\n")
                             fh.flush()
+                            if idx == _capture_layer and _capture_layer not in _captured:
+                                _captured[_capture_layer] = (
+                                    inp[0].detach().clone() if isinstance(inp, tuple) and inp else None,
+                                    o.detach().clone(),
+                                )
+                                _t.save(_captured[_capture_layer],
+                                        f"/tmp/mhc_layer_{idx}_io_r{rank}.pt")
                         return hook
 
                     for i, layer in enumerate(layers):

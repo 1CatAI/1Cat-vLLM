@@ -887,3 +887,33 @@ Next session's concrete steps:
    get_weight_tensor path) — compare outputs.
 3. Diverge ⇒ bisect layer 19's components (attention vs
    MoE); agree ⇒ walk to the next extreme-ratio layer.
+
+
+## Layer-19 IO captured (hook harness working)
+
+The extended hook (VLLM_HOOK_CAPTURE_LAYER=19) captured
+layer 19's input and output tensors:
+- input (256, 4096) fp16, norm 2886, std 2.82
+- output (256, 4096) fp16, norm 5198, std 5.08
+- No NaN/inf in either ✓
+
+Norm-profile corrections from the full data:
+- The 4 passes in the stats file: 3 profiling runs + 1
+  generate. The profiling passes' norms go NaN (synthetic
+  inputs → rsqrt(0)) — normal, not a bug signal.
+- The generate pass's trajectory: oscillating 8-207 with
+  several 2-5x swings (layer 5: 3.96x, 19: 5.01x, 21:
+  0.41x) — characteristic of mHC residual stream energy
+  exchange, NOT obviously a bug. The forward is
+  numerically STABLE (no inf/nan in the real pass).
+- The corruption is SUBTLE (wrong values, not overflow) —
+  consistent with a convention/indexing bug.
+
+The decisive next test: the IN-WORKER REPLAY — at the
+captured layer, recompute the forward with dequantized
+bf16 weights (get_weight_tensor path) on the captured
+input, compare against the captured output. Divergence
+localizes the bug to that layer's quantized compute;
+agreement walks to the next layer. The replay runs inside
+the worker (the weights are live there) — extend the hook
+with a replay branch.
