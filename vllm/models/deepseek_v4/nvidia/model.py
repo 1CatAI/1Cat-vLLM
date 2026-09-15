@@ -1257,6 +1257,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 else:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    # Batched exl3 linears (wo_a): checkpoint names are
+                    # slice-qualified (wo_a.slice.N.{trellis,suh,svh,mul1})
+                    # but the params are flat (wo_a.{suffix}). Strip the
+                    # slice qualifier and pass the slice index as the
+                    # shard id — the exl3 weight loader splits per slice.
+                    _sl = re.match(r"^(.*)\.slice\.(\d+)\.(\w+)$", name)
+                    if _sl is not None:
+                        _base, _idx, _suffix = _sl.groups()
+                        _p = params_dict.get(f"{_base}.{_suffix}")
+                        if _p is not None:
+                            _p.weight_loader(_p, loaded_weight, int(_idx))
+                            loaded_params.add(name)
+                            continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
