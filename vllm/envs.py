@@ -485,6 +485,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS: int = 8
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE: bool = False
     VLLM_FLASH_V100_XQA_G6_DUAL_CTA: bool = False
+    VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH: int = 1
     VLLM_FLASH_V100_XQA_SPLIT_REDUCE: bool = False
     VLLM_FLASH_V100_E4M3_BATCH_XQA: bool = True
     VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED: bool = True
@@ -3180,6 +3181,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))
+    ),
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH": lambda: int(
+        os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH", "1")
     ),
     "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))

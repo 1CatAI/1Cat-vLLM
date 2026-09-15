@@ -46653,6 +46653,124 @@ has launched no full model. Details and artifacts are in
 - Model admission and human review remain outstanding. PR524 stays Draft;
   no auto-merge, production default change, or private long-prefill promotion.
 
+## 2026-09-14 Qwen3.8-27B-FP8 TP4 C32 pure-decode recovery
+
+- The accepted comparison window is concurrency 32, 2048 input tokens, 256
+  generated tokens, FP16 KV, no speculative decoding, TP4 on GPUs 0-3, and a
+  32768-token CUDA-graph capacity. Stable graph-replay intervals exclude
+  prefill and request-level throughput. The A800 reference interval is
+  `33.521 ms/step`; a 10% higher decode-step rate requires at most
+  `30.474 ms/step`.
+- The original V100 trace measured `36.285 ms/step`. Its largest C1-to-C32
+  expansions were FP8 projections (`+6.846 ms`), GDN (`+3.317 ms`), full
+  attention (`+2.837 ms`), and TP communication (`+2.413 ms`). Direct C32
+  comparison showed the V100 projection and GDN were already faster than the
+  A800 reference, while TP communication, layout/elementwise work, and full
+  attention accounted for the remaining absolute gap.
+- Coordinated M32 FP8 tuning reduced the interval to `34.235 ms`. Enabling the
+  established fused Gemma add+RMS route reduced it to `31.330 ms`. The
+  existing 6-warp dual-resident G6/D256 attention route then produced two
+  independent full traces at `30.140 ms` and `30.124 ms`; the repeat has p90
+  `30.143 ms` and p99 `30.158 ms`. This is 11.27% more decode steps per second
+  than the A800 reference and clears the target by `0.350 ms/step`.
+- The repeat trace reduced full-attention rank-mean service from `4.113 ms` to
+  `2.897 ms`, FP8 projection service from `17.176 ms` to `14.868 ms`, and the
+  fragmented elementwise/layout category from `3.534 ms` to `1.312 ms`.
+  TP communication remains `2.990 ms` and is the next independent source
+  target. The optimized graph contains 1076 nodes versus the original 1696.
+- Defaults apply only to the exact Qwen3.8-27B-FP8, FP16, TP4, no-speculative,
+  graph-captured C32 contract and preserve explicit environment overrides.
+  They warm and tune M24/M32, select the fused Gemma RMS route, and enable the
+  6-warp attention route at batch 16 or larger. An added minimum-batch selector
+  keeps B1-B8 on the established 8-warp path; a B1/2/4/8/16/24/32 operator
+  sweep found no low-batch route regression and measured 34.24% and 35.25%
+  attention speedups at B16 and B32.
+- The new Flash-V100 extension builds successfully with CUDA 12.8 and SM70.
+  The batch sweep is bit-exact against the 8-warp output at every tested
+  batch. Focused config, environment, and fused-RMS tests pass. A custom
+  all-reduce block-count sweep saved only 1.7% of the isolated collective,
+  max-model-length 4096 did not reduce active attention time, partition 512
+  regressed, and direct TP4 all-reduce+RMS graph fusion did not match; these
+  routes are rejected for this milestone.
+- The rebuilt minimum-batch extension was subsequently exercised in a complete
+  source endpoint. All four workers mapped DSO
+  `eea5fdd5...cbc1a0`, all five automatic defaults were logged, and every rank
+  loaded the same 35 coordinated FP8 tuning records. With the compile cache
+  prepared, CUDA graph capture finished in 92 seconds. A deterministic
+  2048-input/256-output request returned HTTP 200, `finish_reason=length`, and
+  exactly 256 output tokens (token-id SHA256 `5be973bb...eeca9f`).
+- Two rebuilt-source C32 traces measured rank-max replay intervals of
+  `29.535 ms` and `29.502 ms`. The cleaner repeat selected 244 stable full-batch
+  steps and measured p50 `29.489 ms`, p90 `29.511 ms`, and p99 `29.877 ms`.
+  Relative to the A800 mean/p50/p90/p99, decode-step rate is higher by
+  13.62%/13.43%/13.90%/20.10%, so every recorded percentile clears the 10%
+  target. The current endpoint remains healthy after collection; request-level
+  throughput remains excluded from acceptance.
+
+## 2026-09-14 Qwen3.8-27B-FP8 TP4 C32 8K decode decay
+
+- The matched long-context criterion is 32 concurrent requests, exactly 8192
+  input and 256 generated tokens per request, temperature zero, ignore-EOS,
+  and full decode ordinals 2-251. Prefill, TTFT, padded tail, and request-level
+  throughput remain excluded. Two V100 and two A800 traces each contribute 250
+  stable steps, for 500 steps per device configuration.
+- The two complete V100 traces measure `36.183 ms` and `36.122 ms`; pooled
+  rank-max mean/p50/p90/p99 are `36.152/36.152/36.198/36.220 ms`. The two A800
+  traces measure `39.674 ms` and `39.772 ms`; pooled values are
+  `39.723/39.678/39.994/40.529 ms`. V100 decode-step rate is higher by
+  9.88%/9.75%/10.49%/11.90%. The 10%-faster mean threshold is `36.112 ms`, so
+  V100 currently misses it by `0.040 ms`; do not claim robust 10% superiority
+  at 8K from these traces.
+- From 2K to 8K, V100 step latency rises 22.54% while A800 rises 18.50%; the
+  V100 rate advantage narrows from 13.62% to 9.88%. V100 full-attention service
+  grows from `2.901 ms` to `9.350 ms`, accounting for about 97% of its
+  `6.650 ms` step increase. The inter-graph gap stays approximately
+  `1.664 ms`, and projection, GDN, norm, and layout costs are nearly flat.
+- At 8K, V100 attention is `0.424 ms` slower than A800 attention. Recover at
+  least `0.2-0.3 ms/step` for a repeatable margin. Test context-qualified
+  partition 256/384/512 choices before another communication change; the
+  previously rejected global partition-512 route regressed 2K and must not be
+  enabled unconditionally.
+- Two initial V100 four-second traces covered only the early 106/107 decode
+  positions and are diagnostic only. They understate the full 8192-to-8447
+  attention window and are excluded from the accepted comparison. The final
+  report and raw Nsight artifacts are under
+  `bench_results/27b_fp8_concurrency_a800_review_20260914/c32_8k/`.
+
+## 2026-09-14 Qwen3.8-27B-FP8 C32 32K vLLM serving baseline
+
+- The user changed the 32K criterion to standard `vllm bench serve`: random
+  dataset, seed 1234, fixed 32768 input and 256 output tokens, range ratio
+  zero, temperature zero, ignore EOS, 128 requests, request rate infinity,
+  and maximum concurrency 32. Both endpoints complete 128/128 requests with
+  zero failures and exactly 4,194,304 input plus 32,768 output tokens.
+- Tokenizer JSON hashes match across hosts. The vLLM 1.5.0 V100 and vLLM
+  0.29.0 A800 `RandomDataset` implementations have the same request-generation
+  path; their source diff is limited to typing and an unused embeddings-batch
+  field. This is a matched request workload, while each server retains its
+  native TP, compute/KV dtype, projection, and attention configuration.
+- V100 TP4 completes in `2972.63 s` at `0.04306 req/s` and `11.023 output
+  tok/s`; A800 TP1 completes in `2064.03 s` at `0.06201 req/s` and `15.876
+  output tok/s`. V100 output/request throughput is 30.57% lower. Reaching 10%
+  above A800 requires `17.463 output tok/s`, or a 58.42% improvement over the
+  current V100 result.
+- V100 versus A800 ITL mean/p50/p90/p99 is
+  `2059.92/61.94/4844.37/5103.26 ms` versus
+  `1151.94/46.64/3369.47/3593.90 ms`. Under-100-ms intervals form 53.43% of
+  V100 samples at a `60.84 ms` p50, versus 62.23% at `46.34 ms` on A800.
+  More importantly, 30.23% of V100 intervals exceed 4 seconds, versus 0.012%
+  on A800. Long-context decode and prefill interference are separate gaps.
+- TTFT mean/p50 is only 3.40%/3.08% higher on V100, while mean/p50 E2EL is
+  47.22%/53.44% higher. Prioritize chunked-prefill scheduling A/Bs at
+  max-batched-token sizes 1024/2048/4096/8192 and partial-prefill limits,
+  then isolate a C32 32K decode partition 256/384/512 sweep. Do not promote a
+  global partition-512 route because it already regressed the 2K criterion.
+- V100 records 32,609 ITL chunks rather than the theoretical 32,640 because
+  31 streams coalesced one adjacent token pair. Preserve this 0.095% client
+  measurement limitation; vLLM-bench ITL is not a strict CUDA-step trace.
+  Full JSON, logs, summary, and report are under
+  `bench_results/27b_fp8_concurrency_a800_review_20260914/c32_32k/`.
+
 ## 2026-09-14 E4M3 FP8-KV route parity
 
 - Base `a6f5e8347b` (`onecat/main`), owned branch
@@ -46704,3 +46822,59 @@ has launched no full model. Details and artifacts are in
   3.64x/6.12x/6.35x/6.46x/6.59x. Native attention admission has no batch or
   total-KV-length ceiling; services above B32 continue through piecewise CUDA
   graphs with the same accelerated attention route.
+
+## 2026-09-15 Qwen3.8-27B-FP8 TP4 C32 32K recovery
+
+- Merge `onecat/main` through `02c87ab890` (PR638) into the owned C32 branch.
+  The merged defaults send resident decode rows in a mixed chunked-prefill
+  batch through paged XQA and capture E4M3 graphs through B32. The exact
+  32768-input/256-output service uses FP16 execution, E4M3 KV, TP4, Mamba
+  `align`, page 1568, max batched tokens 8192, prefix caching, asynchronous
+  scheduling, and normal CUDA graphs.
+- A shortened standard `vllm bench serve` screen uses the same random dataset,
+  seed 1234, fixed lengths, request rate infinity, and C32 criterion as the
+  128-request A800/V100 baseline. It sends 40 distinct prompts and adds a new
+  cache salt to isolate all previous endpoint traffic. It completes 40/40 in
+  `342.13 s` at **29.930 output tok/s**, with ITL mean/p50/p99
+  `562.31/78.35/2137.91 ms`. The first 40 completions from the recorded A800
+  baseline take `933.69 s` at `10.967 output tok/s`; its 10%-higher target is
+  `12.064 output tok/s`. The new V100 screen is 2.73x the A800 rate and clears
+  that shortened target. Per the user's iteration constraint, do not spend a
+  full 128-request run until another implementation change needs final
+  acceptance.
+- The old FP16-align allocation was the primary capacity cliff: 32 exact 32K
+  requests consumed 99.9168% of available KV capacity and left only 898
+  logical tokens. E4M3 page 1568 raises measured capacity to about 1.85-1.89M
+  tokens and maximum 33,024-token concurrency to 56-57, so C32 no longer
+  enters preemption at the physical-cache edge. This capacity change, plus the
+  mixed-batch decode-row XQA route, explains the large request-level recovery.
+- Stable decode is not the source of the original 32K serving deficit. At
+  matched B21/B22, the old FP16 V100 trace measured 48.146/48.240-ms median
+  ITL versus 46.154/46.412 ms on A800, only 3.9%-4.3% slower. The old standard
+  A800 run never had more than 22 simultaneous decoding requests, so comparing
+  its global p50 with a V100 B31/B32 interval confounds batch size. A separate
+  warm-prefix E4M3 B32 probe measures about 74.7-ms steady ITL, or 428 aggregate
+  decode tok/s. This is a real long-context E4M3 B32 cost and remains separate
+  from the recovered rolling-request throughput.
+- Mamba-aligned prefill remains the latency limiter. A cold 32K request is
+  split into 21 page-1568 scheduler steps. PR638 reduces the C1 victim's 42
+  observed mixed-batch gaps from 358-454 ms to 248-346 ms and request wall
+  from 20.856 s to 16.370 s by moving its resident decode row off the per-row
+  prefill path. With four victims and five cold 32K requests, the accepted
+  single-row bridge records 99 stalls and 165.73 aggregate stall-seconds;
+  most victim gaps are 1.69-2.19 s because the five prefill rows execute in
+  the same scheduler step.
+- Operator isolation rejects disabling the FP8 bridge. At q1568/KV32928, the
+  bridge expansion itself costs only `0.186 ms` per layer and bridged FP16
+  attention costs about `25.17 ms`; native E5M2 paged attention costs
+  `125.52 ms`, while a matching E4M3 probe costs about `194.95 ms`. The bridge
+  is therefore not the inflated component; the repeated long-prefix attention
+  service dominates each atomic prefill step.
+- A consecutive equal-query bridge-batching prototype is also rejected and is
+  not retained. A generic operator probe saved 5%-6% at four to five rows, but
+  the real backend lost its optimized single-row dense FA2 route and selected
+  batched paged FA2. The exact C4-decode plus five-cold-32K probe regressed
+  victim wall `49.895 -> 55.059 s` (+10.35%) and aggregate stall time
+  `165.73 -> 186.50 s`. Further work must accelerate the page-1568 dense FA2
+  attention service or preserve that kernel while changing scheduling; do not
+  repeat the discarded paged-batch bridge.
