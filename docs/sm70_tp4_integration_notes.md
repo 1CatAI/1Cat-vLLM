@@ -774,3 +774,34 @@ compressor, sparse attention topk, rotary), model wiring.
 The forward-hook harness (per-layer hidden norms on
 constant input) is the next experiment — it localizes the
 broken component in one run.
+
+
+## mhc fused pipeline verified (correctness narrowing continues)
+
+The production fused path (mhc_fused_post_pre_tilelang —
+the model's actual call, including the sm70 triton staging
+and the shared sinkhorn mixing) compared against the
+pure-torch reference (mhc_fused_post_pre_torch) on
+identical inputs: all four outputs (x, residual, post_mix,
+res_mix) agree at fp16 noise level (max rel err
+0.0002-0.0015). The mhc stack is FULLY CLEARED — prenorm
+staging exact, post consistent, fused pipeline consistent.
+
+Correctness scoreboard: weight representation EXACT,
+linear compute ✓, MoE slicing ✓, mhc stack (all three
+paths) ✓, vocab trim ✓.
+
+THE ATTENTION COMPUTE IS THE REMAINING SUSPECT — the only
+major component without a differential test. Concretely:
+the group-paired batched apply's integration in the real
+model (the standalone apply math is verified; the
+integration — the o tensor's group layout, the reshape
+(num_groups, -1) pairing with the slice order — is not),
+the compressor's kv-score path, the sparse attention's
+topk indices, the rotary embedding's inverse application.
+
+Next experiment (unchanged): the forward-hook harness —
+per-layer hidden norms on a constant input, then the
+layer-level parity test. The attention's components are
+testable the same way the mhc stack was: differential
+tests against torch references.
