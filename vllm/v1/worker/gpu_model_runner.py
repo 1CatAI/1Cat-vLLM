@@ -10256,6 +10256,58 @@ class GPUModelRunner(
                                 )
                                 _t.save(_captured[_capture_layer],
                                         f"/tmp/mhc_layer_{idx}_io_r{rank}.pt")
+                                # In-worker replay: monkey-patch each exl3
+                                # linear's forward with a dense fp16 matmul
+                                # over the dequantized weight, run the layer,
+                                # restore the originals.
+                                try:
+                                    orig_fwds = []
+
+                                    def _dense_fwd(sub, x, *a, **kw):
+                                        W = sub.get_weight_tensor()
+                                        y = x.float() @ W.float()
+                                        return y.to(x.dtype)
+
+                                    for sub_name, sub in module.named_modules():
+                                        if hasattr(sub, "get_weight_tensor") and hasattr(sub, "forward"):
+                                            orig_fwds.append((sub, sub.forward))
+                                            import functools as _ft
+                                            sub.forward = _ft.partial(_dense_fwd, sub)
+                                    with _t.no_grad():
+                                        replay_out = module(*inp)
+                                    if isinstance(replay_out, tuple):
+                                        replay_out = replay_out[0]
+                                    for sub, fwd in orig_fwds:
+                                        sub.forward = fwd
+                                    _t.save(replay_out.detach(),
+                                            f"/tmp/mhc_layer_{idx}_replay_r{rank}.pt")
+                                    # Dump the model-loaded exl3 params for
+                                    # checkpoint comparison
+                                    params_dump = {}
+                                    for sub_name, sub in module.named_modules():
+                                        # The raw merged params (pre-stitch state)
+                                        for pn in ("trellis", "suh", "svh"):
+                                            v = getattr(sub, pn, None)
+                                            if v is not None and _t.is_tensor(v):
+                                                params_dump[f"{sub_name}.{pn}"] = v.detach().cpu()
+                                        if getattr(sub, "_exl3_linears", None):
+                                            params_dump[f"{sub_name}.__linears__"] = _t.tensor(
+                                                [len(sub._exl3_linears)])
+                                            for pn in ("trellis", "suh", "svh"):
+                                                try:
+                                                    v = sub.get_parameter(pn)
+                                                    params_dump[f"{sub_name}.{pn}"] = v.detach().cpu()
+                                                except Exception:
+                                                    pass
+                                    _t.save(params_dump,
+                                            f"/tmp/mhc_layer_{idx}_params_r{rank}.pt")
+                                    fh.write(f"REPLAY {idx} {replay_out.float().norm().item():.6f}\n")
+                                    fh.flush()
+                                except Exception as _e:
+                                    for sub, fwd in orig_fwds:
+                                        sub.forward = fwd
+                                    fh.write(f"REPLAY FAIL {idx} {_e}\n")
+                                    fh.flush()
                         return hook
 
                     for i, layer in enumerate(layers):

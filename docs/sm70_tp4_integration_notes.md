@@ -917,3 +917,42 @@ localizes the bug to that layer's quantized compute;
 agreement walks to the next layer. The replay runs inside
 the worker (the weights are live there) — extend the hook
 with a replay branch.
+
+
+## CORRECTNESS BUG FOUND: fused_wqa_wkv's wkv partition never loads
+
+The replay divergence (cosine 0.066) traced to the model's
+loaded weights: the param dump + checkpoint comparison
+shows the fused_wqa_wkv merged layer's trellis param is
+(256, 96, 80) — the FULL output size (wq_a 64 tiles + wkv
+32 tiles) — with:
+- partition 0 [0:64]: wq_a.trellis at 100% match — loaded
+  UN-NARROWED (the full wq_a tensor, no TP slicing)
+- partition 1 [64:96]: ALL ZEROS — the wkv tensors never
+  loaded (torch.empty → zeroed by the padded init or never
+  written)
+
+The model computes the wkv projection with zero weights →
+the attention's KV path is dead → garbage from token 1 ✓
+explains the first-token gibberish completely.
+
+Root cause: the fused_wqa_wkv merged layer's TP handling
+is broken end-to-end — the param allocated at full (un-
+sharded) output size, the wq_a write bypassed the TP
+narrowing, and the wkv write never fired. The un-narrowed
+wq_a + zero wkv combination also explains the norm
+profile's layer-19 oscillation (dead KV path changes the
+residual mixing).
+
+Fix direction: the merged layer's create_weights must
+allocate the SHARDED output sizes (output_partition_sizes
+already carries the per-rank sizes — verify what the
+fused layer passes), and the loader's stacked-mapping
+path must narrow both partitions (shard_exl3_col for
+wq_a shard 0, and the wkv shard 1 write must fire —
+trace why it doesn't: the stacked mapping entry exists
+('attn.fused_wqa_wkv', 'attn.wkv', 1), so the loader's
+shard_id=1 branch is the suspect).
+
+After the fix: re-run the replay parity (cosine should
+jump to ~1.0) and the greedy probe (coherent token).
