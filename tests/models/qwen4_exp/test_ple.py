@@ -880,6 +880,52 @@ def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
     assert _get_ple_embedding_quant_method(quant_config, prefix) is None
 
 
+def _modelopt_mixed(quantized_layers: dict, exclude_modules: list[str]):
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": None,
+                "exclude_modules": exclude_modules,
+                "quantized_layers": quantized_layers,
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "language_model.model.layers.1.ple.ple_embedding.ngram_embedding",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding",
+    ],
+)
+def test_ple_fp8_embedding_from_modelopt_mixed_precision(prefix: str) -> None:
+    """nvidia/Qwen3.8-Flash-Next-NVFP4 declares the FP8 PLE table per layer
+    and does not set ple_embedding_dtype; the table must still select the FP8
+    embedding method, otherwise pinned-host PLE refuses to start."""
+    ple = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    experts = {"model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}}
+
+    fp8 = _modelopt_mixed({ple: {"quant_algo": "FP8"}, **experts}, ["lm_head"])
+    assert isinstance(
+        _get_ple_embedding_quant_method(fp8, prefix), Qwen4ExpPLEFp8EmbeddingMethod
+    )
+
+    unlisted = _modelopt_mixed(experts, ["lm_head"])
+    assert _get_ple_embedding_quant_method(unlisted, prefix) is None
+
+    excluded = _modelopt_mixed(
+        {ple: {"quant_algo": "FP8"}, **experts},
+        ["*.ple.ple_embedding.ngram_embedding*"],
+    )
+    assert _get_ple_embedding_quant_method(excluded, prefix) is None
+
+
 def test_ple_ngram_ids_custom_op_uses_current_request_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
