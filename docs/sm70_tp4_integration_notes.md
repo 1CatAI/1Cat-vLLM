@@ -675,3 +675,30 @@ the attention compute or model wiring. Next: the
 layer-level parity test (exl3 weights vs dequantized bf16
 weights through one decoder layer) and the hidden-state
 norm probe — the plan documented above.
+
+
+## Session close (tuning + correctness narrowing, 2026-09-15)
+
+Additional verification this session:
+- The group-paired batched apply's semantic is correct:
+  contiguous head sharding makes local group 0 ↔ global
+  slice 2r hold, so the pairing is right under the model's
+  sharding scheme.
+
+Correctness status: the quantized linear stack (weights,
+slicing, fused compute) is fully CLEARED by parity and
+consistency tests. The gibberish output lives in the
+attention compute or model wiring — the layer-level parity
+test and the hidden-state norm probe are the next
+experiments (both need forward-hook work inside the vLLM
+workers).
+
+Throughput status: reconstruct-only path ~2.2-2.9 toks/s
+(correctness-blocked, so tuning is premature). The GEMV IMA
+fix would unlock the fast decode path (~10x per-call claim
+in the dispatch docstring) — kernel-level debug asserts in
+exl3_gemv_sm70_kernel.cuh are the prepared next step
+(compute-sanitizer is blocked by NCCL).
+
+All changes committed across the three repos (1Cat-vLLM-sm70,
+references/vllm-exl3, exllamav3-sm70).
