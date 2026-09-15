@@ -956,3 +956,31 @@ shard_id=1 branch is the suspect).
 
 After the fix: re-run the replay parity (cosine should
 jump to ~1.0) and the greedy probe (coherent token).
+
+
+## wkv partition FIXED — output changed, attention suspect remains
+
+The vocab-parallel branch gate (the fix): the branch was
+catching EVERY tp_size=1 trellis call — the merged
+layers' wkv write landed at [0:32] (the wq_a region) and
+was overwritten by the wq_a write, leaving the wkv
+partition zeros. Gated on the LM head prefix.
+
+Verification: the merged param's tail [64:96] now matches
+the checkpoint's wkv.trellis at 100% (was 0%/zeros) ✓.
+
+Output change: 'occ S Q'sef...' → 'ifiableifiableifiable'
+— the fix had an effect but the output is still garbage
+(REPETITION pattern now — classic broken-attention/KV
+symptom).
+
+Remaining suspect: the attention compute/state — the
+compressor's kv-score quantized fallback, the sparse
+attention's topk, the rotary's runtime application, or
+the KV cache. The layer-19 replay parity (the harness is
+deployed) is the next decisive test: with the weights now
+correct, a replay divergence isolates the compute bug.
+
+Also note: one run hit a flaky 'We expected the number of
+MOE layers' assertion — a MoE-forward counting race, not
+reproduced on the clean rerun.
