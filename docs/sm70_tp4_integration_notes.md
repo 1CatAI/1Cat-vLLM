@@ -984,3 +984,20 @@ correct, a replay divergence isolates the compute bug.
 Also note: one run hit a flaky 'We expected the number of
 MOE layers' assertion — a MoE-forward counting race, not
 reproduced on the clean rerun.
+
+
+## Post-cleanup verification (trace strip)
+
+The diagnostic traces stripped from both repos; the clean
+tree reproduces the same state: the pipeline runs, the
+output is still garbled ('  ifiable obifiable  $' —
+repetition/fragment pattern). The wkv fix is live (the
+merged param verified 100% both partitions).
+
+The remaining correctness bug: the attention compute or
+model wiring. The layer-19 replay parity (the hook
+harness captures the IO; the replay swaps the exl3
+forwards for dense dequantized matmuls) is the prepared
+next experiment — with the weights now verified correct,
+a replay divergence isolates the compute bug to a
+specific component.
