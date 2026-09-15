@@ -413,3 +413,37 @@ Carry-forward cleanup items (pre-ship, non-blocking):
 - vision-key filter duplicates: inner-model filter at 1192-1199 is
   dead code (the ForCausalLM filter at 1476-1478 is operative);
   consolidate at next touch
+
+
+## Milestone update: engine initializes, prefill runs, decode crashes (2026-09-15 late)
+
+Fixes this round (all verified by test runs):
+- batched wo_a apply: group-paired slicing — the apply ran ALL
+  slices on ALL groups and concatenated (doubling z width);
+  now slice i pairs with group i (dim -2), outputs cat along
+  last dim. This fixed the [8192, 2048] reshape crash.
+- bmm shard construction: process_weights_after_loading now
+  builds _bmm_n linears for bmm layers (trellis out-tile span
+  per slice, suh row i, svh span i), markers read at [0]
+  (uniform). Previously built n_shards=1 linear → list index
+  OOR in the apply.
+- compressor_kv_score / indexer_compressor_kv_score: guard
+  .weight access — quantized (EXL3) fused_wkv_wgate has no
+  .weight; call the layer forward instead (return_bias=False
+  → bare tensor).
+
+State: engine initializes, KV cache allocates (2.02 GiB at
+0.95 util / 256 ctx / 4 seqs), prefill completes, GENERATE
+starts — decode crashes with an ILLEGAL MEMORY ACCESS in
+sm70/sparse_kernels.py:919 (sparse paged fp8 decode kernel).
+
+Memory regimes mapped: 0.90 util → KV 0.03 GiB (too small);
+0.95 → KV 1.6-2.0 GiB ✓ but decode workspace tight (0.97
+OOMs the workspace); the IMA is the current blocker, not
+capacity.
+
+Next session's opening item: the IMA in the sparse paged fp8
+decode kernel — check the paged KV index bounds under
+max_model_len=256 (4841 KV tokens, 4 seqs) and the fp8 page
+table indexing; the crash reproduces immediately on the
+first decode step.
