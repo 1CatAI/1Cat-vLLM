@@ -564,11 +564,15 @@ worthless if wrong), then the GEMV IMA for throughput.
 
 ## Correctness narrowing (round-trip + scale-correlation results)
 
-The quantize_tiles round-trip test is INVALID as a weight
-validator: its `quantized_tiles` return is the pre-embedding
-quantized value in a coded space, not the decoded
-reconstruction — even random control data shows ~1.0
-'device' error. Dead end as designed.
+CORRECTED: the earlier round-trip verdict was wrong. The
+quantize_tiles output IS the decoded codebook value in
+fixed codebook units (quantize_tiles_kernel.cuh:321,
+decode_3inst) — no per-tile scale. The ~0.87/1.0 errors
+were a UNIT MISMATCH: outer-domain tiles (de-Hadamarded,
+rescaled by suh/svh, std 0.023) fed to the fixed-unit
+codebook. The mul1 quantization path requires pre-
+normalized input (quantize_rows: rms → cs → scale0 →
+normalize → quantize → scale back).
 
 Scale-correlation check (PASSES): the dequantized W's
 column norms correlate with |svh| at cosine 1.0000 and row
@@ -591,6 +595,26 @@ Next experiment: apply the dequantized W as a dense fp16
 matmul vs the fused path on the same input — if they
 disagree, the fused compute (Hadamard convention) is the
 bug; if they agree, the attention graph is the suspect.
+
+ROUND-TRIP RESULT (inner domain, decisive): taking
+get_inner_weight_tensor() (raw ext.reconstruct output =
+codebook units, no had/suh/svh), extracting tiles with the
+canonical permute, requantizing with K = trellis.shape[-1]//16
+and the layer's mul1 flag: error 0.000000 — EXACT. Codebook
+values are exactly representable, so the tile element-order
+convention and the encode-decode pairing are VERIFIED
+CORRECT. This closes the fused-vs-dense blind spot (both
+paths share the same decode; only a true round-trip can
+test the tile order).
+
+Correctness conclusion (final for the weight domain): the
+quantized weight representation is EXACTLY self-consistent
+through quantize → encode → decode → reconstruct →
+requantize. The gibberish is definitively NOT in the
+quantized weight representation. Remaining suspects: the
+RUNTIME Hadamard application to activations (the forward's
+had_l/had_r convention vs quantize-time), the attention
+compute graph, or model wiring.
 
 
 ## Fused-vs-dense parity (correctness narrowing complete for the linear path)
