@@ -1001,3 +1001,37 @@ forwards for dense dequantized matmuls) is the prepared
 next experiment — with the weights now verified correct,
 a replay divergence isolates the compute bug to a
 specific component.
+
+
+## Replay methodology correction (KV cache contamination)
+
+The layer-19 replay divergence (cosine 0.066, 1.4x norm)
+is CONTAMINATED: the replay ran the layer's forward a
+second time — the attention read the KV cache entries
+written by the first pass, so the replay's attention
+output differs from the captured output REGARDLESS of
+the linears' correctness. The replay's linear-swap
+methodology is invalid for attention layers as built.
+
+Also confirmed: the layer-19 output is bit-identical
+before and after the wkv fix — expected, since the wkv
+projection feeds the KV cache (affecting subsequent
+tokens' attention), not the current layer's output. The
+wkv fix's effect shows in the GENERATION (the output
+pattern changed) and the re-baseline norm profile
+(early-layer norms dropped 35 → 13.7, the trajectory
+reshaped).
+
+Re-baseline profile on FIXED weights: bounded early
+(4-7), gradual mid growth (5 → 20), accelerating late
+(28 → 53 → 120 at the final layer). No non-finite
+values. The final-layer jump (2.2x) is the new
+localization candidate — the last decoder layer's output
+feeds the lm_head.
+
+Correct replay methodology (next session): either replay
+a non-attention component (the MLP/MoE part only), or
+isolate the KV cache (clear/restore around the replay),
+or compare the LINEAR outputs directly (hook the linears'
+inputs/outputs, not the layer's) — the linear-level
+parity is immune to the cache state.
