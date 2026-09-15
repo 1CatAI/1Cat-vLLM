@@ -312,3 +312,23 @@ Scope for the redesign:
 - apply: per-slice GEMV over each slice's params, concatenated
   output (or batched GEMV — the bmm structure the model's forward
   expects)
+
+
+## Per-slice suh distinctness — redesign definitively required (2026-09-15)
+
+The last open question: are the slices' suh tensors distinct (each
+group has its own input-side scale) or identical (one write +
+broadcast)? Checked the checkpoint directly: slice.0.suh ≠ slice.1.suh
+(4096-element tensors, values differ). Each of the 8 groups carries
+its own suh.
+
+This settles the design question raised by the refined analysis (the
+output_partition_sizes derivation fix would address svh/trellis
+segment addressing, but suh needs 8 distinct 4096-element slots —
+the flat (1, 4096) param cannot hold them regardless of segment
+math). The per-slice param redesign is confirmed REQUIRED:
+
+- create_weights: per-slice params — 8 slices → per-rank 2 slices ×
+  (trellis (256, 64, 80), suh (4096,), svh (1024,), markers)
+- loader: slice.N → param[N_local], direct write per suffix
+- apply: per-slice GEMV (the model's bmm forward structure)
