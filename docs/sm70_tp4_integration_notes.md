@@ -619,3 +619,37 @@ Next session's correctness plan (in order):
    batched apply integration, the compressor's kv-score
    guard change (the quantized fallback path), the sparse
    attention's topk indices.
+
+
+## First-token probe result (correctness narrowing continues)
+
+Greedy decode (temperature=0) produces garbage from the
+FIRST token ('occ S Q'sef intensity ofifiable'). The argmax
+token is already wrong — the corruption is in the PREFILL
+forward, not the KV cache or decode loop.
+
+Cleared by this session's tests: the quantized linear stack
+(weights self-consistent, fused compute parity 0.0005), the
+padded-vocab leak (trimmed), the stream race (IMA persists
+without overlap).
+
+Prime suspect: the MoE expert weight path — the FusedMoE
+bridge's w13/w2 slicing of the exl3 expert trellis. A wrong
+expert-weight slicing produces valid-shaped but wrong
+expert weights → garbage output from layer 0 (the hash-MoE
+layers use the same expert compute). Fits: first-token
+garbage, all layers affected equally.
+
+Secondary suspects: the attention compute (group-paired
+apply integration, compressor), the hash-MoE + bias routing
+combination (the bias is now registered for hash layers 0-2
+matching the checkpoint — verify fused_topk_bias handles
+the hash+bias combination as the model intends).
+
+Next session's plan:
+1. MoE bridge parity: one expert's weight through the
+   bridge's slicing vs direct checkpoint dequantize —
+   compare.
+2. Layer-level probe: hidden-state norms per layer on a
+   constant input (norm explosion/collapse localizes).
+3. If MoE clears: the attention compute graph.
