@@ -447,3 +447,38 @@ decode kernel — check the paged KV index bounds under
 max_model_len=256 (4841 KV tokens, 4 seqs) and the fp8 page
 table indexing; the crash reproduces immediately on the
 first decode step.
+
+
+## IMA diagnostic plan (carry-forward, next session's opening)
+
+Memory-regime table (util-only is a dead end — it moves the
+failure point, never fixes the workspace/KV competition):
+- 0.90 util: pool after weights ~1.6 GiB → KV 0.03 GiB, init
+  fails
+- 0.95 util: KV 1.62-2.02 GiB ✓ but decode workspace OOMs in
+  the leftover
+- 0.97 util: carves MORE KV → workspace margin worse
+
+Ratio levers (one-line harness changes): max_num_seqs=4
+(shrinks num_decode_tokens → workspace linearly), SPLITK_C128
+off (drops the fp32 partial buffers entirely), max_model_len
+=256 (shrinks num_partials). Shrink the workspace FIRST, then
+util has room to move.
+
+The fp32 splitk partial_acc (num_decode_tokens, heads,
+num_partials, 512) fp32 × 3 buffers is the allocation that
+OOMed — num_partials scales with main_width (SWA window +
+compressed context), not the request length.
+
+Discriminator before splitk index-math work: rerun with
+CUDA_LAUNCH_BLOCKING=1 — the current traceback (sparse.py:145
+forward_mqa → :272 _forward_decode → sparse_kernels.py:919)
+may be a DELAYED fault from a prefill-side kernel, reported
+at the next sync. If the IMA fires on decode step 1, look one
+frame earlier for a prefill-side writer; if after several
+clean steps, the splitk decode indexing is the real suspect.
+
+Then: buffer-shape-vs-index-range check — the workspace specs
+at sparse.py:212-235 vs the kernel's index math at
+sparse_kernels.py:919 (main_width/num_partials derivation
+source: layer attribute vs actual index buffer width).
