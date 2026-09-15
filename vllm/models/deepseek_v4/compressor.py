@@ -295,12 +295,19 @@ class DeepseekCompressor(nn.Module):
             requires_grad=False,
         )
 
+        # Thread the quant config through: this pack ships the
+        # compressor quantized (exl3 tensors for wkv/wgate) — the
+        # layer must get the exl3 quant method so the trellis/suh/svh
+        # params register. The sm70 fp13 GEMV fast path (which reads
+        # .weight) is only valid for unquantized packs; the forward
+        # falls back to the quant-method path when .weight is absent.
+        _qc = getattr(vllm_config, "quant_config", None)
         self.fused_wkv_wgate = MergedColumnParallelLinear(
             self.hidden_size,
             [self.coff * self.head_dim, self.coff * self.head_dim],
             bias=False,
             return_bias=False,
-            quant_config=None,
+            quant_config=_qc,
             disable_tp=True,
             prefix=f"{prefix}.fused_wkv_wgate",
         )

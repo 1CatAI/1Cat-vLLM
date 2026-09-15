@@ -465,7 +465,10 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
-        elif getattr(config, "topk_method", None) == "noaux_tc":
+        if getattr(config, "topk_method", None) == "noaux_tc":
+            # The checkpoint carries the router bias for every layer
+            # (incl. hash-MoE layers) — register it unconditionally for
+            # noaux_tc; the hash branch's tid2eid is orthogonal.
             self.gate.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
@@ -642,6 +645,13 @@ class DeepseekV4Attention(nn.Module):
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
+        # Register batched-layer prefixes on the quant config BEFORE
+        # layer construction: the plugin's create_weights reads this
+        # map to allocate per-slice params (layer attrs set after
+        # construction are too late — create_weights runs inside the
+        # constructor).
+        if quant_config is not None and hasattr(quant_config, "bmm_prefixes"):
+            quant_config.bmm_prefixes["wo_a"] = self.n_local_groups
         self.window_size = config.sliding_window
         # NOTE(zyongye) Compress ratio can't be 0
         # we do this for because MTP layer is not included
@@ -1180,6 +1190,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # Vision-aligner weights: this model doesn't construct the
+        # aligner — drop the keys before any delegation.
+        weights = (w for w in weights if not w[0].startswith("aligner.")
+                   and "image_" not in w[0] and not w[0].startswith("vision."))
+        import os
+        if os.environ.get("EXL3_SLICE_DEBUG"):
+            _ck = [k for k in params_dict if "fused_wkv_wgate" in k or "compressor" in k]
+            print(f"[params] compressor keys: {_ck[:6]}", flush=True)
 
         # TP for attention
         tp_size = get_tensor_model_parallel_world_size()
@@ -1267,9 +1285,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         _base, _idx, _suffix = _sl.groups()
                         _p = params_dict.get(f"{_base}.{_suffix}")
                         if _p is not None:
-                            _p.weight_loader(_p, loaded_weight, int(_idx))
+                            # LOCAL slice index: rank r owns slices
+                            # gpr*r .. gpr*(r+1)-1 (gpr = o_groups / tp).
+                            # n_groups/tp_size live on the attention
+                            # module; derive groups-per-rank from the
+                            # config and the layer's bmm_batch_size.
+                            _gpr = None
+                            for _m in self.modules():
+                                if getattr(_m, "is_bmm", False) and getattr(_m, "bmm_batch_size", None):
+                                    _gpr = _m.bmm_batch_size
+                                    break
+                            if _gpr is None:
+                                _gpr = 1
+                            if int(_idx) // _gpr != 0:
+                                loaded_params.add(name)
+                                continue
+                            _local = int(_idx) % _gpr
+                            _p.weight_loader(_p, loaded_weight, _local)
                             loaded_params.add(name)
                             continue
+                    # This pack names the router bias `ffn.gate.bias`
+                    # (legacy DeepSeek naming); the model registers it
+                    # as gate.e_score_correction_bias.
+                    # VL-router bias: unused by this text-only serving
+                    # path (no vision tower in the model code) — skip.
+                    if name.endswith(".gate.bias_vl"):
+                        loaded_params.add(name)
+                        continue
+                    # Vision aligner: not constructed by this model.
+                    if name.startswith("aligner."):
+                        loaded_params.add(name)
+                        continue
+                    if name.endswith(".ffn.gate.bias"):
+                        name = name[: -len(".ffn.gate.bias")] + ".ffn.gate.e_score_correction_bias"
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -1338,6 +1386,11 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         orig_to_new_regex=scale_regex,
         orig_to_new_suffix={
             "head.weight": "lm_head.weight",
+            "head.trellis": "lm_head.trellis",
+            "head.suh": "lm_head.suh",
+            "head.svh": "lm_head.svh",
+            "head.mul1": "lm_head.mul1",
+            "head.mcg": "lm_head.mcg",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },
@@ -1381,6 +1434,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=vllm_config.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:
@@ -1419,6 +1473,10 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Vision-side weights (aligner, image tokens): this text-only
+        # model doesn't construct them — drop before the loader.
+        weights = (w for w in weights if not w[0].startswith("aligner.")
+                   and "image_" not in w[0] and not w[0].startswith("vision."))
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()

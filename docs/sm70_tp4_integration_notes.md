@@ -342,3 +342,38 @@ fused_wqa_wkv exists. Preserve it where possible: group same-K
 slices into batched GEMV calls rather than fully sequential
 per-slice applies. Correctness first (the notes' design), then this
 perf refinement once the load path is green.
+
+
+## MAJOR MILESTONE: weight loading complete, forward runs (2026-09-15)
+
+The TP=4 load path is GREEN: all weights load (LOAD OK), the model
+constructs, and the first forward pass runs — the failure moved to
+APPLY time (determine_available_memory's profiling forward), at the
+shared_experts gate_up_proj's reconstruct reshape:
+
+    shape '[8192, 2048]' invalid for input of size 33554432
+    (reconstruct_hgemm, exllamav3/modules/quant/exl3.py:176)
+
+The shared_experts gate_up geometry: the layer's registered
+in_features/out_features don't match the loaded trellis's decoded
+shape. The reconstruct's y.view(rows, out_features) fails — the
+layer's geometry attrs need checking against the loaded trellis
+(in 4096, out 4096 = gate 2048 + up 2048).
+
+Fixes landed this round (vllm-exl3 + 1Cat model.py):
+- bmm_prefixes map (Exl3Config.__init__ + from_config skip set +
+  model-side registration before construction) → per-slice suh
+  allocation for wo_a
+- shape-based rank-local write path in the loader (segment math
+  from loaded vs param shapes)
+- head_bits family extended to shared_experts
+- compressor quant threading (quant_config=None → vllm_config.
+  quant_config) — the compressor's exl3 params now register
+- lm_head quantized (VocabParallelEmbedding branch in
+  get_quant_method + quant_config passed to ParallelLMHead)
+- tile-aligned padded+TP relaxation (pad % 16 == 0) with zero-init
+- span math round() for padded geometry (129280//32384=3 skew)
+- gate bias name mapping (ffn.gate.bias → ffn.gate.e_score_
+  correction_bias), unconditional noaux_tc bias registration
+- vision-side key filter (aligner./image_/vision.) at the
+  ForCausalLM level
