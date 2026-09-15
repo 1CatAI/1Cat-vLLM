@@ -70,3 +70,27 @@ Open items before a real TP=4 run:
    KV — fits 32 GiB V100s, but KV cache size needs tuning.
 3. The loop backend is slow (per-token expert loop); TP=4 e2e
    numbers will be launch-bound until the sm70 fused path lands.
+
+## MTP/DSpark readiness (2026-09-15)
+
+The fork has the full DSpark speculative-decoding path:
+- `DSparkDeepseekV4ForCausalLM` (vllm/models/deepseek_v4/nvidia/
+  dspark.py) loads the mtp.0/1/2 checkpoint weights as the draft.
+- The draft's linear layers take `quant_config=vllm_config.quant_config`
+  — with the exl3 plugin registered, the draft's exl3-quantized
+  weights resolve through Exl3Config like the target model.
+- The DFlash2 proposer (vllm/v1/spec_decode/dflash.py) drives the
+  DSpark draft on sm70 — the README's Flash-V100 DFlash2 numbers
+  are this path on this hardware class.
+- Serving: `--speculative-config method=dspark` (use_dspark() →
+  DFlash2 proposer).
+
+Our model: num_nextn_predict_layers=3, mtp_bits=3 (exl3-quantized
+MTP weights present — 9447 mtp.* keys in the checkpoint). The draft
+is a dense 3-layer model (no MoE), so its exl3 layers are plain
+LinearEXL3 served directly by the sm70 GEMV kernels — the same
+kernels the E2E-verified loop backend exercises.
+
+Untested: an end-to-end serve with spec decode on V100. The
+remaining risk is the draft/target KV and sampler interaction under
+the sm70 attention backends, not the quant path.
