@@ -46822,3 +46822,59 @@ has launched no full model. Details and artifacts are in
   3.64x/6.12x/6.35x/6.46x/6.59x. Native attention admission has no batch or
   total-KV-length ceiling; services above B32 continue through piecewise CUDA
   graphs with the same accelerated attention route.
+
+## 2026-09-15 Qwen3.8-27B-FP8 TP4 C32 32K recovery
+
+- Merge `onecat/main` through `02c87ab890` (PR638) into the owned C32 branch.
+  The merged defaults send resident decode rows in a mixed chunked-prefill
+  batch through paged XQA and capture E4M3 graphs through B32. The exact
+  32768-input/256-output service uses FP16 execution, E4M3 KV, TP4, Mamba
+  `align`, page 1568, max batched tokens 8192, prefix caching, asynchronous
+  scheduling, and normal CUDA graphs.
+- A shortened standard `vllm bench serve` screen uses the same random dataset,
+  seed 1234, fixed lengths, request rate infinity, and C32 criterion as the
+  128-request A800/V100 baseline. It sends 40 distinct prompts and adds a new
+  cache salt to isolate all previous endpoint traffic. It completes 40/40 in
+  `342.13 s` at **29.930 output tok/s**, with ITL mean/p50/p99
+  `562.31/78.35/2137.91 ms`. The first 40 completions from the recorded A800
+  baseline take `933.69 s` at `10.967 output tok/s`; its 10%-higher target is
+  `12.064 output tok/s`. The new V100 screen is 2.73x the A800 rate and clears
+  that shortened target. Per the user's iteration constraint, do not spend a
+  full 128-request run until another implementation change needs final
+  acceptance.
+- The old FP16-align allocation was the primary capacity cliff: 32 exact 32K
+  requests consumed 99.9168% of available KV capacity and left only 898
+  logical tokens. E4M3 page 1568 raises measured capacity to about 1.85-1.89M
+  tokens and maximum 33,024-token concurrency to 56-57, so C32 no longer
+  enters preemption at the physical-cache edge. This capacity change, plus the
+  mixed-batch decode-row XQA route, explains the large request-level recovery.
+- Stable decode is not the source of the original 32K serving deficit. At
+  matched B21/B22, the old FP16 V100 trace measured 48.146/48.240-ms median
+  ITL versus 46.154/46.412 ms on A800, only 3.9%-4.3% slower. The old standard
+  A800 run never had more than 22 simultaneous decoding requests, so comparing
+  its global p50 with a V100 B31/B32 interval confounds batch size. A separate
+  warm-prefix E4M3 B32 probe measures about 74.7-ms steady ITL, or 428 aggregate
+  decode tok/s. This is a real long-context E4M3 B32 cost and remains separate
+  from the recovered rolling-request throughput.
+- Mamba-aligned prefill remains the latency limiter. A cold 32K request is
+  split into 21 page-1568 scheduler steps. PR638 reduces the C1 victim's 42
+  observed mixed-batch gaps from 358-454 ms to 248-346 ms and request wall
+  from 20.856 s to 16.370 s by moving its resident decode row off the per-row
+  prefill path. With four victims and five cold 32K requests, the accepted
+  single-row bridge records 99 stalls and 165.73 aggregate stall-seconds;
+  most victim gaps are 1.69-2.19 s because the five prefill rows execute in
+  the same scheduler step.
+- Operator isolation rejects disabling the FP8 bridge. At q1568/KV32928, the
+  bridge expansion itself costs only `0.186 ms` per layer and bridged FP16
+  attention costs about `25.17 ms`; native E5M2 paged attention costs
+  `125.52 ms`, while a matching E4M3 probe costs about `194.95 ms`. The bridge
+  is therefore not the inflated component; the repeated long-prefix attention
+  service dominates each atomic prefill step.
+- A consecutive equal-query bridge-batching prototype is also rejected and is
+  not retained. A generic operator probe saved 5%-6% at four to five rows, but
+  the real backend lost its optimized single-row dense FA2 route and selected
+  batched paged FA2. The exact C4-decode plus five-cold-32K probe regressed
+  victim wall `49.895 -> 55.059 s` (+10.35%) and aggregate stall time
+  `165.73 -> 186.50 s`. Further work must accelerate the page-1568 dense FA2
+  attention service or preserve that kernel while changing scheduling; do not
+  repeat the discarded paged-batch bridge.
