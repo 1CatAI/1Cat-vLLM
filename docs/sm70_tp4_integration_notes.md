@@ -257,3 +257,26 @@ batched-linear geometry (per-slice in/out sizes), or model-side
 narrowing before the loader call. The checkpoint shapes are the
 authority: slice.suh covers the full input; slice.svh covers the
 slice's output partition.
+
+
+## wo_a slice geometry — runtime metadata settled (2026-09-15)
+
+Debug metadata from the failing launch: `n_shards=1 out_parts=[2048]
+row=False merged=False tp=4`. The wo_a layer at TP=4: 8 groups / 4
+ranks = 2 groups per rank → the rank's param covers 2048 out (2
+slices × 1024), allocated as ONE shard (n_shards=1).
+
+The slice mapping: checkpoint slice N belongs to rank N//2, local
+index N%2. The model's slice branch must:
+1. Skip slices not owned by this rank (N//2 != tp_rank).
+2. svh: narrow locally — local slice i covers param[i*1024:(i+1)*1024]
+   (the loader's uniform-shard dest math can't address halves of a
+   single-shard param).
+3. suh: pass through the loader's row-parallel narrowing (suh
+   covers the full input; shard_exl3_row narrows by TP).
+
+The loader's span logic (loaded_shard_id tuples) handles spanning
+tensors; here the checkpoint ships per-slice tensors so the model
+narrows and routes per slice. All arithmetic verified against the
+checkpoint shapes (slice svh 1024, slice suh 4096, slice trellis
+(256, 64, 80)).
