@@ -94,3 +94,19 @@ kernels the E2E-verified loop backend exercises.
 Untested: an end-to-end serve with spec decode on V100. The
 remaining risk is the draft/target KV and sampler interaction under
 the sm70 attention backends, not the quant path.
+
+## TP=4 config parse verified (2026-09-15)
+
+`EngineArgs(model=<DeepSeek-V4-Flash pack>, tensor_parallel_size=4)
+.create_engine_config()` succeeds: quant resolves to Exl3Config, TP=4
+accepted. Required fixing the plugin's `get_min_capability` (80 → 70):
+the sm70 GEMV decode path serves LinearEXL3 on V100; the fused MoE
+path still requires Ampere and falls back to the loop backend below
+cc 8.0 (EXL3_FUSED_MOE=0 or the plugin's backend selection).
+
+Automatic entry-point loading verified through the engine path:
+`EngineArgs.create_engine_config()` → `load_general_plugins()` →
+`register_quantization_config("exl3")` → Exl3Config. A bare
+`import vllm` does NOT load plugins (by design — plugins load at
+engine-config time), so the earlier bare-import probe failing was
+expected behavior, not a gap.
