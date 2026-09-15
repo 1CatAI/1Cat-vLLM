@@ -286,3 +286,29 @@ tensors; here the checkpoint ships per-slice tensors so the model
 narrows and routes per slice. All arithmetic verified against the
 checkpoint shapes (slice svh 1024, slice suh 4096, slice trellis
 (256, 64, 80)).
+
+
+## Batched-layer load: flat param layout confirmed insufficient (2026-09-15)
+
+Empirical close-out of the loader-patch route: with the slice branch
+passing full per-slice tensors (verified via debug print — svh
+arrives (1024,) complete), the loader's fallback still fails because
+the PARAM LAYOUT itself is flat: one suh (1, 4096), one svh (2048),
+one trellis — but a batched layer needs per-slice params (2 local
+slices × their own suh/svh/trellis). The loader's segment math
+cannot address halves of a single-shard param.
+
+Confirmed requirement: per-slice parameter sets in Exl3LinearMethod
+(the design recorded earlier — group shards by owning rank, one
+trellis/suh/svh set per slice, apply() runs per-slice GEMVs). The
+loader-patch route is exhausted; the redesign is the path.
+
+Scope for the redesign:
+- create_weights: allocate per-slice params (slices_per_rank × each
+  suffix), shaped from the checkpoint's per-slice geometry
+  (in 4096, out 1024 per slice for wo_a)
+- weight loader: route slice.N → param[N_local], direct write (no
+  TP narrowing — verified: all suffixes are rank-local complete)
+- apply: per-slice GEMV over each slice's params, concatenated
+  output (or batched GEMV — the bmm structure the model's forward
+  expects)
