@@ -289,6 +289,53 @@ def test_e4m3_batched_xqa_long_context_caps_partition_at_256(
     assert captured_partitions == [256]
 
 
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "cache_dtype", "expected_partial_dtype"),
+    (
+        ("auto", torch.float16, torch.float16),
+        ("fp8_e4m3", torch.uint8, torch.float32),
+        ("fp8_e5m2", torch.uint8, torch.float16),
+    ),
+)
+def test_xqa_workspace_preserves_e4m3_partials_in_fp32(
+    monkeypatch,
+    kv_cache_dtype,
+    cache_dtype,
+    expected_partial_dtype,
+) -> None:
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    _clear_decode_caches()
+    captured_dtypes: list[torch.dtype] = []
+
+    def fake_xqa(*args):
+        captured_dtypes.append(args[6].dtype)
+        return torch.empty_like(args[0])
+
+    monkeypatch.setattr(
+        flash_attn_v100.flash_attn_v100_cuda,
+        "decode_paged_xqa_fwd",
+        fake_xqa,
+    )
+    query = torch.empty((2, 6, 256), dtype=torch.float16)
+    key_cache = torch.empty((16, 16, 1, 256), dtype=cache_dtype)
+    value_cache = torch.empty_like(key_cache)
+    block_table = torch.zeros((2, 16), dtype=torch.int32)
+    seq_lens = torch.full((2,), 256, dtype=torch.int32)
+
+    flash_attn_v100.flash_attn_decode_paged_xqa(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        kv_cache_dtype=kv_cache_dtype,
+        max_seq_len_hint=256,
+        workspace_seq_capacity_hint=256,
+    )
+
+    assert captured_dtypes == [expected_partial_dtype]
+
+
 @torch.inference_mode()
 def test_stale_active_num_partitions_does_not_truncate_decode(
     monkeypatch,

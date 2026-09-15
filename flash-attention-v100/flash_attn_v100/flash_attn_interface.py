@@ -1264,7 +1264,7 @@ def flash_attn_decode_paged_xqa(
             and q.ndim == 3
             and q.shape[1:] == (6, 256)
             and os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
-            and 1 < q.shape[0] <= 16
+            and q.shape[0] > 1
             and k_cache.dtype == torch.uint8
             and v_cache.dtype == torch.uint8
             else (
@@ -1291,6 +1291,11 @@ def flash_attn_decode_paged_xqa(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            partial_dtype=(
+                torch.float32
+                if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                else torch.float16
+            ),
         )
     )
 

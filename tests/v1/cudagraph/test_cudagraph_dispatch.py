@@ -748,6 +748,7 @@ class TestCudagraphDispatcher:
     @pytest.mark.parametrize(
         ("auto_enabled", "wave_enabled", "expected_variant"),
         (
+            (None, None, CUDAGRAPH_VARIANT_LONG_CONTEXT),
             (True, True, CUDAGRAPH_VARIANT_LONG_CONTEXT),
             (False, True, CUDAGRAPH_VARIANT_DEFAULT),
             (True, False, CUDAGRAPH_VARIANT_DEFAULT),
@@ -761,14 +762,14 @@ class TestCudagraphDispatcher:
         expected_variant,
     ):
         monkeypatch.delenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", raising=False)
-        monkeypatch.setenv(
-            "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO",
-            "1" if auto_enabled else "0",
-        )
-        monkeypatch.setenv(
-            "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS",
-            "1" if wave_enabled else "0",
-        )
+        for name, enabled in (
+            ("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", auto_enabled),
+            ("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS", wave_enabled),
+        ):
+            if enabled is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, "1" if enabled else "0")
         monkeypatch.setenv("VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN", "49152")
         comp_config = CompilationConfig(
             cudagraph_mode="FULL_DECODE_ONLY",

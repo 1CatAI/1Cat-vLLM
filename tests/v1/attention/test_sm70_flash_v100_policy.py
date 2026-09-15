@@ -292,6 +292,19 @@ def test_sm70_g6_dual_cta_min_batch_env_contract(monkeypatch):
     assert envs.VLLM_FLASH_V100_XQA_G6_DUAL_CTA_MIN_BATCH == 16
 
 
+def test_sm70_mixed_prefill_decode_rows_env_is_default_on(monkeypatch):
+    import vllm.envs as envs
+
+    name = "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS is True
+
+    monkeypatch.setenv(name, "0")
+    envs.disable_envs_cache()
+    assert envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS is False
+
+
 def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     import vllm.envs as envs
 
@@ -1764,7 +1777,8 @@ def test_flash_v100_smallq_replay_shape_overflow_fails_fast(
         (8, [1, 2, 4, 8]),
         (12, [1, 2, 4, 8, 12]),
         (16, [1, 2, 4, 8, 16]),
-        (256, [1, 2, 4, 8, 16]),
+        (32, [1, 2, 4, 8, 16, 32]),
+        (256, [1, 2, 4, 8, 16, 32]),
     ],
 )
 def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(
@@ -2486,9 +2500,15 @@ def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(monkeypatch, dflash_
 
 @pytest.mark.parametrize(
     ("batch_size", "enabled", "expected_route"),
-    ((2, False, "scalar"), (2, True, "xqa"), (16, True, "xqa"), (17, True, "scalar")),
+    (
+        (2, False, "scalar"),
+        (2, True, "xqa"),
+        (16, True, "xqa"),
+        (17, True, "xqa"),
+        (32, True, "xqa"),
+    ),
 )
-def test_flash_v100_e4m3_batched_xqa_is_exactly_gated(
+def test_flash_v100_e4m3_batched_xqa_has_no_artificial_batch_cap(
     monkeypatch, batch_size, enabled, expected_route
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl

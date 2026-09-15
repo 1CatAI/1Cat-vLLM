@@ -4,8 +4,10 @@ Date: 2026-07-15
 
 ## Scope And Status
 
-This document owns the FP8 E5M2 KV-cache long-context path for
-Qwen3.6-27B-AWQ on TP2 V100. The accepted runtime uses TurboMind AWQ,
+The original sections of this document own the FP8 E5M2 KV-cache
+long-context path for Qwen3.6-27B-AWQ on TP2 V100. The 2026-09-14 update
+extends the same route-parity policy to E4M3 KV for the GQA6/D256 shapes used
+by Qwen3.8-27B. The accepted runtime uses TurboMind AWQ,
 `FLASH_ATTN_V100`, prefix caching, Mamba align mode, CUDA graphs, and no eager
 execution.
 
@@ -341,7 +343,168 @@ kernel project, but the first-order FP8 long-context regression is closed.
 Before further work, measure its share of final TPOT; do not optimize the
 534-us partition kernel as though it were the entire model token latency.
 
-The 256K full-model point remains unmeasured after this change because the
-matched run is expensive. The 128K operator microbenchmark is complete, and a
-future 256K full-model run should be a confirmation gate rather than another
-route-discovery experiment.
+For the original E5M2 work, the 256K full-model point remains unmeasured. The
+128K operator microbenchmark is complete; any future E5M2 full-model run should
+be a confirmation gate rather than another route-discovery experiment. The
+separate E4M3 update below includes a 256K full-model result.
+
+## 2026-09-14 E4M3 Route Parity And Long-Page Repair
+
+The E4M3 GQA6/D256 route now shares the production FP16 attention schedules
+where the shape matches:
+
+- prefix prefill performs one E4M3-to-FP16 gather into the shared page-784
+  workspace, then calls the default Q8000/Q8192 FP16-Tensor-Core, FP32-
+  accumulated dense kernel;
+- uniform decode uses the E4M3 XQA route for B1 and batches larger than 16;
+- small query rows in a mixed chunked-prefill batch are grouped into one paged
+  decode/XQA call instead of walking their long prefix through prefill;
+- B1 long decode uses device-side p64/p256/p512/p896/p1664 wave selection for
+  any 16-aligned page size of at least 256 tokens, including page 800 and page
+  1568;
+- E4M3 XQA keeps softmax probabilities, PV accumulation state, partition
+  outputs, and the final partition reduction in FP32. The public output remains
+  FP16, matching the model interface.
+
+These routes are default on. Their environment variables are rollback controls,
+not admission requirements. The supported E4M3 XQA specialization remains the
+measured GQA6/D256 shape; unrelated GQA ratios keep their accurate existing
+route.
+
+### Page-800 Correctness Root Cause
+
+The first 256K p896 and p1664 measurements differed from scalar decode by as
+much as `1.2546e-3`. Changing FP16 partition storage to FP32 did not change the
+error. The defect was address calculation: the page-800 specialized loader
+encoded only logical pages zero and one, while a p896 partition can span three
+pages and a p1664 partition can span four. It therefore read valid memory from
+the wrong page for the later tokens.
+
+The loader now computes logical pages zero through three and sizes the
+partition page list with ceil division. A regression compares the wave routes
+with the scalar p256 oracle at the page boundaries that expose this defect.
+
+### CUDA-Graph Operator Gate
+
+All rows below capture both scalar and XQA calls in `torch.cuda.CUDAGraph` on a
+V100-SXM2-32GB. No eager server configuration is used.
+
+| Shape | Page | Context | Scalar | E4M3 XQA | Speedup | Max abs diff |
+|---|---:|---:|---:|---:|---:|---:|
+| B1/Hq6/Hkv1/D256 | 800 | 256K | 3.2975 ms | 0.4834 ms | 6.82x | 0 |
+| B1/Hq6/Hkv1/D256 | 1568 | 256K | 3.4051 ms | 0.4922 ms | 6.92x | `2.38e-7` |
+| B8/Hq6/Hkv1/D256 | 800 | 256K | 24.8675 ms | 3.8455 ms | 6.47x | `2.38e-7` |
+| B32/Hq6/Hkv1/D256 | 800 | 64K | 24.7134 ms | 3.7532 ms | 6.58x | `9.54e-7` |
+| B32/Hq6/Hkv1/D256 | 800 | 256K | 96.4159 ms | 14.6154 ms | 6.60x | `4.77e-7` |
+
+The explicit B1 page-800 partition checks are bitwise equal for p512 and
+p1664; p896 has `1.19e-7` maximum absolute difference. These data separate the
+kernel quality claim from model sampling: the fast route is now numerically
+aligned with the established scalar E4M3 implementation before any full-model
+quality comparison.
+
+### Full-Model CUDA-Graph Gate
+
+The end-to-end gate uses four V100-SXM2-32GB GPUs, Torch 2.10.0+cu128, TP4,
+the Qwen3.8-27B NVFP4 checkpoint through its compressed-tensors metadata,
+FP16 model execution, E4M3 KV, Q8192 chunks, maximum length 262144, one live
+request, prefix caching disabled, and `FULL_AND_PIECEWISE` CUDA graphs. It does
+not enable speculative decoding or eager execution.
+
+| Purpose | Prompt | Output policy | Decode intervals | TTFT | Prompt throughput | Decode result |
+|---|---:|---|---:|---:|---:|---:|
+| Quality | 16000 | natural EOS | 5 | 3.8562 s | 4149.15 tok/s | short observation only |
+| Quality | 256000 | natural EOS | 15 | 102.7519 s | **2491.44 tok/s** | short observation only |
+| Speed | 256000 | fixed 256 tokens | 255 | 102.9135 s | 2487.53 tok/s | **47.308 tok/s / 21.138 ms TPOT** |
+
+Both natural-EOS retrieval and knowledge checks pass and both answers terminate
+naturally. Their five- and fifteen-interval decode figures are deliberately not
+reported as speed baselines. The fixed-length run supplies the qualified 256K
+decode result; its post-EOS padding is not quality evidence. For the 256K
+request, every TP rank records 480 Q8192 FP32-accumulated
+long-prefill calls and 496 E4M3 bridge calls. The final route summary also
+records 48 `decode_xqa_e4m3_dynamic_page800` calls per rank. The run contains
+no prefix-cache hit, non-finite value, worker failure, or CUDA error.
+
+The final source-built single-V100 Q8192 operator check reaches 77.0142 TFLOP/s
+at KV128K and 75.9654 TFLOP/s at KV256K. Sampled output is finite, with relative L2
+0.2387% and 0.2607%, respectively.
+
+### Concurrent `vllm bench serve` Gate
+
+The serving concurrency gate uses the same TP4 NVFP4 model and E4M3 KV route
+above with `max_model_len=262144`, `max_num_batched_tokens=65536`,
+`max_num_seqs=32`, prefix caching disabled, and normal
+`FULL_AND_PIECEWISE` CUDA graphs. The benchmark is the standard
+`vllm bench serve` random dataset with exact 2048-token inputs, 256 forced
+output tokens, request rate infinity, one warmup cohort of the measured size,
+and concurrency 2, 4, 8, 16, or 32. No run passes `--enforce-eager`.
+
+Startup captures both full and piecewise graphs at request counts
+`[1, 2, 4, 8, 16, 32]`; the B32 capture records the page-800 E4M3 XQA route.
+The previous no-MTP helper stopped full-graph capture at B16 even when
+`max_num_seqs` was 32. It now includes B32 by default. Larger scheduler
+capacities remain admitted and use the existing piecewise graph path rather
+than losing the attention acceleration.
+
+| Concurrency | Total input tokens | Median TTFT | TTFT-derived prefill* | Pure decode* | Steady ITL median/P90 | Full-request output TPS | Median request wall | Success/failure |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| C2 | 4,096 | 0.8554 s | 4,788 tok/s | 115.725 tok/s | 17.282 / 17.406 ms | 92.288 tok/s | 5.539 s | 2 / 0 |
+| C4 | 8,192 | 1.6962 s | 4,830 tok/s | 223.730 tok/s | 17.879 / 18.038 ms | 151.222 tok/s | 6.761 s | 4 / 0 |
+| C8 | 16,384 | 5.2214 s | 3,138 tok/s | 418.723 tok/s | 19.106 / 19.248 ms | 203.168 tok/s | 10.076 s | 8 / 0 |
+| C16 | 32,768 | 10.7109 s | 3,059 tok/s | 708.450 tok/s | 22.585 / 22.837 ms | 248.859 tok/s | 16.451 s | 16 / 0 |
+| C32 | 65,536 | 21.7727 s | 3,010 tok/s | **983.986 tok/s** | 32.521 / 32.824 ms | **272.868 tok/s** | 30.008 s | 32 / 0 |
+
+`TTFT-derived prefill` follows the requested report convention:
+total input tokens divided by median TTFT. `Pure decode` is concurrency times
+1000 divided by the standard benchmark's pooled median ITL in milliseconds.
+The full-request output TPS is the benchmark's measured generated-token
+throughput and includes TTFT. These definitions keep the derived columns
+reproducible and prevent a prefix-cache hit or a short decode sample from being
+reported as prefill or decode throughput.
+
+All 62 measured requests return exactly 256 tokens with no API errors,
+non-finite timing samples, empty text, or replacement characters. A separate
+32-request natural-language burst returns the identical complete answer
+`校验词是“海蓝石榴”；太阳系最大的行星是木星。` for every request; all finish by
+EOS rather than the 64-token cap.
+
+The matching 256K CUDA-graph operator matrix verifies the attention route
+independently of the short serving prompt:
+
+| Batch | Scalar E4M3 | E4M3 XQA | Speedup | Max abs diff |
+| ---: | ---: | ---: | ---: | ---: |
+| B2 | 6.5542 ms | 1.8001 ms | 3.64x | `5.96e-8` |
+| B4 | 12.1188 ms | 1.9790 ms | 6.12x | `4.77e-7` |
+| B8 | 23.9122 ms | 3.7683 ms | 6.35x | `2.38e-7` |
+| B16 | 47.6985 ms | 7.3877 ms | 6.46x | `4.77e-7` |
+| B32 | 96.2947 ms | 14.6028 ms | 6.59x | `4.77e-7` |
+
+Every operator output is finite. The native E4M3 batch-XQA admission has no
+batch ceiling or total-KV-length ceiling; 64/128/256-token partitions and the
+page-wave schedule are runtime choices after shape admission. The measured
+specialization still requires the actual kernel contract: SM70,
+Flash-Attention-V100, E4M3 KV, GQA6/D256, and no sliding window.
+
+### Source-Build Identity
+
+The CUDA 12.8, SM70 `build_ext --inplace` command completes successfully and
+imports the following artifacts directly from this owned worktree:
+
+- vLLM core: `2557f6b7b65773d9ed5f51c78eb7e7fed1ba83d05be473104e318bf8f88fa4c4`;
+- stable libtorch: `622af59642e4ca861c1ae0561792fd3221f2d166d29f8bff0b0fb5b03b2ad162`;
+- FA2/79T: `aa657e1624e40e102da8081d6deb57d92828aa129445a5506f4cb8a2d2eb5add`;
+- Flash-V100: `66df783d9dfb783195bc9cae75d416731601f6a1095fba20d26bd7a8c10370b3`.
+
+ELF dependencies resolve against the selected Torch 2.10.0 and CUDA 12.8
+runtime. Process-map inspection confirms that the attention DSOs come from
+this worktree rather than another checkout or an external sidecar.
+
+### Runtime And Test Contract
+
+The route is built from the same source tree as the vLLM core and Flash-V100
+extension. Validation must record extension hashes and route counters. Future
+end-to-end FP8-KV tests use normal CUDA graphs and must not pass
+`--enforce-eager`. A 256K first-request run must report uncached prefill
+separately from a prefix-cache hit; the cached request is not evidence for
+prefill throughput.
