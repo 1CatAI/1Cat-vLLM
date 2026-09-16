@@ -1302,17 +1302,26 @@ exllamav3 — commit 55d9744):
 
 - Config: TP=4, max_model_len=256, max_num_seqs=4,
   gpu_memory_utilization=0.90, enforce_eager, fp8 KV.
-  (0.95 OOMs at the compress_norm_rope Triton launch with a
-  longer prompt — the driver needs ~1.6 GiB/GPU of headroom
-  beyond the 0.95 profile; 0.90 is the working ceiling.)
+  Memory-profile chain: 0.95 with max_model_len=1024 OOMs
+  during Triton JIT warmup (compress_norm_rope launch,
+  jit.py → driver __call__ — a transient allocation, not
+  prompt-length-dependent); 0.90 then refused to start
+  because the KV floor for max_model_len=1024 (0.41 GiB)
+  exceeded the 0.37 GiB available; 0.90 + max_model_len=512
+  (0.21 GiB floor) starts with margin. Do not raise back
+  toward 0.95 without shrinking max_model_len.
 - Result: 3.52 tok/s decode (26 tokens in 7.4 s, greedy,
-  ignore_eos), coherent output, zero asserts.
+  ignore_eos), zero asserts. Caveats: (1) cold first-call
+  figure — includes remaining JIT warmup, so it is a lower
+  bound on steady-state decode; (2) output carries minor
+  glitches ("Abjua" for Abuja, "Saudi Arabi") — symptoms of
+  the still-open reconstruct-path correctness bug (see the
+  correctness section above), not new regressions.
 - Context: the documented reconstruct-only range was
   ~2.2-2.9 tok/s; the ~10x per-call GEMV claim is in the
   dispatch docstring. The measured 3.52 tok/s on the
   bypassed path is consistent with the reconstruct-only
-  range (the probe's prompt is long, so prefill dominates
-  less than in the earlier correctness runs).
+  range.
 
 Throughput verdict: the GEMV fast path's ~10x per-call claim
 would put decode at ~30+ tok/s — a material gap. The IMA
