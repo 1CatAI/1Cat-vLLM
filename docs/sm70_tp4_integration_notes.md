@@ -1330,3 +1330,40 @@ Throughput verdict: the GEMV fast path's ~10x per-call claim
 would put decode at ~30+ tok/s — a material gap. The IMA
 root-cause work (NCCL sm70 rebuild + sanitizer) is justified
 by this measurement whenever decode throughput matters.
+
+## Qwen3.8-Flash-Next (exl3) loadability on this fork (2026-09-16)
+
+Tested: cannot load today. Three sequential blockers, each
+hit and documented:
+
+1. TP4 + multimodal: the VISION tower's MLP
+   (visual.blocks.N.mlp.linear_fc1, in=1152 out=1076,
+   pad_rows=76 — non-tile-aligned) trips the reference
+   plugin's padded-geometry TP constraint
+   (vllm-exl3 exl3.py:2717).
+2. TP4 + language_model_only=True: passes the vision tower
+   but trips the same constraint on the GDN linear-
+   attention ba_proj (qwen_gdn_linear_attn.py:2633,
+   MergedColumnParallelLinear out=[12,12] multi-shard —
+   12 v-heads per rank at TP4, padded to 128 with
+   multi-shard + bf16-shard layout the plugin rejects).
+3. TP1: the QSA E4M3 phase-1 path hard-requires TP4
+   (qsa.py:255); without fp8 KV the 101 GB checkpoint
+   OOMs on one V100.
+
+The PLE ngram CPU-offload ("ngram in system mem") itself
+WORKS: VLLM_PLE_CPU_OFFLOAD=1 spawned the PleOffload
+worker successfully in every attempt. The blockers are
+EXL3 padded-geometry / QSA TP constraints:
+
+- ba_proj + vision MLP: the plugin's check could allow
+  padded geometry when the pad is zeroed (the padded svh
+  rows are zero per the plugin's own comment) — a plugin
+  change in vllm-exl3's create_weights.
+- QSA TP1: a model-code phase-1 scope constraint.
+
+Also tested: the 27B dense exl3 (turboderp_Qwen3.8-27B)
+cannot load on this fork either — the checkpoint's shard
+layout trips the loader's shape check ("expected (128,5120)
+but got (48, 5120)") and its padded geometry requires TP1
+while its size requires more.
