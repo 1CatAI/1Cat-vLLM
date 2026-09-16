@@ -1164,3 +1164,40 @@ permute with the slots — their mispairing is the bounded ~20%
 effect. The exl3's degradation is bounded and cannot explain the
 cos-0.43 gap; that gap was the vLLM's slice-selection bug (every
 rank loading slices 0-1), fixed and verified above.
+
+## GEMV IMA: hypotheses narrowed (2026-09-16, post-fix session)
+
+With the slice-selection fix landed, the GEMV IMA work resumed.
+New discriminator results:
+
+- Shard-view alignment: DEAD. The trellis's tile stride is 160
+  bytes (80 int16 words per tile for K=5), so every tile-granular
+  shard view is 4-byte aligned — the narrowed-B-view alignment
+  hypothesis cannot produce the fault. Tested empirically: the
+  exact failing shape (K=5, 4096x512, mul1) with narrowed views
+  at every rank offset passes standalone.
+- Cooperative-launch concurrency: WEAKENED. The cooperative GEMV
+  co-exists with a busy side-stream kernel (matmul chain
+  occupying SMs) — the driver queues the launch rather than
+  faulting. Not the mechanism (at least not in this simple form).
+- Buffer sizing re-verified: the ws (16 MiB) covers the ksplit
+  partials (4 * size_n max); the locks buffer is unused by the
+  sm70 GEMV (cooperative grid.sync instead of lock-based
+  reduction); the multi/dual variants' (matrix, group) indexing
+  stays within the buffers.
+- Static bounds re-verified for the exact failing shape: the B
+  index max = the tensor's last element; the C/A/suh pointer
+  alignments hold for the wkv shard's offsets (3072 B, 768 B —
+  both 4B-aligned).
+- The dual/multi GEMV variants (exl3_gemv2, exl3_gemv_multi) and
+  the tiled sm70 path (exl3_gemm_gr's 8-row tiling) share the
+  same kernel and launch checks — no variant-specific hazard
+  found.
+
+Confirmed next step (unchanged from the plan): the dynamic repro —
+build the ext with bounds-printf debug asserts in
+exl3_gemv_sm70_kernel.cuh (printf the faulting index + thread +
+block on the B/C/A accesses), then run the default-env repro
+(rows 1-16 route to the GEMV; RECONSTRUCT_MIN_ROWS unset). The
+static analysis is exhausted; every remaining hypothesis needs
+the faulting address from the dynamic run.
