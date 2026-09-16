@@ -1293,3 +1293,28 @@ coherent end-to-end. The GEMV path itself remains
 sanitizer-clean standalone with the real checkpoint tensors;
 the in-vivo-only fault is documented in the elimination record
 above.
+
+## Serve-config throughput probe (2026-09-16)
+
+First end-to-end throughput measurement on the verified-green
+config (EXL3_SM70_GEMV_DISABLE=1, the new env kill switch in
+exllamav3 — commit 55d9744):
+
+- Config: TP=4, max_model_len=256, max_num_seqs=4,
+  gpu_memory_utilization=0.90, enforce_eager, fp8 KV.
+  (0.95 OOMs at the compress_norm_rope Triton launch with a
+  longer prompt — the driver needs ~1.6 GiB/GPU of headroom
+  beyond the 0.95 profile; 0.90 is the working ceiling.)
+- Result: 3.52 tok/s decode (26 tokens in 7.4 s, greedy,
+  ignore_eos), coherent output, zero asserts.
+- Context: the documented reconstruct-only range was
+  ~2.2-2.9 tok/s; the ~10x per-call GEMV claim is in the
+  dispatch docstring. The measured 3.52 tok/s on the
+  bypassed path is consistent with the reconstruct-only
+  range (the probe's prompt is long, so prefill dominates
+  less than in the earlier correctness runs).
+
+Throughput verdict: the GEMV fast path's ~10x per-call claim
+would put decode at ~30+ tok/s — a material gap. The IMA
+root-cause work (NCCL sm70 rebuild + sanitizer) is justified
+by this measurement whenever decode throughput matters.
