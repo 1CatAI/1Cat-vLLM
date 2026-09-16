@@ -1201,3 +1201,58 @@ block on the B/C/A accesses), then run the default-env repro
 (rows 1-16 route to the GEMV; RECONSTRUCT_MIN_ROWS unset). The
 static analysis is exhausted; every remaining hypothesis needs
 the faulting address from the dynamic run.
+
+## GEMV IMA: full elimination record (2026-09-16, continued)
+
+The in-vivo fault (default RECONSTRUCT_MIN_ROWS: rows 1-16
+route to the GEMV) is a deterministic IMA at the m=1 K=5
+n=512 wkv-slice GEMV launch (exl3_gemv.cu cuda_check at the
+cooperative launch), on the first decode step, on every TP
+rank. With CUDA_LAUNCH_BLOCKING=1 the error surfaces at
+exl3_gemv.cu:289 (the launch's cuda_check).
+
+Eliminated with evidence:
+
+- B-load OOB: device printf bounds-check on every ld_b
+  access across all runs — zero prints.
+- Static extents: TORCH_CHECKs on A_had/suh/svh/C numel vs
+  the launch extents in exl3_gemm_gr — all pass.
+- Standalone GEMV with the REAL checkpoint wkv tensors
+  (m=1, K=5, cb=2, exact shapes): compute-sanitizer clean,
+  correct output.
+- Concurrent two-stream GEMVs sharing the A_had cache
+  tensor (wqa n=1024 + wkv n=512): sanitizer clean.
+- Custom all-reduce disabled: fault persists.
+- Env bisections (fault persists in every combination
+  tested): MHC_FP32_STAGE=0, QNORM_KV_FUSED_TP4=0,
+  FP13_GEMV=0, PRIVATE_COMPRESSOR_STATE=0.
+- Aux-stream concurrency: attn_gemm_parallel_execute forced
+  serial (aux_streams=None) — fault persists.
+- Non-contiguous trellis: TENSOR_DBG dump of every K=5
+  GEMV's trellis in-vivo — all contiguous with the exact
+  expected strides ((2560, 80, 1) for (256, 32, 80)).
+- Triton sparse-attention kernel: the earlier trace
+  attribution was the error SURFACING at the next CUDA call
+  (Triton's module load), not the origin.
+- Latent bug fixed en route: the cached xh (A_had) workspace
+  was sized (1, in_features) while the m>1 GEMV path's
+  input-Had phase writes m * in_features halves — sized to
+  EXL3_GEMV_SM70_MAX_M (8) rows now. Not the in-vivo
+  fault's root cause (the fault persists with the fix) but
+  a real overflow for every batched GEMV call.
+
+Sanitizer on the full TP=4 run is blocked: NCCL ships no
+sm70 SASS; under compute-sanitizer injection the PTX JIT of
+NCCL's kernels fails (cudaErrorNoKernelImageForDevice at
+ncclInitKernelsForDevice) and NCCL init aborts the workers.
+CUDA_FORCE_PTX_JIT=1 breaks the SASS-only exl3/custom-AR
+kernels (468 symbol-not-found errors). TP=1/2 are impossible
+(111 GB checkpoint).
+
+Status: the GEMV fast path stays opt-in. The green config
+(VLLM_EXL3_RECONSTRUCT_MIN_ROWS=1: all rows reconstruct,
+the GEMV never fires) is verified end-to-end: ' Paris. The
+capital of Spain is Madrid. The capital of Italy is Rome.'
+Root-causing the in-vivo fault requires a sanitizer-
+compatible TP=4 run (NCCL with sm70 SASS, or a
+sanitizer-tolerant NCCL build).
