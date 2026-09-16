@@ -1256,3 +1256,28 @@ capital of Spain is Madrid. The capital of Italy is Rome.'
 Root-causing the in-vivo fault requires a sanitizer-
 compatible TP=4 run (NCCL with sm70 SASS, or a
 sanitizer-tolerant NCCL build).
+
+## Correction: the green-run mechanism (2026-09-16, final)
+
+The earlier "green config" runs used `VLLM_EXL3_RECONSTRUCT_MIN_ROWS=1`
+— an env var that DOES NOT EXIST in either tree (the routing constant
+is `AUTO_RECONSTRUCT_THRESHOLD = 144` in exllamav3's exl3.py, and the
+only other knob is `no_reconstruct` in infer_params). Those runs'
+env var was inert; their success mechanism was unverified.
+
+Re-verified with a REAL bypass: `AUTO_RECONSTRUCT_THRESHOLD = 0`
+(temporarily, in exllamav3's exl3.py — routes every row to
+reconstruct_hgemm; the GEMV never fires) on the current clean build:
+
+  OUT: ' Paris. The capital of the United States is Washington, D.C.
+  The capital of Germany is Berlin. ...' — exit 0, zero GPU asserts.
+
+So the core claim survives with corrected evidence: bypassing the
+GEMV entirely yields green; the default routing (rows 1-16 to the
+GEMV) faults deterministically at the m=1 K=5 wkv-slice GEMV launch.
+The GEMV fast path remains the crash site; it stays opt-in until
+root-caused under a sanitizer-compatible TP=4 setup.
+
+Recommended interim default for this stack: keep the GEMV fast path
+disabled (e.g. `AUTO_RECONSTRUCT_THRESHOLD = 0` or an equivalent
+shipping knob) until the in-vivo fault is root-caused.
