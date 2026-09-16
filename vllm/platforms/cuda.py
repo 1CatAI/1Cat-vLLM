@@ -157,6 +157,16 @@ def _get_backend_priorities(
                     AttentionBackendEnum.FLEX_ATTENTION,
                     AttentionBackendEnum.TURBOQUANT,
                 ]
+            if device_capability.major == 7 and device_capability.minor == 5:
+                # Turing: FLASH_ATTN runs via the sm75 FA2 build (fp16-only,
+                # cmake/external_projects/vllm_flash_attn_sm75.cmake).
+                # FlashInfer's paged prefill fails with "invalid argument" on
+                # SM75; TRITON_ATTN stays as the fallback for non-fp16 models.
+                return [
+                    AttentionBackendEnum.FLASH_ATTN,
+                    AttentionBackendEnum.TRITON_ATTN,
+                    AttentionBackendEnum.FLEX_ATTENTION,
+                ]
             return [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASHINFER,
@@ -327,7 +337,12 @@ class CudaPlatformBase(Platform):
         attn_selector_config: AttentionSelectorConfig,
         num_heads: int | None = None,
     ) -> str:
-        device_capability = cls.get_device_capability()
+        # Heterogeneous PP: the backend must match THIS worker's GPU, not
+        # device 0 of the visibility list (an RTX stage and a V100 stage
+        # need different backends). Workers have set their device before
+        # any attention layer is built.
+        device_id = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
+        device_capability = cls.get_device_capability(device_id)
         assert device_capability is not None
 
         # First try checking just the selected backend, if there is one.

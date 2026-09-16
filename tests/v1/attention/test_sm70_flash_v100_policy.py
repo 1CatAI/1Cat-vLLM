@@ -217,11 +217,14 @@ def test_flash_v100_priority_is_sm70_only(monkeypatch):
         device_capability=DeviceCapability(major=7, minor=5),
     )
 
+    # Turing: FLASH_ATTN via the sm75 FA2 build, then TRITON_ATTN. FlashInfer is
+    # not offered on 7.5 (its paged prefill fails with "invalid argument").
     assert backends[:3] == [
         AttentionBackendEnum.FLASH_ATTN,
-        AttentionBackendEnum.FLASHINFER,
         AttentionBackendEnum.TRITON_ATTN,
+        AttentionBackendEnum.FLEX_ATTENTION,
     ]
+    assert AttentionBackendEnum.FLASHINFER not in backends
     assert AttentionBackendEnum.FLASH_ATTN_V100 not in backends
 
 
