@@ -1297,10 +1297,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                                     break
                             if _gpr is None:
                                 _gpr = 1
-                            if int(_idx) // _gpr != 0:
+                            # Rank-gated slice selection: rank r owns
+                            # slices gpr*r .. gpr*(r+1)-1 (gpr = the
+                            # bmm batch size = o_groups / tp_size).
+                            # The checkpoint's slice order is identity
+                            # (slice N pairs with head-group N).
+                            _rank = get_tensor_model_parallel_rank()
+                            _idx_i = int(_idx)
+                            if _idx_i // _gpr != _rank:
                                 loaded_params.add(name)
                                 continue
-                            _local = int(_idx) % _gpr
+                            _local = _idx_i % _gpr
                             _p.weight_loader(_p, loaded_weight, _local)
                             loaded_params.add(name)
                             continue

@@ -1035,3 +1035,132 @@ isolate the KV cache (clear/restore around the replay),
 or compare the LINEAR outputs directly (hook the linears'
 inputs/outputs, not the layer's) — the linear-level
 parity is immune to the cache state.
+
+## Session: attention-block verification + exl3 head-order finding (2026-09-16)
+
+### vLLM attention block CLEARED end-to-end
+The exact-math reference computed from the vLLM's own captured q/kv
+now reproduces the captured o_a stage at cos 0.981 (residual 0.217
+rel_diff = the FP8 cache quantization, measured 2.7% on the roped
+kv). The complete verified chain:
+  scores = q_roped . k_roped * scale, causal mask
+  softmax with the sink folded into the denominator (m = max(sink,
+  scores); sink weight exp(sink - m) in the denominator)
+  values = roped V (K=V shared-KV MQA)
+  derot: CONJUGATE rotation on the output's rope slice (last 64
+  dims per head) at the query position — applied to the attention
+  OUTPUT, not the values
+  then o_a (grouped) -> wo_b.
+Earlier reference attempts omitted the derot-on-output term and
+under-attributed the value path; the apparent cos-0.43 divergence
+was the reference's composition error, not a vLLM bug.
+
+### Verified-cleared components (vLLM side)
+- mHC gate math: tilelang, torch fallback, hc_mix/hc_apply CUDA
+  kernels — all match the HF transformers 5.15.0 reference (split
+  order [H,H,H*H], Sinkhorn axis order, comb^T @ streams combine,
+  2*sigmoid post, pre sigmoid+eps).
+- Attention sink loading: bit-exact, checkpoint-ordered.
+- q/kv projections: bit-exact at rope-identity positions.
+- q post-norm+rope: bit-exact per-head.
+- Shard convention: runtime-verified self-consistent (wq_b narrow
+  takes the correct tile chunk; sink = heads 0-15; wo_a = groups
+  0-1 on rank 0).
+- FP8 KV cache: e4m3 round-trip error 2.7% on the roped kv — far
+  too small to explain any observed divergence.
+
+### exllamav3 multi-GEMV row bug (FIXED, verified)
+exl3_gemv_multi hardcoded size_m=1 in its cooperative launch
+(exl3_gemv.cu:542) while the caller (_project_o_grouped) passed
+multi-row inputs into torch.empty outputs — row 0 computed, rows
+1+ uninitialized garbage on every multi-token forward. Fixed by
+driving the GEMV row by row with per-matrix pointer tables
+(o[g][0][r], A_had[g][r], C[g][r]). Standalone generation flipped
+from garbage to correct output ("The capital of France is Paris").
+
+### exl3 head-order finding
+The exl3 runtime head order is rotated +32 heads (+4 groups) vs
+the checkpoint (activation-level: the exl3's q head slot h holds
+the checkpoint head (h+32)%64's computation, cos 1.0 exact,
+uniform, rope-consistent). The exl3's sinks are checkpoint-ordered
+(verified) — mispaired with the rotated head slots; bounded effect
+(delta_max 1.81 vs score spread ~9, ~20% relative). The exl3's
+o_a groups are checkpoint-ordered. The exl3 model tolerates this
+(coherent output) but is degraded — it is NOT a canonical
+reference for per-head comparisons.
+
+### Slice-order test (inconclusive, reverted)
+The +4-group slice remap (wo_a only, wo_b left identity) produced
+different-but-still-garbled output — expected, since fixing wo_a
+alone breaks the wo_a<->wo_b pairing. The checkpoint's wo_b is
+flat (not slice-qualified), so a slice-order fix would need the
+wo_b column blocks remapped identically. The test cannot decide
+the slice order without completing both sides.
+
+### Current status
+The vLLM still garbles end-to-end with the attention block,
+mHC, shard convention, and FP8 cache all verified correct. The
+bug lives OUTSIDE the verified set: MoE/hash routing, the mHC
+apply composition at runtime, deeper-layer effects, the final
+norm/head, or a layer-type-specific path. The per-layer stream
+comparison infrastructure (variance-gated captures, per-site
+mHC states, MLA q/kv hooks) is in place for the next bisect.
+
+## ROOT CAUSE FIXED: TP slice selection missing the rank term (2026-09-16)
+
+### The bug
+`load_weights`'s slice-qualified branch (wo_a.slice.N.*) kept slices
+0..gpr-1 on EVERY rank — the keep condition `int(_idx) // _gpr != 0`
+had no rank term, so every rank loaded rank-0's slices and skipped
+the rest. At TP=4 with o_groups=8, gpr=2: all four ranks ran their
+attention's grouped o_proj with slices 0-1's weights against their
+own (correctly sharded) head-groups 2-7's activations. Every layer's
+attention output was wrong at TP>1; TP=1 was unaffected (which is
+why the standalone path worked).
+
+### The fix
+Rank-gated slice selection: rank r keeps slices gpr*r..gpr*(r+1)-1,
+_local = _idx % gpr. The checkpoint's slice order is identity
+(slice N pairs with head-group N) — the +4-rotation hypothesis was
+tested and rejected (worse output, and the wo_b flat layout
+confirmed identity).
+
+### Verification
+- "The capital of France is" -> " Paris" (+ coherent multi-capital
+  continuations, correct code answers on the coding prompt).
+- Hash table (tid2eid) verified loading bit-exact (int64->int32
+  cast clean) — was a suspect, cleared.
+- The full attention chain verified independently: exact-math
+  reference (roped K scores, sink-folded softmax, roped V,
+  derot-on-output) reproduces the captured o_a at cos 0.981
+  (residual = the FP8 cache's 2.7% quantization).
+
+### Cleared along the way
+- FP8 KV cache: e4m3 round-trip 2.7% — too small to matter.
+- Softmax variants (sink fold, sink-as-key, no-causal, scale
+  variants): all equivalent under the exact reference — the
+  differentiator was the derot-on-output term.
+- hc_head_fuse tilelang kernel: matches HF HyperHead exactly.
+- tid2eid hash routing kernel: matches HF HashRouter (gather +
+  renormalize + scaling).
+
+### Remaining known issues
+- exllamav3 head-order rotation (+32 slots vs checkpoint): the
+  exl3 runtime is degraded-but-functional; separate from the vLLM.
+- exllamav3 multi-GEMV size_m=1 row bug: FIXED this session
+  (row-by-row driving in _project_o_grouped).
+- GEMV IMA (fast decode path): still open, next up.
+
+### exl3 head-order resolution (final)
+The group-major store math in dsa_attn (dsa_triton.py:283-285:
+`out[h // HPG, row, (h % HPG) * D + d]`) settles the compensation
+question: the o_proj's group g consumes the exl3's head slots
+g*8..g*8+7 — the same (rotated) slots the q occupied. Since the
+rotation is present in EVERY layer's q slots AND every layer's
+o_proj grouping identically, it is a consistent relabeling: the
+model computes a valid (permuted) function, not the checkpoint's.
+The sinks are the only absolute-indexed component that does not
+permute with the slots — their mispairing is the bounded ~20%
+effect. The exl3's degradation is bounded and cannot explain the
+cos-0.43 gap; that gap was the vLLM's slice-selection bug (every
+rank loading slices 0-1), fixed and verified above.
