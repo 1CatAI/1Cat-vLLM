@@ -440,7 +440,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _setup_ple_offload(self, ipc_addr: str) -> None:
         """Attach the shared CPU PLE worker to address-stable MRV2 inputs."""
+        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
         from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+        if not any(
+            isinstance(module, PleOffloadLayer) for module in self.model.modules()
+        ):
+            # PLE layers sit on the first pipeline stage. Later stages have
+            # nothing to connect and must not register: the worker expects
+            # exactly one registration per stage-0 rank.
+            logger.info("PleOffload: no PleOffloadLayer on this rank, no connector")
+            return
 
         query_start_loc_source = getattr(self.model_state, "ple_query_start_loc", None)
         ngram_context_source = getattr(self.model_state, "ngram_context", None)

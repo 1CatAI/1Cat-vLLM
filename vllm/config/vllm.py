@@ -335,6 +335,55 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
     parallel_config.ensure_ple_offload_ipc_path()
 
 
+def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
+    """Whether the PLE overflow cascade is configured, checking its contract.
+
+    ``VLLM_QWEN4EXP_PLE_STORE_DEVICE`` names the card that stores table rows
+    beyond the device and pinned-host tiers, ``VLLM_QWEN4EXP_PLE_DISK`` allows
+    the rest to be read from the mapped checkpoint; either one starts the
+    cascade. The PLE offload worker then serves those rows next to the
+    resident tables, which is a different contract from the whole-table
+    offload and from the hybrid lane.
+
+    Only a config that carries a model is checked: helper configs without one,
+    such as the PLE offload worker's isolated single-rank world, inherit the
+    variable but have no table to place.
+    """
+    from vllm.models.qwen4_exp.common.ple import (
+        ple_store_budget_bytes,
+        ple_store_device,
+    )
+
+    store_device = ple_store_device()
+    if store_device is None:
+        if envs.VLLM_QWEN4EXP_PLE_STORE_GIB is not None:
+            raise ValueError(
+                "VLLM_QWEN4EXP_PLE_STORE_GIB is set without "
+                "VLLM_QWEN4EXP_PLE_STORE_DEVICE"
+            )
+        if not envs.VLLM_QWEN4EXP_PLE_DISK:
+            return False
+    else:
+        # Refuses a missing or invalid store budget before any rank loads.
+        ple_store_budget_bytes()
+    if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
+        raise ValueError(
+            "The Qwen4Exp PLE cascade is configured, but the model has no PLE layers"
+        )
+    if envs.VLLM_SM70_QWEN38_HYBRID_PLE or envs.VLLM_PLE_DISK_OFFLOAD:
+        raise ValueError(
+            "The Qwen4Exp PLE cascade cannot be combined with "
+            "VLLM_SM70_QWEN38_HYBRID_PLE or VLLM_PLE_DISK_OFFLOAD"
+        )
+    return True
+
+
+def _apply_qwen4exp_ple_cascade_defaults(parallel_config: ParallelConfig) -> None:
+    """Start the PLE offload worker that serves the cascade's outer tiers."""
+    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    parallel_config.ensure_ple_offload_ipc_path()
+
+
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     # B32 is the largest concurrency with end-to-end SM70 graph validation.
     # Keep larger scheduler capacities usable through the regular piecewise
@@ -1870,6 +1919,18 @@ class VllmConfig:
                 "Auto-setting VLLM_SM70_FP8_TURBOMIND=0 for SM70 FP8 MoE "
                 "0.0.3 dense dequant fallback lane. Set "
                 "VLLM_SM70_FP8_TURBOMIND explicitly to override."
+            )
+
+        if self.model_config is not None and _qwen4exp_ple_cascade_requested(
+            self.model_config
+        ):
+            _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
+            store_device = envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE
+            logger.info_once(
+                "Qwen4Exp PLE overflow cascade: store device %s, disk tier %s; "
+                "the PLE offload worker serves the rows beyond the resident tiers.",
+                "none" if store_device is None else store_device,
+                "allowed" if envs.VLLM_QWEN4EXP_PLE_DISK else "off",
             )
 
         attention_backend = self.attention_config.backend

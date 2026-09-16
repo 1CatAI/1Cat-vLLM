@@ -228,6 +228,11 @@ class PleOffloadConnector:
             input_ids_buf=self._input_ids_buf,
             query_start_loc_buf=self._query_start_loc_buf,
             ngram_context_buf=self._ngram_context_buf,
+            remote_placements={
+                name: placement
+                for name, layer in self._layers.items()
+                if (placement := layer.remote_placement()) is not None
+            },
         )
 
         # ForkingPickler transmits tensors through shared-memory and CUDA IPC.

@@ -13,6 +13,7 @@ import torch
 import vllm.envs as envs
 import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
+from tests.utils import set_lazy_env
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
@@ -964,3 +965,124 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+
+
+class _LocalTablesPleLayer(_WeightLoadingPleLayer):
+    """A tiered layer keeps its constructor and merges the worker's rows itself."""
+
+    @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        return True
+
+
+def test_ple_layer_keeping_local_tables_initializes_and_merges_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_lazy_env(monkeypatch, "VLLM_PLE_CPU_OFFLOAD", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", None)
+    monkeypatch.setattr(ple_offload_layer, "is_offload_process", lambda: False)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    placeholder = _WeightLoadingPleLayer()
+    assert not hasattr(placeholder, "weight")
+    assert _WeightLoadingPleLayer.get_target_device() == torch.device("cpu")
+
+    # The subclass inherits the guarded constructor; the guard has to consult
+    # the instance's class, not the class that installed the guard.
+    layer = _LocalTablesPleLayer()
+    assert layer.weight.shape == (2,)
+    assert _LocalTablesPleLayer.get_target_device() == torch.device("cuda", 0)
+
+    layer._is_cpu_offloaded = True
+    output = layer(torch.zeros(3), torch.tensor([4, 5, 6]))
+    assert torch.equal(output, torch.tensor([[4], [5], [6]]))
+
+    monkeypatch.setattr(ple_offload_layer, "is_offload_process", lambda: True)
+    assert _LocalTablesPleLayer.get_target_device() == torch.device("cpu")
+
+
+def test_ple_offload_runner_binds_remote_placements_per_layer() -> None:
+    bound: dict[str, list[object]] = {}
+
+    class FakeLayer:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def bind_remote_placements(self, placements: list[object]) -> None:
+            bound[self.name] = placements
+
+    runner = ple_offload_worker.PleOffloadRunner.__new__(
+        ple_offload_worker.PleOffloadRunner
+    )
+    runner._layers = {"tiered": FakeLayer("tiered"), "whole": FakeLayer("whole")}
+
+    def registration(dp_rank: int, tp_rank: int, placements: dict[str, object]):
+        return ple_offload_worker.PleOffloadRegistration(
+            worker_id=dp_rank * 2 + tp_rank,
+            dp_rank=dp_rank,
+            tp_rank=tp_rank,
+            gpu_output_buffers={},
+            sem_flag_tensors={},
+            input_ids_buf=torch.zeros(1, dtype=torch.int32),
+            query_start_loc_buf=torch.zeros(2, dtype=torch.int32),
+            ngram_context_buf=None,
+            remote_placements=placements,
+        )
+
+    registrations = [
+        registration(dp_rank, tp_rank, {"tiered": f"tp{tp_rank}"})
+        for dp_rank in range(2)
+        for tp_rank in range(2)
+    ]
+    runner._bind_remote_placements(registrations, dp_size=2, tp_size=2)
+    assert bound == {"tiered": ["tp0", "tp1"]}
+
+    bound.clear()
+    with pytest.raises(RuntimeError, match="every rank must register"):
+        runner._bind_remote_placements(registrations[:3], dp_size=2, tp_size=2)
+    drifted = registrations[:3] + [registration(1, 1, {"tiered": "other"})]
+    with pytest.raises(RuntimeError, match="differ between data-parallel"):
+        runner._bind_remote_placements(drifted, dp_size=2, tp_size=2)
+    with pytest.raises(RuntimeError, match="unknown layer"):
+        runner._bind_remote_placements(
+            [registration(0, 0, {"missing": "x"})], dp_size=1, tp_size=1
+        )
+    assert bound == {}
+
+
+def test_mrv2_ple_offload_skips_ranks_without_ple_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = torch.nn.Linear(2, 2)
+    runner._ple_offload_connector = None
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        pytest.fail("a rank without PLE layers must not build a connector")
+
+    monkeypatch.setattr(ple_offload_connector_module, "PleOffloadConnector", refuse)
+
+    runner._setup_ple_offload("ipc:///tmp/test-ple-offload")
+
+    assert runner._ple_offload_connector is None
+
+
+def test_offload_world_drops_the_pipeline_layer_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker builds its model as a single pipeline stage; a partition
+    inherited from the GPU workers' pipeline would make get_pp_indices refuse
+    that stage."""
+    from vllm.distributed.utils import get_pp_indices
+
+    set_lazy_env(monkeypatch, "VLLM_PP_LAYER_PARTITION", "24,24")
+    with pytest.raises(ValueError, match="does not match pp_size"):
+        get_pp_indices(48, 0, 1)
+    # An initialized world leaves only the environment handling to run.
+    monkeypatch.setattr(ple_offload_worker.dist, "is_initialized", lambda: True)
+
+    ple_offload_worker._init_offload_distributed()
+
+    assert get_pp_indices(48, 0, 1) == (0, 48)
