@@ -798,6 +798,9 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_STORE_DEVICE: int | None = None
+    VLLM_QWEN4EXP_PLE_STORE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_DISK: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -4719,6 +4722,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "").strip() == ""
         else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0"))
+    ),
+    # Qwen4Exp PLE overflow cascade: visible CUDA index of the card that
+    # stores table rows beyond the device and pinned-host tiers. Setting it
+    # starts the PLE offload worker next to the resident tables; the compute
+    # ranks wait for its rows inside their CUDA graphs. Unset: no cascade.
+    "VLLM_QWEN4EXP_PLE_STORE_DEVICE": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_STORE_DEVICE", "").strip() == ""
+        else int(os.getenv("VLLM_QWEN4EXP_PLE_STORE_DEVICE", "0"))
+    ),
+    # Qwen4Exp PLE overflow cascade: memory in GiB on the store device for
+    # the rows beyond the device and pinned-host tiers, in total and shared
+    # equally by the tensor-parallel ranks. Required with
+    # VLLM_QWEN4EXP_PLE_STORE_DEVICE; it has to leave room for whatever else
+    # runs on that card. Rows beyond it make the startup fail.
+    "VLLM_QWEN4EXP_PLE_STORE_GIB": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_STORE_GIB", "").strip() == ""
+        else float(os.getenv("VLLM_QWEN4EXP_PLE_STORE_GIB", "0"))
+    ),
+    # Qwen4Exp PLE overflow cascade: let the rows beyond every other tier be
+    # read from the mapped checkpoint on disk. Without it such a remainder
+    # fails the startup. The disk tier needs no budget (the checkpoint is
+    # already there) but is the slowest tier by far.
+    "VLLM_QWEN4EXP_PLE_DISK": lambda: (
+        os.getenv("VLLM_QWEN4EXP_PLE_DISK", "False").lower() in ("true", "1")
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
