@@ -687,7 +687,20 @@ class Platform:
             )
 
         if cache_config.mamba_cache_mode == "align":
-            cache_config.mamba_block_size = cache_config.block_size
+            # An explicit --mamba-block-size is the recurrent-state checkpoint
+            # grid, not a KV page multiplier: keep it instead of forcing it to the
+            # KV block size. It must stay a multiple of the block size, because a
+            # cached prefix is restorable only if some length is both block-aligned
+            # (KV blocks) and grid-aligned (recurrent state); otherwise prefix
+            # caching silently drops to zero hits.
+            if cache_config.user_specified_mamba_block_size:
+                grid = cache_config.mamba_block_size
+                assert grid is not None and grid % cache_config.block_size == 0, (
+                    "--mamba-block-size must be a multiple of --block-size in "
+                    f"align mode, got {grid} and {cache_config.block_size}"
+                )
+            else:
+                cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token
