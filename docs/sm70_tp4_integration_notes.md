@@ -1286,13 +1286,14 @@ shipping knob) until the in-vivo fault is root-caused.
 
 Until the in-vivo GEMV fault is root-caused under a sanitizer-
 compatible TP=4 setup, run this stack with the GEMV fast path
-disabled. The verified-green configuration: `AUTO_RECONSTRUCT_
-THRESHOLD = 0` in exllamav3's exl3.py (or an equivalent shipping
-knob) — every row reconstructs, the GEMV never fires, output is
-coherent end-to-end. The GEMV path itself remains
-sanitizer-clean standalone with the real checkpoint tensors;
-the in-vivo-only fault is documented in the elimination record
-above.
+disabled. The shipping knob: `EXL3_SM70_GEMV_DISABLE=1` (env,
+exllamav3 commit 55d9744) — routes every row to
+reconstruct+hgemm, the GEMV never fires, output is coherent
+end-to-end. The earlier hand-edit of `AUTO_RECONSTRUCT_
+THRESHOLD = 0` is superseded by this knob; the constant stays
+144. The GEMV path itself remains sanitizer-clean standalone
+with the real checkpoint tensors; the in-vivo-only fault is
+documented in the elimination record above.
 
 ## Serve-config throughput probe (2026-09-16)
 
