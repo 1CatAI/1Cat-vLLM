@@ -1281,3 +1281,15 @@ root-caused under a sanitizer-compatible TP=4 setup.
 Recommended interim default for this stack: keep the GEMV fast path
 disabled (e.g. `AUTO_RECONSTRUCT_THRESHOLD = 0` or an equivalent
 shipping knob) until the in-vivo fault is root-caused.
+
+## Interim operating recommendation
+
+Until the in-vivo GEMV fault is root-caused under a sanitizer-
+compatible TP=4 setup, run this stack with the GEMV fast path
+disabled. The verified-green configuration: `AUTO_RECONSTRUCT_
+THRESHOLD = 0` in exllamav3's exl3.py (or an equivalent shipping
+knob) — every row reconstructs, the GEMV never fires, output is
+coherent end-to-end. The GEMV path itself remains
+sanitizer-clean standalone with the real checkpoint tensors;
+the in-vivo-only fault is documented in the elimination record
+above.
