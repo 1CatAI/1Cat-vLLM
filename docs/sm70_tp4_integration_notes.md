@@ -1303,14 +1303,16 @@ exllamav3 — commit 55d9744):
 
 - Config: TP=4, max_model_len=256, max_num_seqs=4,
   gpu_memory_utilization=0.90, enforce_eager, fp8 KV.
-  Memory-profile chain: 0.95 with max_model_len=1024 OOMs
-  during Triton JIT warmup (compress_norm_rope launch,
-  jit.py → driver __call__ — a transient allocation, not
-  prompt-length-dependent); 0.90 then refused to start
-  because the KV floor for max_model_len=1024 (0.41 GiB)
-  exceeded the 0.37 GiB available; 0.90 + max_model_len=512
-  (0.21 GiB floor) starts with margin. Do not raise back
-  toward 0.95 without shrinking max_model_len.
+  Memory-profile chain (figures from the max_model_len=1024
+  probe run): 0.95 OOMs during Triton JIT warmup
+  (compress_norm_rope launch, jit.py → driver __call__ — a
+  transient allocation, not prompt-length-dependent); 0.90
+  then refused to start because the KV floor for
+  max_model_len=1024 (0.41 GiB) exceeded the 0.37 GiB
+  available; 0.90 + max_model_len=256 (the final config,
+  ~0.10 GiB floor) starts with margin — measured KV 0.43
+  GiB / 1,030 tokens. Do not raise back toward 0.95 without
+  shrinking max_model_len.
 - Result: 3.52 tok/s decode (26 tokens in 7.4 s, greedy,
   ignore_eos), zero asserts. Caveats: (1) cold first-call
   figure — includes remaining JIT warmup, so it is a lower
