@@ -2,6 +2,35 @@
 
 Date: 2026-05-30
 
+## Mamba state grid decoupled from the KV block size, 2026-09-17
+
+[Design note](sm70_mamba_state_grid_decoupling.md). The long-prefill chunk is
+`min(max_num_scheduled_tokens, mamba_state_block_size)`, and the 75T Q8000
+dense route only dispatches for a chunk in [8000, 8192], so the recurrent-state
+grid -- not the token budget -- decided whether the fast prefill path was
+reachable at all. Page-size unification scaled that grid together with the block
+size, which tied the fast path to a 4096 block.
+
+- An explicit `--mamba-block-size` is now honoured in align mode and is no
+  longer multiplied by the page-unification ratio. Both edits are inert without
+  the flag, so existing deployments are unchanged: `--block-size 4096` still
+  yields grid 8192, chunk 8192 and an 858,310-token pool exactly as before.
+- `--block-size 2048 --mamba-block-size 8192` gives chunk 8192 with the 75T
+  route and a 1,058,133-token pool, 23-29% more than the 4096 block, at equal
+  prefill (3336 versus a 3295-3426 tok/s band on a unique-salt 100K prompt).
+- The grid must be a multiple of the block size. `--block-size 1648` against
+  grid 8192 measured the largest pool (1,112,091) and the fastest prefill
+  (3551 tok/s) but dropped prefix caching to 0 hits over 812,040 queries,
+  because no prefix length is then simultaneously block-aligned (KV blocks) and
+  grid-aligned (recurrent state). The alignment assertion is retained for that
+  reason.
+- Prefix-cache reuse is quantised by the grid, not the block: at grid 8192 a
+  byte-identical prompt below 8192 tokens gets no reuse at all. Since
+  `chunk <= grid`, the reuse quantisation, the chunk size and the grid are one
+  and the same knob, so a smaller block buys KV capacity only -- not finer
+  reuse. This is inherent to align-mode hybrid scheduling.
+- Adopted default for this model: `scripts/serve_qwen38_27b_nvfp4_v100.sh`.
+
 ## DFlash2 TP4 capacity tails, 2026-09-11
 
 [The capacity-tail worklog](sm70_dflash2_tail_graphs_20260911.md) tracks PR596.

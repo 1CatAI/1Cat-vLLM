@@ -1021,6 +1021,7 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
 
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    vllm_config: VllmConfig | None = None,
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
@@ -1053,6 +1054,17 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
+            if (
+                isinstance(layer_spec, MambaSpec)
+                and vllm_config is not None
+                and vllm_config.cache_config.user_specified_mamba_block_size
+            ):
+                # The Mamba block size is the recurrent-state checkpoint grid, not
+                # a KV page multiplier: align-mode state memory is
+                # page_size_bytes * (2 + num_speculative_blocks), which does not
+                # depend on block_size. Keep an explicit grid; the physical page is
+                # still padded to max_page_size by the branch below.
+                new_block_size = layer_spec.block_size
             replace_args = {"block_size": new_block_size}
             # A padded page does not grow when only block_size changes. This
             # happens for hybrid Mamba targets when a higher-precision draft
@@ -2451,7 +2463,7 @@ def get_kv_cache_groups(
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec, vllm_config)
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
     # Add hidden-state layers back with page aligned to the common page.
