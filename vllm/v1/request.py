@@ -167,6 +167,8 @@ class Request:
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
+        # Detected cross-request junction to retain for subsequent sparse reuse.
+        self.shared_prefix_boundary = 0
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
