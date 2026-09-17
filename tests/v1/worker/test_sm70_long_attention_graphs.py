@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.sm70_e4m3_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.worker.gpu import cudagraph_utils as cg
 from vllm.v1.worker.gpu.cudagraph_utils import (
@@ -94,24 +95,32 @@ def test_disabled_operator_preserves_original_binding(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "enabled,method,sm70,target,sequence_parallel,expect_tail",
+    "enabled,method,capability,target,sequence_parallel,expect_tail",
     [
-        (True, "dflash", True, True, False, True),
-        (False, "dflash", True, True, False, False),
-        (True, "mtp", True, True, False, False),
-        (True, "dflash", False, True, False, False),
-        (True, "dflash", True, False, False, False),
-        (True, "dflash", True, True, True, False),
+        (True, "dflash", (7, 0), True, False, True),
+        # Turing takes the same tail graphs as Volta.
+        (True, "dflash", (7, 5), True, False, True),
+        (False, "dflash", (7, 0), True, False, False),
+        (True, "mtp", (7, 0), True, False, False),
+        (True, "dflash", (8, 0), True, False, False),
+        (True, "dflash", (7, 0), False, False, False),
+        (True, "dflash", (7, 0), True, True, False),
     ],
 )
 def test_tail_capture_and_dispatch_from_real_initialization(
-    monkeypatch, enabled, method, sm70, target, sequence_parallel, expect_tail
+    monkeypatch, enabled, method, capability, target, sequence_parallel, expect_tail
 ):
     monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", str(int(enabled)))
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
     monkeypatch.delenv("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", raising=False)
     monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(cg.current_platform, "is_device_capability", lambda cap: sm70)
+    # The gate asks the worker's own device; answer for it only.
+    monkeypatch.setattr(
+        cg.current_platform,
+        "get_device_capability",
+        lambda device_id=0: DeviceCapability(*capability),
+    )
+    monkeypatch.setattr(cg.torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
     monkeypatch.setattr(
         cg,

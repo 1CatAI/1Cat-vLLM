@@ -56,14 +56,32 @@ def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
     return reserve_bytes
 
 
+def _worker_device_is_pre_ampere() -> bool:
+    """Whether this worker's own device is Volta or Turing.
+
+    The SM70 graph tunings are pre-Ampere tunings: Turing runs the same
+    kernels, the same fp16 contract and the same compile graph as Volta.
+    Asking index 0 of the visibility list would answer for a different
+    worker on a mixed rig, so ask the device this process has selected.
+    """
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability(
+        device_id=torch.accelerator.current_device_index()
+    )
+    return capability is not None and (capability.major, capability.minor) in (
+        (7, 0),
+        (7, 5),
+    )
+
+
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     return bool(
         envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
         and speculative_config is not None
         and speculative_config.method == "mtp"
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
+        and _worker_device_is_pre_ampere()
     )
 
 
@@ -171,8 +189,7 @@ class CudaGraphManager:
             and speculative_config is not None
             and speculative_config.method == "dflash"
             and decode_query_len == 8
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _worker_device_is_pre_ampere()
             and not self.compilation_config.pass_config.enable_sp
         )
         if self._sm70_dflash2_tail_graphs:
@@ -361,8 +378,7 @@ class CudaGraphManager:
                         )
                         if (
                             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-                            and current_platform.is_cuda()
-                            and current_platform.is_device_capability((7, 0))
+                            and _worker_device_is_pre_ampere()
                         ):
                             logger.info_once(
                                 "Running SM70 Flash-V100 compile full-graph "
