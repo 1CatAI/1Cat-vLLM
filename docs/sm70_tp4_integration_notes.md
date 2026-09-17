@@ -1427,13 +1427,17 @@ K=2/K=3 exl3_gemm calls crash ONLY when suh/svh are passed as None (the
 regular-kernel fallback dereferences them) — always pass valid suh/svh when
 testing shapes the GEMV declines.
 
-## Padded Geometry phase: Flash-Next loads end-to-end (2026-09-17)
+## Padded Geometry phase: main model weight loading fixed (2026-09-17)
 
-The 2026-09-16 blockers above are resolved. The Qwen3.8-Flash-Next
-exl3-4.05bpw_h6_ng6 pack now loads end-to-end on TP4 with
-VLLM_PLE_CPU_OFFLOAD=1: all four ranks report "Model loading took
-17.51 GiB" and the PleOffload workers register (log
-/tmp/qwen_load27.log). Two remaining PLE items are tracked below.
+The 2026-09-16 vision/ba_proj blockers above are resolved. The
+Qwen3.8-Flash-Next exl3-4.05bpw_h6_ng6 pack's MAIN MODEL weight loading
+succeeds on TP4 with VLLM_PLE_CPU_OFFLOAD=1: all four ranks report
+"Model loading took 17.51 GiB" and the PleOffload layers register (log
+/tmp/qwen_load27.log). CORRECTION of an earlier phrasing: the engine
+does NOT reach ready — the PLE offload worker's table-format failure
+kills startup (WorkerProc failed), and the non-offload path hits the
+pinned-host FP8 requirement. The PLE table integration below is the
+remaining blocker; the model does not serve yet.
 
 ### Index gap: unindexed extra shards were dropped (root cause)
 
