@@ -335,8 +335,9 @@ def test_qsa_grouped_page4_null_block_padding_no_nan(monkeypatch, pad_fix) -> No
     block (physical page 0, mask 0) and counts the padding in seq_len. The
     forward loads page 0's K/V for those padded rows and sets P=0, but 0 * NaN
     survives the P@V tensor-core reduction when page 0 holds bytes that decode
-    to E4M3 NaN (fp16 GDN state co-located in the hybrid cache). XQA never reads
-    the null block, so it is the clean reference.
+    to E4M3 NaN (fp16 GDN state co-located in the hybrid cache). The reference is
+    a kernel-independent einsum over the selected tokens, which map to physical
+    pages >= 1 and so exclude the null block.
 
     pad_fix=False relies on the Flash-V100 kernel zeroing unattended rows;
     pad_fix=True adds the Python planner post-pass that repoints the padding.
@@ -398,16 +399,23 @@ def test_qsa_grouped_page4_null_block_padding_no_nan(monkeypatch, pad_fix) -> No
         "v_scale": v_scale,
     }
 
-    # XQA reference (grouped OFF) never reads the null block.
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 0)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", False)
-    reference = qsa_sparse_paged_attention(
-        query, k_cache, v_cache, logical_indices, block_table, token_to_req, **kwargs
-    )
-    assert torch.isfinite(reference).all()
+    # Kernel-independent ground-truth reference: decode E4M3 -> fp32 and attend
+    # only the selected tokens, which map to physical pages >= 1, so the null
+    # block never contributes. (The XQA route is not used as the reference: its
+    # E4M3 page4 tmp_out dtype contract differs across Flash-V100 builds.)
+    decoded_k = k_cache.view(torch.float8_e4m3fn).float() * k_scale
+    decoded_v = v_cache.view(torch.float8_e4m3fn).float() * v_scale
+    logical = torch.arange(topk, device="cuda")
+    phys = block_table[0, logical // page_size].long()
+    offs = logical % page_size
+    sel_k = decoded_k[phys, offs, 0, :]
+    sel_v = decoded_v[phys, offs, 0, :]
+    scores = torch.einsum("rhd,nd->rhn", query.float(), sel_k) / math.sqrt(head_dim)
+    reference = torch.einsum("rhn,nd->rhd", torch.softmax(scores, dim=-1), sel_v)
 
     # Grouped route with the pad-fix in the requested state.
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 0)
     monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
     monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAD_FIX", pad_fix)
     actual = qsa_sparse_paged_attention(
@@ -417,4 +425,4 @@ def test_qsa_grouped_page4_null_block_padding_no_nan(monkeypatch, pad_fix) -> No
     assert torch.isfinite(actual).all(), (
         f"grouped route leaked null-block NaN (pad_fix={pad_fix})"
     )
-    torch.testing.assert_close(actual.float(), reference.float(), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(actual.float(), reference, atol=3e-2, rtol=3e-2)
