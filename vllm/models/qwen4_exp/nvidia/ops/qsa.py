@@ -1675,8 +1675,13 @@ def _qsa_xqa_page4_workspace(
             device=q.device,
         )
         exp_sums = torch.empty_like(max_logits)
-        active_num_partitions = torch.tensor(
-            [num_partitions], dtype=torch.int32, device=q.device
+        # torch.tensor([...], device=cuda) does a host->device copy, which is
+        # illegal during CUDA graph capture. The workspace cache is keyed by the
+        # active stream, so an E4M3 >16-row verify batch captured on the graph's
+        # side stream rebuilds here; torch.full fills on-device (scalar kernel
+        # arg, no host copy) and stays capture-safe.
+        active_num_partitions = torch.full(
+            (1,), num_partitions, dtype=torch.int32, device=q.device
         )
         workspace = (
             capacity,
