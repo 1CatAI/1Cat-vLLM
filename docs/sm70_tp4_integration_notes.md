@@ -1426,3 +1426,82 @@ layer 12 are the suspects. Note: standalone
 K=2/K=3 exl3_gemm calls crash ONLY when suh/svh are passed as None (the
 regular-kernel fallback dereferences them) — always pass valid suh/svh when
 testing shapes the GEMV declines.
+
+## Padded Geometry phase: Flash-Next loads end-to-end (2026-09-17)
+
+The 2026-09-16 blockers above are resolved. The Qwen3.8-Flash-Next
+exl3-4.05bpw_h6_ng6 pack now loads end-to-end on TP4 with
+VLLM_PLE_CPU_OFFLOAD=1: all four ranks report "Model loading took
+17.51 GiB" and the PleOffload workers register (log
+/tmp/qwen_load27.log). Two remaining PLE items are tracked below.
+
+### Index gap: unindexed extra shards were dropped (root cause)
+
+The pack ships vision_k6.safetensors (987 visual tensors) and
+ngram_embedding.safetensors (5 PLE tensors) alongside the indexed
+model-0000{1..9} shards, but model.safetensors.index.json's weight_map
+omits both files. vLLM's filter_duplicate_safetensors_files drops any
+glob-matched shard absent from the weight_map, so every visual.* and
+the PLE ngram tensors never reached the model. This produced BOTH the
+"visual.merger.linear_fc1: neither mcg nor mul1 marker is set" failure
+and the PLE worker's "checkpoint filter matched no weights".
+
+Fix (data-side, backup at model.safetensors.index.json.bak-pre-extra-shards):
+append the two files' tensor names to the weight_map. Any pack that
+ships extra shards must list them in the index.
+
+### Fork-side fixes (uncommitted at docs time)
+
+- qwen3_vl.py Qwen3_VisionTransformer.load_weights: the tower's
+  attention packs q/k/v into one QKVParallelLinear while the pack ships
+  per-projection attn.q_proj./k_proj./v_proj. tensors; the stacked
+  mapping only matched the attn.q. spelling. Added the _proj variants
+  (shard ids q/k/v) so the fused params receive each projection.
+- model.py Qwen4ExpForCausalLM: ParallelLMHead now receives
+  quant_config so the quantized head tensors claim through the plugin.
+- ple_layer.py Qwen4ExpPLELayer: key_proj/value_proj pass
+  quant_config=None — the pack ships them as plain weights (no
+  trellis/marker siblings); the EXL3 fallback claim otherwise fails the
+  marker validation (same pattern as ba_proj).
+- qwen_gdn_linear_attn.py create_ba_proj: quant_config=None (ba
+  tensors are plain F16), documented in-code.
+
+### Plugin-side fixes (vllm-exl3 reference tree, uncommitted)
+
+All in exl3.py; the padded-geometry relaxation set:
+1. Span-branch TP narrowing: a merged layer's full-output checkpoint
+   tensor narrows to this rank's slice before the shard split.
+2. head_bits gate covers _attn./shared_expert/visual. prefixes and
+   excludes indexer; the vision tower ships whole-tower K=6 (verified:
+   every visual trellis is 96-wide in the k6 pack).
+3. Padded-dest head-fit writes: narrowed tensors smaller than the
+   padded dest write at the head (1-D suh/svh, trellis in-tiles and
+   out-tiles); the zeroed pad is never consumed.
+4. Divisor-based shard_tp_size: the coarsest divisor whose per-rank
+   piece fits the padded dest (the padded expected_out skews the old
+   ratio; 640 svh vs padded 256 = 2.5).
+5. expert_mapping fallback to the fork's FusedMoE attribute.
+6. Empty-marker guard in the bmm path (visual merger's (0,) markers).
+7. lm_head claim without non_routed spec (quantized head tensors).
+8. Marker write restored to write-then-return (a debug probe briefly
+   broke the control flow; caught and fixed).
+
+### PLE table: packed 6-bit format needs plugin integration (open)
+
+The pack's PLE table is EXL3-trellis-packed: ngram_embedding.trellis
+int16 (320001536, 61) = 1 scale word + 160*6/16 ring words per row
+(K=6, 36.4 GiB packed vs 1.4 TiB dense fp16), plus head_bias (16,160),
+head_offsets/head_vocab_sizes (16,), layer_multipliers (3,) — the
+plugin's Exl3EmbeddingMethod format. The fork's Qwen4ExpNGramEmbedding
+expects bare-name buffers and shard_N.weight dense rows, and the pack's
+quantization_config.json lacks the ngram_embedding spec that would
+activate the plugin's method. Consequences:
+- With VLLM_PLE_CPU_OFFLOAD=1 the offload worker fails loading the
+  table (ValueError on ngram_embedding.head_bias). The main model loads
+  and the PLE layer registers; PLE lookups are non-functional.
+- Without offload, V100 (capability < 8) takes the pinned-host path
+  which requires FP8 checkpoint storage -> NotImplementedError.
+Integrating the plugin's packed-table decode (gather + on-the-fly
+decode, ~9.8 GiB/rank packed under TP4) into the fork's embedding and
+offload worker is the remaining work; the index fix above already
+routes the tensors to the loader.
