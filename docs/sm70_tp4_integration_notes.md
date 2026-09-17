@@ -1367,3 +1367,62 @@ cannot load on this fork either — the checkpoint's shard
 layout trips the loader's shape check ("expected (128,5120)
 but got (48, 5120)") and its padded geometry requires TP1
 while its size requires more.
+
+## GEMV IMA ROOT CAUSE FIXED: K>=5 ld_b double-counted the lane term (2026-09-16, final)
+
+Sanitizer-verified root cause of the 48-report IMA (exl3_gemv_sm70_kernel.cuh,
+the bits>=5 branch of ld_b): the bp pointer ends with `+ lane` (the word within
+tile 0 — the K<=4 branches rely on it), and the K>=5 branch added the tile/word
+terms on top of bp WITHOUT subtracting lane first. Effective word = lane +
+(l>>1)*TWORDS + (l&1)*32 + lane — lane counted twice. Every K>=5 read was
+mis-addressed (even loads fetched word 2*lane instead of lane); in-bounds reads
+returned wrong words (garbage dequantized weights) and the last k-slice's final
+group read past the trellis end by (2*lane - 40) words.
+
+The 48-report signature, exactly: kernel <5,1,2,0,0,0> (K=5, fp32 C, mul1,
+MMODE 0, CFG 0, no smem), threads 500-511 (warp 15, lanes 20-31), bytes
+0..88 step 8 past the allocation — (2*lane - 40) words = (lane-20)*8 bytes.
+
+Fix (commit 4b256b0, all three kernels — single, dual, multi):
+`bp - lane + i*slice_stride + (l>>1)*TWORDS + min((l&1)*32 + lane, TWORDS-1)`.
+The clamp keeps odd-load lanes 8-31 within the 40-word tile (their values are
+discarded by the decoder); the `- lane` corrects every lane's word.
+
+### Verification record
+- Unit (standalone, /tmp/test_gemv_fix.py): K=5/6/8 GEMV vs
+  reconstruct + Had + matmul + Had reference at m=1 and m=4, shapes from the
+  faulting launch family included: max_rel ~3e-7 (fp accumulation error).
+  NOTE the reference must apply the Had transforms — the trellis stores
+  Had-domain weights; a plain A @ W comparison false-fails at rel ~1.4.
+- Sanitizer (trunc12, TP=4, the full repro): 0 Invalid reports (was 48).
+  The 48 remaining "errors" in the fixed run are NCCL 209
+  (cudaErrorNoKernelImageForDevice) reports from the sanitizer's own NCCL
+  probes — not device faults.
+- Repro: trunc12 TP=4 default routing, 5-token and 32-token runs, short and
+  636-token prompts, 126 consecutive runs: 0 IMAs. Output matches the
+  reconstruct+hgemm bypass path token-for-token for 24+ tokens.
+- Earlier hypotheses eliminated by measurement: size_n=8224 padded-n overrun
+  (no n=8224 launch exists in any inventory), K mismatch config-vs-tensor
+  (0 mismatched launches in 3,949 parsed), prefetch-ring overrun (guards
+  verified in source), uncompiled clamp (rebuild verified at 164 s).
+
+### Build-system pitfall (cost hours)
+`python setup.py build_ext --inplace` does NOT track .cuh header changes
+reliably: after editing exl3_gemv_sm70_kernel.cuh, `touch` every .cu that
+includes it (exl3_gemv.cu) or the kernels silently keep the old code. A 4 s
+build is a no-op; the kernel TUs take ~30 s each.
+
+### Open issue (post-fix, separate from the K>=5 bug)
+The FULL model (111 GB, all layers) still crashes with an async IMA surfacing
+at vllm-exl3 exl3.py:685 (nonzero in apply_exl3_python_loop) — the MoE
+python-loop backend (EXL3_FUSED_MOE=0). trunc12 (12 layers, same expert
+config, same shapes) is green over 126 runs, so the fault is presumed to live
+in a layer >= 12 or a shape only the full model presents (inferred from
+trunc12's coverage, not observed). The faulting kernel is unidentified (async
+surfacing point).
+Next step: build a trunc24 model and run the sanitizer split at the layer
+boundary; the K=3 MoE experts (MCG, cb=1) and the mixed-bit dense layers past
+layer 12 are the suspects. Note: standalone
+K=2/K=3 exl3_gemm calls crash ONLY when suh/svh are passed as None (the
+regular-kernel fallback dereferences them) — always pass valid suh/svh when
+testing shapes the GEMV declines.
