@@ -207,6 +207,9 @@ repos:
     entry: python tools/pre_commit/check_spdx_header.py
     language: python
     types: [python]
+    # This existing test declares AGPL-3.0-only. The Apache-specific fixer
+    # must not prepend a conflicting license to it.
+    exclude: ^tests/compile/test_qwen4exp_qsa_e4m3_gate\.py$
   - id: check-root-lazy-imports
     name: Check root lazy imports
     entry: python tools/pre_commit/check_init_lazy_imports.py
