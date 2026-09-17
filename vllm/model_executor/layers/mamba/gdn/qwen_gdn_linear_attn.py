@@ -2657,6 +2657,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> MergedColumnParallelLinear:
+        # The ba checkpoint tensors are unquantized (plain F16, unpadded):
+        # EXL3 must not claim this layer (its padded-geometry loader rejects
+        # unpadded bf16 shards), so quant_config is always None here and
+        # the vanilla UnquantizedLinearMethod handles the weight.
         # When gqa_interleaved_layout=True (Qwen3-Next), in_proj_ba is stored
         # as a single fused weight [b_g0, a_g0, b_g1, a_g1, ...] interleaved
         # by key-head group; a single output shard preserves this across TP.
@@ -2669,7 +2673,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             input_size=hidden_size,
             output_sizes=output_sizes,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=prefix,
             disable_tp=self.maybe_disable_tp(quant_config),
         )

@@ -1548,14 +1548,18 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             int(config.ple_embed_dim),
             self.hc_hidden_size,
             bias=False,
-            quant_config=quant_config,
+            # The checkpoint ships the PLE projections as plain weights
+            # (ple.key_proj.weight / value_proj.weight, no trellis/marker
+            # siblings) — offering them to the quant method makes the EXL3
+            # fallback claim them and the marker validation then fails.
+            quant_config=None,
             prefix=f"{prefix}.key_proj",
         )
         self.value_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=f"{prefix}.value_proj",
         )
         norm_args = (
