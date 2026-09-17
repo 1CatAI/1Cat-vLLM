@@ -2244,6 +2244,22 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
       }
       __syncthreads();
+      // W12: defensively zero K rows no query attends (see the V panel below).
+      // K NaN is already masked out of the scores by grouped_verify_key_visible,
+      // but zeroing keeps the loaded panel free of the null block's E4M3 NaN.
+      // Masks are visible after the __syncthreads() above; the one added inside
+      // publishes the zeros before grouped_verify_qk consumes shared_kv.
+      if constexpr (SPARSE_PAGE4) {
+        for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
+             idx += kGroupedVerifyThreads) {
+          const int row = idx / kSharedStrideVec;
+          const uint32_t token_mask = smem.sparse_token_masks[row >> 2];
+          if ((token_mask & (0x11111111u << (row & 3))) == 0) {
+            reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+          }
+        }
+        __syncthreads();
+      }
 
       int active_m_tiles = 0x7;
       if constexpr (SPARSE_PAGE4) {
@@ -2335,6 +2351,22 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
+    // W12: defensively zero K rows no query attends (see the V panel below).
+    // K NaN is already masked out of the scores by grouped_verify_key_visible,
+    // but zeroing keeps the loaded panel free of the null block's E4M3 NaN.
+    // Masks are visible after the __syncthreads() above; the one added inside
+    // publishes the zeros before grouped_verify_qk consumes shared_kv.
+    if constexpr (SPARSE_PAGE4) {
+      for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
+           idx += kGroupedVerifyThreads) {
+        const int row = idx / kSharedStrideVec;
+        const uint32_t token_mask = smem.sparse_token_masks[row >> 2];
+        if ((token_mask & (0x11111111u << (row & 3))) == 0) {
+          reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+        }
+      }
+      __syncthreads();
+    }
 
     int active_m_tiles = 0x7;
     if constexpr (COMPENSATE_P) {
@@ -2462,6 +2494,28 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
       reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+    }
+    // W12: the grouped planner pads each category to a multiple of 8 with
+    // (physical microblock 0 = null block, mask 0) and counts the padding in
+    // seq_len; the forward also carries unselected tokens inside partial
+    // microblocks. Such rows get P=0, but 0 * NaN survives the P@V MMA when
+    // page 0 holds fp16 GDN state that decodes to E4M3 NaN (W8). Zero every
+    // row no query attends (mask bit = query*4 + token_in_microblock, so the
+    // row is unattended iff (mask & (0x11111111u << (row & 3))) == 0) so the
+    // reduction sees 0 * 0 = 0. The leading __syncthreads() makes the V panel
+    // load finish before we overwrite its page-0 rows (else the load races past
+    // the zero and resurrects the NaN); the trailing one publishes the zeros
+    // before P@V. Masks were synced earlier in this iteration.
+    if constexpr (SPARSE_PAGE4) {
+      __syncthreads();
+      for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
+           idx += kGroupedVerifyThreads) {
+        const int row = idx / kSharedStrideVec;
+        const uint32_t token_mask = smem.sparse_token_masks[row >> 2];
+        if ((token_mask & (0x11111111u << (row & 3))) == 0) {
+          reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+        }
+      }
     }
     __syncthreads();
 
