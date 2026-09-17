@@ -13,6 +13,7 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.models.qwen4_exp.common.ple import (
@@ -52,13 +53,26 @@ def _patch_tp(monkeypatch: pytest.MonkeyPatch, rank: int, world_size: int) -> No
 
 
 def _pinned_layer(num_embeddings: int = 32, embedding_dim: int = 8):
-    return Qwen4ExpPinnedHostEmbedding(
-        num_embeddings=num_embeddings,
-        embedding_dim=embedding_dim,
-        params_dtype=torch.float16,
-        padding_size=8,
-        prefix="model.layers.2.ple.ngram_embedding",
-        quant_method=Qwen4ExpPLEFp8EmbeddingMethod(),
+    # The table registers itself in the config's static forward context so
+    # the gather op can resolve it by name at run time.
+    with set_current_vllm_config(VllmConfig()):
+        return Qwen4ExpPinnedHostEmbedding(
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+            params_dtype=torch.float16,
+            padding_size=8,
+            prefix="model.layers.2.ple.ngram_embedding",
+            quant_method=Qwen4ExpPLEFp8EmbeddingMethod(),
+        )
+
+
+def _expose_to_gather_op(monkeypatch: pytest.MonkeyPatch, layer) -> None:
+    # qwen4_exp_ple_pinned_gather resolves the table through the forward
+    # context, like qwen4_exp_compute_ple_ngram_ids does for its layer.
+    monkeypatch.setattr(
+        ple_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={layer.layer_name: layer}),
     )
 
 
@@ -140,6 +154,7 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
     )
     monkeypatch.setattr(ple_module, "_ple_host_budget_bytes", lambda: host_rows * 8)
     layer = _pinned_layer(num_embeddings=8)
+    _expose_to_gather_op(monkeypatch, layer)
     raw = torch.tensor(
         [0x00, 0x01, 0x08, 0x38, 0x7E, 0x80, 0xB8, 0xFE],
         dtype=torch.uint8,
