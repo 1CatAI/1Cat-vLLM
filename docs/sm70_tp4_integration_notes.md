@@ -1509,3 +1509,26 @@ Integrating the plugin's packed-table decode (gather + on-the-fly
 decode, ~9.8 GiB/rank packed under TP4) into the fork's embedding and
 offload worker is the remaining work; the index fix above already
 routes the tensors to the loader.
+
+### PLE integration parameters (derived and verified this session)
+
+- Table geometry: rows = 320001536 (padded ngram vocab), words/row =
+  61 = 1 scale word + 160*6//16 ring words (ngram_words_per_row(6),
+  NGRAM_ROW_DIM=160, K=6 = head_bits); num_heads = 16
+  ((ngram_size-1) * heads_per_ngram = 2*8, head_bias (16,160) with
+  head_dim = ple_embed_dim 2560 / 16 = 160); num_shards = 1 (single
+  trellis tensor). Packed size 36.4 GiB total, ~9.8 GiB/rank under
+  TP4; dense per-head-dim table = 95.37 GiB (matches the offload
+  worker's logged host budget exactly — the decode-at-load design
+  fits).
+- Spec fields the plugin's Exl3EmbeddingMethod expects (exl3.py
+  create_weights / _ngram_embedding_spec): bits, num_shards,
+  rows_per_shard, num_heads.
+- Integration points: (1) add the ngram_embedding spec block to the
+  pack's quantization_config.json (or derive it from tensor_storage in
+  the plugin); (2) extend the fork's _get_ple_embedding_quant_method
+  (ple_layer.py:474) with an EXL3 branch returning the plugin's
+  Exl3EmbeddingMethod when Exl3Config._ngram_embedding_spec(prefix)
+  matches; (3) decode-at-load via the plugin's ngram_dequant_rows_torch
+  (pure-torch oracle) or the ext kernel, feeding the existing dense
+  host lookup path unchanged.
