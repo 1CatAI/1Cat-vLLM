@@ -71,8 +71,17 @@ def is_exact_sm70_cuda_platform() -> bool:
     Quant-method selection runs before a layer owns a CUDA tensor, so it
     cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
     from the tensor-based helpers used by linear weight preparation.
+
+    The capability is read from the device this worker builds its layers on.
+    Probing device 0 of the visibility list answers for a different card on a
+    heterogeneous node: with a Turing card first the Volta workers lose their
+    SM70 routes, and with a Volta first the Turing workers take them.
     """
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability(
+        (7, 0), device_id=torch.accelerator.current_device_index()
+    )
 
 
 def should_use_mxfp4_moe_turbomind() -> bool:
