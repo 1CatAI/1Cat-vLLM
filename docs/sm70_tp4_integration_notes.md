@@ -1628,3 +1628,30 @@ Closed sub-questions (settled — do not reopen):
 - hc_head: DS4f-only surface (applied at deepseek_v4 model.py:1168).
   Flash-Next ships zero hc_head_* keys — its 100 hc_* keys are the
   hyper-connection mixer family, fully wired and consumed.
+
+### Serve + throughput measurement (post-correctness, 2026-09-18)
+
+api_server serve attempt (port 8000, max_num_seqs=8, gmu 0.90): failed at
+KV-cache profiling — "No available memory for the cache blocks" at 0.90
+(0.92 + fp8 KV also failed; fp8 KV dtype may be unsupported on this stack
+— the second failure was a worker init error, not a KV error). The
+offline LLM path with gmu=0.92, max_num_seqs=4-8, enforce_eager works.
+
+Throughput sweep (offline LLM, max_tokens=256, greedy, max_num_seqs=8):
+- CONC=1: 3.35 tok/s (wall 76.4s for 256 tokens)
+- CONC=4: 6.81 tok/s (wall 150.4s for 1024 tokens)
+- CONC=8: 6.81 tok/s (wall 300.8s for 2048 tokens)
+
+Aggregate throughput saturates at ~6.8 tok/s beyond concurrency 4 —
+per-request decode is ~3.3 tok/s and batched execution does not increase
+aggregate decode rate (eager mode + EXL3 GEMV-disabled path; the
+per-request rate is the binding constraint, not scheduling). The >20
+tok/s gate is NOT met at any concurrency level. Note the jit_monitor
+warning shows Triton JIT compilation during inference (QSA merge/splitk
+kernel) — first-call JIT cost is included in these numbers; steady-state
+decode may be slightly higher, but not 6x.
+
+Output correctness: unchanged flat-fragment signature (TEXT in the serve
+test matches the canonical garbage). Correctness remains the blocker for
+betterbench (numeric-quality scores would be meaningless on broken
+output) and for the >20 tok/s gate as a quality-adjusted target.
