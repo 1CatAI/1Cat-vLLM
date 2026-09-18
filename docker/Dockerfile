@@ -345,6 +345,8 @@ COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY cmake cmake/
 COPY csrc csrc/
 COPY flash_qla flash_qla/
+COPY flashinfer-sm70 flashinfer-sm70/
+COPY flash-attention-v100 flash-attention-v100/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
 
