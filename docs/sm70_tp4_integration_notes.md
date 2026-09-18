@@ -1599,3 +1599,32 @@ and the family clause is evaluated BEFORE the `_attn.` clause (which
 would otherwise swallow `self_attn.indexer.*` via substring match).
 Verified: Flash-Next indexer resolves 4 != 6 -> global bits; DS4f
 resolves 5 == 5 -> family applied. 8/8 routing-decision cases pass.
+
+### Post-commit smoke (run 110) + closed sub-questions
+
+Final smoke on the committed state (fork `2e78725dd`, plugin `c0ab9eb`):
+load clean (11/11 shards), generation runs end-to-end, exit 0, GPUs freed.
+Output reproduces the canonical flat-fragment signature — the load56
+'!!!!!!!!' variant was transient to that run's VLLM_SM70_LM_HEAD_TOP1=0
+auto-set, so the sampling-path confound is moot. step0 logprobs: top-5
+cluster at −9.0..−9.7 (<0.8 nat spread over 248320 vocab) — near-uniform
+distribution, consistent with the residual-stream corruption reaching the
+output; NOT a calibration/sampling issue. Stability verified; correctness
+remains open — next diagnostic is the reference forward (transformers
+qwen3_next modeling on the same weights) compared layer-by-layer against
+the fork's residual stream, anchored at layer-0's first-call block_input.
+
+Closed sub-questions (settled — do not reopen):
+- 1488-row PLE delta: prime-sized heads explain it (sum of the 16 primes
+  20000003..20000171 = 320001446, plus padding = the table's 320001536
+  rows; the 90-row residual is padding). Not a bug.
+- pad_size in the merged HC linear: pad slot reserved, split discards it;
+  the fused HC path is env-gated OFF (verified twice) — pad never consumed.
+- MTP draft keys (14): no collision with target layers (the orig_to_new
+  prefix remap does not touch mtp.*); ignored when spec config is absent.
+- act-mask firing: proven at runtime by the bisect diag (192 = 48 layers
+  × 4 ranks fired inside the owned-mask block); the env-gated log has
+  since been stripped from the commit — the proof stands.
+- hc_head: DS4f-only surface (applied at deepseek_v4 model.py:1168).
+  Flash-Next ships zero hc_head_* keys — its 100 hc_* keys are the
+  hyper-connection mixer family, fully wired and consumed.
