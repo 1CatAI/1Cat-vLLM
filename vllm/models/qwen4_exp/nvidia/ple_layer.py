@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+    pad_vocab_size,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
@@ -470,6 +471,8 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         if prepare_accelerator_weight is not None:
             prepare_accelerator_weight()
 
+_Exl3EmbeddingMethod: type | None = None
+
 
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
@@ -479,8 +482,116 @@ def _get_ple_embedding_quant_method(
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
 
+def _ngram_spec_from_checkpoint(prefix: str) -> dict | None:
+    """Derive the EXL3 n-gram table spec from the checkpoint shard header.
+
+    The worker's Exl3Config is built from config.json's inline
+    quantization_config, which lacks the packed-table ledger — so the
+    plugin's tensor_storage derivation never runs. Rebuild the spec from
+    the packed trellis geometry: rows = the fork's padded n-gram vocab,
+    num_heads = the fork's head count, bits = the K whose packed row
+    width matches the trellis tensor's second dim (read from the
+    safetensors header — no tensor data is loaded).
+    """
+    import json
+    import struct
+
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config().model_config.hf_config
+    text_config = getattr(config, "text_config", config)
+    # The packed table's row count is the SUM of the per-head prime vocab
+    # sizes, padded to the divisor — replicate the embedding's own
+    # computation (it pads the accumulated offset, not the base).
+    base = text_config.ngram_vocab_size_base
+    heads = (text_config.ngram_size - 1) * text_config.heads_per_ngram
+    if heads <= 0:
+        return None
+    ple_dense_layer_id = 0
+    sizes = [
+        _nth_prime_after(base - 1, ple_dense_layer_id * heads + local + 1)
+        for local in range(heads)
+    ]
+    unpadded_total = sum(sizes)
+    divisor = int(text_config.make_ngram_vocab_size_divisible_by)
+    padded_vocab = ((unpadded_total + divisor - 1) // divisor) * divisor
+    # Row width: ple_embed_dim split across heads (160 for this pack) —
+    # independent of the padded vocab row count.
+    ple_embed_dim = text_config.ple_embed_dim
+    if ple_embed_dim % heads:
+        return None
+    head_dim = ple_embed_dim // heads
+    # Locate the shard holding the packed table next to the model config.
+    model_dir = get_current_vllm_config().model_config.model
+    if not os.path.isdir(model_dir):
+        return None
+    shard = os.path.join(model_dir, "ngram_embedding.safetensors")
+    if not os.path.isfile(shard):
+        return None
+    trellis_key = None
+    with open(shard, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        if key.endswith(".ngram_embedding.trellis"):
+            trellis_key = key
+            break
+    if trellis_key is None:
+        return None
+    shape = header[trellis_key]["shape"]
+    if len(shape) != 2:
+        return None
+    rows, words = int(shape[0]), int(shape[1])
+    row_dim = head_dim // heads if False else head_dim
+    del row_dim
+    # words = 1 scale word + row_dim * bits // 16 ring words, row_dim = 160.
+    bits = None
+    for k in range(1, 9):
+        if (1 + (head_dim * k) // 16) == words and (head_dim * k) % 16 == 0:
+            bits = k
+            break
+    if bits is None or rows != padded_vocab:
+        return None
+    return {
+        "bits": bits,
+        "num_shards": 1,
+        "rows_per_shard": rows,
+        "num_heads": heads,
+        "modules": ["ngram_embedding"],
+    }
+
+
+def _get_ple_embedding_quant_method(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    *,
+    force_fp8_storage: bool = False,
+) -> QuantizeMethodBase | None:
+    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
     if force_fp8_storage:
         return Qwen4ExpPLEFp8EmbeddingMethod()
+    # EXL3 packs ledger the packed n-gram table under tensor_storage; the
+    # plugin's Exl3EmbeddingMethod owns that format (packed trellis rows +
+    # head_bias/head_offsets/head_vocab_sizes/layer_multipliers aux).
+    exl3_spec = getattr(quant_config, "_ngram_embedding_spec", None)
+    if exl3_spec is not None:
+        spec = exl3_spec(prefix)
+        if spec is None:
+            # The worker's Exl3Config is built from config.json's INLINE
+            # quantization_config (get_quant_config prefers hf_config over the
+            # sidecar file), which lacks tensor_storage — so the plugin's
+            # derivation never ran. Rebuild the spec from this checkpoint's
+            # packed-table geometry instead: rows/heads come from the model
+            # config, bits from the trellis row width in the shard header.
+            spec = _ngram_spec_from_checkpoint(prefix)
+        if spec is not None:
+            global _Exl3EmbeddingMethod
+            from vllm_exl3.exl3 import Exl3EmbeddingMethod as _EM
+
+            _Exl3EmbeddingMethod = _EM
+            return _EM(quant_config, spec)
     if not isinstance(quant_config, Fp8Config):
         return None
     if not quant_config.is_checkpoint_fp8_serialized:
@@ -1322,6 +1433,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
             if getattr(self, "_disk_offload", False):
                 self._disk_embedding_lookup(ngram_ids, embedding_output)
+            elif isinstance(
+                getattr(self.ngram_embedding, "quant_method", None),
+                _Exl3EmbeddingMethod,
+            ):
+                # The EXL3 n-gram table is trellis-packed; the plugin's
+                # method gathers packed rows and decodes them on the fly.
+                embedding_output.copy_(
+                    self.ngram_embedding.quant_method.embedding(
+                        self.ngram_embedding, ngram_ids
+                    ).reshape(embedding_output.shape)
+                )
             else:
                 torch.index_select(
                     self.ngram_embedding.weight,
@@ -1386,9 +1508,25 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
 
+        embedding_method = getattr(self.ngram_embedding, "quant_method", None)
+        exl3_table = (
+            embedding_method is not None
+            and _Exl3EmbeddingMethod is not None
+            and isinstance(embedding_method, _Exl3EmbeddingMethod)
+        )
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                continue
+            if exl3_table and name.startswith("ngram_embedding."):
+                # The EXL3 n-gram table registers its params on the embedding:
+                # the packed table lives under shard_<i>.trellis while the
+                # checkpoint ships a single unsharded trellis tensor — bridge
+                # the name so AutoWeightsLoader routes it to the shard param.
+                leaf = name.rsplit(".", 1)[-1]
+                if leaf == "trellis":
+                    name = name.replace(".trellis", ".shard_0.trellis")
+                regular_weights.append((name, loaded_weight))
                 continue
             if name in persistent_buffers:
                 buffer = persistent_buffers[name]

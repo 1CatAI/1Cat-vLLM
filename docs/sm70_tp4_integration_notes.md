@@ -1532,3 +1532,70 @@ routes the tensors to the loader.
   matches; (3) decode-at-load via the plugin's ngram_dequant_rows_torch
   (pure-torch oracle) or the ext kernel, feeding the existing dense
   host lookup path unchanged.
+
+### Flat-garbage component bisect (complete — no component-level bug found)
+
+Session-long A/B and instrumentation campaign on the Flash-Next flat-garbage
+signature (greedy output flat-fragment tokens, top-5 logprobs within 0.5-1.2
+nats at -6..-9, argmax landing on token 0 = '!' under tie-break). Every
+component was probed and found self-consistent:
+
+- **Router**: logits selective (top-10 softmax mass 0.0435 pre-renorm over
+  512 experts), healthy spread. Fused E512/K10 top-k path A/B'd against
+  legacy — identical garbage.
+- **Routed experts**: live post-load weight norms match checkpoint-derived
+  values exactly (w_gate 728/728, w_down 735/735 per-rank). Offline expert
+  forward (reconstruct + GEMM chain) healthy (out norm 61070 for
+  embedding-scale input). Live routed gain 14.3 vs shared-expert gain 13.9 —
+  consistent.
+- **Shared expert**: live shard weights healthy; forward chain internally
+  consistent (down out 1474 * sigmoid gate 0.53 = 781 ~ measured 700).
+  Per-rank partial differences are channel variance, not corruption.
+- **HC hyper-connection wiring**: model-level mixer + per-layer
+  attn/mlp_hyper_connection all wired; 398 hyper/mhc checkpoint keys
+  accounted for (48 target layers x 8 + MTP draft 8 + mixers 6); hc_norm
+  consumed in both fused and common paths; block_inject consumed via
+  merged slot 1; nvidia fused kernels faithful to the common reference
+  (hc_silu x/HC, hc_gate_mix mean, combine 2*sigmoid(inj/HC)).
+- **Final mixer gate**: selective, not uniform (per-stream mean gate
+  [0.42, 0.30, 0.018, 0.086]).
+- **Full-attention layers** (3, 7, ...): healthy — attention gain 0.8,
+  rotary orthogonal (q_norm 112.584 == rotary 112.584), indexer active.
+- **GDN linear-attention layers**: chunk output ~0.0092 — consistent with
+  the checkpoint's aggressive layer-0 decay gates (g mean -4.7/token,
+  min -49.3; exp(A_log) up to 16.9). Gating formula verified against the
+  transformers reference: g = -exp(A_log)*softplus(a + dt_bias),
+  beta = sigmoid(b); b-first/a-second split order matches the reference
+  `b, a = torch.split(...)` exactly. ba swap A/B changed g (110.5 -> 754.8)
+  proving sensitivity; original order retained.
+- **PLE**: multipliers exact match (splitmix64 seed formula reproduces
+  [23703573157769, 20109073645365, 8052911324071]); head_vocab_sizes exact
+  match (16 primes after 20000000); offsets cumulative; head_bias consumed
+  by the plugin's dequant (both ext and CPU fallback paths); table rows
+  validated at load. PLE-zero A/B: output unchanged (garbage either way).
+- **lm_head**: row 129216-equivalent checks normal; svh scales healthy;
+  recurring fragment tokens at 1.2-1.4 sigma (unremarkable).
+- **Embedding**: plain unquantized tensor, stock sharding, healthy norms.
+
+**Conclusion**: the flat-garbage is not a component-level bug in the fork
+or plugin. All components are individually self-consistent with the
+checkpoint's shipped values and the reference semantics. The failure must
+be in the residual-stream CONTENT (values, not magnitudes) — the next
+diagnostic step is a layer-by-layer comparison against a reference
+(transformers) forward on the same weights, or a re-examination of the
+EXL3 quantization of the original checkpoint (the quantizer's own
+architecture assumptions, e.g. HC stream order, could differ).
+
+### Indexer bits routing fix (plugin, this session)
+
+The `'indexer.'` name-family was added to the head_bits family for DS4f
+(whose indexer ships 80-wide trellis = 5bpw head_bits). Flash-Next packs
+its indexer at the GLOBAL bits (64-wide = 4bpw) — the family match routed
+it to head_bits=6 and crashed at load: `dest (160, 40, 96) != loaded
+(160, 40, 64)`. Fix in exl3.py: the indexer family now resolves from the
+checkpoint's actual packed width (`_resolve_indexer_bits_from_checkpoint`
+reads the safetensors header — trellis words/16 = bits — no tensor data),
+and the family clause is evaluated BEFORE the `_attn.` clause (which
+would otherwise swallow `self_attn.indexer.*` via substring match).
+Verified: Flash-Next indexer resolves 4 != 6 -> global bits; DS4f
+resolves 5 == 5 -> family applied. 8/8 routing-decision cases pass.
