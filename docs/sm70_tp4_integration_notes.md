@@ -1655,3 +1655,36 @@ Output correctness: unchanged flat-fragment signature (TEXT in the serve
 test matches the canonical garbage). Correctness remains the blocker for
 betterbench (numeric-quality scores would be meaningless on broken
 output) and for the >20 tok/s gate as a quality-adjusted target.
+
+### References pass + 27B diagnosis (2026-09-18, post-merge)
+
+vllm-exl3 merged with upstream 0.4.2 line (upstream tip 08ed1bf): 5
+conflict hunks resolved as semantic unions — upstream's 128-block-aligned
+MoE buffer scheme + act-mask wiring kept alongside our mixed-K flag and
+contiguous() fallthrough guard; embedding() keeps upstream's
+input_.is_cuda CPU-offload guard AND our disk-mode out-variant buffer;
+setup.py keeps our relative-path _src() helper (setuptools >=77).
+Merged plugin imports clean; merge commit f8a773f on main (ahead 12).
+Post-merge Flash-Next smoke still recommended before pinning behavior.
+
+Other trees fast-forwarded: exllamav3 (02aef45), ninfer-v100 (b37d0dd3),
+vllm (23e26e0588). graphsignal cloned into references/ (per user) for
+post-correctness profiling: sidecar CUPTI profiler, /signals JSON API on
+port 18259, graphsignal-run wrapper, --cuda-graph-trace node for
+per-kernel decode ranking. Sequenced AFTER correctness per user gate.
+
+**27B shard-layout mismatch diagnosed** (turboderp_Qwen3.8-27B-exl3_SC,
+"expected (128, 5120) but got (48, 5120)"): the checkpoint's
+quantization_config carries NO ignore marker for the linear_attn ba
+projections, so qwen3_5.py's _uses_split_gdn_input_projections returns
+False and create_ba_proj returns None — the ba rows fold into the fused
+in_proj_qkvz MergedColumnParallelLinear. The EXL3 method then pads the
+48-row ba shard to the next multiple of 128 (expected (128, 5120)) while
+the checkpoint ships unpadded (48, 5120) separate in_proj_a/b tensors.
+The qwen_gdn path avoids this by passing quant_config=None explicitly
+(qwen_gdn_linear_attn.py:2612 comment). Fix options: (a) fork-side —
+detect split projections structurally (separate in_proj_a/b tensor names
+in the checkpoint index) instead of relying on config markers; (b)
+pack-side — add the ignore marker when packing. Note the 27B is dense
+(no MoE), 64 layers x 5120 hidden, ~40 GB at 6.0bpw; the 48-row ba shard
+also needs the padded-geometry relaxation at TP4 (48 < 128 pad).
