@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 REPO = Path(__file__).resolve().parents[3]
 TOOL_PATH = REPO / "tools" / "qwen4_exp" / "qsa_kv_calibration.py"
 

@@ -29,6 +29,7 @@ from vllm.models.qwen4_exp.nvidia.qsa import (
 
 E4M3 = "fp8_e4m3"
 _MTP_SPEC = object()
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _configs(*, dtype=torch.float16, tp=4, spec=_MTP_SPEC):
@@ -106,7 +107,8 @@ def test_gate_non_e4m3_cache_is_noop(monkeypatch):
 # --------------------------------------------------------------------------- #
 # D2: strict draft-side scale validation lists the missing tensor names.
 # --------------------------------------------------------------------------- #
-def test_validate_scale_overlay_lists_missing_names():
+def test_validate_scale_overlay_lists_missing_names(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", True)
     required = {
         "model.layers.0.self_attn.k_scale",
         "model.layers.0.self_attn.v_scale",
@@ -190,7 +192,12 @@ def test_finalize_qsa_scale_load_success_and_missing(monkeypatch):
     stub2 = _make_qsa_stub(0.1, 0.2)
     container2 = _FakeModel(stub2)
     with pytest.raises(ValueError, match="Missing:.*self_attn"):
-        _finalize_qsa_e4m3_scale_load(container2, {"layers.0.self_attn.k_scale"}, E4M3)
+        _finalize_qsa_e4m3_scale_load(
+            container2,
+            {"layers.0.self_attn.k_scale"},
+            E4M3,
+            require_calibrated_speculative_draft=True,
+        )
 
 
 def test_finalize_qsa_scale_load_skips_offload_process(monkeypatch):

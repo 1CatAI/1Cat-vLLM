@@ -469,6 +469,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         sentinel and is marked finalized so nothing re-validates it.
         """
         set_default_quant_scales(self, register_buffer=False)
+        if hasattr(self, "k_scale"):
+            del self.k_scale
+        if hasattr(self, "v_scale"):
+            del self.v_scale
         self._qsa_kv_scales_finalized = True
 
     def validate_loaded_kv_scales(self) -> None:
