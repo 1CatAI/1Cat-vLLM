@@ -573,7 +573,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         # and on the PLE offload process (is_offload_process()).
         from .model import _finalize_qsa_e4m3_scale_load
 
-        _finalize_qsa_e4m3_scale_load(self, loaded_weights, self.model._kv_cache_dtype)
+        _finalize_qsa_e4m3_scale_load(
+            self,
+            loaded_weights,
+            self.model._kv_cache_dtype,
+            require_calibrated_speculative_draft=True,
+        )
         return loaded_weights
 
 

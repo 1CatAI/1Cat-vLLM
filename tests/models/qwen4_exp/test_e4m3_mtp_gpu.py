@@ -199,7 +199,7 @@ def test_e4m3_verify_cuda_graph_replay(monkeypatch):
         **kwargs,
     ).clone()
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     captured = None
     with torch.cuda.graph(graph):
@@ -213,5 +213,5 @@ def test_e4m3_verify_cuda_graph_replay(monkeypatch):
             **kwargs,
         )
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     torch.testing.assert_close(captured.float(), eager.float(), atol=3e-2, rtol=3e-2)

@@ -13,12 +13,15 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 REPO = Path(__file__).resolve().parents[3]
 TOOL_PATH = REPO / "tools" / "qwen4_exp" / "qsa_kv_calibration.py"
 
 
 def _load_tool():
     spec = importlib.util.spec_from_file_location("qsa_kv_cal_tool", TOOL_PATH)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

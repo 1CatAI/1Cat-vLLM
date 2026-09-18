@@ -81,12 +81,12 @@ def test_e4m3_page4_workspace_capture_safe(rows, monkeypatch):
     qsa_ops._SM70_QSA_XQA_PAGE4_WORKSPACES.clear()
     qsa_ops._SM70_QSA_GROUPED_PAGE4_WORKSPACES.clear()
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = qsa_sparse_paged_attention(*args, **kwargs)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.isfinite(captured).all()
     torch.testing.assert_close(captured.float(), eager.float(), atol=3e-2, rtol=3e-2)

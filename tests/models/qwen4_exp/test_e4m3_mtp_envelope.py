@@ -16,14 +16,18 @@ from pathlib import Path
 
 import pytest
 
-MATERIALIZER = Path("/home/l/work/flash-next/dev-kv/tools/materialize_overlay.py")
-pytestmark = pytest.mark.skipif(
-    not MATERIALIZER.is_file(), reason="phase-2 materializer not present"
+MATERIALIZER = (
+    Path(__file__).resolve().parents[3]
+    / "tools"
+    / "qwen4_exp"
+    / "materialize_qsa_scale_overlay.py"
 )
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 def _load_mat():
     spec = importlib.util.spec_from_file_location("mtp_materializer", MATERIALIZER)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
