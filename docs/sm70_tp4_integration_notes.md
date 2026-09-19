@@ -1688,3 +1688,51 @@ in the checkpoint index) instead of relying on config markers; (b)
 pack-side — add the ignore marker when packing. Note the 27B is dense
 (no MoE), 64 layers x 5120 hidden, ~40 GB at 6.0bpw; the 48-row ba shard
 also needs the padded-geometry relaxation at TP4 (48 < 128 pad).
+
+### Merge-restoration session (post-run-110, this session)
+
+Merged-tree legacy MoE path repaired (plugin commits bebfa8b, 6378eb7,
+f4e321f on main after f8a773f merge). Merge-direction verification
+(f8a773f parents: 08ed1bf first, c0ab9eb second) flipped the earlier
+attribution: the block-aligned copy-TRUE + act_mask scheme is the FORK's
+(run-110-era, act_mask absent from origin/main); upstream contributes
+the arena/direct-fill staging and the 74191ec tile validation. The
+post-merge file ran upstream's validation + arena fallback on the
+legacy path, producing three distinct failures:
+
+- identity geometry: arena fallback staged every expert on host (52k
+  staging-fallback warnings, load crawl, timeout kill);
+- aligned geometry: the 74191ec validation rejected the narrowed
+  10-tile shard against the aligned 16-tile attr before the fork's
+  copy-TRUE branch could fill the aligned dest;
+- arena default ON (VLLM_EXL3_TRELLIS_ARENA defaults 1) gated the
+  validation to the path that always ran.
+
+Fixes: arena staging + tile validation gated behind use_arena; ALIGNED
+maybe_roundup restored (revert of ed6bfa7's identity restore); legacy
+trellis alloc now fills the block-aligned 16-tile window from the
+un-narrowed checkpoint tensor (zeros pre-fill dropped — the window IS
+the payload; w13 col path kt range on dim 1). Legacy path requires
+VLLM_EXL3_TRELLIS_ARENA=0 in the smoke env.
+
+Validation: smoke10 load clean (144 s, zero staging fallbacks).
+CPU/GPU repro of the full rank-0 apply pipeline (down + gate windows,
+aligned scales, act-mask) against the un-sharded reference: max diff
+0.0 (down) / 1.5e-6 rel (apply) — exact.
+
+Fused-path bisect (all TP4, deterministic output):
+- stock config → garbage
+- router topk OFF → garbage
+- GDN prefill Triton → garbage
+- FlashQLA decode OFF → garbage
+- shared-gate + lm_head top1 OFF → garbage (TEXT identical to stock)
+
+Identical TEXT across all toggles: the corruption sits in a path common
+to all runs and predates the merge — consistent with run-110's
+documented residual-stream corruption (flat-fragment signature,
+near-uniform step-0 logprobs). This session's changes introduce no
+regression; the load pipeline is restored and the MoE apply is verified
+exact. Output correctness remains blocked on the run-110 open problem;
+next diagnostic unchanged: layer-by-layer reference forward anchored at
+layer-0 block_input. Throughput at max_num_seqs=4 single-request:
+3.17 tok/s decode (unchanged from run-110-era measurements).
