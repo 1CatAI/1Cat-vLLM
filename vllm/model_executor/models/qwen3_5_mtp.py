@@ -34,6 +34,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
@@ -196,31 +197,27 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_input_ids(input_ids)
-            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        # The drafter is stage-local, so this module is always a complete
+        # model: gpu_model_runner returns the IntermediateTensors on every
+        # non-final pipeline rank before speculation is reached, and the MTP
+        # layers here are replicated rather than partitioned. Branching on the
+        # TARGET model's pipeline position sent the final rank into the
+        # "receive from the previous stage" path and asserted on intermediate
+        # tensors that nobody sends.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[current_step_idx](
             positions=positions,
             hidden_states=hidden_states,
-            residual=residual,
+            residual=None,
         )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -434,7 +431,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -505,10 +502,16 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
 
         super().__init__()
         self.config = config
+        # The target's embedding only lives on the first pipeline rank, and
+        # load_eagle_model skips embedding sharing under PP. A shared (missing)
+        # embedding would stay a PPMissingLayer on the drafter's rank, so the
+        # drafter builds and loads its own copy there.
         self.model = Qwen3_5MultiTokenPredictor(
             vllm_config=mtp_vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
-            share_target_embed_tokens=self.share_target_io_weights,
+            share_target_embed_tokens=(
+                self.share_target_io_weights and get_pp_group().world_size == 1
+            ),
         )
 
         if get_pp_group().is_last_rank:
@@ -527,6 +530,9 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(
         self,
