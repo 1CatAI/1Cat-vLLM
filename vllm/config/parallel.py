@@ -974,6 +974,20 @@ class ParallelConfig:
                 "Disabled the custom all-reduce kernel because it is not "
                 "supported on current platform."
             )
+        if self.tensor_parallel_size == 2 and current_platform.is_device_capability(70):
+            # SM70 (Volta) TP=2 hangs in the generic custom all-reduce
+            # kernel: both ranks spin forever at the first TP all-reduce
+            # during warmup (100% GPU util at ~47 W, no forward progress,
+            # non-converging CUDA-graph capture). Reported in #652
+            # (2x V100 PCIe) and reproduced on 2x V100 SXM2 with NVLink.
+            # TP=4 and TP=8 keep custom all-reduce: they dispatch through
+            # the SM70-native push all-reduce paths (#605), which do not
+            # use the broken TP=2 kernel.
+            self.disable_custom_all_reduce = True
+            logger.debug(
+                "Disabled the custom all-reduce kernel for SM70 with "
+                "TP=2; falling back to NCCL."
+            )
         if self.nnodes > 1:
             self.disable_custom_all_reduce = True
             logger.debug(
