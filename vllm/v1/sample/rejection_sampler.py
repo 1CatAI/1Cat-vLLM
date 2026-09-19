@@ -15,7 +15,10 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.v1.sample.logits_processor.builtin import (
+    MinPLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
@@ -132,7 +135,18 @@ def _parse_step_filter(raw_steps: str | None) -> set[int] | None:
 def _token_matching_processor_safe(processor: object) -> bool:
     if isinstance(processor, MinTokensLogitsProcessor):
         return not processor.min_toks
+    if isinstance(processor, MinPLogitsProcessor):
+        # Its apply() is shaped per request, token matching samples per token.
+        return not processor.min_p_count
     return False
+
+
+def _combined_bonus_processor_safe(processor: object) -> bool:
+    # apply_sampling_constraints covers min_p for every sampled position, the
+    # bonus one included, so an active min_p keeps the fast path.
+    if isinstance(processor, MinPLogitsProcessor):
+        return True
+    return _token_matching_processor_safe(processor)
 
 
 def _token_matching_sampling_enabled(
@@ -182,14 +196,9 @@ def _combined_bonus_sampling_enabled(
     holder = sampling_metadata.thinking_budget_state_holder
     if holder is not None and holder.has_tracked_requests():
         return False
-    if any(
-        not _token_matching_processor_safe(processor)
-        for processor in sampling_metadata.logitsprocs.argmax_invariant
-    ):
-        return False
-    return not any(
-        not _token_matching_processor_safe(processor)
-        for processor in sampling_metadata.logitsprocs.non_argmax_invariant
+    return all(
+        _combined_bonus_processor_safe(processor)
+        for processor in sampling_metadata.logitsprocs.all
     )
 
 
@@ -1108,6 +1117,7 @@ def apply_sampling_constraints(
     )
     # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.
     logits.div_(temperature.unsqueeze(-1))
+    apply_min_p(logits, cu_num_draft_tokens, sampling_metadata)
 
     # Get expanded top_k and top_p tensors.
     top_k = None
@@ -1128,6 +1138,25 @@ def apply_sampling_constraints(
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
     return apply_top_k_top_p(logits, top_k, top_p)
+
+
+def apply_min_p(
+    logits: torch.Tensor,  # [num_tokens, vocab_size]
+    cu_num_tokens: torch.Tensor,  # [batch_size]
+    sampling_metadata: SamplingMetadata,
+) -> None:
+    """Drop, in place, every token whose probability is below min_p times the
+    most likely token's. Same place in the order as the regular sampler: after
+    the temperature, before top-k and top-p. In logit space the cut is
+    max_logit + log(min_p); a request without min_p gets log(0) = -inf and
+    loses nothing."""
+    for processor in sampling_metadata.logitsprocs.argmax_invariant:
+        if isinstance(processor, MinPLogitsProcessor) and processor.min_p_count:
+            min_p = expand_batch_to_tokens(
+                processor.min_p.squeeze(1), cu_num_tokens, logits.shape[0]
+            )
+            threshold = logits.amax(dim=-1, keepdim=True) + min_p.log().unsqueeze(-1)
+            logits.masked_fill_(logits < threshold, float("-inf"))
 
 
 def expand_batch_to_tokens(
