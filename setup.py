@@ -184,7 +184,7 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
 
     env = os.environ.copy()
     env["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
-        "FLASH_ATTN_V100_CUDA_ARCH_LIST", "7.0"
+        "FLASH_ATTN_V100_CUDA_ARCH_LIST", "7.0;7.2"
     )
     subprocess.check_call(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
@@ -235,7 +235,7 @@ def bundle_precompiled_flash_attn_v100(build_lib: str) -> None:
 
 def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     """Precompile the SM70 GDN extension so runtime never requires NVCC."""
-    if not _cuda_arch_contains(7, 0):
+    if not (_cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2)):
         return
 
     src = FLASH_QLA_SM70_ROOT / "csrc" / "gdn_forward.cu"
@@ -247,7 +247,7 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     extension_build_dir = Path(build_temp) / "flash_qla_sm70_gdn_strided"
     extension_build_dir.mkdir(parents=True, exist_ok=True)
     previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0;7.2"
     try:
         extension = load_torch_extension(
             name="flash_qla_sm70_gdn_strided",
@@ -256,6 +256,7 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
             extra_cuda_cflags=[
                 "-O3",
                 "-gencode=arch=compute_70,code=sm_70",
+                "-gencode=arch=compute_72,code=sm_72",
             ],
             extra_cflags=["-O3"],
             with_cuda=True,
