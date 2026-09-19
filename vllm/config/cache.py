@@ -94,6 +94,13 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_cache_retention_interval: int | None = Field(default=0, ge=0)
+    """Token interval between retained Mamba prefix-cache checkpoints.
+    ``None`` keeps dense admission; ``0`` keeps replay and detected shared-prefix
+    boundaries; positive values additionally keep periodic checkpoints and must
+    be a multiple of the resolved cache-hit alignment. This backport applies to
+    aligned Mamba groups; other cache types keep their existing admission policy.
+    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -198,6 +205,7 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",
