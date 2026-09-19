@@ -1404,32 +1404,88 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return num_computed_tokens - 1
 
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int | None,
+        kv_cache_spec: KVCacheSpec,
+        retention_interval: int | None,
+        reachable_boundaries: Sequence[int] = (),
+    ) -> list[bool] | None:
+        """Adapt upstream #45845/#47782 retention to 1Cat's align-state layout."""
+        if retention_interval is None or alignment_tokens is None:
+            return None
+        assert isinstance(kv_cache_spec, MambaSpec)
+        block_size = kv_cache_spec.block_size
+        # Preserve the previous dense fallback for unproven mixed alignments.
+        if kv_cache_spec.mamba_cache_mode != "align" or alignment_tokens != block_size:
+            return None
+        mask = [False] * (end_block - start_block)
+        if retention_interval:
+            per_segment = retention_interval // block_size
+            if per_segment <= 1:
+                return None
+            first = (start_block + per_segment) // per_segment * per_segment - 1
+            for i in range(first - start_block, len(mask), per_segment):
+                mask[i] = True
+        for boundary in reachable_boundaries:
+            aligned = boundary // alignment_tokens * alignment_tokens
+            block = aligned // block_size - 1
+            if start_block <= block < end_block:
+                mask[block - start_block] = True
+        return mask
+
     def cache_blocks(
         self,
         request: Request,
         num_tokens: int,
         alignment_tokens: int | None = None,
+        *,
+        retention_interval: int | None = None,
+        replay_boundaries: Sequence[int] = (),
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
-        num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
-        if num_cached_blocks_after > num_cached_blocks_before:
-            blocks = self.req_to_blocks[request.request_id]
-            for block_idx in range(num_cached_blocks_before, num_cached_blocks_after):
-                block = blocks[block_idx]
-                if block.is_null:
-                    continue
-                assert block.block_hash is not None
-                self.cached_blocks_this_step.add(block.block_hash)
-                if self.mamba_cache_mode == "align":
-                    self._pending_boundary_state_offloads.append(
-                        (
-                            request.request_id,
-                            self.kv_cache_group_id,
-                            block,
-                            (block_idx + 1) * self.block_size,
-                        )
+        num_full_blocks = num_tokens // self.block_size
+        if num_cached_blocks_before >= num_full_blocks:
+            return
+        boundaries = list(replay_boundaries)
+        if boundary := getattr(request, "shared_prefix_boundary", 0):
+            boundaries.append(boundary)
+        mask = self.reachable_block_mask(
+            num_cached_blocks_before,
+            num_full_blocks,
+            alignment_tokens,
+            self.kv_cache_spec,
+            retention_interval,
+            boundaries,
+        )
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=self.req_to_blocks[request.request_id],
+            num_cached_blocks=num_cached_blocks_before,
+            num_full_blocks=num_full_blocks,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=mask,
+        )
+        self.num_cached_block[request.request_id] = num_full_blocks
+        blocks = self.req_to_blocks[request.request_id]
+        for block_idx in range(num_cached_blocks_before, num_full_blocks):
+            block = blocks[block_idx]
+            if block.is_null or block.block_hash is None:
+                continue
+            self.cached_blocks_this_step.add(block.block_hash)
+            if self.mamba_cache_mode == "align":
+                self._pending_boundary_state_offloads.append(
+                    (
+                        request.request_id,
+                        self.kv_cache_group_id,
+                        block,
+                        (block_idx + 1) * self.block_size,
                     )
+                )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()

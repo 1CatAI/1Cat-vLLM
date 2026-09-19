@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from typing import Literal
 
 from vllm.v1.kv_offload.base import (
@@ -9,9 +9,11 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingManager,
     OffloadKey,
+    OffloadPolicy,
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
@@ -242,3 +244,105 @@ class CPUOffloadingManager(OffloadingManager):
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+
+class GroupedCPUOffloadingManager(OffloadingManager):
+    """Independent group pools whose block IDs address disjoint CPU tensors.
+
+    A key only stores one KV group. Giving each group its own pool avoids
+    charging small groups for the largest shared GPU tensor layout. IDs may
+    repeat across groups; the GPU transfer spec carries the original group ID.
+    """
+
+    def __init__(self, managers: Mapping[int, OffloadingManager]):
+        self.managers = managers
+
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        contexts = [m.on_new_request(req_context) for m in self.managers.values()]
+        return RequestOffloadingContext(
+            policy=(
+                OffloadPolicy.REQUEST_LEVEL
+                if any(c.policy == OffloadPolicy.REQUEST_LEVEL for c in contexts)
+                else OffloadPolicy.BLOCK_LEVEL
+            )
+        )
+
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        for manager in self.managers.values():
+            manager.on_request_finished(req_context)
+
+    def shutdown(self) -> None:
+        for manager in self.managers.values():
+            manager.shutdown()
+
+    def _partition(self, keys: Collection[OffloadKey]) -> dict[int, list[OffloadKey]]:
+        groups: dict[int, list[OffloadKey]] = {}
+        for key in keys:
+            group_idx = get_offload_group_idx(key)
+            assert group_idx in self.managers
+            groups.setdefault(group_idx, []).append(key)
+        return groups
+
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
+        return self.managers[get_offload_group_idx(key)].lookup(key, req_context)
+
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        for group_idx, group_keys in self._partition(keys).items():
+            self.managers[group_idx].touch(group_keys, req_context)
+
+    def prepare_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> CPULoadStoreSpec:
+        block_ids: dict[OffloadKey, int] = {}
+        for group_idx, group_keys in self._partition(keys).items():
+            spec = self.managers[group_idx].prepare_load(group_keys, req_context)
+            assert isinstance(spec, CPULoadStoreSpec)
+            block_ids.update(zip(group_keys, map(int, spec.block_ids)))
+        return CPULoadStoreSpec([block_ids[key] for key in keys])
+
+    def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        for group_idx, group_keys in self._partition(keys).items():
+            self.managers[group_idx].complete_load(group_keys, req_context)
+
+    def prepare_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
+        block_ids: dict[OffloadKey, int] = {}
+        evicted_keys: list[OffloadKey] = []
+        for group_idx, group_keys in self._partition(keys).items():
+            output = self.managers[group_idx].prepare_store(group_keys, req_context)
+            if output is None:
+                # The scheduler advances every group's store cursor on success.
+                # Release only this call's new reservations so all groups retry.
+                # Already performed evictions are not undone; pre-existing
+                # in-flight stores must not be cancelled.
+                self.complete_store(list(block_ids), req_context, success=False)
+                return None
+            assert isinstance(output.store_spec, CPULoadStoreSpec)
+            block_ids.update(
+                zip(output.keys_to_store, map(int, output.store_spec.block_ids))
+            )
+            evicted_keys.extend(output.evicted_keys)
+        stored = [key for key in keys if key in block_ids]
+        return PrepareStoreOutput(
+            keys_to_store=stored,
+            store_spec=CPULoadStoreSpec([block_ids[key] for key in stored]),
+            evicted_keys=evicted_keys,
+        )
+
+    def complete_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        success: bool = True,
+    ) -> None:
+        for group_idx, group_keys in self._partition(keys).items():
+            self.managers[group_idx].complete_store(group_keys, req_context, success)
+
+    def take_events(self) -> Iterable[OffloadingEvent]:
+        for manager in self.managers.values():
+            yield from manager.take_events()
+
+    def reset_cache(self) -> None:
+        for manager in self.managers.values():
+            manager.reset_cache()
