@@ -1,8 +1,8 @@
 #ifndef FUSED_MMA_H
 #define FUSED_MMA_H
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ != 700)
-  #error "Volta WMMA: This header is for sm_70 ONLY! Compile with -arch=sm_70"
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700 || __CUDA_ARCH__ > 720)
+  #error "Volta WMMA: This header is for sm_70/sm_72 ONLY! Compile with -arch=sm_70 or -arch=sm_72"
 #endif
 
 #include <cuda_fp16.h>
