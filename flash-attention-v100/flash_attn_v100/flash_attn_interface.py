@@ -25,6 +25,12 @@ _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
+# Workspaces allocated while a CUDA graph capture is in flight have their
+# pointers baked into that graph. Replacing such a cache entry returns the
+# buffer to the shared graph memory pool, which then hands the very same block
+# to the next capture: two live graphs end up writing into one workspace.
+# Keep every capture-time allocation alive for the life of the process.
+_capture_retained_workspaces: list = []
 _grouped_verify_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
@@ -116,6 +122,13 @@ def _cuda_graph_capture_active() -> bool:
         return bool(is_capturing())
     except RuntimeError:
         return False
+
+
+def _retain_if_capturing(workspace):
+    """Pin a workspace that a CUDA graph capture is about to bake in."""
+    if _cuda_graph_capture_active():
+        _capture_retained_workspaces.append(workspace)
+    return workspace
 
 
 def _allocate_decode_workspace(
@@ -346,15 +359,17 @@ def _get_decode_workspace_for_plan(
         workspace is None
         or workspace.max_num_partitions < plan.workspace_num_partitions
     ):
-        workspace = _allocate_decode_workspace(
-            q,
-            batch_capacity=batch_capacity,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            max_num_partitions=_round_decode_partition_capacity(
-                plan.workspace_num_partitions
-            ),
-            partial_dtype=partial_dtype,
+        workspace = _retain_if_capturing(
+            _allocate_decode_workspace(
+                q,
+                batch_capacity=batch_capacity,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                max_num_partitions=_round_decode_partition_capacity(
+                    plan.workspace_num_partitions
+                ),
+                partial_dtype=partial_dtype,
+            )
         )
         if _can_cache_workspace(q):
             _decode_workspace_cache[key] = workspace
@@ -395,10 +410,12 @@ def _get_xqa_staged_rescale_workspace(
         else None
     )
     if workspace is None or workspace.size(2) < max_num_partitions:
-        workspace = torch.empty(
-            (batch_capacity, num_heads, max_num_partitions),
-            dtype=torch.float32,
-            device=q.device,
+        workspace = _retain_if_capturing(
+            torch.empty(
+                (batch_capacity, num_heads, max_num_partitions),
+                dtype=torch.float32,
+                device=q.device,
+            )
         )
         if _can_cache_workspace(q):
             _xqa_staged_rescale_workspace_cache[key] = workspace
