@@ -168,6 +168,8 @@ def _sm70_mhc_post_kernel(
                 + output_stream * comb_stride_j
             )
             value += mix * residual
+        # float16 store: saturate, see FP16_MAX in tilelang_kernels.py.
+        value = tl.clamp(value, -65504.0, 65504.0)
         tl.store(
             out_ptr
             + token_idx * out_stride_t
@@ -357,8 +359,9 @@ def _sm70_mhc_pre_norm_kernel(
     norm_weight = tl.load(
         norm_weight_ptr + hidden_offsets, mask=hidden_mask, other=0.0
     ).to(tl.float32)
-    # Match the upstream fused kernel's FP16 staging before RMSNorm scaling.
-    layer_input = layer_input.to(tl.float16).to(tl.float32)
+    # No float16 staging of the unnormalized sum: an attention-sink row adds
+    # up past 65504 here although its normalized value is small. The fused
+    # tilelang kernel stashes it in float32 under float16 for the same reason.
     layer_input = layer_input * norm_scale * norm_weight
     tl.store(
         layer_input_ptr + token_idx * output_stride_t + hidden_offsets,
