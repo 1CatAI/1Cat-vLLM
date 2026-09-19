@@ -2245,10 +2245,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       }
       __syncthreads();
       // W12: defensively zero K rows no query attends (see the V panel below).
-      // K NaN is already masked out of the scores by grouped_verify_key_visible,
-      // but zeroing keeps the loaded panel free of the null block's E4M3 NaN.
-      // Masks are visible after the __syncthreads() above; the one added inside
-      // publishes the zeros before grouped_verify_qk consumes shared_kv.
+      // K NaN is already masked out of the scores by
+      // grouped_verify_key_visible, but zeroing keeps the loaded panel free of
+      // the null block's E4M3 NaN. Masks are visible after the __syncthreads()
+      // above; the one added inside publishes the zeros before
+      // grouped_verify_qk consumes shared_kv.
       if constexpr (SPARSE_PAGE4) {
         for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
              idx += kGroupedVerifyThreads) {
