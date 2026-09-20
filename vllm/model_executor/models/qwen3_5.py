@@ -301,6 +301,40 @@ def _uses_split_gdn_input_projections(
     return False
 
 
+def _checkpoint_ships_split_gdn_projections(
+    model_config: object,
+) -> bool:
+    """Structural fallback for the config-marker detection above.
+
+    Some EXL3 checkpoints quantize the fused in_proj_qkvz group but ship
+    the b/a projections as separate unquantized tensors WITHOUT any ignore
+    marker in quantization_config (the quantizer omits them because they
+    are not quantized). The weight names are the ground truth: if the
+    checkpoint ships separate linear_attn.in_proj_a/b tensors, the fused
+    qkvz/ba layout would pad the b/a rows into the quantized group and
+    mismatch the checkpoint shapes.
+    """
+    try:
+        model_path = getattr(model_config, "hf_config_path", None) \
+            or getattr(model_config, "model", None)
+        if not model_path:
+            return False
+        import json
+        import os
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        if not os.path.isfile(index_path):
+            return False
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        return any(
+            key.endswith("linear_attn.in_proj_a.weight")
+            or key.endswith("linear_attn.in_proj_b.weight")
+            for key in weight_map
+        )
+    except Exception:
+        return False
+
+
 def _get_default_sm70_dense_force_suffixes(tp_size: int) -> set[str]:
     # 0.0.3 enabled the SM70 f16 dense fast path for the narrow dense
     # Qwen3.5 projection pair. Keep the set intentionally small; broader
@@ -343,10 +377,21 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
     """
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.use_split_input_projections = _uses_split_gdn_input_projections(
-            self.quant_config
+        # Base __init__ calls create_qkvz_proj/create_ba_proj, so the flag
+        # must exist before super().__init__(). Both quant_config and
+        # model_config are reachable through vllm_config (gdn/base.py:39-41).
+        vllm_config = kwargs.get("vllm_config") or next(
+            (a for a in args if hasattr(a, "quant_config")), None
         )
+        self.use_split_input_projections = (
+            _uses_split_gdn_input_projections(
+                getattr(vllm_config, "quant_config", None)
+            )
+            or _checkpoint_ships_split_gdn_projections(
+                getattr(vllm_config, "model_config", None)
+            )
+        )
+        super().__init__(*args, **kwargs)
 
     def create_qkvz_proj(
         self,
@@ -362,7 +407,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             value_dim,
             value_dim,
         ]
-        if not _uses_split_gdn_input_projections(quant_config):
+        if not self.use_split_input_projections:
             output_sizes.extend([self.num_v_heads, self.num_v_heads])
         return MergedColumnParallelLinear(
             input_size=hidden_size,
@@ -372,6 +417,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             prefix=prefix,
         )
 
+
     def create_ba_proj(
         self,
         hidden_size: int,
@@ -379,14 +425,19 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> MergedColumnParallelLinear | None:
-        if not _uses_split_gdn_input_projections(quant_config):
+        if not self.use_split_input_projections:
             return None
+        # The ba checkpoint tensors are unquantized (plain F16, unpadded):
+        # EXL3 must not claim this layer (its padded-geometry loader rejects
+        # unpadded shards and pads 48 rows to 128), so quant_config is always
+        # None here and the vanilla UnquantizedLinearMethod handles it.
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[num_v_heads] * 2,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=prefix,
+            disable_tp=self.maybe_disable_tp(quant_config),
         )
 
     def forward_cuda(
