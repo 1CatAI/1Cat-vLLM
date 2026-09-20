@@ -756,6 +756,13 @@ class Qwen3_5Model(Qwen3NextModel):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
+        import os as _os
+        if _os.environ.get("VLLM_EXL3_RESOLVER_DEBUG"):
+            _sample = sorted(k for k in params_dict if "layers.0.linear_attn" in k)[:6]
+            _sample += sorted(k for k in params_dict if "layers.0.mlp" in k)[:4]
+            print(f"[qwen3_5-params] self={type(self).__name__} n={len(params_dict)}", flush=True)
+            for _k in _sample:
+                print(f"[qwen3_5-params]   {_k}", flush=True)
         has_split_ba_proj = any(
             ".linear_attn.in_proj_ba." in name for name in params_dict
         )
@@ -803,6 +810,7 @@ class Qwen3_5Model(Qwen3NextModel):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
 
             if name.startswith("mtp."):
                 continue
