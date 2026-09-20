@@ -229,6 +229,10 @@ class SimpleCPUOffloadWorker:
                 )
             # Launch stores (GPU->CPU).
             if metadata.store_gpu_blocks:
+                # The copy reads the live KV cache, which the compute stream is
+                # still writing: order the transfer stream behind it first.
+                assert self.store_stream is not None
+                self.store_stream.wait_stream(torch.cuda.current_stream())
                 self._backend.launch_copy(
                     metadata.store_gpu_blocks,
                     metadata.store_cpu_blocks,
