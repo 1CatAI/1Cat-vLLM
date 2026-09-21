@@ -128,10 +128,14 @@ def preprocess_mamba_align_fused_kernel(
     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)
     crossed_boundary = (state_idx >= 0) & (state_idx != new_state_idx)
+    # Ordinary one-token decode reads the canonical recurrent state. After a
+    # speculative step, materialize the accepted slot there even if the request
+    # stays in the same Mamba block; the non-spec kernels cannot select it.
+    single_token_tail = (query_end - query_start == 1) & (token_bias > 0)
     tl.store(
         num_accepted_tokens_ptr + req_indices,
         1,
-        mask=mask & crossed_boundary,
+        mask=mask & (crossed_boundary | single_token_tail),
     )
 
 
@@ -149,6 +153,7 @@ def _precopy_mamba_align_kernel(
     state_conv_widths_ptr,
     state_group_indices_ptr,
     idx_mapping_ptr,
+    query_start_loc_ptr,
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
@@ -164,9 +169,12 @@ def _precopy_mamba_align_kernel(
 
     src_col = tl.load(src_col_ptr + req_idx)
     dst_col = tl.load(state_idx_ptr + req_idx)
-    if src_col < 0 or src_col == dst_col:
-        return
     token_bias = tl.load(token_bias_ptr + req_idx)
+    query_start = tl.load(query_start_loc_ptr + batch_idx)
+    query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    single_token_tail = query_end - query_start == 1 and token_bias > 0
+    if src_col < 0 or (src_col == dst_col and not single_token_tail):
+        return
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
@@ -258,6 +266,7 @@ def run_mamba_align_precopy(
     src_col: torch.Tensor,
     token_bias: torch.Tensor,
     idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
@@ -275,6 +284,7 @@ def run_mamba_align_precopy(
         ctx.state_conv_widths,
         ctx.state_group_indices,
         idx_mapping,
+        query_start_loc,
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
