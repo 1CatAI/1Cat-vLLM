@@ -190,6 +190,8 @@ memory0.85. Native workspace profiling is logged in both. Model/cache/graph
 memory for TP1 is19.67/3.03/0.65 GiB, with71493 token cache capacity (the initial
 32K launch); TP2 cache is12.21 GiB/762956 tokens and graph memory1.84 GiB.
 The initial TP1 cache estimate supported a64K retry, which starts and serves.
+That final64K launch retains3.03 GiB cache memory, reports82782 effective
+cache tokens, and captures1.04 GiB of graphs.
 
 Natural-EOS cold retrieval passes on TP1 at64000 input tokens (TTFT83.182s)
 and TP2 at256000 (TTFT213.286s). Both return all four expected values and stop
