@@ -12,12 +12,15 @@ Integration: `onecat/main`. Base: `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`.
 Owned branch/worktree: `codex/v100-tp-generalize-20260921-021932` /
 `worktrees/v100-tp-generalize-20260921-021932`.
 
-## Latest acceptance state: full FP32 candidate, 2026-09-21
+## Quality investigation; promotion remains pending, 2026-09-21
 
-This PR remains a draft. Removing TP-size admission gates is implemented, but
-blanket default promotion is not accepted. In particular, full QK/PV FP32 is
-currently 70-71T, below the requested 75T minimum. The earlier 75T measurement
-must not be attributed to full FP32 accumulation.
+PR666 remains a draft. The [paired output audit](sm70_tp_quality_audit.md)
+records the96-item ON/OFF comparison, the repaired DFlash context-boundary
+failure, and the subsequent NVFP4 scale-rounding investigation. Do not promote
+the candidate on the strength of finite outputs or operator checks alone.
+The local-layout routes have no TP-size allowlist, but the candidate still
+needs output-quality acceptance. Full QK/PV FP32 currently measures70-71T;
+the75T target remains open. The earlier75T measurement used FP16 QK.
 
 | Check | Current evidence | Outstanding |
 | --- | --- | --- |
@@ -25,7 +28,7 @@ must not be attributed to full FP32 accumulation.
 | QK and PV accumulation | Both FP32 in candidate r8; FP16 inputs/intermediates/output | Recover 75T without reducing precision |
 | TP1 | Default no-DFlash64K, cold retrieval and C1-C32 requests pass | DFlash2/8192-token profiling still exceeds memory |
 | TP2, 256K | Full-FP32 default no-DFlash cold retrieval and C1-C32 pass | DFlash2 shared-layout r5 remains earlier QK arithmetic |
-| TP4 27B + DFlash2, 256K | r8 completes96 quality items, cold256K and C1-C32 bench | C16/C32 queue; matched quality baseline remains separate |
+| TP4 27B + DFlash2, 256K | r8 completes96 quality items, cold256K and C1-C32 bench | C16/C32 queue; matched audit: see linked report |
 | Actual simultaneous decode | TP2 r5 C2/C4 measured; C8 queues | Do not relabel queued C8-C32 as resident decode |
 | Shared QPN2 weight default | Operator equivalence passes | Paired model quality before changing default |
 | 35B-A3B AWQ/FP8 migration target | No matching model found locally | Matched baseline still required; not claimed here |

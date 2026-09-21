@@ -4,24 +4,41 @@ Date: 2026-05-30
 
 ## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
 
-Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see
-[implementation and live validation log](sm70_tp_shape_coverage.md). The
-candidate replaces TP allowlists with local layout capabilities and passes
-256K operator/CUDA Graph checks. It is **not accepted on main**. The precision
-audit found the inherited75T recipe accumulated QK in FP16; full QK/PV FP32
-candidate r8 measures70-71T, below the75T target. TP2 r5 passes cold256K and
-natural-EOS retrieval but uses the inherited QK arithmetic. C8-C32 TP2 client
-requests queue behind4 resident sequences and are not simultaneous decode
-evidence. TP4 r8 completes96 quality items, cold256K (2511tok/s estimated prefill)
-and C1-C32 bench on GPU4-7. It reaches13 resident sequences; C16/C32 queue.
-GPU0-3 belongs to another task. TP1 27B+DFlash2 weights load after the missing
-placeholder fix, but chunk8192 profiling exceeds memory. Fresh final-capability no-DFlash TP1/TP2 services pass cold64K/256K retrieval
-and C1-C32 bench; TP1 reaches9 resident sequences, TP2 reaches32. TP2 C2
-first-use sampling compilation is retained separately from a warmed-kernel,
-cold-prefix repeat. The missing matched
-35B-A3B AWQ/FP8 evidence is still required for migration acceptance. Do not
-repeat the rejected smaller-PV-tile or cuBLAS layout/algorithm screens; the
-design note records the retained results and invalid benchmark exclusions.
+Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see the
+[implementation and speed evidence](sm70_tp_shape_coverage.md) and
+[paired quality audit](sm70_tp_quality_audit.md). Default dispatch follows local
+head/matrix layout rather than TP1/TP2/TP4 allowlists. Promotion is paused
+for the quality investigation below. QK and PV accumulate in
+FP32, measuring70-71T;75T remains open. Do not attribute the older FP16-QK
+75T result to full FP32.
+
+The paired96-item audit completes without truncation: OFF/ON scores are
+GSM8K30/30, MATH50032/32 and MBPP26/25. The small difference does not establish
+statistical equivalence. Three deterministic discordant-case diagnostics also
+retain all failures. Both modes shared an exact-capacity DFlash failure;
+commit316e04a1ec materializes accepted Mamba state before a single-token tail.
+The original262128-input request now returns the correct16-token answer and
+naturally stops exactly at262144 total tokens. Eleven GPU state/graph checks pass.
+
+The follow-up isolates early greedy token differences to the projection
+accelerators: attention-only trajectories match the OFF control on all three
+short diagnostic probes. QPN2 prematurely rounds the global weight scale to
+FP16;12 checked real tensors have13-59% differing group scales. The repair
+matches the ordinary W4A16 effective weights and avoids rebias overflow.
+Twenty-four exact GPU cases pass; same-input FP64 audits put repaired QPN2
+and TurboMind at virtually identical error. The repaired32-item MBPP run
+scores23/32, versus25/32 for the fresh matched OFF control. All64 outputs
+finish naturally. This is not quality acceptance. Do not build another wheel;
+the user requested source/kernel diagnosis and repair instead.
+
+Earlier full-FP32 TP4 DFlash results include cold256K prefill about2511tok/s and
+C1-C32 client completion, with13 resident sequences. No-DFlash TP1/TP2 pass
+cold64K/256K and C1-C32; TP2 reaches32 resident sequences. TP1 27B+DFlash2 still
+exceeds chunk8192 profiling memory, and TP2 DFlash/256K needs the unpromoted
+shared-weight layout. These limits are not erased by removing TP gates.
+The missing matched35B-A3B AWQ/FP8 evidence remains a migration requirement;
+this PR does not claim that migration is complete. Rejected tuning and invalid
+measurements remain in the design note; do not repeat them without a new cause.
 
 ## Mamba state grid decoupled from the KV block size, 2026-09-17
 
