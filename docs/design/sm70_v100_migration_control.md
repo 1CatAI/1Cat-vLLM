@@ -12,7 +12,8 @@ audit found the inherited75T recipe accumulated QK in FP16; full QK/PV FP32
 candidate r8 measures70-71T, below the75T target. TP2 r5 passes cold256K and
 natural-EOS retrieval but uses the inherited QK arithmetic. C8-C32 TP2 client
 requests queue behind4 resident sequences and are not simultaneous decode
-evidence. TP4 r8 quality/long-context/concurrency is running on GPU4-7;
+evidence. TP4 r8 completes96 quality items, cold256K (2511tok/s estimated prefill)
+and C1-C32 bench on GPU4-7. It reaches13 resident sequences; C16/C32 queue.
 GPU0-3 belongs to another task. TP1 27B+DFlash2 weights load after the missing
 placeholder fix, but chunk8192 profiling exceeds memory. The missing matched
 35B-A3B AWQ/FP8 evidence is still required for migration acceptance. Do not

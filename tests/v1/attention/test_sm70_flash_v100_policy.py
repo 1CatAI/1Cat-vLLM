@@ -862,6 +862,7 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
         _vllm_fa2_C=SimpleNamespace(
             sm70_d256_gqa_architecture_fwd=architecture,
             sm70_d256_gqa_v37_fwd=architecture,
+            sm70_d256_gqa_accumulation_bits=lambda: 32,
         )
     )
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
@@ -873,6 +874,29 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
     monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", None)
 
     assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
+
+
+@pytest.mark.parametrize("bits", [None, 16, 32])
+@pytest.mark.parametrize("q8192", [False, True])
+def test_sm70_architecture_rejects_stale_accumulation(monkeypatch, bits, q8192):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    architecture = object()
+    native = SimpleNamespace(
+        sm70_d256_gqa_architecture_fwd=architecture,
+        sm70_d256_gqa_architecture_q8192_fwd=architecture,
+    )
+    if bits is not None:
+        native.sm70_d256_gqa_accumulation_bits = lambda: bits
+    monkeypatch.setattr(
+        flash_v100, "torch", SimpleNamespace(ops=SimpleNamespace(_vllm_fa2_C=native))
+    )
+    name = "_sm70_d256_gqa_architecture" + ("_q8192" if q8192 else "") + "_op"
+    monkeypatch.setattr(flash_v100, name, None)
+    monkeypatch.setattr(flash_v100, name + "_checked", False)
+    loader = getattr(flash_v100, "_get" + name)
+    assert loader() is (architecture if bits == 32 else None)
 
 
 def test_prefill_dense_splitkv3_workspace_reuses_exact_shape(monkeypatch):

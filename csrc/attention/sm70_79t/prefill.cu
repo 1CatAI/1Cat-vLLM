@@ -5803,6 +5803,19 @@ extern "C" cudaError_t onecat_sm70_d256_dense_state_raw(
 
 namespace FLASH_NAMESPACE {
 
+  #if PREFIX_TORCH_QUERY_TOKENS == 8192
+extern "C" int64_t onecat_sm70_q8192_accumulation_bits() {
+  #else
+extern "C" int64_t onecat_sm70_q8000_accumulation_bits() {
+  #endif
+  #if defined(PREFIX_QK_CUBLAS_FP32_ACCUM) && \
+      defined(PREFIX_PV_FP32_MMA_ACCUMULATE)
+  return 32;
+  #else
+  return 16;
+  #endif
+}
+
 struct Sm70GqaScoreWorkspace {
   at::Tensor scores;
   cudaEvent_t completion = nullptr;

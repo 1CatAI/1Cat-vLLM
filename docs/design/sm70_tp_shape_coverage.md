@@ -25,7 +25,7 @@ must not be attributed to full FP32 accumulation.
 | QK and PV accumulation | Both FP32 in candidate r8; FP16 inputs/intermediates/output | Recover 75T without reducing precision |
 | TP1 27B + DFlash2 | Loader placeholder fix passes; weights load | 8192-token profiling exceeds available memory |
 | TP2 27B + DFlash2, 256K | r5 cold 256K and natural-EOS retrieval pass | r5 uses QK FP16; not full-FP32 acceptance |
-| TP4 27B + DFlash2, 256K | r8 starts with default separate weights and full graphs | 96-item quality, long context and serving concurrency running |
+| TP4 27B + DFlash2, 256K | r8 completes96 quality items, cold256K and C1-C32 bench | C16/C32 queue; matched quality baseline remains separate |
 | Actual simultaneous decode | TP2 r5 C2/C4 measured; C8 queues | Do not relabel queued C8-C32 as resident decode |
 | Shared QPN2 weight default | Operator equivalence passes | Paired model quality before changing default |
 | 35B-A3B AWQ/FP8 migration target | No matching model found locally | Matched baseline still required; not claimed here |
@@ -75,6 +75,17 @@ dominate the workload; apparent tail duration includes scheduling overlap and
 is not the isolated compute time. Nsight Systems2022.4 lacks QdstrmImporter
 on this host; its raw capture is not claimed as a readable trace.
 
+### Compiled-library precision admission
+
+The native library now reports `sm70_d256_gqa_accumulation_bits()`, checking
+compile-time QK/PV flags in both Q8000 and Q8192 translation units. The Python
+loaders require32 for this architecture route. Missing/old FP16-QK libraries
+fall back to exact dense attention with a rebuild message; the independent
+v37 operator retains its admission. Eight loader-policy cases pass, and the
+rebuilt native library reports32. This adds capability reporting without
+changing r8 GPU arithmetic; running r8 servers keep their original mapped
+library. The replacement was installed atomically for fresh processes.
+
 ### Corrected TP2 r5 long context and concurrency
 
 r5 includes the captured-state fix and startup workspace profiling committed
@@ -103,6 +114,55 @@ The DFlash capture-size policy also had a separate16-request cap. It now
 includes verifier shapes through32 requests, independently of TP size; the
 TP4 startup confirms q8*C32=256 is captured. Sixteen focused policy checks
 pass. This fixes graph coverage, not memory capacity or scheduler residency.
+
+## TP4 r8 serving results, 2026-09-21 13:12 CST
+
+The full-FP32 TP4 configuration above completes96 sampled quality items:
+GSM8K28/32 (strict extractor), MATH50032/32 (`math-verify`0.9.0), and
+sanitized MBPP25/32 (all provided tests held out). MBPP initially has one
+32768-token cutoff; item164 is rerun with ceiling65536 and naturally stops
+at28149 tokens, still failing its assertions. Retain both records. Other
+items finish naturally. These are sample scores, not a matched regression
+comparison or proof of unchanged model quality. GSM8K item830 contains the
+correct1128 minutes reformatted as18h48m, which the strict extractor misses.
+
+Generated Python is evaluated in a subprocess with Landlock filesystem
+isolation, seccomp network/process restrictions and CPU/memory/time limits.
+All32 reference solutions pass the same evaluator. No model tests or expected
+outputs are included in MBPP prompts; the entry function signature is provided.
+Raw evidence: `tp4-default-qk32-r8-{gsm,math500,mbpp}32.jsonl`,
+`tp4-default-qk32-r8-longanswer-mbpp32.jsonl`,
+`mbpp32-reference-sandbox.json`.
+
+Cold natural-EOS retrieval at32768/131072/256000 input tokens returns the
+four expected values each time and stops at16 output tokens. TTFT is
+7.612/39.673/100.595 seconds. Formal `vllm bench serve`256000/256 C1:
+TTFT101.955s, request104.716s, prefill estimate2510.91tok/s, complete-output
+2.445tok/s. Post-TTFT output rate92.35tok/s is a synthetic ignore-EOS result;
+DFlash mean accepted length is2.857. It is not directly comparable to the
+TP2 r5 result with accepted length6.071 or to natural-language decode.
+
+Cold `vllm bench serve`,2048 input and256 output tokens/request, random dataset,
+seed20260921+C, temperature0.7/top_p0.8/top_k20, no warmup/ready-check, prefix
+reset before each case:
+
+| Client concurrency | Total input | TTFT median(s) | TPOT median(ms) | Complete output(tok/s) | Request median(s) | Observed max resident |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 | 2048 | 0.523 | 3.260 | 188.877 | 1.354 | 1 |
+| C2 | 4096 | 0.788 | 7.818 | 173.392 | 2.781 | 2 |
+| C4 | 8192 | 1.828 | 8.889 | 232.275 | 3.718 | 4 |
+| C8 | 16384 | 2.990 | 18.130 | 238.556 | 7.159 | 8 |
+| C16 | 32768 | 4.844 | 30.052 | 248.126 | 13.652 | 13 |
+| C32 | 65536 | 11.364 | 29.056 | 267.356 | 20.891 | 13 |
+
+All requests complete with zero failures and zero observed prefix-cache hits.
+C16/C32 each incur one preemption/recompute and queue behind the cache-capacity
+limit. They are not32 simultaneous GPU decode. Full emitted-token common-window
+decode timings are being measured only for resident C2/C4/C8. TPOT is a
+per-request post-TTFT average; stream ITL is a DFlash chunk interval and is not
+inverted to obtain per-token throughput. Benchmark JSON and sampled residency
+are retained under `tp4-default-qk32-r8-cold-c*`; consolidated values are in
+`tp4-r8-serving-summary.json`.
 
 ## Acceptance and worklog
 

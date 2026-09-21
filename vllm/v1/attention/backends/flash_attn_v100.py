@@ -1380,6 +1380,17 @@ def _get_sm70_splitd_d256_ops():
     return _sm70_splitd_d256_ops
 
 
+def _sm70_gqa_has_fp32_accumulation() -> bool:
+    capability = getattr(torch.ops._vllm_fa2_C, "sm70_d256_gqa_accumulation_bits", None)
+    if capability is not None and capability() == 32:
+        return True
+    logger.warning_once(
+        "SM70 Q8000/Q8192 prefill requires rebuilt FA2 with FP32 QK and PV "
+        "accumulation; using exact dense prefill until the library is updated."
+    )
+    return False
+
+
 def _get_sm70_d256_gqa_architecture_op():
     """Load the optional SM70 GQA long-prefill architecture operator."""
     global _sm70_d256_gqa_architecture_op
@@ -1402,6 +1413,12 @@ def _get_sm70_d256_gqa_architecture_op():
         ):
             _get_sm70_splitd_d256_ops()
 
+        if (
+            not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            and not _sm70_gqa_has_fp32_accumulation()
+        ):
+            _sm70_d256_gqa_architecture_op = None
+            return None
         _sm70_d256_gqa_architecture_op = getattr(
             torch.ops._vllm_fa2_C,
             op_name,
@@ -1437,6 +1454,9 @@ def _get_sm70_d256_gqa_architecture_q8192_op():
     try:
         if not hasattr(torch.ops._vllm_fa2_C, op_name):
             _get_sm70_splitd_d256_ops()
+        if not _sm70_gqa_has_fp32_accumulation():
+            _sm70_d256_gqa_architecture_q8192_op = None
+            return None
         _sm70_d256_gqa_architecture_q8192_op = getattr(
             torch.ops._vllm_fa2_C,
             op_name,
