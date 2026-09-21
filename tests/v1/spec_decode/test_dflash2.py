@@ -269,10 +269,15 @@ def test_sm70_dflash2_verifier_contract_is_tp_and_quantization_independent(
     assert _is_sm70_dflash2_verifier_contract(*args)
 
 
-def test_sm70_dflash2_verifier_defaults_preserve_overrides(monkeypatch):
+@pytest.mark.parametrize(
+    "overridden_name",
+    ["VLLM_SM70_DFLASH2_QPN8_RERANK", "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS"],
+)
+def test_sm70_dflash2_verifier_defaults_preserve_overrides(
+    monkeypatch, overridden_name
+):
     for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
         monkeypatch.delenv(name, raising=False)
-    overridden_name = "VLLM_SM70_DFLASH2_QPN8_RERANK"
     monkeypatch.setenv(overridden_name, "0")
 
     applied = _apply_sm70_dflash2_verifier_defaults()

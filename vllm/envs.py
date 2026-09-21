@@ -2306,10 +2306,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
     ),
-    # Experimental fixed 8192/16-warp reduction for the FP16 no-residual and
+    # Fixed 8192/16-warp reduction for the FP16 no-residual and
     # FP16-residual Gemma norms not covered by the existing FP32-residual path.
-    # Prevents per-rank/startup autotune from changing reduction order. Keep
-    # disabled until fixed-prefix, natural-output and full-round gates pass.
+    # Prevents per-rank/startup autotune from changing reduction order. Enabled
+    # by the SM70 DFlash2 profile; explicit zero retains the rollback path.
     "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))
     ),

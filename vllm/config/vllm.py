@@ -99,6 +99,9 @@ _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": "1",
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
+    # Keep the no-residual/FP16-residual reductions consistent across ranks
+    # and process starts. Autotuning them perturbs the initial GDN state.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": "1",
     "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",

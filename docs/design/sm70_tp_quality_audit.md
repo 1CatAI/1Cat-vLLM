@@ -185,6 +185,64 @@ is recorded in `qpn2-scale-fix-native-r16.json`.
 Final diagnostics: `postfix-greedy-{on,off}-r18-mbpp32.jsonl` and
 `greedy-repro-r19.json`.
 
+## Fixed-prefix localization after the scale repair
+
+The next diagnostic fixes both the token tape and the target's q8 verification
+schedule, so a changed draft proposal cannot explain a different target input.
+This is a forced-accept diagnostic, not a quality score or speed measurement.
+The same source-native libraries are used in both fresh TP4 processes; only
+QPN2 dispatch changes. The 93-token MBPP73 prompt and 225 observed target
+positions use normal CUDA Graph execution.
+
+In the original capture (`r21`), all 256 target projections were checked on
+real activations against independently decoded checkpoint weights and FP64
+matrix products. Every sampled result is finite. Maximum relative L2 error
+is 0.000230 for QPN2 and 0.000240 for ordinary TurboMind at the first q8 step.
+Each arm is scored against its own captured input; these are not same-input
+element-count comparisons. A separate actual-hidden-state LM-head audit
+checks 900 vocabulary-shard rows: zero missing exact top-21 candidates and
+zero local top-1 changes. Neither audit establishes full-model equivalence.
+
+The expanded `r23` capture localizes the first prefill discrepancy before
+layer 0's input projection. Seven FP16 normalized inputs differ on rank 0;
+the other ranks have identical inputs and identical GDN chunk outputs across
+the two processes. Within one process, ranks also disagree on those seven
+normalization elements. This is the previously documented Inductor RMSNorm
+reduction-order drift, which had an opt-in repair but no serving default.
+The source already preserves FP32 accumulation; selecting a reduction by
+timing independently on each rank makes that arithmetic order unstable.
+
+The DFlash2 serving profile now selects the existing fixed 8192-element,
+16-warp Gemma reduction for its supported no-residual/FP16-residual geometry.
+It preserves the established FP32-residual path and CUDA Graph execution,
+has no TP-count or weight-quantization gate, and honors an explicit zero
+rollback. In `r24`, with the fixed reduction in both arms, all four ranks'
+captured prefill projections, first-layer GDN intermediates and final hidden
+states are bitwise equal. Across the 225 fixed positions there are no target
+top-1 changes. Decode hidden states still differ by up to 0.01134 relative L2
+because the matrix kernels retain different FP32 summation orders. This
+remaining difference is recorded, not declared harmless by the prefill fix.
+
+The source review also finds an independent heterogeneous-batch sampling
+bug: the compact target cutoff guard uses only the first request's
+temperature/top-p. Later requests can therefore miss a split top-p tie and
+retain a different vocabulary support. The guard now expands each request's
+parameters using its packed logit-row offsets. The original caller fails
+the reordered-request/variable-row regression; the repaired guard passes.
+All original quality requests used identical sampling parameters, so this
+bug is not offered as the cause of their score difference.
+
+Artifacts: `projection-capture-r{21,24}-comparison.json`,
+`gdn-prefill-comparison-r{23,24}.json`,
+`capture-qpn2-{on,off}-step1-oracle-r21.json`,
+`capture-qpn2-on-step0-oracle-r21.json`, `captured-lm-head-r22.json`,
+`mixed-cutoff-original-caller-r25.log`, `mixed-cutoff-after-r25.log`,
+and `norm-tests-r25.log` (20 V100 tests, including changed-input graph replay
+and an actual Inductor fullgraph). Captured tensors and compiler caches are
+retained in the task cache. A fresh, uninstrumented MBPP32 ON/OFF pair,
+standard vLLM bench, and the 262128+16 boundary gate follow these changes.
+Their results, rather than forced-token diagnostics, determine promotion.
+
 ## Reproduction and scope
 
 Raw artifacts and launch receipts are retained outside Git in the task artifact
