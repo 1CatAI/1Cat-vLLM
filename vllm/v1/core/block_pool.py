@@ -415,13 +415,21 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], reuse_first: bool = False
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            reuse_first: Hand these blocks out again before any other free
+                block, cached or not. A sliding window that has moved past its
+                blocks releases them with this: their KV can never serve a
+                future hit at any alignment boundary the window still covers,
+                so keeping them cache-valuable would only let the running
+                prefill rotate the whole pool and evict other requests.
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
@@ -431,13 +439,24 @@ class BlockPool:
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
         if self.enable_caching:
-            # Uncached scratch has no reusable prefix to evict. Recycle it
-            # before consuming the queue's older cached entries.
+            # Uncached scratch has no reusable prefix to evict, and blocks a
+            # sliding window has moved past (``reuse_first``) can never serve a
+            # future hit. Recycle both before consuming the queue's older
+            # cached entries, so a long prefill does not rotate the whole pool
+            # and evict other requests' prefixes.
             self.free_block_queue.prepend_n(
-                [block for block in freed_blocks if block.block_hash is None]
+                [
+                    block
+                    for block in freed_blocks
+                    if reuse_first or block.block_hash is None
+                ]
             )
             self.free_block_queue.append_n(
-                [block for block in freed_blocks if block.block_hash is not None]
+                [
+                    block
+                    for block in freed_blocks
+                    if not reuse_first and block.block_hash is not None
+                ]
             )
         else:
             self.free_block_queue.append_n(freed_blocks)
