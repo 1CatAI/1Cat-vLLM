@@ -1056,6 +1056,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
+        # Missing draft weights are supplied by load_dflash_model's target
+        # sharing step. Drop their uninitialized placeholders before the
+        # generic post-loader prepares quantized/packed LM-head copies.
+        # A full TP1 vocabulary otherwise adds several GiB of transient state.
+        if not getattr(self, "has_own_embed_tokens", False):
+            del self.model.embed_tokens
+        if not getattr(self, "has_own_lm_head", False):
+            del self.lm_head
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

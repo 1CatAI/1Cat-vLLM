@@ -169,3 +169,23 @@ port18521, DFlash, explicit shared QPN2, maxlen65536, memory0.88). The prior
 TP1/TP2 endpoints have been stopped. GPU0–3 still belong to the other task.
 Next: default-route E2E concurrency/quality, cold 256K, TP4 acceptance, and
 matched performance evidence before promoting Draft #666.
+
+Startup follow-up: `tp2-default-r3` failed capacity admission: separate QPN2
+weights load19.54 GiB/rank, leave3.8 GiB KV at utilization0.85, while256K requires
+6.0 GiB. `tp1-dflash-r3` instead failed during draft post-processing: the
+checkpoint has no LM head, but the generic loader tried to build an approximate
+1.19 GiB QPN8 copy of its uninitialized placeholder immediately before target
+sharing. The loader now releases missing embedding/head placeholders after
+checkpoint loading and before generic post-processing; checkpoint-owned weights
+remain intact. Eight focused loading/sharing tests pass. The fresh TP1 retry
+loads successfully (26.06 GiB weights) and has reached graph compilation;
+capacity/serving acceptance is still pending. The fresh TP2 retry uses explicit
+shared QPN2 until the separate/shared model acceptance is resolved.
+
+Implementation checkpoint5810c3c8ce is pushed to Draft #666; commit hooks all
+pass, including mypy after correcting the batch-aware workspace key type.
+Attention policy checks228 passed. Native artifact SHA256:
+
+- `_C.abi3.so`: b6fca82a75e6eb0a77ae31ec2ff59469ea59e7b6d4d2fe90c371b17e2ecadd65
+- `_vllm_fa2_C.abi3.so`: 53d18b1a4a9f7cae81c938ad2b3986512b2d76ba468c20f8a46ccadb8629d530
+- FlashV100: 4a1157b24e4eb75d8311149b81e62efdb2652eaaa1898a7f104d0e379eab11e3
