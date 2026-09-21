@@ -1619,6 +1619,48 @@ def _should_use_prefill_d256_gqa_architecture(
     )
 
 
+# Native prefill storage is shared by all layers on a device. Initialize it
+# during memory profiling so the KV allocator does not consume its budget.
+_sm70_prefill_profiled_workspaces: set[tuple[torch.device, int]] = set()
+
+
+def _profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> None:
+    if (
+        not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+        or not envs.VLLM_FLASH_V100_FA2_D256_PREFILL
+        or envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        or not query.is_cuda
+        or query.dtype != torch.float16
+        or query.ndim != 3
+        or query.shape[2] != 256
+        or query.shape[1] != 6 * num_kv_heads
+        or query.shape[0] < _SM70_79T_CORE_QUERY_LEN
+        or not current_platform.is_device_capability(70)
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    q_len = (
+        _SM70_79T_CORE_QUERY_LEN
+        if query.shape[0] == _SM70_79T_CORE_QUERY_LEN
+        else _SM70_79T_MAX_QUERY_LEN
+    )
+    cache_key = (query.device, q_len)
+    if cache_key in _sm70_prefill_profiled_workspaces:
+        return
+    op = (
+        _get_sm70_d256_gqa_architecture_op()
+        if q_len == _SM70_79T_CORE_QUERY_LEN
+        else _get_sm70_d256_gqa_architecture_q8192_op()
+    )
+    if op is None:
+        return
+    q = torch.zeros((1, q_len, 6, 256), device=query.device, dtype=query.dtype)
+    kv = torch.zeros((1, q_len, 1, 256), device=query.device, dtype=query.dtype)
+    op(q, kv, kv, torch.empty_like(q), 0.0625, True)
+    _sm70_prefill_profiled_workspaces.add(cache_key)
+    logger.info_once("SM70 Q%d prefill workspace included in memory profiling.", q_len)
+
+
 def _run_sm70_gqa_groups(
     op: Callable[..., torch.Tensor],
     query: torch.Tensor,
@@ -6113,6 +6155,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if attn_metadata is None:
             assert output is not None
+            if (
+                self.attn_type == AttentionType.DECODER
+                and self.sliding_window == (-1, -1)
+                and self.alibi_slopes is None
+                and not self.logits_soft_cap
+                and self.sinks is None
+                and abs(self.scale - 0.0625) <= 1.0e-8
+            ):
+                _profile_sm70_prefill_workspace(query, self.num_kv_heads)
             _record_route("metadata_none_zero_output")
             return output.fill_(0)
 

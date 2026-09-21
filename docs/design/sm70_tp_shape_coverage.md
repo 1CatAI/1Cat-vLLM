@@ -189,3 +189,41 @@ Attention policy checks228 passed. Native artifact SHA256:
 - `_C.abi3.so`: b6fca82a75e6eb0a77ae31ec2ff59469ea59e7b6d4d2fe90c371b17e2ecadd65
 - `_vllm_fa2_C.abi3.so`: 53d18b1a4a9f7cae81c938ad2b3986512b2d76ba468c20f8a46ccadb8629d530
 - FlashV100: 4a1157b24e4eb75d8311149b81e62efdb2652eaaa1898a7f104d0e379eab11e3
+
+### Graph replay and long-prefill follow-up
+
+The TP1 DFlash placeholder fix is committed as `96e2f28b67`. The retried model
+loads (26.06 GiB), but initial profiling leaves a negative KV budget (-3.58 GiB)
+with chunk8192/maxseq32. TP1 DFlash serving has **not** passed; lowering max length
+alone cannot fix this activation/weight capacity failure.
+
+TP2 `tp2-shared-r4` completed vLLM bench C1/2/4/8/16/32 and GSM8K32 (30/32,
+zero truncation, all natural stops, max_tokens32768). Its first 32768-token
+request failed while creating the long-prefill cuBLAS workspace. The initial
+memory profile skipped attention, so the KV allocator had not reserved the
+75T workspace. The candidate now initializes the selected Q8000/Q8192 core
+once during the attention memory-profile call; no TP-size condition is added.
+Fresh `tp2-prefill-r5` startup confirms Q8192 workspace inclusion. Long-context
+serving acceptance remains pending until that fresh run completes.
+
+A separate operator CUDA Graph microbenchmark exposed dangling host addresses
+in the existing native core: captured symbol copies referenced stack locals,
+and later calls overwrote host-side tail metadata. The fix passes symbol values
+as kernel arguments and retains immutable tail metadata per KV length/value
+buffer. Four regressions pass for Q8000/Q8192, Hkv2/4 and B1/2, replaying an old
+graph after another KV length is captured and all inputs change. Replay output
+is bitwise equal to an ordinary invocation of the same arithmetic.
+
+Q8192/KV262144 graph replay, including per-head copies, measured Hkv1/2/4 at
+76.625/75.748/75.296 logical causal TFLOP/s (169.502/342.925/689.974 ms).
+These are single-GPU operator results for the three local layouts, not TP
+serving throughput. Raw data: `prefill-graph-local-heads.json`; failure retained
+in `prefill-graph-local-heads.log`; passing trace `prefill-graph-r5.log`.
+
+Measurement correction: vLLM bench's initial ready-check request reuses the
+first benchmark prompt. All subsequent cold-prefill runs set
+`--ready-check-timeout-sec 0 --num-warmups 0` and explicitly reset prefix cache.
+Previous 2048-token cases are retained as originally measured, not relabeled as
+proven cold-cache evidence. DFlash stream ITL measures chunk arrivals, so it
+must not be inverted as per-token pure-decode TPS. Long-quality streaming now
+records emitted token IDs per chunk and rejects error/unfinished streams.

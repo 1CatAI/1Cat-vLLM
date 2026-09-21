@@ -58,3 +58,47 @@ def test_q8192_multihead_prefill_at_256k(heads, batch):
             # Preserve the accepted 75T reduction exactly. Its FP16 probability
             # tiles have a different error budget from the optional v37 core.
             assert float((actual - ref).norm() / ref.norm()) < 0.007
+
+
+@pytest.mark.parametrize("q_len", [8000, 8192])
+@pytest.mark.parametrize("heads,batch", [(2, 1), (4, 2)])
+def test_multihead_prefill_graph_replay_after_other_capture(q_len, heads, batch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    from vllm.v1.attention.backends.flash_attn_v100 import _run_sm70_gqa_groups
+    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+    op = (
+        torch.ops._vllm_fa2_C.sm70_d256_gqa_architecture_fwd
+        if q_len == 8000
+        else torch.ops._vllm_fa2_C.sm70_d256_gqa_architecture_q8192_fwd
+    )
+    torch.manual_seed(7542)
+    captures = []
+    for length in (32768, 65536):
+        q = torch.randn(
+            batch, q_len, heads * 6, 256, device="cuda", dtype=torch.float16
+        )
+        k = torch.randn(batch, length, heads, 256, device="cuda", dtype=q.dtype)
+        v = torch.randn_like(k)
+        out = torch.empty_like(q)
+        _run_sm70_gqa_groups(op, q, k, v, out, 0.0625, True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _run_sm70_gqa_groups(op, q, k, v, out, 0.0625, True)
+        captures.append((graph, q, k, v, out))
+
+    # The second capture must not overwrite metadata used by the first graph.
+    # Changing all inputs also detects accidentally captured warmup outputs.
+    for graph, q, k, v, out in captures:
+        q.normal_()
+        k.normal_()
+        v.normal_()
+        for _ in range(3):
+            graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.isfinite(out).all()
+        reference = torch.empty_like(q)
+        _run_sm70_gqa_groups(op, q, k, v, reference, 0.0625, True)
+        torch.accelerator.synchronize()
+        assert torch.equal(out, reference)
