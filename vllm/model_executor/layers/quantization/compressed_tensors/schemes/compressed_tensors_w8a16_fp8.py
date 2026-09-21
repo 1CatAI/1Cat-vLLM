@@ -75,13 +75,17 @@ def _sm70_fp8_qpn8_enabled(enable_by_default: bool) -> bool:
 def _sm70_channel_fp8_qpn8_config(
     layer: torch.nn.Module,
 ) -> tuple[int, int, bool] | None:
-    if getattr(layer, "tp_size", 1) != 4:
-        return None
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    if tuple(layer.weight.shape) != _SM70_CHANNEL_FP8_QPN8_SHAPES.get(suffix):
+    if suffix not in _SM70_CHANNEL_FP8_QPN8_SHAPES:
+        return None
+    if len(layer.weight.shape) != 2 or not _sm70_channel_fp8_shape_is_validated(layer):
         return None
     n_dim, k_dim = (int(dim) for dim in layer.weight.shape)
-    return _SM70_CHANNEL_FP8_QPN8_CONFIGS.get((k_dim, n_dim))
+    if suffix == "gate_up_proj" and n_dim % 64:
+        return None
+    return _SM70_CHANNEL_FP8_QPN8_CONFIGS.get(
+        (k_dim, n_dim), (8 if k_dim % 256 else 16, 2, False)
+    )
 
 
 def _sm70_channel_fp8_shape_is_validated(layer: torch.nn.Module) -> bool:
@@ -295,7 +299,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         layer.sm70_fp8_qpn8_gated_prefetch = gated_prefetch
                     logger.info_once(
                         "Memory-neutral SM70 channel-FP8 QPN8 path enabled "
-                        "for accepted Qwen3.8-27B TP4 dense shapes."
+                        "for aligned local projection shapes."
                     )
                     return
                 if missing_ops:

@@ -26,19 +26,20 @@ logger = init_logger(__name__)
 
 def _is_sm70_tp4_nvfp4_gate_up(layer: torch.nn.Module) -> bool:
     return bool(
-        getattr(layer, "tp_size", 1) == 4
-        and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
         and getattr(layer, "input_size_per_partition", 0) == 5120
-        and getattr(layer, "output_size_per_partition", 0) == 8704
-        and getattr(layer, "logical_widths", None) == [4352, 4352]
+        and getattr(layer, "output_size_per_partition", 0) > 0
+        and layer.output_size_per_partition % 64 == 0
+        and getattr(layer, "logical_widths", None)
+        == [layer.output_size_per_partition // 2] * 2
     )
 
 
 def _is_sm70_tp4_nvfp4_down(layer: torch.nn.Module) -> bool:
     return bool(
-        getattr(layer, "tp_size", 1) == 4
-        and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
-        and getattr(layer, "input_size_per_partition", 0) == 4352
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and getattr(layer, "input_size_per_partition", 0) > 0
+        and layer.input_size_per_partition % 128 == 0
         and getattr(layer, "output_size_per_partition", 0) == 5120
     )
 
@@ -53,7 +54,7 @@ def _is_sm70_nvfp4_qpn4_runtime_contract() -> bool:
 
 
 def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
-    """Admit the quality-audited DFlash2 TP4 operator contract.
+    """Admit the DFlash2 operator contract independently of TP size.
 
     Scheduler capacity is intentionally not part of this model-load decision.
     The opaque dispatcher selects QPN2 only from live ``M <= 32`` shapes and
@@ -77,7 +78,6 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
         and selector_top_k == 16
         and parallel_config.pipeline_parallel_size == 1
-        and parallel_config.tensor_parallel_size == 4
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
     )
@@ -145,17 +145,27 @@ _SM70_NVFP4_QPN2_REQUIRED_OPS = (
 _SM70_NVFP4_QPN2_PREFILL_REQUIRED_OPS = ("nvfp4_qpn2_prefill_dispatch_sm70_out",)
 
 
+def _qpn2_config(k: int, n: int, gated: bool) -> tuple[int, int]:
+    # Keep existing tuned configurations; other aligned local projections use
+    # the same native kernels with a split count that divides K/16.
+    return _SM70_NVFP4_QPN2_CONFIGS.get(
+        (k, n, gated), (8 if gated or k % 256 else 16, 2)
+    )
+
+
 def _is_qpn2_layer(layer: torch.nn.Module) -> bool:
-    if getattr(layer, "tp_size", 1) != 4:
-        return False
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    expected = _SM70_NVFP4_QPN2_SHAPES.get(suffix)
-    if expected is None or tuple(layer.weight.shape) != expected:
+    if suffix not in _SM70_NVFP4_QPN2_SHAPES or len(layer.weight.shape) != 2:
         return False
-    expected_n, expected_packed_k = expected
+    n, packed_k = layer.weight.shape
+    k = packed_k * 2
     return bool(
-        getattr(layer, "input_size_per_partition", 0) == expected_packed_k * 2
-        and getattr(layer, "output_size_per_partition", 0) == expected_n
+        k > 0
+        and k % 128 == 0
+        and n > 0
+        and getattr(layer, "input_size_per_partition", 0) == k
+        and getattr(layer, "output_size_per_partition", 0) == n
+        and (suffix != "gate_up_proj" or n % 64 == 0)
     )
 
 
@@ -458,7 +468,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 suffix = layer.prefix.rsplit(".", 1)[-1]
                 k = layer.input_size_per_partition
                 n = qpn2_output_size
-                split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[(k, n, False)]
+                split_k, nacc = _qpn2_config(k, n, False)
                 if not qpn2_shared:
                     layer.register_buffer(
                         "sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False
@@ -485,7 +495,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     )
                 logger.info_once(
                     "SM70 NVFP4 QPN2 M<=32 route enabled for a compatible "
-                    "TP4 projection contract."
+                    "local projection layout contract."
                 )
                 if qpn2_shared:
                     logger.info_once(
@@ -578,9 +588,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         split_k = int(layer.sm70_nvfp4_qpn2_split_k)
         nacc = int(layer.sm70_nvfp4_qpn2_nacc)
         if gated_silu:
-            split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[
-                (x_2d.shape[1], kernel_output_size * 2, True)
-            ]
+            split_k, nacc = _qpn2_config(x_2d.shape[1], kernel_output_size * 2, True)
         if getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
             min_prefill_m = (
                 envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M

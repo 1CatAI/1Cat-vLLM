@@ -2,6 +2,19 @@
 
 Date: 2026-05-30
 
+## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
+
+Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see
+[implementation and live validation log](sm70_tp_shape_coverage.md). This task
+generalizes the GQA6/D256 FP32 attention and quantized local projection paths
+and is not yet accepted on main. GPU operator checks cover 256K, real projection
+weights and CUDA Graph replay. Whole-model TP2/TP4 quality/concurrency checks
+remain in progress. TP1 27B at 256K fails the explicit KV memory-capacity check;
+its shorter-context serving results must not be relabelled 256K results. The
+originally authorized GPU services were stopped; another task owns GPU0–3,
+and this task's current endpoints use GPU4 and GPU5–6. Exact owned process IDs
+and launch records are in the design note's artifact directory.
+
 ## Mamba state grid decoupled from the KV block size, 2026-09-17
 
 [Design note](sm70_mamba_state_grid_decoupling.md). The long-prefill chunk is

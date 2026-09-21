@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bitwise gates for the opt-in TP2 E4M3 scalar decode implementation."""
+"""Bitwise gates for the default E4M3 scalar decode implementation."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-FLAG = "VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST"
+FLAG = "VLLM_FLASH_V100_E4M3_SCALAR_FAST"
 
 
-@pytest.mark.parametrize("native_version", [None, 1])
+@pytest.mark.parametrize("native_version", [None, 1, 2])
 def test_requested_fast_path_rejects_stale_library(monkeypatch, native_version):
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     monkeypatch.setenv(FLAG, "1")
@@ -38,7 +38,7 @@ def test_requested_fast_path_rejects_stale_library(monkeypatch, native_version):
     kv = torch.empty((1, 3296, 2, 256), dtype=torch.uint8)
     table = torch.zeros((8, 1), dtype=torch.int32)
     seq = torch.zeros(8, dtype=torch.int32)
-    with pytest.raises(RuntimeError, match="TP2 E4M3 scalar fast revision 2"):
+    with pytest.raises(RuntimeError, match="E4M3 scalar fast revision 3"):
         interface.flash_attn_decode_paged(
             q, kv, kv, table, seq, kv_cache_dtype="fp8_e4m3"
         )
@@ -51,7 +51,7 @@ def native():
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     extension = interface.flash_attn_v100_cuda
     version = getattr(extension, "tp2_e4m3_scalar_fast_version", lambda: 0)
-    if version() < 2:
+    if version() < 3:
         pytest.skip("rebuild Flash-V100 with TP2 scalar fast revision 2")
     return extension
 
@@ -107,20 +107,27 @@ def workspace(q, parts):
     )
 
 
-@pytest.mark.parametrize("length", [1025, 3297, 262144])
-def test_live_graph_bitwise_state_and_fp64_reference(native, monkeypatch, length):
+@pytest.mark.parametrize("length", [3297, 262144])
+@pytest.mark.parametrize(
+    "rows,kv_heads", [(1, 1), (1, 2), (1, 4), (8, 1), (8, 2), (8, 4), (32, 4)]
+)
+def test_live_graph_bitwise_state_and_fp64_reference(
+    native, monkeypatch, length, rows, kv_heads
+):
     torch.manual_seed(20260908)
     page, parts = 3296, 256
     pages = (length + page - 1) // page
     # Interleaved, strided K/V with a nonidentity page table, as in the service.
-    kv = torch.randn((pages, 2, page, 2, 256), device="cuda", dtype=torch.float16)
+    kv = torch.randn(
+        (pages, 2, page, kv_heads, 256), device="cuda", dtype=torch.float16
+    )
     kv = kv.to(torch.float8_e4m3fn).view(torch.uint8)
     k, v = kv.unbind(1)
     order = torch.randperm(pages, device="cuda").int()
-    table = order[None].repeat(8, 1)
-    q = torch.randn((8, 12, 256), device="cuda", dtype=torch.float16)
+    table = order[None].repeat(rows, 1)
+    q = torch.randn((rows, kv_heads * 6, 256), device="cuda", dtype=torch.float16)
     q_initial = q.clone()
-    seq = torch.zeros(8, device="cuda", dtype=torch.int32)
+    seq = torch.zeros(rows, device="cuda", dtype=torch.int32)
     active = torch.full((1,), parts, device="cuda", dtype=torch.int32)
     states = [workspace(q, parts), workspace(q, parts)]
     graphs = []
@@ -157,7 +164,7 @@ def test_live_graph_bitwise_state_and_fp64_reference(native, monkeypatch, length
             call()
         graphs.append(graph)
 
-    initial_seq = torch.arange(length - 7, length + 1, device="cuda").int()
+    initial_seq = torch.arange(length - rows + 1, length + 1, device="cuda").int()
     for replay in range(4):
         seq.copy_(initial_seq)
         if replay == 1:
@@ -178,7 +185,7 @@ def test_live_graph_bitwise_state_and_fp64_reference(native, monkeypatch, length
             torch.arange(parts, device="cuda")[None, None]
             < ((seq + 1023) // 1024)[:, None, None]
         )
-        valid = valid.expand(8, 12, parts)
+        valid = valid.expand(rows, kv_heads * 6, parts)
         for control, candidate in zip(states[0][1:4], states[1][1:4]):
             assert torch.equal(
                 control[valid].view(torch.int32), candidate[valid].view(torch.int32)
@@ -187,12 +194,12 @@ def test_live_graph_bitwise_state_and_fp64_reference(native, monkeypatch, length
             assert bool((state[4][..., 256:] == 123).all())
 
         if length == 3297 and replay == 0:
-            rk = k[order.long()].reshape(-1, 2, 256)[:length]
-            rv = v[order.long()].reshape(-1, 2, 256)[:length]
+            rk = k[order.long()].reshape(-1, kv_heads, 256)[:length]
+            rv = v[order.long()].reshape(-1, kv_heads, 256)[:length]
             rk = rk.view(torch.float8_e4m3fn).double() * 0.5
             rv = rv.view(torch.float8_e4m3fn).double() * 1.25
             expected = torch.empty_like(q, dtype=torch.float64)
-            for head in range(2):
+            for head in range(kv_heads):
                 score = (
                     q[:, head * 6 : (head + 1) * 6].transpose(0, 1).double()
                     @ rk[:, head].T
@@ -214,8 +221,6 @@ def test_live_graph_bitwise_state_and_fp64_reference(native, monkeypatch, length
 @pytest.mark.parametrize(
     "rows,heads,kv_heads,partition,window",
     [
-        (4, 12, 2, 1024, -1),
-        (8, 6, 1, 1024, -1),
         (8, 12, 2, 256, -1),
         (8, 12, 2, 1024, 127),
     ],

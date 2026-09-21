@@ -4869,9 +4869,7 @@ at::Tensor private_grouped_e4m3_fp32_paged(
               "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [2..8,6,256]");
   TORCH_CHECK(
       k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
-          (k.size(1) == 800 || k.size(1) == 848 || k.size(1) == 1616 ||
-           k.size(1) == 1648 || k.size(1) == 1728 || k.size(1) == 3296 ||
-           k.size(1) == 3456) &&
+          k.size(1) > 0 && k.size(1) % 16 == 0 &&
           k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
           v.sizes() == k.sizes(),
       "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
@@ -5001,6 +4999,10 @@ at::Tensor sm70_grouped_long_entry(
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  // The runtime-page specialization is compiled alongside the fixed pages.
+  // Python uses this capability to avoid widening admission for stale DSOs.
+  ops.def("sm70_grouped_long_page_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_grouped_long_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(a!) partial, "

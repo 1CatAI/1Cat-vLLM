@@ -591,7 +591,7 @@ _prefill_dense_splitkv3_workspaces: dict[
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
 _sm70_79t_q8192_padding_workspaces: dict[
-    tuple[int, int, torch.dtype, int, int],
+    tuple[int, int, torch.dtype, int, int, int],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 
@@ -757,11 +757,15 @@ def _g6_aligned_page_partition_size_hint(
     if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
         return None
     if not (
-        query.shape == (1, 6, 256)
+        query.ndim == 3
+        and query.shape[0] == 1
+        and query.shape[2] == 256
         and key_cache.ndim == 4
         and key_cache.shape[1] >= _DEFAULT_DECODE_PARTITION_SIZE
         and key_cache.shape[1] % 16 == 0
-        and key_cache.shape[2:] == (1, 256)
+        and key_cache.shape[2] > 0
+        and key_cache.shape[3] == 256
+        and query.shape[1] == 6 * key_cache.shape[2]
         and value_cache.shape == key_cache.shape
         and value_cache.dtype == key_cache.dtype
     ):
@@ -948,11 +952,14 @@ def _decode_xqa_allowed_for_q_per_kv(
 
 
 def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
-    """Gate the exact SM70 E4M3 G6 batched XQA route."""
+    """Admit GQA6 batches independently of the number of local KV heads."""
     return (
         envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+        and query.ndim == 3
         and query.shape[0] > 1
-        and query.shape[1:] == (6, 256)
+        and query.shape[1] > 0
+        and query.shape[1] % 6 == 0
+        and query.shape[2] == 256
     )
 
 
@@ -1588,10 +1595,15 @@ def _should_use_prefill_d256_gqa_architecture(
         envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
         and architecture_op is not None
         and shape_allowed
-        and query.shape == (1, max_seqlen_q, 6, 256)
+        and query.ndim == 4
+        and query.shape[0] > 0
+        and query.shape[1] == max_seqlen_q
+        and query.shape[3] == 256
         and key.ndim == 4
-        and key.shape[0] == 1
-        and key.shape[2:] == (1, 256)
+        and key.shape[0] == query.shape[0]
+        and key.shape[2] > 0
+        and key.shape[3] == 256
+        and query.shape[2] == 6 * key.shape[2]
         and value.shape == key.shape
         and max_seqlen_k == key.shape[1]
         and query.dtype == torch.float16
@@ -1605,6 +1617,34 @@ def _should_use_prefill_d256_gqa_architecture(
         and abs(softmax_scale - 0.0625) <= 1.0e-8
         and not _is_cuda_graph_capturing(query)
     )
+
+
+def _run_sm70_gqa_groups(
+    op: Callable[..., torch.Tensor],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Apply the native GQA6 core independently to each local KV head."""
+    if query.shape[0] == 1 and key.shape[2] == 1:
+        return op(query, key, value, out, softmax_scale, causal)
+    for batch in range(query.shape[0]):
+        for head in range(key.shape[2]):
+            group_q = query[batch : batch + 1, :, head * 6 : (head + 1) * 6]
+            group_out = torch.empty_like(group_q, memory_format=torch.contiguous_format)
+            op(
+                group_q.contiguous(),
+                key[batch : batch + 1, :, head : head + 1].contiguous(),
+                value[batch : batch + 1, :, head : head + 1].contiguous(),
+                group_out,
+                softmax_scale,
+                causal,
+            )
+            out[batch : batch + 1, :, head * 6 : (head + 1) * 6].copy_(group_out)
+    return out
 
 
 def _run_sm70_d256_gqa_79t_dispatch(
@@ -1630,7 +1670,8 @@ def _run_sm70_d256_gqa_79t_dispatch(
     if fringe_len < 0 or query_len > _SM70_79T_MAX_QUERY_LEN:
         raise ValueError(f"unsupported SM70 79T query length {query_len}")
     if fringe_len == 0:
-        return architecture_op(
+        return _run_sm70_gqa_groups(
+            architecture_op,
             query,
             key,
             value,
@@ -1641,7 +1682,8 @@ def _run_sm70_d256_gqa_79t_dispatch(
 
     core_query = query[:, fringe_len:]
     core_out = out[:, fringe_len:]
-    architecture_op(
+    _run_sm70_gqa_groups(
+        architecture_op,
         core_query,
         key,
         value,
@@ -1661,7 +1703,7 @@ def _run_sm70_d256_gqa_79t_dispatch(
         fringe_prefix = 0
     else:
         fringe_query = torch.zeros(
-            (1, padded_fringe_len, *query.shape[2:]),
+            (query.shape[0], padded_fringe_len, *query.shape[2:]),
             dtype=query.dtype,
             device=query.device,
         )
@@ -1687,7 +1729,7 @@ def _get_sm70_79t_q8192_padding_workspace(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not query.is_cuda:
         padded_query = torch.empty(
-            (1, _SM70_79T_MAX_QUERY_LEN, *query.shape[2:]),
+            (query.shape[0], _SM70_79T_MAX_QUERY_LEN, *query.shape[2:]),
             dtype=query.dtype,
             device=query.device,
         )
@@ -1701,12 +1743,13 @@ def _get_sm70_79t_q8192_padding_workspace(
         device_index,
         stream_id,
         query.dtype,
+        int(query.shape[0]),
         int(query.shape[2]),
         int(query.shape[3]),
     )
     workspace = _sm70_79t_q8192_padding_workspaces.get(cache_key)
     if workspace is None:
-        shape = (1, _SM70_79T_MAX_QUERY_LEN, *query.shape[2:])
+        shape = (query.shape[0], _SM70_79T_MAX_QUERY_LEN, *query.shape[2:])
         padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
         workspace = padded_query, torch.empty_like(padded_query)
         _sm70_79t_q8192_padding_workspaces[cache_key] = workspace
@@ -1727,7 +1770,8 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
     if not _SM70_79T_CORE_QUERY_LEN < query_len <= _SM70_79T_MAX_QUERY_LEN:
         raise ValueError(f"unsupported SM70 Q8192 dispatch length {query_len}")
     if query_len == _SM70_79T_MAX_QUERY_LEN:
-        return architecture_q8192_op(
+        return _run_sm70_gqa_groups(
+            architecture_q8192_op,
             query,
             key,
             value,
@@ -1740,7 +1784,8 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
     leading_padding = _SM70_79T_MAX_QUERY_LEN - query_len
     padded_query[:, :leading_padding].zero_()
     padded_query[:, leading_padding:].copy_(query)
-    architecture_q8192_op(
+    _run_sm70_gqa_groups(
+        architecture_q8192_op,
         padded_query,
         key,
         value,
@@ -1919,7 +1964,8 @@ def _try_sm70_fa2_d256_prefill(
                     assert architecture_op is not None
                     try:
                         if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
-                            splitd_result = architecture_op(
+                            splitd_result = _run_sm70_gqa_groups(
+                                architecture_op,
                                 query,
                                 key,
                                 value,
@@ -7151,7 +7197,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if partition_size_hint is not None:
                 if (
                     self.kv_cache_dtype in ("fp8", "fp8_e4m3")
-                    and query.shape == (1, 6, 256)
+                    and query.shape[0] == 1
                     and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1")
                     != "0"
                 ):

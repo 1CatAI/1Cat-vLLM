@@ -13,6 +13,7 @@ from vllm.v1.attention.ops.sm70_e4m3_long import (
     load_attention_library,
     long_attention_capability,
     resolve_long_attention,
+    run_six_head_groups,
 )
 
 logger = init_logger(__name__)
@@ -22,9 +23,9 @@ logger = init_logger(__name__)
 # manifest and no environment variable. The manifest stays as an explicit
 # override for an unqualified experimental candidate.
 BUILTIN_SCALAR_OP = "sm70_scalar_attention_fwd"
-# Page size in tokens the compact scalar kernel was compiled for. It is fixed at
-# build time because the kernel bakes the page geometry into its indexing.
-SCALAR_PAGE_SIZE = 3296
+# Each 1024-token partition caches at most two physical page IDs. A page of
+# at least 1024 tokens satisfies that bound; its size is a runtime argument.
+SCALAR_MIN_PAGE_SIZE = 1024
 BUILTIN_SCALAR_MANIFEST = {
     "module_name": "_vllm_fa2_C",
     "library_sha256": BUILTIN_SCALAR_OP,
@@ -124,12 +125,21 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         if not (
             bucket is not None
             and bucket <= capability
-            and q.shape == (1, 6, 256)
+            and q.ndim == 3
+            and q.shape[0] == 1
+            and q.shape[1] > 0
+            and q.shape[2] == 256
             and q.dtype == torch.float16
             and q.device == device
             and q.is_contiguous()
             and k.ndim == 4
-            and k.shape[1:] == (SCALAR_PAGE_SIZE, 1, 256)
+            and (
+                k.shape[1] >= SCALAR_MIN_PAGE_SIZE
+                if not manifest_name
+                else k.shape[1] == 3296
+            )
+            and k.shape[2] * 6 == q.shape[1]
+            and k.shape[3] == 256
             and k.dtype == v.dtype == torch.uint8
             and v.shape == k.shape
             and kv_cache_dtype == "fp8_e4m3"
@@ -141,7 +151,8 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             and 0 < max_seq_len_hint <= capability
         ):
             return False
-        module.run(
+        run_six_head_groups(
+            module.run,
             q,
             k,
             v,

@@ -3485,3 +3485,65 @@ def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode)
         assert calls[0][0][3] is table
         assert routes == ["prefill_smallq_decode_scalar"]
         assert bool((out == 2).all())
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_prefill_architecture_admits_local_gqa_groups(monkeypatch, kv_heads, batch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    query = torch.empty(
+        (batch, 8192, 6 * kv_heads, 256), dtype=torch.float16, device="meta"
+    )
+    key = torch.empty(
+        (batch, 262144, kv_heads, 256), dtype=torch.float16, device="meta"
+    )
+    assert mod._should_use_prefill_d256_gqa_architecture(
+        query,
+        key,
+        key,
+        max_seqlen_q=8192,
+        max_seqlen_k=262144,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+def test_gqa_group_dispatch_preserves_head_and_batch_mapping(kv_heads):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    q = torch.arange(2 * 7 * 6 * kv_heads * 4).reshape(2, 7, 6 * kv_heads, 4).float()
+    k = torch.arange(2 * 9 * kv_heads * 4).reshape(2, 9, kv_heads, 4).float()
+    v = k + 3
+    out = torch.empty_like(q)
+    calls = []
+
+    def operator(query, key, value, output, scale, causal):
+        assert query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+        assert query.shape[2] == 6 and key.shape[2] == 1
+        assert scale == 0.0625 and causal
+        output.copy_(
+            query + key[:, :7].expand_as(query) + value[:, :7].expand_as(query)
+        )
+        calls.append(1)
+        return output
+
+    mod._run_sm70_gqa_groups(operator, q, k, v, out, 0.0625, True)
+    expected = (
+        q + k[:, :7].repeat_interleave(6, dim=2) + v[:, :7].repeat_interleave(6, dim=2)
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert len(calls) == 2 * kv_heads
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("batch", [2, 4, 8, 16, 32])
+def test_e4m3_xqa_policy_accepts_multiple_kv_heads(kv_heads, batch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    q = torch.empty((batch, 6 * kv_heads, 256), dtype=torch.float16)
+    assert mod._e4m3_batch_xqa_allowed(q)
+    k = torch.empty((1, 800, kv_heads, 256), dtype=torch.uint8)
+    assert mod._g6_aligned_page_partition_size_hint(q[:1], k, k, "fp8_e4m3") == 64

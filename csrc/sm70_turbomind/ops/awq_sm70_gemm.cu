@@ -4291,8 +4291,10 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 bool sm70_fp8_prefill_cutlass_gated_silu_enabled(
     const torch::Tensor& in_feats, const torch::Tensor& dense_weight) {
   const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
-  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) == 8000 &&
-         in_feats.size(1) == 5120 && dense_weight.size(1) == 8704;
+  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) >= 8000 &&
+         in_feats.size(0) <= 8192 && in_feats.size(1) > 0 &&
+         in_feats.size(1) % 128 == 0 && dense_weight.size(1) > 0 &&
+         dense_weight.size(1) % 128 == 0;
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
