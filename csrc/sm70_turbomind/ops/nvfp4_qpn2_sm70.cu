@@ -106,6 +106,17 @@ __device__ __forceinline__ half2 fp8e4m3_to_half2(uint8_t value) {
   return __halves2half2(converted, converted);
 }
 
+__device__ __forceinline__ half2 nvfp4_effective_scale(uint8_t value,
+                                                       float global_scale) {
+  // Match TurboMind's W4A16 weights: multiply the exact E4M3 group scale
+  // by the FP32 global scale before rounding once to FP16. Rounding the
+  // global factor first changes the model's weights on every decode step.
+  const half raw = __low2half(fp8e4m3_to_half2(value));
+  const half scaled =
+      __float2half_rn(__fmul_rn(__half2float(raw), global_scale));
+  return __halves2half2(scaled, scaled);
+}
+
 // QPN2 stores [N/32, K/16, lane], while TurboMind V/Pack1 stores
 // [K/16, N] in logical column order. Preserve FP32 multiply then FP16 RNE.
 __global__ void nvfp4_qpn2_restore_tm_scales_kernel(half* output,
@@ -136,7 +147,12 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
   values[3] = (packed & kSign) | ((packed >> 3) & kExponentMantissa);
 #pragma unroll
   for (int index = 0; index < 4; ++index) {
-    output[index] = __hmul2(*reinterpret_cast<half2*>(&values[index]), scale);
+    // Undo the FP4 exponent bias on the code, not on its scale. Scaling
+    // the scale by 2^14 first loses subnormals and can overflow even when
+    // the final dequantized weights are finite.
+    const half2 code = __hmul2(*reinterpret_cast<half2*>(&values[index]),
+                               __float2half2_rn(16384.0f));
+    output[index] = __hmul2(code, scale);
   }
 }
 
@@ -174,7 +190,6 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
       codes, tile, groups_k16, lane);
   const uint8_t* scale_ptr =
       group_scales + static_cast<size_t>(tile) * groups_k16 * 32 + lane;
-  const half2 global_scale2 = __float2half2_rn(global_scale * 16384.0f);
 
   float accum[RowTiles][NAcc][8];
 #pragma unroll
@@ -192,9 +207,8 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
     const uint2 packed = reader.load(group);
-    const half2 scale = __hmul2(
-        fp8e4m3_to_half2(__ldg(scale_ptr + static_cast<size_t>(group) * 32)),
-        global_scale2);
+    const half2 scale = nvfp4_effective_scale(
+        __ldg(scale_ptr + static_cast<size_t>(group) * 32), global_scale);
     half2 weights[8];
     dequant_e2m1x8(packed.x, scale, weights);
     dequant_e2m1x8(packed.y, scale, weights + 4);
@@ -287,7 +301,6 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
                                                     lane);
   const uint8_t* scale_ptr =
       group_scales + static_cast<size_t>(tile) * groups_k16 * 32 + lane;
-  const half2 global_scale2 = __float2half2_rn(global_scale * 16384.0f);
 
   float accum[RowTiles][NAcc][8];
 #pragma unroll
@@ -305,9 +318,8 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
     const uint2 packed = reader.load(group);
-    const half2 scale = __hmul2(
-        fp8e4m3_to_half2(__ldg(scale_ptr + static_cast<size_t>(group) * 32)),
-        global_scale2);
+    const half2 scale = nvfp4_effective_scale(
+        __ldg(scale_ptr + static_cast<size_t>(group) * 32), global_scale);
     half2 weights[8];
     dequant_e2m1x8(packed.x, scale, weights);
     dequant_e2m1x8(packed.y, scale, weights + 4);
