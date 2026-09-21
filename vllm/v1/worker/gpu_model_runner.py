@@ -11098,12 +11098,16 @@ class GPUModelRunner(
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
+                # A dummy batch can hold more tokens than one sequence may
+                # (max_num_batched_tokens > max_model_len); wrap so every
+                # position stays inside the model's position table.
                 self.positions[:num_tokens_padded].copy_(
                     torch.arange(
                         num_tokens_padded,
                         dtype=torch.int64,
                         device=self.device,
                     )
+                    % self.max_model_len
                 )
                 positions = self.positions[:num_tokens_padded]
 
