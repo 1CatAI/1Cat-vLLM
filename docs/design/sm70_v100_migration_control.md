@@ -15,7 +15,10 @@ requests queue behind4 resident sequences and are not simultaneous decode
 evidence. TP4 r8 completes96 quality items, cold256K (2511tok/s estimated prefill)
 and C1-C32 bench on GPU4-7. It reaches13 resident sequences; C16/C32 queue.
 GPU0-3 belongs to another task. TP1 27B+DFlash2 weights load after the missing
-placeholder fix, but chunk8192 profiling exceeds memory. The missing matched
+placeholder fix, but chunk8192 profiling exceeds memory. Fresh final-capability no-DFlash TP1/TP2 services pass cold64K/256K retrieval
+and C1-C32 bench; TP1 reaches9 resident sequences, TP2 reaches32. TP2 C2
+first-use sampling compilation is retained separately from a warmed-kernel,
+cold-prefix repeat. The missing matched
 35B-A3B AWQ/FP8 evidence is still required for migration acceptance. Do not
 repeat the rejected smaller-PV-tile or cuBLAS layout/algorithm screens; the
 design note records the retained results and invalid benchmark exclusions.

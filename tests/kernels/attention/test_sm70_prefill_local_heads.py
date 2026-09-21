@@ -55,8 +55,8 @@ def test_q8192_multihead_prefill_at_256k(heads, batch):
             )
             ref = (scores.softmax(-1) @ v[item, :, head].double()).transpose(0, 1)
             actual = out[item, rows, head * 6 : (head + 1) * 6].double()
-            # Preserve the accepted 75T reduction exactly. Its FP16 probability
-            # tiles have a different error budget from the optional v37 core.
+            # Preserve this kernel's reduction across local KV groups. FP16
+            # intermediate tiles retain a different error budget from v37.
             assert float((actual - ref).norm() / ref.norm()) < 0.007
 
 

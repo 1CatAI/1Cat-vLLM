@@ -23,14 +23,14 @@ must not be attributed to full FP32 accumulation.
 | --- | --- | --- |
 | TP1/2/4 local attention/projection geometry | GPU operator and changed-input CUDA Graph checks pass | Whole-model results are separate |
 | QK and PV accumulation | Both FP32 in candidate r8; FP16 inputs/intermediates/output | Recover 75T without reducing precision |
-| TP1 27B + DFlash2 | Loader placeholder fix passes; weights load | 8192-token profiling exceeds available memory |
-| TP2 27B + DFlash2, 256K | r5 cold 256K and natural-EOS retrieval pass | r5 uses QK FP16; not full-FP32 acceptance |
+| TP1 | Default no-DFlash64K, cold retrieval and C1-C32 requests pass | DFlash2/8192-token profiling still exceeds memory |
+| TP2, 256K | Full-FP32 default no-DFlash cold retrieval and C1-C32 pass | DFlash2 shared-layout r5 remains earlier QK arithmetic |
 | TP4 27B + DFlash2, 256K | r8 completes96 quality items, cold256K and C1-C32 bench | C16/C32 queue; matched quality baseline remains separate |
 | Actual simultaneous decode | TP2 r5 C2/C4 measured; C8 queues | Do not relabel queued C8-C32 as resident decode |
 | Shared QPN2 weight default | Operator equivalence passes | Paired model quality before changing default |
 | 35B-A3B AWQ/FP8 migration target | No matching model found locally | Matched baseline still required; not claimed here |
 
-Current server: TP4 on GPU4-7, target QUASAR-QAT Qwen3.8-27B NVFP4,
+TP4 r8 measured server (now stopped): TP4 on GPU4-7, target QUASAR-QAT Qwen3.8-27B NVFP4,
 DFlash2 draft revision `dedf8df68adfb1afeaf7b7480c0a0243108177b4`,
 num_speculative_tokens=7, target E4M3 KV, draft FP16 KV, FP16 compute,
 max_model_len=262144, chunk8192, maxseq32, memory utilization0.85,
@@ -85,6 +85,19 @@ v37 operator retains its admission. Eight loader-policy cases pass, and the
 rebuilt native library reports32. This adds capability reporting without
 changing r8 GPU arithmetic; running r8 servers keep their original mapped
 library. The replacement was installed atomically for fresh processes.
+
+A final bounded CUTLASS prefix-QK screen also loses to cuBLAS: graph replay
+at M49152/N24576/K256 and physical K stride262144 measures10.53-12.42ms
+for four FP32-accumulating threadblock/warp shapes, versus paired cuBLAS
+8.61/8.68ms. All output elements match the cuBLAS FP16 output in this screen.
+It is rejected, not installed in serving (`qk32-cutlass-screen.log`).
+The final extension was rebuilt after formatting at source4038f83009;
+SHA256 `95db86166a28f3e0533b1e3931a860134293f32687cda0f24d4ef2cce4e13c39`.
+Four changed-input/length graph regressions pass on the final binary. Serving
+r9 loaded the pre-format capability build, SHA256
+`08f089644ce3221bb80b3269cc7250fd06af14e8a95f10165a9f3df14417cdb2`;
+the only later CUDA-source difference is formatting. No process hot reload
+or private preloaded library is used.
 
 ### Corrected TP2 r5 long context and concurrency
 
@@ -157,12 +170,67 @@ reset before each case:
 
 All requests complete with zero failures and zero observed prefix-cache hits.
 C16/C32 each incur one preemption/recompute and queue behind the cache-capacity
-limit. They are not32 simultaneous GPU decode. Full emitted-token common-window
-decode timings are being measured only for resident C2/C4/C8. TPOT is a
+limit. They are not32 simultaneous GPU decode. Complete emitted-token chunks inside an all-requests decode window measure
+C2=245.96, C4=306.12 and C8=403.27 aggregate tok/s (2048 output tokens/request).
+Window durations are15.60/22.70/38.58 seconds. C16/C32 are excluded because
+the resident-capacity evidence does not support those simultaneous counts. TPOT is a
 per-request post-TTFT average; stream ITL is a DFlash chunk interval and is not
 inverted to obtain per-token throughput. Benchmark JSON and sampled residency
 are retained under `tp4-default-qk32-r8-cold-c*`; consolidated values are in
 `tp4-r8-serving-summary.json`.
+
+## TP1/TP2 default no-DFlash checks, 2026-09-21 13:36 CST
+
+Fresh capability-checked services use the same27B NVFP4 target, FP16 compute,
+E4M3 KV, chunk8192/maxseq32, graphs enabled, default weight layouts and no
+acceleration overrides. DFlash is **disabled** in these two configurations;
+they must not be compared as matched scaling points against TP4 DFlash.
+TP1 uses GPU4, maxlen65536 and memory0.92; TP2 uses GPU5-6, maxlen262144 and
+memory0.85. Native workspace profiling is logged in both. Model/cache/graph
+memory for TP1 is19.67/3.03/0.65 GiB, with71493 token cache capacity (the initial
+32K launch); TP2 cache is12.21 GiB/762956 tokens and graph memory1.84 GiB.
+The initial TP1 cache estimate supported a64K retry, which starts and serves.
+
+Natural-EOS cold retrieval passes on TP1 at64000 input tokens (TTFT83.182s)
+and TP2 at256000 (TTFT213.286s). Both return all four expected values and stop
+at16 tokens; logs explicitly show QK+PV FP32 architecture/FP8-bridge dispatch.
+These one-shot cold timings include any first-use compilation.
+
+Cold `vllm bench serve`,2048 input/256 output per request, same protocol as
+TP4, all requests completed without errors and no observed prefix-cache hits:
+
+| Concurrency | TP1 TTFT median(s) | TP1 complete output(tok/s) | TP2 TTFT median(s) | TP2 complete output(tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| C1 | 1.728 | 23.933 | 1.000 | 37.914 |
+| C2 | 3.705 | 38.028 | 5.385 | 30.769 |
+| C4 | 7.295 | 58.321 | 3.866 | 94.477 |
+| C8 | 20.670 | 64.272 | 8.252 | 105.723 |
+| C16 | 20.569 | 69.850 | 10.510 | 145.241 |
+| C32 | 52.949 | 68.333 | 18.182 | 182.143 |
+
+TP1 reaches9 resident requests and queues higher client concurrency. TP2
+reaches32 resident requests. Neither run preempts. TP2 C2 logs first-use
+`_topk_topp_kernel` compilation; a single diagnostic repeat after clearing
+prefix cache records TTFT1.541s/output58.158tok/s with warmed kernels. Keep
+both observations, do not replace the slower first-use result or interpret
+warm kernels as prefix-cache hits. Raw records use
+`tp1-fp32-cap-64k-r9-c*`, `tp2-fp32-cap-r9-c*`, and
+`tp2-fp32-cap-r9-warmkernel-c2`.
+
+A separate512-output-token run measures actual common-window aggregate
+TP2 decode at C2/4/8/16/32:76.02/145.56/272.64/474.05/570.35tok/s.
+All five cases have a valid window after every first token and before any
+last token; durations13.39/13.95/14.88/17.04/28.09s. These exclude prefill.
+Per-request median emitted-token intervals are26.25/27.38/29.28/33.67/55.97ms.
+Raw records: `tp2-fp32-cap-r9-steady-c*.json`. This confirms resident C32
+serving on the TP2 no-DFlash configuration; it does not change the DFlash
+memory limits documented above.
+
+TP1 27B+DFlash2 remains unaccepted due to memory, and TP2 DFlash2/256K still
+uses explicit shared QPN2 in its earlier r5 checks. The new default no-DFlash
+results do not erase those limitations. QPN4 retains its pre-existing
+single-sequence/no-MTP admission; the generic LM-head/attention/local-projection
+changes must not be described as removing every specialized kernel contract.
 
 ## Acceptance and worklog
 
