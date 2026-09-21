@@ -2020,6 +2020,10 @@ def test_deepseek_v4_tuple_width_minimizes_physical_pool_pages():
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
+        # VllmConfig.max_in_flight_tokens with one concurrent batch; the
+        # sliding-window spec reads it for the recycling-aware admission
+        # bound this PR adds.
+        max_in_flight_tokens=8192,
     )
 
     assert (
@@ -2500,3 +2504,32 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+def test_free_kv_cache_block_queue_prepend_n():
+    queue = FreeKVCacheBlockQueue([])
+    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
+
+    queue.prepend_n([])
+    assert queue.num_free_blocks == 0
+    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
+
+    # Prepend into an empty queue: fake_head->b0->b1->fake_tail
+    queue.prepend_n(blocks[0:2])
+    assert queue.get_all_free_blocks() == blocks[0:2]
+    assert blocks[0].prev_free_block is queue.fake_free_list_head
+    assert blocks[1].next_free_block is queue.fake_free_list_tail
+
+    # Appended blocks go behind, prepended ones in front.
+    queue.append_n(blocks[4:6])
+    queue.prepend_n(blocks[2:4])
+    assert queue.num_free_blocks == 6
+    assert queue.get_all_free_blocks() == [
+        blocks[2],
+        blocks[3],
+        blocks[0],
+        blocks[1],
+        blocks[4],
+        blocks[5],
+    ]
+    assert queue.popleft() is blocks[2]

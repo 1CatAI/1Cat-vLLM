@@ -521,6 +521,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
 
+        # Hits are always a multiple of ``lcm_block_size`` (see
+        # ``find_longest_cache_hit``), which is also the segment size
+        # ``cache_blocks`` caches within. Managers need it when deciding which
+        # released blocks can still serve a future hit.
+        for manager in self.single_type_managers:
+            manager.alignment_tokens = self.lcm_block_size
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         # Cache hits in this coordinator are always a multiple of
         # ``lcm_block_size`` tokens (see ``find_longest_cache_hit``). Within an

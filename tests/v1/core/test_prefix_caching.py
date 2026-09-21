@@ -281,7 +281,7 @@ def test_prefill(hash_fn):
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Cache hit in the common prefix when the original block is already free.
     # Incomplete 1 block (6 tokens)
@@ -295,7 +295,7 @@ def test_prefill(hash_fn):
     blocks = manager.allocate_slots(
         req2, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([6],)
+    assert blocks is not None and blocks.get_block_ids() == ([5],)  # reuse partial [5]
 
     # Although we only have 6 free blocks, we have 8 blocks in
     # the free block queue due to lazy removal.
@@ -315,7 +315,7 @@ def test_prefill(hash_fn):
     )
     # This block ID order also checks the eviction order.
     assert blocks is not None and blocks.get_block_ids() == (
-        [7, 8, 9, 10, 4, 5, 6, 3, 2, 1],
+        [5, 4, 6, 7, 8, 9, 10, 3, 2, 1],
     )
 
     assert free_block_queue.num_free_blocks == 0
@@ -1186,7 +1186,7 @@ def test_prefill_plp():
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Request #2 is a prompt-logprobs request:
     # NO cache hit in the common prefix; duplicates request #0 cached blocks
@@ -1315,11 +1315,15 @@ def test_evict():
     assert manager.block_pool.free_block_queue.num_free_blocks == 1
 
     manager.free(req0)
+    # partial blocks (without hash) at head, other at tail (LRU policy):
+    assert [
+        b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ] == [6, 10, 5, 4, 3, 2, 1]
     manager.free(req1)
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [10, 6, 5, 4, 3, 2, 1, 9, 8, 7]
+    ] == [6, 10, 5, 4, 3, 2, 1, 9, 8, 7]
 
     # Touch the first 2 blocks.
     req2 = make_request("2", list(range(2 * 16 + 3)), block_size, sha256)
@@ -1329,7 +1333,7 @@ def test_evict():
     blocks = manager.allocate_slots(
         req2, 3, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([10],)
+    assert blocks is not None and blocks.get_block_ids() == ([6],)
     assert manager.block_pool.free_block_queue.num_free_blocks == 7
 
 
@@ -3139,3 +3143,28 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
 
     assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
+
+
+def test_free_blocks_reuses_uncached_blocks_before_cached_ones():
+    """Uncached blocks must be handed out again before cached ones.
+
+    A sliding-window group caches only the short run of blocks at each
+    alignment boundary; everything else it releases mid-prefill carries no
+    hash. If those go to the back of the free queue, the same prefill keeps
+    taking blocks from the front and evicts other requests' cached prefixes
+    although it could simply reuse what it just released.
+    """
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+
+    cached = pool.get_new_blocks(2)  # stands in for another request's prefix
+    for blk in cached:
+        blk.block_hash = make_block_hash_with_group_id(BlockHash(b"x"), 0)
+    uncached = pool.get_new_blocks(2)  # released without ever being cached
+    pool.free_blocks(cached)
+    pool.free_blocks(uncached)
+
+    handed_out = pool.get_new_blocks(2)
+    assert [b.block_id for b in handed_out] == [b.block_id for b in uncached]
+    assert all(b.block_hash is not None for b in cached), (
+        "the cached prefix must still be intact after the allocation"
+    )

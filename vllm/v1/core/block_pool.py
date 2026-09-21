@@ -416,21 +416,44 @@ class BlockPool:
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self, ordered_blocks: Iterable[KVCacheBlock], reuse_first: bool = False
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            reuse_first: Hand these blocks out again before any other free
+                block, cached or not. A sliding window that has moved past its
+                blocks releases them with this: their KV can never serve a
+                future hit at any alignment boundary the window still covers,
+                so keeping them cache-valuable would only let the running
+                prefill rotate the whole pool and evict other requests.
         """
-        # Materialize the iterable to allow multiple passes.
-        blocks_list = list(ordered_blocks)
-        for block in blocks_list:
+        # Identify blocks with hash (LRU cache) and without it (never match APC)
+        blocks_to_evict_last = []
+        blocks_to_evict_first = []
+        for block in ordered_blocks:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+            if block.ref_cnt == 0 and not block.is_null:
+                if reuse_first or block.block_hash is None or not self.enable_caching:
+                    # LIFO reuse of non-cached blocks for better GPU locality.
+                    # For sliding-window groups this is what keeps a long
+                    # prefill from evicting other requests' prefixes: the
+                    # blocks its window has moved past carry no hash (only the
+                    # run at each alignment boundary is cached), so they are
+                    # reused before any cached block is touched.
+                    blocks_to_evict_first.append(block)
+                else:
+                    # FIFO reuse of cached blocks for LRU eviction behavior.
+                    blocks_to_evict_last.append(block)
+
+        # Blocks to reuse first are prepended to the front of the free queue.
+        self.free_block_queue.prepend_n(blocks_to_evict_first)
+        # Blocks to reuse last are appended to the end of the free queue.
+        self.free_block_queue.append_n(blocks_to_evict_last)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
