@@ -1313,6 +1313,10 @@ def test_evict():
     assert manager.block_pool.free_block_queue.num_free_blocks == 1
 
     manager.free(req0)
+    # partial blocks (without hash) at head, other at tail (LRU policy):
+    assert [
+        b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ] == [6, 10, 5, 4, 3, 2, 1]
     manager.free(req1)
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     assert [
@@ -3217,3 +3221,51 @@ def test_sparse_store_events_preserve_logical_ranges(
     assert actual_indices == expected_indices
     # Dense runs remain batched; only logical gaps create new events.
     assert len(events) == sum(i - 1 not in expected_indices for i in expected_indices)
+
+
+def test_free_blocks_reuses_uncached_blocks_before_cached_ones():
+    """Uncached blocks must be handed out again before cached ones.
+
+    A sliding-window group caches only the short run of blocks at each
+    alignment boundary; everything else it releases mid-prefill carries no
+    hash. If those go to the back of the free queue, the same prefill keeps
+    taking blocks from the front and evicts other requests' cached prefixes
+    although it could simply reuse what it just released.
+    """
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+
+    cached = pool.get_new_blocks(2)  # stands in for another request's prefix
+    for blk in cached:
+        blk.block_hash = make_block_hash_with_group_id(BlockHash(b"x"), 0)
+    uncached = pool.get_new_blocks(2)  # released without ever being cached
+    pool.free_blocks(cached)
+    pool.free_blocks(uncached)
+
+    handed_out = pool.get_new_blocks(2)
+    assert [b.block_id for b in handed_out] == [b.block_id for b in uncached]
+    assert all(b.block_hash is not None for b in cached), (
+        "the cached prefix must still be intact after the allocation"
+    )
+
+
+def test_free_blocks_reuse_first_hands_out_dead_cached_blocks_first():
+    """Cached blocks a sliding window has moved past go out before others.
+
+    Their hash is still set, but no future hit at an alignment boundary the
+    window covers can read them. Freed with ``reuse_first`` they must be
+    handed out before another request's cached prefix.
+    """
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+
+    prefix = pool.get_new_blocks(2)  # another request's cached prefix
+    dead = pool.get_new_blocks(2)  # cached, but behind the window
+    for blk in prefix + dead:
+        blk.block_hash = make_block_hash_with_group_id(BlockHash(b"x"), 0)
+    pool.free_blocks(prefix)
+    pool.free_blocks(dead, reuse_first=True)
+
+    handed_out = pool.get_new_blocks(2)
+    assert [b.block_id for b in handed_out] == [b.block_id for b in dead]
+    assert all(b.block_hash is not None for b in prefix), (
+        "the other request's prefix must still be intact after the allocation"
+    )
