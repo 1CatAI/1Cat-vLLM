@@ -86,7 +86,13 @@ def test_compact_guard_checks_each_rows_sampling_parameters(temperature):
     assert _compact_target_requires_reference(probe, temperatures, top_p) == expected
 
 
-def test_compact_rejection_uses_request_mapping_and_variable_row_counts(monkeypatch):
+@pytest.mark.parametrize(
+    ("temperatures", "top_ps"),
+    [([0.5, 2.0, 1.0], [0.95, 0.9, 1.0]), ([1.0, 2.0, 0.1], [0.8, 0.9, 0.8])],
+)
+def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
+    monkeypatch, temperatures, top_ps
+):
     class Speculator:
         def get_sparse_draft_logits(self):
             return None, None
@@ -103,8 +109,8 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(monkeypa
     probe[:, :2] = 2.0
     probe[:, -1] = -20.0
     states = SimpleNamespace(
-        temperature=SimpleNamespace(np=np.array([0.5, 2.0, 1.0])),
-        top_p=SimpleNamespace(np=np.array([0.95, 0.9, 1.0])),
+        temperature=SimpleNamespace(np=np.array(temperatures)),
+        top_p=SimpleNamespace(np=np.array(top_ps)),
     )
     batch = SimpleNamespace(
         has_structured_output_reqs=False,

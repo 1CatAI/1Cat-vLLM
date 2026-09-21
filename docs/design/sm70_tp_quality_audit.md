@@ -243,6 +243,67 @@ retained in the task cache. A fresh, uninstrumented MBPP32 ON/OFF pair,
 standard vLLM bench, and the 262128+16 boundary gate follow these changes.
 Their results, rather than forced-token diagnostics, determine promotion.
 
+### Uninstrumented fixed-normalization pair
+
+The r26/r27 pair uses commit `28389e1fa5`, the unchanged source-native
+libraries, and the same deployment contract described above. Both arms
+select the fixed normalization by default. All 32 request bodies are identical
+between arms. ON scores **24/32**, OFF **25/32**; all 64 responses stop
+naturally. The only OFF-only correct item is 144; there are no ON-only correct
+items. ON emits 185389 tokens in total (maximum 41976 for one answer), OFF
+161292 (maximum 28229). The former OFF-only item 7 now passes in both arms.
+This is still an unresolved quality difference, not a passed promotion gate.
+
+Item 144's two answers both contain the correct nth-decagonal formula
+`n * (4*n - 3)`. ON assigns the required `is_num_decagonal` name to membership
+testing and places the nth computation in another helper; OFF assigns the
+required name to nth computation. This explains the assertion failure but
+does not identify the low-level cause of the generation branch. Retain the
+original score. A separate full natural-EOS, C1/temperature-zero comparison
+is used to investigate this remaining case; it must not replace the C4
+sampled results with a more favorable diagnostic.
+
+That complete greedy diagnostic finishes naturally in both modes: ON passes
+after 13413 output tokens; OFF fails after 14878, assigning the required name
+to the predicate. Request bodies match, with C1 and temperature zero in both
+arms. The direction reverses relative to the primary sampled pair. This does
+not establish a stable one-way accuracy loss, but also does not erase the
+primary 24/25 result or establish global equivalence. Do not repeat sampled
+sweeps solely to obtain a favorable score; the next numerical investigation
+needs a concrete same-input counterexample beyond the validated rounding floor.
+
+An independent audit of item 84 also confirms that its generated answers
+satisfy the stated integer equation, while the tests demand specific tuples
+among multiple valid solutions. The sandboxed equation check passes; the
+original strict score remains a failure. See `mbpp84-semantic-audit-r26.json`.
+
+Standard `vllm bench serve`, random 2048-token input/256-token output, with
+DFlash2 and normal CUDA Graphs, records:
+
+| Mode | Concurrency | Median TTFT | Median TPOT | Full-request output throughput |
+| --- | ---: | ---: | ---: | ---: |
+| OFF | 1 | 0.6831 s | 5.7054 ms | 119.6903 tok/s |
+| ON | 1 | 0.5927 s | 3.3647 ms | 176.3946 tok/s |
+| OFF | 4 | 2.6441 s | 12.5228 ms | 160.0622 tok/s |
+| ON | 4 | 2.2109 s | 11.0062 ms | 189.2527 tok/s |
+
+These are fixed-output synthetic speed checks, separate from natural answer
+quality. DFlash streaming events can contain multiple tokens: do not invert
+the raw inter-event latency and call it per-token decode throughput.
+Each arm also passes the cold 262128-input/16-output retrieval-and-sum
+boundary, returning `173 / 284 / 396 / 853`, with natural EOS at 262144 total
+tokens. ON TTFT is 132.3341 s (1980.8 input tok/s by input/TTFT); OFF TTFT is
+174.3433 s (1503.5 input tok/s). These are measured first long requests in
+their respective processes, without using prefix-cache hits as prefill speed.
+The 16-token answer is not a long-context decode-throughput benchmark.
+
+Artifacts: `norm-quality-pair-r27.json`,
+`audit-norm-{on-r26,off-r27}-mbpp32{.jsonl,-summary.json}`,
+the corresponding `-c{1,4}.json` and `-long-262128.json`,
+`quality-repair-source-r26.json`, and `mbpp144-r27-analysis.json`.
+The complete deterministic diagnostic is retained in
+`greedy-fixed-{off-r28,on-r29}-mbpp32.jsonl` and `greedy-fixed-pair-r29.json`.
+
 ## Reproduction and scope
 
 Raw artifacts and launch receipts are retained outside Git in the task artifact

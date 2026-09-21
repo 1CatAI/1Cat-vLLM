@@ -46796,6 +46796,17 @@ has launched no full model. Details and artifacts are in
   caller fails the heterogeneous-batch regression. This does not explain the
   earlier homogeneous-parameter MBPP score gap.
 - See `sm70_tp_quality_audit.md` for retained r20-r25 evidence. Uninstrumented
-  r26/r27 MBPP32, vLLM bench C1/C4 and the 262128+16 boundary gate follow. Keep
-  promotion conditional on their measured outcomes. The 75T full-FP32 target
-  and 35B-A3B AWQ/FP8 migration baselines are not resolved by this change.
+  r26/r27 MBPP32 completes at ON24/32 versus OFF25/32, all64naturalEOS;
+  item144is the only OFF-only correct case. Both answers contain the correct
+  nth-decagonal formula but assign different behavior to the required function
+  name. Keep this difference and the quality gate open; do not hide it with
+  prompt changes or a favorable rerun. Full C1 greedy144 is a separate diagnostic.
+- Complete greedy144 reverses the direction: ON passes after13413tokens,
+  OFF fails after14878; both stop naturally with identical C1/temperature-zero
+  requests. This is not a replacement for the C4sampled24/25 result. Avoid
+  repeating score sweeps without a concrete new numerical counterexample.
+- vLLM bench C1/C4 full-request output TPS is ON176.3946/189.2527 versus
+  OFF119.6903/160.0622 at2048input/256output. Both cold262128+16boundary checks
+  pass with naturalEOS; ON/OFF TTFT132.3341/174.3433s. Do not infer long-context
+  decode speed from that16-token answer. The75T full-FP32 target and35B-A3B
+  AWQ/FP8 migration baselines are not resolved by this change.
