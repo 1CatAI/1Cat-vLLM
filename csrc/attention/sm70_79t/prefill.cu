@@ -1934,7 +1934,11 @@ struct CublasQKLauncher {
 
   void launch(cudaStream_t stream) const {
     check(cublasSetStream(handle, stream), "set cuBLAS QK stream");
+  #if defined(PREFIX_QK_CUBLAS_FP32_ACCUM)
+    cublasGemmAlgo_t qk_algorithm = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  #else
     cublasGemmAlgo_t qk_algorithm = CUBLAS_GEMM_ALGO9_TENSOR_OP;
+  #endif
     if (char const* runtime_algorithm =
             std::getenv("PREFIX_QK_CUBLAS_ALGO_RUNTIME")) {
       qk_algorithm =

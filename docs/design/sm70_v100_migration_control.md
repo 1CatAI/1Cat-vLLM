@@ -5,15 +5,19 @@ Date: 2026-05-30
 ## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
 
 Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see
-[implementation and live validation log](sm70_tp_shape_coverage.md). This task
-generalizes the GQA6/D256 FP32 attention and quantized local projection paths
-and is not yet accepted on main. GPU operator checks cover 256K, real projection
-weights and CUDA Graph replay. Whole-model TP2/TP4 quality/concurrency checks
-remain in progress. TP1 27B at 256K fails the explicit KV memory-capacity check;
-its shorter-context serving results must not be relabelled 256K results. The
-originally authorized GPU services were stopped; another task owns GPU0–3,
-and this task's current endpoints use GPU4 and GPU5–6. Exact owned process IDs
-and launch records are in the design note's artifact directory.
+[implementation and live validation log](sm70_tp_shape_coverage.md). The
+candidate replaces TP allowlists with local layout capabilities and passes
+256K operator/CUDA Graph checks. It is **not accepted on main**. The precision
+audit found the inherited75T recipe accumulated QK in FP16; full QK/PV FP32
+candidate r8 measures70-71T, below the75T target. TP2 r5 passes cold256K and
+natural-EOS retrieval but uses the inherited QK arithmetic. C8-C32 TP2 client
+requests queue behind4 resident sequences and are not simultaneous decode
+evidence. TP4 r8 quality/long-context/concurrency is running on GPU4-7;
+GPU0-3 belongs to another task. TP1 27B+DFlash2 weights load after the missing
+placeholder fix, but chunk8192 profiling exceeds memory. The missing matched
+35B-A3B AWQ/FP8 evidence is still required for migration acceptance. Do not
+repeat the rejected smaller-PV-tile or cuBLAS layout/algorithm screens; the
+design note records the retained results and invalid benchmark exclusions.
 
 ## Mamba state grid decoupled from the KV block size, 2026-09-17
 

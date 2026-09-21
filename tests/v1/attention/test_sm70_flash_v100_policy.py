@@ -1813,7 +1813,9 @@ def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded():
         18,
         20,
     ]
-    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 80
+    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 160
+    for concurrency in (2, 4, 8, 16, 32):
+        assert concurrency * 8 in _sm70_speculative_cudagraph_capture_sizes(32, 8)
 
 
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(

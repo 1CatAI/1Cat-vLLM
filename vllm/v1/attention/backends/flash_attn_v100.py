@@ -1705,7 +1705,7 @@ def _run_sm70_d256_gqa_79t_dispatch(
     The remaining 8000 rows have the same causal alignment as the qualified
     Q8000 operator against the full K/V tensors.  Padding only the small
     leading fringe to 64 rows keeps the exact Split-D contract without adding
-    work to the 75T core.
+    work to the Q8000 core.
     """
     query_len = int(query.shape[1])
     fringe_len = query_len - _SM70_79T_CORE_QUERY_LEN
@@ -2052,7 +2052,7 @@ def _try_sm70_fa2_d256_prefill(
                                 "long-prefill architecture route active (%s).",
                                 "v37 FP32"
                                 if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
-                                else "Q8000 core / Q8192 FP32 75T dispatch",
+                                else "Q8000 core / Q8192 QK+PV FP32 dispatch",
                             )
                             _logged_prefill_d256_gqa_architecture = True
                         _record_route("prefill_dense_d256_gqa_arch_long")
