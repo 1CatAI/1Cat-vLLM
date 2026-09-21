@@ -1864,19 +1864,17 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   const bool channel_scales = group_scales.dim() == 2 &&
                               group_scales.size(0) == 1 &&
                               group_scales.size(1) == packed_n;
-  const bool qwen38_dense_shape =
-      !gated_silu &&
-      ((k == 5120 && (packed_n == 4096 || packed_n == 3584)) ||
-       (k == 1536 && packed_n == 5120) || (k == 4352 && packed_n == 5120));
-  const bool qwen38_gated_shape = gated_silu && k == 5120 && packed_n == 8704;
+  const bool aligned_shape =
+      k > 0 && split_k > 0 && k % (16 * split_k) == 0 && packed_n > 0;
+  const bool dense_shape = !gated_silu && aligned_shape && packed_n % 32 == 0;
+  const bool gated_shape = gated_silu && aligned_shape && packed_n % 64 == 0;
   const bool native_m32 = qpn8_m32_native_enabled && m > 16 && m <= 32 &&
-                          qwen38_dense_shape &&
-                          (split_k == 12 || split_k == 16) &&
+                          dense_shape && (split_k == 12 || split_k == 16) &&
                           accumulator_chains == 2 && !prefetch_codes;
   const bool admitted_m = (qpn8_m16_enabled && m <= 16) ||
                           (qpn8_m32_chunked_enabled && m <= 32) || native_m32;
   if (admitted_m && channel_scales && split_k <= (gated_silu ? 8 : 16) &&
-      (qwen38_dense_shape || qwen38_gated_shape)) {
+      (dense_shape || gated_shape)) {
     if (native_m32) {
       static std::once_flag qpn8_m32_native_log_once;
       std::call_once(qpn8_m32_native_log_once, []() {
@@ -1901,7 +1899,7 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
       const int64_t rows = std::min<int64_t>(16, m - row);
       auto input_chunk = input.narrow(0, row, rows);
       auto out_chunk = out.narrow(0, row, rows);
-      if (qwen38_gated_shape) {
+      if (gated_shape) {
         fp8_qpn8_gated_pair_sm70_out(out_chunk, input_chunk, codes,
                                      group_scales, split_k, accumulator_chains,
                                      true, prefetch_codes);

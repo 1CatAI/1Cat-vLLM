@@ -285,6 +285,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_col_gpu,
             self._mamba_token_bias_gpu,
             input_batch.idx_mapping,
+            input_batch.query_start_loc,
         )
 
     def _get_dflash2_gdn_builders(

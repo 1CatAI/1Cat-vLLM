@@ -37,7 +37,8 @@ def grouped_e4m3_fp32_allowed(
         and instance._flash_v100_window_size(causal=True) == (-1, -1)
         and query.ndim == 3
         and 2 <= query.shape[0] <= 8
-        and query.shape[1:] == (6, 256)
+        and query.shape[1] > 0
+        and query.shape[2] == 256
         and query.dtype == torch.float16
         and query.is_contiguous()
         and out.shape == query.shape
@@ -45,8 +46,10 @@ def grouped_e4m3_fp32_allowed(
         and out.device == query.device
         and out.is_contiguous()
         and k.ndim == 4
-        and k.shape[1] in (800, 848, 1616, 1648, 1728, 3296, 3456)
-        and k.shape[2:] == (1, 256)
+        and k.shape[1] > 0
+        and k.shape[1] % 16 == 0
+        and k.shape[2] * 6 == query.shape[1]
+        and k.shape[3] == 256
         and v.shape == k.shape
         and k.dtype == torch.uint8
         and v.dtype == torch.uint8

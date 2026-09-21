@@ -60,7 +60,7 @@ def test_single_request_shape_and_metadata_admission(monkeypatch, change):
     elif change == "table2":
         metadata.block_table = table.expand(2, -1) if rows == 1 else table[:2]
     elif change == "page":
-        k = k[:, :816]
+        k = k[:, :817]
     elif change == "lengths":
         lengths = lengths.long()
     elif change == "dtype":

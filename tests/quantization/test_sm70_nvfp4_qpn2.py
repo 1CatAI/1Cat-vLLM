@@ -102,7 +102,7 @@ def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
             "get_current_vllm_config",
             lambda: _runtime_config(tp=2),
         )
-        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
 
         monkeypatch.setattr(
             nvfp4_scheme,
@@ -129,7 +129,7 @@ def test_nvfp4_qpn2_dflash2_explicit_rollback(monkeypatch):
         envs.disable_envs_cache()
 
 
-def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
+def test_nvfp4_qpn2_shape_gate_ignores_tp_size():
     layer = SimpleNamespace(
         tp_size=4,
         prefix="model.language_model.layers.0.mlp.gate_up_proj",
@@ -140,7 +140,7 @@ def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     assert nvfp4_scheme._is_qpn2_layer(layer)
 
     layer.tp_size = 2
-    assert not nvfp4_scheme._is_qpn2_layer(layer)
+    assert nvfp4_scheme._is_qpn2_layer(layer)
     layer.tp_size = 4
     compatible = (
         ("linear_attn.in_proj_qkvz", 5120, 4120, (4120, 2560)),

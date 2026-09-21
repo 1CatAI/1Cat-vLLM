@@ -1026,18 +1026,21 @@ def flash_attn_decode_paged(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
     )
     if (
-        os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST", "0") == "1"
+        os.getenv(
+            "VLLM_FLASH_V100_E4M3_SCALAR_FAST",
+            os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST", "1"),
+        )
+        == "1"
         and e4m3_fp32
         and q.dtype == torch.float16
-        and tuple(q.shape) == (8, 12, 256)
-        and k_cache.shape[2:] == (2, 256)
+        and q.shape[2] == 256
         and plan.partition_size == 1024
         and window_size_left == window_size_right == -1
         and anchor_lens is None
     ):
         version = getattr(flash_attn_v100_cuda, "tp2_e4m3_scalar_fast_version", None)
-        if not callable(version) or int(version()) < 2:
-            raise RuntimeError("Rebuild Flash-V100 for TP2 E4M3 scalar fast revision 2")
+        if not callable(version) or int(version()) < 3:
+            raise RuntimeError("Rebuild Flash-V100 for E4M3 scalar fast revision 3")
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -1145,6 +1148,11 @@ def flash_attn_grouped_e4m3_fp32_paged(
         raise RuntimeError(
             "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 4"
         )
+    if (
+        q.shape[1] != 6
+        or k_cache.shape[1] not in (800, 848, 1616, 1648, 1728, 3296, 3456)
+    ) and int(flash_attn_v100_cuda.grouped_e4m3_fp32_precision_version()) < 5:
+        raise RuntimeError("Rebuild Flash-V100 for multi-head E4M3 revision 5")
     workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
     return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
         q,
@@ -1262,7 +1270,8 @@ def flash_attn_decode_paged_xqa(
             E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
             if kv_cache_dtype in ("fp8", "fp8_e4m3")
             and q.ndim == 3
-            and q.shape[1:] == (6, 256)
+            and k_cache.shape[2] > 0
+            and q.shape[1:] == (6 * k_cache.shape[2], 256)
             and os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
             and q.shape[0] > 1
             and k_cache.dtype == torch.uint8
@@ -1271,10 +1280,17 @@ def flash_attn_decode_paged_xqa(
                 E4M3_XQA_VALID_DECODE_PARTITION_SIZES
                 if kv_cache_dtype in ("fp8", "fp8_e4m3")
                 and q.ndim == 3
-                and q.shape == (1, 6, 256)
+                and k_cache.shape[2] > 0
+                and q.shape == (1, 6 * k_cache.shape[2], 256)
+                and k_cache.shape[1] >= 256
+                and k_cache.shape[1] % 16 == 0
                 and k_cache.dtype == torch.uint8
                 and v_cache.dtype == torch.uint8
-                else VALID_DECODE_PARTITION_SIZES
+                else (
+                    E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
+                    if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    else VALID_DECODE_PARTITION_SIZES
+                )
             )
         ),
     )

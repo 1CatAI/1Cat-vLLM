@@ -180,13 +180,19 @@ def long_attention_graph_contract(capacity: int | None = None):
     return long_attention_contract(manifest, capacity)
 
 
-# Paged-KV page sizes the shipped operator has compiled specializations for.
-# The host entry dispatch only instantiates these two, so a different page size
-# has no kernel to run and the route must fall back. The page size follows the
-# served window, so this is what makes the route available at one window and
-# unavailable at another.
+# Keep the qualified fixed pages for older native libraries. Rebuilt libraries
+# also expose the existing runtime-page kernel for positive 16-aligned pages.
 ADMITTED_PAGE_SIZES = (1648, 3296)
 _REPORTED_PAGE_SIZES: set[int] = set()
+
+
+def long_attention_page_supported(page_size: int, manifest: dict) -> bool:
+    if page_size in ADMITTED_PAGE_SIZES:
+        return True
+    if page_size <= 0 or page_size % 16 or manifest["module_name"] != "_vllm_fa2_C":
+        return False
+    revision = getattr(torch.ops._vllm_fa2_C, "sm70_grouped_long_page_revision", None)
+    return revision is not None and revision() >= 1
 
 
 def _report_unadmitted_page_size(page_size: int) -> None:
@@ -195,9 +201,8 @@ def _report_unadmitted_page_size(page_size: int) -> None:
     _REPORTED_PAGE_SIZES.add(page_size)
     logger.warning(
         "SM70 E4M3 long-context route declined: the paged-KV page size is %d "
-        "tokens and the shipped operator only has compiled specializations for "
-        "%s. The route falls back to the ordinary path. Adjust --max-model-len "
-        "so the derived page size matches, or compile the specialization.",
+        "tokens. Rebuild the shipped operator for positive 16-aligned pages; "
+        "older libraries retain fixed pages %s. Using the ordinary path.",
         page_size,
         ADMITTED_PAGE_SIZES,
     )
@@ -227,13 +232,15 @@ def wrap_long_attention(fallback):
             and bucket <= capability
             and q.ndim == 3
             and q.shape[0] in query_rows
-            and q.shape[1:] == (6, 256)
+            and q.shape[1] > 0
+            and q.shape[2] == 256
             and k.ndim == 4
-            and k.shape[1] in ADMITTED_PAGE_SIZES
-            and k.shape[2:] == (1, 256)
+            and long_attention_page_supported(k.shape[1], manifest)
+            and k.shape[2] * 6 == q.shape[1]
+            and k.shape[3] == 256
             and v.shape == k.shape
         ):
-            if k.ndim == 4 and k.shape[1] not in ADMITTED_PAGE_SIZES:
+            if k.ndim == 4 and not long_attention_page_supported(k.shape[1], manifest):
                 _report_unadmitted_page_size(int(k.shape[1]))
             return fallback(
                 q,
@@ -257,7 +264,8 @@ def wrap_long_attention(fallback):
                 torch.empty((80, 8, 6, 2), dtype=torch.float32, device=q.device),
             )
         partial, lse = _WORKSPACES[key]
-        return operator(
+        return run_six_head_groups(
+            operator,
             q,
             k,
             v,
@@ -272,3 +280,26 @@ def wrap_long_attention(fallback):
         )
 
     return run
+
+
+def run_six_head_groups(operator, q, k, v, out, *args):
+    """Reuse the validated six-head kernel without copying the paged KV cache.
+
+    Each group retains the original reduction order. The shared workspace is
+    consumed serially on the current stream; graph capture retains the small
+    query/output buffers used for the individual groups.
+    """
+    if k.shape[2] == 1:
+        return operator(q, k, v, out, *args)
+    for head in range(k.shape[2]):
+        group_q = q[:, head * 6 : (head + 1) * 6].contiguous()
+        group_out = torch.empty_like(group_q)
+        operator(
+            group_q,
+            k[:, :, head : head + 1],
+            v[:, :, head : head + 1],
+            group_out,
+            *args,
+        )
+        out[:, head * 6 : (head + 1) * 6].copy_(group_out)
+    return out

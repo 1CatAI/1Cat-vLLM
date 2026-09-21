@@ -99,6 +99,9 @@ _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": "1",
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
+    # Keep the no-residual/FP16-residual reductions consistent across ranks
+    # and process starts. Autotuning them perturbs the initial GDN state.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": "1",
     "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",
@@ -514,10 +517,14 @@ def _sm70_speculative_cudagraph_capture_sizes(
     decode_query_len: int,
 ) -> list[int]:
     """Return bounded auxiliary and verifier shapes without a TP contract."""
-    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
-        max_num_seqs,
-        decode_query_len,
-    )
+    # DFlash verification has the same B32 attention/layout coverage as
+    # ordinary decode. A 16-request cap leaves C32 outside CUDA Graph replay.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
+    request_sizes = {
+        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
+    }
+    request_sizes.add(max_graph_reqs)
+    verifier_sizes = [decode_query_len * size for size in request_sizes]
     return sorted(
         set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
     )

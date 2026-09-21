@@ -32,6 +32,7 @@ def _make_context(
         is_initialized=True,
         num_layers=1,
         num_state_types=2,
+        num_states=len(states),
         block_table_ptrs=torch.tensor(
             [block_table.data_ptr()], dtype=torch.int64, device=device
         ),
@@ -134,6 +135,7 @@ def test_mrv2_align_precopy_matches_v1_sd_semantics(token_bias: int) -> None:
         src_col,
         bias,
         idx_mapping,
+        torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * 2,
     )
     torch.accelerator.synchronize()
 
@@ -194,3 +196,62 @@ def test_mrv2_align_postprocess_same_block_shift_is_exact() -> None:
     torch.testing.assert_close(conv, conv_ref, rtol=0, atol=0)
     torch.testing.assert_close(temporal, temporal_ref, rtol=0, atol=0)
     assert int(accepted[0]) == 1
+
+
+@pytest.mark.parametrize("accepted_count", [2, 6, 8])
+@pytest.mark.parametrize("query_len", [1, 8])
+def test_speculative_to_single_token_tail_materializes_accepted_state(
+    accepted_count: int, query_len: int
+) -> None:
+    torch.manual_seed(44)
+    device = torch.device("cuda")
+    # Physical IDs are deliberately unrelated to the speculative slot offsets.
+    table = torch.tensor([[4, 7, 2, 9, 1, 8, 3, 6]], device=device, dtype=torch.int32)
+    conv = torch.randn(10, 10, 128, device=device, dtype=torch.float16)
+    temporal = torch.randn(10, 4, 16, 16, device=device, dtype=torch.float32)
+    original_conv, original_temporal = conv.clone(), temporal.clone()
+    ctx = _make_context(conv, temporal, table, block_size=8192)
+    mapping = torch.zeros(1, device=device, dtype=torch.int32)
+    state_idx = torch.zeros_like(mapping)
+    computed = torch.full_like(mapping, 100)
+    qsl = torch.tensor([0, query_len], device=device, dtype=torch.int32)
+    accepted = torch.full_like(mapping, accepted_count)
+    src, bias = torch.empty_like(mapping), torch.empty_like(mapping)
+
+    def run():
+        preprocess_mamba_align_fused_kernel[(1,)](
+            mapping,
+            state_idx,
+            computed,
+            qsl,
+            accepted,
+            src,
+            bias,
+            1,
+            BLOCK_SIZE=1,
+            MAMBA_BLOCK_SIZE=8192,
+        )
+        run_mamba_align_precopy(ctx, 1, state_idx, src, bias, mapping, qsl)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        conv.copy_(original_conv)
+        temporal.copy_(original_temporal)
+        accepted.fill_(accepted_count)
+        state_idx.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        expected_conv, expected_temporal = (
+            original_conv.clone(),
+            original_temporal.clone(),
+        )
+        if query_len == 1:
+            offset = accepted_count - 1
+            expected_conv[4, : 10 - offset] = original_conv[4, offset:]
+            expected_temporal[4] = original_temporal[int(table[0, offset])]
+        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+        torch.testing.assert_close(temporal, expected_temporal, rtol=0, atol=0)
+        assert int(accepted[0]) == (1 if query_len == 1 else accepted_count)

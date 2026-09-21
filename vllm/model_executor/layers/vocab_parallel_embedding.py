@@ -35,7 +35,7 @@ from vllm.platforms import current_platform
 DEFAULT_VOCAB_PADDING_SIZE = 64
 logger = init_logger(__name__)
 
-_SM70_DFLASH2_QPN8_LM_HEAD_SHAPE = (62080, 5120)
+_SM70_DFLASH2_QPN8_VOCAB_CHUNK = 62080
 _SM70_DFLASH2_QPN8_MAX_ROWS = 8
 _SM70_DFLASH2_QPN8_CANDIDATES = 64
 _SM70_DFLASH2_QPN8_SPLIT_K = 8
@@ -142,18 +142,19 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
 def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
     if not _sm70_dflash2_qpn8_rerank_requested():
         return False
-    if tuple(layer.weight.shape) != _SM70_DFLASH2_QPN8_LM_HEAD_SHAPE:
+    rows, hidden = layer.weight.shape
+    if rows < 64 or rows % 32 or hidden <= 0 or hidden % 128:
         logger.warning_once(
-            "SM70 DFlash2 QPN8 rerank requires LM-head shape %s; got %s. "
+            "SM70 DFlash2 QPN8 rerank requires N>=64, N%%32=0 and K%%128=0; got %s. "
             "Using the dense LM head.",
-            _SM70_DFLASH2_QPN8_LM_HEAD_SHAPE,
             tuple(layer.weight.shape),
         )
         return False
-    if getattr(layer, "tp_size", 1) != 4:
-        logger.warning_once(
-            "SM70 DFlash2 QPN8 rerank requires TP4; using the dense LM head."
-        )
+    if not envs.VLLM_SM70_DFLASH2_FP32_LOGITS and (
+        rows > _SM70_DFLASH2_QPN8_VOCAB_CHUNK or hidden != 5120
+    ):
+        # The legacy packed FP16 reranker requires exactly 64 candidates and
+        # K=5120. The FP32 indexed reranker supports wider candidate sets.
         return False
     if layer.shard_indices.num_org_vocab_padding != 0:
         logger.warning_once(
@@ -213,7 +214,17 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     layer._sm70_dflash2_fp32_logits = fp32_logits
     rerank_dtype = torch.float32 if fp32_logits else torch.float16
     max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
-    candidates = _SM70_DFLASH2_QPN8_CANDIDATES
+    # Keep the accepted support density when a worker owns more vocabulary.
+    # A wider shard screens 64 candidates per original-sized vocabulary chunk,
+    # preserving every candidate that separate TP4 shards would have retained.
+    groups = tuple(
+        (begin, min(begin + _SM70_DFLASH2_QPN8_VOCAB_CHUNK, rows))
+        for begin in range(0, rows, _SM70_DFLASH2_QPN8_VOCAB_CHUNK)
+    )
+    candidates = sum(
+        min(_SM70_DFLASH2_QPN8_CANDIDATES, end - begin) for begin, end in groups
+    )
+    layer._sm70_dflash2_qpn8_vocab_groups = groups
     layer.register_buffer("_sm70_dflash2_qpn8_codes", codes, persistent=False)
     layer.register_buffer("_sm70_dflash2_qpn8_scales", packed_scales, persistent=False)
     layer.register_buffer(
@@ -300,7 +311,10 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
         )
     layer._sm70_dflash2_qpn8_rerank_prepared = True
     logger.info_once(
-        "SM70 DFlash2 QPN8 top-64 rerank layout prepared (%s logits).",
+        "SM70 DFlash2 QPN8 rerank layout prepared: %d vocabulary chunks, "
+        "%d candidates (%s logits).",
+        len(groups),
+        candidates,
         "FP32" if fp32_logits else "FP16",
     )
     return True
@@ -377,14 +391,14 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     if not _is_sm70_lm_head_fastpath_eligible(layer):
         return False
 
-    tp_size = getattr(layer, "tp_size", 1)
     if (
         envs.VLLM_SM70_DFLASH2_FP32_LOGITS
-        and tp_size in (2, 4)
-        and tuple(layer.weight.shape) == (248320 // tp_size, 5120)
+        and len(layer.weight.shape) == 2
+        and layer.weight.shape[0] > 0
+        and layer.weight.shape[1] % 16 == 0
     ):
-        # Dense FP32 output must not depend on the TP4-only QPN8 candidate
-        # layout being available. TP2 otherwise silently keeps FP16 logits.
+        # Dense FP32 output does not depend on candidate-layout availability
+        # or the number of devices participating in tensor parallelism.
         layer._sm70_dflash2_fp32_logits = True
 
     raw_top1_requested = _sm70_env_bool(
@@ -594,13 +608,21 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     # support, so skip the unnecessary 64-element result sort. This keeps the
     # official PyTorch multiblock selector while avoiding its final bitonic
     # kernel and leaves candidate quality unchanged.
-    torch.topk(
-        qpn8_logits,
-        _SM70_DFLASH2_QPN8_CANDIDATES,
-        dim=-1,
-        sorted=False,
-        out=(qpn8_values, qpn8_ids),
-    )
+    candidate_offset = 0
+    for begin, end in layer._sm70_dflash2_qpn8_vocab_groups:
+        count = min(_SM70_DFLASH2_QPN8_CANDIDATES, end - begin)
+        group_values = qpn8_values[:, candidate_offset : candidate_offset + count]
+        group_ids = qpn8_ids[:, candidate_offset : candidate_offset + count]
+        torch.topk(
+            qpn8_logits[:, begin:end],
+            count,
+            dim=-1,
+            sorted=False,
+            out=(group_values, group_ids),
+        )
+        if begin:
+            group_ids.add_(begin)
+        candidate_offset += count
 
     fp32_logits = getattr(layer, "_sm70_dflash2_fp32_logits", False)
     if fp32_logits:
@@ -687,8 +709,10 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         )
 
     logger.info_once(
-        "SM70 DFlash2 QPN8 top-64 plus %s rerank path enabled (dense_order=%s).",
+        "SM70 DFlash2 QPN8 top-64 per vocabulary chunk plus %s rerank path "
+        "enabled (chunks=%d, dense_order=%s).",
         "FP32 candidate" if fp32_logits else "packed TurboMind FP16",
+        len(layer._sm70_dflash2_qpn8_vocab_groups),
         use_dense_order,
     )
     output_shape = (*x.shape[:-1], selector_k)

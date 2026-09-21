@@ -33,19 +33,22 @@ _SELECTOR_ALIGNMENT_STEP = 0
 
 def _compact_target_requires_reference(
     probe_logits: torch.Tensor,
-    temperature: float,
-    top_p: float,
+    temperature: float | np.ndarray,
+    top_p: float | np.ndarray,
 ) -> bool:
     """Keep ambiguous cutoffs on the full-vocabulary sampling contract.
 
     The 21st candidate detects a tie crossing top-20. Ties wholly inside the
     retained nucleus are harmless; ties split by top-p need the reference's
     vocabulary tie order. The small CDF guard also covers FP32 scan rounding.
-    This is called outside the model CUDA graphs, once per B1 verification.
+    Sampling parameters are scalar or per-logit-row arrays. This is called
+    outside the model CUDA graphs, once per verification batch.
     """
-    # The branch needs one host decision anyway. Copy the tiny B1 probe once
+    # The branch needs one host decision anyway. Copy the compact probe once
     # instead of launching a chain of GPU reductions followed by the same fence.
     probe = probe_logits.detach().cpu().float().numpy()
+    temperature = np.asarray(temperature, dtype=np.float32).reshape(-1, 1)
+    top_p = np.asarray(top_p, dtype=np.float32).reshape(-1, 1)
     logits = probe[:, :_TARGET_TOP_K] / temperature
     exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
     probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
@@ -56,7 +59,7 @@ def _compact_target_requires_reference(
         (logits[:, :-1] == logits[:, 1:]) & (keep[:, :-1] != keep[:, 1:])
     ).any(axis=-1)
     near_cutoff = np.abs(before - top_p).min(axis=-1) <= (16 * np.finfo(np.float32).eps)
-    ambiguous = cutoff_tie | ((nucleus_tie | near_cutoff) & (top_p < 1.0))
+    ambiguous = cutoff_tie | ((nucleus_tie | near_cutoff) & (top_p[:, 0] < 1.0))
     return bool(ambiguous.any())
 
 
@@ -253,12 +256,15 @@ def try_dflash2_sparse_target_rejection(
         sample_hidden_states,
         _TARGET_TOP_K + 1,
     )
-    idx = input_batch.idx_mapping_np[0]
+    idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
+    # Packed verifier rows need their own request's sampling parameters.
+    # Reusing the first request misses ambiguous nuclei in heterogeneous batches.
+    num_logits = np.diff(input_batch.cu_num_logits_np)
     if _compact_target_requires_reference(
         target_topk_logits,
-        float(states.temperature.np[idx]),
-        float(states.top_p.np[idx]),
+        np.repeat(states.temperature.np[idx], num_logits),
+        np.repeat(states.top_p.np[idx], num_logits),
     ):
         logger.info_once(
             "DFlash2 target cutoff requires full-vocabulary reference sampling."

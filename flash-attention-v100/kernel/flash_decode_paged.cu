@@ -3542,11 +3542,13 @@ void launch_flash_attention_decode_paged(
                 "anchored decode window requires an fp16 KV cache");
     if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && D == 256 &&
                   PARTITION_SIZE == 1024 && std::is_same_v<PARTIAL_T, float>) {
-      const char* enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
-      const bool use_fast = enabled && enabled[0] == '1' &&
-                            enabled[1] == '\0' && batch_size == 8 &&
-                            num_heads_q == 12 && num_heads_kv == 2 &&
-                            window_size_left == -1 && window_size_right == -1;
+      const char* enabled = std::getenv("VLLM_FLASH_V100_E4M3_SCALAR_FAST");
+      if (enabled == nullptr) {
+        enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
+      }
+      const bool use_fast =
+          (enabled == nullptr || (enabled[0] == '1' && enabled[1] == '\0')) &&
+          window_size_left == -1 && window_size_right == -1;
       if (use_fast) {
         tp2_e4m3_scalar_fast_calls.fetch_add(1, std::memory_order_relaxed);
         launch_partition(std::false_type{}, std::true_type{});
@@ -4392,16 +4394,15 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
     float scale, float k_scale, float v_scale) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
-                  q.size(0) <= 8 && q.size(1) == 6 && q.size(2) == 256,
-              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [2..8,6,256]");
+                  q.size(0) <= 8 && q.size(1) > 0 && q.size(1) % 6 == 0 &&
+                  q.size(2) == 256,
+              "E4M3 grouped FP32 requires CUDA FP16 Q [2..8,6*Hkv,256]");
   TORCH_CHECK(
-      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
-          (k.size(1) == 800 || k.size(1) == 848 || k.size(1) == 1616 ||
-           k.size(1) == 1648 || k.size(1) == 1728 || k.size(1) == 3296 ||
-           k.size(1) == 3456) &&
+      k.dim() == 4 && k.size(2) * 6 == q.size(1) && k.size(3) == 256 &&
+          k.size(1) > 0 && k.size(1) % 16 == 0 &&
           k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
           v.sizes() == k.sizes(),
-      "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
+      "E4M3 grouped FP32 requires uint8 KV [pages,16-aligned-page,Hkv,256]");
   TORCH_CHECK(
       block_table.dim() == 2 && block_table.size(0) == 1 &&
           block_table.is_contiguous() &&
@@ -4446,6 +4447,22 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "E4M3 grouped FP32 supports SM70 only");
+  if (k.size(2) > 1) {
+    // KV heads are independent. Retain the validated FP32 reduction for each
+    // GQA6 group, including causal row lengths and arbitrary cache strides.
+    // The shared partial workspace is reused in current-stream order.
+    for (int64_t head = 0; head < k.size(2); ++head) {
+      auto group_q = q.narrow(1, head * 6, 6).contiguous();
+      auto group_k = k.narrow(2, head, 1);
+      auto group_v = v.narrow(2, head, 1);
+      auto group_out = at::empty_like(group_q);
+      flash_attention_grouped_e4m3_fp32_paged(
+          group_q, group_k, group_v, group_out, block_table, row_lengths,
+          partial, lse, scale, k_scale, v_scale);
+      out.narrow(1, head * 6, 6).copy_(group_out);
+    }
+    return out;
+  }
   // A contiguous FP16 view can start at a half-element storage offset.
   // The shared-Q feed uses uint4 loads; only those exceptional views need
   // an aligned, stream-local copy. Ordinary model Q keeps the original path.
@@ -4486,10 +4503,11 @@ int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Revision 3 retains unnormalized FP32 numerators and separate max/sum.
   // Older normalized-partial/LSE workspaces are not ABI-compatible.
   // Revision 4 admits DFlash2 1728/3456 pages and FP32 scalar E4M3 partials.
-  return 4;
+  // Revision 5 admits multiple local KV heads and runtime aligned page sizes.
+  return 5;
 }
 
-int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 2; }
+int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 3; }
 
 int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count() {
   // Includes capture-time launches; CUDA Graph replay does not call this host
@@ -5174,9 +5192,8 @@ at::Tensor flash_attention_decode_paged_xqa(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
     const bool e4m3_batch_allowed = q.size(0) > 1 && xqa_e4m3_batch_enabled();
-    const bool e4m3_aligned_page = k_cache.size(1) >= 256 &&
-                                   k_cache.size(1) % 16 == 0 &&
-                                   k_cache.size(2) == 1;
+    const bool e4m3_aligned_page =
+        k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0;
     const bool use_large_partition =
         q.size(0) == 1 &&
         (partition_size == 512 || partition_size == 896 ||
@@ -5188,12 +5205,12 @@ at::Tensor flash_attention_decode_paged_xqa(
                 "E4M3 XQA supports B=1, or B>=2 when "
                 "VLLM_FLASH_V100_E4M3_BATCH_XQA=1; q_per_kv=6 and D=256 are "
                 "required. A 16-aligned page with at least 256 tokens and "
-                "Hkv=1 additionally supports B1 partition sizes 512, 896, "
+                "additionally supports B1 partition sizes 512, 896, "
                 "1024, and 1664");
     const bool e4m3_batch_optimized =
         q.size(0) > 1 && xqa_e4m3_batch_optimized_enabled() &&
         k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
-        k_cache.size(2) == 1 && k_cache.scalar_type() == at::kByte;
+        k_cache.scalar_type() == at::kByte;
     const XQABatchContextRoute e4m3_batch_route =
         e4m3_batch_optimized && batch_context_max_seq_len > 0 && q.size(0) >= 4
             ? select_xqa_batch_context_route(
