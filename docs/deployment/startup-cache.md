@@ -70,24 +70,8 @@ long-output/context quality gates before enabling a cache in production.
   [PR #621](https://github.com/1CatAI/1Cat-vLLM/pull/621) proposes restoring the
   default and carries a Torch 2.10 serialization backport. Review its prerequisites
   rather than treating a cache environment variable as a correctness fix.
-- Test the very first reload after an empty-cache compile. Set
-  `VLLM_FORCE_AOT_LOAD=1` on that reload to expose the original traceback instead
-  of a silent fallback. This flag does not change the cache key. Preserve the
-  initial artifacts before a fallback can replace them.
-- The non-mega vLLM AOT format saves the Triton kernels and constant arguments
-  referenced by its FX graph, then remaps their indices into the new process's
-  table. Torch's bundled-AOT serialization backport alone does not cover this
-  vLLM serializer. Older artifacts containing Triton nodes without the table
-  must be regenerated once; artifacts without those nodes remain readable.
-- Frozen Python module names such as `<frozen os>` must not change the backend
-  source hash: Dynamo reports them during tracing, while AOT `SourceInfo` omits
-  them on reload. Real source files still participate in cache invalidation.
-  Compare `cache_key_factors.json` from the initial and reloaded backend if a
-  load unexpectedly misses its Inductor artifacts.
-- Preserve and compare effective `.best_config` values when diagnosing cold/reload
-  drift. Restoring standalone artifacts writes their saved autotune choices.
-  Different subgraphs can carry conflicting choices even within one rank; rank
-  isolation alone is not a demonstrated correctness fix.
+- AOT loads that immediately recompile may be missing the serialized Triton
+  kernel table on Torch 2.10. Confirm actual artifact-load logs in a fresh process.
 - A successful artifact load followed by an invalid-pointer error can mean a
   process-local scratch or weight address was serialized as an integer. The
   compressed-tensors channel-FP8 QPN8 route resolves its shared prefill workspace
