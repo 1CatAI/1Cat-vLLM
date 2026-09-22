@@ -3,10 +3,11 @@
 
 import contextlib
 import hashlib
+import importlib
 import inspect
 import os
 import pickle
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Literal
 from unittest.mock import patch
 
@@ -163,6 +164,101 @@ def patch_pytree_map_over_slice():
         pytree._deregister_pytree_node(slice)
 
 
+def _triton_kernel_nodes(
+    graph_module: torch.fx.GraphModule,
+) -> Iterator[tuple[torch.fx.GraphModule, torch.fx.Node]]:
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        triton_kernel_wrapper_functional,
+        triton_kernel_wrapper_mutation,
+    )
+
+    for module in graph_module.modules():
+        if isinstance(module, torch.fx.GraphModule):
+            for node in module.graph.nodes:
+                if node.op == "call_function" and node.target in (
+                    triton_kernel_wrapper_functional,
+                    triton_kernel_wrapper_mutation,
+                ):
+                    yield module, node
+
+
+def _serialize_triton_side_table(graph_module: torch.fx.GraphModule) -> dict:
+    """Save only the process-local Triton entries referenced by this graph."""
+    from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+
+    from vllm.triton_utils import triton
+
+    kernels = {}
+    constants = {}
+    for _, node in _triton_kernel_nodes(graph_module):
+        kernel_idx = node.kwargs["kernel_idx"]
+        if kernel_idx not in kernels:
+            kernel = kernel_side_table.get_kernel(kernel_idx)
+            fn = kernel.fn
+            module, name = fn.__module__, fn.__name__
+            imported = getattr(importlib.import_module(module), name, None)
+            configs = None
+            if (
+                isinstance(kernel, triton.runtime.autotuner.Autotuner)
+                and imported is kernel.fn
+                and len(kernel.configs) == 1
+                and not kernel.keys
+                and not kernel.reset_to_zero
+                and not kernel.restore_value
+                and not kernel.user_defined_pre_hook
+                and not kernel.user_defined_post_hook
+                and kernel.perf_model is None
+                and kernel.early_config_prune is None
+            ):
+                # Dynamo wraps explicit launch options (e.g. num_warps=8)
+                # in a generated one-config Autotuner. Importing only the
+                # underlying JIT function would silently lose those options.
+                configs = kernel.configs
+            elif imported is not kernel:
+                raise RuntimeError(f"Triton kernel {module}.{name} is not importable")
+            kernels[kernel_idx] = (module, name, configs)
+        constant_idx = node.kwargs["constant_args_idx"]
+        constants[constant_idx] = kernel_side_table.get_constant_args(constant_idx)
+    return {"kernels": kernels, "constants": constants}
+
+
+def _restore_triton_side_table(
+    graph_module: torch.fx.GraphModule, saved: dict | None
+) -> None:
+    from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+
+    from vllm.triton_utils import triton
+
+    nodes = list(_triton_kernel_nodes(graph_module))
+    if not nodes:
+        return
+    if saved is None:
+        raise RuntimeError("AOT graph has no Triton side table; regenerate the cache")
+
+    # Other graphs can already have populated the process-global table. Allocate
+    # current IDs and rewrite this graph instead of overwriting their entries.
+    kernels = {}
+    for idx, (module, name, configs) in saved["kernels"].items():
+        kernel = getattr(importlib.import_module(module), name)
+        if configs is not None:
+            kernel = triton.autotune(configs=configs, key=[])(kernel)
+        kernels[idx] = kernel_side_table.add_kernel(kernel)
+    constants = {
+        idx: kernel_side_table.add_constant_args(args)
+        for idx, args in saved["constants"].items()
+    }
+    modified = set()
+    for module, node in nodes:
+        node.kwargs = {
+            **node.kwargs,
+            "kernel_idx": kernels[node.kwargs["kernel_idx"]],
+            "constant_args_idx": constants[node.kwargs["constant_args_idx"]],
+        }
+        modified.add(module)
+    for module in modified:
+        module.recompile()
+
+
 class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
     """
     A wrapper around a compiled function by vllm. It will forward the tensor
@@ -282,6 +378,12 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
                 state["example_inputs"],
             )
 
+        # The non-mega path reconstructs an FX graph before loading Inductor
+        # artifacts. Torch's bundled-AOT serializer does not cover that graph.
+        if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+            state["triton_side_table"] = _serialize_triton_side_table(
+                state["graph_module"]
+            )
         state["graph_module"] = cls.serialize_graph_module(state["graph_module"])
         state["example_inputs"] = GraphPickler.dumps(state["example_inputs"])
 
@@ -302,6 +404,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         state = pickle.loads(data)
+        triton_side_table = state.pop("triton_side_table", None)
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
         state["example_inputs"] = GraphPickler.loads(state["example_inputs"], fake_mode)
@@ -344,6 +447,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
         state["graph_module"] = cls.deserialize_graph_module(
             state["graph_module"], fake_mode
         )
+        _restore_triton_side_table(state["graph_module"], triton_side_table)
         state["graph_module"].recompile()
 
         # Fall back to standard VllmBackend.
