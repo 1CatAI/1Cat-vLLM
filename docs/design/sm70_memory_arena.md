@@ -10,7 +10,9 @@ and requires numerical and output-quality checks with CUDA Graph enabled.
 
 - `VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE=0` restores independent decode row
   buffers. The default is 1. Device, stream, heads, dimension, partition size,
-  and partial dtype remain separate; only row capacities share storage.
+  partial dtype, and rounded partition capacity remain separate; only row
+  capacities share storage. Keeping partition capacities separate avoids
+  multiplying the largest context by the largest batch seen on a stream.
   Captured generations remain alive after growth, including warmup allocations
   later referenced by a graph. Capture normally proceeds largest-first.
 - `VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS=16384` restores the previous

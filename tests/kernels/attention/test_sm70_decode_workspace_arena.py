@@ -52,8 +52,19 @@ def test_non_captured_growth_releases_old_storage():
     q = torch.empty((8, 6, 32), dtype=torch.float16)
     workspace(q, 2)
     old = weakref.ref(next(iter(fa._decode_workspace_cache.values())).tmp_out)
-    workspace(q, 8, partitions=8)
+    workspace(q, 8)
     assert old() is None
+
+
+def test_long_then_batched_short_does_not_multiply_capacities():
+    q = torch.empty((56, 12, 256), dtype=torch.float16)
+    long = workspace(q, 1, partitions=1024)
+    short = workspace(q, 56, partitions=16)
+    assert short[0].shape == (56, 12, 16, 256)
+    assert long[0].data_ptr() != short[0].data_ptr()
+    assert workspace(q, 24, partitions=9)[0].data_ptr() == short[0].data_ptr()
+    assert workspace(q, 1, partitions=1024)[0].data_ptr() == long[0].data_ptr()
+    assert len(fa._decode_workspace_cache) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -67,7 +78,7 @@ def test_capture_reuse_then_growth_retains_addresses():
     with torch.cuda.stream(stream):
         # The first buffer predates capture, but becomes live graph storage.
         workspace(q, 2)
-    for index, (rows, partitions) in enumerate([(2, 4), (8, 8), (1, 4)]):
+    for index, (rows, partitions) in enumerate([(2, 4), (8, 4), (1, 4)]):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream, pool=pool):
             scratch = workspace(q, rows, partitions)[0]
@@ -84,7 +95,7 @@ def test_capture_reuse_then_growth_retains_addresses():
     for index in [0, 2, 1, 0, 1, 2]:
         graphs[index].replay()
         torch.accelerator.synchronize()
-        rows, capacity = [(2, 4), (8, 8), (1, 8)][index]
+        rows, capacity = [(2, 4), (8, 4), (1, 4)][index]
         assert results[index].item() == rows * 6 * capacity * 32 * (index + 1)
 
 
@@ -119,14 +130,26 @@ def test_graph_attention_matches_independent_workspaces(monkeypatch, heads, kv_d
         stream = torch.cuda.Stream()
         pool = torch.cuda.graph_pool_handle()
         cases = {}
-        for rows in [32, 16, 8, 4, 2, 1]:
+        for rows, context in [
+            (1, 2048),
+            (32, 128),
+            (16, 128),
+            (8, 2048),
+            (4, 128),
+            (2, 2048),
+        ]:
             out = torch.empty_like(q[:rows])
-            args = (q[:rows], k, v, table[:rows], lengths[:rows])
+            case_lengths = (
+                lengths[:rows]
+                if context == 2048
+                else torch.full_like(lengths[:rows], context)
+            )
+            args = (q[:rows], k, v, table[:rows], case_lengths)
             kwargs = dict(
                 out=out,
                 kv_cache_dtype=kv_dtype,
-                max_seq_len_hint=2048,
-                workspace_seq_capacity_hint=2048,
+                max_seq_len_hint=context,
+                workspace_seq_capacity_hint=context,
                 partition_size_hint=256,
             )
             with torch.cuda.stream(stream):
@@ -134,7 +157,7 @@ def test_graph_attention_matches_independent_workspaces(monkeypatch, heads, kv_d
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream, pool=pool):
                 fa.flash_attn_decode_paged(*args, **kwargs)
-            cases[rows] = (graph, out)
+            cases[rows] = (graph, out, case_lengths)
         modes.append(cases)
     for rows in [1, 32, 4, 16, 2, 8, 32, 1]:
         for cases in modes:

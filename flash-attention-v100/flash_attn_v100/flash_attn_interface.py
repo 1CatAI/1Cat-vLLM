@@ -334,6 +334,7 @@ def _get_decode_workspace_for_plan(
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
     share_rows = os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0"
+    partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
     key = (
         device_index,
         stream_id,
@@ -342,6 +343,7 @@ def _get_decode_workspace_for_plan(
         head_dim,
         plan.partition_size,
         partial_dtype,
+        partition_capacity if share_rows else None,
     )
 
     workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
@@ -351,7 +353,10 @@ def _get_decode_workspace_for_plan(
         or workspace.max_num_partitions < plan.workspace_num_partitions
     ):
         # Capture sizes normally descend, so smaller shapes can use a prefix
-        # of the first allocation. A later growth must keep any old addresses
+        # of the first allocation. Partition capacities remain separate: a
+        # long single-row request followed by a short batched request must not
+        # multiply the largest row count by the largest context capacity.
+        # A later growth must keep any old addresses
         # already embedded in graphs alive, including warmup allocations that
         # were subsequently reused during capture.
         previous = workspace
