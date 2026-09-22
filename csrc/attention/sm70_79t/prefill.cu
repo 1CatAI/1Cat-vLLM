@@ -6208,9 +6208,15 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   auto* tail_pv_params = reinterpret_cast<TailPVKernel::Params*>(
       workspace->tail_pv_params.data_ptr<uint8_t>());
 
+  cudaStreamCaptureStatus capture_status;
+  C10_CUDA_CHECK(cudaStreamIsCapturing(caller_stream, &capture_status));
+  const bool capturing = capture_status == cudaStreamCaptureStatusActive;
   if (workspace->shared_scores->completion_recorded) {
-    C10_CUDA_CHECK(cudaStreamWaitEvent(
-        caller_stream, workspace->shared_scores->completion, 0));
+    // The previous call can belong to another stream or graph. Explicit event
+    // nodes preserve that dependency instead of importing uncaptured work.
+    C10_CUDA_CHECK(cudaStreamWaitEvent(caller_stream,
+                                       workspace->shared_scores->completion,
+                                       capturing ? cudaEventWaitExternal : 0));
   }
   C10_CUDA_CHECK(cudaEventRecord(workspace->input_ready, caller_stream));
   C10_CUDA_CHECK(cudaStreamWaitEvent(prefix_stream, workspace->input_ready, 0));
@@ -6668,8 +6674,9 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(cudaEventRecord(workspace->completion, prefix_stream));
   C10_CUDA_CHECK(cudaStreamWaitEvent(caller_stream, workspace->completion, 0));
-  C10_CUDA_CHECK(
-      cudaEventRecord(workspace->shared_scores->completion, caller_stream));
+  C10_CUDA_CHECK(cudaEventRecordWithFlags(
+      workspace->shared_scores->completion, caller_stream,
+      capturing ? cudaEventRecordExternal : 0));
   workspace->shared_scores->completion_recorded = true;
   return out;
 }

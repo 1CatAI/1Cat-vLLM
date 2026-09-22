@@ -128,8 +128,15 @@ def test_q8000_q8192_share_scores_and_preserve_graph_replay():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             op(q, k, v, out, 0.0625, True)
-        cases.append((graph, out, reference, q, k, v))
+        cases.append((graph, out, reference, q, k, v, op))
+    combined = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(combined):
+        for _, out, _, q, k, v, op in cases:
+            op(q, k, v, out, 0.0625, True)
     for _ in range(3):
         for graph, out, reference, *_ in cases:
             graph.replay()
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        combined.replay()
+        for _, out, reference, *_ in cases:
             torch.testing.assert_close(out, reference, rtol=0, atol=0)

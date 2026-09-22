@@ -109,12 +109,16 @@ def test_compact_scales_reuse_graph_scratch_without_changing_outputs(rows):
                 out, x, tm_weight, compact, 0.125 * (1 + i % 2), k_ld, q_ld, False
             )
 
-    run()
-    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
     before = torch.cuda.memory_allocated()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=stream):
         run()
+    # Warm up TurboMind on the capture stream so its own scratch is excluded.
     # One scale matrix per stream/shape, not one per layer in the captured graph.
     assert torch.cuda.memory_allocated() - before < 4 * scales.nbytes + 2 * 2**20
     for _ in range(3):
