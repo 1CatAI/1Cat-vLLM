@@ -2,7 +2,7 @@
 
 This change reuses paged decode scratch across row capacities on each CUDA
 stream, reduces the native FP32-accumulated prefill score block from 16384 to
-8192 tokens, and concatenates DFlash auxiliary states directly into the draft
+8192 tokens, and retains/concatenates DFlash auxiliary snapshots in the draft
 projection dtype. The rollout gate allows at most 3% matched serving slowdown
 and requires numerical and output-quality checks with CUDA Graph enabled.
 
@@ -18,8 +18,9 @@ and requires numerical and output-quality checks with CUDA Graph enabled.
   This preserves FP16 operands and FP32 accumulation but changes online-softmax
   merge order. Rebuild the source extension; no wheel or sidecar is required.
 - `VLLM_DFLASH_COMPACT_AUX_HIDDEN=0` restores concatenate-then-cast. The default
-  is 1. Auxiliary snapshots retain their original precision; conversion occurs
-  at the same projection boundary. Other draft implementations retain the
+  is 1. Auxiliary snapshots use the dtype already required by the loaded draft
+  projection. The target hidden states, residuals, and their addition retain
+  their existing precision. Only the retained copy is converted. Other draft implementations retain the
   existing tensor interface through a fallback.
 
 No TP count, batch=1, or model quantization restriction is introduced. Sharing
@@ -36,7 +37,10 @@ A baseline TP2 allocation history reproduces the 2.109 GiB temporary peak:
 800 MiB FP32 auxiliary concatenation, 400 MiB cast projection input, five
 160 MiB auxiliary snapshots, and two 80 MiB output tensors. Direct concatenation
 removes the 800 MiB intermediate without changing projection arithmetic.
-This is an allocation attribution, not yet a final serving-memory measurement.
+Removing only the concatenation exposes another 2.064 GiB peak during the
+target forward. Storing the five auxiliary copies in the already-required
+FP16 projection dtype also removes 400 MiB of retained snapshots. This is an
+allocation attribution, not yet a final serving-memory measurement.
 
 The prior Graph inventory contains 2007.56 MiB of per-row decode buffers where
 774 MiB accommodates the largest shape, suggesting 1233.56 MiB reclaimable per
@@ -47,8 +51,14 @@ memory.
 
 13 decode arena tests pass on V100: FP16 and E4M3 KV, 6/12/24 heads, alternating
 row shapes, separate streams, warmup-buffer capture, and subsequent growth.
-CPU-only: 5 pass / 8 GPU skips. Native rebuild and combined end-to-end gates are
-pending; these initial results do not establish a serving-speed claim.
+CPU-only: 5 pass / 8 GPU skips. The combined initial GPU gate has 45 passes;
+22 compact projection/snapshot tests pass, including compiled and Graph
+execution, strided input, FP16/FP32 inputs, and unchanged target tensors.
+15 relevant DFlash loading/contract tests and the context-pipeline GPU test
+also pass. Q8192 at 256K is 1.92% slower with 8K blocks in the operator gate;
+Q8000 is 2.22% slower. All 256K biased/periodic stress cases pass the FP32
+oracle and exact replay. Combined serving gates remain pending; these results
+do not establish a serving-speed claim.
 
 PR 661 addresses capture-time allocation retention on growth; this change
 primarily removes duplicate row-capacity allocations and additionally retains

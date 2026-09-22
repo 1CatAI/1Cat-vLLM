@@ -6,6 +6,7 @@ from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.interfaces import EagleModelMixin
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
@@ -144,5 +145,16 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         shared_lm_head = True
 
     _validate_dflash_shared_weights(dflash_model, shared_embed, shared_lm_head)
+
+    # Keep only the precision the loaded drafter consumes. This affects the
+    # auxiliary snapshots, never the target model's hidden/residual tensors.
+    # Other drafters retain their existing auxiliary-state contract.
+    get_aux_dtype = getattr(dflash_model, "get_aux_hidden_state_dtype", None)
+    aux_dtype = get_aux_dtype() if get_aux_dtype is not None else None
+    if aux_dtype is not None:
+        for module in target_model.modules():
+            if isinstance(module, EagleModelMixin):
+                module.aux_hidden_state_dtype = aux_dtype
+        logger.info("DFlash auxiliary snapshots use projection dtype %s.", aux_dtype)
 
     return dflash_model

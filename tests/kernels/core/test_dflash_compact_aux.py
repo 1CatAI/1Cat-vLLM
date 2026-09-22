@@ -8,10 +8,12 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.model_executor.models.interfaces import EagleModelMixin
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 
 
 class Projection:
+    get_aux_hidden_state_dtype = DFlashQwen3ForCausalLM.get_aux_hidden_state_dtype
     combine_hidden_states = DFlashQwen3ForCausalLM.combine_hidden_states
     combine_aux_hidden_states = DFlashQwen3ForCausalLM.combine_aux_hidden_states
 
@@ -54,3 +56,46 @@ def test_projection_matches_cat_then_cast(
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
     for original, hidden in zip(originals, aux):
         torch.testing.assert_close(original, hidden, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("residual_dtype", [None, torch.float16, torch.float32])
+@pytest.mark.parametrize("snapshot_dtype", [None, torch.float16])
+@torch.inference_mode()
+def test_aux_snapshot_keeps_target_arithmetic_and_storage(
+    residual_dtype, snapshot_dtype
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = EagleModelMixin()
+    model._set_aux_hidden_state_layers((1,))
+    model.aux_hidden_state_dtype = snapshot_dtype
+    hidden = torch.randn(8192, 32, device=device, dtype=torch.float16)
+    residual = (
+        torch.randn_like(hidden, dtype=residual_dtype)
+        if residual_dtype is not None
+        else None
+    )
+    expected = hidden + residual if residual is not None else hidden
+    expected = expected.to(snapshot_dtype or expected.dtype).clone()
+    hidden_before = hidden.clone()
+    residual_before = residual.clone() if residual is not None else None
+
+    def capture(hidden, residual):
+        return model._maybe_add_hidden_state([], 1, hidden, residual)[0]
+
+    actual = capture(hidden, residual)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if device == "cuda":
+        compiled = torch.compile(capture, fullgraph=True)
+        torch.testing.assert_close(compiled(hidden, residual), expected, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = compiled(hidden, residual)
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    torch.testing.assert_close(hidden, hidden_before, rtol=0, atol=0)
+    if residual is not None:
+        torch.testing.assert_close(residual, residual_before, rtol=0, atol=0)
+        residual.zero_()
+    hidden.zero_()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
