@@ -22,7 +22,9 @@ requests and32K/128K/exact262144-boundary retrieval requests complete.
 MBPP32 remains25/32 main versus24/32 candidate; the candidate has no truncated
 answers, while main has one. The discordant item144 is also main-only correct
 in a serial sampled check. A separate complete C1/temperature-zero diagnostic
-matches all15756 generated tokens and passes in both modes. Preserve both
+produces15756 tokens and identical complete response text, passing in both modes.
+A same-native-build shared-off control reproduces that text; eight forced
+prefixes also have identical top20 logprob maps with shared storage on/off. Preserve both
 outcomes; the greedy diagnostic is not a replacement quality score or proof
 of global equivalence.504 real-projection cases match every FP16 output bit,
 including compact restoration and changed-input graph replay;40 GPU and19 CPU

@@ -120,12 +120,23 @@ helper. Serial C1 with the same sampling and seed also gives main pass
 (21814 output tokens) and candidate fail (14700); both stop naturally.
 This is an observed one-question difference, not proof of equivalence
 or proof that the memory change causes a general quality regression.
-The complete C1/temperature-zero diagnostic gives both implementations the
-same15756 output tokens, natural EOS and a passing answer. The complete
+The complete C1/temperature-zero diagnostic gives both implementations
+15756 output tokens, natural EOS and a passing answer. The complete
 reasoning and final-answer strings match exactly. These diagnostics do not
 replace the primary scores or establish global accuracy equivalence; they
 do not reproduce a deterministic loss from the memory changes. In particular,
 do not label the sampled one-question difference as proven precision loss.
+
+A third process uses the candidate's exact native libraries with shared codes
+and shared scales explicitly disabled. It also generates15756 tokens, passes,
+and returns identical complete response text. Eight teacher-forced prefixes
+(0/16/64/128/256/537/1024/4096 reasoning tokens, including the first sampled
+divergence) return identical next tokens and identical API top20 logprob maps
+with sharing on/off. These are observed text and probability comparisons;
+the chat endpoint did not return the full generated token-ID sequence or
+full-vocabulary logits. The tests find no storage-induced numerical loss;
+they do not establish the exact proposal/rejection step responsible for the
+sampled trajectory difference. Do not rerun sampled sweeps to select a score.
 
 The current native build passes504 ordinary/gated real-projection cases
 across all four TP4 shards, six projection types, M=1/8/16/32/33/64/93/128/1024,
