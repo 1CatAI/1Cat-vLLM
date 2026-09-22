@@ -59,7 +59,7 @@ def test_projection_matches_cat_then_cast(
 
 
 @pytest.mark.parametrize("residual_dtype", [None, torch.float16, torch.float32])
-@pytest.mark.parametrize("snapshot_dtype", [None, torch.float16])
+@pytest.mark.parametrize("snapshot_dtype", [None, torch.float16, torch.float32])
 @torch.inference_mode()
 def test_aux_snapshot_keeps_target_arithmetic_and_storage(
     residual_dtype, snapshot_dtype
@@ -75,7 +75,12 @@ def test_aux_snapshot_keeps_target_arithmetic_and_storage(
         else None
     )
     expected = hidden + residual if residual is not None else hidden
-    expected = expected.to(snapshot_dtype or expected.dtype).clone()
+    if (
+        snapshot_dtype is not None
+        and torch.finfo(snapshot_dtype).bits < 8 * expected.element_size()
+    ):
+        expected = expected.to(snapshot_dtype)
+    expected = expected.clone()
     hidden_before = hidden.clone()
     residual_before = residual.clone() if residual is not None else None
 
@@ -85,6 +90,7 @@ def test_aux_snapshot_keeps_target_arithmetic_and_storage(
     actual = capture(hidden, residual)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     if device == "cuda":
+        torch._dynamo.reset()
         compiled = torch.compile(capture, fullgraph=True)
         torch.testing.assert_close(compiled(hidden, residual), expected, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()

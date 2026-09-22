@@ -155,6 +155,8 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         for module in target_model.modules():
             if isinstance(module, EagleModelMixin):
                 module.aux_hidden_state_dtype = aux_dtype
-        logger.info("DFlash auxiliary snapshots use projection dtype %s.", aux_dtype)
+        logger.info(
+            "DFlash auxiliary snapshot compaction uses projection dtype %s.", aux_dtype
+        )
 
     return dflash_model

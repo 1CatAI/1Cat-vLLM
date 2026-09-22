@@ -31,7 +31,8 @@ existing per-stream cache contract. Concurrent streams use separate storage.
 
 Base: `4f8e5e674a1afa4be6e712fd735386a875385a5b` (`onecat/main`).
 V100 SXM2 32GB, CUDA 12.8, Torch 2.10.0+cu128; source build, no preload.
-Task artifacts: `/data/minimax-h3/task-cache/memory-arena-20260922/artifacts`.
+Native manifests, allocation traces, and per-request artifacts are retained in
+the task-local handoff.
 
 A baseline TP2 allocation history reproduces the 2.109 GiB temporary peak:
 800 MiB FP32 auxiliary concatenation, 400 MiB cast projection input, five

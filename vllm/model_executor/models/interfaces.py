@@ -1341,10 +1341,14 @@ class EagleModelMixin:
             # paths reuse or mutate hidden-state storage across layers, which
             # can otherwise make every collected aux tensor alias the final one.
             # A drafter may request the dtype it already uses at its projection
-            # boundary. Do not cast the target's hidden states or residuals.
+            # boundary. Only convert when storage shrinks; widening a copy can
+            # also change a compiler's intermediate rounding. Never cast the
+            # target's hidden states or residuals.
             aux_hidden_states.append(
                 value.to(dtype=self.aux_hidden_state_dtype, copy=True)
                 if self.aux_hidden_state_dtype is not None
+                and torch.finfo(self.aux_hidden_state_dtype).bits
+                < 8 * value.element_size()
                 else value.clone()
             )
         return aux_hidden_states
