@@ -388,16 +388,46 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 
 
 @pytest.mark.parametrize(
-    "capture_sizes,expected", [([], True), ([1, 8, 32], True), ([8, 64], False)]
+    "capture_sizes,expected", [([], True), ([1, 8, 32], True), ([8, 64, 256], True)]
 )
-def test_compact_scales_exclude_fallback_sized_graphs(
+def test_compact_scales_support_fallback_sized_graphs(
     monkeypatch, capture_sizes, expected
 ):
-    monkeypatch.setattr(envs, "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
     monkeypatch.setattr(
         torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", lambda: 1, raising=False
     )
     config = _runtime_config()
     config.compilation_config = SimpleNamespace(cudagraph_capture_sizes=capture_sizes)
     monkeypatch.setattr(nvfp4_scheme, "get_current_vllm_config", lambda: config)
     assert nvfp4_scheme._compact_qpn2_scales_enabled() == expected
+
+
+def test_shared_layout_defaults_and_rollback(monkeypatch):
+    for name in (
+        "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT",
+        "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        envs.disable_envs_cache()
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
+
+
+@pytest.mark.parametrize("version", [None, lambda: 0])
+def test_compact_scales_reject_old_extension(monkeypatch, version):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", version, raising=False
+    )
+    assert not nvfp4_scheme._compact_qpn2_scales_enabled()

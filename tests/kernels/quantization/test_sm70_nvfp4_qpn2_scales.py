@@ -76,3 +76,57 @@ def test_qpn2_basis_vectors_preserve_dequantized_weights(global_scale, rows, sha
         x[torch.arange(rows, device="cuda"), columns] = 1
         graph.replay()
         torch.testing.assert_close(out, expected[:, columns].T, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [64, 256])
+@torch.inference_mode()
+def test_compact_scales_reuse_graph_scratch_without_changing_outputs(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    import vllm._C  # noqa: F401
+
+    torch.manual_seed(71)
+    n = k = 2048
+    codes = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
+    raw = torch.randint(1, 8, (n, k // 16), device="cuda").to(torch.float8_e4m3fn)
+    compact = torch.ops._C.nvfp4_qpn2_prepare_scales_sm70(raw)
+    tm_weight, scales, meta = torch.ops._C.nvfp4_sm70_prepare(
+        codes.T.contiguous(), (raw.float() * 0.125).T.half().contiguous(), 16, False
+    )
+    _, scales2, _ = torch.ops._C.nvfp4_sm70_prepare(
+        codes.T.contiguous(), (raw.float() * 0.25).T.half().contiguous(), 16, False
+    )
+    k_ld, q_ld = int(meta[0]), int(meta[1])
+    x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
+    outputs = [
+        torch.empty(rows, n, device="cuda", dtype=torch.float16) for _ in range(24)
+    ]
+    references = [torch.empty_like(outputs[0]) for _ in range(2)]
+
+    def run():
+        for i, out in enumerate(outputs):
+            torch.ops._C.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+                out, x, tm_weight, compact, 0.125 * (1 + i % 2), k_ld, q_ld, False
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
+    before = torch.cuda.memory_allocated()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    # Warm up TurboMind on the capture stream so its own scratch is excluded.
+    # One scale matrix per stream/shape, not one per layer in the captured graph.
+    assert torch.cuda.memory_allocated() - before < 4 * scales.nbytes + 2 * 2**20
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        for reference, scale in zip(references, [scales, scales2]):
+            torch.ops._C.nvfp4_gemm_sm70_out(
+                reference, x, tm_weight, scale, 16, k_ld, q_ld, False
+            )
+        for i, out in enumerate(outputs):
+            torch.testing.assert_close(out, references[i % 2], rtol=0, atol=0)

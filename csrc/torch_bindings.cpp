@@ -364,6 +364,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor scales, float global_scale) -> ()");
   ops.impl("nvfp4_qpn2_restore_tm_scales_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_restore_tm_scales_sm70_out);
+  // Python may be newer than the loaded extension. Only this version retains
+  // compact-scale scratch across layers in larger CUDA graphs.
+  ops.def("nvfp4_qpn2_compact_scales_version_sm70() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "nvfp4_qpn2_compact_tm_gemm_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor weight, Tensor scales, float global_scale, int k_ld, "

@@ -3,11 +3,13 @@
 ## Scope and activation
 
 `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT=1` removes the separate QPN2 code
-buffer from compatible SM70 TP4 NVFP4 projections. It requires a rebuild
+buffer from compatible SM70 NVFP4 local projection layouts. It requires a rebuild
 providing `nvfp4_qpn2_prepare_scales_sm70` and
 `nvfp4_qpn2_tm_dispatch_sm70_out`. Older binaries retain the existing
-separate layouts and log the missing capability. The switch defaults to
-zero pending broader model quality and concurrency performance acceptance.
+separate layouts and log the missing capability. The switch defaults to one;
+set it to zero before model loading to retain separate layouts. The current
+[default validation and memory results](sm70_memory_defaults.md) supersede
+the historical admission decisions recorded below.
 
 The existing QPN2 model and shape gates still apply. The target is
 Qwen3.8-27B-QUASAR-NVFP4 with DFlash2 q7. This does not enable QPN2 on
@@ -30,24 +32,23 @@ The common reader implements this address change for ordinary/gated QPN2
 and the prefill dequantizer. Arithmetic, accumulation and activation order
 are preserved.
 
-By default, scales remain separate because TurboMind merges the global scale into FP16
-while QPN2 retains E4M3 plus a separate global scale. Recovering the original
-E4M3 data from rounded FP16 would change the numerical contract.
+TurboMind consumes the global scale merged into FP16, while QPN2 consumes
+original E4M3 plus a separate global scale. Recovering original E4M3 from
+rounded FP16 would change the numerical contract and is not used.
 
 With `VLLM_SM70_NVFP4_QPN2_SHARED_SCALES=1`, compatible shared-code layers
 instead retain only the original packed E4M3 scales. TurboMind fallback
 restores the loader's FP32 multiplication followed by FP16 round-to-nearest
-into a temporary scale tensor. Serial fallback calls reuse allocator blocks;
-the largest supported layer requires 5.3125 MiB. QPN2 small-M decode and
+into scratch retained per device, CUDA stream and matrix size. Each call
+restores its own layer before GEMM. QPN2 small-M decode and
 bounded dense prefill keep their existing scale reader and arithmetic.
 
-This second opt-in requires the rebuilt compact-scale operator and the
-DFlash2 TP4 q7 contract without DBO. All configured CUDA graph capture sizes
-must be at most 32; otherwise persistent TurboMind scales are retained.
-Larger graphs would retain temporary scales for every captured projection,
-negating the intended saving. Direct prepared-layer calls and TurboMind
-warmup also restore scales before consuming them. The switch defaults to
-zero while model admission remains outstanding.
+Compact scales default to one and require the rebuilt compact-scale operator
+and existing DFlash2 q7 contract without DBO. Admission follows local layouts,
+without a TP-count allowlist or a capture-size limit of 32. Reusing stable
+scratch prevents larger graphs from retaining a scale allocation per layer.
+Direct prepared-layer calls and TurboMind warmup restore scales before use.
+Set `VLLM_SM70_NVFP4_QPN2_SHARED_SCALES=0` to retain persistent FP16 scales.
 
 The new opaque C++ dispatcher keeps dynamic M selection outside Dynamo:
 

@@ -561,6 +561,21 @@ class Worker(WorkerBase):
                 != CUDAGraphMode.NONE
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                if self.use_v2_model_runner and current_platform.is_device_capability(
+                    70
+                ):
+                    from vllm.v1.worker.gpu.cudagraph_utils import (
+                        get_sm70_cudagraph_memory_reserve,
+                    )
+
+                    cudagraph_memory_estimate = get_sm70_cudagraph_memory_reserve(
+                        self.vllm_config.compilation_config.cudagraph_mode,
+                        profile_torch_peak - profile_result.before_profile.torch_peak,
+                    )
+                    logger.info(
+                        "SM70 graph memory reserve before KV allocation: %.2f GiB",
+                        cudagraph_memory_estimate / 2**30,
+                    )
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (

@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <map>
+#include <tuple>
 
 #include "nvfp4_qpn2_layout.cuh"
 
@@ -692,10 +694,25 @@ void nvfp4_qpn2_compact_tm_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                          torch::Tensor scales,
                                          double global_scale, int64_t k_ld,
                                          int64_t q_ld, bool gated_silu) {
-  // Only the fallback needs these scales. Serial calls reuse the allocator's
-  // temporary block; model admission excludes fallback-sized CUDA graphs.
-  auto expanded = torch::empty({input.size(1) / 16, weight.size(1) * 8},
-                               input.options().dtype(torch::kFloat16));
+  // Match TurboMind's per-device/per-stream scratch lifetime. Every layer
+  // restores its own scales before GEMM on that stream. Keeping each size alive
+  // also preserves pointers captured by earlier graphs when a new shape
+  // arrives.
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  using Key = std::tuple<int, cudaStream_t, int64_t>;
+  static std::mutex mutex;
+  static std::map<Key, torch::Tensor> scratch;
+  std::lock_guard<std::mutex> lock(mutex);
+  const int64_t rows = input.size(1) / 16;
+  const int64_t cols = weight.size(1) * 8;
+  const Key key{input.get_device(), at::cuda::getCurrentCUDAStream(),
+                rows * cols};
+  auto& storage = scratch[key];
+  if (!storage.defined()) {
+    storage =
+        torch::empty({rows * cols}, input.options().dtype(torch::kFloat16));
+  }
+  auto expanded = storage.view({rows, cols});
   nvfp4_qpn2_restore_tm_scales_sm70_out(expanded, scales, global_scale);
   nvfp4_gemm_sm70_out(out, input, weight, expanded, 16, k_ld, q_ld, gated_silu);
 }
