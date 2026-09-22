@@ -72,15 +72,19 @@ def test_qsa_metadata_query_offset_bounds(
         if backend == "torch"
         else qsa_cache.build_qsa_metadata_triton
     )
-    token_to_req, positions, slots = builder(
-        common,
-        token_buffer[:mapping_capacity],
-        position_buffer[:num_actual_tokens],
-        slot_buffer[:num_actual_tokens],
-        storage_block_size=4,
-        compress_ratio=2 if cache_kind == "compressed" else 1,
-        circular_buffer_size=4 if cache_kind == "circular" else 0,
-    )
+
+    def build_metadata():
+        return builder(
+            common,
+            token_buffer[:mapping_capacity],
+            position_buffer[:num_actual_tokens],
+            slot_buffer[:num_actual_tokens],
+            storage_block_size=4,
+            compress_ratio=2 if cache_kind == "compressed" else 1,
+            circular_buffer_size=4 if cache_kind == "circular" else 0,
+        )
+
+    token_to_req, positions, slots = build_metadata()
 
     assert token_to_req.tolist() == [0] * num_actual_tokens
     assert positions.tolist() == list(range(7, 7 + num_actual_tokens))
@@ -93,3 +97,28 @@ def test_qsa_metadata_query_offset_bounds(
     assert token_buffer[-1].item() == sentinel
     assert position_buffer[-1].item() == sentinel
     assert slot_buffer[-1].item() == sentinel
+
+    if backend == "triton":
+        eager = tuple(tensor.clone() for tensor in (token_to_req, positions, slots))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = build_metadata()
+        for _ in range(3):
+            graph.replay()
+            for actual, expected in zip(replayed, eager):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        # Replay must consume updated request data, not capture-time positions.
+        common.seq_lens[0].add_(4)
+        graph.replay()
+        assert replayed[0].tolist() == [0] * num_actual_tokens
+        assert replayed[1].tolist() == list(range(11, 11 + num_actual_tokens))
+        updated_slots = (
+            [25, -1, 26, -1]
+            if cache_kind == "compressed"
+            else expected_slots[cache_kind]
+        )
+        assert replayed[2].tolist() == updated_slots[:num_actual_tokens]
+        assert token_buffer[-1].item() == sentinel
+        assert position_buffer[-1].item() == sentinel
+        assert slot_buffer[-1].item() == sentinel
