@@ -217,16 +217,6 @@ def _compact_qpn2_scales_enabled() -> bool:
     if not hasattr(torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out"):
         logger.warning_once("Compact QPN2 scales require rebuilt native operators.")
         return False
-    config = get_current_vllm_config()
-    sizes = config.compilation_config.cudagraph_capture_sizes or []
-    # Graphs retain temporary allocations per captured operator. Keep persistent
-    # FP16 scales when a fallback-sized graph could negate the memory saving.
-    if any(size > 32 for size in sizes):
-        logger.warning_once(
-            "Compact QPN2 scales require CUDA graph capture sizes <=32; "
-            "retaining persistent TurboMind scales."
-        )
-        return False
     return _is_sm70_dflash2_nvfp4_qpn2_runtime_contract()
 
 
@@ -491,7 +481,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     state.use_scale_code = True
                     logger.info_once(
                         "SM70 QPN2 retains E4M3 scales only; TurboMind restores "
-                        "temporary FP16 scales for fallback shapes."
+                        "shared FP16 scratch for fallback shapes."
                     )
                 logger.info_once(
                     "SM70 NVFP4 QPN2 M<=32 route enabled for a compatible "

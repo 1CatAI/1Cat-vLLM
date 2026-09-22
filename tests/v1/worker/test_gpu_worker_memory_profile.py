@@ -67,6 +67,7 @@ def test_kv_budget_ignores_cold_compile_scratch(
     device = torch.device("cuda:0")
     torch.accelerator.empty_cache()
     worker = Worker.__new__(Worker)
+    worker.use_v2_model_runner = False
     worker.device = device
     worker.init_snapshot = MemorySnapshot(device=device)
     weights_bytes = 512 * MiB

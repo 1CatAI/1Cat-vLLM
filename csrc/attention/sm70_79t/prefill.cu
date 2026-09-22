@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
+#include "shared_workspace.h"
+#include <cstring>
 
 /***************************************************************************************************
  * End-to-end prefix architecture screen for V100/SM70.
@@ -5991,6 +5993,7 @@ struct Sm70GqaHalf2Workspace {
       size_t(kTailTileRows) * kTailTileTokens * kTailTasks;
   static constexpr size_t kTailAllocationHeadroom = 2ull << 30;
 
+  std::shared_ptr<onecat_sm70_prefill::ScoreWorkspace> shared_scores;
   Sm70GqaHalf2Runtime runtime;
   cublasHandle_t& prefix_cublas;
   cublasHandle_t& tail_cublas;
@@ -6033,10 +6036,11 @@ struct Sm70GqaHalf2Workspace {
   };
   std::map<std::pair<int, const Element*>, TailMetadata> host_tail_metadata;
   bool concurrent_tail_scores = false;
-  std::mutex launch_mutex;
+  std::mutex& launch_mutex;
 
   explicit Sm70GqaHalf2Workspace(const at::Tensor& q)
-      : prefix_cublas(runtime.prefix_cublas),
+      : shared_scores(onecat_sm70_prefill::get_score_workspace(q, kBlockN)),
+        prefix_cublas(runtime.prefix_cublas),
         tail_cublas(runtime.tail_cublas),
         prefix_stream(runtime.prefix_stream),
         tail_stream(runtime.tail_stream),
@@ -6046,7 +6050,8 @@ struct Sm70GqaHalf2Workspace {
         completion(runtime.completion),
         query_transposed(at::empty({kHeadDim, kRows}, q.options())),
         key_transposed(at::empty({kHeadDim, kMaxTotalKV}, q.options())),
-        scores(at::empty({kBlockN, kRows}, q.options())),
+        scores(shared_scores->scores.narrow(0, 0, int64_t(kBlockN) * kRows)
+                   .view({kBlockN, kRows})),
         prefix_numerator(at::empty({kRows, kHeadDim},
     #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
                                    q.options().dtype(at::ScalarType::Float))),
@@ -6072,7 +6077,8 @@ struct Sm70GqaHalf2Workspace {
             q.options().dtype(at::ScalarType::Byte))),
         tail_pv_params(at::empty(
             {static_cast<int64_t>(kFinePVTasks * sizeof(TailPVKernel::Params))},
-            q.options().dtype(at::ScalarType::Byte))) {
+            q.options().dtype(at::ScalarType::Byte))),
+        launch_mutex(shared_scores->mutex) {
     static_assert(kQuery % kTailTileTokens == 0);
     static_assert(
         (kQuery == 8000 && kTailTileTokens == 320 && kTailTiles == 25) ||
@@ -6107,7 +6113,9 @@ struct Sm70GqaHalf2Workspace {
     size_t total_bytes = 0;
     C10_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     size_t tail_score_bytes = kTailScoreElements * sizeof(ScoreElement);
-    bool force_serial_tail = std::getenv("PREFIX_TORCH_SERIAL_TAIL") != nullptr;
+    const char* serial_tail = std::getenv("PREFIX_TORCH_SERIAL_TAIL");
+    bool force_serial_tail =
+        serial_tail == nullptr || std::strcmp(serial_tail, "0") != 0;
     concurrent_tail_scores =
         !force_serial_tail &&
         free_bytes >= tail_score_bytes + kTailAllocationHeadroom;
@@ -6200,6 +6208,10 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   auto* tail_pv_params = reinterpret_cast<TailPVKernel::Params*>(
       workspace->tail_pv_params.data_ptr<uint8_t>());
 
+  if (workspace->shared_scores->completion_recorded) {
+    C10_CUDA_CHECK(cudaStreamWaitEvent(
+        caller_stream, workspace->shared_scores->completion, 0));
+  }
   C10_CUDA_CHECK(cudaEventRecord(workspace->input_ready, caller_stream));
   C10_CUDA_CHECK(cudaStreamWaitEvent(prefix_stream, workspace->input_ready, 0));
   C10_CUDA_CHECK(cudaMemsetAsync(
@@ -6656,6 +6668,9 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(cudaEventRecord(workspace->completion, prefix_stream));
   C10_CUDA_CHECK(cudaStreamWaitEvent(caller_stream, workspace->completion, 0));
+  C10_CUDA_CHECK(
+      cudaEventRecord(workspace->shared_scores->completion, caller_stream));
+  workspace->shared_scores->completion_recorded = true;
   return out;
 }
 

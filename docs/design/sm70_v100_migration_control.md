@@ -2,6 +2,14 @@
 
 Date: 2026-05-30
 
+## Memory reuse defaults, 2026-09-22
+
+[Candidate implementation and validation contract](sm70_memory_defaults.md).
+Based on merged PR666/main949728e891, this scope removes duplicate weight/scale
+storage and native score workspaces without narrowing TP or concurrency gates.
+Matched memory, quality and graph performance acceptance is pending. Preserve
+all failed paths; do not promote based only on the earlier32K memory smoke.
+
 ## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
 
 Draft PR666, base `b711d5304525dfc0cca6bc8a0bb005f33fe1bbf8`; see the
