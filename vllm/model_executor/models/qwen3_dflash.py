@@ -984,6 +984,31 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             context_states, context_positions, context_slot_mapping
         )
 
+    def combine_aux_hidden_states(
+        self, aux_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
+        fc_weight = (
+            getattr(self.model.fc, "weight", None)
+            if self.model.use_aux_hidden_state
+            else None
+        )
+        if envs.VLLM_DFLASH_COMPACT_AUX_HIDDEN and fc_weight is not None:
+            # The projection already casts its concatenated input to this dtype.
+            # Copy/cast directly into the final buffer to avoid keeping a full
+            # FP32 concatenation alongside the FP16 projection input. Auxiliary
+            # snapshots and the projection's arithmetic stay unchanged.
+            shape = (
+                *aux_hidden_states[0].shape[:-1],
+                sum(hidden.shape[-1] for hidden in aux_hidden_states),
+            )
+            combined = torch.empty(
+                shape, dtype=fc_weight.dtype, device=aux_hidden_states[0].device
+            )
+            torch.cat(aux_hidden_states, dim=-1, out=combined)
+        else:
+            combined = torch.cat(aux_hidden_states, dim=-1)
+        return self.combine_hidden_states(combined)
+
     def combine_hidden_states(
         self,
         hidden_states: torch.Tensor,

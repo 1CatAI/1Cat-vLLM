@@ -862,9 +862,7 @@ class DFlash2Speculator(DFlashSpeculator):
         ):
             return
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            hidden_states = self._combine_aux_hidden_states(aux_hidden_states)
         self.hidden_states[:8].copy_(hidden_states[:8])
         self._context_target_positions.copy_(input_batch.positions[:8])
         # Context projection does not depend on the acceptance decision. Raw

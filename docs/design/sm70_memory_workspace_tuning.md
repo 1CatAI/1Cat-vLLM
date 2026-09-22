@@ -1,5 +1,9 @@
 # SM70 prefill workspace tuning
 
+The measurements below document the earlier 24K-to-16K change. See
+[graph scratch and DFlash peak memory](sm70_memory_arena.md) for the subsequent
+8K score default and its separate validation.
+
 The FP32-accumulated Q8000/Q8192 prefill route now retains a 1.50 GiB score
 workspace per device instead of 2.25 GiB, saving 768 MiB. This applies wherever
 the existing route is selected; no tensor-parallel or model-quantization gate
@@ -9,8 +13,8 @@ CUDA Graph address lifetime are preserved.
 ## Configuration
 
 Set `VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS` before worker startup to a
-multiple of 8192 in [8192, 131072]. The default is 16384; 24576 restores the
-previous capacity. The score buffer uses
+multiple of 8192 in [8192, 131072]. The current default is 8192; 16384 selects the capacity measured below,
+and 24576 restores the original capacity. The score buffer uses
 `block_tokens * 8192 * 6 * sizeof(half)` bytes per device and is shared by the
 Q8000 and Q8192 specializations. Do not change this setting after workspace
 initialization. Rebuild the native FA2 extension and restart workers to apply

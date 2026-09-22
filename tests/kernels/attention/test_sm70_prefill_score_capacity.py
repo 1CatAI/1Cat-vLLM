@@ -61,7 +61,7 @@ def test_score_capacity_and_graph_replay(block):
         assert "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS" in record["error"]
         return
     assert record["finite"]
-    score_bytes = (16384 if block is None else block) * 8192 * 6 * 2
+    score_bytes = (8192 if block is None else block) * 8192 * 6 * 2
     # Remaining fixed scratch is ~408 MiB. Allow CUDA/cuBLAS initialization
     # overhead without allowing an ignored small-capacity override to pass.
     assert score_bytes <= record["allocated"] < score_bytes + 512 * 1024**2
