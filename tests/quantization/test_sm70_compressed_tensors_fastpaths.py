@@ -136,7 +136,7 @@ def test_compressed_tensors_channel_fp8_prepares_and_dispatches_turbomind(
     assert gemm_calls == [((2, 6), (2, 4), (4, 6), (1, 6), 128, 4, 6, False)]
 
 
-def test_compressed_tensors_channel_fp8_qpn8_shape_gate_is_exact():
+def test_compressed_tensors_channel_fp8_qpn8_shape_gate_requires_alignment():
     layer = SimpleNamespace(
         tp_size=4,
         prefix="model.language_model.layers.0.linear_attn.in_proj_qkvz",
@@ -159,6 +159,12 @@ def test_compressed_tensors_channel_fp8_qpn8_shape_gate_is_exact():
     layer.tp_size = 2
     layer.prefix = "model.language_model.layers.3.self_attn.o_proj"
     layer.weight = SimpleNamespace(shape=(5120, 1536))
+    # QPN8 now supports aligned local projections independently of TP size.
+    assert _sm70_channel_fp8_qpn8_config(layer) == (12, 2, False)
+
+    layer.weight = SimpleNamespace(shape=(5121, 1536))
+    assert _sm70_channel_fp8_qpn8_config(layer) is None
+    layer.weight = SimpleNamespace(shape=(5120, 1537))
     assert _sm70_channel_fp8_qpn8_config(layer) is None
 
 
@@ -244,6 +250,14 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
         out.fill_(2)
 
     monkeypatch.setattr(f"{module}.sm70_ops.fp8_qpn8_dispatch_sm70_out", fake_dispatch)
+    # Exercise the runtime workspace resolver with the CPU native-op stand-in.
+    import importlib
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "sm70_ct_fp8_qpn8_dispatch",
+        importlib.import_module(module)._sm70_ct_fp8_qpn8_dispatch,
+    )
     output = scheme.apply_weights(
         layer,
         torch.ones((2, 4), dtype=torch.float16),
