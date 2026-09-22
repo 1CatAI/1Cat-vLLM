@@ -42,21 +42,26 @@ else:
 """
 
 
-@pytest.mark.parametrize("block", [8192, 16384, 24576, 0, 8193, "invalid"])
+@pytest.mark.parametrize("block", [None, 8192, 16384, 24576, 0, 8193, "invalid"])
 def test_score_capacity_and_graph_replay(block):
+    env = dict(os.environ)
+    if block is None:
+        env.pop("VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS", None)
+    else:
+        env["VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS"] = str(block)
     result = subprocess.run(
         [sys.executable, "-c", _SCRIPT],
-        env={**os.environ, "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS": str(block)},
+        env=env,
         capture_output=True,
         text=True,
         check=True,
     )
     record = json.loads(result.stdout.strip().splitlines()[-1])
-    if block not in (8192, 16384, 24576):
+    if block not in (None, 8192, 16384, 24576):
         assert "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS" in record["error"]
         return
     assert record["finite"]
-    score_bytes = block * 8192 * 6 * 2
+    score_bytes = (16384 if block is None else block) * 8192 * 6 * 2
     # Remaining fixed scratch is ~408 MiB. Allow CUDA/cuBLAS initialization
     # overhead without allowing an ignored small-capacity override to pass.
     assert score_bytes <= record["allocated"] < score_bytes + 512 * 1024**2
