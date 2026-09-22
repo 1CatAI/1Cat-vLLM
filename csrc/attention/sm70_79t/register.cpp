@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#include <cuda_runtime.h>
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <ATen/cuda/Exceptions.h>

@@ -393,7 +393,8 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 def test_compact_scales_support_fallback_sized_graphs(
     monkeypatch, capture_sizes, expected
 ):
-    monkeypatch.setattr(envs, "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
     monkeypatch.setattr(
         torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
     )
