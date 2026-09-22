@@ -97,3 +97,46 @@ def test_rejects_partial_prefix_pv_tile(query_len, op_name):
     output = torch.empty_like(q)
     with pytest.raises(RuntimeError, match="32-token alignment"):
         getattr(torch.ops._vllm_fa2_C, op_name)(q, k, v, output, 0.0625, True)
+
+
+@torch.inference_mode()
+def test_q8000_q8192_share_scores_and_preserve_graph_replay():
+    if not torch.accelerator.is_available() or torch.cuda.get_device_capability() != (
+        7,
+        0,
+    ):
+        pytest.skip("requires SM70")
+    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+    torch.manual_seed(732)
+    cases = []
+    for length, name in [
+        (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+        (8000, "sm70_d256_gqa_architecture_fwd"),
+    ]:
+        q = torch.randn(1, length, 6, 256, device="cuda", dtype=torch.float16)
+        k = torch.randn(1, length + 8192, 1, 256, device="cuda", dtype=torch.float16)
+        v = torch.randn_like(k)
+        out = torch.empty_like(q)
+        op = getattr(torch.ops._vllm_fa2_C, name)
+        before = torch.accelerator.memory_allocated()
+        op(q, k, v, out, 0.0625, True)
+        if length == 8000:
+            # The second family must not allocate another ~2.2 GiB scores buffer.
+            assert torch.accelerator.memory_allocated() - before < 1024**3
+        reference = out.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(q, k, v, out, 0.0625, True)
+        cases.append((graph, out, reference, q, k, v, op))
+    combined = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(combined):
+        for _, out, _, q, k, v, op in cases:
+            op(q, k, v, out, 0.0625, True)
+    for _ in range(3):
+        for graph, out, reference, *_ in cases:
+            graph.replay()
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        combined.replay()
+        for _, out, reference, *_ in cases:
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)

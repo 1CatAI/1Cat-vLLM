@@ -2170,11 +2170,14 @@ class VllmConfig:
                         "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
                         "SM70 Flash-V100 0.0.3 compile graph startup."
                     )
-                if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ:
+                if (
+                    not self.use_v2_model_runner
+                    and "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ
+                ):
                     os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
                     logger.info_once(
-                        "Auto-setting VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 "
-                        "for SM70 Flash-V100 0.0.3 compile graph startup."
+                        "Disabling the legacy SM70 graph memory profiler; "
+                        "V2 budgets its graph reserve before KV allocation."
                     )
                 if "VLLM_SM70_LM_HEAD_TOP1" not in os.environ:
                     os.environ["VLLM_SM70_LM_HEAD_TOP1"] = "0"
