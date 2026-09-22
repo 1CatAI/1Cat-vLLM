@@ -41,10 +41,61 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import replace_parameter
+from vllm.utils.torch_utils import direct_register_custom_op
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 logger = init_logger(__name__)
+
+
+def _sm70_ct_fp8_qpn8_dispatch(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+) -> None:
+    # Resolve scratch storage inside the opaque op. Passing its data_ptr as an
+    # integer from apply_weights embeds a process-local address in AOT artifacts.
+    # Weight preparation already reserves this shared, bounded workspace.
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is None:
+        raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
+    sm70_ops.fp8_qpn8_dispatch_sm70_out(
+        out,
+        workspace.data_ptr(),
+        x,
+        codes,
+        scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )
+
+
+def _sm70_ct_fp8_qpn8_dispatch_fake(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "sm70_ct_fp8_qpn8_dispatch",
+    _sm70_ct_fp8_qpn8_dispatch,
+    mutates_args=["out"],
+    fake_impl=_sm70_ct_fp8_qpn8_dispatch_fake,
+)
 
 _SM70_CHANNEL_FP8_QPN8_SHAPES = {
     "in_proj_qkvz": (4096, 5120),
@@ -284,9 +335,6 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     layer.sm70_fp8_qpn8_split_k = split_k
                     layer.sm70_fp8_qpn8_nacc = nacc
                     layer.sm70_fp8_qpn8_prefetch = prefetch
-                    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
-                        workspace.data_ptr()
-                    )
                     if getattr(layer, "prefix", "").rsplit(".", 1)[-1] == (
                         "gate_up_proj"
                     ):
@@ -390,9 +438,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             if x_2d.shape[0] == 0:
                 return out_2d.reshape(out_shape)
             if getattr(layer, "sm70_fp8_qpn8", False):
-                sm70_ops.fp8_qpn8_dispatch_sm70_out(
+                torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
                     out_2d,
-                    int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
                     x_2d,
                     layer.weight,
                     layer.weight_scale_inv,
@@ -440,9 +487,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         )
         if x_2d.shape[0] == 0:
             return out_2d.reshape(*x.shape[:-1], out_features)
-        sm70_ops.fp8_qpn8_dispatch_sm70_out(
+        torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
             out_2d,
-            int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
             x_2d,
             layer.weight,
             layer.weight_scale_inv,
