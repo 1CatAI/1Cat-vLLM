@@ -46810,3 +46810,66 @@ has launched no full model. Details and artifacts are in
   pass with naturalEOS; ON/OFF TTFT132.3341/174.3433s. Do not infer long-context
   decode speed from that16-token answer. The75T full-FP32 target and35B-A3B
   AWQ/FP8 migration baselines are not resolved by this change.
+
+## 2026-09-22 Studio startup: channel-FP8 QPN8 cached workspace addresses
+
+- Integration base `949728e891aaeb43285e6730aa8b7abc8b986acc`; runtime baseline
+  `f5dbb369a78ad94f0876ccc502c7953d8dc41688`, Torch 2.10.0+cu128, CUDA 12.8,
+  four V100 32 GB, TP4, FP16 execution, E5M2 KV, Flash-V100, FULL_AND_PIECEWISE
+  graphs, 262144 context, 8192 batched tokens, four sequences, memory fraction
+  0.8, prefix caching and DFlash2 seven-token probabilistic speculation.
+- Unsloth Qwen3.8-27B-NVFP4 startup took 253.67 seconds with the vLLM compile
+  cache disabled; weights took about eight seconds and compilation 117 seconds.
+  A persistent Inductor cache alone is not proof of AOT artifact reuse. Studio's
+  imported interpreter also lacked Ninja on PATH and referenced a deleted CUDA
+  toolkit directory; preparing native extensions belongs to installation.
+- The first cache-enabled Unsloth run completed, but its long greedy code
+  response differed from the cache-disabled control. Repeating the control
+  reproduced its original answer. A subsequent actual AOT reload failed in
+  `_C.fp8_qpn8_dispatch_sm70_out`: the compiled graph contained the previous
+  process's integer scratch pointer, which was not a registered CUDA address.
+  Keep these failed paths; a cache-write-only test cannot qualify this route.
+- Resolve the compressed-tensors channel-FP8 QPN8 shared workspace inside an
+  opaque operator. The cached graph contains tensor inputs and dispatch
+  parameters, never the workspace address. Both ordinary and fused gated-SiLU
+  projections use the resolver; the native math kernels remain unchanged.
+- Add an export/save/reload regression that replaces the workspace allocation
+  and verifies the new address is used, plus the fresh-process startup matrix
+  in `benchmarks/benchmark_startup_cache.py`. Related global cache-policy work
+  remains in PR621; the Qwen4Exp PLE address fix is PR622. This change addresses
+  the separate mixed NVFP4/channel-FP8 checkpoint path.
+- With the workspace fix, the Unsloth cache-disabled run takes 172.00 seconds
+  and exactly reproduces all three original responses (math, Chinese prose,
+  and a 1654-token Python LRU implementation). The cache-fill run takes 171.53
+  seconds; first reload takes 122.33 seconds with a Torch 2.10 artifact-load
+  fallback; the next fresh process takes 84.74 seconds with all 12 AOT loads
+  (three graphs on four ranks), no load fallback, and 8.30 seconds reported
+  compilation work. First native-extension build time is excluded from these
+  process-to-health measurements. Host activity on the other GPU set varied;
+  these are individual startup observations, not an averaged timing study.
+- Cache-fill and both reloads produce exactly the same three responses. The
+  long code answer differs between cache-disabled and cache-enabled execution
+  (1654 versus 1764 tokens); both versions' generated unittest suites pass
+  (seven and eight tests respectively). Keep the strict off/on token-parity
+  gate marked failed: this is not evidence that PR621 can enable every model
+  globally without separate quality qualification. A source-identical
+  cache-disabled warm control before the fix took 157.96 seconds.
+- The QAT checkpoint, tested separately on the other V100 quartet with the
+  same serving limits, takes 253.18 seconds to fill its cache, 120.86 seconds
+  on the fallback reload, then 79.25 seconds with all 12 AOT loads. Its three
+  responses match across those cache-enabled launches; this is not a QAT
+  cache-off/on parity comparison.
+- A separate corrected-runtime canary starts in 86.27 seconds with 12 AOT
+  loads and passes eight executable Python-function checks under the model's
+  normal non-thinking sampling (temperature 0.7, top-p 0.8, top-k 20), parsed
+  tool calling, and retrieval from 261994 prompt tokens with nine output tokens
+  and natural EOS. The long request takes 162.88 seconds end-to-end; it is a
+  context-boundary quality gate, not a startup or decode-speed measurement.
+  These functional checks qualify the tested checkpoint/configuration, not
+  all FP8 layouts or models, and do not replace the failed off/on text-parity
+  observation above.
+- Studio deployment verification measures 88.26 seconds from the management
+  load request to completion, including 86.13 seconds from engine launch to
+  readiness. It loads all 12 AOT artifacts without fallback and passes a chat
+  request through Studio's authenticated public-API proxy. Existing model,
+  topology, context, batch limits, and speculative settings are preserved.

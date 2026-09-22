@@ -244,6 +244,14 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
         out.fill_(2)
 
     monkeypatch.setattr(f"{module}.sm70_ops.fp8_qpn8_dispatch_sm70_out", fake_dispatch)
+    # Exercise the runtime workspace resolver with the CPU native-op stand-in.
+    import importlib
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "sm70_ct_fp8_qpn8_dispatch",
+        importlib.import_module(module)._sm70_ct_fp8_qpn8_dispatch,
+    )
     output = scheme.apply_weights(
         layer,
         torch.ones((2, 4), dtype=torch.float16),
