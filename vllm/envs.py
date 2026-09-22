@@ -1907,8 +1907,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
-    # Share TurboMind B/Pack1 codes with QPN2, preserving both scale formats.
-    # Opt in until same-contract GPU correctness and performance gates pass.
+    # Share TurboMind B/Pack1 codes with compatible QPN2 projections. Compact
+    # scales additionally require native support for reusable graph scratch.
     "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "1"))
     ),

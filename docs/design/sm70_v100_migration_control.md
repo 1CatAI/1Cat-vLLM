@@ -7,8 +7,33 @@ Date: 2026-05-30
 [Candidate implementation and validation contract](sm70_memory_defaults.md).
 Based on merged PR666/main949728e891, this scope removes duplicate weight/scale
 storage and native score workspaces without narrowing TP or concurrency gates.
-Matched memory, quality and graph performance acceptance is pending. Preserve
-all failed paths; do not promote based only on the earlier32K memory smoke.
+Shared codes and compact scales default on, with capability fallback and explicit
+rollback. Reusable scale scratch removes the capture-size<=32 restriction;
+Q8000/Q8192 and the tail share scores; SM70 V2 reserves graph memory before KV.
+See the linked report for the exact native capability and stream contracts.
+
+Matched TP4/27B NVFP4/DFlash2/7/E4M3/FP16-draft/185W/CUDA-Graph validation
+reduces model loading from10.07 to6.47 GiB/rank, with KV budget10.57 to12.68 GiB.
+Cold256000/256 prefill changes2069.8 to2061.5 tok/s (-0.40%); fixed-seed C32
+aggregate output throughput averages+0.91%. More resident requests increase
+per-request TPOT; do not hide it behind aggregate throughput. All C1-C32 bench
+requests and32K/128K/exact262144-boundary retrieval requests complete.
+
+MBPP32 remains25/32 main versus24/32 candidate; the candidate has no truncated
+answers, while main has one. The discordant item144 is also main-only correct
+in a serial sampled check. A separate complete C1/temperature-zero diagnostic
+matches all15756 generated tokens and passes in both modes. Preserve both
+outcomes; the greedy diagnostic is not a replacement quality score or proof
+of global equivalence.504 real-projection cases match every FP16 output bit,
+including compact restoration and changed-input graph replay;40 GPU and19 CPU
+regressions pass. No effective-weight or attention accumulation precision was
+reduced to obtain the memory saving.
+
+TP2 on2x32GB passes32K retrieval with12.17 GiB model loading per rank. TP1 on32GB
+still fails KV admission with DFlash2/chunk8192/C32/utilization0.85. No physical
+16GB GPU was tested. The full-FP32 75T and35B migration targets remain open.
+Keep the interrupted audit and rejected experiments recorded in the report;
+do not repeat broad sampled sweeps solely to obtain a favorable score.
 
 ## Local head/projection layouts across TP1/TP2/TP4, 2026-09-21
 
