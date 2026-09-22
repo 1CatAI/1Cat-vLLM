@@ -350,18 +350,25 @@ class Worker(WorkerBase):
             yield
             return
 
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        match = re.search(r"max_split_size_mb:(\d+)", conf)
-        original_value = match.group(1) if match else None
-
-        set_allocator_settings(f"max_split_size_mb:{max_split_size_mb}")
+        # Runtime allocator settings reset omitted options such as rounding and
+        # garbage collection. Preserve the complete config, including the newer
+        # alias; PyTorch gives the legacy variable precedence even when empty.
+        conf = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+        )
+        scoped_conf, count = re.subn(
+            r"(^|,)\s*max_split_size_mb\s*:\s*\d+",
+            lambda match: f"{match.group(1)}max_split_size_mb:{max_split_size_mb}",
+            conf,
+        )
+        if not count:
+            scoped_conf = f"{conf}," if conf else ""
+            scoped_conf += f"max_split_size_mb:{max_split_size_mb}"
+        set_allocator_settings(scoped_conf)
         try:
             yield
         finally:
-            # PyTorch defaults to SIZE_MAX (no limit).
-            _SIZE_MAX_MB = (2**64 - 1) // (1024 * 1024)
-            restore = original_value if original_value else str(_SIZE_MAX_MB)
-            set_allocator_settings(f"max_split_size_mb:{restore}")
+            set_allocator_settings(conf)
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -604,6 +611,7 @@ class Worker(WorkerBase):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
+        self.warmup_torch_memory = warmup_torch_residual
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -819,6 +827,7 @@ class Worker(WorkerBase):
 
             non_kv_cache_memory = (
                 self.model_runner.model_memory_usage
+                + self.warmup_torch_memory
                 + self.peak_activation_memory
                 + self.non_torch_memory
                 + cuda_graph_memory_bytes
@@ -843,7 +852,9 @@ class Worker(WorkerBase):
                 f"{format_gib(self.requested_memory)} GiB). "
                 f"Actual usage is {format_gib(self.model_runner.model_memory_usage)} "
                 f"GiB for weight, {format_gib(self.peak_activation_memory)} GiB "
-                f"for peak activation, {format_gib(self.non_torch_memory)} GiB "
+                f"for peak activation, {format_gib(self.warmup_torch_memory)} GiB "
+                f"for persistent warmup allocations, "
+                f"{format_gib(self.non_torch_memory)} GiB "
                 f"for non-torch memory, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
                 f"config with `--kv-cache-memory="

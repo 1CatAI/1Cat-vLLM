@@ -6,8 +6,8 @@ and policy apply to TP1, TP2, and TP4; no tensor-parallel gate is added.
 
 The prefix score block can be selected before worker startup with
 `VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS`. It must be a multiple of 8192 in
-[8192, 131072]. The current build default remains 24576 until the memory,
-quality, and speed gates establish a smaller default. The score buffer uses
+[8192, 131072]. The candidate default is 16384 (1.50 GiB per device); 24576 restores the
+previous 2.25 GiB capacity. End-to-end promotion remains under validation. The score buffer uses
 `block_tokens * 8192 * 6 * sizeof(half)` bytes per device and is shared by the
 Q8000 and Q8192 specializations. Graph addresses remain fixed for the worker
 lifetime. Do not change this setting after workspace initialization.
@@ -33,4 +33,16 @@ GPU 0–3 are reserved for this task; the unrelated service on GPU 4–7 is not
 modified. Task-owned source, build, compiler caches, and raw results are kept
 under `/data/minimax-h3/task-cache/memory-workspaces-20260922`.
 
-Validation is pending; no speed or quality acceptance is claimed yet.
+Initial matched Graph operator results: 16384 saves 768 MiB per device with
+0.49–0.81% latency increase at 128K/256K across Q8000/Q8192. The 8192-token
+option saves 1.50 GiB but increases latency by 2.00–2.26%, so it was not selected
+as the default. All sampled outputs are finite; FP32 oracle relative L2 remains
+0.00054–0.00184. The 24576 override is bitwise identical to the previous binary
+on all five tested shapes. End-to-end validation is still pending.
+
+The worker also preserves the complete allocator configuration while temporarily
+changing `max_split_size_mb` for model loading. The previous partial settings
+update reset user rounding and garbage-collection options and ignored the unified
+`PYTORCH_ALLOC_CONF` alias. The post-capture KV capacity suggestion now includes
+persistent warmup allocations, as the actual KV budget already does. This corrects
+the suggestion without increasing KV allocation or removing the Graph reserve.
