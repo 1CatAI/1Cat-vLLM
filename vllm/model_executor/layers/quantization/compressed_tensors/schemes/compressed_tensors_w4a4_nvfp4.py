@@ -214,8 +214,16 @@ def _missing_qpn2_prefill_ops() -> list[str]:
 def _compact_qpn2_scales_enabled() -> bool:
     if not envs.VLLM_SM70_NVFP4_QPN2_SHARED_SCALES:
         return False
-    if not hasattr(torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out"):
-        logger.warning_once("Compact QPN2 scales require rebuilt native operators.")
+    version = getattr(torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", None)
+    if (
+        not hasattr(torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out")
+        or version is None
+        or version() < 1
+    ):
+        logger.warning_once(
+            "Compact QPN2 scales require native operators with reusable graph scratch; "
+            "retaining persistent FP16 scales."
+        )
         return False
     return _is_sm70_dflash2_nvfp4_qpn2_runtime_contract()
 
