@@ -430,6 +430,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL: bool = False
     VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
+    VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS: int = 16384
     VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
@@ -2990,6 +2991,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # an explicit rollback and matched-control selection.
     "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0"))
+    ),
+    # Native Q8000/Q8192 prefix score capacity; read once per worker workspace.
+    # Multiples of 8192 in [8192, 131072]. Use 24576 for the previous capacity.
+    "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS", "16384")
     ),
     "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
         int(
