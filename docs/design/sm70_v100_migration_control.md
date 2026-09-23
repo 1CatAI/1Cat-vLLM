@@ -46974,9 +46974,11 @@ has launched no full model. Details and artifacts are in
   `aten::nonzero` calls, all under target `execute_model`; its nested CPU span
   accounted for about 7.38 ms/step in the perturbed trace. The existing pure
   DDTree state path avoids those dynamic boolean indices, but ordinary MTP4
-  does not select it. Next candidate: a byte/shape-equivalent single-request,
-  all-spec GDN state contract using fixed slices instead of masked indexing.
-  A byte-exact standalone GPU screen found 0.189 to 0.027 ms per call, with
-  roughly three calls per round. This alone predicts only about 0.5 ms, but
-  the GPU synchronization within the live scheduling interval may alter the
-  end-to-end effect; no full-model gain has yet been claimed.
+  does not select it. An isolated single-request, all-spec fixed-slice GDN
+  candidate matched its masked-index tensors in CPU/GPU unit tests and reduced
+  one standalone call from 0.189 to 0.027 ms. The necessary full-model gate
+  **failed**: with the same direct-copy PLE route, fixed output first diverged
+  at token 25 and verification grew from 307 to 441 rounds; natural prompts
+  0 and 2 diverged at tokens 36 and 208. It is not in PR #684 and must not be
+  counted as a speedup. The isolated candidate was reverted after the run;
+  unit-level tensor equality did not establish whole-graph state equivalence.
