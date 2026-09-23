@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import dataclasses
 import io
 import json
+import os
 import pickle
 from collections.abc import Callable
 from pickle import Pickler
 from typing import Any
+from unittest.mock import patch
 
 import torch._functorch.config
 import torch.fx as fx
@@ -15,6 +18,7 @@ from torch._dynamo.utils import dynamo_timed
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from torch._logging._internal import trace_structured
 
+import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
@@ -263,16 +267,42 @@ class PiecewiseBackend:
             else:
                 args_list = get_fake_args_from_graph(self.graph)
 
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
-            )
+            # AOT reload reads Inductor's saved best_config files. Different
+            # piecewise graphs (and shape ranges) can generate the same kernel
+            # source yet choose different launch configs. Keep each decision
+            # beside the graph that made it instead of letting a later graph
+            # overwrite the first graph's autotune entry.
+            cache_context: contextlib.AbstractContextManager[Any]
+            if (
+                envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                and envs.VLLM_USE_AOT_COMPILE
+                and not envs.VLLM_DISABLE_COMPILE_CACHE
+            ):
+                compile_range = range_entry.compile_range
+                cache_dir = os.path.join(
+                    self.vllm_backend.compiler_manager.cache_dir,
+                    "inductor_cache",
+                    f"subgraph_{self.piecewise_compile_index}",
+                    f"range_{compile_range.start}_{compile_range.end}",
+                )
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_context = patch.dict(
+                    os.environ, {"TORCHINDUCTOR_CACHE_DIR": cache_dir}
+                )
+            else:
+                cache_context = contextlib.nullcontext()
+
+            with cache_context:
+                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+                    self.graph,
+                    args_list,
+                    self.vllm_backend.inductor_config,
+                    self.compilation_config,
+                    compile_range=range_entry.compile_range,
+                    graph_index=self.piecewise_compile_index,
+                    num_graphs=self.total_piecewise_compiles,
+                    is_encoder=self.vllm_backend.is_encoder,
+                )
 
             range_entry.compiled = True
 
