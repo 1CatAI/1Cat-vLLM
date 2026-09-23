@@ -9,7 +9,7 @@ import resource
 import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -103,6 +103,7 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
+_MADV_SEQUENTIAL = 2
 
 logger = init_logger(__name__)
 
@@ -127,7 +128,14 @@ def _advise_random_file_access(tensor: torch.Tensor) -> str:
             "weights; eager or copied tensors are unsupported"
         )
 
+    _madvise_mapped_tensor(tensor, _MADV_RANDOM)
+    return mapped_path
+
+
+def _madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
+    """Apply one madvise value to the pages a mapped CPU tensor covers."""
     page_size = os.sysconf("SC_PAGE_SIZE")
+    address = tensor.data_ptr()
     byte_count = tensor.numel() * tensor.element_size()
     aligned_address = address - address % page_size
     aligned_end = (address + byte_count + page_size - 1) // page_size * page_size
@@ -135,11 +143,33 @@ def _advise_random_file_access(tensor: torch.Tensor) -> str:
     if libc.madvise(
         ctypes.c_void_p(aligned_address),
         ctypes.c_size_t(aligned_end - aligned_address),
-        _MADV_RANDOM,
+        advice,
     ):
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-    return mapped_path
+
+
+@contextmanager
+def _sequential_shard_reads(shards: Iterable[torch.Tensor | None]):
+    """Give the shard mappings readahead back for one bulk pass over them.
+
+    The gather path wants MADV_RANDOM: it reads scattered rows, and read-around
+    would fetch pages it never touches. Copying a contiguous range wants the
+    opposite, and the difference is not small. Measured on this rig, reading the
+    PLE checkpoint through one mapping: 56 MiB/s under MADV_RANDOM against
+    856 MiB/s under MADV_SEQUENTIAL, so the store tier's 26 GiB took nine
+    minutes instead of half a minute. MADV_WILLNEED does not help here; it
+    prefetches once but leaves the mapping random, so the faults that follow
+    still arrive one page at a time.
+    """
+    touched = [shard for shard in shards if shard is not None]
+    for shard in touched:
+        _madvise_mapped_tensor(shard, _MADV_SEQUENTIAL)
+    try:
+        yield
+    finally:
+        for shard in touched:
+            _madvise_mapped_tensor(shard, _MADV_RANDOM)
 
 
 @triton.jit
@@ -1272,18 +1302,21 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         started = time.perf_counter()
         copied = 0
-        for segment in segments:
-            destination = table.narrow(0, segment.offset, segment.end - segment.start)
-            for shard_index, shard in enumerate(self._disk_shards):
-                assert shard is not None
-                # Raw bytes: the store card only gathers, the ranks dequantize.
-                copied += copy_ple_embedding_shard_(
-                    destination,
-                    shard.view(torch.uint8),
-                    checkpoint_start=shard_index * self._disk_shard_size,
-                    tp_start=segment.start,
-                    tp_end=segment.end,
+        with _sequential_shard_reads(self._disk_shards):
+            for segment in segments:
+                destination = table.narrow(
+                    0, segment.offset, segment.end - segment.start
                 )
+                for shard_index, shard in enumerate(self._disk_shards):
+                    assert shard is not None
+                    # Raw bytes: the store card only gathers, the ranks dequantize.
+                    copied += copy_ple_embedding_shard_(
+                        destination,
+                        shard.view(torch.uint8),
+                        checkpoint_start=shard_index * self._disk_shard_size,
+                        tp_start=segment.start,
+                        tp_end=segment.end,
+                    )
         if copied != store_rows:
             raise RuntimeError(
                 f"Qwen4Exp PLE store tier loaded {copied} of {store_rows} rows"
