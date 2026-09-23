@@ -46984,3 +46984,37 @@ has launched no full model. Details and artifacts are in
   repair is verified, but the strict numerical/output parity investigation
   remains open. Do not erase failed gates or repeatedly interrupt production
   without a smaller reproducer for the remaining per-subgraph tuning drift.
+
+## 2026-09-23 AOT autotune subgraph-isolation rejection
+
+- Draft PR #682 isolates `TORCHINDUCTOR_CACHE_DIR` by piecewise subgraph and
+  compile range on the SM70 Flash-V100 AOT cache path. Its regression test
+  confirms that identical autotune keys in different subgraphs/ranges retain
+  separate choices; that test and seven AOT side-table tests pass. The branch
+  is stacked on the first-reload repair in #675. It does not change the default
+  cache policy owned by #621.
+- The GPU0–3 diagnostic preserves the Qwen3.8-27B Unsloth NVFP4 TP4 contract:
+  FP16, FP8 E5M2 KV, Flash-V100, 262144 maximum context, 8192 batched tokens,
+  four sequences, 0.8 memory fraction, prefix caching, full/piecewise CUDA
+  graphs, and DFlash2 seven-token probabilistic draft. The candidate Python
+  source is `fa3c4535b8`; native extensions come from the prior installed
+  runtime, so this is not a source-complete promotion build. Cold readiness is
+  274.68 seconds; first forced reload is 84.26 seconds with 12 AOT loads and
+  no graph recompilation; a second reload is 83.76 seconds.
+- The full greedy LRU response still fails cold/reload parity: cold is 1764
+  tokens (`c01c890b...` SHA256), while both reloads are identically 1659
+  tokens (`64063c0f...` SHA256). The first differing text is an article in a
+  generated test-case comment. Inspecting all 1240 saved autotune records
+  against their corresponding isolated runtime cache files finds zero missing
+  and zero changed configs after reload. Thus per-subgraph cache collision is
+  insufficient to explain the remaining deterministic execution difference.
+- Raw logs, full responses, contract and comparison JSON are in
+  `/data/minimax-h3/task-cache/startup-cache-default-20260923/run/`. This
+  diagnostic did not touch the GPU4–7 Studio service. The diagnostic script's
+  first cache-copy command mistakenly read the copied runtime's old cache;
+  that invalid snapshot is labeled `invalid-prior-runtime-cache-copy` and
+  must not be used as this run's cold-cache evidence. The 1240-entry
+  comparison uses the actual current-run compiled artifact bundles instead.
+  Do not merge #682 or enable #621 by default until a smaller cold/reload
+  numerical reproducer isolates the remaining AOT execution difference and a
+  clean source-built runtime passes the same quality gate and 256K boundary.
