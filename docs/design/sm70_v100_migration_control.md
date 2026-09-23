@@ -2,6 +2,118 @@
 
 Date: 2026-05-30
 
+## PRO 6000 C1/C4/C8 prefix-cache and verifier comparison, 2026-09-24
+
+The resumed PRO 6000 machine retained its original C8 target-forward profiler
+trace. We reran matched 2,048-input/256-output DFlash2 q7 probabilistic
+requests, with 1,792 shared prompt tokens, temperature 0.7, top-p 0.8,
+top-k 20, and prefix caching explicitly enabled on both services. V100 uses
+TP4/FP16/E4M3 KV/Flash-V100; PRO uses TP1/BF16/FlashInfer. The checkpoint
+and dataset hashes match across hosts. The research V100 source and extensions
+still need the clean-package and output-quality acceptance gates described
+below. Request-level decode capacity excludes each request's TTFT but includes
+new-request prefill pauses:
+
+| In flight / total | V100 decode tok/s | PRO decode tok/s | V100 / PRO | V100 / PRO draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| C1 / 16 | 229.71 | 210.42 | 1.092 | 55.38% / 55.84% |
+| C4 / 32 | 265.56 | 519.82 | 0.511 | 59.54% / 53.80% |
+| C8 / 48 | 277.81 | 711.77 | 0.390 | 56.17% / 50.83% |
+
+Median per-request mean ITL (ms) is V100 4.248/14.286/29.028 and PRO
+4.618/7.504/10.866 at C1/C4/C8. From C1 to C8, V100 ITL inflates 6.83x
+and PRO 2.35x; aggregate V100 decode capacity rises only 21% versus PRO's
+238%. V100 is slightly faster at C1. The ITL is the median of each request's
+mean inter-token latency, not a median over individual token gaps.
+
+All three 2K runs had zero prefix-cache hits despite the shared 1,792-token prefix.
+The hybrid cache aligns an attention page to 1,648 tokens; DFlash/EAGLE
+recomputes the last matched page, leaving no reusable complete page at 2K.
+A separate 4K-input/3,504-shared-prefix C8 single-wave probe confirmed
+nonzero hits on both systems; its pure decode window was 253.78 versus
+626.53 tok/s with 32.82% versus 33.82% acceptance. That prompt changed the
+acceptance profile, so it is only a cache-path diagnostic, not a substitute
+for the matched 2K production baseline. Cache hit counters differed between
+the systems and should not be treated as an equal cache-hit ratio.
+
+An instrumented 2K single wave filters only complete eight-row-per-request
+verifier steps. CUDA-event medians (ms) are:
+
+| Full-q8 stage | V100 / PRO C1 | V100 / PRO C4 | V100 / PRO C8 |
+| --- | ---: | ---: | ---: |
+| Target forward | 13.317 / 21.101 | 32.741 / 24.010 | 56.995 / 28.029 |
+| Sampling before draft | 2.763 / 1.142 | 5.359 / 1.271 | 7.552 / 1.346 |
+| Draft | 4.601 / 4.038 | 9.928 / 4.219 | 14.543 / 4.595 |
+| Full GPU step | 20.739 / 26.302 | 48.227 / 29.495 | 79.288 / 33.949 |
+
+V100 forward grows 24.254 ms from C4 to C8, versus 4.019 ms on PRO; it
+accounts for about 78% of V100's 31.061-ms full-step increase.
+Across C1 to C8, V100 forward grows 43.678 ms (4.28x) versus PRO's 6.928
+ms (1.33x), whereas full GPU steps grow 58.549 versus 7.647 ms. The PRO C8
+target-forward trace contains 62 full steps. Within its target annotation,
+mean kernel busy time is 24.69 ms: FP4 CUTLASS GEMM 8.00, FP8 CUTLASS GEMM
+7.72, CUDA GDN 5.83, target attention 0.81 and FP4 activation quantization
+0.44 ms. These kernel-busy categories do not sum to the independently measured
+CUDA-event forward wall time. The pinned vLLM 0.29.0 implementation pre-packs
+NVFP4 weights/scales at load and uses compressed-weight CUTLASS FP4 GEMM;
+scaled FP8 GEMM similarly consumes FP8 weights without a separate full-weight
+FP16 materialization every step. PRO still performs scale/activation work.
+
+V100 already executes TurboMind batched W4A16 GEMM. Its compressed-weight
+channel-FP8 QPN8 route admits at most M32; C8/q8 is M64 and falls through
+to repeated full-weight FP16 dequantization and GEMM. NVFP4 QPN2 also changes
+at M32 to the TurboMind batch route. The PRO SM120 native FP4/FP8 Tensor Core
+and TP1 path are structurally different from V100 SM70 FP16 Tensor Core plus
+TP4 reductions. A new same-shape Nsight Systems CUDA Graph node trace captures
+six interior full C8/q8 steps on all four V100 ranks without new prefill. On
+rank 0 the mean per-step kernel busy time is 77.675 ms, comprising 16.250 ms
+TurboMind NVFP4 gate/down GEMM, **12.238 ms repeated full-weight channel-FP8
+dequantization**, 4.816 ms GDN update, 4.959 ms TP reduction, 3.436 ms
+target grouped attention, 2.259 ms FP4 scale restoration, and 6.701 ms
+draft paged attention. The remaining 27.015 ms includes FP16 GEMM, sampling
+and other target/draft kernels; categories are kernel busy time rather than a
+closed target-forward wall decomposition. The previous C16 trace's 12.291-ms
+QPN8 dequantization is a separate shape. Its similarity to C8 is expected
+because full-weight reconstruction is dominated by weight size once M>32.
+
+A second six-step, no-prefill C4/q8 graph-node trace on rank 0 records
+47.324 ms total kernel busy time per step. Its NVFP4 QPN2 compressed-weight
+gate/down GEMMs are 8.427/4.082 ms; channel-FP8 QPN8 compressed-weight GEMM
+is 9.993 ms; GDN update, TP reduction, grouped target attention and draft
+paged attention are 3.469, 3.196, 1.951 and 3.618 ms. C4 has **no
+full-weight dequantization**. At C8 the NVFP4 path changes to TurboMind
+W4A16 and its gate/down GEMM body rises from C4's 12.509 to 16.250 ms,
+plus 2.259 ms scale restoration. GDN, TP reduction and target attention rise
+to 4.816, 4.959 and 3.436 ms. The FP8 route changes at M64 from packed
+QPN8 GEMM to full-weight dequantization plus FP16 GEMM; the directly measured
+12.238-ms dequantization is only part of its C8 cost. The FP16 GEMMs are not
+isolated from the "other" trace category, so C4 packed GEMM versus C8
+dequantization alone is not a closed route comparison. Two matching Nsight
+captures locate the C4-to-C8 route transition without assigning all of the
+target-forward growth to one kernel.
+
+A corrected C1/q8 graph-node trace uses the same six interior full steps,
+rank 0 and no-prefill filter. Its kernel busy time is 19.265 ms/step: NVFP4
+QPN2 gate/down 2.852/1.674 ms, packed channel-FP8 QPN8 GEMM 3.956 ms, GDN
+update 0.963 ms, TP reduction 1.263 ms, target grouped attention 0.633 ms,
+draft paged attention 0.853 ms and other kernels 7.071 ms. Between C1/M8 and
+C4/M32, the two compressed-weight GEMM families rise by 7.983 and 6.037 ms,
+respectively. Their combined 14.020-ms kernel-busy increase is the largest
+identified part of the 19.424-ms target-forward CUDA-event increase. GDN,
+TP reduction and target attention rise by 2.506, 1.933 and 1.318 ms. These
+different timing scopes cannot be subtracted into a closed forward breakdown.
+The C1-to-C4 slowdown therefore starts inside batch-scaling packed GEMM and
+TP/GDN work; the repeated full-weight FP8 materialization appears only after
+the M32-to-M64 route change. PRO's C1-to-C8 target forward rises only 6.928
+ms, but only its saved C8 trace has per-kernel attribution. Its compressed
+CUTLASS GEMMs, SM120 native low-precision Tensor Cores and TP1/no all-reduce
+explain the direction of the smaller growth; assigning an exact C1-to-C8
+PRO kernel delta would require a matching C1 trace. The next V100 candidate
+should address M8–M64 batched FP4/FP8 GEMM and avoid per-step full-weight
+materialization across quantizations, then retest C1/C4/C8 output quality and
+unprofiled decode capacity. A source-route hypothesis is not an achieved
+speedup or clean-build baseline.
+
 ## DFlash2 27B concurrent decode investigation, 2026-09-23
 
 The matched 2,048-input/256-output rolling workload uses the same target and
