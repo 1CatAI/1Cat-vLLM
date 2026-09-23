@@ -47057,3 +47057,18 @@ has launched no full model. Details and artifacts are in
   open. The first short-request trial ended at its artificially small
   64-token output limit and is labeled separately; the full-request retry is
   the valid diagnostic. Do not infer production quality from this check.
+- A narrower warm PIECEWISE diagnostic keeps the same four AOT artifacts and
+  capture policy but bypasses `CUDAGraphWrapper` replay for inference, calling
+  its compiled runnable directly. The full LRU output remains the identical
+  1485-token warm answer (`44d817b8...` SHA256), not the 1764-token cold
+  answer. A subsequent four-token smoke confirms the bypass branch actually
+  ran on all four TP workers, with four direct AOT loads and no recompile.
+  Therefore replay itself is not necessary for this drift; investigate the
+  PIECEWISE forward-context/attention dispatch and capture-specific execution
+  state before changing the default. The first two bypass attempts never
+  reached inference because the diagnostic config override had been restored,
+  so SM70 auto-selected `FULL_AND_PIECEWISE` and looked for a different AOT
+  key; their logs are retained and excluded from the result. Only the isolated
+  candidate runtime was patched, then restored source-identical. Evidence is
+  `piecewise-only/bypass-replay.log` and
+  `piecewise-only/bypass-replay-confirm.log` under the task cache root.
