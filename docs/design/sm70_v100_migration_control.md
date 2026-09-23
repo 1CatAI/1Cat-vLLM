@@ -46950,10 +46950,13 @@ has launched no full model. Details and artifacts are in
   99-tok/s emitted rate as a quality-preserving result.
 - Draft PR [#684](https://github.com/1CatAI/1Cat-vLLM/pull/684) instead
   accelerates only the byte-exact short disk-PLE gather. The steady complete
-  round is 11.85655 s / 307 = 38.621 ms (9.8% below the control); the fixed
-  requests and all three natural-prompt outputs match token-for-token with
-  unchanged draft counts. Twelve targeted CPU tests pass. Larger prefill
-  gathers retain their deduplicated route; the 32-worker cold-page path stays.
+  round first fell to 11.85655 s / 307 = 38.621 ms (9.8% below the control)
+  with sorted-scatter. Direct copying from retained mmap addresses then cut the
+  matched repeat to 11.38005 s / 307 = 37.069 ms (13.4% below the original
+  control). Both fixed requests and all three natural-prompt outputs match
+  token-for-token with unchanged draft counts. Twelve targeted CPU tests pass.
+  Larger prefill gathers retain their deduplicated, parallel route; the direct
+  copy does not allocate a second table. The complete 20-ms goal remains open.
 - An exact Triton screen of the M=5, 50-route MoE sort/expand matched all
   output bytes and routing metadata and reduced that isolated operator from
   25.6 to 13.3 microseconds. Across 48 target layers it projects only about
@@ -46973,3 +46976,7 @@ has launched no full model. Details and artifacts are in
   DDTree state path avoids those dynamic boolean indices, but ordinary MTP4
   does not select it. Next candidate: a byte/shape-equivalent single-request,
   all-spec GDN state contract using fixed slices instead of masked indexing.
+  A byte-exact standalone GPU screen found 0.189 to 0.027 ms per call, with
+  roughly three calls per round. This alone predicts only about 0.5 ms, but
+  the GPU synchronization within the live scheduling interval may alter the
+  end-to-end effect; no full-model gain has yet been claimed.

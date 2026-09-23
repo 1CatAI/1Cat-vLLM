@@ -120,6 +120,24 @@ also matched the control token-for-token, with identical draft counts. This is
 a single-start A/B result, not a claim that the complete round has reached its
 20-ms target. It changes no PLE bytes or model arithmetic.
 
+The next short-gather revision removes shard sorting and thread-pool dispatch
+for at most 128 rows. It validates the logical IDs, then copies each FP8 row
+directly from the already-retained mmap address into the pinned output. It
+does not allocate a second table; larger prefill requests still use the
+deduplicated, parallel path. In one same-input CPU-only 80-row screen, the
+cached scatter/32-worker median was 5.166 ms versus 0.275 ms for direct row
+copy. With independently sampled IDs and page faults, medians were 8.332 and
+7.013 ms. These are lookup timings, not full-round savings.
+
+The matched TP4/V2 full-model repeat then took 11.38005 s / 307 rounds =
+37.069 ms per complete round, down 1.552 ms (4.0%) from the sorted-scatter
+revision and 5.728 ms (13.4%) from the original control. Both fixed requests
+and all three natural-prompt outputs and draft counts remained identical to
+the sorted-scatter run. Their emitted decode rates were 44.99, 63.70, 83.09,
+and 46.25 tokens/s for the fixed repeat and natural prompts respectively.
+The full-round 20-ms target is still unmet; do not extrapolate the CPU lookup
+delta into GPU time.
+
 ## Prefill results
 
 ### Repeated prompt, warm page cache

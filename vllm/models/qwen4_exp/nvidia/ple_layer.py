@@ -968,6 +968,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
         self._disk_shards: list[torch.Tensor | None] = []
         self._disk_shard_arrays: list[np.ndarray] = []
+        self._disk_shard_pointers: list[int] = []
         self._disk_mapped_paths: set[str] = set()
         self._disk_executor: ThreadPoolExecutor | None = None
         if self._disk_offload:
@@ -1237,9 +1238,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         output_bytes = output.view(torch.uint8).reshape(-1, self.head_dim).numpy()
         executor = getattr(self, "_disk_executor", None)
 
-        # Decode has at most a few dozen rows. Sorting by shard and scattering
-        # directly avoids np.unique's inverse map and the second output copy.
-        # Keep the deduplicated route for prefill, where repeated IDs matter.
+        # Decode moves only a few dozen rows. Per-shard NumPy dispatch and the
+        # thread pool cost more than copying these FP8 rows from their retained
+        # file mappings. Keep the deduplicated, parallel route for prefill.
         if flat_ids.size <= 128:
             min_id = int(flat_ids.min())
             max_id = int(flat_ids.max())
@@ -1249,36 +1250,16 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     f"[{min_id}, {max_id}] for "
                     f"{self.ngram_embedding.org_vocab_size} rows"
                 )
-            shard_ids = flat_ids // self._disk_shard_size
-            order = np.argsort(shard_ids, kind="stable")
-            sorted_shards = shard_ids[order]
-            split_positions = np.searchsorted(
-                sorted_shards, np.arange(1, self.split_ngram_parts)
-            ).tolist()
-            starts = [0, *split_positions]
-            ends = [*split_positions, flat_ids.size]
-            tasks = [
-                (shard_index, start, end)
-                for shard_index, (start, end) in enumerate(
-                    zip(starts, ends, strict=True)
+            row_bytes = self.head_dim
+            output_ptr = output_bytes.ctypes.data
+            shard_size = self._disk_shard_size
+            for output_row, row_id in enumerate(flat_ids.tolist()):
+                shard_index, local_row = divmod(row_id, shard_size)
+                ctypes.memmove(
+                    output_ptr + output_row * row_bytes,
+                    self._disk_shard_pointers[shard_index] + local_row * row_bytes,
+                    row_bytes,
                 )
-                if start != end
-            ]
-
-            def gather_decode_shard(task: tuple[int, int, int]) -> None:
-                shard_index, start, end = task
-                positions = order[start:end]
-                local_ids = flat_ids[positions] - shard_index * self._disk_shard_size
-                output_bytes[positions] = self._disk_shard_arrays[shard_index][
-                    local_ids
-                ]
-
-            if executor is None or len(tasks) == 1:
-                for task in tasks:
-                    gather_decode_shard(task)
-            else:
-                for _ in executor.map(gather_decode_shard, tasks):
-                    pass
             if profile:
                 faults_after = resource.getrusage(resource.RUSAGE_SELF)
                 logger.info(
@@ -1530,6 +1511,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 shard.view(torch.uint8).numpy()
                 for shard in self._disk_shards
                 if shard is not None
+            ]
+            self._disk_shard_pointers = [
+                array.ctypes.data for array in self._disk_shard_arrays
             ]
             mapped_gib = (
                 sum(

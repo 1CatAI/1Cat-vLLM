@@ -703,7 +703,7 @@ def test_ngram_embedding_retains_and_gathers_disk_shards(
 
 
 @pytest.mark.parametrize("num_rows", [0, 1, 80, 128, 129, 256])
-def test_ngram_embedding_disk_decode_scatter_matches_prefill(
+def test_ngram_embedding_disk_decode_short_gather_matches_prefill(
     monkeypatch: pytest.MonkeyPatch, num_rows: int
 ) -> None:
     module = _make_disk_ngram_embedding_for_load_test()
