@@ -44,6 +44,8 @@ class _DecodeWorkspace:
     exp_sums: torch.Tensor
     active_num_partitions: torch.Tensor
     max_num_partitions: int
+    captured: bool = False
+    previous: "_DecodeWorkspace | None" = None
 
 
 @dataclass
@@ -331,41 +333,62 @@ def _get_decode_workspace_for_plan(
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
+    share_rows = os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0"
+    partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
     key = (
         device_index,
         stream_id,
-        batch_capacity,
+        None if share_rows else batch_capacity,
         num_heads,
         head_dim,
         plan.partition_size,
         partial_dtype,
+        partition_capacity if share_rows else None,
     )
 
     workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
     if (
         workspace is None
+        or workspace.tmp_out.size(0) < batch_capacity
         or workspace.max_num_partitions < plan.workspace_num_partitions
     ):
+        # Capture sizes normally descend, so smaller shapes can use a prefix
+        # of the first allocation. Partition capacities remain separate: a
+        # long single-row request followed by a short batched request must not
+        # multiply the largest row count by the largest context capacity.
+        # A later growth must keep any old addresses
+        # already embedded in graphs alive, including warmup allocations that
+        # were subsequently reused during capture.
+        previous = workspace
         workspace = _allocate_decode_workspace(
             q,
-            batch_capacity=batch_capacity,
+            batch_capacity=max(
+                batch_capacity, previous.tmp_out.size(0) if previous else 0
+            ),
             num_heads=num_heads,
             head_dim=head_dim,
             max_num_partitions=_round_decode_partition_capacity(
-                plan.workspace_num_partitions
+                max(
+                    plan.workspace_num_partitions,
+                    previous.max_num_partitions if previous else 0,
+                )
             ),
             partial_dtype=partial_dtype,
         )
+        if previous is not None:
+            workspace.previous = previous if previous.captured else previous.previous
         if _can_cache_workspace(q):
             _decode_workspace_cache[key] = workspace
 
+    if _cuda_graph_capture_active():
+        workspace.captured = True
     if active_num_partitions is None:
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
     return (
-        workspace.tmp_out[:, :, : workspace.max_num_partitions, :],
-        workspace.max_logits[:, :, : workspace.max_num_partitions],
-        workspace.exp_sums[:, :, : workspace.max_num_partitions],
+        workspace.tmp_out[:batch_capacity],
+        workspace.max_logits[:batch_capacity],
+        workspace.exp_sums[:batch_capacity],
         active_num_partitions,
     )
 

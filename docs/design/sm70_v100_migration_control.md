@@ -2,6 +2,28 @@
 
 Date: 2026-05-30
 
+## Graph scratch, score workspace and active peak, 2026-09-23
+
+[Implementation and paired evidence](sm70_memory_arena.md). The new SM70
+defaults share decode row buffers per stream and rounded partition capacity,
+use 8K rather than 16K prefill score blocks, and retain DFlash auxiliary
+snapshots in the loaded projection dtype. FP16 attention operands and FP32
+accumulation remain. No TP, batch=1, or model-quantization gate was added.
+
+At TP2, non-KV active allocation drops 17.117 -> 15.146 GiB/card, and the
+temporary request increment drops 2.110 -> 1.674 GiB. At TP4, non-KV active
+allocation drops 10.225 -> 8.794 GiB/card, and the increment drops
+2.183 -> 1.343 GiB. Same-resident TP2 C4 throughput rises 0.44%; TP4 256K
+TTFT/TPOT rise 0.58%/1.44%, and same-resident C8 throughput rises 1.84%.
+The increased KV pool permits more resident requests at offered C32; aggregate
+throughput rises, while individual TPOT rises 7.68% at TP2 and 20.56% at TP4.
+Do not describe these saturated latencies as within the 3% matched-speed gate.
+
+TP2 MBPP32 scores 24/32 in both arms with no truncation; two item verdicts
+swap. TP4 32K-prefix MBPP4 scores 4/4 in both arms without truncation.
+The TP1 32GB DFlash2/8K/C32/GUM0.9 admission still fails by 1.939 GiB;
+no 16GB-card feasibility or full-FP32 75T/35B performance claim follows.
+
 ## Memory reuse defaults, 2026-09-22
 
 [Candidate implementation and validation contract](sm70_memory_defaults.md).
