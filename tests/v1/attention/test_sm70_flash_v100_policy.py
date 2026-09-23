@@ -3513,6 +3513,54 @@ def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode)
         assert bool((out == 2).all())
 
 
+@pytest.mark.parametrize("batch", [2, 8, 16])
+@pytest.mark.parametrize("native_revision_six", [False, True])
+def test_e4m3_fp32_request_major_admission_requires_native_revision(
+    monkeypatch, batch, native_revision_six
+):
+    import flash_attn_v100
+
+    from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+        grouped_e4m3_fp32_allowed,
+    )
+
+    monkeypatch.setattr(
+        flash_attn_v100,
+        "flash_attn_grouped_e4m3_fp32_available",
+        lambda min_version=4: native_revision_six and min_version == 6,
+    )
+    query = torch.empty((batch * 8, 6, 256), dtype=torch.float16)
+    output = torch.empty_like(query)
+    cache = torch.empty((batch, 3296, 1, 256), dtype=torch.uint8)
+    table = torch.zeros((batch * 8, 1), dtype=torch.int32)
+    lengths = torch.full((batch * 8,), 2048, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        block_table=table[::8].contiguous(),
+        seq_lens=torch.full((batch,), 2048, dtype=torch.int32),
+        causal=True,
+    )
+    instance = SimpleNamespace(
+        flash_attn_grouped_e4m3_fp32_paged=object(),
+        kv_cache_dtype="fp8_e4m3",
+        use_smallq_decode_xqa=True,
+        _flash_v100_window_size=lambda causal: (-1, -1),
+    )
+    assert (
+        grouped_e4m3_fp32_allowed(
+            instance,
+            query,
+            cache,
+            cache,
+            table,
+            lengths,
+            metadata,
+            out=output,
+            partition_size_hint=None,
+        )
+        is native_revision_six
+    )
+
+
 @pytest.mark.parametrize("kv_heads", [1, 2, 4])
 @pytest.mark.parametrize("batch", [1, 2])
 def test_prefill_architecture_admits_local_gqa_groups(monkeypatch, kv_heads, batch):

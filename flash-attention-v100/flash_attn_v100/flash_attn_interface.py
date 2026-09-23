@@ -1135,12 +1135,12 @@ def flash_attn_grouped_verify_request_major_abi_version() -> int:
     return 0 if get_abi_version is None else int(get_abi_version())
 
 
-def flash_attn_grouped_e4m3_fp32_available() -> bool:
+def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
     version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
     return (
         hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
         and callable(version)
-        and int(version()) >= 4
+        and int(version()) >= min_version
     )
 
 
@@ -1156,12 +1156,13 @@ def flash_attn_grouped_e4m3_fp32_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """E4M3 q2..8/GQA6/D256 attention over one KV sequence.
+    """E4M3 q2..8/B1 or request-major q8/B2..16 GQA6/D256 attention.
 
     Row lengths are authoritative GPU metadata, not inferred from padded Q.
     Zero lengths produce zero outputs. All positive lengths must fit the
     block table, whose entries must address valid physical pages. This is
-    not an independent-request batch API. QK/PV and partial storage are FP32;
+    q8 batches use one block-table row per independent request. QK/PV and
+    partial storage are FP32;
     Tensor Core operands and final output remain FP16. KV must encode E4M3.
     Precision revision 3 retains FP32 numerators and separate max/sum until
     the final normalization, as well as compensated QK/P and tile-local PV.
@@ -1176,7 +1177,12 @@ def flash_attn_grouped_e4m3_fp32_paged(
         or k_cache.shape[1] not in (800, 848, 1616, 1648, 1728, 3296, 3456)
     ) and int(flash_attn_v100_cuda.grouped_e4m3_fp32_precision_version()) < 5:
         raise RuntimeError("Rebuild Flash-V100 for multi-head E4M3 revision 5")
-    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    batch_size = block_table.shape[0]
+    if batch_size > 1 and not flash_attn_grouped_e4m3_fp32_available(6):
+        raise RuntimeError("Rebuild Flash-V100 for request-major E4M3 revision 6")
+    workspace = _get_grouped_verify_workspace(
+        q, batch_size=batch_size, partial_dtype=torch.float32
+    )
     return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
         q,
         k_cache,

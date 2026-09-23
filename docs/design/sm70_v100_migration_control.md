@@ -2,6 +2,126 @@
 
 Date: 2026-05-30
 
+## DFlash2 27B concurrent decode investigation, 2026-09-23
+
+The matched 2,048-input/256-output rolling workload uses the same target and
+draft checkpoints, prompt set, q7 probabilistic sampler (temperature 0.7,
+top-p 0.8, top-k 20), 262,144 service capacity, 8,192-token scheduler budget,
+and 16 sequence slots on both machines. The V100 service uses four
+V100-SXM2-32GB GPUs, FP16 execution, E4M3 KV, TurboMind and Flash-V100;
+RTX PRO 6000 uses one GPU, native BF16 and FlashInfer. These are deployment
+comparisons, not a same-architecture kernel comparison. Both runs have zero
+prefix-cache hits. The V100 source tree matches main `d49e32b358`, but its
+native extensions predate the merge; it is a research baseline until rebuilt
+from the owned source. The DFlash2 q1 tail CUDA Graph option is disabled because
+the current full-capture startup stalls with it enabled. Other CUDA Graphs run.
+
+| Requests in flight / total | V100 decode capacity | PRO 6000 decode capacity | V100 full-q8 target verify / forward / draft |
+| --- | ---: | ---: | ---: |
+| C1 / 16 | 194.0 tok/s | 177.8 tok/s | 16.108 / 13.174 / 4.231 ms |
+| C4 / 32 | 204.1 tok/s | 452.3 tok/s | 45.096 / 39.699 / 9.767 ms |
+| C8 / 48 | 221.1 tok/s | 660.5 tok/s | 78.318 / 70.834 / 14.973 ms |
+| C16 / 64 | 255.5 tok/s | 1039.1 tok/s | 122.094 / 110.214 / 25.462 ms |
+
+Decode capacity excludes each request's TTFT but includes prefill stalls from
+new rolling requests. The verifier/forward/draft columns are CUDA-event medians
+for complete q8 steps in a separate instrumented run; they are not additive
+end-to-end latency. V100 draft acceptance is 40.9% at C16 versus 42.7% on PRO
+6000, too close to explain the fourfold capacity gap.
+
+A short CUDA Graph node trace captured eight complete C16 q8 steps on all four
+V100 ranks after two settling steps, without a new prefill in the capture.
+Six interior steps on the critical rank average about 148 ms wall and 144 ms
+summed kernel service. Graph-node IDs separate approximately 108 ms target
+forward from 22.6 ms draft; uncaptured graph nodes, sampling, and other kernels
+account for about 13.4 ms service. The target graph's main per-step kernel
+families are paged attention 29.1 ms, TurboMind NVFP4 GEMM 26.5 ms, FP16
+GEMM/CUTLASS 15.0 ms, FP8 QPN8 weight dequantization 12.4 ms, fused GDN update
+9.8 ms, and TP reduction 8.8 ms. The draft graph spends about 14.2 ms in
+paged attention. Category sums describe service, not a closed wall-clock
+decomposition, and graph-node tracing adds overhead.
+
+The C16 E4M3 DFlash2 target log rejects batched grouped verification at
+`reqs=16, q=(128,6,256)`. The exact E4M3 FP32 grouped entry requires one
+request; the older request-major grouped entry admits E5M2 only because its
+partial values are FP16. DFlash2 E4M3 then runs per-query paged decode for its
+16 full-attention layers, matching the 29.1-ms trace bucket. This is a proven
+route gap, but eliminating that whole bucket alone cannot close the C16 gap.
+The existing E4M3 XQA batch operator was admitted in a task-private probe;
+its C16 decode capacity was 264.0 tok/s (+3.3%) and acceptance fell from
+40.9% to 39.5%, so it is not the selected change.
+
+The source candidate extends the FP32 grouped verifier to independent
+request-major q8 batches of 2–16 requests, using the existing B1 numerical
+path and native precision ABI version 6. In a matched, uninstrumented 2K/256
+run, C8 decode capacity rose from 221.1 to 244.2 tok/s (+10.4%), and C16
+from 255.5 to 278.8 tok/s (+9.1%); the PRO 6000 references remain 660.5
+and 1039.1 tok/s. The candidate's C8/C16 acceptance was 41.5%/38.9%, versus
+41.6%/40.9% on the old V100 route. After rebuilding the final Flash-V100
+source (SHA256 `f23e6f7d2f1aa3724874e6444b5804a6bdee8570c9747f00a756fe369a757acd`),
+a second matched C16 run reached 288.7 tok/s (+13.0%), with acceptance 42.9%
+and 3.972 output tokens per draft round versus 38.9% and 3.689 in the first
+candidate run. Acceptance variation contributes to the spread; do not assign
+the full difference between candidate runs to kernel speed. Prefix hits were
+zero and the final logs show grouped q8/128-row capture on all four ranks.
+In a separate same-dataset C8 single wave, the candidate's overlap window
+with no new prefill reached 347.2 tok/s versus 820.8 tok/s on PRO 6000;
+this pure decode comparison remains 2.36x apart. The old corrected V100
+service did not run this exact single-wave dataset, so this number is not a
+matched candidate-versus-main speedup claim.
+These are research results using a native Flash-V100 extension built from this
+branch, with other unchanged vLLM native extensions from a source-equivalent
+main build. They are not yet clean-wheel performance or a full output-quality
+gate. The 65 focused CUDA and dispatch tests pass after the final rebuild.
+
+CUDA-event medians for complete q8 steps after the change are C8 target
+verifier/forward/sample/draft/full step 65.198/57.230/7.747/14.288/79.469 ms
+(64 samples), and C16 94.107/81.632/12.459/24.152/118.262 ms (54 samples).
+Against the matched old V100 phase run, the C16 target forward falls by
+28.582 ms and full GPU step by 29.327 ms. At C8, PRO 6000's verifier/forward/
+sample/draft/full step is 29.49/28.06/1.43/4.64/34.14 ms under its slightly
+wider forward timing boundary. The candidate still spends roughly 29 ms more
+in target forward, 6 ms more in sampling and 10 ms more in draft at C8. This
+is a phase-level direction, not a closed identical-kernel decomposition.
+
+At B16/q8/2K, the grouped attention operator takes about 0.38 ms per full
+attention layer versus 1.93 ms for the old row operator. At B16/q8/32K, the
+new grouped operator takes about 3.6 ms per layer and is only about 2–3%
+faster than sixteen independent grouped calls, though it is much faster than
+the row operator. The first 32K probe exposed a request-stride bug in the
+FP32 max/sum workspace: the stride omitted its second float and overlapped
+request data once more than 40 splits were live. The bug is fixed. Focused
+CUDA tests now compare B2/B4/B8/B16 q8 with independent requests under graph
+replay, and B2 at both 32K and 262,144 tokens; a B16 32K operator screen is
+also bitwise equal to independent requests. These tests do not replace
+end-to-end long-context quality validation.
+
+The remaining C16 gap is not an attention-only problem. QPN8 weight
+dequantization repeats about 12.4 ms per target step; making all eligible
+weights resident FP16 would require approximately 4.36 GiB per TP rank and
+would consume KV/long-context capacity. Widening NVFP4 GEMM autotuning to
+M128 reduced one representative gated projection from 334 to 295 microseconds
+but left a second projection unchanged; it also requires explicit prewarming
+before CUDA Graph capture. Neither isolated result is an end-to-end gain.
+An experimental grouped split cap improved one-layer 2K/32K timings but
+changed FP16 outputs by about 1e-5 relative and was reverted; it is absent
+from the candidate source and final native extension. Full vLLM/Triton rebuild
+was stopped after it began fetching unrelated dependencies; only the changed
+Flash-V100 extension was rebuilt. The clean package/quality gate remains open.
+For a quantization-independent GDN schedule screen, BV8 beat BV32 by
+1.25–1.73x on C4/C8/C16 q1/q8 synthetic layers and matched FP16 outputs
+bitwise. A whole-model C16 trial with the existing `VLLM_SM70_FLA_BV=8`
+override reached 290.2 tok/s decode capacity and 238.6 tok/s output versus
+288.7/235.6 without the override; acceptance also changed from 42.9% to
+41.4%. This small, sampling-sensitive system gain does not justify changing
+the shared recurrent schedule yet. A general PyTorch top-k/top-p fallback
+matched the Triton mask but took 18.8 ms versus 2.1 ms at 128x248,320, so
+it is not an alternative sampling speed path. Nsight Compute counters were
+unavailable under the host's `ERR_NVGPUCTRPERM` policy; Nsight Systems and
+CUDA events remain the evidence source.
+Continue with a shared batch-shape GEMM/GDN/TP path and preserve the memory
+budget; do not promote a single-kernel projection as a PRO 6000 win.
+
 ## Graph scratch, score workspace and active peak, 2026-09-23
 
 [Implementation and paired evidence](sm70_memory_arena.md). The new SM70
