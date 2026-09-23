@@ -461,6 +461,12 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             sm70_tm.is_exact_sm70_cuda_platform()
             and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
         )
+        # Turing takes the QPN8 kernels with the QPN8 dense prefill; the
+        # TurboMind GEMMs are registered for exact SM70 only.
+        self.use_sm75_fp8_qpn8 = (
+            sm70_tm.is_turing_cuda_platform()
+            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+        )
 
     def create_weights(
         self,
@@ -563,6 +569,26 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             logger.info_once("SM70 ModelOpt FP8 TurboMind W8A16 dense path enabled.")
             return
 
+        if self.use_sm75_fp8_qpn8:
+            if self.input_dtype != torch.float16:
+                raise RuntimeError(
+                    "ModelOpt FP8 QPN8 on Turing requires FP16 activations, "
+                    f"got {self.input_dtype}."
+                )
+            sm70_tm.prepare_fp8_qpn8_dense_linear(layer, weight, max_w_scale)
+            replace_parameter(
+                layer,
+                "weight",
+                torch.empty(0, dtype=weight.dtype, device=weight.device),
+            )
+            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.input_scale = None
+            logger.info_once(
+                "SM75 ModelOpt FP8 QPN8 W8A16 dense path enabled "
+                "(QPN8 decode kernels, dense fp16 prefill)."
+            )
+            return
+
         layer.weight = Parameter(weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
@@ -599,6 +625,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             if bias is not None:
                 out.add_(bias)
             return out.reshape(*x.shape[:-1], layer.output_size_per_partition)
+        if sm70_tm.has_prepared_fp8_qpn8_linear(layer):
+            return sm70_tm.apply_prepared_fp8_qpn8_linear(layer, x, bias)
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
@@ -1099,15 +1127,22 @@ def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     ``amax / (6 * 448)`` (the Marlin multiplier). TurboMind combine is
     ``block * global``. Do not infer convention from scale magnitude.
     """
-    if not sm70_tm.should_prepare_turbomind(
+    if sm70_tm.should_prepare_turbomind(layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND):
+        logger.info_once(
+            "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
+            "(weight-only; activations remain half)."
+        )
+        sm70_tm.prepare_nvfp4_linear(layer)
+    elif sm70_tm.should_prepare_turing_qpn2(
         layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
     ):
+        logger.info_once(
+            "SM75 ModelOpt NVFP4 QPN2 path enabled (QPN2 decode kernels, dense "
+            "fp16 prefill; weight-only, activations remain half)."
+        )
+        sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer)
+    else:
         return False
-    logger.info_once(
-        "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
-        "(weight-only; activations remain half)."
-    )
-    sm70_tm.prepare_nvfp4_linear(layer)
     layer.weight = Parameter(
         torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
         requires_grad=False,
@@ -2402,7 +2437,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     @classmethod
     def get_min_capability(cls) -> int:
         if (
-            sm70_tm.is_exact_sm70_cuda_platform()
+            sm70_tm.is_pre_ampere_cuda_platform()
             and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
         ):
