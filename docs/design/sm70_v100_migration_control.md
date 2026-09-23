@@ -47392,3 +47392,13 @@ has launched no full model. Details and artifacts are in
   paths do not activate the new layouts, but this is not a model speed or
   quality regression test. Keep the control OFF by default and defer the
   target-dependent Draft PR until both the speed and cross-model gates pass.
+- The remaining C8/q8 GPU service is 65.40 ms, of which compressed FP4+FP8
+  GEMM is 31.91 ms. The non-GEMM 33.49 ms already exceeds 33.949/1.05 =
+  32.33 ms, the saved PRO q8 step budget for 5% superiority under equal
+  emitted tokens. This is a diagnostic inference, not an endpoint bound:
+  acceptance and rolling prefill also affect tok/s. It shows that a future
+  faster compressed GEMM alone cannot close the whole q8 step. The largest
+  remaining categories are draft paged attention 6.56 ms, TP collectives
+  5.75 ms, sampling 4.09 ms, and other kernels 8.09 ms. Existing SM70 TP4
+  push all-reduce screens in this control document regressed at M64, so no
+  unqualified communication switch is stacked on this candidate.
