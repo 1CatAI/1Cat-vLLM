@@ -4,8 +4,8 @@ The measurements below document the earlier 24K-to-16K change. See
 [graph scratch and DFlash peak memory](sm70_memory_arena.md) for the subsequent
 8K score default and its separate validation.
 
-The FP32-accumulated Q8000/Q8192 prefill route now retains a 1.50 GiB score
-workspace per device instead of 2.25 GiB, saving 768 MiB. This applies wherever
+The earlier FP32-accumulated Q8000/Q8192 change reduced the score workspace
+from 2.25 GiB to 1.50 GiB per device, saving 768 MiB. This applies wherever
 the existing route is selected; no tensor-parallel or model-quantization gate
 is added. FP32 accumulation, causal masking, the tail implementation, and
 CUDA Graph address lifetime are preserved.
