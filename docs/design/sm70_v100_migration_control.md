@@ -47018,3 +47018,42 @@ has launched no full model. Details and artifacts are in
   Do not merge #682 or enable #621 by default until a smaller cold/reload
   numerical reproducer isolates the remaining AOT execution difference and a
   clean source-built runtime passes the same quality gate and 256K boundary.
+- A follow-up diagnostic removes DFlash2 speculation while retaining the same
+  Qwen3.8-27B NVFP4 model, TP4/GPU0–3, FP16, FP8 E5M2 KV, 262144 maximum
+  context, Flash-V100 and AOT cache. Cold readiness is 227.63 seconds, and
+  first forced reload is 75.23 seconds with four AOT loads. The complete
+  greedy LRU response again differs: cold 1805 tokens (`58a42b7f...` SHA256),
+  reload 1764 tokens (`3f300ddb...` SHA256). All 1584 saved autotune records
+  match the isolated runtime cache after reload, and all 1692 generated Python
+  source files present at readiness are byte-identical afterward. This
+  eliminates DFlash2 as a necessary cause; investigate the backbone AOT
+  deserialization/execution or CUDA graph capture path next. Raw evidence is
+  under `/data/minimax-h3/task-cache/startup-cache-default-20260923/no-spec/`.
+- In a further no-speculation diagnostic, an uncommitted patch in the isolated
+  candidate runtime honors explicit `cudagraph_mode=NONE` while keeping the
+  SM70 compile/AOT policy; the served engine confirms `VLLM_COMPILE`, AOT and
+  no CUDA graphs. Cold readiness is 225.09 seconds and the first forced
+  reload is 76.22 seconds. Both complete 1764-token greedy LRU responses have
+  the same SHA256 (`0c3f7590...`), and the four AOT artifacts load without
+  graph recompilation. This narrows the failed full-graph contract to CUDA
+  graph capture/replay or a graph-specific compile shape, rather than AOT
+  serialization alone. It does not qualify the normal graph-enabled route.
+  Raw evidence is under
+  `/data/minimax-h3/task-cache/startup-cache-default-20260923/no-graph/`.
+- With the same isolated diagnostic patch and no-speculation model,
+  `cudagraph_mode=PIECEWISE` also fails cold/reload parity: cold 226.61 seconds,
+  1764 tokens (`3f300ddb...` SHA256); reload 75.21 seconds, 1485 tokens
+  (`44d817b8...` SHA256). Observed decode is about 43 tokens/s versus about
+  69 tokens/s with `FULL_AND_PIECEWISE` on this request, so PIECEWISE is not a
+  throughput-equivalent fallback. This further localizes the numerical issue
+  to piecewise graph capture/replay or its shape policy. Raw evidence is under
+  `/data/minimax-h3/task-cache/startup-cache-default-20260923/piecewise-only/`.
+- A further warm PIECEWISE reload in the isolated runtime temporarily forces
+  `CUDAGraphWrapper.check_input_addresses=True` without changing the cached
+  AOT artifact. Four AOT loads and the same complete 1485-token warm response
+  (`44d817b8...` SHA256) succeed without an input-address mismatch. Thus
+  replay input-pointer drift is not observed for the tested shapes; wrapper
+  output lifetime, capture state, or graph-specific numerical kernels remain
+  open. The first short-request trial ended at its artificially small
+  64-token output limit and is labeled separately; the full-request retry is
+  the valid diagnostic. Do not infer production quality from this check.
