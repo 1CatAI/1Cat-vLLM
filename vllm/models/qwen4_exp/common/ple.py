@@ -110,7 +110,11 @@ def copy_ple_embedding_shard_(
     source = loaded_weight.narrow(0, overlap.source_start, overlap.row_count)
     target = destination.narrow(0, overlap.destination_start, overlap.row_count)
     with torch.no_grad():
-        target.copy_(source.to(device=target.device, dtype=target.dtype))
+        # copy_ converts device and dtype itself. Staging through .to() would
+        # leave a device-side copy of the slice cached by the allocator: on a
+        # store card filled up to its reserve that was the 0.37 GiB the stage
+        # beside it then ran out of (2026-09-23).
+        target.copy_(source)
     return overlap.row_count
 
 

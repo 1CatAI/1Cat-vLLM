@@ -569,6 +569,26 @@ def test_plan_ple_placement_falls_through_to_the_disk_tier() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shard_copy_to_the_device_keeps_no_staging_memory() -> None:
+    # The allocator keeps a cached staging copy of the shard slice reserved on
+    # the card that holds the device tier, memory the KV cache would get.
+    # 10 MiB: smaller slices share a 2 MiB allocator block with the table, and
+    # the old staging copy would pass unnoticed.
+    rows = 65536
+    table = torch.empty(rows, 160, dtype=torch.uint8, device="cuda")
+    shard = torch.randint(0, 255, (rows, 160), dtype=torch.uint8)
+    torch.accelerator.synchronize()
+    reserved = torch.accelerator.memory_reserved()
+    copied = copy_ple_embedding_shard_(
+        table, shard, checkpoint_start=0, tp_start=0, tp_end=rows
+    )
+    torch.accelerator.synchronize()
+    assert copied == rows
+    assert torch.equal(table.cpu(), shard)
+    assert torch.accelerator.memory_reserved() == reserved
+
+
 def test_copy_ple_embedding_shard_tiers_matches_the_single_copy() -> None:
     checkpoint = torch.arange(20 * 4, dtype=torch.int8).view(20, 4)
     # TP range [5, 15) of a 20-row table, checkpoint shards of 6 rows; the
