@@ -46930,3 +46930,46 @@ has launched no full model. Details and artifacts are in
   readiness. It loads all 12 AOT artifacts without fallback and passes a chat
   request through Studio's authenticated public-API proxy. Existing model,
   topology, context, batch limits, and speculative settings are preserved.
+
+## 2026-09-24 Qwen3.8 Flash-Next NVFP4 MTP4 full-round cost
+
+- The acceptance contract is the **complete** TP4/V2 MTP4 verification round,
+  not the target-only forward: 8,192 fixed input tokens, 513 greedy output
+  tokens, disk-backed PLE without prefault, FP16 activations/KV, full/piecewise
+  CUDA Graph, four V100-SXM2-32GB GPUs. The retained control is
+  13.13857 s / 307 rounds = 42.797 ms/round, with 1.671 accepted tokens per
+  round. The low-overhead trace attributes 33.35 ms to PLE-input submission
+  through verifier-result sampling and 10.92 ms to sampling, draft, and
+  next-round preparation. The post-PLE target graph alone is 24.66 ms, so a
+  20-ms **complete** round cannot come from a PLE-only tweak.
+- Direct NVFP4 MTP5 expert and 25-KiB TP push together reached
+  5.16974 s / 131 rounds = 39.464 ms/round on disk PLE, but the deterministic
+  fixed output first diverged at token index 8. Two of three natural prompts
+  also diverged. The higher acceptance is from a changed output stream, not a
+  qualified speedup. Do not enable this pair by default or reuse its
+  99-tok/s emitted rate as a quality-preserving result.
+- Draft PR [#684](https://github.com/1CatAI/1Cat-vLLM/pull/684) instead
+  accelerates only the byte-exact short disk-PLE gather. The steady complete
+  round is 11.85655 s / 307 = 38.621 ms (9.8% below the control); the fixed
+  requests and all three natural-prompt outputs match token-for-token with
+  unchanged draft counts. Twelve targeted CPU tests pass. Larger prefill
+  gathers retain their deduplicated route; the 32-worker cold-page path stays.
+- An exact Triton screen of the M=5, 50-route MoE sort/expand matched all
+  output bytes and routing metadata and reduced that isolated operator from
+  25.6 to 13.3 microseconds. Across 48 target layers it projects only about
+  0.6 ms/round, so no extra full-model startup is warranted for this candidate
+  while the 20-ms gap remains. Prior direct-W13 split-K 1/4/5/8/10/16/20/32
+  screens were all non-bitwise relative to the generic path; do not repeat them
+  as an output-parity fix.
+- The 4.87-ms draft-completion to next-PLE-input interval has only about
+  0.43 ms of visible rank-0 GPU kernels and is largely host/launch/coordination.
+  A single 12-step scheduled Torch CPU/GPU profile was deliberately diagnostic
+  only: it slowed a 129-token request to 11.11 seconds of decode, so its times
+  are not endpoint speed figures. Python-stack attribution nonetheless found
+  three GDN metadata-builder calls per step. Over those 12 steps,
+  `build_gdn_spec_decode_state_contract` performed 180 `aten::index` and 180
+  `aten::nonzero` calls, all under target `execute_model`; its nested CPU span
+  accounted for about 7.38 ms/step in the perturbed trace. The existing pure
+  DDTree state path avoids those dynamic boolean indices, but ordinary MTP4
+  does not select it. Next candidate: a byte/shape-equivalent single-request,
+  all-spec GDN state contract using fixed slices instead of masked indexing.
