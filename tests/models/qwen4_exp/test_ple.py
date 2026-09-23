@@ -702,6 +702,60 @@ def test_ngram_embedding_retains_and_gathers_disk_shards(
     assert torch.equal(output, expected.view(torch.uint8))
 
 
+@pytest.mark.parametrize("num_rows", [0, 1, 80, 128, 129, 256])
+def test_ngram_embedding_disk_decode_scatter_matches_prefill(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    shard_1 = (
+        torch.arange(8, 16, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    )
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+        ]
+    )
+    ngram_ids = (torch.arange(num_rows, dtype=torch.long) * 5 % 8).reshape(-1, 1)
+    output = torch.empty(num_rows, 2, dtype=torch.uint8)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        module._disk_executor = executor
+        module._disk_embedding_lookup(ngram_ids, output)
+    expected = torch.cat((shard_0, shard_1))[ngram_ids.reshape(-1)]
+    assert torch.equal(output, expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_rows,bad_id", [(1, -1), (80, 8), (129, 8)])
+def test_ngram_embedding_disk_gather_rejects_invalid_ids(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int, bad_id: int
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard = torch.zeros(4, 2).to(torch.float8_e4m3fn)
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard),
+            ("ngram_embedding.shard_1.weight", shard),
+        ]
+    )
+    ngram_ids = torch.zeros(num_rows, 1, dtype=torch.long)
+    ngram_ids[-1] = bad_id
+    with pytest.raises(IndexError, match="PLE disk row id out of range"):
+        module._disk_embedding_lookup(
+            ngram_ids, torch.empty(num_rows, 2, dtype=torch.uint8)
+        )
+
+
 def test_ngram_embedding_disk_offload_rejects_missing_shard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -95,6 +95,31 @@ an incomplete 128-shard table. The pooled implementation additionally exercised
 duplicate IDs spanning two shards. The three full-model random-input cases
 produced the same output token IDs and hashes as the resident-RAM path.
 
+## MTP4 decode short-gather follow-up (2026-09-24)
+
+The 5-token verifier gathers 80 FP8 rows. The disk-backed path now sorts
+these short requests by shard and scatters directly into the pinned output,
+skipping the unique/inverse map and its second output copy. It retains NumPy
+views of the existing file mappings; this is not a 47.684-GiB anonymous table
+copy. Requests above 128 rows keep the globally deduplicated prefill path.
+
+A CPU-only screen on all 128 real checkpoint shards found that cached 80-row
+lookups fell from 4.60 to 3.45 ms median at 32 workers. With independently
+sampled rows and cold faults, the medians were 9.29 and 8.96 ms. The cold
+screen also showed why replacing the pool with one worker is unsafe: its
+legacy lookup took 22.23 ms median. The 32-worker pool remains in place.
+
+One full-model TP4/V2 run used four V100-SXM2-32GB GPUs, the native NVFP4
+checkpoint, FP16 activations/KV, 8,192 input tokens, 513 greedy output tokens,
+MTP4, disk-backed PLE without prefault, full/piecewise CUDA Graph, and a second
+identical request for the steady measurement. The unchanged-source control
+took 13.1386 s / 307 rounds = 42.797 ms per complete verification round. The
+short-gather route took 11.8565 s / 307 rounds = 38.621 ms/round, saving
+4.176 ms (9.8%). The first fixed request and all three natural-prompt outputs
+also matched the control token-for-token, with identical draft counts. This is
+a single-start A/B result, not a claim that the complete round has reached its
+20-ms target. It changes no PLE bytes or model arithmetic.
+
 ## Prefill results
 
 ### Repeated prompt, warm page cache

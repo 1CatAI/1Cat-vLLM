@@ -967,6 +967,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
         self._disk_shards: list[torch.Tensor | None] = []
+        self._disk_shard_arrays: list[np.ndarray] = []
         self._disk_mapped_paths: set[str] = set()
         self._disk_executor: ThreadPoolExecutor | None = None
         if self._disk_offload:
@@ -1233,6 +1234,64 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         flat_ids = ngram_ids.reshape(-1).numpy()
         if flat_ids.size == 0:
             return
+        output_bytes = output.view(torch.uint8).reshape(-1, self.head_dim).numpy()
+        executor = getattr(self, "_disk_executor", None)
+
+        # Decode has at most a few dozen rows. Sorting by shard and scattering
+        # directly avoids np.unique's inverse map and the second output copy.
+        # Keep the deduplicated route for prefill, where repeated IDs matter.
+        if flat_ids.size <= 128:
+            min_id = int(flat_ids.min())
+            max_id = int(flat_ids.max())
+            if min_id < 0 or max_id >= self.ngram_embedding.org_vocab_size:
+                raise IndexError(
+                    "PLE disk row id out of range: "
+                    f"[{min_id}, {max_id}] for "
+                    f"{self.ngram_embedding.org_vocab_size} rows"
+                )
+            shard_ids = flat_ids // self._disk_shard_size
+            order = np.argsort(shard_ids, kind="stable")
+            sorted_shards = shard_ids[order]
+            split_positions = np.searchsorted(
+                sorted_shards, np.arange(1, self.split_ngram_parts)
+            ).tolist()
+            starts = [0, *split_positions]
+            ends = [*split_positions, flat_ids.size]
+            tasks = [
+                (shard_index, start, end)
+                for shard_index, (start, end) in enumerate(
+                    zip(starts, ends, strict=True)
+                )
+                if start != end
+            ]
+
+            def gather_decode_shard(task: tuple[int, int, int]) -> None:
+                shard_index, start, end = task
+                positions = order[start:end]
+                local_ids = flat_ids[positions] - shard_index * self._disk_shard_size
+                output_bytes[positions] = self._disk_shard_arrays[shard_index][
+                    local_ids
+                ]
+
+            if executor is None or len(tasks) == 1:
+                for task in tasks:
+                    gather_decode_shard(task)
+            else:
+                for _ in executor.map(gather_decode_shard, tasks):
+                    pass
+            if profile:
+                faults_after = resource.getrusage(resource.RUSAGE_SELF)
+                logger.info(
+                    "PLE disk mmap gather: tokens=%d rows=%d wall=%.3f ms "
+                    "major_faults=%d minor_faults=%d",
+                    ngram_ids.shape[0],
+                    flat_ids.size,
+                    (time.perf_counter() - started) * 1000.0,
+                    faults_after.ru_majflt - faults_before.ru_majflt,
+                    faults_after.ru_minflt - faults_before.ru_minflt,
+                )
+            return
+
         sorted_ids, inverse = np.unique(flat_ids, return_inverse=True)
         if sorted_ids[0] < 0 or sorted_ids[-1] >= self.ngram_embedding.org_vocab_size:
             raise IndexError(
@@ -1254,12 +1313,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         def gather_shard(task: tuple[int, int, int]) -> None:
             shard_index, start, end = task
-            shard = self._disk_shards[shard_index]
-            assert shard is not None
             local_ids = sorted_ids[start:end] - shard_index * self._disk_shard_size
-            sorted_output[start:end] = shard.view(torch.uint8).numpy()[local_ids]
+            sorted_output[start:end] = self._disk_shard_arrays[shard_index][local_ids]
 
-        executor = getattr(self, "_disk_executor", None)
         if executor is None or len(tasks) == 1:
             for task in tasks:
                 gather_shard(task)
@@ -1267,7 +1323,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             for _ in executor.map(gather_shard, tasks):
                 pass
 
-        output_bytes = output.view(torch.uint8).reshape(-1, self.head_dim).numpy()
         np.take(sorted_output, inverse, axis=0, out=output_bytes)
         if profile:
             faults_after = resource.getrusage(resource.RUSAGE_SELF)
@@ -1471,6 +1526,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 raise RuntimeError(
                     f"PLE disk offload did not load shards: {missing_shards}"
                 )
+            self._disk_shard_arrays = [
+                shard.view(torch.uint8).numpy()
+                for shard in self._disk_shards
+                if shard is not None
+            ]
             mapped_gib = (
                 sum(
                     shard.numel() * shard.element_size()
