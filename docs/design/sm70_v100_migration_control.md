@@ -122,6 +122,71 @@ CUDA events remain the evidence source.
 Continue with a shared batch-shape GEMM/GDN/TP path and preserve the memory
 budget; do not promote a single-kernel projection as a PRO 6000 win.
 
+The PRO 6000 service is now stopped. The retained service log identifies
+vLLM v0.29.0, native BF16, FlashInfer CUTLASS NVFP4, CUTLASS scaled-FP8
+linear, CUDA GDN decode, FlashInfer XQA and TP1. The pinned upstream
+`v0.29.0` implementation pre-swizzles FP4 weight scales at load and uses
+`scaled_fp4_quant` followed by a GEMM that consumes compressed FP4 weights;
+its FP8 linear similarly uses activation quantization and
+`cutlass_scaled_mm`. There is no local copy of the PRO per-kernel profiler
+trace, so these are source-backed route facts, not measured PRO category times.
+
+The V100 trace confirms that its C16 target already runs TurboMind **batch**
+GEMM: over eight q8 steps per rank, 448 gate/up `gemm_kernel` calls average
+276.2 microseconds and 448 down calls 195.1 microseconds, or about 26.4 ms
+per step for the 56 NVFP4 MLP layers. Compact-scale restore costs about
+2.3 ms per step. FP8 QPN8 full-weight dequant costs about 12.4 ms per step;
+QPN8 native handles at most 32 rows, while C16/q8 sends 128 rows. This
+explains why applying a single-request fast-path result to C16 was invalid.
+V100 and PRO perform conceptually similar projections, but SM70 executes
+packed W4A16/FP16 Tensor Core work while SM120 uses native FP4/FP8 Tensor
+Cores. TP4 further requires inter-rank reductions that PRO TP1 avoids.
+
+Small independent CUDA Graph screens reject naively slicing M128 into
+repeated packed kernels: FP8 K1536/N5120 falls from 91.5 to 152.7 us when
+using eight M16 tiles, and NVFP4 K5120/N8704 gate from 306.3 to 613.4 us
+with four M32 tiles. Repeated weight reads exceed the saved reconstruction.
+The existing TurboMind shape tuner can be prewarmed at M64/M128 by setting
+`VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=128` together with
+`VLLM_SM70_AWQ_WARMUP_MAX_M=128`; merely raising the former inside a captured
+graph will use the default spec. Synthetic M128 gate/down timings change
+328.4/222.9 to 300.6/156.8 us, but output hashes change. A full 64-request
+C16 run on the same 2K/256 dataset gives 292.17 tok/s decode capacity,
+237.25 tok/s output and 41.96% acceptance, versus the previous candidate's
+288.7/235.6 tok/s and 42.9%. The gain is under 2% with acceptance drift,
+so the shared default stays unchanged. The original 13.97-GiB/rank KV cache
+budget is unchanged by tuning. Task-private evidence is in the retained
+`verification/` artifact directory
+(`screen_packed_m128.json`, `screen_turbomind_m128_{default,tuned}.jsonl`,
+`v100-turbomind-m128-c16.json` and its service log). The corrected grouped
+path was subsequently captured with Nsight Systems
+`--cuda-graph-trace=node` across four ranks and eight complete C16/q8 steps.
+An earlier default `graph` capture omitted model graph nodes and is not used
+for forward attribution. On rank 0, kernel busy time per full q8 step changed
+as follows (old paged / corrected grouped, ms): target attention
+29.047 / 5.750; FP4 TurboMind gate/down 26.390 / 25.480; QPN8 full-weight
+dequant 12.415 / 12.291; GDN update 9.803 / 9.701; TP reduce
+9.846 / 9.548; FP4 scale restore 2.329 / 2.274; draft paged attention
+14.216 / 13.449. All kernel service falls 144.047 -> 117.586 ms per step.
+The target attention reduction explains most of the prior improvement, while
+the FP4 batch GEMM, QPN8 dequant, recurrent update and TP costs remain. These
+category times are not a closed target forward wall decomposition and do not
+measure corresponding PRO kernel times. Original four-rank reports and SQL
+comparison are task-private under `verification/trace-c16-grouped-nodes/`.
+
+The same 2K/256, C16/64-request unprofiled endpoint contract rejects
+shortening DFlash2's speculative depth as a broad concurrency fix. With the
+same grouped-attention source, q7/q3/q1 (8/4/2 target rows per request)
+produce 288.69/247.46/237.27 tok/s request-level decode capacity,
+235.57/206.12/200.21 tok/s complete output throughput, and
+3.972/2.858/1.797 emitted tokens per draft round. q3/q1 verifier matrix
+rows are M64/M32 rather than q7's M128, but the additional rounds outweigh
+their cheaper steps. The q3/q1 services selected their E4M3 grouped FP32
+attention route and had zero prefix-cache hits. These results compare V100
+configuration choices; the retained PRO 6000 q7 reference is unchanged.
+Original summaries and service route logs are task-private under
+`verification/v100-q{3,1}-*`.
+
 ## Graph scratch, score workspace and active peak, 2026-09-23
 
 [Implementation and paired evidence](sm70_memory_arena.md). The new SM70
