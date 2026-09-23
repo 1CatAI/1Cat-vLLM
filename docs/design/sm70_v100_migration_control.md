@@ -46990,3 +46990,15 @@ has launched no full model. Details and artifacts are in
   vs 21.5 microseconds) and also non-bitwise. The direct M=5 GEMV is therefore
   not a quality-preserving or sufficiently large target-graph optimization;
   do not start a whole model for this candidate.
+- A representative steady node-trace round has 427 CUTLASS FP16 `Kernel2`
+  launches taking 7.699 ms of perturbed kernel service; MoE expert GEMM is
+  another 3.696 ms. These are diagnostic GPU service times, not additive
+  untraced wall time. A GPU-only PyTorch BLAS-preference screen found cuBLASLt
+  faster than cuBLAS only at M=5/K=2560/N=4096 (45.1 vs 49.2 microseconds),
+  but 5,619 outputs differed; at K=10240/N=336 and K=1536/N=2560 cuBLASLt
+  was slower and non-bitwise. Neither a BLAS toggle nor the direct GEMV passes
+  the exact-output gate. Reaching 20 ms/round requires substantial target-graph
+  and draft/preparation changes, not further PLE-only tuning. At the retained
+  1.671 accepted tokens/round, 20 ms/round is only 83.6 emitted tokens/s; to
+  exceed the approximately 98-token/s no-MTP baseline at unchanged acceptance
+  requires below 17.1 ms/round.
