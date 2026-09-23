@@ -46982,3 +46982,11 @@ has launched no full model. Details and artifacts are in
   0 and 2 diverged at tokens 36 and 208. It is not in PR #684 and must not be
   counted as a speedup. The isolated candidate was reverted after the run;
   unit-level tensor equality did not establish whole-graph state equivalence.
+- A GPU-only SM70 M=5 FP16 projection screen tested a five-row Triton GEMV
+  with FP32 accumulation against the existing PyTorch linear graph, without
+  loading the model. At K=2560/N=4096 its best graph median was 44.0 vs
+  49.2 microseconds, but 130 of 20,480 FP16 outputs differed (max 0.125).
+  K=10240/N=336 and K=1536/N=2560 were slower (best 39.9 vs 19.5 and 23.6
+  vs 21.5 microseconds) and also non-bitwise. The direct M=5 GEMV is therefore
+  not a quality-preserving or sufficiently large target-graph optimization;
+  do not start a whole model for this candidate.
