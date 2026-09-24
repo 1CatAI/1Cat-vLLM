@@ -721,7 +721,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
     @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        except pynvml.NVMLError:
+            # Broken/unresponsive GPU (e.g. post-Xid NVLink island) — this
+            # warning path must not take down the whole platform init.
+            return f"<unavailable:{device_id}>"
         return pynvml.nvmlDeviceGetName(handle)
 
     @classmethod
