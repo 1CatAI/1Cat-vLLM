@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
     _is_sm70_fp8_qpn8_runtime_contract,
     _missing_sm70_fp8_qpn8_ops,
+    _try_sm70_fp8_prescaled_decode_scales,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -111,6 +112,7 @@ def _sm70_ct_fp8_qpn8_batch_dispatch(
     accumulator_chains: int,
     prefetch_codes: bool,
     gated_silu: bool,
+    tm_prescaled: bool,
 ) -> None:
     # AOTInductor shares a dynamic M range. Dispatch inside this opaque op so
     # a graph captured at M=1 can later select the measured M64 path.
@@ -119,9 +121,16 @@ def _sm70_ct_fp8_qpn8_batch_dispatch(
     # step but changes the acceptance trajectory enough to lose pure decode.
     # Preserve the exact QPN8 route through M32, including the C1 fast path.
     if 32 < m <= 64:
-        sm70_ops.fp8_gemm_sm70_out(
-            out, x, tm_weight, tm_scales, 128, tm_k_ld, tm_q_ld, gated_silu
-        )
+        if tm_prescaled:
+            if gated_silu:
+                raise ValueError("Pre-scaled FP8 batch GEMM cannot fuse gated-SiLU")
+            sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
+                out, x, tm_weight, tm_scales, 128, tm_k_ld, tm_q_ld
+            )
+        else:
+            sm70_ops.fp8_gemm_sm70_out(
+                out, x, tm_weight, tm_scales, 128, tm_k_ld, tm_q_ld, gated_silu
+            )
         return
     _sm70_ct_fp8_qpn8_dispatch(
         out,
@@ -148,6 +157,7 @@ def _sm70_ct_fp8_qpn8_batch_dispatch_fake(
     accumulator_chains: int,
     prefetch_codes: bool,
     gated_silu: bool,
+    tm_prescaled: bool,
 ) -> None:
     return None
 
@@ -395,6 +405,24 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         tm_weight, tm_scales, tm_meta = sm70_ops.fp8_sm70_prepare(
                             layer.weight, weight_scale, 128, gated
                         )
+                        n, k = layer.weight.shape
+                        prescaled_batch = None
+                        if (
+                            not gated
+                            and os.getenv("VLLM_SM70_FP8_BATCH_PRESCALED", "0") == "1"
+                            and (k, n) in {(1536, 5120), (5120, 4096), (5120, 3584)}
+                            and hasattr(sm70_ops, "fp8_gemm_sm70_prefill_prescaled_out")
+                        ):
+                            prescaled_batch = _try_sm70_fp8_prescaled_decode_scales(
+                                tm_scales
+                            )
+                        if prescaled_batch is not None:
+                            tm_scales = prescaled_batch
+                            logger.info_once(
+                                "SM70 channel-FP8 batch GEMM uses reversible "
+                                "load-time pre-scaled FP16 scales for M=33..64."
+                            )
+                        layer.sm70_fp8_batch_tm_prescaled = prescaled_batch is not None
                         layer.register_buffer(
                             "sm70_fp8_batch_tm_weight", tm_weight, persistent=False
                         )
@@ -538,6 +566,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         int(layer.sm70_fp8_qpn8_nacc),
                         bool(layer.sm70_fp8_qpn8_prefetch),
                         False,
+                        bool(layer.sm70_fp8_batch_tm_prescaled),
                     )
                 else:
                     torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
@@ -603,6 +632,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 int(layer.sm70_fp8_qpn8_gated_nacc),
                 bool(layer.sm70_fp8_qpn8_gated_prefetch),
                 True,
+                bool(layer.sm70_fp8_batch_tm_prescaled),
             )
         else:
             torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(

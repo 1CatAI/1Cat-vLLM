@@ -33,15 +33,19 @@ def test_batched_layout_policy_is_shared_and_reversible(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("m", "k", "n", "split_k", "gated_silu"),
+    ("m", "k", "n", "split_k", "gated_silu", "tm_prescaled"),
     [
-        (8, 1536, 5120, 12, False),
-        (32, 5120, 3584, 16, False),
-        (64, 1536, 5120, 12, False),
-        (64, 5120, 8704, 8, True),
+        (8, 1536, 5120, 12, False, False),
+        (32, 5120, 3584, 16, False, False),
+        (48, 1536, 5120, 12, False, True),
+        (64, 1536, 5120, 12, False, False),
+        (64, 1536, 5120, 12, False, True),
+        (64, 5120, 8704, 8, True, False),
     ],
 )
-def test_batch_fp8_dispatch_matches_qpn8_and_replays(m, k, n, split_k, gated_silu):
+def test_batch_fp8_dispatch_matches_qpn8_and_replays(
+    m, k, n, split_k, gated_silu, tm_prescaled
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA required")
     torch.manual_seed(20260924)
@@ -51,6 +55,9 @@ def test_batch_fp8_dispatch_matches_qpn8_and_replays(m, k, n, split_k, gated_sil
     tm_weight, tm_scales, meta = torch.ops._C.fp8_sm70_prepare(
         weight, scales, 128, gated_silu
     )
+    if tm_prescaled:
+        tm_scales = tm_scales.mul(256)
+        assert bool(torch.isfinite(tm_scales).all().item())
     x = torch.randn((m, k), device="cuda", dtype=torch.float16).mul_(0.1)
     expected = torch.empty(
         (m, n // 2 if gated_silu else n), device="cuda", dtype=torch.float16
@@ -85,6 +92,7 @@ def test_batch_fp8_dispatch_matches_qpn8_and_replays(m, k, n, split_k, gated_sil
             2,
             False,
             gated_silu,
+            tm_prescaled,
         )
 
     candidate()

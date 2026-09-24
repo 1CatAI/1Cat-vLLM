@@ -2,6 +2,38 @@
 
 Date: 2026-05-30
 
+## TP4 DFlash2 batch GEMM supply experiment, 2026-09-24
+
+For Qwen3.8-27B-NVFP4 at C8/q8, the channel-FP8 TurboMind output
+projection still has low SM70 occupancy. A reversible load-time 256x shift of
+its existing FP16 scale removes the E4M3 exponent-bias multiply inside the
+packed-weight transform without expanding the weights. Only M=33..64 and
+fully packed K1536/N5120 or K5120/N4096,3584 projections are eligible;
+M<=32 remains on the QPN8 fast path, and non-reversible scales fall back.
+`VLLM_SM70_FP8_BATCH_PRESCALED=1` opts in. It is off by default.
+
+On real TP4 weights, the M64 output-projection CUDA Graph operator time falls
+from 73.66 to 31.76 us, with identical fixed-input output. With the same
+M16/N256/K32 split-3 tile forced in both transforms, the main GEMM alone
+falls from 41.22 to 34.50 us; registers/thread remain 146/148 and achieved
+occupancy 17.40/17.48%. Tensor-pipe activity is about 29% and DRAM throughput
+25–28% of sustained peak, so neither compute nor HBM is saturated on this
+sample. Narrow N128 tiles reduce registers to 110–128 but increase operator
+time to 40.9–41.7 us; they were discarded. An FP4 K16 tile candidate also
+failed the complete-service gate and was discarded.
+
+The uninstrumented same-source ON/OFF C8 pure-decode median is
+516.77/489.59 tok/s across three independent eight-request waves (+5.6%).
+For 48 rolling requests, ON/OFF decode capacity is 338.16/343.12 tok/s and
+complete output throughput is 270.77/283.93 tok/s. The rolling result does
+not support default-on. One matched C1/C4 run gives virtually identical
+ON/OFF results, as expected from the unchanged QPN8 route. Seven focused
+SM70 CUDA Graph/replay checks pass. The saved single-wave PRO C8 pure decode
+is 820.84 tok/s; no fresh PRO comparison or 35B-A3B AWQ/FP8 speed gate was
+available for this experiment. The opt-in candidate is retained for further
+mixed-prefill and GEMM scheduling work, not promoted as an overall C8 speed
+win.
+
 ## PRO 6000 C1/C4/C8 prefix-cache and verifier comparison, 2026-09-24
 
 The resumed PRO 6000 machine retained its original C8 target-forward profiler
