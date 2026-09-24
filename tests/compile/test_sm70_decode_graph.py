@@ -290,35 +290,15 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
         "VLLM_PLE_CPU_OFFLOAD",
         "VLLM_PLE_DISK_OFFLOAD",
         "VLLM_SM70_QWEN38_HYBRID_PLE",
-        "VLLM_QWEN4EXP_PLE_STORE_DEVICE",
-        "VLLM_QWEN4EXP_PLE_STORE_GIB",
         "VLLM_QWEN4EXP_PLE_DISK",
     ):
         set_lazy_env(monkeypatch, name, None)
     model_config = SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[1]))
 
     assert not _qwen4exp_ple_cascade_requested(model_config)
-    # The two variables only make sense together.
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
-    with pytest.raises(ValueError, match="without VLLM_QWEN4EXP_PLE_STORE_DEVICE"):
-        _qwen4exp_ple_cascade_requested(model_config)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", "4")
-    with pytest.raises(ValueError, match="requires VLLM_QWEN4EXP_PLE_STORE_GIB"):
-        _qwen4exp_ple_cascade_requested(model_config)
-
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
-    assert _qwen4exp_ple_cascade_requested(model_config)
-
-    # The disk tier alone also starts the cascade: a host with no spare card.
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", None)
-    assert not _qwen4exp_ple_cascade_requested(model_config)
+    # The disk tier starts the cascade.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
     assert _qwen4exp_ple_cascade_requested(model_config)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", "4")
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
     with pytest.raises(ValueError, match="no PLE layers"):
         _qwen4exp_ple_cascade_requested(
             SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[]))
@@ -331,9 +311,6 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
     with pytest.raises(ValueError, match="cannot be combined"):
         _qwen4exp_ple_cascade_requested(model_config)
     set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", "-1")
-    with pytest.raises(ValueError, match="non-negative"):
-        _qwen4exp_ple_cascade_requested(model_config)
 
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""
