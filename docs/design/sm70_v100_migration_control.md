@@ -47002,3 +47002,18 @@ has launched no full model. Details and artifacts are in
   1.671 accepted tokens/round, 20 ms/round is only 83.6 emitted tokens/s; to
   exceed the approximately 98-token/s no-MTP baseline at unchanged acceptance
   requires below 17.1 ms/round.
+- The latest direct-copy low-overhead Nsight graph capture at source
+  `48be98393d` matches all 513 fixed output tokens and 307 verifier rounds.
+  Its **decode-only** metric is 12.505251 s / 307 = 40.734 ms/round under
+  tracing, versus the same-code untraced repeat of 37.069 ms/round. Across
+  306 closed PLE-to-PLE intervals, 40.669 ms mean divides without overlap
+  into PLE input-to-four-rank-result readiness **4.437 ms**, post-PLE target
+  **25.112 ms**, verifier sampling/draft **6.169 ms**, and next-round
+  preparation **4.951 ms**. The 4.437-ms PLE-related window includes IPC,
+  fanout, and overlapping pre-PLE GPU work, not just mmap lookup. Five rounds
+  have request-to-first-result waits over 10 ms, so the complete-round p99 is
+  56.223 ms; the trace cannot alone attribute those stalls to disk faults or
+  worker scheduling. The 13.482920-s traced request wall includes prefill and
+  must not be divided by 307 as a decode metric. Full local report and raw
+  SQLite are in `.artifacts/mtp_disk_memmove_graph_report.md` and
+  `.artifacts/mtp_disk_memmove_graph_trace.sqlite`.
