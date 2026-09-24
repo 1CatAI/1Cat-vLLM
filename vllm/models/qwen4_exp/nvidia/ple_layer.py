@@ -1087,6 +1087,56 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
+    def _compute_ngram_ids_cpu_small(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Avoid many tiny Torch ops for CPU-offloaded speculative steps."""
+        tokens = input_ids.tolist()
+        starts = query_start_loc.tolist()
+        context = ngram_context.tolist()
+        num_tokens = len(tokens)
+        num_reqs = len(starts) - 1
+        max_seq_len = max(1, max(b - a for a, b in zip(starts, starts[1:])))
+        num_valid_tokens = min(starts[-1], num_tokens)
+        eos = self.eos_token_id
+        packed = [[eos] * (max_seq_len + 2) for _ in range(num_reqs)]
+        for req in range(num_reqs):
+            packed[req][:2] = context[req]
+            begin = min(starts[req], num_valid_tokens)
+            end = min(starts[req + 1], num_valid_tokens)
+            packed[req][2 : 2 + end - begin] = tokens[begin:end]
+
+        multipliers = self.layer_multipliers.tolist()
+        sizes = self.ngram_heads_vocab_sizes.tolist()
+        offsets = self.ngram_heads_offsets.tolist()
+        mask = (1 << 64) - 1
+        sign = 1 << 63
+        full = 1 << 64
+        output = []
+        req = 0
+        for pos in range(num_tokens):
+            while req + 1 < num_reqs and pos >= starts[req + 1]:
+                req += 1
+            col = min(max(pos - starts[req], 0), max_seq_len - 1)
+            seq = packed[req]
+            current, previous = seq[col + 2], seq[col + 1]
+            # A preceding EOS resets the history used by the trigram head.
+            previous2 = eos if previous == eos else seq[col]
+            mixed2 = ((current * multipliers[0]) & mask) ^ (
+                (previous * multipliers[1]) & mask
+            )
+            mixed3 = mixed2 ^ ((previous2 * multipliers[2]) & mask)
+            if mixed2 >= sign:
+                mixed2 -= full
+            if mixed3 >= sign:
+                mixed3 -= full
+            output.extend(mixed2 % sizes[h] + offsets[h] for h in range(8))
+            output.extend(mixed3 % sizes[h] + offsets[h] for h in range(8, 16))
+        return torch.tensor(output, dtype=torch.long).reshape(num_tokens, 16)
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
@@ -1148,6 +1198,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
             logger.info_once("SM70 Qwen3.8 fused M=1 PLE ngram-ID path enabled.")
             return output
+
+        if (
+            is_offload_process()
+            and num_tokens <= 16
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+            and self.ngram_heads == 16
+            and self.layer_multipliers.numel() == 3
+            and self.ngram_heads_vocab_sizes.numel() == 16
+            and self.ngram_heads_offsets.numel() == 16
+            and input_ids.device.type == "cpu"
+            and query_start_loc.device.type == "cpu"
+            and ngram_context.device.type == "cpu"
+            and input_ids.dtype in (torch.int32, torch.int64)
+            and query_start_loc.dtype in (torch.int32, torch.int64)
+            and ngram_context.dtype in (torch.int32, torch.int64)
+            and ngram_context.ndim == 2
+            and ngram_context.shape[0] >= num_reqs
+            and ngram_context.shape[1] == 2
+            and self.layer_multipliers.device.type == "cpu"
+            and self.ngram_heads_vocab_sizes.device.type == "cpu"
+            and self.ngram_heads_offsets.device.type == "cpu"
+        ):
+            return self._compute_ngram_ids_cpu_small(
+                input_ids, query_start_loc, ngram_context
+            )
 
         input_ids = input_ids.long()
         query_start_loc = query_start_loc.long()

@@ -612,15 +612,13 @@ def build_gdn_spec_decode_state_contract(
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
-    block_mask = _mask_for(block_table_tensor)
-    seq_mask = _mask_for(seq_lens)
-    accepted_mask = _mask_for(num_accepted_tokens)
     if spec_state_slot_selectors is None:
         spec_state_slot_selectors = num_accepted_tokens
-    selector_mask = _mask_for(spec_state_slot_selectors)
 
+    all_spec_rows = False
     if current_state_block_ids is not None:
         current_mask = _mask_for(current_state_block_ids)
+        accepted_mask = _mask_for(num_accepted_tokens)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
         spec_state_indices_tensor = state_block_ids[current_mask]
         non_spec_source = state_block_ids[~current_mask]
@@ -630,6 +628,8 @@ def build_gdn_spec_decode_state_contract(
             num_spec,
         )
     elif is_mamba_cache_all:
+        block_mask = _mask_for(block_table_tensor)
+        seq_mask = _mask_for(seq_lens)
         spec_state_indices_tensor = gather_gdn_state_block_ids(
             block_table_tensor[block_mask],
             seq_lens[seq_mask],
@@ -643,15 +643,51 @@ def build_gdn_spec_decode_state_contract(
             1,
         ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
-        non_spec_state_indices_tensor = select_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            num_accepted_tokens[~accepted_mask],
-            num_spec,
-        )
+        all_spec_rows = bool(spec_sequence_masks_cpu.all().item())
+        if all_spec_rows:
+            # Preserve the independent, contiguous output of boolean indexing
+            # without allocating row indices for the common pure-MTP batch.
+            spec_state_indices_tensor = block_table_tensor[:, : num_spec + 1].clone()
+            non_spec_state_indices_tensor = block_table_tensor.new_empty((0,))
+        else:
+            # The request classification is authoritative on CPU. GPU boolean
+            # indexing invokes nonzero to discover its dynamic output shape and
+            # synchronizes the host. Index selection keeps the same independently
+            # allocated result without that device-side shape query.
+            spec_rows_cpu = torch.nonzero(spec_sequence_masks_cpu).reshape(-1)
+            non_spec_rows_cpu = torch.nonzero(~spec_sequence_masks_cpu).reshape(-1)
+            row_indices: dict[tuple[torch.device, bool], torch.Tensor] = {}
 
-    spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-    spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+            def _select_rows(tensor: torch.Tensor, speculative: bool) -> torch.Tensor:
+                key = (tensor.device, speculative)
+                indices = row_indices.get(key)
+                if indices is None:
+                    cpu_indices = spec_rows_cpu if speculative else non_spec_rows_cpu
+                    indices = cpu_indices.to(tensor.device, non_blocking=True)
+                    row_indices[key] = indices
+                return torch.index_select(tensor, 0, indices)
+
+            spec_state_indices_tensor = _select_rows(
+                block_table_tensor[:, : num_spec + 1], True
+            )
+            non_spec_state_indices_tensor = select_gdn_state_block_ids(
+                _select_rows(block_table_tensor, False),
+                _select_rows(num_accepted_tokens, False),
+                num_spec,
+            )
+
+    if current_state_block_ids is None and not is_mamba_cache_all:
+        if all_spec_rows:
+            spec_num_accepted_tokens = num_accepted_tokens.clone()
+            spec_state_slot_selectors = spec_state_slot_selectors.clone()
+        else:
+            spec_num_accepted_tokens = _select_rows(num_accepted_tokens, True)
+            spec_state_slot_selectors = _select_rows(spec_state_slot_selectors, True)
+    else:
+        accepted_mask = _mask_for(num_accepted_tokens)
+        selector_mask = _mask_for(spec_state_slot_selectors)
+        spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
+        spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(

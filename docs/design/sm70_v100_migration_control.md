@@ -47017,3 +47017,55 @@ has launched no full model. Details and artifacts are in
   must not be divided by 307 as a decode metric. Full local report and raw
   SQLite are in `.artifacts/mtp_disk_memmove_graph_report.md` and
   `.artifacts/mtp_disk_memmove_graph_trace.sqlite`.
+
+## 2026-09-24 Qwen3.8 MTP4 draft-combine to next-PLE reduction
+
+- Follow-up to PR #684 uses the same 8,192-token fixed prompt, 513 greedy
+  output tokens, TP4 on V100-SXM2-32GB, MTP4, disk-backed PLE without prefault,
+  FP16 activation/KV, and CUDA Graph settings above. The target is the **closed
+  draft-combine to next PLE-input interval**, not an estimate from Python
+  profiler inclusive spans. Its GPU-combine-to-host-PLE boundary can include
+  queueing/handoff and must not be labeled wholly as CPU execution. No model
+  precision or sampling setting changed.
+- The PLE worker now computes at most 16 offloaded n-gram IDs with scalar
+  signed-int64-wrap arithmetic instead of many tiny CPU Torch operations, and
+  enqueues a byte-exact pinned H2D copy directly on each rank's existing copy
+  stream before its completion semaphore. The 5-by-16-ID CPU microbenchmark
+  fell from 0.379 to 0.035 ms median; four-rank fanout enqueue from 0.126
+  to 0.033 ms median. The short-ID path has randomized EOS, padding, and
+  multi-request equality tests; larger gathers keep their prior route.
+- The GPU runner submits PLE as soon as token/query/context inputs are ready,
+  overlapping CPU lookup with attention and Mamba metadata preparation. The
+  ordinary MTP4 GDN contract does **not** receive `current_state_block_ids`,
+  so optimizing that other branch would miss this workload. The active branch
+  now converts authoritative CPU speculative-row masks into GPU `index_select`
+  indices instead of GPU boolean indexing and its dynamic-shape synchronization.
+  For an all-speculative batch it clones the selected block/count/selector
+  tensors and creates an empty non-spec result, retaining the independent,
+  contiguous copy semantics. CPU/GPU pure-spec, mixed, and pure non-spec tests
+  match the masked-index reference; the standalone pure-spec contract fell from
+  about 0.11 to 0.055 ms per call. The previously rejected fixed-slice/no-copy
+  candidate remains rejected because it failed the whole-model quality gate.
+- One same-setting low-overhead graph capture per accepted stage reports 306
+  closed rounds: original combine-to-next-PLE mean **4.951 ms**, after PLE
+  submission and active-branch `index_select` **3.503 ms**, and after the
+  independent-copy pure-spec fast path **3.248 ms** (1.703 ms / 34.4% below
+  original). The final captured complete-round mean is 36.865 ms versus
+  original 40.669 ms; captures perturb throughput, so compare their stage
+  boundaries, not their wall time to an untraced run. Final untraced fixed
+  repeat decode is **10.82794 s / 307 = 35.270 ms/round** versus the original
+  11.38005 s / 307 = 37.069 ms/round. Two fixed and three natural-prompt
+  outputs match their pre-change token IDs and verifier-round counts exactly.
+  The three affected test files passed 188 tests before the final pure-spec
+  addition; its expanded pure/mixed/non-spec matrix then passed ten cases.
+  Local raw evidence: `.artifacts/mtp_disk_pure_clone_probe.json` and
+  `.artifacts/mtp_disk_pure_clone_graph_trace.sqlite`; the earlier-stage
+  comparison is `.artifacts/mtp_disk_early_ple_probe.json` and
+  `.artifacts/mtp_disk_early_ple_graph_trace.sqlite`.
+- The remaining 3.248-ms stage is still worth profiling, but the final trace
+  already spends 25.120 ms from four-rank PLE readiness to verifier gather and
+  6.172 ms in verifier sampling/draft. Thus eliminating this preparation stage
+  entirely would still leave over 31 ms/round under the current target graph
+  and acceptance rate. The 20-ms complete-round objective is not achieved by
+  this change; next decisions should prioritize target-graph/draft cost rather
+  than repeatedly loading the model for sub-0.1-ms host candidates.

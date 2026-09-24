@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
     prepare_dflash2_gdn_group_metadata,
+    select_gdn_state_block_ids,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -1341,6 +1342,56 @@ def test_align_cache_mixed_non_spec_uses_legacy_current_state_slot0(
     assert _effective_spec_initial_state_slots(meta) == [41]
     assert meta.non_spec_state_indices_tensor is not None
     assert meta.non_spec_state_indices_tensor.tolist() == [30]
+
+
+@pytest.mark.parametrize(
+    "mask_values",
+    [[True], [True] * 5, [True, False, True], [False], [False] * 3],
+)
+@pytest.mark.parametrize("device_name", ["cpu", "cuda:0"])
+def test_active_align_state_selection_matches_masked_copy(
+    mask_values: list[bool], device_name: str
+) -> None:
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    device = torch.device(device_name)
+    count = len(mask_values)
+    mask_cpu = torch.tensor(mask_values, dtype=torch.bool)
+    mask = mask_cpu.to(device)
+    block = torch.arange(count * 8, device=device, dtype=torch.int32).reshape(count, 8)
+    accepted = torch.arange(1, count + 1, device=device, dtype=torch.int32)
+    selectors = accepted.flip(0).contiguous()
+    result = build_gdn_spec_decode_state_contract(
+        block_table_tensor=block,
+        seq_lens=torch.full((count,), 32, device=device, dtype=torch.int32),
+        block_size=16,
+        num_spec=4,
+        spec_sequence_masks_cpu=mask_cpu,
+        num_accepted_tokens=accepted,
+        current_state_block_ids=None,
+        is_mamba_cache_all=False,
+        spec_state_slot_selectors=selectors,
+    )
+    expected = (
+        block[mask, :5],
+        select_gdn_state_block_ids(block[~mask], accepted[~mask], 4),
+        accepted[mask],
+        selectors[mask],
+    )
+    actual = (
+        result.spec_state_indices_tensor,
+        result.non_spec_state_indices_tensor,
+        result.num_accepted_tokens,
+        result.spec_state_slot_selectors,
+    )
+    for observed, reference in zip(actual, expected, strict=True):
+        assert observed is not None
+        assert torch.equal(observed, reference)
+        assert observed.is_contiguous() == reference.is_contiguous()
+    assert result.spec_state_indices_tensor is not None
+    assert result.spec_state_indices_tensor.data_ptr() != block.data_ptr()
+    assert result.num_accepted_tokens is not None
+    assert result.num_accepted_tokens.data_ptr() != accepted.data_ptr()
 
 
 def test_align_active_mtp_rollover_contract_near_block_boundary(
