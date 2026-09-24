@@ -302,6 +302,32 @@ def main() -> None:
 
         baseline_stage2()
         torch.accelerator.synchronize()
+
+        def w2_only_stage() -> None:
+            # Keep the existing permute, W13, SwiGLU and unpermute. Replace
+            # only the sorted W2 GEMM with the same packed-weight QPN route.
+            op(
+                candidate_w2,
+                baseline_intermediate,
+                qpn_w2,
+                qpn_s2,
+                sorted_ids,
+                False,
+                1,
+            )
+
+        w2_only_stage()
+        w2_only_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(w2_only_graph):
+            baseline_stage2()
+            w2_only_stage()
+        graph_bitwise = True
+        for _ in range(8):
+            baseline_intermediate.normal_(0, 0.1)
+            w2_only_graph.replay()
+            graph_bitwise &= torch.equal(candidate_w2, baseline_w2)
+        baseline_stage2()
+        w2_only_stage()
         pattern: dict[str, object] = {
             "unique_experts": int(token_order_ids.unique().numel()),
             "baseline_us": {
@@ -312,6 +338,12 @@ def main() -> None:
             },
             "candidate_w13": [],
             "candidate_w2": [],
+            "w2_only": {
+                "warm_us": graph_us(w2_only_stage),
+                "cold_us": cold_us(w2_only_stage, l2_flush),
+                "graph_bitwise": graph_bitwise,
+                **error(candidate_w2, baseline_w2),
+            },
         }
 
         for split_k in (4, 5, 8, 10, 16, 20, 32):

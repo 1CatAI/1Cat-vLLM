@@ -46955,3 +46955,21 @@ has launched no full model. Details and artifacts are in
   `VLLM_SM70_QWEN38_GDN_SPLIT_COPY=1` enables it for measurement. The shared
   Qwen3.5 helper remains bitwise-equivalent; its targeted GPU suite passes
   11/11 including M5 and graph-replay mutation.
+- The source-built wheel `dee82211...31c06` hit the M5 split-copy route in
+  actual full-graph capture. Against the same functional public/main path
+  with the flag off, both 8192/513 fixed outputs, three sampled natural
+  conversations, the warmup, all verifier-round counts and accepted counts
+  match exactly. The two fixed-request pure-decode times fell from
+  12.78594/12.77940 to 12.62005/12.62305 seconds (306 rounds each), about
+  0.51-0.54 ms/round. Natural-request times varied upward by 0.08-0.13 s;
+  the small endpoint gain is not sufficient to default-enable this route.
+- A separate W2-only MTP5 screen retains the baseline sorted permute, W13,
+  SwiGLU and unpermute. On real packed checkpoint weights, QPN split-1 W2
+  matches the grouped W2 output bit-for-bit for both 10-overlap and
+  50-distinct expert patterns, including eight changing-input graph replays.
+  Warm W2 drops 24.144 to 15.500 and 26.988 to 18.470 microseconds per
+  layer; the maximum 48-layer warm projection is about 0.41 ms/round. Split
+  2/5/10 changed FP16 outputs and remain rejected. An exact TP4/M5/FP16
+  W2-only production gate is opt-in at
+  `VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5=1`; endpoint quality and speed
+  are pending.
