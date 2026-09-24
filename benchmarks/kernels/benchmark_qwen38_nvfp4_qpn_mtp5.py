@@ -13,7 +13,9 @@ and FP32 accumulation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import statistics
 from collections.abc import Callable
 from pathlib import Path
@@ -144,6 +146,8 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--screen-w13-policy", action="store_true")
+    parser.add_argument("--profile-selected-w13", action="store_true")
     args = parser.parse_args()
 
     if args.library is not None:
@@ -250,6 +254,8 @@ def main() -> None:
         "overlap_10_experts": torch.arange(TOP_K, device="cuda").repeat(TOKENS),
         "distinct_50_experts": torch.arange(ROUTES, device="cuda"),
     }
+    if args.screen_w13_policy:
+        result["w13_tune_enabled"] = os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1")
     for pattern_name, token_order_ids_i64 in patterns.items():
         token_order_ids = token_order_ids_i64.to(torch.int32).contiguous()
         sort_index = torch.argsort(token_order_ids_i64, stable=True)
@@ -284,6 +290,20 @@ def main() -> None:
             )
 
         baseline_stage13()
+        if args.profile_selected_w13:
+            torch.cuda.cudart().cudaProfilerStart()
+            baseline_stage13()
+            torch.cuda.cudart().cudaProfilerStop()
+            return
+        if args.screen_w13_policy:
+            elapsed_us = graph_us(baseline_stage13)
+            result["patterns"][pattern_name] = {
+                "w13_us": elapsed_us,
+                "w13_sha256": hashlib.sha256(
+                    baseline_w13.cpu().numpy().tobytes()
+                ).hexdigest(),
+            }
+            continue
         torch.ops._C.silu_and_mul(baseline_intermediate, baseline_w13)
 
         def baseline_stage2() -> None:
@@ -302,6 +322,32 @@ def main() -> None:
 
         baseline_stage2()
         torch.accelerator.synchronize()
+
+        def w2_only_stage() -> None:
+            # Keep the existing permute, W13, SwiGLU and unpermute. Replace
+            # only the sorted W2 GEMM with the same packed-weight QPN route.
+            op(
+                candidate_w2,
+                baseline_intermediate,
+                qpn_w2,
+                qpn_s2,
+                sorted_ids,
+                False,
+                1,
+            )
+
+        w2_only_stage()
+        w2_only_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(w2_only_graph):
+            baseline_stage2()
+            w2_only_stage()
+        graph_bitwise = True
+        for _ in range(8):
+            baseline_intermediate.normal_(0, 0.1)
+            w2_only_graph.replay()
+            graph_bitwise &= torch.equal(candidate_w2, baseline_w2)
+        baseline_stage2()
+        w2_only_stage()
         pattern: dict[str, object] = {
             "unique_experts": int(token_order_ids.unique().numel()),
             "baseline_us": {
@@ -312,6 +358,12 @@ def main() -> None:
             },
             "candidate_w13": [],
             "candidate_w2": [],
+            "w2_only": {
+                "warm_us": graph_us(w2_only_stage),
+                "cold_us": cold_us(w2_only_stage, l2_flush),
+                "graph_bitwise": graph_bitwise,
+                **error(candidate_w2, baseline_w2),
+            },
         }
 
         for split_k in (4, 5, 8, 10, 16, 20, 32):

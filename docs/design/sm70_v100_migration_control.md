@@ -46930,3 +46930,74 @@ has launched no full model. Details and artifacts are in
   readiness. It loads all 12 AOT artifacts without fallback and passes a chat
   request through Studio's authenticated public-API proxy. Existing model,
   topology, context, batch limits, and speculative settings are preserved.
+
+## 2026-09-24 Qwen3.8 MTP5 verifier small-kernel follow-up
+
+- Base `d49e32b3587d4d34ffccb0ffd376e63974b06c88`, TP4 on V100 GPU0-3,
+  Torch 2.10.0+cu128, checkpoint `RadixArk/Qwen3.8-Flash-Next-NVFP4`, FP16
+  execution, PLE on disk, MTP4 (five target tokens), fixed 8192/513 decode.
+  The candidate is isolated and opt-in; no claim is made about the public
+  default or the separate draft #684 baseline.
+- The checkpoint is `qwen4_exp_text`, with 36 non-interleaved GDN layers and
+  12 QSA layers. An interleaved Qwen3Next layout-copy screen was rejected:
+  although its microbenchmark saved 2.64 ms per 36 layers, two matched model
+  launches showed no route hit and no reproducible speed gain. Its source
+  change was reverted. Do not revisit that route for this checkpoint.
+- The actual non-interleaved MTP5 path uses two `index_select` operations and
+  one small contiguous copy for Z/B/A tails. Reusing the existing Qwen3.5
+  single-copy Triton kernel gives bitwise-identical FP16 results across all
+  bit patterns tested and reads updated inputs on CUDA Graph replay. A paired
+  M5 microbenchmark measures 15.676 to 1.424 microseconds per GDN layer,
+  projecting at most 0.513 ms across 36 layers per verifier round. This is
+  operator evidence only; model-level route, quality and speed are pending.
+- The guarded candidate is limited to SM70, TP4, M5, FP16, contiguous
+  `(5,4096)` QKVZ and `(5,24)` BA output, with no replicated BA projection.
+  `VLLM_SM70_QWEN38_GDN_SPLIT_COPY=1` enables it for measurement. The shared
+  Qwen3.5 helper remains bitwise-equivalent; its targeted GPU suite passes
+  11/11 including M5 and graph-replay mutation.
+- The source-built wheel `dee82211...31c06` hit the M5 split-copy route in
+  actual full-graph capture. Against the same functional public/main path
+  with the flag off, both 8192/513 fixed outputs, three sampled natural
+  conversations, the warmup, all verifier-round counts and accepted counts
+  match exactly. The two fixed-request pure-decode times fell from
+  12.78594/12.77940 to 12.62005/12.62305 seconds (306 rounds each), about
+  0.51-0.54 ms/round. Natural-request times varied upward by 0.08-0.13 s;
+  the small endpoint gain is not sufficient to default-enable this route.
+- A separate W2-only MTP5 screen retains the baseline sorted permute, W13,
+  SwiGLU and unpermute. On real packed checkpoint weights, QPN split-1 W2
+  matches the grouped W2 output bit-for-bit for both 10-overlap and
+  50-distinct expert patterns, including eight changing-input graph replays.
+  Warm W2 drops 24.144 to 15.500 and 26.988 to 18.470 microseconds per
+  layer; the maximum 48-layer warm projection is about 0.41 ms/round. Split
+  2/5/10 changed FP16 outputs and remain rejected. An exact TP4/M5/FP16
+  W2-only production gate is opt-in at
+  `VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5=1`; endpoint quality and speed
+  are pending.
+- The source-built W2 candidate wheel `3707cb83...cfb49` hit both the GDN
+  and sorted W2-only routes in the actual MTP5 FULL graph. Against the GDN-only
+  run, all six request token streams, verifier-round counts and accepted-token
+  counts match exactly. The two fixed 8192/513 pure-decode repeats changed
+  12.62005/12.62305 to 12.63203/12.51705 seconds; the latter is 0.346 ms
+  per 306-round verifier faster, while the former is unchanged within noise.
+  Three natural-request decode times improve by 0.005-0.033 s. Keep the W2
+  route opt-in pending a broader quality and low-noise speed gate; do not
+  extrapolate these sub-millisecond changes to the 20-ms complete-round goal.
+- The W13 resource screen must distinguish TurboMind's first-time autotune
+  candidates from the selected production kernel. An initial NCU sample of
+  a `64x128x32`, split-10 candidate was **not** the chosen W13 path and its
+  counters are not used as production evidence. A subsequent profiler-start
+  capture after tuning sampled the selected `8x128x64`, split-2 path:
+  98 registers/thread, 448 CTAs, 25.2% achieved warp occupancy, 44.6% SM
+  throughput, 20.3% L2 throughput and 0.77 eligible warps/scheduler/cycle.
+  NCU's 57.95-us duration is perturbed; the ordinary graph benchmark measures
+  44.32/48.87 us for overlapping/distinct expert patterns. The achieved
+  occupancy and issue rate suggest a latency/scheduling opportunity, not a
+  proven DRAM bandwidth wall.
+- A separate-process scheduler A/B rejects disabling the existing TurboMind
+  W13 autotune: the default `64x128x32`, split-10 path is about 163.7/163.9
+  us and has different FP16 output hashes from the tuned 44.3/48.9-us path.
+  Previously screened direct W13 split-K variants likewise change FP16
+  outputs. No W13 arithmetic or default policy changed in this follow-up.
+  A future candidate must keep the selected accumulation/rounding boundaries,
+  prove bitwise equality on the real checkpoint and graph replay, then show
+  enough savings to justify a new model startup.

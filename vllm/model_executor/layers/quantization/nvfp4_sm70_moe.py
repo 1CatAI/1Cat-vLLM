@@ -363,6 +363,32 @@ def _use_qwen38_qpn_mtp5_decode(
     )
 
 
+def _use_qwen38_w2_only_mtp5(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Keep sorted MTP5 routing and W13, replacing only the W2 GEMM."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5
+        and sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+        and not getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False)
+        and layer.expert_map is None
+        and int(layer.global_num_experts) == 512
+        and int(layer.local_num_experts) == 512
+        and x.is_cuda
+        and x.shape == (5, 2560)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.is_cuda
+        and topk_ids.shape == (5, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+    )
+
+
 @triton.jit
 def _prepare_single_token_slots_kernel(
     input_ptr,
@@ -1935,25 +1961,39 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["gate_up"],
                 interleaved=interleaved_w13,
             )
-        if raw_scale:
-            sm70_ops.nvfp4_expand_raw_scales_sm70_out(
-                layer.w2_tm_scales,
-                layer.w2_raw_scale_codes,
-                layer.w2_raw_global_scales,
-                False,
+        if _use_qwen38_w2_only_mtp5(layer, x, topk_ids):
+            logger.info_once(
+                "SM70 Qwen3.8 MTP5 sorted W2-only QPN split-1 route enabled."
             )
-        sm70_ops.nvfp4_moe_dense_stage_sm70_out(
-            buffers["sorted_output"],
-            buffers["intermediate"],
-            stage_offsets,
-            stage_expert_ids,
-            layer.w2_strided_ptrs_w,
-            layer.w2_strided_ptrs_s,
-            stage_experts,
-            layer.sm70_nvfp4_w2_k_dim,
-            layer.sm70_nvfp4_w2_n_dim,
-            layer.sm70_nvfp4_group_size,
-        )
+            sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                buffers["permuted_experts_id"],
+                False,
+                1,
+            )
+        else:
+            if raw_scale:
+                sm70_ops.nvfp4_expand_raw_scales_sm70_out(
+                    layer.w2_tm_scales,
+                    layer.w2_raw_scale_codes,
+                    layer.w2_raw_global_scales,
+                    False,
+                )
+            sm70_ops.nvfp4_moe_dense_stage_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w2_k_dim,
+                layer.sm70_nvfp4_w2_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
         if direct_single_token:
             _single_token_weighted_reduce(
                 buffers["sorted_output"], topk_weights, output

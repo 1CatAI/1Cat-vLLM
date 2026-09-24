@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
+    VLLM_SM70_QWEN38_GDN_SPLIT_COPY: bool = False
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -213,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = False
+    VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5: bool = False
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -1848,6 +1850,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1"))
     ),
+    # Copy-only MTP5 Qwen3.8 QKVZ/BA split after the existing projections.
+    # Keep opt-in until matched model-quality and verifier-speed gates pass.
+    "VLLM_SM70_QWEN38_GDN_SPLIT_COPY": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_GDN_SPLIT_COPY", "0"))
+    ),
     "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
     ),
@@ -2100,6 +2107,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quality and acceptance gates are recorded.
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0"))
+    ),
+    # Keep the production MTP5 permute/W13/activation/unpermute route, but
+    # replace only its sorted W2 GEMM with the bitwise-matched QPN split-1 op.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5", "0"))
     ),
     # Exact single-token Qwen3.8 W2 epilogue. Ten expert warps retain the
     # established FP16 route rounding and reduce in top-k order with FP32 FMA.

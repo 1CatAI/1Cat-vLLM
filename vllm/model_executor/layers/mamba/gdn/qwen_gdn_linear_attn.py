@@ -1383,6 +1383,97 @@ def _sm70_compile_graph_slice_dim(
     return tensor.index_select(dim, indices)
 
 
+@triton.jit
+def _sm70_qwen35_gdn_split_kernel(
+    mixed_qkvz,
+    mixed_ba,
+    output,
+    stride_qkvz_row: tl.int64,
+    stride_ba_row: tl.int64,
+    num_rows: tl.constexpr,
+    qkv_size: tl.constexpr,
+    z_size: tl.constexpr,
+    ba_size: tl.constexpr,
+    BLOCK_Z: tl.constexpr,
+    BLOCK_BA: tl.constexpr,
+):
+    row = tl.program_id(0)
+
+    z_cols = tl.arange(0, BLOCK_Z)
+    z_mask = z_cols < z_size
+    z = tl.load(
+        mixed_qkvz + row * stride_qkvz_row + qkv_size + z_cols,
+        mask=z_mask,
+    )
+    tl.store(output + row * z_size + z_cols, z, mask=z_mask)
+
+    ba_cols = tl.arange(0, BLOCK_BA)
+    ba_mask = ba_cols < ba_size
+    b = tl.load(mixed_ba + row * stride_ba_row + ba_cols, mask=ba_mask)
+    a = tl.load(
+        mixed_ba + row * stride_ba_row + ba_size + ba_cols,
+        mask=ba_mask,
+    )
+    z_numel = num_rows * z_size
+    ba_numel = num_rows * ba_size
+    tl.store(output + z_numel + row * ba_size + ba_cols, b, mask=ba_mask)
+    tl.store(
+        output + z_numel + ba_numel + row * ba_size + ba_cols,
+        a,
+        mask=ba_mask,
+    )
+
+
+def _sm70_materialize_qwen35_gdn_splits(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    qkv_size: int,
+    z_size: int,
+    ba_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Materialize non-interleaved Qwen GDN z/b/a with one bitwise copy."""
+    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
+        raise ValueError("mixed_qkvz and mixed_ba must both be rank two")
+    if mixed_qkvz.shape[0] != mixed_ba.shape[0]:
+        raise ValueError("mixed_qkvz and mixed_ba row counts must match")
+    if mixed_qkvz.dtype != mixed_ba.dtype:
+        raise ValueError("mixed_qkvz and mixed_ba dtypes must match")
+    if mixed_qkvz.stride(1) != 1 or mixed_ba.stride(1) != 1:
+        raise ValueError("mixed_qkvz and mixed_ba must be contiguous by row")
+    if mixed_qkvz.shape[1] < qkv_size + z_size:
+        raise ValueError("mixed_qkvz is narrower than qkv_size + z_size")
+    if mixed_ba.shape[1] < 2 * ba_size:
+        raise ValueError("mixed_ba is narrower than 2 * ba_size")
+
+    num_rows = mixed_qkvz.shape[0]
+    z_numel = num_rows * z_size
+    ba_numel = num_rows * ba_size
+    packed = torch.empty(
+        z_numel + 2 * ba_numel,
+        dtype=mixed_qkvz.dtype,
+        device=mixed_qkvz.device,
+    )
+    _sm70_qwen35_gdn_split_kernel[(num_rows,)](
+        mixed_qkvz,
+        mixed_ba,
+        packed,
+        mixed_qkvz.stride(0),
+        mixed_ba.stride(0),
+        num_rows=num_rows,
+        qkv_size=qkv_size,
+        z_size=z_size,
+        ba_size=ba_size,
+        BLOCK_Z=triton.next_power_of_2(z_size),
+        BLOCK_BA=triton.next_power_of_2(ba_size),
+        num_warps=8,
+        num_stages=1,
+    )
+    z = packed[:z_numel].view(num_rows, z_size)
+    b = packed[z_numel : z_numel + ba_numel].view(num_rows, ba_size)
+    a = packed[z_numel + ba_numel :].view(num_rows, ba_size)
+    return z, b, a
+
+
 def _sm70_gdn_rmsnorm_onepass_enabled() -> bool:
     return envs.VLLM_SM70_GDN_RMSNORM_ONEPASS
 
@@ -4241,19 +4332,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
                     mixed_qkv = mixed_qkv.contiguous()
-                z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+                ba_size = ba.shape[-1] // 2
+                use_sm70_qwen38_split_copy = (
+                    envs.VLLM_SM70_QWEN38_GDN_SPLIT_COPY
+                    and current_platform.is_device_capability(70)
+                    and use_sm70_decode_graph_semantics()
+                    and not self.disable_tp_for_ba_proj
+                    and self.tp_size == 4
+                    and self.hidden_size == 2560
+                    and mixed_qkvz.dtype == torch.float16
+                    and mixed_qkvz.shape == (5, 4096)
+                    and mixed_qkvz.is_contiguous()
+                    and ba.dtype == torch.float16
+                    and ba.shape == (5, 24)
+                    and ba.is_contiguous()
+                )
+                if use_sm70_qwen38_split_copy:
+                    z, b, a = _sm70_materialize_qwen35_gdn_splits(
+                        mixed_qkvz, ba, qkv_size, z_size, ba_size
+                    )
+                    _log_runtime_route_once(
+                        "SM70 Qwen3.8 MTP5 non-interleaved GDN split-copy "
+                        "route enabled."
+                    )
+                else:
+                    z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+                    b = ba[..., :ba_size]
+                    a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+                    if self.disable_tp_for_ba_proj and self.tp_size > 1:
+                        ba_chunk = self.num_v_heads // self.tp_size
+                        ba_start = self.tp_rank * ba_chunk
+                        b = b[:, ba_start : ba_start + ba_chunk]
+                        a = a[:, ba_start : ba_start + ba_chunk]
+                    b = b.contiguous()
+                    a = a.contiguous()
                 z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
-                ba_size = ba.shape[-1] // 2
-                b = ba[..., :ba_size]
-                a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
-                if self.disable_tp_for_ba_proj and self.tp_size > 1:
-                    ba_chunk = self.num_v_heads // self.tp_size
-                    ba_start = self.tp_rank * ba_chunk
-                    b = b[:, ba_start : ba_start + ba_chunk]
-                    a = a[:, ba_start : ba_start + ba_chunk]
-                b = b.contiguous()
-                a = a.contiguous()
 
         if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
             70
