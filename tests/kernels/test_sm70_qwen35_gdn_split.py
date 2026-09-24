@@ -12,7 +12,7 @@ from vllm.model_executor.models.qwen3_5 import (
 )
 
 
-@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("num_rows", [1, 5, 8, 32])
 def test_qwen35_gdn_split_materialization_is_bitwise_exact(num_rows: int):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
@@ -53,11 +53,14 @@ def test_qwen35_gdn_split_materialization_is_bitwise_exact(num_rows: int):
     assert torch.equal(actual_a, expected_a)
 
 
-def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
+@pytest.mark.parametrize("num_rows", [5, 8])
+def test_qwen35_gdn_split_graph_replay_reads_current_projection_values(
+    num_rows: int,
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Qwen3.5 GDN split kernel")
 
-    num_rows, qkv_size, z_size, ba_size = 8, 2560, 1536, 12
+    qkv_size, z_size, ba_size = 2560, 1536, 12
     mixed_qkvz = torch.randn(
         (num_rows, qkv_size + z_size), dtype=torch.float16, device="cuda"
     )

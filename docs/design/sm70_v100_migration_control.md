@@ -46930,3 +46930,28 @@ has launched no full model. Details and artifacts are in
   readiness. It loads all 12 AOT artifacts without fallback and passes a chat
   request through Studio's authenticated public-API proxy. Existing model,
   topology, context, batch limits, and speculative settings are preserved.
+
+## 2026-09-24 Qwen3.8 MTP5 verifier small-kernel follow-up
+
+- Base `d49e32b3587d4d34ffccb0ffd376e63974b06c88`, TP4 on V100 GPU0-3,
+  Torch 2.10.0+cu128, checkpoint `RadixArk/Qwen3.8-Flash-Next-NVFP4`, FP16
+  execution, PLE on disk, MTP4 (five target tokens), fixed 8192/513 decode.
+  The candidate is isolated and opt-in; no claim is made about the public
+  default or the separate draft #684 baseline.
+- The checkpoint is `qwen4_exp_text`, with 36 non-interleaved GDN layers and
+  12 QSA layers. An interleaved Qwen3Next layout-copy screen was rejected:
+  although its microbenchmark saved 2.64 ms per 36 layers, two matched model
+  launches showed no route hit and no reproducible speed gain. Its source
+  change was reverted. Do not revisit that route for this checkpoint.
+- The actual non-interleaved MTP5 path uses two `index_select` operations and
+  one small contiguous copy for Z/B/A tails. Reusing the existing Qwen3.5
+  single-copy Triton kernel gives bitwise-identical FP16 results across all
+  bit patterns tested and reads updated inputs on CUDA Graph replay. A paired
+  M5 microbenchmark measures 15.676 to 1.424 microseconds per GDN layer,
+  projecting at most 0.513 ms across 36 layers per verifier round. This is
+  operator evidence only; model-level route, quality and speed are pending.
+- The guarded candidate is limited to SM70, TP4, M5, FP16, contiguous
+  `(5,4096)` QKVZ and `(5,24)` BA output, with no replicated BA projection.
+  `VLLM_SM70_QWEN38_GDN_SPLIT_COPY=1` enables it for measurement. The shared
+  Qwen3.5 helper remains bitwise-equivalent; its targeted GPU suite passes
+  11/11 including M5 and graph-replay mutation.

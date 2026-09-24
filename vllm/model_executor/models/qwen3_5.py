@@ -50,6 +50,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _sm70_compile_graph_slice_dim,
     _sm70_dump_gdn_projection_tensor,
     _sm70_gdn_qpn8_ba_dispatch_eligible,
+    _sm70_materialize_qwen35_gdn_splits,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -77,7 +78,6 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
-from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
     _encode_layer_name,
 )
@@ -119,97 +119,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-
-@triton.jit
-def _sm70_qwen35_gdn_split_kernel(
-    mixed_qkvz,
-    mixed_ba,
-    output,
-    stride_qkvz_row: tl.int64,
-    stride_ba_row: tl.int64,
-    num_rows: tl.constexpr,
-    qkv_size: tl.constexpr,
-    z_size: tl.constexpr,
-    ba_size: tl.constexpr,
-    BLOCK_Z: tl.constexpr,
-    BLOCK_BA: tl.constexpr,
-):
-    row = tl.program_id(0)
-
-    z_cols = tl.arange(0, BLOCK_Z)
-    z_mask = z_cols < z_size
-    z = tl.load(
-        mixed_qkvz + row * stride_qkvz_row + qkv_size + z_cols,
-        mask=z_mask,
-    )
-    tl.store(output + row * z_size + z_cols, z, mask=z_mask)
-
-    ba_cols = tl.arange(0, BLOCK_BA)
-    ba_mask = ba_cols < ba_size
-    b = tl.load(mixed_ba + row * stride_ba_row + ba_cols, mask=ba_mask)
-    a = tl.load(
-        mixed_ba + row * stride_ba_row + ba_size + ba_cols,
-        mask=ba_mask,
-    )
-    z_numel = num_rows * z_size
-    ba_numel = num_rows * ba_size
-    tl.store(output + z_numel + row * ba_size + ba_cols, b, mask=ba_mask)
-    tl.store(
-        output + z_numel + ba_numel + row * ba_size + ba_cols,
-        a,
-        mask=ba_mask,
-    )
-
-
-def _sm70_materialize_qwen35_gdn_splits(
-    mixed_qkvz: torch.Tensor,
-    mixed_ba: torch.Tensor,
-    qkv_size: int,
-    z_size: int,
-    ba_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Materialize Qwen3.5 z/b/a tails with one bitwise copy kernel."""
-    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
-        raise ValueError("mixed_qkvz and mixed_ba must both be rank two")
-    if mixed_qkvz.shape[0] != mixed_ba.shape[0]:
-        raise ValueError("mixed_qkvz and mixed_ba row counts must match")
-    if mixed_qkvz.dtype != mixed_ba.dtype:
-        raise ValueError("mixed_qkvz and mixed_ba dtypes must match")
-    if mixed_qkvz.stride(1) != 1 or mixed_ba.stride(1) != 1:
-        raise ValueError("mixed_qkvz and mixed_ba must be contiguous by row")
-    if mixed_qkvz.shape[1] < qkv_size + z_size:
-        raise ValueError("mixed_qkvz is narrower than qkv_size + z_size")
-    if mixed_ba.shape[1] < 2 * ba_size:
-        raise ValueError("mixed_ba is narrower than 2 * ba_size")
-
-    num_rows = mixed_qkvz.shape[0]
-    z_numel = num_rows * z_size
-    ba_numel = num_rows * ba_size
-    packed = torch.empty(
-        z_numel + 2 * ba_numel,
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    _sm70_qwen35_gdn_split_kernel[(num_rows,)](
-        mixed_qkvz,
-        mixed_ba,
-        packed,
-        mixed_qkvz.stride(0),
-        mixed_ba.stride(0),
-        num_rows=num_rows,
-        qkv_size=qkv_size,
-        z_size=z_size,
-        ba_size=ba_size,
-        BLOCK_Z=triton.next_power_of_2(z_size),
-        BLOCK_BA=triton.next_power_of_2(ba_size),
-        num_warps=8,
-        num_stages=1,
-    )
-    z = packed[:z_numel].view(num_rows, z_size)
-    b = packed[z_numel : z_numel + ba_numel].view(num_rows, ba_size)
-    a = packed[z_numel + ba_numel :].view(num_rows, ba_size)
-    return z, b, a
 
 
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
