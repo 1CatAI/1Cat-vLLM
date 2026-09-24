@@ -13,7 +13,9 @@ and FP32 accumulation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import statistics
 from collections.abc import Callable
 from pathlib import Path
@@ -144,6 +146,8 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--screen-w13-policy", action="store_true")
+    parser.add_argument("--profile-selected-w13", action="store_true")
     args = parser.parse_args()
 
     if args.library is not None:
@@ -250,6 +254,8 @@ def main() -> None:
         "overlap_10_experts": torch.arange(TOP_K, device="cuda").repeat(TOKENS),
         "distinct_50_experts": torch.arange(ROUTES, device="cuda"),
     }
+    if args.screen_w13_policy:
+        result["w13_tune_enabled"] = os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1")
     for pattern_name, token_order_ids_i64 in patterns.items():
         token_order_ids = token_order_ids_i64.to(torch.int32).contiguous()
         sort_index = torch.argsort(token_order_ids_i64, stable=True)
@@ -284,6 +290,20 @@ def main() -> None:
             )
 
         baseline_stage13()
+        if args.profile_selected_w13:
+            torch.cuda.cudart().cudaProfilerStart()
+            baseline_stage13()
+            torch.cuda.cudart().cudaProfilerStop()
+            return
+        if args.screen_w13_policy:
+            elapsed_us = graph_us(baseline_stage13)
+            result["patterns"][pattern_name] = {
+                "w13_us": elapsed_us,
+                "w13_sha256": hashlib.sha256(
+                    baseline_w13.cpu().numpy().tobytes()
+                ).hexdigest(),
+            }
+            continue
         torch.ops._C.silu_and_mul(baseline_intermediate, baseline_w13)
 
         def baseline_stage2() -> None:

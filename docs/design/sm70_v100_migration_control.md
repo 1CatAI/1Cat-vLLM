@@ -46973,3 +46973,31 @@ has launched no full model. Details and artifacts are in
   W2-only production gate is opt-in at
   `VLLM_SM70_NVFP4_QWEN38_MOE_W2_ONLY_MTP5=1`; endpoint quality and speed
   are pending.
+- The source-built W2 candidate wheel `3707cb83...cfb49` hit both the GDN
+  and sorted W2-only routes in the actual MTP5 FULL graph. Against the GDN-only
+  run, all six request token streams, verifier-round counts and accepted-token
+  counts match exactly. The two fixed 8192/513 pure-decode repeats changed
+  12.62005/12.62305 to 12.63203/12.51705 seconds; the latter is 0.346 ms
+  per 306-round verifier faster, while the former is unchanged within noise.
+  Three natural-request decode times improve by 0.005-0.033 s. Keep the W2
+  route opt-in pending a broader quality and low-noise speed gate; do not
+  extrapolate these sub-millisecond changes to the 20-ms complete-round goal.
+- The W13 resource screen must distinguish TurboMind's first-time autotune
+  candidates from the selected production kernel. An initial NCU sample of
+  a `64x128x32`, split-10 candidate was **not** the chosen W13 path and its
+  counters are not used as production evidence. A subsequent profiler-start
+  capture after tuning sampled the selected `8x128x64`, split-2 path:
+  98 registers/thread, 448 CTAs, 25.2% achieved warp occupancy, 44.6% SM
+  throughput, 20.3% L2 throughput and 0.77 eligible warps/scheduler/cycle.
+  NCU's 57.95-us duration is perturbed; the ordinary graph benchmark measures
+  44.32/48.87 us for overlapping/distinct expert patterns. The achieved
+  occupancy and issue rate suggest a latency/scheduling opportunity, not a
+  proven DRAM bandwidth wall.
+- A separate-process scheduler A/B rejects disabling the existing TurboMind
+  W13 autotune: the default `64x128x32`, split-10 path is about 163.7/163.9
+  us and has different FP16 output hashes from the tuned 44.3/48.9-us path.
+  Previously screened direct W13 split-K variants likewise change FP16
+  outputs. No W13 arithmetic or default policy changed in this follow-up.
+  A future candidate must keep the selected accumulation/rounding boundaries,
+  prove bitwise equality on the real checkpoint and graph replay, then show
+  enough savings to justify a new model startup.
