@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
+    VLLM_SM70_MTP4_FUSED_GDN_METADATA: bool = False
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
@@ -2241,6 +2243,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate until the fixed-trajectory and mixed-batch Graph checks pass.
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
+    ),
+    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
+    ),
+    # Pure MTP4 graph batches can construct all GDN groups' state rows in one
+    # launch. Keep this opt-in while the fixed-prompt verifier-round difference
+    # from the unchanged path is audited; mixed/prefill batches still fall back.
+    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "0"))
     ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.

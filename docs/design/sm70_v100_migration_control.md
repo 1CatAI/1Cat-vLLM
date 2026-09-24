@@ -47069,3 +47069,55 @@ has launched no full model. Details and artifacts are in
   and acceptance rate. The 20-ms complete-round objective is not achieved by
   this change; next decisions should prioritize target-graph/draft cost rather
   than repeatedly loading the model for sub-0.1-ms host candidates.
+
+## 2026-09-24 Qwen3.8 MTP4 shared and fused GDN metadata follow-up
+
+- The preceding 3.248-ms draft-combine-to-next-PLE trace showed 102 CUDA
+  runtime calls in one representative rank-0 interval, including 57 kernel
+  launches and 39 asynchronous copies. Three GDN builders independently
+  classified the same request batch. MTP4 on SM70 now computes their common
+  classification, query offsets, and token indices once. This default path is
+  controlled by `VLLM_SM70_MTP4_SHARED_GDN_METADATA=1`; setting it to `0`
+  restores the old per-builder path. No model arithmetic or precision changed.
+- A further opt-in, `VLLM_SM70_MTP4_FUSED_GDN_METADATA=1`, reuses the grouped
+  pointer-table kernel to populate all GDN cache groups and shared graph
+  buffers in one launch for pure speculative FULL-graph batches. The MTP4
+  align-mode state column is selected from sequence length and Mamba block
+  size, matching `mamba_get_block_table_tensor`; DFlash2 retains its separate
+  post-precopy start-index contract. Mixed/prefill or unsupported batches
+  fall back. The fusion flag defaults to `0` pending the verifier-trajectory
+  audit below.
+- At the three-group, MTP4 width-5 V100 micro shape, pure-single-request
+  metadata submission was 1.757 ms legacy, 1.434 ms shared, and 0.120 ms
+  fused (full GPU completion: 1.776, 1.454, 0.136 ms respectively).
+  Three-request pure-spec behaved similarly. Mixed three-request metadata
+  submission was 2.515 ms legacy versus 1.562 ms shared; fusion is not used
+  for mixed batches. Twelve targeted tests cover shared pure/mixed metadata,
+  fused MTP4 query lengths 2-5 in both `none` and `align` modes, changing
+  sequence lengths/accepted counts, and existing DFlash2 fused behavior. All
+  compared scalar and tensor metadata fields match the original builders.
+- Three single-start TP4 V100 full-model runs used identical 8,192-token
+  fixed input, 513 greedy output tokens, MTP4, FP16 activation/KV, disk PLE
+  without prefault, and the same graph configuration. On the same committed
+  source, the unchanged GDN path and shared-only path each used **306**
+  verification rounds and generated identical tokens for both fixed prompts
+  and all three natural prompts. The second fixed request's pure decode fell
+  from **10.756 to 10.032 s** (47.60 to 51.04 emitted tok/s, +7.2%); the first
+  repeat showed the same direction. This is a matched endpoint measurement,
+  not a per-kernel attribution. The earlier pre-commit record used 307 rounds,
+  so it is not substituted for this same-source control.
+- The opt-in fused run also produced identical output tokens, but required
+  **308** fixed-prompt verification rounds versus the same-source control's
+  306. Its low-overhead trace reduced the target interval from the preceding
+  3.248-ms reference to **0.896 ms** mean (p50 0.857 ms) across 307 closed
+  rounds; the captured complete-round mean was 34.529 ms. Because the draft
+  acceptance trajectory differs, this is a promising speed experiment, **not
+  the default quality-approved route**. Do not infer arithmetic parity from
+  matching final tokens alone or compare whole-round means as exact A/B
+  throughput. Next work should isolate graph-buffer aliasing/metadata reuse
+  effects before enabling the fusion default. Raw local evidence is in
+  `.artifacts/mtp4_fused_gdn_probe.json`,
+  `.artifacts/mtp4_fused_gdn_graph_trace.sqlite`,
+  `.artifacts/mtp4_shared_only_probe.json`, and
+  `.artifacts/mtp4_current_source_old_gdn_probe.json`. All GPU test processes
+  exited.

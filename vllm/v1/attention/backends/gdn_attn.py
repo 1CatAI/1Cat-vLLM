@@ -178,6 +178,7 @@ def _dflash2_gdn_group_metadata_kernel(
     block_table_strides,
     state_start_indices,
     req_index_mapping,
+    seq_lens,
     spec_query_start_loc_src,
     num_accepted_src,
     state_selector_src,
@@ -191,6 +192,8 @@ def _dflash2_gdn_group_metadata_kernel(
     PAD_ID: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_STATE_START: tl.constexpr,
+    USE_SEQ_LEN_START: tl.constexpr,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
 ):
     """Write every GDN group's state IDs and the shared graph metadata."""
     group_id = tl.program_id(0)
@@ -218,6 +221,10 @@ def _dflash2_gdn_group_metadata_kernel(
         )
         state_columns = columns + state_starts
         live_state_mask &= (state_starts >= 0) & (state_columns < block_table_stride)
+    if USE_SEQ_LEN_START:
+        seq_len = tl.load(seq_lens + rows, mask=live_state_mask, other=0)
+        state_columns = columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
+        live_state_mask &= state_columns < block_table_stride
     state_ids = tl.load(
         block_table + rows * block_table_stride + state_columns,
         mask=live_state_mask,
@@ -860,6 +867,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and (
                 envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
                 or envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
+                or (
+                    envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+                    and envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+                    and self.vllm_config.speculative_config is not None
+                    and self.vllm_config.speculative_config.method == "mtp"
+                    and self.vllm_config.speculative_config.num_speculative_tokens == 4
+                    and device.type == "cuda"
+                )
             )
             and _dflash_ddtree_gdn_shared_common_enabled()
         ):
@@ -2232,6 +2247,8 @@ def prepare_dflash2_gdn_group_metadata(
     descriptor: DFlash2GDNGroupDescriptor | None,
     state_start_indices: torch.Tensor | None = None,
     req_index_mapping: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    enable_mtp4: bool = False,
 ) -> (
     tuple[
         dict[int, GDNAttentionMetadata],
@@ -2239,16 +2256,20 @@ def prepare_dflash2_gdn_group_metadata(
     ]
     | None
 ):
-    """Prepare all pure-MRV2 DFlash2 GDN graph metadata in one launch.
+    """Prepare pure-speculative GDN graph metadata for all groups in one launch.
 
     ``mamba_cache_mode=none`` reads the first speculative state columns.
     ``mamba_cache_mode=align`` supplies the authoritative, post-precopy state
-    column for each live request. DFlash2 batches keep live speculative rows at
+    column for each live request. MTP4 uses the legacy sequence-length-derived
+    align column instead. Both paths keep live speculative rows at
     the front and CUDA-graph padding at the back, so one pointer-table kernel can
     perform the same state selection and tail fill without ten independent
     gather/copy pipelines.
     """
-    if not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
+    if enable_mtp4:
+        if not envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA:
+            return None
+    elif not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
         return None
     if not builders_by_group or num_actual_tokens <= 0:
         return None
@@ -2258,6 +2279,11 @@ def prepare_dflash2_gdn_group_metadata(
         return None
 
     use_state_start = state_start_indices is not None
+    use_seq_len_start = seq_lens is not None
+    if use_seq_len_start and not enable_mtp4:
+        return None
+    if use_state_start and use_seq_len_start:
+        return None
     if use_state_start != (req_index_mapping is not None):
         return None
     if use_state_start:
@@ -2270,6 +2296,14 @@ def prepare_dflash2_gdn_group_metadata(
             or req_index_mapping.device != num_accepted_tokens.device
             or req_index_mapping.dtype != torch.int32
             or req_index_mapping.ndim != 1
+        ):
+            return None
+    if use_seq_len_start:
+        assert seq_lens is not None
+        if (
+            seq_lens.device != num_accepted_tokens.device
+            or seq_lens.dtype != torch.int32
+            or seq_lens.ndim != 1
         ):
             return None
 
@@ -2308,7 +2342,16 @@ def prepare_dflash2_gdn_group_metadata(
     mamba_cache_mode = first_builder.vllm_config.cache_config.mamba_cache_mode
     if mamba_cache_mode not in ("none", "align"):
         return None
-    if use_state_start != (mamba_cache_mode == "align"):
+    if enable_mtp4:
+        if use_state_start or use_seq_len_start != (mamba_cache_mode == "align"):
+            return None
+    elif use_state_start != (mamba_cache_mode == "align"):
+        return None
+    if (
+        use_seq_len_start
+        and seq_lens is not None
+        and seq_lens.numel() < num_spec_decodes
+    ):
         return None
     width = first_builder.num_spec_state_tokens + 1
     common_buffers = first_builder._ddtree_fast_common_buffers
@@ -2385,6 +2428,8 @@ def prepare_dflash2_gdn_group_metadata(
         tuple(state.data_ptr() for state in output_states),
         tuple(table.stride(0) for table in input_tables),
         use_state_start,
+        use_seq_len_start,
+        first_builder.kv_cache_spec.block_size,
         common_buffers.spec_sequence_masks.data_ptr(),
         common_buffers.spec_token_indx.data_ptr(),
         common_buffers.non_spec_token_indx.data_ptr(),
@@ -2421,6 +2466,7 @@ def prepare_dflash2_gdn_group_metadata(
         descriptor.block_table_strides,
         num_accepted_tokens if state_start_indices is None else state_start_indices,
         num_accepted_tokens if req_index_mapping is None else req_index_mapping,
+        num_accepted_tokens if seq_lens is None else seq_lens,
         query_start_loc,
         num_accepted_tokens,
         num_accepted_tokens,
@@ -2434,6 +2480,8 @@ def prepare_dflash2_gdn_group_metadata(
         PAD_ID=PAD_SLOT_ID,
         BLOCK=block,
         USE_STATE_START=use_state_start,
+        USE_SEQ_LEN_START=use_seq_len_start,
+        MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
         num_warps=1,
     )
     common_buffers.initialized_key = (
@@ -2507,6 +2555,17 @@ def prepare_dflash2_gdn_group_metadata(
                     width,
                     dtype=torch.long,
                     device=source_table.device,
+                )
+                expected_state = torch.gather(source_table, 1, columns)
+            elif use_seq_len_start:
+                assert seq_lens is not None
+                starts = torch.clamp(
+                    (seq_lens[:num_spec_decodes] - 1)
+                    // first_builder.kv_cache_spec.block_size,
+                    min=0,
+                ).to(torch.long)
+                columns = starts[:, None] + torch.arange(
+                    width, dtype=torch.long, device=source_table.device
                 )
                 expected_state = torch.gather(source_table, 1, columns)
             else:
