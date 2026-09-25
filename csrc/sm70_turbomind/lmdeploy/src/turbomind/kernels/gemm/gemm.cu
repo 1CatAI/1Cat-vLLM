@@ -301,6 +301,19 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Mxfp4MoeGroupedM8FastTarget(
 std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
     const GemmDesc& desc) {
   const std::string desc_str = to_string(desc);
+  if (desc.m > 32 && desc.m <= 64 && desc.num == 1 && desc.k == 5120 &&
+      (desc.n == 4096 || desc.n == 3584) &&
+      desc_str.starts_with("sm70_f16_e4m3k128_f16_tnt_")) {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 32, 256, 32, 5,
+                                desc.n == 4096 ? 3 : 0, true,
+                                "sm70_fp8_pscale_batch"};
+  }
+  if (desc.m > 32 && desc.m <= 64 && desc.num == 1 && desc.n == 5120 &&
+      desc.k == 1536 &&
+      desc_str.starts_with("sm70_f16_e4m3k128_f16_tnt_")) {
+    return Sm70AwqTp2FastTarget{desc.n, desc.k, 16, 256, 32, 3, 3, true,
+                                "sm70_fp8_pscale_batch"};
+  }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {
     return Sm70AwqTp2FastTarget{

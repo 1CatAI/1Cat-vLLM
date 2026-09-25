@@ -356,6 +356,7 @@ if TYPE_CHECKING:
     VLLM_MOE_DP_CHUNK_SIZE: int = 256
     VLLM_ENABLE_MOE_DP_CHUNK: bool = False
     VLLM_SM70_FLASH_ATTN_V100: bool = True
+    VLLM_SM70_BATCH_GEMM_LAYOUTS: bool = False
     VLLM_SM70_PROFILE_TRACE: bool = False
     VLLM_SM70_DECODE_EVENT_TRACE: bool = False
     VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS: float = 1.0
@@ -2777,6 +2778,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # requested.
     "VLLM_SM70_FLASH_ATTN_V100": lambda: bool(
         int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))
+    ),
+    "VLLM_SM70_BATCH_GEMM_LAYOUTS": lambda: bool(
+        int(os.getenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0"))
     ),
     "VLLM_SM70_PROFILE_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))

@@ -48,6 +48,21 @@ class Fp8PrescaledM1KernelImpl final : public KernelImpl<Gemm> {
   }
 };
 
+template <class Gemm>
+class Fp8PrescaledBatchKernelImpl final : public KernelImpl<Gemm> {
+ public:
+  Fp8PrescaledBatchKernelImpl() {
+    this->info_.name += "_sm70_fp8_pscale_batch";
+  }
+
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    return desc.m > 32 && desc.m <= 64 && desc.num == 1 &&
+           ((desc.n == 5120 && desc.k == 1536) ||
+            ((desc.n == 4096 || desc.n == 3584) && desc.k == 5120)) &&
+           KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
 }  // namespace
 
 void Registry::sm70_884_8() {
@@ -74,6 +89,11 @@ void Registry::sm70_884_8() {
 
         using Fp8PrescaledM1 = CP::Type<8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 128>;
         Add(std::make_unique<Fp8PrescaledM1KernelImpl<typename Fp8PrescaledM1::Kernel>>());
+
+        using Fp8PrescaledBatch32 = CP::Type<32, 256, 32, 1, 4, 1, D, S, 2, true, 1, 128, 32, 128>;
+        using Fp8PrescaledBatch16 = CP::Type<16, 256, 32, 1, 4, 1, D, S, 2, true, 1, 128>;
+        Add(std::make_unique<Fp8PrescaledBatchKernelImpl<typename Fp8PrescaledBatch32::Kernel>>());
+        Add(std::make_unique<Fp8PrescaledBatchKernelImpl<typename Fp8PrescaledBatch16::Kernel>>());
     // clang-format on
   }
 }

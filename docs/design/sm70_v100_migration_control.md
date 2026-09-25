@@ -2,6 +2,335 @@
 
 Date: 2026-05-30
 
+## TP4 DFlash2 batch GEMM supply experiment, 2026-09-24
+
+For Qwen3.8-27B-NVFP4 at C8/q8, the channel-FP8 TurboMind output
+projection still has low SM70 occupancy. A reversible load-time 256x shift of
+its existing FP16 scale removes the E4M3 exponent-bias multiply inside the
+packed-weight transform without expanding the weights. Only M=33..64 and
+fully packed K1536/N5120 or K5120/N4096,3584 projections are eligible;
+M<=32 remains on the QPN8 fast path, and non-reversible scales fall back.
+`VLLM_SM70_FP8_BATCH_PRESCALED=1` opts in. It is off by default.
+
+On real TP4 weights, the M64 output-projection CUDA Graph operator time falls
+from 73.66 to 31.76 us, with identical fixed-input output. With the same
+M16/N256/K32 split-3 tile forced in both transforms, the main GEMM alone
+falls from 41.22 to 34.50 us; registers/thread remain 146/148 and achieved
+occupancy 17.40/17.48%. Tensor-pipe activity is about 29% and DRAM throughput
+25–28% of sustained peak, so neither compute nor HBM is saturated on this
+sample. Narrow N128 tiles reduce registers to 110–128 but increase operator
+time to 40.9–41.7 us; they were discarded. An FP4 K16 tile candidate also
+failed the complete-service gate and was discarded.
+
+The uninstrumented same-source ON/OFF C8 pure-decode median is
+516.77/489.59 tok/s across three independent eight-request waves (+5.6%).
+For 48 rolling requests, ON/OFF decode capacity is 338.16/343.12 tok/s and
+complete output throughput is 270.77/283.93 tok/s. The rolling result does
+not support default-on. One matched C1/C4 run gives virtually identical
+ON/OFF results, as expected from the unchanged QPN8 route. Seven focused
+SM70 CUDA Graph/replay checks pass. The saved single-wave PRO C8 pure decode
+is 820.84 tok/s; no fresh PRO comparison or 35B-A3B AWQ/FP8 speed gate was
+available for this experiment. The opt-in candidate is retained for further
+mixed-prefill and GEMM scheduling work, not promoted as an overall C8 speed
+win.
+
+## PRO 6000 C1/C4/C8 prefix-cache and verifier comparison, 2026-09-24
+
+The resumed PRO 6000 machine retained its original C8 target-forward profiler
+trace. We reran matched 2,048-input/256-output DFlash2 q7 probabilistic
+requests, with 1,792 shared prompt tokens, temperature 0.7, top-p 0.8,
+top-k 20, and prefix caching explicitly enabled on both services. V100 uses
+TP4/FP16/E4M3 KV/Flash-V100; PRO uses TP1/BF16/FlashInfer. The checkpoint
+and dataset hashes match across hosts. The research V100 source and extensions
+still need the clean-package and output-quality acceptance gates described
+below. Request-level decode capacity excludes each request's TTFT but includes
+new-request prefill pauses:
+
+| In flight / total | V100 decode tok/s | PRO decode tok/s | V100 / PRO | V100 / PRO draft acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| C1 / 16 | 229.71 | 210.42 | 1.092 | 55.38% / 55.84% |
+| C4 / 32 | 265.56 | 519.82 | 0.511 | 59.54% / 53.80% |
+| C8 / 48 | 277.81 | 711.77 | 0.390 | 56.17% / 50.83% |
+
+Median per-request mean ITL (ms) is V100 4.248/14.286/29.028 and PRO
+4.618/7.504/10.866 at C1/C4/C8. From C1 to C8, V100 ITL inflates 6.83x
+and PRO 2.35x; aggregate V100 decode capacity rises only 21% versus PRO's
+238%. V100 is slightly faster at C1. The ITL is the median of each request's
+mean inter-token latency, not a median over individual token gaps.
+
+All three 2K runs had zero prefix-cache hits despite the shared 1,792-token prefix.
+The hybrid cache aligns an attention page to 1,648 tokens; DFlash/EAGLE
+recomputes the last matched page, leaving no reusable complete page at 2K.
+A separate 4K-input/3,504-shared-prefix C8 single-wave probe confirmed
+nonzero hits on both systems; its pure decode window was 253.78 versus
+626.53 tok/s with 32.82% versus 33.82% acceptance. That prompt changed the
+acceptance profile, so it is only a cache-path diagnostic, not a substitute
+for the matched 2K production baseline. Cache hit counters differed between
+the systems and should not be treated as an equal cache-hit ratio.
+
+An instrumented 2K single wave filters only complete eight-row-per-request
+verifier steps. CUDA-event medians (ms) are:
+
+| Full-q8 stage | V100 / PRO C1 | V100 / PRO C4 | V100 / PRO C8 |
+| --- | ---: | ---: | ---: |
+| Target forward | 13.317 / 21.101 | 32.741 / 24.010 | 56.995 / 28.029 |
+| Sampling before draft | 2.763 / 1.142 | 5.359 / 1.271 | 7.552 / 1.346 |
+| Draft | 4.601 / 4.038 | 9.928 / 4.219 | 14.543 / 4.595 |
+| Full GPU step | 20.739 / 26.302 | 48.227 / 29.495 | 79.288 / 33.949 |
+
+V100 forward grows 24.254 ms from C4 to C8, versus 4.019 ms on PRO; it
+accounts for about 78% of V100's 31.061-ms full-step increase.
+Across C1 to C8, V100 forward grows 43.678 ms (4.28x) versus PRO's 6.928
+ms (1.33x), whereas full GPU steps grow 58.549 versus 7.647 ms. The PRO C8
+target-forward trace contains 62 full steps. Within its target annotation,
+mean kernel busy time is 24.69 ms: FP4 CUTLASS GEMM 8.00, FP8 CUTLASS GEMM
+7.72, CUDA GDN 5.83, target attention 0.81 and FP4 activation quantization
+0.44 ms. These kernel-busy categories do not sum to the independently measured
+CUDA-event forward wall time. The pinned vLLM 0.29.0 implementation pre-packs
+NVFP4 weights/scales at load and uses compressed-weight CUTLASS FP4 GEMM;
+scaled FP8 GEMM similarly consumes FP8 weights without a separate full-weight
+FP16 materialization every step. PRO still performs scale/activation work.
+
+V100 already executes TurboMind batched W4A16 GEMM. Its compressed-weight
+channel-FP8 QPN8 route admits at most M32; C8/q8 is M64 and falls through
+to repeated full-weight FP16 dequantization and GEMM. NVFP4 QPN2 also changes
+at M32 to the TurboMind batch route. The PRO SM120 native FP4/FP8 Tensor Core
+and TP1 path are structurally different from V100 SM70 FP16 Tensor Core plus
+TP4 reductions. A new same-shape Nsight Systems CUDA Graph node trace captures
+six interior full C8/q8 steps on all four V100 ranks without new prefill. On
+rank 0 the mean per-step kernel busy time is 77.675 ms, comprising 16.250 ms
+TurboMind NVFP4 gate/down GEMM, **12.238 ms repeated full-weight channel-FP8
+dequantization**, 4.816 ms GDN update, 4.959 ms TP reduction, 3.436 ms
+target grouped attention, 2.259 ms FP4 scale restoration, and 6.701 ms
+draft paged attention. The remaining 27.015 ms includes FP16 GEMM, sampling
+and other target/draft kernels; categories are kernel busy time rather than a
+closed target-forward wall decomposition. The previous C16 trace's 12.291-ms
+QPN8 dequantization is a separate shape. Its similarity to C8 is expected
+because full-weight reconstruction is dominated by weight size once M>32.
+
+A second six-step, no-prefill C4/q8 graph-node trace on rank 0 records
+47.324 ms total kernel busy time per step. Its NVFP4 QPN2 compressed-weight
+gate/down GEMMs are 8.427/4.082 ms; channel-FP8 QPN8 compressed-weight GEMM
+is 9.993 ms; GDN update, TP reduction, grouped target attention and draft
+paged attention are 3.469, 3.196, 1.951 and 3.618 ms. C4 has **no
+full-weight dequantization**. At C8 the NVFP4 path changes to TurboMind
+W4A16 and its gate/down GEMM body rises from C4's 12.509 to 16.250 ms,
+plus 2.259 ms scale restoration. GDN, TP reduction and target attention rise
+to 4.816, 4.959 and 3.436 ms. The FP8 route changes at M64 from packed
+QPN8 GEMM to full-weight dequantization plus FP16 GEMM; the directly measured
+12.238-ms dequantization is only part of its C8 cost. The FP16 GEMMs are not
+isolated from the "other" trace category, so C4 packed GEMM versus C8
+dequantization alone is not a closed route comparison. Two matching Nsight
+captures locate the C4-to-C8 route transition without assigning all of the
+target-forward growth to one kernel.
+
+A corrected C1/q8 graph-node trace uses the same six interior full steps,
+rank 0 and no-prefill filter. Its kernel busy time is 19.265 ms/step: NVFP4
+QPN2 gate/down 2.852/1.674 ms, packed channel-FP8 QPN8 GEMM 3.956 ms, GDN
+update 0.963 ms, TP reduction 1.263 ms, target grouped attention 0.633 ms,
+draft paged attention 0.853 ms and other kernels 7.071 ms. Between C1/M8 and
+C4/M32, the two compressed-weight GEMM families rise by 7.983 and 6.037 ms,
+respectively. Their combined 14.020-ms kernel-busy increase is the largest
+identified part of the 19.424-ms target-forward CUDA-event increase. GDN,
+TP reduction and target attention rise by 2.506, 1.933 and 1.318 ms. These
+different timing scopes cannot be subtracted into a closed forward breakdown.
+The C1-to-C4 slowdown therefore starts inside batch-scaling packed GEMM and
+TP/GDN work; the repeated full-weight FP8 materialization appears only after
+the M32-to-M64 route change. PRO's C1-to-C8 target forward rises only 6.928
+ms, but only its saved C8 trace has per-kernel attribution. Its compressed
+CUTLASS GEMMs, SM120 native low-precision Tensor Cores and TP1/no all-reduce
+explain the direction of the smaller growth; assigning an exact C1-to-C8
+PRO kernel delta would require a matching C1 trace. The next V100 candidate
+should address M8–M64 batched FP4/FP8 GEMM and avoid per-step full-weight
+materialization across quantizations, then retest C1/C4/C8 output quality and
+unprofiled decode capacity. A source-route hypothesis is not an achieved
+speedup or clean-build baseline.
+
+## DFlash2 27B concurrent decode investigation, 2026-09-23
+
+The matched 2,048-input/256-output rolling workload uses the same target and
+draft checkpoints, prompt set, q7 probabilistic sampler (temperature 0.7,
+top-p 0.8, top-k 20), 262,144 service capacity, 8,192-token scheduler budget,
+and 16 sequence slots on both machines. The V100 service uses four
+V100-SXM2-32GB GPUs, FP16 execution, E4M3 KV, TurboMind and Flash-V100;
+RTX PRO 6000 uses one GPU, native BF16 and FlashInfer. These are deployment
+comparisons, not a same-architecture kernel comparison. Both runs have zero
+prefix-cache hits. The V100 source tree matches main `d49e32b358`, but its
+native extensions predate the merge; it is a research baseline until rebuilt
+from the owned source. The DFlash2 q1 tail CUDA Graph option is disabled because
+the current full-capture startup stalls with it enabled. Other CUDA Graphs run.
+
+| Requests in flight / total | V100 decode capacity | PRO 6000 decode capacity | V100 full-q8 target verify / forward / draft |
+| --- | ---: | ---: | ---: |
+| C1 / 16 | 194.0 tok/s | 177.8 tok/s | 16.108 / 13.174 / 4.231 ms |
+| C4 / 32 | 204.1 tok/s | 452.3 tok/s | 45.096 / 39.699 / 9.767 ms |
+| C8 / 48 | 221.1 tok/s | 660.5 tok/s | 78.318 / 70.834 / 14.973 ms |
+| C16 / 64 | 255.5 tok/s | 1039.1 tok/s | 122.094 / 110.214 / 25.462 ms |
+
+Decode capacity excludes each request's TTFT but includes prefill stalls from
+new rolling requests. The verifier/forward/draft columns are CUDA-event medians
+for complete q8 steps in a separate instrumented run; they are not additive
+end-to-end latency. V100 draft acceptance is 40.9% at C16 versus 42.7% on PRO
+6000, too close to explain the fourfold capacity gap.
+
+A short CUDA Graph node trace captured eight complete C16 q8 steps on all four
+V100 ranks after two settling steps, without a new prefill in the capture.
+Six interior steps on the critical rank average about 148 ms wall and 144 ms
+summed kernel service. Graph-node IDs separate approximately 108 ms target
+forward from 22.6 ms draft; uncaptured graph nodes, sampling, and other kernels
+account for about 13.4 ms service. The target graph's main per-step kernel
+families are paged attention 29.1 ms, TurboMind NVFP4 GEMM 26.5 ms, FP16
+GEMM/CUTLASS 15.0 ms, FP8 QPN8 weight dequantization 12.4 ms, fused GDN update
+9.8 ms, and TP reduction 8.8 ms. The draft graph spends about 14.2 ms in
+paged attention. Category sums describe service, not a closed wall-clock
+decomposition, and graph-node tracing adds overhead.
+
+The C16 E4M3 DFlash2 target log rejects batched grouped verification at
+`reqs=16, q=(128,6,256)`. The exact E4M3 FP32 grouped entry requires one
+request; the older request-major grouped entry admits E5M2 only because its
+partial values are FP16. DFlash2 E4M3 then runs per-query paged decode for its
+16 full-attention layers, matching the 29.1-ms trace bucket. This is a proven
+route gap, but eliminating that whole bucket alone cannot close the C16 gap.
+The existing E4M3 XQA batch operator was admitted in a task-private probe;
+its C16 decode capacity was 264.0 tok/s (+3.3%) and acceptance fell from
+40.9% to 39.5%, so it is not the selected change.
+
+The source candidate extends the FP32 grouped verifier to independent
+request-major q8 batches of 2–16 requests, using the existing B1 numerical
+path and native precision ABI version 6. In a matched, uninstrumented 2K/256
+run, C8 decode capacity rose from 221.1 to 244.2 tok/s (+10.4%), and C16
+from 255.5 to 278.8 tok/s (+9.1%); the PRO 6000 references remain 660.5
+and 1039.1 tok/s. The candidate's C8/C16 acceptance was 41.5%/38.9%, versus
+41.6%/40.9% on the old V100 route. After rebuilding the final Flash-V100
+source (SHA256 `f23e6f7d2f1aa3724874e6444b5804a6bdee8570c9747f00a756fe369a757acd`),
+a second matched C16 run reached 288.7 tok/s (+13.0%), with acceptance 42.9%
+and 3.972 output tokens per draft round versus 38.9% and 3.689 in the first
+candidate run. Acceptance variation contributes to the spread; do not assign
+the full difference between candidate runs to kernel speed. Prefix hits were
+zero and the final logs show grouped q8/128-row capture on all four ranks.
+In a separate same-dataset C8 single wave, the candidate's overlap window
+with no new prefill reached 347.2 tok/s versus 820.8 tok/s on PRO 6000;
+this pure decode comparison remains 2.36x apart. The old corrected V100
+service did not run this exact single-wave dataset, so this number is not a
+matched candidate-versus-main speedup claim.
+These are research results using a native Flash-V100 extension built from this
+branch, with other unchanged vLLM native extensions from a source-equivalent
+main build. They are not yet clean-wheel performance or a full output-quality
+gate. The 65 focused CUDA and dispatch tests pass after the final rebuild.
+
+CUDA-event medians for complete q8 steps after the change are C8 target
+verifier/forward/sample/draft/full step 65.198/57.230/7.747/14.288/79.469 ms
+(64 samples), and C16 94.107/81.632/12.459/24.152/118.262 ms (54 samples).
+Against the matched old V100 phase run, the C16 target forward falls by
+28.582 ms and full GPU step by 29.327 ms. At C8, PRO 6000's verifier/forward/
+sample/draft/full step is 29.49/28.06/1.43/4.64/34.14 ms under its slightly
+wider forward timing boundary. The candidate still spends roughly 29 ms more
+in target forward, 6 ms more in sampling and 10 ms more in draft at C8. This
+is a phase-level direction, not a closed identical-kernel decomposition.
+
+At B16/q8/2K, the grouped attention operator takes about 0.38 ms per full
+attention layer versus 1.93 ms for the old row operator. At B16/q8/32K, the
+new grouped operator takes about 3.6 ms per layer and is only about 2–3%
+faster than sixteen independent grouped calls, though it is much faster than
+the row operator. The first 32K probe exposed a request-stride bug in the
+FP32 max/sum workspace: the stride omitted its second float and overlapped
+request data once more than 40 splits were live. The bug is fixed. Focused
+CUDA tests now compare B2/B4/B8/B16 q8 with independent requests under graph
+replay, and B2 at both 32K and 262,144 tokens; a B16 32K operator screen is
+also bitwise equal to independent requests. These tests do not replace
+end-to-end long-context quality validation.
+
+The remaining C16 gap is not an attention-only problem. QPN8 weight
+dequantization repeats about 12.4 ms per target step; making all eligible
+weights resident FP16 would require approximately 4.36 GiB per TP rank and
+would consume KV/long-context capacity. Widening NVFP4 GEMM autotuning to
+M128 reduced one representative gated projection from 334 to 295 microseconds
+but left a second projection unchanged; it also requires explicit prewarming
+before CUDA Graph capture. Neither isolated result is an end-to-end gain.
+An experimental grouped split cap improved one-layer 2K/32K timings but
+changed FP16 outputs by about 1e-5 relative and was reverted; it is absent
+from the candidate source and final native extension. Full vLLM/Triton rebuild
+was stopped after it began fetching unrelated dependencies; only the changed
+Flash-V100 extension was rebuilt. The clean package/quality gate remains open.
+For a quantization-independent GDN schedule screen, BV8 beat BV32 by
+1.25–1.73x on C4/C8/C16 q1/q8 synthetic layers and matched FP16 outputs
+bitwise. A whole-model C16 trial with the existing `VLLM_SM70_FLA_BV=8`
+override reached 290.2 tok/s decode capacity and 238.6 tok/s output versus
+288.7/235.6 without the override; acceptance also changed from 42.9% to
+41.4%. This small, sampling-sensitive system gain does not justify changing
+the shared recurrent schedule yet. A general PyTorch top-k/top-p fallback
+matched the Triton mask but took 18.8 ms versus 2.1 ms at 128x248,320, so
+it is not an alternative sampling speed path. Nsight Compute counters were
+unavailable under the host's `ERR_NVGPUCTRPERM` policy; Nsight Systems and
+CUDA events remain the evidence source.
+Continue with a shared batch-shape GEMM/GDN/TP path and preserve the memory
+budget; do not promote a single-kernel projection as a PRO 6000 win.
+
+The PRO 6000 service is now stopped. The retained service log identifies
+vLLM v0.29.0, native BF16, FlashInfer CUTLASS NVFP4, CUTLASS scaled-FP8
+linear, CUDA GDN decode, FlashInfer XQA and TP1. The pinned upstream
+`v0.29.0` implementation pre-swizzles FP4 weight scales at load and uses
+`scaled_fp4_quant` followed by a GEMM that consumes compressed FP4 weights;
+its FP8 linear similarly uses activation quantization and
+`cutlass_scaled_mm`. There is no local copy of the PRO per-kernel profiler
+trace, so these are source-backed route facts, not measured PRO category times.
+
+The V100 trace confirms that its C16 target already runs TurboMind **batch**
+GEMM: over eight q8 steps per rank, 448 gate/up `gemm_kernel` calls average
+276.2 microseconds and 448 down calls 195.1 microseconds, or about 26.4 ms
+per step for the 56 NVFP4 MLP layers. Compact-scale restore costs about
+2.3 ms per step. FP8 QPN8 full-weight dequant costs about 12.4 ms per step;
+QPN8 native handles at most 32 rows, while C16/q8 sends 128 rows. This
+explains why applying a single-request fast-path result to C16 was invalid.
+V100 and PRO perform conceptually similar projections, but SM70 executes
+packed W4A16/FP16 Tensor Core work while SM120 uses native FP4/FP8 Tensor
+Cores. TP4 further requires inter-rank reductions that PRO TP1 avoids.
+
+Small independent CUDA Graph screens reject naively slicing M128 into
+repeated packed kernels: FP8 K1536/N5120 falls from 91.5 to 152.7 us when
+using eight M16 tiles, and NVFP4 K5120/N8704 gate from 306.3 to 613.4 us
+with four M32 tiles. Repeated weight reads exceed the saved reconstruction.
+The existing TurboMind shape tuner can be prewarmed at M64/M128 by setting
+`VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=128` together with
+`VLLM_SM70_AWQ_WARMUP_MAX_M=128`; merely raising the former inside a captured
+graph will use the default spec. Synthetic M128 gate/down timings change
+328.4/222.9 to 300.6/156.8 us, but output hashes change. A full 64-request
+C16 run on the same 2K/256 dataset gives 292.17 tok/s decode capacity,
+237.25 tok/s output and 41.96% acceptance, versus the previous candidate's
+288.7/235.6 tok/s and 42.9%. The gain is under 2% with acceptance drift,
+so the shared default stays unchanged. The original 13.97-GiB/rank KV cache
+budget is unchanged by tuning. Task-private evidence is in the retained
+`verification/` artifact directory
+(`screen_packed_m128.json`, `screen_turbomind_m128_{default,tuned}.jsonl`,
+`v100-turbomind-m128-c16.json` and its service log). The corrected grouped
+path was subsequently captured with Nsight Systems
+`--cuda-graph-trace=node` across four ranks and eight complete C16/q8 steps.
+An earlier default `graph` capture omitted model graph nodes and is not used
+for forward attribution. On rank 0, kernel busy time per full q8 step changed
+as follows (old paged / corrected grouped, ms): target attention
+29.047 / 5.750; FP4 TurboMind gate/down 26.390 / 25.480; QPN8 full-weight
+dequant 12.415 / 12.291; GDN update 9.803 / 9.701; TP reduce
+9.846 / 9.548; FP4 scale restore 2.329 / 2.274; draft paged attention
+14.216 / 13.449. All kernel service falls 144.047 -> 117.586 ms per step.
+The target attention reduction explains most of the prior improvement, while
+the FP4 batch GEMM, QPN8 dequant, recurrent update and TP costs remain. These
+category times are not a closed target forward wall decomposition and do not
+measure corresponding PRO kernel times. Original four-rank reports and SQL
+comparison are task-private under `verification/trace-c16-grouped-nodes/`.
+
+The same 2K/256, C16/64-request unprofiled endpoint contract rejects
+shortening DFlash2's speculative depth as a broad concurrency fix. With the
+same grouped-attention source, q7/q3/q1 (8/4/2 target rows per request)
+produce 288.69/247.46/237.27 tok/s request-level decode capacity,
+235.57/206.12/200.21 tok/s complete output throughput, and
+3.972/2.858/1.797 emitted tokens per draft round. q3/q1 verifier matrix
+rows are M64/M32 rather than q7's M128, but the additional rounds outweigh
+their cheaper steps. The q3/q1 services selected their E4M3 grouped FP32
+attention route and had zero prefix-cache hits. These results compare V100
+configuration choices; the retained PRO 6000 q7 reference is unchanged.
+Original summaries and service route logs are task-private under
+`verification/v100-q{3,1}-*`.
+
 ## Graph scratch, score workspace and active peak, 2026-09-23
 
 [Implementation and paired evidence](sm70_memory_arena.md). The new SM70
@@ -46930,3 +47259,266 @@ has launched no full model. Details and artifacts are in
   readiness. It loads all 12 AOT artifacts without fallback and passes a chat
   request through Studio's authenticated public-API proxy. Existing model,
   topology, context, batch limits, and speculative settings are preserved.
+
+## 2026-09-24 DFlash2 concurrent batch-layout candidate
+
+- Owned branch `codex/v100-dflash2-concurrent-decode-20260923-075451`, base
+  `d49e32b358`. Keep the 27B TP4, q7, 2K/256, prefix-enabled, E4M3-KV and
+  262144-context contract fixed. Previous unprofiled rolling decode is
+  229.706/265.558/277.808 tok/s at C1/C4/C8 on V100, versus saved PRO
+  210.416/519.818/711.773. Neither run has the new per-step pure-decode
+  recorder, so do not label those values pure decode. The batch-layout
+  candidate is opt-in with `VLLM_SM70_BATCH_GEMM_LAYOUTS=1` until the
+  cross-model and two-host admission gates pass.
+- PRO C1/C4 raw rank-0 Torch traces are copied from the rented host with
+  SHA256 `5dabd5180997a92bde16ad4cb86b3170ae8e5ea0350c85de972d3c5ff98a2e74`
+  and `99a8faf4a5a88b4026cbf8efca20c7cdb6de79baeccb8bf47e478394866e4500`.
+  They are retained under task-private `verification/pro-trace-c1c4/`; the
+  original C8 trace remains on the host. New SSH attempts to port 36176 close
+  before authentication, so fresh two-host admission is pending.
+- Real checkpoint TP4 channel-FP8 GEMM screening at M8/M32/M64 compares the
+  present QPN8 path with a second load-time TurboMind W8A16 compressed layout.
+  At M64, measured savings are about 31 us per output projection, 66 us per
+  GDN input projection and 47 us per attention QKV projection. Weighted by
+  64/48/16 target layers this projects 5.85 ms per complete target forward.
+  At M8, QPN8 is faster. The candidate preserves QPN8 through M32 and chooses
+  TurboMind only for M33–M64. It does not restore a complete FP16 weight on
+  those verifier batches. Dynamic-dispatch/CUDA-graph tests pass 5/5 on the
+  clean extension, including fused gate/up; M8/M32 outputs are bitwise equal
+  to QPN8 and M64 differs by at most 0.007813 absolute in the tested tensors.
+  An earlier M32 TurboMind variant reduced the GPU step by roughly 1 ms but
+  lost 3.8 percentage points of draft acceptance on matched rolling C4,
+  reducing pure decode 409.59→387.63 tok/s. It was rejected.
+- NVFP4 shares the concurrent-layout policy. Retaining the already prepared
+  FP16 TurboMind scale layout for M>32 avoids the former per-step E4M3 scale
+  restoration. Real layer-0 TP4 gate/up and down M64 outputs are bitwise equal
+  to the compact-scale fallback; graph medians improve 205.96→183.26 us and
+  100.45→87.72 us. Weighted across 64 layers this projects about 2.27 ms.
+  M32 gate/up TurboMind interleaving and prior QPN2 split/tile candidates do
+  not show a material gain and are not promoted.
+- Clean source-built native and Flash-V100 extensions are deployed in the
+  owned worktree. Their hashes are retained in task-private
+  `verification/clean-artifact-current.json`; the final `_C.abi3.so` is
+  `fd6ab2274a43e851fac4557921cf41f0e21e26afde60f6230faa7318b2fcd677`.
+  The first packaging attempt stopped for missing `patchelf`; the corrected
+  clean `setup.py build_ext` compiled all native and bundled Flash extensions
+  successfully. The optional Rust frontend was skipped because `rustc` is
+  unavailable, and a complete wheel was not produced. `readelf` finds no
+  RPATH/RUNPATH in the deployed extensions; the source tree imports the clean
+  native and Flash-V100 copies. Candidate logs confirm both layouts,
+  1,009,312 KV tokens at
+  memory fraction 0.8 (3.85 complete 262144-token requests), a 4K prefix
+  hit count of 26368/32768, and a 32768-input/32-output service request.
+- A task-only scheduler recorder counts actual emitted tokens over complete
+  8-request active steps with no new prefill, including q1–q8 acceptance.
+  With the same C1→C4→C8 order and 2K/256 dataset, the first batch-layout
+  candidate versus clean control had C8 pure decode 464.56→544.41 tok/s and
+  median step 79.67→65.86 ms. Rolling C8 decode improved 277.27→297.93
+  tok/s with matched acceptance 52.32%/52.26%. C4 pure decode regressed
+  409.59→387.63 tok/s due to the rejected M32 FP8 switch. C1 pure decode was
+  236.56→241.64 tok/s, with four representative seeded 256-token outputs
+  byte-identical between layouts. All raw rows and benchmark JSON are under
+  task-private `verification/pure-{off,on}.*.jsonl` and
+  `verification/v100-batch-layout-pure-{off,on}-*.json`; their filtered summary
+  is `verification/pure-decode-matched-on-off-summary.json`. The recorder is
+  diagnostic; uninstrumented service results remain the speed admission gate.
+  The final M64-only dispatch has passed the focused 5/5 GPU tests. Its first
+  uninstrumented C1/C4/C8 service run, in that order, reaches
+  231.788/255.976/295.735 rolling decode tok/s with
+  55.38/54.95/53.86% acceptance. The M≤32 QPN8 path remains in place;
+  C1/C4 have no demonstrated speed gain, and C8 remains far below the saved
+  PRO 711.773 tok/s. These are single runs, not the three-run admission gate.
+  Raw JSON is task-private `verification/v100-batch-layout-m64only-*.json`.
+- Rank-0 Nsight CUDA Graph node traces on six interior, no-prefill C8/q8
+  steps show 82.45→69.20 ms median step spacing and 77.68→65.40 ms mean
+  GPU kernel service with the M64-only dispatch. Per-step FP8 full-weight
+  dequant (12.24 ms), post-dequant GEMM (10.50 ms), and FP4 scale restore
+  (2.26 ms) disappear; FP8 compressed GEMM costs 16.11 ms, FP4 compressed
+  GEMM 15.79 ms. The remaining GDN, draft attention, target grouped
+  attention, TP communication, sampling, and other kernels cost
+  5.42/6.56/3.33/5.75/4.09/8.09 ms respectively. These are GPU kernel
+  sums, not the endpoint pure-decode metric. The reusable classification
+  script and per-step JSON are task-private
+  `verification/summarize_c8_nsys_compare.py` and
+  `verification/trace-c8-m64only/comparison.json`.
+- The saved PRO rank-0 C1/C4 Torch traces have a 7.03→7.79 ms FP4 CUTLASS
+  GEMM and 7.04→7.62 ms FP8 CUTLASS GEMM from C1 to C4, while GDN grows
+  0.96→2.25 ms. The V100 C8 compressed GEMM total alone is 31.91 ms versus
+  the saved PRO C8 15.73 ms, so further work must prioritize arithmetic
+  throughput as well as launch and attention costs. PRO SSH currently closes
+  before authentication; fresh two-host admission and output-quality gates
+  remain open.
+- A real-shard M64 TurboMind FP8 tuning screen changed only `out_proj` in one
+  run (100.11→58.85 us), while `in_proj_qkvz` and `qkv_proj` stayed near
+  115 us. It is below the 5-ms weighted-forward promotion threshold and is
+  not enabled. An exploratory resident-FP16 screen reached 48.01/72.94/
+  70.02 us on the three FP8 projection shapes, but would add about 1.7 GiB
+  per GPU versus the second compressed layout and would leave the stipulated
+  direct-compressed-weight execution route. It is not part of this candidate.
+  The screening logs are task-private `verification/screen_fp8_tm_m64_tuning.log`
+  and `verification/screen_fp8_resident_m64.log`.
+- After copying the clean built extensions into the owned source tree, the
+  focused SM70 dispatch/CUDA Graph suite passes 5/5. Three sequential
+  uninstrumented candidate runs of the same C1/16, C4/32, C8/48 2K/256
+  dataset have median rolling decode 236.630/257.106/303.188 tok/s, median
+  acceptance 56.48/55.58/54.48%, and median per-request mean ITL
+  4.106/15.563/26.337 ms. All nine runs report zero prefix-cache hits,
+  consistent with the hybrid-cache block alignment for the 1792-token shared
+  prefix. Candidate C8 is about 9.1% above the historical 277.808 tok/s V100
+  run but still 57.4% below saved PRO 711.773 tok/s; C1/C4 remain near or
+  below their historical baselines. The C8 acceptance median is 1.69
+  percentage points below historical V100, within the plan's 2-point limit,
+  compared with a matched new-binary OFF control below. Raw outputs are
+  task-private `verification/v100-clean-m64on-repeat{1,2,3}/`.
+- Three sequential OFF-control runs on the same clean binary and request
+  sequence have C1/C4/C8 median rolling decode
+  237.523/263.183/279.502 tok/s and median acceptance
+  56.77/56.70/56.18%. With batch layouts enabled, C8 improves 8.48% and
+  loses 1.70 percentage points of acceptance; C1 is 0.38% slower and C4 is
+  2.31% slower. All nine OFF runs also report zero prefix-cache hits.
+  Per-request mean ITL medians are 4.102/15.200/27.182 ms OFF versus
+  4.106/15.563/26.337 ms ON. Raw OFF JSON is task-private
+  `verification/v100-clean-m64off-repeat{1,2,3}/`. This retains the M64 C8
+  candidate for quality review but does not satisfy the PRO superiority target
+  or C4 recovery. A seeded C8 eight-request wave has only 3/8 exact output texts
+  between ON/OFF; the other five diverge under probabilistic sampling, so
+  the existing task-quality gate remains necessary before promotion.
+- A final matched task-only scheduler record, on the same clean binary, counts
+  emitted tokens across all C-active, no-new-prefill decode steps (q1–q8).
+  ON/OFF pure decode is C1 212.305/227.053, C4 397.956/415.296, and C8
+  558.144/462.666 tok/s. Median step spacing is C1 20.643/20.664, C4
+  48.207/48.057, and C8 65.717/79.768 ms. The C8 gain is 20.64% in this
+  instrumented measure; the C1/C4 rate differences track sampling acceptance
+  changes while their step times remain essentially equal. This recorder is
+  diagnostic and perturbs timing; the three-run, uninstrumented comparison
+  above remains the endpoint speed evidence. Rows and exact benchmark windows
+  are task-private `verification/pure-m64{on,off}-final.*.jsonl` and
+  `verification/v100-pure-m64{on,off}-final-once/`; their summary is
+  `verification/pure-decode-m64-final-on-off-summary.json`.
+- In the three-run uninstrumented OFF/ON comparison, median TTFT is
+  C1 0.5469/0.5467 s, C4 0.6933/0.6927 s, and C8 0.7951/1.2290 s;
+  median of per-run ITL P90 is C1 5.179/5.201 ms, C4 20.793/22.112 ms,
+  and C8 38.002/37.451 ms. The C8 TTFT median is unstable across runs
+  (ON 0.770/1.231/1.229 s, OFF 1.062/0.795/0.793 s), so the change is
+  retained as a measured latency cost, not attributed to the GEMM kernel.
+- A paired xhigh GSM8K test on dataset indices 8–23 uses the same model,
+  TP4, q7 probabilistic draft, E4M3 KV, Flash-V100, 262144 model length,
+  aligned prefix cache, 8 active requests, and fixed temperature/top-p/top-k
+  0.7/0.8/20 with request seed 20260923. The quality harness now accepts
+  this checkpoint's `xhigh` chat-template value. OFF and ON both score 15/16,
+  have no invalid answers, and stop naturally on all 16 questions. Aggregate
+  draft acceptance is 53.814% OFF versus 52.587% ON (-1.227 percentage
+  points); mean acceptance length is 4.767 versus 4.681. Only 1/16 token
+  sequences are identical, but all final numerical answers match. The
+  benchmark's absolute 4.85 mean-length threshold fails for the OFF control
+  too on this short subset, so this pair establishes relative quality only.
+  Raw results and comparison are task-private
+  `verification/gsm8k16-m64{off,on}-clean.json` and
+  `verification/gsm8k16-m64-clean-on-off-summary.json`.
+- The candidate remains opt-in. The C1/C4/C8 rolling 5%-ahead-PRO goal is
+  not met: the saved PRO points are 210.416/519.818/711.773 tok/s versus
+  this V100 candidate's 236.630/257.106/303.188. The PRO SSH entry at
+  port 36176 still closes before authentication, so the required fresh
+  three-run PRO and PRO pure-decode records cannot be collected. Local 35B-A3B
+  AWQ/FP8 weights are absent; a focused policy test confirms that non-DFlash
+  paths do not activate the new layouts, but this is not a model speed or
+  quality regression test. Keep the control OFF by default and defer the
+  target-dependent Draft PR until both the speed and cross-model gates pass.
+- The remaining C8/q8 GPU service is 65.40 ms, of which compressed FP4+FP8
+  GEMM is 31.91 ms. The non-GEMM 33.49 ms already exceeds 33.949/1.05 =
+  32.33 ms, the saved PRO q8 step budget for 5% superiority under equal
+  emitted tokens. This is a diagnostic inference, not an endpoint bound:
+  acceptance and rolling prefill also affect tok/s. It shows that a future
+  faster compressed GEMM alone cannot close the whole q8 step. The largest
+  remaining categories are draft paged attention 6.56 ms, TP collectives
+  5.75 ms, sampling 4.09 ms, and other kernels 8.09 ms. Existing SM70 TP4
+  push all-reduce screens in this control document regressed at M64, so no
+  unqualified communication switch is stacked on this candidate.
+
+## 2026-09-25 DFlash batch attention and packed GDN follow-up
+
+- Continue the existing owned branch and Draft PR #688, based on
+  `onecat/main` at `d49e32b3587d4d34ffccb0ffd376e63974b06c88`; do not open
+  a duplicate PR. The detailed contract, results and limits are recorded in
+  [SM70 DFlash batch attention and verifier-state scheduling](sm70_dflash2_batch_attention_gdn.md).
+  This entry supersedes the older candidate's timing figures above, not its
+  outstanding PRO and 35B-A3B acceptance gates.
+- The latest same-contract trace localizes a real missing batch path:
+  draft projections were batched, but paged attention ran one request at a
+  time. Uniform noncausal draft queries now use the existing native kernel's
+  batch grid, with live GPU page tables and lengths during graph replay.
+  No native rebuild, additional environment flag or quantization-specific
+  fast path is added. Native extension SHA256 remains
+  `2884a59db00563d686a5dd7bbfbad57edb424b7d43b22a79bb468f299b56cef5`.
+- TP4 full-q8 GDN uses the numerically identical BV8 schedule for C4/C8,
+  preserving every FP32 state snapshot and accepted-state selector. The
+  existing FlashQLA DDTree API with linear parents does not outperform it
+  across C1/C4/C8, so that alternative is not promoted. This comparison does
+  not rule out a new specialized FlashQLA verifier.
+- The same CUDA-event observer gives rank-0 target-forward C1/C4/C8
+  14.055/31.253/37.648 → 14.065/30.365/36.863 ms, draft
+  4.296/9.322/13.490 → 4.270/6.760/7.309 ms, and whole-step
+  20.000/45.861/57.810 → 20.371/42.255/50.744 ms. These are full concurrent
+  batches, not per-request serialized costs. Candidate per-step rank maxima,
+  then medians, are 20.556/42.360/51.105 ms. Timing instrumentation is for
+  attribution and is not endpoint speed admission.
+- Six interior Nsight steps per batch and rank confirm five draft attention
+  launches at all batch sizes, with grids (1,1,8)/(1,1,32)/(1,1,64).
+  Previously C4/C8 issued 20/40 separate small launches. Rank-0 draft
+  attention service changes 0.862/3.255/6.451 → 0.859/0.876/0.910 ms;
+  GDN C4/C8 changes 3.689/5.345 → 2.661/4.474 ms. Target GEMM remains
+  8.506/20.278/21.429 ms at C1/C4/C8. The C1→C4 increase still dominates
+  target-forward growth; GEMM occupies 66.8%/58.1% of C4/C8 target service.
+- Three matched, uninstrumented endpoint runs at C1/16, C4/32 and C8/48,
+  same 2K/256 dataset and sampling, give rolling client decode-capacity
+  medians 243.633/293.667/343.050 → 246.891/298.459/356.606 tok/s.
+  C4/C8 gains are 1.63%/3.95%. This metric includes replacement-prefill
+  pauses and is not a GPU emitted-token counter. Prefix hits are zero.
+  Acceptance medians change 56.60/56.70/56.22% → 57.49/56.54/55.18%;
+  individual runs vary. A single common-client-window estimate gives
+  C4 418.12→494.03 and C8 746.67→784.79 tok/s, but retokenizes streamed text
+  and must not be reported as the exact three-run pure-decode gate.
+- All 44 focused GPU tests pass: attention graph replay with changing live
+  lengths/pages, FP16/E4M3 KV, page16/1648, 2K–262K logical positions;
+  and TP2/TP4 packed GDN with heterogeneous selectors, all snapshots and
+  repeated replays. Targeted pre-commit passes with the bundled Flash-V100
+  package on MYPYPATH. Paired GSM8K16 xhigh natural-EOS quality runs both
+  score 15/16 with the same wrong question; acceptance 51.29→51.58%.
+  The control has one length-capped output, candidate none. This is relative
+  quality evidence, not general output-quality proof.
+- Do not repeat the rejected real-weight GEMM screens unchanged. FP8 M32
+  four-phase split-K regresses; reduced unrolling cuts registers 138→127
+  but saves only about 5.36 us on one shape. FP4 multirow 16/32-row reuse
+  preserves bits but regresses M32 gate/up from 145 to 157–161 us and does
+  not help down. Research extensions are not loaded into the service.
+- Raw endpoint results, trace, compiler logs, rejected screens and source
+  hashes use task-private key `verification/batch-followup-20260925/`.
+  No new PRO measurement or 35B-A3B AWQ/FP8 model-speed gate was run.
+  The 5%-ahead-PRO goal remains open; this update does not claim completion.
+
+## 2026-09-25 Default enablement and integration of PR #688
+
+- Following the user's explicit request to enable the measured paths and
+  merge, the existing SM70 Qwen3.8 DFlash2 configuration now sets batch GEMM
+  layouts on and AWQ warmup/FP8 tuning/NVFP4 tuning limits to M64. Every
+  explicit environment override is preserved. This supersedes the older
+  default-off batch-layout decision; it does not declare the PRO speed goal
+  achieved. The configuration contract is independent of target quantization
+  and KV dtype; local operators retain their own capability and shape gates.
+- Joint draft paged attention and TP4 C4/C8 packed GDN scheduling select
+  automatically within their routes. The packed GDN entry, combined split,
+  draft context pipeline/KV graph and quantized LM-head prerequisites now
+  join the same automatic configuration, preserving explicit overrides.
+  C1/C4 compressed GEMM keeps the existing small-M routes, while
+  the alternate FP8 prescaled layout remains default-off. No additional
+  native source change or rebuild is needed for this configuration update.
+- The focused verifier-contract/default tests cover the batch settings and
+  packed-verifier/draft prerequisites' overrides and TP/quantization-independent
+  admission. Existing paired endpoint/quality and 44 GPU regression evidence
+  remain recorded above. The previous CI failure was an import-group
+  classification difference for the new benchmark's optional native package;
+  moving that import into the benchmark operation makes local and CI lint
+  resolution agree. Targeted pre-commit passes.
+- Fresh default-configuration service logs, smoke requests, CI and merge
+  records are retained under task-private
+  `verification/batch-followup-20260925/merge-defaults/`.

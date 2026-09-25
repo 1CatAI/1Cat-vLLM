@@ -4182,9 +4182,12 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
         m == 1 && ((n == 1536 && k == 4096) || (n == 8192 && k == 1024) ||
                    (n == 4096 && k == 2048) || (n == 1024 && k == 4096) ||
                    (n == 4096 && k == 512));
-    TORCH_CHECK(qwen38_prefill || prescaled_m1,
+    const bool prescaled_batch =
+        m > 32 && m <= 64 &&
+        ((n == 5120 && k == 1536) || ((n == 4096 || n == 3584) && k == 5120));
+    TORCH_CHECK(qwen38_prefill || prescaled_m1 || prescaled_batch,
                 "fp8_gemm_sm70: pre-scaled block-FP8 requires an accepted "
-                "8K prefill or M=1 tensor shape.");
+                "8K prefill, M=1, or M=33..64 tensor shape.");
     TORCH_CHECK(!gated_silu,
                 "fp8_gemm_sm70: pre-scaled path does not fuse gated SILU.");
   }

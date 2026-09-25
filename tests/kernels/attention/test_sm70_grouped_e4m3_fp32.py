@@ -18,7 +18,7 @@ def _native():
 
 
 @pytest.mark.parametrize("has_entry", [False, True])
-@pytest.mark.parametrize("version", [None, 0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("version", [None, 0, 1, 2, 3, 4, 5, 6])
 def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, version):
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     native = SimpleNamespace()
@@ -30,6 +30,135 @@ def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, versi
     assert interface.flash_attn_grouped_e4m3_fp32_available() is (
         has_entry and version is not None and version >= 4
     )
+    assert interface.flash_attn_grouped_e4m3_fp32_available(6) is (
+        has_entry and version is not None and version >= 6
+    )
+
+
+@pytest.mark.parametrize("batch", [2, 4, 8, 16])
+def test_request_major_q8_matches_independent_requests_under_graph(batch):
+    op = _native()
+    from flash_attn_v100 import flash_attn_grouped_e4m3_fp32_available
+
+    if not flash_attn_grouped_e4m3_fp32_available(6):
+        pytest.skip("rebuild native request-major E4M3 revision 6")
+    torch.manual_seed(20260923)
+    page = 3296
+    q = torch.randn((batch * 8, 6, 256), device="cuda", dtype=torch.float16)
+    encoded = (
+        torch.randn((2, batch, page, 1, 256), device="cuda", dtype=torch.float16)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    backing = torch.empty((batch, 2, page, 1, 256), device="cuda", dtype=torch.uint8)
+    order = torch.randperm(batch, device="cuda")
+    backing[order, 0] = encoded[0]
+    backing[order, 1] = encoded[1]
+    k, v = backing.unbind(1)
+    table = order.int()[:, None].contiguous()
+    lengths = torch.arange(2041, 2049, device="cuda", dtype=torch.int32).repeat(batch)
+    expected = torch.empty_like(q)
+    actual = torch.empty_like(q)
+
+    def reference():
+        for request in range(batch):
+            begin = request * 8
+            end = begin + 8
+            op(
+                q[begin:end],
+                k,
+                v,
+                table[request : request + 1],
+                lengths[begin:end],
+                out=expected[begin:end],
+                softmax_scale=0.0625,
+                k_scale=0.5,
+                v_scale=1.25,
+            )
+
+    def batched():
+        op(
+            q,
+            k,
+            v,
+            table,
+            lengths,
+            out=actual,
+            softmax_scale=0.0625,
+            k_scale=0.5,
+            v_scale=1.25,
+        )
+
+    reference()
+    batched()
+    assert torch.equal(actual, expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        batched()
+    for state in ("live", "zero_rows", "restore"):
+        if state == "zero_rows":
+            lengths[::8] = 0
+        else:
+            lengths[::8] = 2041
+        reference()
+        graph.replay()
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("context", [32768, 262144])
+def test_request_major_q8_long_context_workspace_is_request_isolated(context):
+    op = _native()
+    from flash_attn_v100 import flash_attn_grouped_e4m3_fp32_available
+
+    if not flash_attn_grouped_e4m3_fp32_available(6):
+        pytest.skip("rebuild native request-major E4M3 revision 6")
+    torch.manual_seed(20260923)
+    batch, page = 2, 3296
+    num_pages = (context + page - 1) // page
+    q = torch.randn((batch * 8, 6, 256), device="cuda", dtype=torch.float16)
+    encoded = (
+        torch.randn(
+            (batch * num_pages, 2, page, 1, 256),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    k, v = encoded.unbind(1)
+    table = torch.arange(batch * num_pages, device="cuda", dtype=torch.int32).reshape(
+        batch, num_pages
+    )
+    lengths = torch.arange(
+        context - 7, context + 1, device="cuda", dtype=torch.int32
+    ).repeat(batch)
+    expected = torch.empty_like(q)
+    actual = torch.empty_like(q)
+    for request in range(batch):
+        rows = slice(request * 8, (request + 1) * 8)
+        op(
+            q[rows],
+            k,
+            v,
+            table[request : request + 1],
+            lengths[rows],
+            out=expected[rows],
+            softmax_scale=0.0625,
+            k_scale=0.5,
+            v_scale=1.25,
+        )
+    op(
+        q,
+        k,
+        v,
+        table,
+        lengths,
+        out=actual,
+        softmax_scale=0.0625,
+        k_scale=0.5,
+        v_scale=1.25,
+    )
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize(

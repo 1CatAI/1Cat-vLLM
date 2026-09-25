@@ -2073,13 +2073,17 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       query_len > MAX_QUERY_TOKENS) {
     return;
   }
+  if constexpr (ROW_SEQLENS) {
+    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+  }
 
   if constexpr (!SPARSE_PAGE4) {
     partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                    kGroupedVerifyHeadDim;
     partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                   (ROW_SEQLENS ? 2 : 1);
   }
 
   int total_kv = seq_lens[group_idx];
@@ -2633,10 +2637,13 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
                  MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
   partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
-                 MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads * (ROW_SEQLENS ? 2 : 1);
   seq_lens += request_idx;
   out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
          kGroupedVerifyHeadDim;
+  if constexpr (ROW_SEQLENS) {
+    row_lengths += static_cast<int64_t>(request_idx) * MAX_QUERY_TOKENS;
+  }
 
   int total_kv = seq_lens[0];
   if constexpr (ROW_SEQLENS) {
@@ -4394,33 +4401,40 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
     float scale, float k_scale, float v_scale) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
-                  q.size(0) <= 8 && q.size(1) > 0 && q.size(1) % 6 == 0 &&
-                  q.size(2) == 256,
-              "E4M3 grouped FP32 requires CUDA FP16 Q [2..8,6*Hkv,256]");
+                  q.size(1) > 0 && q.size(1) % 6 == 0 && q.size(2) == 256,
+              "E4M3 grouped FP32 requires CUDA FP16 Q [rows,6*Hkv,256]");
   TORCH_CHECK(
       k.dim() == 4 && k.size(2) * 6 == q.size(1) && k.size(3) == 256 &&
           k.size(1) > 0 && k.size(1) % 16 == 0 &&
           k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
           v.sizes() == k.sizes(),
       "E4M3 grouped FP32 requires uint8 KV [pages,16-aligned-page,Hkv,256]");
+  const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
   TORCH_CHECK(
-      block_table.dim() == 2 && block_table.size(0) == 1 &&
+      block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
           block_table.size(1) * k.size(1) <= 266240 &&
+          q.size(0) % batch_size == 0 &&
+          (batch_size == 1 ? q.size(0) <= 8 : q.size(0) == batch_size * 8) &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "E4M3 grouped FP32 requires one KV sequence and per-query int32 lengths");
+      "E4M3 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
-  TORCH_CHECK(partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
-                  partial.is_contiguous() &&
-                  partial.scalar_type() == at::kFloat &&
-                  lse.sizes() == at::IntArrayRef({80, 8, 6, 2}) &&
-                  lse.is_contiguous() && lse.scalar_type() == at::kFloat,
-              "E4M3 grouped FP32 requires numerator [80,8,6,256] and max/sum "
-              "[80,8,6,2]");
+  const bool workspace_shapes =
+      batch_size == 1
+          ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
+          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+  TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
+                  partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
+                  lse.scalar_type() == at::kFloat,
+              "E4M3 grouped FP32 requires request-major FP32 numerator "
+              "and max/sum workspaces");
   TORCH_CHECK(
       std::isfinite(scale) && std::isfinite(k_scale) &&
           std::isfinite(v_scale) && k_scale > 0 && v_scale > 0,
@@ -4482,19 +4496,20 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
                            kCompensatedSmemBytes));
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  kernel<<<dim3(1, 80), kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
+  kernel<<<dim3(1, 80, batch_size), kGroupedVerifyThreads,
+           kCompensatedSmemBytes, stream>>>(
       reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
       v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
-      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
+      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0) / batch_size,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      1, row_lengths.data_ptr<int>());
+      static_cast<int>(batch_size), row_lengths.data_ptr<int>());
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-      <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
-          partial.data_ptr<float>(), lse.data_ptr<float>(),
-          row_lengths.data_ptr<int>(),
-          reinterpret_cast<__half*>(out.data_ptr()), q.size(0),
-          row_lengths.data_ptr<int>());
+      <<<dim3(q.size(0) / batch_size, 6, batch_size), kGroupedVerifyThreads, 0,
+         stream>>>(partial.data_ptr<float>(), lse.data_ptr<float>(),
+                   row_lengths.data_ptr<int>(),
+                   reinterpret_cast<__half*>(out.data_ptr()),
+                   q.size(0) / batch_size, row_lengths.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -4504,7 +4519,8 @@ int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Older normalized-partial/LSE workspaces are not ABI-compatible.
   // Revision 4 admits DFlash2 1728/3456 pages and FP32 scalar E4M3 partials.
   // Revision 5 admits multiple local KV heads and runtime aligned page sizes.
-  return 5;
+  // Revision 6 admits request-major batches of up to sixteen q8 verifiers.
+  return 6;
 }
 
 int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 3; }
