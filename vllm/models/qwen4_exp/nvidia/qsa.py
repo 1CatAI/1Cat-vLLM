@@ -110,21 +110,21 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         if not self.replicated_draft:
             return metadata
-        # The shared target/draft group uses target-local blocks for its
-        # generic slot map. Draft K/V owns the full global span on every DCP
-        # rank, so its physical page is twice as wide and must be mapped from
-        # logical positions independently of the sharded target slot mask.
+        # Draft K/V owns the full global span on every DCP rank. Its physical
+        # page may be split into smaller kernel blocks in the common block
+        # table, so map with the builder's kernel block size and ignore the
+        # generic slot mask, which can encode target DCP ownership.
         draft_page_size, _, _ = qsa_dcp_block_geometry(
             self.vllm_config, self.layer_names[0]
         )
-        if self.block_size != draft_page_size:
-            raise RuntimeError("QSA draft requires unsplit replicated block IDs")
+        if draft_page_size % self.block_size:
+            raise RuntimeError("QSA draft kernel block must divide its physical page")
         _, _, slot_mapping = build_qsa_metadata(
             common_attn_metadata,
             self.draft_token_to_req,
             self.draft_logical_positions,
             self.draft_slot_mapping,
-            storage_block_size=draft_page_size,
+            storage_block_size=self.block_size,
             compress_ratio=1,
             map_plain_slot=True,
         )

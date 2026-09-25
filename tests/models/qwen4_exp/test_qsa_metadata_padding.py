@@ -259,8 +259,14 @@ def test_dcp_replicated_draft_main_uses_full_page_not_sharded_slot_map(
     assert slots.tolist() == [46, 47, 48, 49]
 
 
+@pytest.mark.parametrize(
+    ("kernel_block_size", "block_table"),
+    [(16, [5, 6]), (8, [10, 11, 12, 13])],
+)
 def test_dcp_draft_main_builder_suppresses_dummy_writes(
     monkeypatch: pytest.MonkeyPatch,
+    kernel_block_size: int,
+    block_table: list[int],
 ) -> None:
     monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
     monkeypatch.setattr(
@@ -279,7 +285,7 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),
     )
     builder.layer_names = ["mtp.layers.48.self_attn.attn"]
-    builder.block_size = 16
+    builder.block_size = kernel_block_size
     builder.draft_token_to_req = torch.empty(4, dtype=torch.int32)
     builder.draft_logical_positions = torch.empty(4, dtype=torch.int64)
     builder.draft_slot_mapping = torch.empty(4, dtype=torch.int64)
@@ -293,7 +299,7 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
         query_start_loc_cpu=starts,
         seq_lens=torch.tensor([18], dtype=torch.int32),
         slot_mapping=torch.full((4,), -1, dtype=torch.int64),
-        block_table_tensor=torch.tensor([[5, 6]], dtype=torch.int32),
+        block_table_tensor=torch.tensor([block_table], dtype=torch.int32),
     )
     assert builder.build(0, common).slot_mapping.tolist() == [94, 95, 96, 97]
     assert builder.build(
@@ -304,6 +310,6 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
         -1,
         -1,
     ]
-    builder.block_size = 8
-    with pytest.raises(RuntimeError, match="unsplit replicated block IDs"):
+    builder.block_size = 6
+    with pytest.raises(RuntimeError, match="kernel block must divide"):
         builder.build(0, common)
