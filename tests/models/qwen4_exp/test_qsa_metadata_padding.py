@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """QSA metadata bounds when query offsets include graph-padding requests."""
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,6 +12,7 @@ from vllm.models.qwen4_exp.common import qsa_cache
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import torch_utils
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -122,3 +126,93 @@ def test_qsa_metadata_query_offset_bounds(
         assert token_buffer[-1].item() == sentinel
         assert position_buffer[-1].item() == sentinel
         assert slot_buffer[-1].item() == sentinel
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton"])
+def test_dcp_replicated_selector_ignores_sharded_main_slot_mask(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if backend == "triton" and (not HAS_TRITON or not torch.cuda.is_available()):
+        pytest.skip("Triton metadata requires CUDA")
+    device = torch.device("cuda" if backend == "triton" else "cpu")
+    if backend == "torch":
+        monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    starts = torch.tensor([0, 4], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_actual_tokens=4,
+        num_reqs=1,
+        max_query_len=4,
+        max_seq_len=11,
+        query_start_loc=starts.to(device),
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([11], dtype=torch.int32, device=device),
+        # All four target main K/V writes belong to the other DCP rank.
+        slot_mapping=torch.full((4,), -1, dtype=torch.int64, device=device),
+        block_table_tensor=torch.tensor([[5, 6]], dtype=torch.int32, device=device),
+    )
+    builder = (
+        qsa_cache._build_qsa_metadata_torch
+        if backend == "torch"
+        else qsa_cache.build_qsa_metadata_triton
+    )
+    kwargs = dict(
+        storage_block_size=4,
+        compress_ratio=2,
+    )
+
+    def build(ignore_common_slot_mask: bool):
+        return builder(
+            common,
+            torch.empty(4, dtype=torch.int32, device=device),
+            torch.empty(4, dtype=torch.int64, device=device),
+            torch.empty(4, dtype=torch.int64, device=device),
+            ignore_common_slot_mask=ignore_common_slot_mask,
+            **kwargs,
+        )[2]
+
+    assert build(False).tolist() == [-1, -1, -1, -1]
+    assert build(True).tolist() == [23, -1, 24, -1]
+
+
+def test_qsa_dummy_batch_suppresses_replicated_selector_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    monkeypatch.setattr(
+        qsa_cache, "build_qsa_metadata", qsa_cache._build_qsa_metadata_torch
+    )
+    spec = MLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=2,
+        dcp_sharded=False,
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
+    )
+    builder = qsa_cache.QSAMetadataBuilder(
+        spec,
+        ["model.layers.3.self_attn.indexer.compressed_key_cache"],
+        config,
+        torch.device("cpu"),
+        block_table_width=2,
+    )
+    starts = torch.tensor([0, 4], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_actual_tokens=4,
+        num_reqs=1,
+        max_query_len=4,
+        max_seq_len=11,
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([11], dtype=torch.int32),
+        slot_mapping=torch.arange(4, dtype=torch.int64),
+        block_table_tensor=torch.tensor([[5, 6]], dtype=torch.int32),
+    )
+    normal_slots = builder.build(0, common).slot_mapping.clone()
+    dummy = builder.build(0, replace(common, is_dummy_batch=True))
+    assert normal_slots.tolist() == [23, -1, 24, -1]
+    assert dummy.slot_mapping.tolist() == [-1, -1, -1, -1]

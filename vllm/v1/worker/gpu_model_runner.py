@@ -232,10 +232,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cp_utils import (
-    check_attention_cp_compatibility,
-    get_total_cp_world_size,
-)
+from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
@@ -1668,6 +1665,7 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        self._init_dcp_sharded = [True]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -5324,6 +5322,7 @@ class GPUModelRunner(
         ddtree_parent_metadata: DDTreeParentMetadata | None = None,
         cudagraph_capture_max_seq_len: int | None = None,
         cudagraph_graph_variant: int | None = None,
+        is_dummy_batch: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -5455,6 +5454,7 @@ class GPUModelRunner(
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
+            is_dummy_batch=is_dummy_batch,
             causal=True,
             cudagraph_graph_variant=cudagraph_graph_variant,
             is_prefilling=is_prefilling,
@@ -11024,6 +11024,7 @@ class GPUModelRunner(
                     max_query_len=max_query_len,
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
                     for_cudagraph_capture=build_for_capture,
+                    is_dummy_batch=True,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                     ddtree_parent_metadata=dummy_ddtree_parent_metadata,
@@ -12331,17 +12332,23 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        dcp_sharded = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
+            dcp_sharded.append(kv_cache_group.kv_cache_spec.dcp_sharded)
             if isinstance(kv_cache_group.kv_cache_spec, CircularBufferSpec):
                 max_num_blocks_per_req = 1
             else:
                 max_num_blocks_per_req = cdiv(
-                    max_model_len, block_size * get_total_cp_world_size()
+                    max_model_len,
+                    kv_cache_group.kv_cache_spec.global_block_size(
+                        self.dcp_world_size,
+                        self.parallel_config.prefill_context_parallel_size,
+                    ),
                 )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
@@ -12354,9 +12361,11 @@ class GPUModelRunner(
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
+            or dcp_sharded != self._init_dcp_sharded
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
+            self._init_dcp_sharded = dcp_sharded
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -12366,6 +12375,7 @@ class GPUModelRunner(
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                dcp_sharded=dcp_sharded,
                 max_num_blocks_per_req=max_num_blocks,
                 num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
@@ -12382,6 +12392,7 @@ class GPUModelRunner(
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
         )
+        assert self._init_dcp_sharded == dcp_sharded
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig

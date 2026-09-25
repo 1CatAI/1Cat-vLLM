@@ -7,7 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
+from vllm.models.qwen4_exp.common.qsa_cache import (
+    QSAStateBackend,
+    qsa_dcp_block_geometry,
+)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -31,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -191,6 +195,50 @@ def _mixed_dcp_specs():
         else:
             specs[name] = replace(spec, dcp_sharded=False)
     return specs
+
+
+def test_qwen4_exp_real_dcp_cache_geometry() -> None:
+    config = _vllm_config()
+    config.cache_config.block_size = 1600
+    config.parallel_config.decode_context_parallel_size = 2
+    target = qsa_dcp_block_geometry(config, "model.layers.3.self_attn")
+    draft = qsa_dcp_block_geometry(config, "mtp.layers.48.self_attn")
+    assert target == (1600, 3200, True)
+    assert draft == (3200, 3200, False)
+    config.parallel_config.decode_context_parallel_size = 1
+    assert qsa_dcp_block_geometry(config, "model.layers.3.self_attn") == (
+        1600,
+        1600,
+        True,
+    )
+
+
+def test_qwen4_exp_worker_block_table_respects_replicated_dcp_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.worker import block_table as block_table_module
+
+    monkeypatch.setattr(
+        block_table_module,
+        "get_dcp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
+    )
+    monkeypatch.setattr(block_table_module, "get_total_cp_world_size", lambda: 2)
+    tables = MultiGroupBlockTable(
+        max_num_reqs=1,
+        max_model_len=256,
+        max_num_batched_tokens=4,
+        pin_memory=False,
+        device=torch.device("cpu"),
+        block_sizes=[16, 16],
+        kernel_block_sizes=[16, 16],
+        dcp_sharded=[True, False],
+    )
+    assert [t.max_num_blocks_per_req for t in tables.block_tables] == [8, 16]
+    assert [(t.dcp_world_size, t.dcp_rank) for t in tables.block_tables] == [
+        (2, 1),
+        (1, 0),
+    ]
 
 
 def test_qwen4_exp_mixed_dcp_pages_preserve_shared_state_stride() -> None:
@@ -536,3 +584,30 @@ def test_qwen4_exp_qsa_metadata_canonicalizes_expanded_block_table() -> None:
     canonical = builder._canonical_block_table(expanded)
     assert canonical.data_ptr() == first_ptr
     assert torch.equal(canonical, physical_pages[None])
+
+
+def test_qwen4_exp_dcp2_selector_canonicalizes_local_group_expansion() -> None:
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    spec = MLAAttentionSpec(
+        block_size=3200,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=16,
+        dcp_sharded=False,
+    )
+    group = AttentionGroup(
+        QSAStateBackend,
+        ["model.layers.3.self_attn.indexer.compressed_key_cache"],
+        spec,
+        kv_cache_group_id=0,
+    )
+    group.create_metadata_builders(config, torch.device("cpu"), kernel_block_size=16)
+    builder = group.get_metadata_builder()
+    physical = torch.tensor([4, 7, 9], dtype=torch.int32)
+    expansion = 1600 // 16
+    expanded = (
+        physical[:, None] * expansion + torch.arange(expansion, dtype=torch.int32)
+    ).reshape(1, -1)
+    assert torch.equal(builder._canonical_block_table(expanded), physical[None])

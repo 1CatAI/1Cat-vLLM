@@ -7,7 +7,10 @@ from typing import Any
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.common.qsa_cache import QSAKeyStateCache
+from vllm.models.qwen4_exp.common.qsa_cache import (
+    QSACompressedKeyCache,
+    QSAKeyStateCache,
+)
 from vllm.models.qwen4_exp.nvidia.qsa import (
     Qwen4ExpQSAAttention,
     Qwen4ExpQSAFlashAttentionBackend,
@@ -18,6 +21,43 @@ from vllm.v1.worker.utils import bind_kv_cache
 
 def test_qsa_does_not_claim_batch_invariant_reductions() -> None:
     assert not Qwen4ExpQSAFlashAttentionBackend.supports_batch_invariance()
+
+
+@pytest.mark.parametrize(
+    ("prefix", "expected_main_size", "sharded"),
+    [
+        ("model.layers.3.self_attn", 1600, True),
+        ("mtp.layers.48.self_attn", 3200, False),
+    ],
+)
+def test_qsa_real_cache_specs_keep_only_target_main_sharded(
+    prefix: str, expected_main_size: int, sharded: bool
+) -> None:
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=1600),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+    )
+    main = _bare_qsa_attention(output_width=4)
+    main.layer_name = prefix
+    main.num_kv_heads = 1
+    main.head_dim = 256
+    main.kv_cache_torch_dtype = torch.uint8
+    main.kv_cache_dtype = "fp8_e4m3"
+    main_spec = main.get_kv_cache_spec(config)
+
+    side = object.__new__(QSACompressedKeyCache)
+    torch.nn.Module.__init__(side)
+    side.prefix = f"{prefix}.indexer.compressed_key_cache"
+    side.head_size = 128
+    side.dtype = torch.float16
+    side.compress_ratio = 16
+    side_spec = side.get_kv_cache_spec(config)
+
+    assert main_spec.block_size == expected_main_size
+    assert main_spec.dcp_sharded is sharded
+    assert side_spec.block_size == 3200
+    assert not side_spec.dcp_sharded
+    assert main_spec.global_block_size(2) == side_spec.global_block_size(2)
 
 
 def _bare_qsa_attention(output_width: int) -> Qwen4ExpQSAAttention:

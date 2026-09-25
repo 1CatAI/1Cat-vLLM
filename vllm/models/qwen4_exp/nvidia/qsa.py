@@ -58,7 +58,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from ..common.qsa_cache import QSAForwardMetadata
+from ..common.qsa_cache import QSAForwardMetadata, qsa_dcp_block_geometry
 from .indexer_qsa import QSAIndexer
 
 
@@ -113,17 +113,15 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
 class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     """Run paged sparse GQA with the QSA Triton kernel."""
 
-    supports_dcp: bool = False
+    supports_dcp: bool = True
     supports_pcp: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
-        if self.dcp_world_size != 1:
-            raise NotImplementedError(
-                "Qwen4Exp QSA does not support decode context parallelism"
-            )
+        if self.dcp_world_size not in (1, 2):
+            raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
         if self.kv_cache_dtype not in (
             "auto",
             "float16",
@@ -185,6 +183,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         from .ops.qsa import qsa_sparse_paged_attention
 
+        if getattr(layer, "qsa_dcp_sharded", False):
+            if output_gate is None:
+                raise RuntimeError("QSA DCP requires its output gate")
+            self._forward_qsa_dcp(
+                layer,
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+                output_gate[:num_tokens],
+            )
+            return output
+
         qsa_metadata: dict[str, torch.Tensor] = {}
         if query_positions is not None:
             qsa_metadata["query_positions"] = query_positions[:num_tokens]
@@ -206,6 +220,77 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             **qsa_metadata,
         )
         return output
+
+    def _forward_qsa_dcp(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        logical_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_req: torch.Tensor,
+        output: torch.Tensor,
+        output_gate: torch.Tensor,
+    ) -> None:
+        from vllm.distributed import get_dcp_group
+
+        from .ops.qsa import qsa_sparse_paged_attention
+        from .ops.qsa_dcp import qsa_localize_dcp_indices
+
+        local_indices_buffer = layer.dcp_local_indices_buffer
+        partial_output_buffer = layer.dcp_partial_output_buffer
+        partial_lse_buffer = layer.dcp_partial_lse_buffer
+        if any(
+            buffer is None
+            for buffer in (
+                local_indices_buffer,
+                partial_output_buffer,
+                partial_lse_buffer,
+            )
+        ):
+            raise RuntimeError("QSA DCP target workspaces are not initialized")
+        local_indices = qsa_localize_dcp_indices(
+            logical_indices,
+            local_indices_buffer[: query.shape[0]],
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            interleave_size=layer.cp_kv_cache_interleave_size,
+            local_block_size=key_cache.shape[1],
+        )
+        group = get_dcp_group()
+        gathered_query = group.all_gather(query.contiguous(), dim=1)
+        partial_output = partial_output_buffer[: query.shape[0]]
+        partial_lse = partial_lse_buffer[: query.shape[0]]
+        if partial_output.shape != gathered_query.shape:
+            raise RuntimeError("QSA DCP partial output has wrong head geometry")
+        qsa_sparse_paged_attention(
+            gathered_query,
+            key_cache,
+            value_cache,
+            local_indices,
+            block_table,
+            token_to_req,
+            partial_output,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            lse=partial_lse,
+        )
+        merged = cast(
+            torch.Tensor,
+            self.dcp_combine(
+                partial_output,
+                partial_lse,
+                group,
+                is_lse_base_on_e=False,
+            ),
+        )
+        # Match DCP1's attention-output rounding before its sigmoid gate.
+        output.copy_(
+            merged.to(output.dtype).float()
+            * torch.sigmoid(output_gate.view_as(output).float())
+        )
 
 
 def _verify_e4m3_kv_requirements(
@@ -237,7 +322,7 @@ def _verify_e4m3_kv_requirements(
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
-    supports_dcp = False
+    supports_dcp = True
     # The paged indexer and sparse attention switch launch profiles after 32
     # query rows. Advertise the first row count in the wider profile so the
     # generic MRV2 warmup can compile it before serving traffic.
@@ -253,6 +338,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         reduce_results: bool = True,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        dcp_local_indices_buffer: torch.Tensor | None = None,
+        dcp_partial_output_buffer: torch.Tensor | None = None,
+        dcp_partial_lse_buffer: torch.Tensor | None = None,
     ) -> None:
         nn.Module.__init__(self)
         cache_config = vllm_config.cache_config
@@ -275,13 +363,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
-        if (
-            parallel_config.prefill_context_parallel_size > 1
-            or parallel_config.decode_context_parallel_size > 1
-        ):
+        if parallel_config.prefill_context_parallel_size > 1:
             raise NotImplementedError(
-                "Qwen4Exp QSA does not support context parallelism"
+                "Qwen4Exp QSA does not support prefill context parallelism"
             )
+        if parallel_config.decode_context_parallel_size not in (1, 2):
+            raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
         if not getattr(config, "is_causal", True):
             raise NotImplementedError("Qwen4Exp QSA requires causal decoder attention")
 
@@ -363,6 +450,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
 
         self.layer_name = f"{prefix}.attn"
+        _, _, self.qsa_dcp_sharded = qsa_dcp_block_geometry(
+            vllm_config, self.layer_name
+        )
+        self.qsa_dcp_sharded &= parallel_config.decode_context_parallel_size > 1
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        self.dcp_local_indices_buffer = dcp_local_indices_buffer
+        self.dcp_partial_output_buffer = dcp_partial_output_buffer
+        self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
@@ -513,13 +608,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        block_size, _, dcp_sharded = qsa_dcp_block_geometry(
+            vllm_config, self.layer_name
+        )
         return FullAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dcp_sharded=dcp_sharded,
         )
 
     def _project_qkv_gate(
