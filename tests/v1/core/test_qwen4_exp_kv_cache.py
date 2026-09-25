@@ -8,22 +8,29 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     _get_csa_linear_tensor_layout,
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+    get_max_concurrency_for_kv_cache_config,
+    init_none_hash,
 )
 from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -283,6 +290,146 @@ def test_qwen4_exp_replicated_cache_memory_and_merge(spec_cls) -> None:
     assert not spec_cls.merge([spec, spec]).dcp_sharded
     with pytest.raises(AssertionError):
         spec_cls.merge([spec, replace(spec, dcp_sharded=True)])
+
+
+@pytest.mark.parametrize("dcp,expected_tokens", [(1, 775_096), (2, 1_178_375)])
+def test_qwen4_exp_capacity_projection_runs_through_allocator(dcp, expected_tokens):
+    config = _vllm_config()
+    config.model_config.max_model_len = 262_144
+    config.parallel_config.decode_context_parallel_size = dcp
+    config.cache_config.mamba_cache_mode = "align"
+    span = 1600 * dcp
+    specs = {}
+    for layer in range(13):
+        name = f"model.layers.{layer}.self_attn"
+        specs[name] = FullAttentionSpec(
+            block_size=1600 if layer < 12 else span,
+            num_kv_heads=1,
+            head_size=256,
+            dtype=torch.uint8,
+            dcp_sharded=layer < 12,
+        )
+        specs[name + ".compressed"] = MLAAttentionSpec(
+            block_size=span,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+            compress_ratio=4,
+            dcp_sharded=False,
+        )
+        specs[name + ".compressor_state"] = CircularBufferSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.float16,
+            dcp_sharded=False,
+        )
+    for layer in range(36):
+        specs[f"model.layers.{layer}.linear_attn"] = MambaSpec(
+            block_size=span,
+            shapes=((1, 64),),
+            dtypes=(torch.float16,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=3,
+        )
+    specs["model.layers.0.ple"] = MambaSpec(
+        block_size=span,
+        shapes=((1, 64),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+        tp_replicated=True,
+    )
+    # State shapes are synthetic but fit each real QSA page; the allocator
+    # pads them exactly as it does for the measured 12 QSA / 36 GDN / 1 draft.
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(
+        config, groups, available_memory=547 * 11_980_800
+    )
+    concurrency = get_max_concurrency_for_kv_cache_config(config, cache)
+    assert int(concurrency * 262_144) == expected_tokens
+
+
+def test_dcp_prefix_hit_respects_target_draft_and_state_ownership():
+    from tests.v1.core.test_prefix_caching import make_request
+
+    init_none_hash(sha256)
+    target = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    draft = replace(target, dcp_sharded=False)
+    state = MambaSpec(
+        block_size=16, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="all"
+    )
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], target),
+            KVCacheGroupSpec(["draft"], draft),
+            KVCacheGroupSpec(["state"], state),
+        ],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=128,
+        hash_block_size=16,
+        dcp_world_size=2,
+        enable_caching=True,
+    )
+    owners = manager.coordinator.single_type_managers
+    assert [m.block_size for m in owners] == [32, 16, 16]
+    assert [m.dcp_world_size for m in owners] == [2, 1, 1]
+    common = list(range(64))
+    first = make_request("first", common + [91] * 5, 16, sha256)
+    assert manager.allocate_slots(first, 69) is not None
+    second = make_request("second", common + [92] * 5, 16, sha256)
+    blocks, tokens = manager.get_computed_blocks(second)
+    assert tokens == 64
+    assert [len(group) for group in blocks.blocks] == [2, 4, 4]
+    manager.free(first)
+
+
+def test_dcp_offload_worker_and_scheduler_keep_the_same_group_budget():
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.parallel_config.world_size = 4
+    config.cache_config.block_size = 16
+    config.cache_config.hash_block_size = 4
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.cache_config.mamba_cache_mode = "align"
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector_extra_config={"cpu_bytes_to_use": 16 * 1024**2}
+    )
+    specs = _mixed_dcp_specs()
+    for name, spec in list(specs.items()):
+        if isinstance(spec, MambaSpec):
+            specs[name] = replace(
+                spec, block_size=32, mamba_cache_mode="align", num_speculative_blocks=3
+            )
+    groups = get_kv_cache_groups(config, specs)
+    worker_cache = get_kv_cache_config_from_groups(
+        config, groups, available_memory=1 << 20
+    )
+    scheduler_cache = generate_scheduler_kv_cache_config([worker_cache])
+    worker = CPUOffloadingSpec(config, worker_cache)
+    scheduler = CPUOffloadingSpec(config, scheduler_cache)
+    assert worker.gpu_block_size == scheduler.gpu_block_size == (32, 4, 32, 32, 32, 32)
+    assert worker.hash_block_size == scheduler.hash_block_size == 4
+    assert worker.partition_by_group and scheduler.partition_by_group
+    assert worker.cpu_group_page_sizes == scheduler.cpu_group_page_sizes
+    assert worker.cpu_group_num_blocks == scheduler.cpu_group_num_blocks
+    assert worker.num_blocks > 0
+    used = (
+        sum(
+            worker.cpu_group_page_sizes[i] * n
+            for i, n in worker.cpu_group_num_blocks.items()
+        )
+        * 4
+    )
+    assert used <= 16 * 1024**2
 
 
 def test_qwen4_exp_circular_manager_owns_one_block_per_request() -> None:

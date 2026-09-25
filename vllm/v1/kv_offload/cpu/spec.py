@@ -6,7 +6,7 @@ from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -75,19 +75,20 @@ class CPUOffloadingSpec(OffloadingSpec):
             for i, group in enumerate(kv_cache_config.kv_cache_groups)
             if group.kv_cache_spec.prefix_cacheable
         }
+        mamba_specs = {}
+        for i, group in cacheable_groups.items():
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            if isinstance(spec, MambaSpec):
+                mamba_specs[i] = spec
         # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
         # Keep the existing layout for single groups and mixed block geometry.
         self.partition_by_group = (
             kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
-            and any(
-                isinstance(group.kv_cache_spec, MambaSpec)
-                for group in cacheable_groups.values()
-            )
-            and len(
-                {group.kv_cache_spec.block_size for group in cacheable_groups.values()}
-            )
-            == 1
+            and bool(mamba_specs)
+            and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
@@ -124,9 +125,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
-                if isinstance(group.kv_cache_spec, MambaSpec):
+                if i in mamba_specs:
                     mamba_groups.add(i)
-                    mamba_spec = group.kv_cache_spec
+                    mamba_spec = mamba_specs[i]
             # Physical storage contains only that group's tensors, rather than
             # every shared GPU tensor for each independently allocated group key.
             self.cpu_page_size_per_worker = sum(self.cpu_group_page_sizes.values())

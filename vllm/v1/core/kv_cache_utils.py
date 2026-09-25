@@ -601,7 +601,8 @@ def resolve_kv_cache_block_sizes(
     - ``scheduler_block_size`` is the token-alignment invariant used by the
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
       ``cache_config.block_size * dcp * pcp``. Multiple groups: LCM of every
-      group's block size — context parallelism is not supported here.
+      group's global token span. DCP supports full-attention shards and
+      replicated owners; hybrid PCP remains unsupported.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.hash_block_size`` override if set, else the GCD of group
@@ -616,16 +617,29 @@ def resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
 
     if len(groups) <= 1:  # Single group: block_size * dcp * pcp
+        if groups and not groups[0].kv_cache_spec.dcp_sharded:
+            dcp = pcp = 1
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
-    if dcp != 1 or pcp != 1:
+    if pcp != 1 or (
+        dcp != 1
+        and any(
+            spec.dcp_sharded and not isinstance(spec, FullAttentionSpec)
+            for group in groups
+            for spec in (
+                group.kv_cache_spec.kv_cache_specs.values()
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else [group.kv_cache_spec]
+            )
+        )
+    ):
         raise ValueError(
-            "Hybrid KV cache groups with multiple block sizes do not "
-            "support context parallelism (dcp_world_size/pcp_world_size > 1)."
+            "Hybrid context parallelism requires PCP=1 and full-attention "
+            "shards or replicated cache owners."
         )
 
-    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    group_block_sizes = [g.kv_cache_spec.global_block_size(dcp) for g in groups]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors

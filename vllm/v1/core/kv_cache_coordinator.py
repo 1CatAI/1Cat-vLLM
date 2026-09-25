@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
 from math import lcm
 
 from vllm.v1.core.block_pool import BlockPool
@@ -423,13 +424,11 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        self.block_size = self.kv_cache_spec.block_size
-        self.dcp_world_size = dcp_world_size
-        self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
-            self.block_size *= dcp_world_size
-        if pcp_world_size > 1:
-            self.block_size *= pcp_world_size
+        self.block_size = self.kv_cache_spec.global_block_size(
+            dcp_world_size, pcp_world_size
+        )
+        self.dcp_world_size = dcp_world_size if self.kv_cache_spec.dcp_sharded else 1
+        self.pcp_world_size = pcp_world_size if self.kv_cache_spec.dcp_sharded else 1
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
         assert not enable_caching or (hash_block_size == self.block_size), (
@@ -495,16 +494,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         participating_block_sizes = [
-            group.kv_cache_spec.block_size
-            for group in kv_cache_config.kv_cache_groups
-            if group.kv_cache_spec.prefix_cacheable
+            manager.block_size
+            for manager in self.single_type_managers
+            if manager.kv_cache_spec.prefix_cacheable
         ]
         assert all(
             block_size % hash_block_size == 0
             for block_size in participating_block_sizes
         ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        if dcp_world_size > 1:
+            assert all(
+                isinstance(g.kv_cache_spec, FullAttentionSpec)
+                or not g.kv_cache_spec.dcp_sharded
+                for g in kv_cache_config.kv_cache_groups
+            ), "Hybrid DCP requires full-attention shards or replicated cache owners."
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -526,6 +530,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
+            if self.single_type_managers[i].block_size != spec.block_size:
+                # Prefix lookup operates in global tokens; keep worker specs
+                # local so their physical cache strides are unchanged.
+                spec = replace(
+                    spec,
+                    block_size=self.single_type_managers[i].block_size,
+                    dcp_sharded=False,
+                )
 
             # Try to find an existing group with the same spec
             for existing_spec, group_ids, existing_cls in attention_groups:
