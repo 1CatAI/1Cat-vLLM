@@ -522,6 +522,9 @@ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 
 # Skip adding +precompiled suffix to version (preserves git-derived version)
 ENV VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1
+# A linked Git worktree's .git file points outside the Docker build context.
+# Let callers provide the exact source version when SCM metadata is unavailable.
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 # Use existing torch for nightly builds
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -539,6 +542,9 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Build the vLLM wheel
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=.git,target=.git \
+    if [ -n "${SETUPTOOLS_SCM_PRETEND_VERSION}" ]; then \
+        export SETUPTOOLS_SCM_PRETEND_VERSION; \
+    fi; \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \
         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \
