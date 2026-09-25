@@ -1,7 +1,8 @@
 # Qwen4Exp QSA DCP2 implementation and V100 validation plan
 
-Status: planning baseline, 2026-09-24 (America/Vancouver). No DCP code or GPU
-measurement has been completed on this branch.
+Status: allocator and operator prototype, 2026-09-24 (America/Vancouver).
+CPU ownership/prefix/offload geometry and bounded V100 operator tests have
+passed. QSA DCP serving is still disabled; the full model has not run with DCP2.
 
 ## Frozen source stack
 
@@ -123,4 +124,64 @@ and review of measured capacity, latency, and output parity.
   pre-commit hooks passed.
 - CPU baseline: 136 passed, 12 GPU-only skipped across QSA graph padding,
   Mamba retention, and E4M3 MTP overlay tests on this worktree.
-- DCP2 implementation, model startup, and V100 measurements remain pending.
+- `212be8cf8b`: per-owner `dcp_sharded` metadata and global block spans;
+  per-layer physical page sizes; shared Mamba views retain the correct stride.
+- `5c93a7636d`: separate localized selection buffer using 1Cat's all-ID / -1
+  ABI; optional base-2 LSE and FP32 attention output; per-rank output gating
+  is rejected when LSE is requested.
+- `6f6bbeee1d`: owner-aware hybrid prefix lookup, manager allocation, and
+  grouped CPU offload budgets. The scheduler and worker agree on group spans
+  and budgets even with heterogeneous Mamba padding.
+- The real allocator, with the model's 12 target QSA / 36 GDN / 1 draft / 1 PLE
+  owner counts and synthetic recurrent tensors that fit their padded pages,
+  reproduces 775,096 DCP1 tokens and projects 1,178,375 target-only DCP2 tokens
+  at the same `547 * 11,980,800` byte budget. This excludes additional runtime
+  scratch and does not establish deployed capacity.
+- CPU coverage: 14 QSA layout/ownership tests, 147 retention/grouped-offload
+  tests, and 66 general cache-utils tests passed. One general DeepSeek test
+  lacks `max_in_flight_tokens` in its mock config and fails identically at
+  the untouched baseline `978f38fb9b`; it is not a DCP regression. General
+  config tests require an explicit CPU platform in this GPU-free environment.
+- V100 suites: 20 localization tests (13 GPU cases plus 7 argument guards)
+  and 4 G12 attention cases passed. Attention covers FP16/E4M3, one/multiple
+  split-K partitions, empty owners, nonidentity page tables, and the original
+  DCP1 call. Predetermined tolerances: output `rtol=3e-3, atol=2e-3`; base-2 LSE
+  `rtol=1e-4, atol=2e-3` against an independent FP32 reference.
+- GPU execution used the existing `b4fef533ec` image with only the two QSA
+  operator modules mounted. Their SHA256 values are recorded below; both
+  match committed source. This is single-GPU simulation of each rank's math,
+  not a distributed NCCL or model test. The graph test's synchronization call
+  was renamed to `torch.accelerator.synchronize` after the GPU run to satisfy
+  the repository lint rule; the tested kernels are unchanged.
+- Lease `lease-c79436ef-946a-40d8-ab15-0e42b9508169` is released; all three
+  temporary containers were cleaned, and the displaced resident reports
+  `restored=1`. The 18080 health check returned 200, `/v1/models` returned
+  `QWEN-Flash`, and a bounded chat request returned `OK` with the original
+  `b4fef533ec` service fingerprint.
+
+Operator SHA256:
+
+```text
+qsa.py      266b861cdf48c86529d8877538b1b30933a4b51134dde1dd118ae8578ffd3e05
+qsa_dcp.py  b941fce8e2fe827be11fde79c69f3865d33fe3eebf8eff6e440cefc4c3490c7b
+```
+
+Evidence directory: `/home/leon/1Cat/research/qsa-dcp2-assessment-20260924/`:
+`v100-indices-r1.log`, `v100-attention.log`, `cpu-cache-utils.log`,
+`baseline-deepseek-fixture.log`, and `restored-serving-smoke.json`.
+
+## Next integration boundary
+
+1. Emit the correct target/selector/ring/draft ownership from the model's
+   real cache specs and propagate it through worker block tables and slot
+   mapping. Existing QSA DCP rejection must remain until these agree.
+2. Wire localized metadata, query gather, LSE/output collectives, and the final
+   output gate into `Qwen4ExpQSAFlashAttentionImpl`. Validate actual two-rank
+   communication, including empty owners and graph replay. TP4 has two KV
+   heads, so DCP pairs must stay within each replicated KV-head pair.
+3. Allocate model-level persistent workspaces and measure their true footprint.
+   Current LSE output is an operator API, not a graph-memory optimization.
+4. Build a complete image from this main-plus-PR stack before full-model A/B;
+   the old image used for operator tests does not validate current main's
+   native libraries. Then qualify MTP3 metadata, offload transfers/restart,
+   long-context cache pressure, output parity, and serving performance.
