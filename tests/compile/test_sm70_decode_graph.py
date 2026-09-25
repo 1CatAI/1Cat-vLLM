@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.utils import set_lazy_env
 from vllm.compilation.sm70_decode_graph import (
     is_sm70_decode_graph_compiling,
     sm70_decode_graph_compilation,
@@ -14,9 +15,12 @@ from vllm.compilation.sm70_decode_graph import (
 )
 from vllm.config.parallel import ParallelConfig
 from vllm.config.vllm import (
+    VllmConfig,
+    _apply_qwen4exp_ple_cascade_defaults,
     _apply_sm70_qwen38_hybrid_ple_defaults,
     _apply_sm70_qwen38_nomtp_defaults,
     _is_sm70_qwen38_nomtp_dual_compile_contract,
+    _qwen4exp_ple_cascade_requested,
 )
 
 
@@ -217,7 +221,7 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
         "VLLM_PLE_CPU_OFFLOAD",
         "VLLM_PLE_DISK_OFFLOAD",
     ):
-        monkeypatch.delenv(env_name, raising=False)
+        set_lazy_env(monkeypatch, env_name, None)
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""
 
@@ -235,9 +239,9 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
 def test_qwen38_hybrid_ple_decode_uses_local_module(monkeypatch) -> None:
     from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 
-    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
-    monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
+    set_lazy_env(monkeypatch, "VLLM_PLE_CPU_OFFLOAD", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
 
     class ToyPle(PleOffloadLayer):
         def __init__(self) -> None:
@@ -265,7 +269,7 @@ def test_qwen38_hybrid_ple_decode_uses_local_module(monkeypatch) -> None:
 def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     from vllm.v1.ple_offload.connector import PleOffloadConnector
 
-    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches: list[tuple[int, int]] = []
     connector = SimpleNamespace(
         _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens))
@@ -279,3 +283,37 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     )
 
     assert launches == [(1, 8192)]
+
+
+def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
+    for name in (
+        "VLLM_PLE_CPU_OFFLOAD",
+        "VLLM_PLE_DISK_OFFLOAD",
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+        "VLLM_QWEN4EXP_PLE_DISK",
+    ):
+        set_lazy_env(monkeypatch, name, None)
+    model_config = SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[1]))
+
+    assert not _qwen4exp_ple_cascade_requested(model_config)
+    # The disk tier starts the cascade.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
+    assert _qwen4exp_ple_cascade_requested(model_config)
+    with pytest.raises(ValueError, match="no PLE layers"):
+        _qwen4exp_ple_cascade_requested(
+            SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[]))
+        )
+    # Regression (first cascade boot, 2026-09-15): the PLE offload worker
+    # builds a model-less VllmConfig for its isolated world while the variable
+    # is inherited; that config must not be refused.
+    VllmConfig()
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", "1")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _qwen4exp_ple_cascade_requested(model_config)
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
+
+    parallel_config = ParallelConfig()
+    assert parallel_config._ple_offload_ipc_path == ""
+    _apply_qwen4exp_ple_cascade_defaults(parallel_config)
+    assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
+    assert parallel_config._ple_offload_ipc_path.startswith("ipc://")

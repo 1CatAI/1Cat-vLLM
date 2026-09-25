@@ -2,15 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Common Qwen4Exp PLE helpers."""
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed.utils import get_layers_outside_first_pp_rank
+from vllm.logger import init_logger
+from vllm.utils.mem_utils import format_gib
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = init_logger(__name__)
 
 
 def check_ple_layers_on_first_pp_rank(text_config: Any, pp_size: int) -> None:
@@ -102,20 +110,34 @@ def copy_ple_embedding_shard_(
     source = loaded_weight.narrow(0, overlap.source_start, overlap.row_count)
     target = destination.narrow(0, overlap.destination_start, overlap.row_count)
     with torch.no_grad():
-        target.copy_(source.to(device=target.device, dtype=target.dtype))
+        # copy_ converts device and dtype itself. Staging through .to() would
+        # leave a device-side copy of the slice cached by the allocator, one
+        # checkpoint shard (0.37 GiB for Qwen3.8-Flash-Next) per card.
+        target.copy_(source)
     return overlap.row_count
 
 
 @dataclass(frozen=True)
 class PLEPlacement:
-    """How many PLE table rows live in device memory and how many on the host."""
+    """How many PLE table rows live in each tier of one tensor-parallel rank.
+
+    The tiers are consecutive ranges of the rank's rows: device memory first,
+    then pinned host memory, then the disk tier the PLE offload worker reads
+    from the mapped checkpoint.
+    """
 
     vram_rows: int
     host_rows: int
+    disk_rows: int
+
+    @property
+    def local_rows(self) -> int:
+        """Rows the rank holds itself."""
+        return self.vram_rows + self.host_rows
 
     @property
     def total_rows(self) -> int:
-        return self.vram_rows + self.host_rows
+        return self.local_rows + self.disk_rows
 
 
 def plan_ple_placement(
@@ -123,63 +145,149 @@ def plan_ple_placement(
     total_rows: int,
     row_bytes: int,
     host_budget_bytes: int,
+    vram_budget_bytes: int | None,
+    disk_allowed: bool = False,
 ) -> PLEPlacement:
-    """Place as many PLE rows as possible in device memory.
+    """Split the PLE rows of one rank into device, host and disk tiers.
 
     The table is addressed by hashes, so every row is equally likely to be read
-    and the split point carries no meaning beyond capacity: whatever does not
-    fit in device memory goes to the host. Rows are never dropped, so the
-    caller must provide a host budget large enough for the remainder.
+    and the split points carry no meaning beyond capacity -- so every tier is
+    filled before the next, fastest first: the device up to its measured
+    budget, then the pinned host share, and only then the disk tier, which is
+    the mapped checkpoint and needs no budget. Without a device budget (no
+    cascade) the host share is taken first and the device holds the rest
+    unmeasured, as it always has. Rows are never dropped: a remainder with no
+    tier left to hold it is an error.
     """
 
     if total_rows < 0 or row_bytes <= 0:
         raise ValueError("total_rows must be non-negative and row_bytes positive")
     if host_budget_bytes < 0:
         raise ValueError("host budget must be non-negative")
-    host_rows = min(total_rows, host_budget_bytes // row_bytes)
-    return PLEPlacement(vram_rows=total_rows - host_rows, host_rows=host_rows)
+    if vram_budget_bytes is not None and vram_budget_bytes < 0:
+        raise ValueError("device budget must be non-negative")
+    if vram_budget_bytes is None:
+        host_rows = min(total_rows, host_budget_bytes // row_bytes)
+        vram_rows = total_rows - host_rows
+    else:
+        vram_rows = min(total_rows, vram_budget_bytes // row_bytes)
+        host_rows = min(total_rows - vram_rows, host_budget_bytes // row_bytes)
+    disk_rows = total_rows - host_rows - vram_rows
+    if disk_rows and not disk_allowed:
+        raise ValueError(
+            f"The PLE table does not fit: {disk_rows} rows "
+            f"({disk_rows * row_bytes} bytes) remain beyond the device and "
+            "host tiers. Raise VLLM_QWEN4EXP_PLE_HOST_GIB, or set "
+            "VLLM_QWEN4EXP_PLE_DISK=1 to read the rest from the checkpoint on disk."
+        )
+    return PLEPlacement(vram_rows=vram_rows, host_rows=host_rows, disk_rows=disk_rows)
 
 
-def copy_ple_embedding_shard_split_(
-    vram_table: torch.Tensor,
-    host_table: torch.Tensor,
+@dataclass(frozen=True)
+class PLERemotePlacement:
+    """Rows of one tensor-parallel rank that the PLE offload worker serves.
+
+    ``tp_start`` and ``tp_end`` are the rank's vocabulary range as the
+    checkpoint counts it, without padding. ``local_rows`` are the rows the
+    rank keeps itself, counted from its first row (device tier followed by
+    the pinned-host tier), so every rank-local id at or beyond it is read
+    from the worker's output buffer, which the worker fills from the mapped
+    checkpoint.
+    """
+
+    tp_start: int
+    tp_end: int
+    local_rows: int
+
+    def __post_init__(self) -> None:
+        if self.tp_start < 0 or self.tp_end < self.tp_start:
+            raise ValueError("invalid TP vocabulary range")
+        if self.local_rows < 0:
+            raise ValueError("local_rows must be non-negative")
+
+    @property
+    def remote_rows(self) -> int:
+        """Rows of this rank the worker has to serve."""
+        return max(0, self.tp_end - self.tp_start - self.local_rows)
+
+
+@dataclass(frozen=True)
+class PLEDiskSegment:
+    """Global row range ``[start, end)`` the worker reads from the checkpoint."""
+
+    start: int
+    end: int
+
+
+def plan_ple_disk_segments(
+    placements: Sequence[PLERemotePlacement],
+) -> list[PLEDiskSegment]:
+    """Row ranges the worker reads from the checkpoint, addressed by global id.
+
+    Tensor-parallel ranks own disjoint vocabulary ranges, so the segments are
+    disjoint and every row id falls into at most one of them.
+    """
+
+    ranges = sorted((placement.tp_start, placement.tp_end) for placement in placements)
+    for (_, previous_end), (next_start, _) in pairwise(ranges):
+        if next_start < previous_end:
+            raise ValueError(f"tensor-parallel vocabulary ranges overlap: {ranges}")
+    return [
+        PLEDiskSegment(
+            start=placement.tp_start + placement.local_rows, end=placement.tp_end
+        )
+        for placement in placements
+        if placement.remote_rows
+    ]
+
+
+def ple_disk_mask(
+    ids: torch.Tensor, segments: Sequence[PLEDiskSegment]
+) -> torch.Tensor:
+    """Which row ids the worker has to read from the mapped checkpoint."""
+
+    mask = torch.zeros_like(ids, dtype=torch.bool)
+    for segment in segments:
+        mask |= (ids >= segment.start) & (ids < segment.end)
+    return mask
+
+
+def copy_ple_embedding_shard_tiers_(
+    tiers: Sequence[tuple[int, torch.Tensor | None]],
     loaded_weight: torch.Tensor,
     *,
     checkpoint_start: int,
     tp_start: int,
     tp_end: int,
 ) -> int:
-    """Copy one checkpoint shard into a table split across device and host.
+    """Copy one checkpoint shard into a table split across consecutive tiers.
 
-    The split point is a row index in the TP-local range, so both halves are
-    plain sub-ranges of the same vocabulary interval and the single-target
-    copy above handles each of them unchanged.
+    Each tier is a row count and the tensor holding those rows, or ``None``
+    for rows another process holds. The tiers cover the TP-local range in
+    order, so every tier is a plain sub-range of the same vocabulary interval
+    and the single-target copy above handles each of them unchanged.
     """
 
     if tp_start < 0 or tp_end < tp_start:
         raise ValueError("invalid TP vocabulary range")
-    if vram_table.shape[0] + host_table.shape[0] < tp_end - tp_start:
-        raise ValueError("split tables do not cover the requested TP range")
-    # Storage includes vocabulary padding, while checkpoint TP bounds do not.
-    # Padding can lie in either half and must not reject a valid checkpoint.
-    boundary = min(tp_end, tp_start + vram_table.shape[0])
+    if sum(rows for rows, _ in tiers) < tp_end - tp_start:
+        raise ValueError("tiers do not cover the requested TP range")
     copied = 0
-    if vram_table.shape[0]:
-        copied += copy_ple_embedding_shard_(
-            vram_table,
-            loaded_weight,
-            checkpoint_start=checkpoint_start,
-            tp_start=tp_start,
-            tp_end=boundary,
-        )
-    if boundary < tp_end:
-        copied += copy_ple_embedding_shard_(
-            host_table,
-            loaded_weight,
-            checkpoint_start=checkpoint_start,
-            tp_start=boundary,
-            tp_end=tp_end,
-        )
+    tier_start = tp_start
+    for rows, destination in tiers:
+        # Storage includes vocabulary padding, while checkpoint TP bounds do
+        # not. Padding can lie in any tier and must not reject a valid
+        # checkpoint.
+        tier_end = min(tp_end, tier_start + rows)
+        if destination is not None and tier_start < tier_end:
+            copied += copy_ple_embedding_shard_(
+                destination,
+                loaded_weight,
+                checkpoint_start=checkpoint_start,
+                tp_start=tier_start,
+                tp_end=tier_end,
+            )
+        tier_start = tier_end
     return copied
 
 
@@ -279,3 +387,100 @@ def cap_host_budget_bytes(
         raise ValueError("ranks_sharing_host must be positive")
     share = max(0, available_bytes - reserve_bytes) // ranks_sharing_host
     return min(budget_bytes, share)
+
+
+def env_gib_bytes(name: str) -> int | None:
+    """Bytes of a GiB-valued PLE variable, or None when it is unset."""
+
+    value_gib = getattr(envs, name)
+    if value_gib is None:
+        return None
+    if not math.isfinite(value_gib) or value_gib < 0:
+        raise ValueError(f"{name} must be finite and non-negative, got {value_gib}")
+    return int(value_gib * 1024**3)
+
+
+def ple_host_budget_bytes() -> int | None:
+    """Configured host bytes per rank for the PLE table, or None to derive them."""
+
+    return env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_GIB")
+
+
+def ple_host_reserve_bytes(host_total_bytes: int) -> int:
+    """Host memory the placement leaves to everything else.
+
+    The engine processes, the checkpoint loading and other tenants of the
+    host need room that no single rank can measure; on a 30 GB host the
+    default keeps 7.5 GiB.
+    """
+
+    reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB")
+    if reserve is not None:
+        return reserve
+    return host_total_bytes // 4
+
+
+def ple_vram_reserve_bytes(device_total_bytes: int) -> int:
+    """Device memory the automatic placement keeps free.
+
+    It covers the activation peak and the graph pool, which the engine only
+    measures after the weights are placed -- so they cannot be read here. On
+    a 48 GB card the gap between (weights + KV) and the utilization budget
+    stayed between 1.8 and 2.3 GiB; the default leaves a slightly wider
+    margin. Overshooting costs host memory, undershooting makes the KV
+    allocator fail late.
+    """
+
+    reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB")
+    if reserve is not None:
+        return reserve
+    return min(int(device_total_bytes * 0.08), 4 * 1024**3)
+
+
+def ple_cascade_configured() -> bool:
+    """Whether the overflow cascade is on: rows beyond the device and host
+    tiers are read from the mapped checkpoint by the PLE offload worker."""
+
+    return bool(envs.VLLM_QWEN4EXP_PLE_DISK)
+
+
+def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
+    """Refuse a configured pinned-host share the host cannot hold.
+
+    Runs once before any rank starts. The ranks place their tables at the same
+    time, so a rank that reads the host memory while a sibling already pins its
+    share would count that share twice and refuse a configuration that fits.
+    The reserve covers what the loading claims afterwards.
+    """
+
+    if not getattr(text_config, "ple_layer_ids", None):
+        return
+    budget = ple_host_budget_bytes()
+    available = available_host_bytes()
+    total = total_host_bytes()
+    if not budget or available is None or total is None:
+        return
+    reserve = ple_host_reserve_bytes(total)
+    share = cap_host_budget_bytes(
+        budget_bytes=budget,
+        available_bytes=available,
+        reserve_bytes=reserve,
+        ranks_sharing_host=ranks_sharing_host,
+    )
+    if share < budget:
+        raise ValueError(
+            f"VLLM_QWEN4EXP_PLE_HOST_GIB asks for {format_gib(budget)} GiB of "
+            f"pinned host memory per rank, but each of the {ranks_sharing_host} "
+            f"tensor-parallel ranks may pin at most {format_gib(share)} GiB: "
+            f"{format_gib(available)} GiB available, {format_gib(reserve)} GiB "
+            "kept in reserve. Lower VLLM_QWEN4EXP_PLE_HOST_GIB or "
+            "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB."
+        )
+    logger.info(
+        "Qwen4Exp PLE host share %s GiB per rank fits: %d ranks, %s GiB "
+        "available, %s GiB kept in reserve.",
+        format_gib(budget),
+        ranks_sharing_host,
+        format_gib(available),
+        format_gib(reserve),
+    )

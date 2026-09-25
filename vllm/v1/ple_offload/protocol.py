@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """IPC message definitions for PLE CPU offload."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import msgspec
 import torch
@@ -26,6 +27,10 @@ class PleOffloadRegistration:
     input_ids_buf: torch.Tensor
     query_start_loc_buf: torch.Tensor
     ngram_context_buf: torch.Tensor | None
+    # Layers that keep resident rows describe here which rows the worker
+    # serves for this rank (PleOffloadLayer.remote_placement); layers absent
+    # from the mapping follow the whole-table contract.
+    remote_placements: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
