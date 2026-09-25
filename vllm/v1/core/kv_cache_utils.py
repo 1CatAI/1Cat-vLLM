@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
@@ -1087,16 +1088,21 @@ def unify_kv_cache_spec_page_size(
                 # still padded to max_page_size by the branch below.
                 new_block_size = layer_spec.block_size
             replace_args = {"block_size": new_block_size}
+            new_spec = layer_spec.copy_with_new_block_size(new_block_size)
             # A padded page does not grow when only block_size changes. This
             # happens for hybrid Mamba targets when a higher-precision draft
             # cache has a larger page than the target cache. Keep the logical
             # block-size adjustment and grow the physical padding with it.
-            if (
+            if isinstance(layer_spec, (AttentionSpec, MambaSpec)) and (
                 isinstance(layer_spec, MambaSpec)
-                or getattr(layer_spec, "page_size_padded", None) is not None
+                or layer_spec.page_size_padded is not None
             ):
                 replace_args["page_size_padded"] = max_page_size
-            new_spec = replace(layer_spec, **replace_args)
+                new_spec = replace(
+                    layer_spec,
+                    block_size=new_block_size,
+                    page_size_padded=max_page_size,
+                )
             assert new_spec.page_size_bytes == max_page_size, (
                 f"Failed to unify KV page for {layer_name}: "
                 f"spec={layer_spec!r}, old_page={layer_page_size}, "
@@ -1679,7 +1685,7 @@ def _get_kv_cache_config_csa_linear(
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     kv_cache_tensors = [
         KVCacheTensor(
-            size=layout.main_kv_page_size * num_blocks,
+            size=layout.main_kv_page_sizes[index] * num_blocks,
             shared_by=[main_kv_name]
             + [
                 group.layer_names[index]
@@ -1691,7 +1697,7 @@ def _get_kv_cache_config_csa_linear(
     ]
     kv_cache_tensors.extend(
         KVCacheTensor(
-            size=layout.compressed_page_size * num_blocks,
+            size=layout.compressed_page_sizes[index] * num_blocks,
             shared_by=[compressed_name, layout.compressor_state_names[index]],
         )
         for index, compressed_name in enumerate(layout.compressed_names)
@@ -1988,14 +1994,12 @@ class _CSALinearTensorLayout:
     compressed_names: list[str]
     compressor_state_names: list[str]
     mamba_groups: list[KVCacheGroupSpec]
-    main_kv_page_size: int
-    compressed_page_size: int
+    main_kv_page_sizes: list[int]
+    compressed_page_sizes: list[int]
 
     @property
     def bytes_per_block(self) -> int:
-        return len(self.main_kv_names) * (
-            self.main_kv_page_size + self.compressed_page_size
-        )
+        return sum(self.main_kv_page_sizes) + sum(self.compressed_page_sizes)
 
 
 class _CSALinearRoles(NamedTuple):
@@ -2119,6 +2123,7 @@ def _get_kv_cache_groups_csa_linear(
     if roles is None:
         return None
     tuples = _get_csa_linear_cache_tuples(roles)
+    dcp = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
     expected_local_kv_heads = vllm_config.model_config.get_num_kv_heads(
         vllm_config.parallel_config
@@ -2135,7 +2140,7 @@ def _get_kv_cache_groups_csa_linear(
         _, compressed = cache.compressed
         _, compressor_state = cache.compressor_state
         if not (
-            main_kv.block_size == compressed.block_size
+            main_kv.global_block_size(dcp) == compressed.global_block_size(dcp)
             and compressor_state.real_page_size_bytes <= compressed.page_size_bytes
             and all(
                 spec.page_size_padded is None
@@ -2149,22 +2154,20 @@ def _get_kv_cache_groups_csa_linear(
     shapes = {
         (
             cache.compressed[1].compress_ratio,
-            cache.main_kv[1].block_size,
-            cache.main_kv[1].page_size_bytes,
-            cache.compressed[1].page_size_bytes,
+            cache.main_kv[1].global_block_size(dcp),
         )
         for cache in tuples
     }
     if len(shapes) != 1:
         raise ValueError(
-            "CSA+linear layers must share one block size, compression ratio, "
-            "and main/compressed page geometry."
+            "CSA+linear layers must share one global block span and compression ratio."
         )
-    _, _, main_kv_page, compressed_page = next(iter(shapes))
+    main_kv_pages = [cache.main_kv[1].page_size_bytes for cache in tuples]
 
     padded_compressor_specs: dict[str, KVCacheSpec] = {
         cache.compressor_state[0]: replace(
-            cache.compressor_state[1], page_size_padded=compressed_page
+            cache.compressor_state[1],
+            page_size_padded=cache.compressed[1].page_size_bytes,
         )
         for cache in tuples
     }
@@ -2174,9 +2177,11 @@ def _get_kv_cache_groups_csa_linear(
         for name, spec in (cache.main_kv, cache.compressed)
     }
     compressed_sparse_uniform = UniformTypeKVCacheSpecs.from_specs(
-        compressed_sparse_specs
+        compressed_sparse_specs, dcp
     )
-    compressor_uniform = UniformTypeKVCacheSpecs.from_specs(padded_compressor_specs)
+    compressor_uniform = UniformTypeKVCacheSpecs.from_specs(
+        padded_compressor_specs, dcp
+    )
     if compressed_sparse_uniform is None or compressor_uniform is None:
         raise ValueError("CSA+linear cache owners have incompatible lifetimes.")
 
@@ -2200,10 +2205,10 @@ def _get_kv_cache_groups_csa_linear(
                 f"CSA+linear {policy} Mamba owners must use one cache spec."
             )
         unpadded_page = replace(representative, page_size_padded=None).page_size_bytes
-        if unpadded_page > main_kv_page:
+        if unpadded_page > min(main_kv_pages):
             raise ValueError(
                 f"CSA+linear Mamba owner {names[0]!r} needs {unpadded_page} "
-                f"bytes, but a main-KV page has {main_kv_page} bytes."
+                f"bytes, but the smallest main-KV page has {min(main_kv_pages)} bytes."
             )
         num_groups = _get_csa_linear_mamba_group_count(
             vllm_config, names, main_kv_names
@@ -2212,13 +2217,21 @@ def _get_kv_cache_groups_csa_linear(
             raise ValueError(
                 "CSA+linear pipeline stage has Mamba owners but no main-KV slots."
             )
-        padded_spec = replace(representative, page_size_padded=main_kv_page)
         grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
         for index, name in enumerate(names):
             grouped_names[index % num_groups].append(name)
-        groups.extend(
-            KVCacheGroupSpec(group_names, padded_spec) for group_names in grouped_names
-        )
+        for group_names in grouped_names:
+            padded_specs: dict[str, KVCacheSpec] = {
+                name: replace(representative, page_size_padded=main_kv_pages[index])
+                for index, name in enumerate(group_names)
+            }
+            if len({spec.page_size_bytes for spec in padded_specs.values()}) == 1:
+                padded: KVCacheSpec = next(iter(padded_specs.values()))
+            else:
+                uniform = UniformTypeKVCacheSpecs.from_specs(padded_specs, dcp)
+                assert uniform is not None
+                padded = uniform
+            groups.append(KVCacheGroupSpec(group_names, padded))
     return groups
 
 
@@ -2238,7 +2251,9 @@ def _get_csa_linear_tensor_layout(
         if not isinstance(spec, UniformTypeKVCacheSpecs):
             return None
         member = next(iter(spec.kv_cache_specs.values()))
-        if type(member) is CircularBufferSpec:
+        if isinstance(member, MambaSpec):
+            mamba_groups.append(group)
+        elif type(member) is CircularBufferSpec:
             compressor_state = spec.kv_cache_specs
         elif type(member) is FullAttentionSpec:
             compressed_sparse = spec.kv_cache_specs
@@ -2265,8 +2280,12 @@ def _get_csa_linear_tensor_layout(
         compressed_names=compressed_names,
         compressor_state_names=list(compressor_state),
         mamba_groups=mamba_groups,
-        main_kv_page_size=compressed_sparse[main_kv_names[0]].page_size_bytes,
-        compressed_page_size=compressed_sparse[compressed_names[0]].page_size_bytes,
+        main_kv_page_sizes=[
+            compressed_sparse[name].page_size_bytes for name in main_kv_names
+        ],
+        compressed_page_sizes=[
+            compressed_sparse[name].page_size_bytes for name in compressed_names
+        ],
     )
 
 
@@ -2515,8 +2534,12 @@ def generate_scheduler_kv_cache_config(
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
             # so use an arbitrary one to initialize the scheduler.
+            uniform = group.kv_cache_spec
             group.kv_cache_spec = next(
-                iter(group.kv_cache_spec.kv_cache_specs.values())
+                spec
+                for spec in uniform.kv_cache_specs.values()
+                if spec.block_size == uniform.block_size
+                and spec.dcp_sharded == uniform.dcp_sharded
             )
     return cfg
 
@@ -2795,6 +2818,7 @@ def _project_kv_cache_groups_to_worker(
         if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
             group_spec = UniformTypeKVCacheSpecs(
                 block_size=group_spec.block_size,
+                dcp_sharded=group_spec.dcp_sharded,
                 kv_cache_specs={
                     layer_name: group_spec.kv_cache_specs[layer_name]
                     for layer_name in worker_layer_names

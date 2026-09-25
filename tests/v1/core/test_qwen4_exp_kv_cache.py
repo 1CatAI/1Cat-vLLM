@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,9 +22,12 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     MambaSpec,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 class _ModelConfig:
@@ -40,7 +44,11 @@ class _ModelConfig:
 def _vllm_config():
     return SimpleNamespace(
         model_config=_ModelConfig(),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
         scheduler_config=SimpleNamespace(
             disable_hybrid_kv_cache_manager=False,
             max_num_batched_tokens=8192,
@@ -162,6 +170,121 @@ def test_qwen4_exp_circular_cache_stores_keys_without_unused_values() -> None:
     assert spec.max_memory_usage_bytes(_vllm_config()) == spec.page_size_bytes
 
 
+def _mixed_dcp_specs():
+    specs = _qwen4_exp_cache_specs()
+    for name, spec in list(specs.items()):
+        if type(spec) is FullAttentionSpec:
+            # Layer 3 is the target; layer 7 stands in for the replicated draft.
+            sharded = "layers.3." in name
+            specs[name] = replace(
+                spec, block_size=16 if sharded else 32, dcp_sharded=sharded
+            )
+        elif type(spec) is MLAAttentionSpec:
+            specs[name] = replace(spec, block_size=32, dcp_sharded=False)
+        else:
+            specs[name] = replace(spec, dcp_sharded=False)
+    return specs
+
+
+def test_qwen4_exp_mixed_dcp_pages_preserve_shared_state_stride() -> None:
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.cache_config.num_gpu_blocks_override = 3
+    groups = get_kv_cache_groups(config, _mixed_dcp_specs())
+    layout = _get_csa_linear_tensor_layout(groups)
+    assert layout is not None
+    assert layout.main_kv_page_sizes == [16_384, 32_768]
+    assert layout.compressed_page_sizes == [2_048, 2_048]
+    assert layout.bytes_per_block == 53_248
+    caches = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 30)
+    assert sum(t.size for t in caches.kv_cache_tensors) == 3 * 53_248
+
+    # Use the real worker reshape path. Every owner must see exactly three
+    # blocks, and a write into block 1 must start at its shared tensor's page.
+    members = {}
+    for group_id, group in enumerate(groups):
+        spec = group.kv_cache_spec
+        specs = (
+            spec.kv_cache_specs
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else {name: spec for name in group.layer_names}
+        )
+        members.update({name: (group_id, s) for name, s in specs.items()})
+    for tensor in caches.kv_cache_tensors:
+        raw = torch.zeros(tensor.size, dtype=torch.int8)
+        for name in tensor.shared_by:
+            group_id, spec = members[name]
+            assert tensor.size == spec.page_size_bytes * 3
+            if not isinstance(spec, MambaSpec):
+                continue
+            views = _reshape_kv_cache(
+                attn_groups=[AttentionGroup(QSAStateBackend, [name], spec, group_id)],
+                kv_cache_raw_tensors={name: raw},
+                cache_dtype="auto",
+                kernel_block_sizes=[16] * len(groups),
+                shared_kv_cache_layers={},
+            )[name]
+            assert views[0].shape[0] == 3
+            assert views[0].stride(0) * views[0].element_size() == tensor.size // 3
+            raw.zero_()
+            views[0][1].fill_(1)
+            assert torch.count_nonzero(raw[: spec.page_size_bytes]) == 0
+            assert (
+                torch.count_nonzero(
+                    raw[spec.page_size_bytes : 2 * spec.page_size_bytes]
+                )
+                > 0
+            )
+            assert torch.count_nonzero(raw[2 * spec.page_size_bytes :]) == 0
+
+    scheduler = generate_scheduler_kv_cache_config([caches])
+    assert scheduler.kv_cache_groups[0].kv_cache_spec.global_block_size(2) == 32
+    assert all(not g.kv_cache_spec.dcp_sharded for g in scheduler.kv_cache_groups[2:])
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_qwen4_exp_dcp_group_uses_global_spans(reverse) -> None:
+    specs = _mixed_dcp_specs()
+    target = specs["model.layers.3.self_attn"]
+    draft = specs["model.layers.7.self_attn"]
+    members = {"target": target, "draft": draft}
+    if reverse:
+        members = dict(reversed(list(members.items())))
+    uniform = UniformTypeKVCacheSpecs.from_specs(members, dcp_world_size=2)
+    assert uniform is not None
+    assert uniform.block_size == 16
+    assert uniform.dcp_sharded
+    assert uniform.global_block_size(2) == 32
+    # Equal physical slots are insufficient if their global spans differ.
+    assert (
+        UniformTypeKVCacheSpecs.from_specs(
+            {"target": target, "draft": replace(draft, block_size=16)}, dcp_world_size=2
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("spec_cls", [FullAttentionSpec, MLAAttentionSpec])
+def test_qwen4_exp_replicated_cache_memory_and_merge(spec_cls) -> None:
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    spec = spec_cls(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.float16,
+        dcp_sharded=False,
+    )
+    assert spec.max_memory_usage_bytes(config) == 512 * spec.page_size_bytes
+    assert (
+        replace(spec, dcp_sharded=True).max_memory_usage_bytes(config)
+        == 256 * spec.page_size_bytes
+    )
+    assert not spec_cls.merge([spec, spec]).dcp_sharded
+    with pytest.raises(AssertionError):
+        spec_cls.merge([spec, replace(spec, dcp_sharded=True)])
+
+
 def test_qwen4_exp_circular_manager_owns_one_block_per_request() -> None:
     spec = CircularBufferSpec(
         block_size=4,
@@ -219,7 +342,6 @@ def test_qwen4_exp_compressed_qsa_reshape_uses_storage_block_size() -> None:
     assert caches["compressed"].untyped_storage().data_ptr() == raw.data_ptr()
 
 
-@pytest.mark.skip_global_cleanup
 def test_qwen4_exp_qsa_metadata_canonicalizes_expanded_block_table() -> None:
     spec = MLAAttentionSpec(
         block_size=784,
