@@ -19,6 +19,7 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
@@ -1019,15 +1020,58 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
     return len(page_sizes) == 1
 
 
+def _compact_sm70_hybrid_sliding_window_pages(
+    specs: dict[str, KVCacheSpec], vllm_config: VllmConfig | None
+) -> dict[str, KVCacheSpec]:
+    """Avoid padding recurrent states to a larger draft attention page.
+
+    Flash-V100 supports kernel blocks divisible by 16. A higher-precision
+    sliding-window cache can use fewer tokens per page while preserving its
+    dtype and window, allowing it to share the target's smaller physical page.
+    Other backends keep their existing layout until validated independently.
+    """
+    attention_config = getattr(vllm_config, "attention_config", None)
+    draft_backend = getattr(
+        getattr(vllm_config, "speculative_config", None), "attention_backend", None
+    )
+    if (
+        getattr(attention_config, "backend", None)
+        != AttentionBackendEnum.FLASH_ATTN_V100
+        or draft_backend not in (None, AttentionBackendEnum.FLASH_ATTN_V100)
+        or not any(isinstance(spec, MambaSpec) for spec in specs.values())
+    ):
+        return specs
+    target_page = max(
+        spec.page_size_bytes
+        for spec in specs.values()
+        if not isinstance(spec, SlidingWindowSpec)
+    )
+    result = dict(specs)
+    for name, spec in specs.items():
+        if (
+            type(spec) is not SlidingWindowSpec
+            or spec.page_size_padded is not None
+            or spec.page_size_bytes <= target_page
+            or spec.page_size_bytes % target_page
+        ):
+            continue
+        ratio = spec.page_size_bytes // target_page
+        if spec.block_size % (16 * ratio):
+            continue
+        result[name] = replace(spec, block_size=spec.block_size // ratio)
+    return result
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
     vllm_config: VllmConfig | None = None,
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
-    are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
+    are the same, return the original KVCacheSpec. Compact compatible oversized
+    Flash-V100 sliding-window pages first, then increase the block size of
+    layers with smaller page size. Raise NotImplementedError if unification
+    fails.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1035,6 +1079,9 @@ def unify_kv_cache_spec_page_size(
     Returns:
         The updated KVCacheSpec with the same page_size_bytes.
     """
+    kv_cache_spec = _compact_sm70_hybrid_sliding_window_pages(
+        kv_cache_spec, vllm_config
+    )
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     if len(page_sizes) <= 1:
         # All layers have the same page size, no need to unify.

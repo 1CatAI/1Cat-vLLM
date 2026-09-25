@@ -2,6 +2,27 @@
 
 Date: 2026-05-30
 
+## Warmup and prefill budget candidate, 2026-09-25
+
+[Memory budget evidence](sm70_memory_budget.md) records scoped warmup allocator
+settings, compact Flash-V100 hybrid pages and tiled NVFP4 prefill projections.
+Gate/up tiling saves 676 MiB in the TP1 8K operator and lowers the measured
+model activation peak from 2.254 to 1.594 GiB. At GUM 0.93, the 64K TP1/C2
+KV budget is still only 2.886 GiB against a reduced 4.28125 GiB requirement.
+The GUM 0.98 gate/up-only probe starts but OOMs on its first 32K request at a
+170 MiB down-projection allocation; preserve this failure when evaluating
+the additional down-projection tiling. The 0.5 GiB Graph reserve is an explicit
+C2 calibration, not a new general default. This scope is pending full serving
+quality/performance validation; do not promote on operator timing alone.
+
+At measured implementation `f39f7099fb`, complete projection tiling plus a
+persistent `max_split_size_mb:20`, GUM 0.98 and 512 MiB Graph reserve passes
+single-card 32768/64512-token cold retrievals with correct answers and natural
+EOS. A 32768-input/256-output C1 `vllm bench serve` request reports TTFT 35.049 s
+and TPOT 9.042 ms, with no failure. This is an explicit 64K experiment, not a
+default configuration or TP4/256K acceptance result. It predates integration
+of the DFlash batch defaults now on main; preserve the measured source/hash.
+
 ## TP4 DFlash2 batch GEMM supply experiment, 2026-09-24
 
 For Qwen3.8-27B-NVFP4 at C8/q8, the channel-FP8 TurboMind output

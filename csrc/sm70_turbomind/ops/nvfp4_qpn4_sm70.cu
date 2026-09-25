@@ -16,6 +16,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 #include "nvfp4_qpn2_layout.cuh"
 
 namespace {
@@ -139,11 +141,12 @@ __device__ __forceinline__ half nvfp4_scale_code_to_half(uint8_t scale_code,
   return __hfma(raw_scale, scale_hi, correction);
 }
 
-template <bool UseScaleCode, bool TurboMindLayout = false>
+template <bool UseScaleCode, bool TurboMindLayout = false, bool Tiled = false,
+          bool GatedTile = true>
 __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
     half* __restrict__ output, const uint8_t* __restrict__ codes,
     const void* __restrict__ packed_scales, half scale_hi, half scale_lo, int n,
-    int k) {
+    int k, int source_n, int column_start) {
   const size_t word_index =
       static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t word_count = static_cast<size_t>(k) * n / 16;
@@ -157,20 +160,35 @@ __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
   const int group = static_cast<int>(outer % groups_k16);
   const int tile = static_cast<int>(outer / groups_k16);
   const int col = tile * 32 + qpn_col_from_lane(lane);
+  int source_tile = tile;
+  size_t source_word = word_index;
+  if constexpr (Tiled) {
+    // Each tile contains matching gate and up columns. Keep the entire K
+    // reduction in one GEMM; only independent output columns are partitioned.
+    int source_col = column_start + col;
+    if constexpr (GatedTile) {
+      source_col =
+          column_start + col % (n / 2) + (col >= n / 2 ? source_n / 2 : 0);
+    }
+    source_tile = source_col / 32;
+    source_word =
+        (static_cast<size_t>(source_tile) * groups_k16 + group) * 32 + lane;
+  }
   half scale;
   if constexpr (UseScaleCode) {
     scale = nvfp4_scale_code_to_half(
-        reinterpret_cast<const uint8_t*>(packed_scales)[word_index], scale_hi,
+        reinterpret_cast<const uint8_t*>(packed_scales)[source_word], scale_hi,
         scale_lo);
   } else {
-    scale = reinterpret_cast<const half*>(packed_scales)[word_index];
+    scale = reinterpret_cast<const half*>(packed_scales)[source_word];
   }
   half2 weights[8];
   if constexpr (TurboMindLayout) {
-    const Nvfp4Qpn2CodeReader<true> reader(codes, tile, groups_k16, lane);
+    const Nvfp4Qpn2CodeReader<true> reader(codes, source_tile, groups_k16,
+                                           lane);
     fp4x16_to_half2x8(reader.load(group), weights);
   } else {
-    fp4x16_to_half2x8(reinterpret_cast<const uint2*>(codes)[word_index],
+    fp4x16_to_half2x8(reinterpret_cast<const uint2*>(codes)[source_word],
                       weights);
   }
   const half2 scale2 = __halves2half2(scale, scale);
@@ -191,13 +209,13 @@ __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
 
 __global__ void nvfp4_qpn4_silu_and_mul_sm70_kernel(
     half* __restrict__ output, const half* __restrict__ gate_up, int rows,
-    int hidden) {
+    int hidden, int output_stride) {
   const int row = blockIdx.x;
   if (row >= rows) {
     return;
   }
   const half* row_input = gate_up + static_cast<size_t>(row) * hidden * 2;
-  half* row_output = output + static_cast<size_t>(row) * hidden;
+  half* row_output = output + static_cast<size_t>(row) * output_stride;
   for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
     const float gate = __half2float(row_input[col]);
     const float silu = gate / (1.0f + __expf(-gate));
@@ -562,10 +580,11 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
   return {packed_codes, packed_scale_codes};
 }
 
-template <bool TurboMindLayout>
+template <bool TurboMindLayout, bool Tiled = false, bool GatedTile = true>
 void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
                                      torch::Tensor scales, double global_scale,
-                                     bool use_scale_code) {
+                                     bool use_scale_code, int64_t source_n = 0,
+                                     int64_t column_start = 0) {
   TORCH_CHECK(out.is_cuda() && codes.is_cuda() && scales.is_cuda(),
               "nvfp4_qpn4_dequantize_sm70_out: tensors must be CUDA");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
@@ -587,8 +606,17 @@ void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
   const int64_t n = out.size(1);
   TORCH_CHECK(k > 0 && k % 128 == 0 && n > 0 && n % 32 == 0,
               "nvfp4_qpn4_dequantize_sm70_out: shape alignment mismatch");
-  TORCH_CHECK(codes.numel() == k * n / 2 && scales.numel() == k * n / 16,
-              "nvfp4_qpn4_dequantize_sm70_out: packed tensor size mismatch");
+  const int64_t packed_n = Tiled ? source_n : n;
+  if constexpr (Tiled) {
+    constexpr int kParts = GatedTile ? 2 : 1;
+    TORCH_CHECK(n % (32 * kParts) == 0 && source_n % (32 * kParts) == 0 &&
+                    column_start >= 0 && column_start % 32 == 0 &&
+                    column_start + n / kParts <= source_n / kParts,
+                "nvfp4 prefill tile alignment mismatch");
+  }
+  TORCH_CHECK(
+      codes.numel() == k * packed_n / 2 && scales.numel() == k * packed_n / 16,
+      "nvfp4_qpn4_dequantize_sm70_out: packed tensor size mismatch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
   const int64_t word_count = k * n / 16;
@@ -598,18 +626,20 @@ void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
       split_half_scale(static_cast<float>(global_scale) * kFp4Bias);
   const half zero_scale = __float2half_rn(0.0f);
   if (use_scale_code) {
-    nvfp4_qpn4_dequantize_sm70_kernel<true, TurboMindLayout>
+    nvfp4_qpn4_dequantize_sm70_kernel<true, TurboMindLayout, Tiled, GatedTile>
         <<<blocks, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<half*>(out.data_ptr<at::Half>()),
             codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
             split_scale.hi, split_scale.lo, static_cast<int>(n),
-            static_cast<int>(k));
+            static_cast<int>(k), static_cast<int>(source_n),
+            static_cast<int>(column_start));
   } else {
-    nvfp4_qpn4_dequantize_sm70_kernel<false, TurboMindLayout>
+    nvfp4_qpn4_dequantize_sm70_kernel<false, TurboMindLayout, Tiled, GatedTile>
         <<<blocks, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<half*>(out.data_ptr<at::Half>()),
             codes.data_ptr<uint8_t>(), scales.data_ptr<at::Half>(), zero_scale,
-            zero_scale, static_cast<int>(n), static_cast<int>(k));
+            zero_scale, static_cast<int>(n), static_cast<int>(k),
+            static_cast<int>(source_n), static_cast<int>(column_start));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -642,6 +672,44 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
   TORCH_CHECK(out.size(0) == m && out.size(1) == (gated_silu ? n / 2 : n),
               "nvfp4_qpn4_prefill_sm70_out: output shape mismatch");
 
+  constexpr int64_t kHiddenTile = 4096;
+  // Smaller prefill blocks benefit from one large GEMM and have a lower
+  // activation peak. Keep that path while bounding large-chunk scratch.
+  if (gated_silu && m >= 4096 && dense_weight_ptr == 0 && n / 2 > kHiddenTile &&
+      n % 64 == 0) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
+    for (int64_t start = 0; start < n / 2; start += kHiddenTile) {
+      const int64_t width = std::min(kHiddenTile, n / 2 - start);
+      auto dense_tile = torch::empty({k, 2 * width}, input.options());
+      nvfp4_qpn4_dequantize_sm70_impl<TurboMindLayout, true>(
+          dense_tile, codes, scales, global_scale, use_scale_code, n, start);
+      auto gate_up = at::mm(input, dense_tile);
+      nvfp4_qpn4_silu_and_mul_sm70_kernel<<<static_cast<int>(m), 256, 0,
+                                            at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<half*>(out.data_ptr<at::Half>()) + start,
+          reinterpret_cast<const half*>(gate_up.data_ptr<at::Half>()),
+          static_cast<int>(m), static_cast<int>(width),
+          static_cast<int>(n / 2));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return;
+  }
+
+  if (!gated_silu && m >= 4096 && dense_weight_ptr == 0 &&
+      k * n * sizeof(at::Half) >= 128 * 1024 * 1024 && n % 64 == 0) {
+    // Reuse the smaller gated-prefill allocations for the down projection,
+    // instead of requesting another large contiguous dense-weight segment.
+    const int64_t tile_n = n / 2;
+    for (int64_t start = 0; start < n; start += tile_n) {
+      auto dense_tile = torch::empty({k, tile_n}, input.options());
+      nvfp4_qpn4_dequantize_sm70_impl<TurboMindLayout, true, false>(
+          dense_tile, codes, scales, global_scale, use_scale_code, n, start);
+      auto output_tile = out.narrow(1, start, tile_n);
+      at::mm_out(output_tile, input, dense_tile);
+    }
+    return;
+  }
+
   // A zero pointer requests an operator-local workspace. This keeps the
   // 85 MiB dense FP16 buffer out of model load, AOT profile, and decode CUDA
   // graph capture. The caching allocator reuses the allocation across layers
@@ -665,7 +733,7 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
                                         at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(gate_up.data_ptr<at::Half>()),
-      static_cast<int>(m), static_cast<int>(n / 2));
+      static_cast<int>(m), static_cast<int>(n / 2), static_cast<int>(n / 2));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
