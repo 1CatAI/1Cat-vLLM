@@ -203,7 +203,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             self._scheduler_mmap = scheduler_mmap
 
             # Create primary tier (CPU-based)
-            assert len(self.gpu_block_size) == 1
+            # The unpartitioned tier stores a full worker KV row for each
+            # offload key. Each group can address that row with its own token
+            # block size; the scheduler and transfer handler retain the group
+            # geometry separately. DCP-sharded attention and replicated
+            # recurrent groups therefore do not require equal block sizes.
             primary_tier = CPUPrimaryTierOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]
