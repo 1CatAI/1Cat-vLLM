@@ -346,12 +346,86 @@ def test_qsa_canonical_block_table_keeps_physical_pages() -> None:
     assert builder._canonical_block_table(table) is table
 
 
-def test_qsa_replicated_side_table_uses_its_own_page_geometry() -> None:
+def _dcp2_selector_builder(buffer_width: int) -> qsa_cache.QSAMetadataBuilder:
+    """A target QSA selector builder with the measured TP4/DCP2 geometry.
+
+    ``qsa_dcp_block_geometry`` gives the replicated selector a page covering
+    ``1568 * 2 = 3136`` global tokens, while the shared common block table
+    enumerates the 32-token kernel blocks this rank owns. Measured on the
+    real model at layer 3 (2026-09-25): ``in_width=539``, ``buf_width=12``,
+    ``spec_block=3136``, ``kernel_block=32``, ``storage_block=784``.
+    """
+
     builder = object.__new__(qsa_cache.QSAMetadataBuilder)
-    builder.block_table_buffer = torch.empty((1, 1), dtype=torch.int32)
-    builder.kv_cache_spec = SimpleNamespace(block_size=3200, dcp_sharded=False)
-    builder.kernel_block_size = 128
+    builder.block_table_buffer = torch.empty((1, buffer_width), dtype=torch.int32)
+    builder.kv_cache_spec = SimpleNamespace(block_size=3136, dcp_sharded=False)
+    builder.kernel_block_size = 32
     builder.has_sharded_main_owner = True
     builder.dcp_world_size = 2
+    return builder
+
+
+def test_qsa_replicated_side_table_uses_local_kernel_block_units() -> None:
+    """A replicated selector still reads its sharded owner's local table.
+
+    The selector page is declared as a global span, so the virtual expansion
+    must be derived from the local span ``3136 // 2 = 1568``, i.e. 49 kernel
+    blocks, not from the global 3136 (98 blocks). Using the global span
+    halved the column count and divided every page ID by twice the correct
+    factor, which mapped the whole table onto page 0.
+    """
+
+    builder = _dcp2_selector_builder(buffer_width=2)
+    table = torch.arange(49, 49 + 98, dtype=torch.int32).unsqueeze(0)
+    assert builder._canonical_block_table(table).tolist() == [[1, 2]]
+
+
+def test_qsa_dcp2_selector_table_addresses_full_long_context() -> None:
+    """Regression for the 30K-token selector slot-mapping failure.
+
+    With the global span the 539-entry table collapsed to 6 columns, so the
+    QSA slot kernel found no column for compressed group index 6 and wrote
+    PAD_SLOT_ID for every group boundary in the chunk: the selector cache
+    never received the current keys. A 30,030-token prompt needs
+    ``ceil(ceil(30030 / 4) / 784) = 10`` columns.
+    """
+
+    builder = _dcp2_selector_builder(buffer_width=12)
+    table = torch.arange(49, 49 + 539, dtype=torch.int32).unsqueeze(0)
+    canonical = builder._canonical_block_table(table)
+    # The slot kernel indexes with
+    # ``(logical_position // compress_ratio) // storage_block_size``, so the
+    # last token of a 30,030-token prompt needs column index 9.
+    last_column_index = ((30030 - 1) // 4) // 784
+    required_columns = last_column_index + 1
+    assert required_columns == 10
+    assert canonical.shape[1] == 11
+    assert canonical.shape[1] >= required_columns
+    # The first source entry is kernel block 49, i.e. selector page 1, not the
+    # degenerate page 0 the doubled expansion produced.
+    assert canonical[0, 0].item() == 1
+
+
+def test_qsa_replicated_draft_side_table_keeps_global_page_geometry() -> None:
+    """A standalone draft replicates every QSA cache, so its table is global.
+
+    ``has_sharded_main_owner`` is false there, so no DCP division applies and
+    the expansion stays ``3136 // 32 = 98``.
+    """
+
+    builder = _dcp2_selector_builder(buffer_width=2)
+    builder.has_sharded_main_owner = False
+    table = torch.arange(98, 98 + 196, dtype=torch.int32).unsqueeze(0)
+    assert builder._canonical_block_table(table).tolist() == [[1, 2]]
+
+
+def test_qsa_dcp_local_span_must_divide_kernel_block() -> None:
+    """An indivisible local span is a real geometry error, not something to
+    silently round: masking it would read the wrong compressed page."""
+
+    builder = _dcp2_selector_builder(buffer_width=4)
+    builder.kv_cache_spec = SimpleNamespace(block_size=3200, dcp_sharded=False)
+    builder.kernel_block_size = 128
     table = torch.arange(675, 700, dtype=torch.int32).unsqueeze(0)
-    assert builder._canonical_block_table(table).tolist() == [[27]]
+    with pytest.raises(RuntimeError, match="must be divisible"):
+        builder._canonical_block_table(table)

@@ -688,7 +688,19 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             self, "kernel_block_size", self.kv_cache_spec.block_size
         )
         group_block_size = self.kv_cache_spec.block_size
-        if self.kv_cache_spec.dcp_sharded and self.dcp_world_size > 1:
+        # The common block table enumerates the kernel blocks this rank owns.
+        # When the group's main K/V is DCP-sharded those entries count local
+        # tokens, while a QSA side page declares the global span it covers
+        # because qsa_dcp_block_geometry multiplies the side span by the DCP
+        # world size. Convert that span back to local tokens before deriving
+        # the virtual expansion. This applies to a replicated selector sharing
+        # a sharded main owner's table just as much as to a sharded page: both
+        # read the same local table. A standalone draft keeps every QSA cache
+        # replicated, so its table is already global and must not be divided.
+        table_counts_local_tokens = (
+            self.kv_cache_spec.dcp_sharded or self.has_sharded_main_owner
+        )
+        if table_counts_local_tokens and self.dcp_world_size > 1:
             if group_block_size % self.dcp_world_size:
                 raise RuntimeError("QSA replicated page must cover whole DCP group")
             group_block_size //= self.dcp_world_size
