@@ -313,3 +313,15 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
     builder.block_size = 6
     with pytest.raises(RuntimeError, match="kernel block must divide"):
         builder.build(0, common)
+
+
+def test_qsa_canonical_block_table_accepts_partial_virtual_page() -> None:
+    builder = object.__new__(qsa_cache.QSAMetadataBuilder)
+    builder.block_table_buffer = torch.empty((1, 3), dtype=torch.int32)
+    builder.kv_cache_spec = SimpleNamespace(block_size=32)
+    builder.kernel_block_size = 16
+    builder.has_sharded_main_owner = False
+    builder.dcp_world_size = 1
+    table = torch.tensor([[14, 15, 16]], dtype=torch.int32)
+    canonical = builder._canonical_block_table(table)
+    assert canonical.tolist() == [[7, 8]]

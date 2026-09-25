@@ -695,20 +695,18 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         expansion = group_block_size // kernel_block_size
         if expansion == 1:
             return block_table
-        if block_table.shape[1] % expansion:
-            raise RuntimeError(
-                "QSA common block-table width does not match its virtual "
-                "kernel-block expansion"
-            )
         rows = block_table.shape[0]
-        columns = block_table.shape[1] // expansion
+        # The final physical page can be only partly represented when the
+        # maximum sequence length is not a multiple of the virtual expansion.
+        # Its first kernel entry still names the physical QSA page.
+        columns = (block_table.shape[1] + expansion - 1) // expansion
         if (
             rows > self.block_table_buffer.shape[0]
             or columns > (self.block_table_buffer.shape[1])
         ):
             raise RuntimeError("QSA canonical block-table buffer is too small")
         canonical = self.block_table_buffer[:rows, :columns]
-        expanded_first = block_table[:, : columns * expansion : expansion]
+        expanded_first = block_table[:, ::expansion]
         torch.div(
             expanded_first,
             expansion,
