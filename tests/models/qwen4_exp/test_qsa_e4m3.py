@@ -323,3 +323,106 @@ def test_qsa_xqa_page4_large_e4m3_key_accumulates_in_fp32(monkeypatch) -> None:
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), reference.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("pad_fix", [False, True])
+@torch.inference_mode()
+def test_qsa_grouped_page4_null_block_padding_no_nan(monkeypatch, pad_fix) -> None:
+    """Grouped page4 must not leak the null block's E4M3 NaN into the output.
+
+    The grouped planner pads each category to a multiple of eight with the null
+    block (physical page 0, mask 0) and counts the padding in seq_len. The
+    forward loads page 0's K/V for those padded rows and sets P=0, but 0 * NaN
+    survives the P@V tensor-core reduction when page 0 holds bytes that decode
+    to E4M3 NaN (fp16 GDN state co-located in the hybrid cache). The reference is
+    a kernel-independent einsum over the selected tokens, which map to physical
+    pages >= 1 and so exclude the null block.
+
+    pad_fix=False relies on the Flash-V100 kernel zeroing unattended rows;
+    pad_fix=True adds the Python planner post-pass that repoints the padding.
+    Either fix keeps grouped finite and equal to XQA. On an unfixed kernel the
+    pad_fix=False case reproduces the NaN and fails.
+    """
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("QSA grouped page4 null-block padding is SM70-only")
+    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+    extension = interface.flash_attn_v100_cuda
+    if not (
+        hasattr(extension, "grouped_sparse_page4_plan_fwd")
+        and hasattr(extension, "grouped_sparse_page4_fwd")
+        and hasattr(extension, "decode_paged_xqa_fwd")
+    ):
+        pytest.skip("Flash-V100 extension lacks grouped/XQA page4 kernels")
+
+    torch.manual_seed(23)
+    # Production-like interleaved cache: [pages, 2(K/V), page_size, Hkv=1, dim].
+    # 32-token physical pages; page 0 is the null block because the block table
+    # starts at physical page 1, so only planner padding ever reads it.
+    rows, heads, head_dim, page_size = 16, 6, 256, 32
+    topk, num_pages = 2051, 400
+    poison_dims = [102, 152, 168, 170, 230]
+
+    kv = torch.randn(
+        (num_pages, 2, page_size, 1, head_dim), dtype=torch.float16, device="cuda"
+    ).mul_(0.35)
+    k_scale = float(kv[:, 0].abs().max().item()) / 448.0
+    v_scale = float(kv[:, 1].abs().max().item()) / 448.0
+    cache = torch.empty(
+        (num_pages, 2, page_size, 1, head_dim), dtype=torch.uint8, device="cuda"
+    )
+    cache[:, 0] = (kv[:, 0] / k_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    cache[:, 1] = (kv[:, 1] / v_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    # 0x7F decodes to NaN under float8_e4m3fn: poison the null block's value
+    # plane for the first microblock (tokens 0-3), the slot padding points at.
+    cache[0, 1, 0:4, 0, poison_dims] = 0x7F
+    k_cache, v_cache = cache[:, 0], cache[:, 1]
+
+    query = torch.randn(
+        (rows, heads, head_dim), dtype=torch.float16, device="cuda"
+    ).mul_(0.2)
+    pages_per_req = (topk + page_size - 1) // page_size
+    block_table = (
+        torch.arange(pages_per_req, dtype=torch.int32, device="cuda") + 1
+    ).view(1, pages_per_req)
+    logical_indices = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
+        rows, 1
+    )
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    query_positions = torch.full((rows,), topk - 1, dtype=torch.int64, device="cuda")
+    sequence_lengths = torch.tensor([topk], dtype=torch.int32, device="cuda")
+    kwargs = {
+        "query_positions": query_positions,
+        "sequence_lengths": sequence_lengths,
+        "kv_cache_dtype": "fp8_e4m3",
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+    }
+
+    # Kernel-independent ground-truth reference: decode E4M3 -> fp32 and attend
+    # only the selected tokens, which map to physical pages >= 1, so the null
+    # block never contributes. (The XQA route is not used as the reference: its
+    # E4M3 page4 tmp_out dtype contract differs across Flash-V100 builds.)
+    decoded_k = k_cache.view(torch.float8_e4m3fn).float() * k_scale
+    decoded_v = v_cache.view(torch.float8_e4m3fn).float() * v_scale
+    logical = torch.arange(topk, device="cuda")
+    phys = block_table[0, logical // page_size].long()
+    offs = logical % page_size
+    sel_k = decoded_k[phys, offs, 0, :]
+    sel_v = decoded_v[phys, offs, 0, :]
+    scores = torch.einsum("rhd,nd->rhn", query.float(), sel_k) / math.sqrt(head_dim)
+    reference = torch.einsum("rhn,nd->rhd", torch.softmax(scores, dim=-1), sel_v)
+
+    # Grouped route with the pad-fix in the requested state.
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 0)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAD_FIX", pad_fix)
+    actual = qsa_sparse_paged_attention(
+        query, k_cache, v_cache, logical_indices, block_table, token_to_req, **kwargs
+    )
+
+    assert torch.isfinite(actual).all(), (
+        f"grouped route leaked null-block NaN (pad_fix={pad_fix})"
+    )
+    torch.testing.assert_close(actual.float(), reference, atol=3e-2, rtol=3e-2)

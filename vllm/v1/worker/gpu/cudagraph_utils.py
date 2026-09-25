@@ -154,6 +154,15 @@ def get_uniform_token_count(
     return None
 
 
+def get_uniform_decode_token_count(
+    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
+) -> int | None:
+    """Classify decode by request phase as well as shape (upstream #51865)."""
+    if has_prefill or num_reqs == 0:
+        return None
+    return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+
 class CudaGraphManager:
     def __init__(
         self,

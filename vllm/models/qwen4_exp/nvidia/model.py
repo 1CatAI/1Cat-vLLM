@@ -195,7 +195,11 @@ def _validate_qsa_e4m3_scale_load(
 
 
 def _finalize_qsa_e4m3_scale_load(
-    model: nn.Module, loaded: set[str], cache_dtype: str
+    model: nn.Module,
+    loaded: set[str],
+    cache_dtype: str,
+    *,
+    require_calibrated_speculative_draft: bool = False,
 ) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return
@@ -212,6 +216,17 @@ def _finalize_qsa_e4m3_scale_load(
     required_scales = {
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
+    missing_scales = required_scales - loaded
+    if require_calibrated_speculative_draft and missing_scales:
+        raise ValueError(
+            "QSA E4M3 speculative draft scale overlay is incomplete; refusing "
+            "to use unit scales after qualification showed invalid proposals. "
+            "Provide calibrated draft K/V scales or keep the draft cache in "
+            "FP16. Loaded "
+            f"{len(required_scales) - len(missing_scales)}/"
+            f"{len(required_scales)} draft K/V scales. Missing: "
+            + ", ".join(sorted(missing_scales))
+        )
     missing_scales = _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
     if not missing_scales:
         logger.info_once(
