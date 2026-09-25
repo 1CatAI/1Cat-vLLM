@@ -198,6 +198,69 @@ def test_small_draft_sliding_window_bucket_absorbs_hybrid_padding():
     assert [len(group.layer_names) for group in groups] == [8] * 8 + [5]
 
 
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_flash_v100_hybrid_draft_pages_preserve_state_capacity(tp):
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    page = 4 * 2**20 // tp
+    full = new_kv_cache_spec(
+        block_size=2048, num_kv_heads=4 // tp, head_size=256, dtype=torch.uint8
+    )
+    mamba = new_mamba_spec(
+        block_size=8192,
+        shapes=((10, 10240 // tp), (48 // tp, 128, 128)),
+        dtypes=(torch.float16, torch.float32),
+        num_speculative_blocks=7,
+        mamba_cache_mode="align",
+        page_size_padded=page,
+    )
+    draft = new_sliding_window_spec(
+        block_size=2048,
+        num_kv_heads=8 // tp,
+        head_size=128,
+        dtype=torch.float16,
+        sliding_window=2048,
+    )
+    specs = {f"full.{i}": full for i in range(16)}
+    specs.update({f"mamba.{i}": mamba for i in range(48)})
+    specs.update({f"draft.{i}": draft for i in range(5)})
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=65536),
+        attention_config=SimpleNamespace(backend=AttentionBackendEnum.FLASH_ATTN_V100),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align", user_specified_mamba_block_size=True
+        ),
+        max_in_flight_tokens=16384,
+    )
+    compact = kv_cache_utils.unify_kv_cache_spec_page_size(specs, config)
+    assert specs["draft.0"].block_size == 2048  # Don't mutate worker specs.
+    assert compact["draft.0"].block_size == 1024
+    assert compact["draft.0"].dtype == torch.float16
+    assert compact["draft.0"].sliding_window == 2048
+    assert compact["mamba.0"] == mamba
+    assert compact["full.0"] == full
+    assert {s.page_size_bytes for s in compact.values()} == {page}
+    groups = kv_cache_utils.get_kv_cache_groups(config, specs)
+    required = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    assert required == 137 * 32 * 2**20 // tp  # 4.28125 GiB / TP.
+
+    # Other backends retain their existing block-size contract.
+    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+    original = kv_cache_utils.unify_kv_cache_spec_page_size(specs, config)
+    assert original["draft.0"] == draft
+    assert original["mamba.0"].page_size_bytes == 2 * page
+
+    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
+    config.speculative_config = SimpleNamespace(
+        attention_backend=AttentionBackendEnum.TRITON_ATTN
+    )
+    assert kv_cache_utils.unify_kv_cache_spec_page_size(specs, config) == original
+
+
 def test_sliding_window_padding_preserves_generic_singleton_grouping():
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     full_spec = new_kv_cache_spec()

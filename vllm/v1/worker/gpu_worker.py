@@ -514,11 +514,18 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
+        # Compilation and lazy workspaces have very different lifetimes. Avoid
+        # pinning large split segments behind small persistent allocations on
+        # SM70, then restore the serving allocator before measuring its peak.
+        warmup_allocator = (
+            self._scoped_allocator_max_split(20)
+            if current_platform.is_cuda() and current_platform.is_device_capability(70)
+            else nullcontext()
+        )
+        with warmup_allocator:
             self.model_runner.profile_run()
 
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
@@ -544,7 +551,6 @@ class Worker(WorkerBase):
         # keeps allocated still counts: non-torch is measured against the
         # init snapshot, and torch memory the warm-up left behind beyond the
         # weights is added below as warmup_torch_residual.
-        self.model_runner.profile_run()
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(

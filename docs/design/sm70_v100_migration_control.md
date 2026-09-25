@@ -2,6 +2,19 @@
 
 Date: 2026-05-30
 
+## Warmup and prefill budget candidate, 2026-09-25
+
+[Memory budget evidence](sm70_memory_budget.md) records scoped warmup allocator
+settings, compact Flash-V100 hybrid pages and tiled NVFP4 prefill projections.
+Gate/up tiling saves 676 MiB in the TP1 8K operator and lowers the measured
+model activation peak from 2.254 to 1.594 GiB. At GUM 0.93, the 64K TP1/C2
+KV budget is still only 2.886 GiB against a reduced 4.28125 GiB requirement.
+The GUM 0.98 gate/up-only probe starts but OOMs on its first 32K request at a
+170 MiB down-projection allocation; preserve this failure when evaluating
+the additional down-projection tiling. The 0.5 GiB Graph reserve is an explicit
+C2 calibration, not a new general default. This scope is pending full serving
+quality/performance validation; do not promote on operator timing alone.
+
 ## Graph scratch, score workspace and active peak, 2026-09-23
 
 [Implementation and paired evidence](sm70_memory_arena.md). The new SM70
