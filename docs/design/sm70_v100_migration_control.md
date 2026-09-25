@@ -47505,12 +47505,15 @@ has launched no full model. Details and artifacts are in
   default-off batch-layout decision; it does not declare the PRO speed goal
   achieved. The configuration contract is independent of target quantization
   and KV dtype; local operators retain their own capability and shape gates.
-- Joint draft paged attention and TP4 C4/C8 packed GDN scheduling were already
-  automatic. C1/C4 compressed GEMM keeps the existing small-M routes, while
+- Joint draft paged attention and TP4 C4/C8 packed GDN scheduling select
+  automatically within their routes. The packed GDN entry, combined split,
+  draft context pipeline/KV graph and quantized LM-head prerequisites now
+  join the same automatic configuration, preserving explicit overrides.
+  C1/C4 compressed GEMM keeps the existing small-M routes, while
   the alternate FP8 prescaled layout remains default-off. No additional
   native source change or rebuild is needed for this configuration update.
-- The 19 focused verifier-contract/default tests pass, including all four
-  batch settings' explicit overrides and TP/quantization-independent
+- The focused verifier-contract/default tests cover the batch settings and
+  packed-verifier/draft prerequisites' overrides and TP/quantization-independent
   admission. Existing paired endpoint/quality and 44 GPU regression evidence
   remain recorded above. The previous CI failure was an import-group
   classification difference for the new benchmark's optional native package;

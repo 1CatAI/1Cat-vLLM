@@ -31,7 +31,10 @@ limits to M64. It preserves every explicit environment override, including
 quantizations and KV dtypes; individual operators check their own capabilities.
 Batch layouts still require capacity for at least eight requests, and C1/C4
 retain their existing small-M kernels. Joint draft attention and the guarded
-packed GDN schedule activate automatically. The experimental FP8 prescaled
+packed GDN schedule activate automatically. The same configuration enables
+the packed GDN entry, combined projection split, draft context pipeline/KV
+graph, and quantized LM-head fallback used by the measured service. Explicit
+overrides still win for these prerequisites. The experimental FP8 prescaled
 layout remains off by default.
 
 Integration base: `d49e32b3587d4d34ffccb0ffd376e63974b06c88`, `onecat/main`.

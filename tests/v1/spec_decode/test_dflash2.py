@@ -278,6 +278,11 @@ def test_sm70_dflash2_verifier_contract_is_tp_and_quantization_independent(
         "VLLM_SM70_AWQ_WARMUP_MAX_M",
         "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
         "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT",
+        "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE",
+        "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH",
+        "VLLM_SM70_DFLASH2_QUANT_LM_HEAD",
     ],
 )
 def test_sm70_dflash2_verifier_defaults_preserve_overrides(

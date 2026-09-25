@@ -92,6 +92,13 @@ _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_AWQ_WARMUP_MAX_M": "64",
     "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "64",
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
+    # Match the measured packed verifier and draft context pipeline without
+    # requiring launch-script flags. Operators retain their shape guards.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": "1",
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": "1",
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "1",
+    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": "1",
     # Preserve candidate and dense logits in FP32 through sampling.
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
     # This is the target projection's memory-neutral FP8 layout, not the
