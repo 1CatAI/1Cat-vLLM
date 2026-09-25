@@ -311,3 +311,37 @@ def test_qsa_circular_group_emits_no_generic_slots_on_sm70() -> None:
         12 * 262144 + 153797,
         12 * 262144 + 165757,
     ]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires an exact SM70 CUDA device",
+)
+def test_dcp2_slot_mapping_preserves_replicated_group_on_sm70() -> None:
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[16, 16],
+        max_num_reqs=1,
+        max_num_batched_tokens=6,
+        max_num_blocks_per_group=[2, 4],
+        device=device,
+        kernel_block_sizes=[16, 16],
+        cp_size=2,
+        cp_rank=0,
+        dcp_sharded=[True, False],
+    )
+    block_tables.append_block_ids(
+        req_index=0,
+        new_block_ids=([7, 8], [12, 13, 14, 15]),
+        overwrite=True,
+    )
+    block_tables.apply_staged_writes()
+    slots = block_tables.compute_slot_mappings(
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32, device=device),
+        positions=torch.tensor([0, 1, 16, 17, 32, 33], device=device),
+        num_tokens_padded=6,
+    )
+    torch.accelerator.synchronize()
+    assert slots[0].tolist() == [112, -1, 120, -1, 128, -1]
+    assert slots[1].tolist() == [192, 193, 208, 209, 224, 225]

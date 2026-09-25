@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu import model_runner as mrv2
@@ -195,3 +196,67 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
 
     assert captured["max_num_blocks_per_group"] == [1, 1]
     assert captured["slot_mapping_enabled"] == [False, True]
+
+
+def test_dcp2_replicated_mamba_keeps_full_block_table_width(monkeypatch):
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.max_model_len = 8000
+    runner.is_encoder_decoder = False
+    runner.dcp_size = 2
+    runner.dcp_rank = 0
+    runner.cp_interleave = 1
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=True)
+    runner.vllm_config = SimpleNamespace()
+    runner.max_num_reqs = 1
+    runner.max_num_tokens = 4
+    runner.device = torch.device("cpu")
+    target = FullAttentionSpec(
+        block_size=1600,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+        dcp_sharded=True,
+    )
+    draft = FullAttentionSpec(
+        block_size=3200,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+        dcp_sharded=False,
+    )
+    mixed = UniformTypeKVCacheSpecs.from_specs({"target": target, "draft": draft}, 2)
+    assert mixed is not None
+    mamba = MambaSpec(
+        block_size=1600,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=1,
+        dcp_sharded=False,
+    )
+    config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target", "draft"], mixed),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    monkeypatch.setattr(
+        mrv2, "init_attn_backend", lambda *args: ([], SimpleNamespace(), [1600, 1600])
+    )
+    captured = {}
+
+    class BlockTablesCaptured(Exception):
+        pass
+
+    def capture_block_tables(**kwargs):
+        captured.update(kwargs)
+        raise BlockTablesCaptured
+
+    monkeypatch.setattr(mrv2, "BlockTables", capture_block_tables)
+    with pytest.raises(BlockTablesCaptured):
+        runner.initialize_kv_cache(config)
+    assert captured["block_sizes"] == [1600, 1600]
+    assert captured["max_num_blocks_per_group"] == [3, 6]
+    assert captured["dcp_sharded"] == [True, False]

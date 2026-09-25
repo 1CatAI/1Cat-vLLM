@@ -570,10 +570,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
+        dcp_sharded = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
-            spec = kv_cache_group.kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                specs = tuple(spec.kv_cache_specs.values())
+            group_spec = kv_cache_group.kv_cache_spec
+            spec = group_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                specs = tuple(group_spec.kv_cache_specs.values())
                 assert specs
                 is_circular = all(
                     isinstance(member, CircularBufferSpec) for member in specs
@@ -581,20 +583,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec = specs[0]
             else:
                 is_circular = isinstance(spec, CircularBufferSpec)
-            block_sizes.append(spec.block_size)
+            block_sizes.append(group_spec.block_size)
             slot_mapping_enabled.append(not is_circular)
-            # When using DCP, each request's KV cache is sharded among different ranks.
-            # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence.
+            dcp_sharded.append(group_spec.dcp_sharded)
+            # Only sharded groups span multiple ranks. Replicated Mamba,
+            # selector, and draft owners need the full global table width.
             max_num_blocks = (
                 1
                 if is_circular
-                else cdiv(block_table_max_model_len, spec.block_size * self.dcp_size)
+                else cdiv(
+                    block_table_max_model_len,
+                    group_spec.global_block_size(self.dcp_size),
+                )
             )
             # Align to a multiple of (128 / block_size) as required by some attention
             # backends such as TRTLLM (#39324)
-            if not is_circular and spec.block_size <= 128:
-                alignment = 128 // spec.block_size
+            if not is_circular and group_spec.block_size <= 128:
+                alignment = 128 // group_spec.block_size
                 max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
@@ -618,6 +623,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
             slot_mapping_enabled=slot_mapping_enabled,
+            dcp_sharded=dcp_sharded,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
