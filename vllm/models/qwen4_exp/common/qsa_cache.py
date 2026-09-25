@@ -679,6 +679,11 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
 
         if not self.block_table_buffer.numel():
             return block_table
+        # A mixed target/draft KV group can expose scheduler-level physical
+        # IDs directly, even when a layer's own kernel block is narrower.
+        # The buffer was sized for the maximum number of physical pages.
+        if block_table.shape[1] <= self.block_table_buffer.shape[1]:
+            return block_table
         kernel_block_size = getattr(
             self, "kernel_block_size", self.kv_cache_spec.block_size
         )

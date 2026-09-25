@@ -91,6 +91,7 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         )
         if self.replicated_draft:
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.draft_block_table_buffer: torch.Tensor | None = None
             self.draft_token_to_req = torch.empty(
                 max_tokens, dtype=torch.int32, device=device
             )
@@ -110,15 +111,42 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         if not self.replicated_draft:
             return metadata
-        # Draft K/V owns the full global span on every DCP rank. Its physical
-        # page may be split into smaller kernel blocks in the common block
-        # table, so map with the builder's kernel block size and ignore the
-        # generic slot mask, which can encode target DCP ownership.
+        # Draft K/V owns the full global span on every DCP rank. The mixed
+        # target/draft group hands us scheduler-level physical page IDs. The
+        # draft KV tensor is viewed in narrower kernel blocks, so expand the
+        # table before both attention reads and slot mapping writes.
         draft_page_size, _, _ = qsa_dcp_block_geometry(
             self.vllm_config, self.layer_names[0]
         )
         if draft_page_size % self.block_size:
             raise RuntimeError("QSA draft kernel block must divide its physical page")
+        expansion = draft_page_size // self.block_size
+        if expansion > 1:
+            table = common_attn_metadata.block_table_tensor
+            rows, columns = table.shape
+            if self.draft_block_table_buffer is None:
+                self.draft_block_table_buffer = torch.empty(
+                    (
+                        self.vllm_config.scheduler_config.max_num_seqs,
+                        columns * expansion,
+                    ),
+                    dtype=table.dtype,
+                    device=table.device,
+                )
+            if (
+                rows > self.draft_block_table_buffer.shape[0]
+                or columns * expansion > self.draft_block_table_buffer.shape[1]
+            ):
+                raise RuntimeError("QSA draft block-table buffer is too small")
+            expanded = self.draft_block_table_buffer[:rows, : columns * expansion]
+            expanded_view = expanded.view(rows, columns, expansion)
+            for sub_block in range(expansion):
+                torch.mul(table, expansion, out=expanded_view[:, :, sub_block])
+                expanded_view[:, :, sub_block].add_(sub_block)
+            common_attn_metadata = common_attn_metadata.replace(
+                block_table_tensor=expanded
+            )
+            metadata.block_table = expanded
         _, _, slot_mapping = build_qsa_metadata(
             common_attn_metadata,
             self.draft_token_to_req,
