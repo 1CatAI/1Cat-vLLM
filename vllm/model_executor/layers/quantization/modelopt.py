@@ -121,6 +121,21 @@ QUANT_ALGOS = [
 KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
 
 
+def _sm70_moe_backend_requested_explicitly(layer) -> bool:
+    """True when the run pins an SM70 MoE backend with ``--moe-backend``.
+
+    The SM70 ModelOpt NVFP4 MoE otherwise binds to the TurboMind experts,
+    whose tuned prefill paths are gated on the TP4 shapes (num_experts 512,
+    hidden 2560, w13 n=320). At other topologies every fast path falls
+    through to the per-expert dense stage, which re-reads an expert's weights
+    per call. Honouring the user's explicit pick lets that run take the
+    selected backend instead. Without the flag nothing changes.
+    """
+    moe_config = getattr(layer, "moe_config", None)
+    backend = getattr(moe_config, "moe_backend", "auto")
+    return isinstance(backend, str) and backend.lower() not in ("", "auto")
+
+
 class ModelOptKVCacheMethod(BaseKVCacheMethod):
     """
     Supports loading kv-cache scaling factors from FP8 or NVFP4 checkpoints.
@@ -1172,6 +1187,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
             isinstance(layer, RoutedExperts)
             and not self.is_layer_excluded(prefix)
             and sm70_tm.is_exact_sm70_cuda_platform()
+            and not _sm70_moe_backend_requested_explicitly(layer)
         ):
             if not sm70_tm.should_use_nvfp4_moe_turbomind():
                 raise NotImplementedError(
@@ -2599,7 +2615,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "NVFP4":
-                if sm70_tm.is_exact_sm70_cuda_platform():
+                if sm70_tm.is_exact_sm70_cuda_platform() and not (
+                    _sm70_moe_backend_requested_explicitly(layer)
+                ):
                     if not sm70_tm.should_use_nvfp4_moe_turbomind():
                         raise NotImplementedError(
                             "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
@@ -2617,7 +2635,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "W4A16_NVFP4":
-                if sm70_tm.is_exact_sm70_cuda_platform():
+                if sm70_tm.is_exact_sm70_cuda_platform() and not (
+                    _sm70_moe_backend_requested_explicitly(layer)
+                ):
                     if not sm70_tm.should_use_nvfp4_moe_turbomind():
                         raise NotImplementedError(
                             "ModelOpt W4A16 NVFP4 MoE on SM70 requires the "

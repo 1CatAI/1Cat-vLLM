@@ -8530,6 +8530,57 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
+        if (
+            self.use_flash_v100_prefill_paged
+            and not causal
+            and bool(getattr(layer, "is_dflash_draft_attn", False))
+            and anchor_lens is None
+            and num_seqs > 1
+            and 0 < max_query_len <= 16
+            and query.shape[0] == num_seqs * max_query_len
+            and bool(torch.all(query_lens == max_query_len).item())
+            and out_view.is_contiguous()
+            and not debug_compare
+            and not dflash_dump
+        ):
+            # The native paged kernel already has a batch grid dimension.
+            # Keep all uniform draft rows in one launch instead of capturing
+            # one small attention kernel per request. Only the query shape is
+            # static: live GPU sequence lengths and block tables must remain
+            # inputs so replay can advance or replace individual requests.
+            shape = (num_seqs, max_query_len, query.shape[1], head_dim)
+            logger.info_once(
+                "FLASH_ATTN_V100 DFlash uniform noncausal paged batch route "
+                "active (batch=%d, q=%d, page=%d).",
+                num_seqs,
+                max_query_len,
+                block_size,
+            )
+            _record_route("prefill_prefix_dflash_noncausal_batch")
+            self._run_prefill_paged_call(
+                route="prefill_prefix_dflash_noncausal_batch",
+                q_len=max_query_len,
+                seq_len=int(seq_lens.max().item()),
+                heads_q=query.shape[1],
+                heads_kv=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                fn=lambda: self.flash_attn_prefill_paged(
+                    query.reshape(shape),
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table[:num_seqs],
+                    attn_metadata.seq_lens[:num_seqs],
+                    out=out_view.view(shape),
+                    softmax_scale=self.scale,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    causal=False,
+                    window_size=window_size,
+                ),
+            )
+            return output
         if causal and _ddtree_parent_metadata_requires_branch(
             attn_metadata,
             query_start_loc,

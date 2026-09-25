@@ -104,6 +104,39 @@ GUM 0.975 instead fails admission (4.25 GiB KV available versus 4.28 required),
 because unsplit allocations change the measured activation peak. This setting
 is a separate runtime experiment, not the warmup-only source default.
 
+## Successful single-card boundary experiment
+
+With the complete candidate, GUM 0.98, the calibrated 512 MiB Graph reserve,
+and `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:20` retained during serving,
+the single-card C2/64K configuration starts and completes both cold retrieval
+requests. They contain 32768 and 64512 input tokens, each returning all three
+values and the sum correctly, with natural EOS after 16 output tokens.
+Each request resets the prefix cache. TTFT is 36.278 and 72.989 seconds;
+the first request includes additional kernel JIT compilation.
+
+One subsequent `vllm bench serve` random 32768-input/256-output C1 request,
+after request warmup and prefix-cache reset, completes with zero failures:
+
+| Metric | Value |
+|---|---:|
+| TTFT | 35.049 s |
+| Input tokens / TTFT (estimate including first-token work) | 934.9 tok/s |
+| TPOT | 9.042 ms |
+| Complete request duration | 37.355 s |
+| Complete-request output throughput | 6.853 tok/s |
+
+TPOT is the official benchmark average after first token, not a separate
+steady pure-decode measurement; DFlash emits multiple accepted tokens per
+step. This is single-GPU 32K evidence, not the earlier TP4 256K baseline.
+
+With persistent allocator scoping the measured profile peak is 1.674 GiB
+(versus 1.594 with the serving allocator restored), and available KV is
+4.405 GiB. Actual Graph capture is 0.404 GiB. After the long requests, device
+usage is 31.471 GiB; peak PyTorch active allocation is 30.759 GiB. Memory
+headroom remains small. Both long retrievals pass, but this does not replace
+a paired dataset-quality or end-to-end speed-regression test. No automatic
+GUM, graph-reserve, or persistent allocator default is changed by this PR.
+
 ## Validation and promotion
 
 Focused CUDA tests cover tiled/fallback gate-up, exact down-projection basis
@@ -115,12 +148,16 @@ has 69 passes and one pre-existing DeepSeek
 fixture failure (`max_in_flight_tokens` missing); the identical failure is
 reproduced on the unmodified base. Do not report the whole suite as green.
 
-Keep this change in Draft until final long-request capacity, matched serving
-speed and output quality are validated. In particular, a 64K startup probe is
+Keep this change in Draft until matched serving speed and output quality are
+validated against the updated integration source. In particular, a 64K probe is
 not a 256K acceptance result, and local TP-shaped kernels do not replace TP2
 and TP4 serving checks.
 
-Main advanced to `fcf59f8e9ae50c186333e98e5cf6aae705f320de` during this
-investigation, including DFlash batched decode defaults. The measurements above
-remain tied to the stated integration base; they are not a validation of the
-newer main combined with this candidate.
+The successful serving probe used implementation `f39f7099fb` (native code
+before formatting-only commit-hook edits). Main advanced to
+`fcf59f8e9ae50c186333e98e5cf6aae705f320de` during this investigation, including
+DFlash batched decode defaults. It was merged into this owned branch after the
+serving probes. The measurements above remain tied to the stated integration
+base; they are not serving validation of the newer main combined with this
+candidate. The full runtime commands and native hashes are retained in the
+local handoff, and all task-owned serving processes were stopped.
