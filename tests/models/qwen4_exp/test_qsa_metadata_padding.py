@@ -279,7 +279,7 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),
     )
     builder.layer_names = ["mtp.layers.48.self_attn.attn"]
-    builder.kernel_block_size = 8
+    builder.block_size = 16
     builder.draft_token_to_req = torch.empty(4, dtype=torch.int32)
     builder.draft_logical_positions = torch.empty(4, dtype=torch.int64)
     builder.draft_slot_mapping = torch.empty(4, dtype=torch.int64)
@@ -304,3 +304,6 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
         -1,
         -1,
     ]
+    builder.block_size = 8
+    with pytest.raises(RuntimeError, match="unsplit replicated block IDs"):
+        builder.build(0, common)

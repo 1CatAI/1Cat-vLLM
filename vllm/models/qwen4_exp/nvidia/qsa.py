@@ -114,14 +114,11 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         # generic slot map. Draft K/V owns the full global span on every DCP
         # rank, so its physical page is twice as wide and must be mapped from
         # logical positions independently of the sharded target slot mask.
-        if (
-            getattr(self, "kernel_block_size", None)
-            != self.vllm_config.cache_config.block_size
-        ):
-            raise RuntimeError("QSA draft requires unsplit target-local block IDs")
         draft_page_size, _, _ = qsa_dcp_block_geometry(
             self.vllm_config, self.layer_names[0]
         )
+        if self.block_size != draft_page_size:
+            raise RuntimeError("QSA draft requires unsplit replicated block IDs")
         _, _, slot_mapping = build_qsa_metadata(
             common_attn_metadata,
             self.draft_token_to_req,
