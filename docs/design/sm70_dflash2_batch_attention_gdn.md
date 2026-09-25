@@ -24,6 +24,16 @@ replay retained the per-request loop.
 
 ## Workload and source
 
+The SM70 Qwen3.8 DFlash2 automatic configuration now enables compressed batch
+GEMM layouts and sets AWQ warmup, FP8 dense tuning and NVFP4 dense tuning
+limits to M64. It preserves every explicit environment override, including
+`VLLM_SM70_BATCH_GEMM_LAYOUTS=0`. The existing contract admits all target
+quantizations and KV dtypes; individual operators check their own capabilities.
+Batch layouts still require capacity for at least eight requests, and C1/C4
+retain their existing small-M kernels. Joint draft attention and the guarded
+packed GDN schedule activate automatically. The experimental FP8 prescaled
+layout remains off by default.
+
 Integration base: `d49e32b3587d4d34ffccb0ffd376e63974b06c88`, `onecat/main`.
 Owned branch: `codex/v100-dflash2-concurrent-decode-20260923-075451`.
 Pre-change HEAD: `b8e05bcbe4586ec4a123e1349ceab0f2821a817a`.

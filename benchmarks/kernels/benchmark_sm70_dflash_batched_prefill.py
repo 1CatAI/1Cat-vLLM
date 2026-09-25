@@ -15,8 +15,6 @@ import statistics
 
 import torch
 
-from flash_attn_v100 import flash_attn_prefill_paged
-
 
 def graph_us(fn):
     for _ in range(3):
@@ -40,6 +38,8 @@ def graph_us(fn):
 
 @torch.inference_mode()
 def screen(context, batch):
+    from flash_attn_v100 import flash_attn_prefill_paged
+
     pages = (context + 15) // 16
     query = torch.randn(batch, 8, 8, 128, device="cuda", dtype=torch.float16)
     key = torch.randn(batch * pages, 16, 2, 128, device="cuda").half()

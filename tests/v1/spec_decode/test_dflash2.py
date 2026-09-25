@@ -271,7 +271,14 @@ def test_sm70_dflash2_verifier_contract_is_tp_and_quantization_independent(
 
 @pytest.mark.parametrize(
     "overridden_name",
-    ["VLLM_SM70_DFLASH2_QPN8_RERANK", "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS"],
+    [
+        "VLLM_SM70_DFLASH2_QPN8_RERANK",
+        "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS",
+        "VLLM_SM70_BATCH_GEMM_LAYOUTS",
+        "VLLM_SM70_AWQ_WARMUP_MAX_M",
+        "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
+        "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
+    ],
 )
 def test_sm70_dflash2_verifier_defaults_preserve_overrides(
     monkeypatch, overridden_name

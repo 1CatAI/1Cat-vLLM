@@ -47495,3 +47495,27 @@ has launched no full model. Details and artifacts are in
   hashes use task-private key `verification/batch-followup-20260925/`.
   No new PRO measurement or 35B-A3B AWQ/FP8 model-speed gate was run.
   The 5%-ahead-PRO goal remains open; this update does not claim completion.
+
+## 2026-09-25 Default enablement and integration of PR #688
+
+- Following the user's explicit request to enable the measured paths and
+  merge, the existing SM70 Qwen3.8 DFlash2 configuration now sets batch GEMM
+  layouts on and AWQ warmup/FP8 tuning/NVFP4 tuning limits to M64. Every
+  explicit environment override is preserved. This supersedes the older
+  default-off batch-layout decision; it does not declare the PRO speed goal
+  achieved. The configuration contract is independent of target quantization
+  and KV dtype; local operators retain their own capability and shape gates.
+- Joint draft paged attention and TP4 C4/C8 packed GDN scheduling were already
+  automatic. C1/C4 compressed GEMM keeps the existing small-M routes, while
+  the alternate FP8 prescaled layout remains default-off. No additional
+  native source change or rebuild is needed for this configuration update.
+- The 19 focused verifier-contract/default tests pass, including all four
+  batch settings' explicit overrides and TP/quantization-independent
+  admission. Existing paired endpoint/quality and 44 GPU regression evidence
+  remain recorded above. The previous CI failure was an import-group
+  classification difference for the new benchmark's optional native package;
+  moving that import into the benchmark operation makes local and CI lint
+  resolution agree. Targeted pre-commit passes.
+- Fresh default-configuration service logs, smoke requests, CI and merge
+  records are retained under task-private
+  `verification/batch-followup-20260925/merge-defaults/`.
