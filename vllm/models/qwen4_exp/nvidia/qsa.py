@@ -112,15 +112,22 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         if not self.replicated_draft:
             return metadata
         # Draft K/V owns the full global span on every DCP rank. The mixed
-        # target/draft group hands us scheduler-level physical page IDs. The
-        # draft KV tensor is viewed in narrower kernel blocks, so expand the
-        # table before both attention reads and slot mapping writes.
+        # target/draft group has already expanded each scheduler page into
+        # kernel blocks using the target page size. The draft needs twice as
+        # many kernel blocks per page, so only expand the remaining ratio.
         draft_page_size, _, _ = qsa_dcp_block_geometry(
             self.vllm_config, self.layer_names[0]
         )
         if draft_page_size % self.block_size:
             raise RuntimeError("QSA draft kernel block must divide its physical page")
-        expansion = draft_page_size // self.block_size
+        group_page_size = self.vllm_config.cache_config.block_size
+        if group_page_size >= self.block_size and group_page_size % self.block_size:
+            raise RuntimeError("QSA group page must divide into kernel blocks")
+        group_blocks_per_page = max(1, group_page_size // self.block_size)
+        draft_blocks_per_page = draft_page_size // self.block_size
+        if draft_blocks_per_page % group_blocks_per_page:
+            raise RuntimeError("QSA draft blocks must divide the group page")
+        expansion = draft_blocks_per_page // group_blocks_per_page
         if expansion > 1:
             table = common_attn_metadata.block_table_tensor
             rows, columns = table.shape

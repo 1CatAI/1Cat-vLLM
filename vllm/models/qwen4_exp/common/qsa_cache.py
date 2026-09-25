@@ -688,7 +688,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             self, "kernel_block_size", self.kv_cache_spec.block_size
         )
         group_block_size = self.kv_cache_spec.block_size
-        if self.has_sharded_main_owner and self.dcp_world_size > 1:
+        if self.kv_cache_spec.dcp_sharded and self.dcp_world_size > 1:
             if group_block_size % self.dcp_world_size:
                 raise RuntimeError("QSA replicated page must cover whole DCP group")
             group_block_size //= self.dcp_world_size

@@ -261,7 +261,7 @@ def test_dcp_replicated_draft_main_uses_full_page_not_sharded_slot_map(
 
 @pytest.mark.parametrize(
     ("kernel_block_size", "block_table"),
-    [(16, [5, 6]), (8, [5, 6])],
+    [(16, [5, 6]), (8, [5, 6]), (2, list(range(20, 29)))],
 )
 def test_dcp_draft_main_builder_suppresses_dummy_writes(
     monkeypatch: pytest.MonkeyPatch,
@@ -304,8 +304,12 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
         block_table_tensor=torch.tensor([block_table], dtype=torch.int32),
     )
     assert builder.build(0, common).slot_mapping.tolist() == [94, 95, 96, 97]
-    if kernel_block_size == 8:
-        assert builder.draft_block_table_buffer[0].tolist() == [10, 11, 12, 13]
+    if kernel_block_size in (8, 2):
+        assert builder.draft_block_table_buffer[0].tolist() == [
+            virtual_block
+            for group_block in block_table
+            for virtual_block in (group_block * 2, group_block * 2 + 1)
+        ]
     assert builder.build(
         0, replace(common, is_dummy_batch=True)
     ).slot_mapping.tolist() == [
@@ -322,7 +326,7 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
 def test_qsa_canonical_block_table_accepts_partial_virtual_page() -> None:
     builder = object.__new__(qsa_cache.QSAMetadataBuilder)
     builder.block_table_buffer = torch.empty((1, 2), dtype=torch.int32)
-    builder.kv_cache_spec = SimpleNamespace(block_size=32)
+    builder.kv_cache_spec = SimpleNamespace(block_size=32, dcp_sharded=False)
     builder.kernel_block_size = 16
     builder.has_sharded_main_owner = False
     builder.dcp_world_size = 1
@@ -334,9 +338,20 @@ def test_qsa_canonical_block_table_accepts_partial_virtual_page() -> None:
 def test_qsa_canonical_block_table_keeps_physical_pages() -> None:
     builder = object.__new__(qsa_cache.QSAMetadataBuilder)
     builder.block_table_buffer = torch.empty((1, 3), dtype=torch.int32)
-    builder.kv_cache_spec = SimpleNamespace(block_size=32)
+    builder.kv_cache_spec = SimpleNamespace(block_size=32, dcp_sharded=False)
     builder.kernel_block_size = 16
     builder.has_sharded_main_owner = False
     builder.dcp_world_size = 1
     table = torch.tensor([[5, 6, 7]], dtype=torch.int32)
     assert builder._canonical_block_table(table) is table
+
+
+def test_qsa_replicated_side_table_uses_its_own_page_geometry() -> None:
+    builder = object.__new__(qsa_cache.QSAMetadataBuilder)
+    builder.block_table_buffer = torch.empty((1, 1), dtype=torch.int32)
+    builder.kv_cache_spec = SimpleNamespace(block_size=3200, dcp_sharded=False)
+    builder.kernel_block_size = 128
+    builder.has_sharded_main_owner = True
+    builder.dcp_world_size = 2
+    table = torch.arange(675, 700, dtype=torch.int32).unsqueeze(0)
+    assert builder._canonical_block_table(table).tolist() == [[27]]
