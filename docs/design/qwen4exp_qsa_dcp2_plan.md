@@ -32,9 +32,10 @@ The capacity calculation predicts about 1.18M global tokens for target-only
 DCP2 before new workspace, or about 1.13M with 256 MiB/card of new workspace,
 against a measured 775,096-token DCP1 baseline. These are layout projections,
 not acceptance results. Four simultaneous full 262,144-token contexts are a
-reference point, not a mandatory success threshold. Correct output and a
-measurable capacity benefit are the hard decision inputs; latency and prefix
-retention determine whether the benefit is operationally worthwhile.
+reference point, not a mandatory success threshold. Correctness, stability,
+reproducible evidence, and service recovery are acceptance gates. Capacity,
+latency, throughput, and prefix retention are measured optimization results,
+not pass/fail thresholds; review their trade-offs before any deployment decision.
 
 ## Implementation sequence
 
@@ -86,19 +87,46 @@ retention determine whether the benefit is operationally worthwhile.
 
 ## Validation matrix and evidence
 
-| Gate | Cases | Evidence required |
+| Check | Cases | Evidence required |
 | --- | --- | --- |
 | CPU ownership | DCP1/2; main, selector, GDN, PLE, ring, draft; empty/ragged/two-request pages | Exact slots, block counts, global spans, hash and eviction/restore invariants |
 | QSA operator | E4M3 and FP16 reference; short/long selection; empty owner; page boundary; prefill/decode | Selected IDs and output parity, finite tensors, per-rank LSE and gate values |
 | Graph/MTP | Captured and eager, repeated replay, mixed prefill/decode, MTP3 | Same output tokens and acceptance decisions; stable scratch pointers and bounded memory |
 | Integrated cache | Prefix miss/hit/partial hit, CPU/filesystem offload and restore, C1/C4 at several context lengths | Correct continuation and cache state after eviction/reload; no deadlock or stale block |
-| Capacity/performance | Same checkpoint/image/config except DCP1 vs DCP2; C1/C4, short/long prompts, repeated runs | Actual pool bytes/blocks/global tokens, peak/card, prefill TTFT, full MTP3 round latency, output tok/s, accept rate, prefix hit/eviction |
+| Capacity/performance profiling | Same checkpoint/image/config except DCP1 vs DCP2; C1/C4, short/long prompts, repeated runs | Actual pool bytes/blocks/global tokens, peak/card, prefill TTFT, full MTP3 round latency, output tok/s, accept rate, prefix hit/eviction |
 
 For numerical tests, set explicit tolerances from the DCP1 FP32 reference
 before inspecting candidate outputs; exact token equality is required on the
 deterministic text replay set. Record sampling seed, prompt hashes, output
 hashes, and any divergence position. Measure cold and warmed runs separately.
 An HTTP 200 or successful model load does not constitute acceptance.
+
+## Final acceptance and optimization targets
+
+The hard acceptance gates are:
+
+1. The supported TP4/DCP2 target-only configuration runs the real checkpoint
+   with MTP3, prefix caching, grouped offload, mixed prefill/decode, and graph
+   replay. Fixed deterministic replay has the same generated token IDs and
+   MTP acceptance decisions as DCP1. Operator outputs and LSE satisfy the
+   predetermined numerical tolerances. No stale cache data, non-finite values,
+   out-of-bounds access, deadlock, or unexpected OOM occurs in the validation
+   matrix.
+2. The DCP1 control remains functional. Results identify exact source/image,
+   checkpoint, configuration, prompts, seeds, and raw logs so the comparison
+   can be reproduced. Capacity and performance measurements must be reported
+   even when their values miss an optimization target.
+3. The temporary GRS lease is released, its cleanup and resident recovery are
+   confirmed, and the original service passes a real serving request.
+
+Optimization targets for the first A/B are at least 20% more usable KV
+capacity than DCP1 at the same GPU budget, no more than 5% lower output
+throughput, and no more than 10% higher TTFT in the primary scenarios. Repeat
+each scenario at least five times and report the distribution, peak memory,
+and prefix behavior. These numbers and the four-full-context reference are
+not hard gates. Missing a target calls for profiling and an explicit trade-off
+decision; it does not erase a technically correct result or automatically
+prevent the next iteration.
 
 ## V100 execution and rollback
 
