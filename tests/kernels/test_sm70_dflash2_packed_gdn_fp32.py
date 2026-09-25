@@ -17,8 +17,13 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 @pytest.mark.parametrize("tp_size", [2, 4])
 @pytest.mark.parametrize("strided_qkv", [False, True])
 @pytest.mark.parametrize("use_bv2", [False, True])
+@pytest.mark.parametrize("batch", [1, 4, 8])
 def test_packed_entry_preserves_fp32_beta_and_strided_state(
-    tp_size: int, strided_qkv: bool, use_bv2: bool, monkeypatch: pytest.MonkeyPatch
+    tp_size: int,
+    strided_qkv: bool,
+    use_bv2: bool,
+    batch: int,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("The packed DFlash2 verifier requires SM70")
@@ -42,7 +47,7 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
     monkeypatch.setattr(
         fused, "fused_sigmoid_gating_delta_rule_update_kernel", RecordingKernel()
     )
-    q_heads, v_heads, dim, tokens = 16 // tp_size, 48 // tp_size, 128, 8
+    q_heads, v_heads, dim, tokens = 16 // tp_size, 48 // tp_size, 128, batch * 8
     width = (2 * q_heads + v_heads) * dim
     projection_width = (2 * q_heads + 2 * v_heads) * dim + 2 * v_heads
     row_stride = (projection_width + 31) // 32 * 32 if strided_qkv else width
@@ -57,15 +62,19 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
     bias = torch.randn(v_heads, device="cuda", dtype=torch.float16)
     # Keep a gap between pool slots to exercise the native state stride.
     control_storage = (
-        torch.randn((12, 2, v_heads, dim, dim), device="cuda", dtype=torch.float32)
+        torch.randn(
+            (batch * 12, 2, v_heads, dim, dim), device="cuda", dtype=torch.float32
+        )
         * 0.02
     )
     candidate_storage = control_storage.clone()
     control_state, candidate_state = control_storage[:, 1], candidate_storage[:, 1]
-    indices = torch.tensor([[3, 9, 4, 8, 2, 6, 1, 5]], device="cuda", dtype=torch.int32)
-    retired = torch.tensor([0, 7, 10, 11], device="cuda")
-    accepted = torch.ones(1, device="cuda", dtype=torch.int32)
-    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    offsets = torch.arange(batch, device="cuda", dtype=torch.int32)[:, None] * 12
+    indices = offsets + torch.tensor([3, 9, 4, 8, 2, 6, 1, 5], device="cuda")
+    indices = indices.to(torch.int32)
+    retired = (offsets + torch.tensor([0, 7, 10, 11], device="cuda")).flatten().long()
+    accepted = torch.ones(batch, device="cuda", dtype=torch.int32)
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * 8
     expected = torch.empty((tokens, v_heads, dim), device="cuda", dtype=torch.float16)
     actual = torch.empty_like(expected)
     layer = SimpleNamespace(
@@ -80,8 +89,8 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
         enable_sm70_dflash2_tp2_gdn_bv2=use_bv2,
     )
     metadata = SimpleNamespace(
-        spec_sequence_masks=torch.ones(1, device="cuda", dtype=torch.bool),
-        num_spec_decodes=1,
+        spec_sequence_masks=torch.ones(batch, device="cuda", dtype=torch.bool),
+        num_spec_decodes=batch,
         num_prefills=0,
         num_decodes=0,
         ddtree_parent_ids=None,
@@ -130,7 +139,7 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
             spec_query_start_loc=cu,
             spec_state_indices_tensor=indices,
             spec_state_slot_selectors=accepted,
-            num_spec_decodes=1,
+            num_spec_decodes=batch,
         )
 
     control()
@@ -142,7 +151,7 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
             run()
         graphs.append(graph)
     for selector in range(1, 9):
-        accepted.fill_(selector)
+        accepted.copy_((torch.arange(batch, device="cuda") + selector - 1) % 8 + 1)
         initial = torch.randn_like(control_storage) * 0.02
         control_storage.copy_(initial)
         candidate_storage.copy_(initial)
@@ -164,5 +173,7 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
             )
             assert torch.all(mixed_storage[:, width:] == -3.0)
     expected_bv = (2 if use_bv2 else 16) if tp_size == 2 else 8
+    if batch > 1:
+        expected_bv = 32 if tp_size == 2 else 8
     assert launches
-    assert set(launches) == {((1, dim // expected_bv, v_heads), expected_bv, 1)}
+    assert set(launches) == {((1, dim // expected_bv, batch * v_heads), expected_bv, 1)}

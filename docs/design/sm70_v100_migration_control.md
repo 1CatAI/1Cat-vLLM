@@ -47434,3 +47434,64 @@ has launched no full model. Details and artifacts are in
   5.75 ms, sampling 4.09 ms, and other kernels 8.09 ms. Existing SM70 TP4
   push all-reduce screens in this control document regressed at M64, so no
   unqualified communication switch is stacked on this candidate.
+
+## 2026-09-25 DFlash batch attention and packed GDN follow-up
+
+- Continue the existing owned branch and Draft PR #688, based on
+  `onecat/main` at `d49e32b3587d4d34ffccb0ffd376e63974b06c88`; do not open
+  a duplicate PR. The detailed contract, results and limits are recorded in
+  [SM70 DFlash batch attention and verifier-state scheduling](sm70_dflash2_batch_attention_gdn.md).
+  This entry supersedes the older candidate's timing figures above, not its
+  outstanding PRO and 35B-A3B acceptance gates.
+- The latest same-contract trace localizes a real missing batch path:
+  draft projections were batched, but paged attention ran one request at a
+  time. Uniform noncausal draft queries now use the existing native kernel's
+  batch grid, with live GPU page tables and lengths during graph replay.
+  No native rebuild, additional environment flag or quantization-specific
+  fast path is added. Native extension SHA256 remains
+  `2884a59db00563d686a5dd7bbfbad57edb424b7d43b22a79bb468f299b56cef5`.
+- TP4 full-q8 GDN uses the numerically identical BV8 schedule for C4/C8,
+  preserving every FP32 state snapshot and accepted-state selector. The
+  existing FlashQLA DDTree API with linear parents does not outperform it
+  across C1/C4/C8, so that alternative is not promoted. This comparison does
+  not rule out a new specialized FlashQLA verifier.
+- The same CUDA-event observer gives rank-0 target-forward C1/C4/C8
+  14.055/31.253/37.648 → 14.065/30.365/36.863 ms, draft
+  4.296/9.322/13.490 → 4.270/6.760/7.309 ms, and whole-step
+  20.000/45.861/57.810 → 20.371/42.255/50.744 ms. These are full concurrent
+  batches, not per-request serialized costs. Candidate per-step rank maxima,
+  then medians, are 20.556/42.360/51.105 ms. Timing instrumentation is for
+  attribution and is not endpoint speed admission.
+- Six interior Nsight steps per batch and rank confirm five draft attention
+  launches at all batch sizes, with grids (1,1,8)/(1,1,32)/(1,1,64).
+  Previously C4/C8 issued 20/40 separate small launches. Rank-0 draft
+  attention service changes 0.862/3.255/6.451 → 0.859/0.876/0.910 ms;
+  GDN C4/C8 changes 3.689/5.345 → 2.661/4.474 ms. Target GEMM remains
+  8.506/20.278/21.429 ms at C1/C4/C8. The C1→C4 increase still dominates
+  target-forward growth; GEMM occupies 66.8%/58.1% of C4/C8 target service.
+- Three matched, uninstrumented endpoint runs at C1/16, C4/32 and C8/48,
+  same 2K/256 dataset and sampling, give rolling client decode-capacity
+  medians 243.633/293.667/343.050 → 246.891/298.459/356.606 tok/s.
+  C4/C8 gains are 1.63%/3.95%. This metric includes replacement-prefill
+  pauses and is not a GPU emitted-token counter. Prefix hits are zero.
+  Acceptance medians change 56.60/56.70/56.22% → 57.49/56.54/55.18%;
+  individual runs vary. A single common-client-window estimate gives
+  C4 418.12→494.03 and C8 746.67→784.79 tok/s, but retokenizes streamed text
+  and must not be reported as the exact three-run pure-decode gate.
+- All 44 focused GPU tests pass: attention graph replay with changing live
+  lengths/pages, FP16/E4M3 KV, page16/1648, 2K–262K logical positions;
+  and TP2/TP4 packed GDN with heterogeneous selectors, all snapshots and
+  repeated replays. Targeted pre-commit passes with the bundled Flash-V100
+  package on MYPYPATH. Paired GSM8K16 xhigh natural-EOS quality runs both
+  score 15/16 with the same wrong question; acceptance 51.29→51.58%.
+  The control has one length-capped output, candidate none. This is relative
+  quality evidence, not general output-quality proof.
+- Do not repeat the rejected real-weight GEMM screens unchanged. FP8 M32
+  four-phase split-K regresses; reduced unrolling cuts registers 138→127
+  but saves only about 5.36 us on one shape. FP4 multirow 16/32-row reuse
+  preserves bits but regresses M32 gate/up from 145 to 157–161 us and does
+  not help down. Research extensions are not loaded into the service.
+- Raw endpoint results, trace, compiler logs, rejected screens and source
+  hashes use task-private key `verification/batch-followup-20260925/`.
+  No new PRO measurement or 35B-A3B AWQ/FP8 model-speed gate was run.
+  The 5%-ahead-PRO goal remains open; this update does not claim completion.
