@@ -9,9 +9,11 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.common import qsa_cache
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAMetadataBuilder
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import torch_utils
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -216,3 +218,89 @@ def test_qsa_dummy_batch_suppresses_replicated_selector_writes(
     dummy = builder.build(0, replace(common, is_dummy_batch=True))
     assert normal_slots.tolist() == [23, -1, 24, -1]
     assert dummy.slot_mapping.tolist() == [-1, -1, -1, -1]
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton"])
+def test_dcp_replicated_draft_main_uses_full_page_not_sharded_slot_map(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if backend == "triton" and (not HAS_TRITON or not torch.cuda.is_available()):
+        pytest.skip("Triton metadata requires CUDA")
+    device = torch.device("cuda" if backend == "triton" else "cpu")
+    if backend == "torch":
+        monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    starts = torch.tensor([0, 4], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_actual_tokens=4,
+        num_reqs=1,
+        max_query_len=4,
+        max_seq_len=10,
+        query_start_loc=starts.to(device),
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([10], dtype=torch.int32, device=device),
+        slot_mapping=torch.full((4,), -1, dtype=torch.int64, device=device),
+        block_table_tensor=torch.tensor([[5, 6]], dtype=torch.int32, device=device),
+    )
+    builder = (
+        qsa_cache._build_qsa_metadata_torch
+        if backend == "torch"
+        else qsa_cache.build_qsa_metadata_triton
+    )
+    _, positions, slots = builder(
+        common,
+        torch.empty(4, dtype=torch.int32, device=device),
+        torch.empty(4, dtype=torch.int64, device=device),
+        torch.empty(4, dtype=torch.int64, device=device),
+        storage_block_size=8,
+        compress_ratio=1,
+        map_plain_slot=True,
+    )
+    assert positions.tolist() == [6, 7, 8, 9]
+    assert slots.tolist() == [46, 47, 48, 49]
+
+
+def test_dcp_draft_main_builder_suppresses_dummy_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    monkeypatch.setattr(
+        "vllm.models.qwen4_exp.nvidia.qsa.build_qsa_metadata",
+        qsa_cache._build_qsa_metadata_torch,
+    )
+    monkeypatch.setattr(
+        FlashAttentionMetadataBuilder,
+        "build",
+        lambda self, *args: SimpleNamespace(slot_mapping=None),
+    )
+    builder = object.__new__(Qwen4ExpQSAMetadataBuilder)
+    builder.replicated_draft = True
+    builder.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=8),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+    )
+    builder.layer_names = ["mtp.layers.48.self_attn.attn"]
+    builder.kernel_block_size = 8
+    builder.draft_token_to_req = torch.empty(4, dtype=torch.int32)
+    builder.draft_logical_positions = torch.empty(4, dtype=torch.int64)
+    builder.draft_slot_mapping = torch.empty(4, dtype=torch.int64)
+    starts = torch.tensor([0, 4], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_actual_tokens=4,
+        num_reqs=1,
+        max_query_len=4,
+        max_seq_len=18,
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([18], dtype=torch.int32),
+        slot_mapping=torch.full((4,), -1, dtype=torch.int64),
+        block_table_tensor=torch.tensor([[5, 6]], dtype=torch.int32),
+    )
+    assert builder.build(0, common).slot_mapping.tolist() == [94, 95, 96, 97]
+    assert builder.build(
+        0, replace(common, is_dummy_batch=True)
+    ).slot_mapping.tolist() == [
+        -1,
+        -1,
+        -1,
+        -1,
+    ]

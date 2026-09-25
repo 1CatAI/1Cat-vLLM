@@ -225,6 +225,7 @@ def _build_qsa_metadata_kernel(
     circular_buffer_size: tl.constexpr,
     num_block_table_columns: tl.constexpr,
     IGNORE_COMMON_SLOT_MASK: tl.constexpr,
+    MAP_PLAIN_SLOT: tl.constexpr,
     launch_pdl: tl.constexpr,
     TOKEN_BLOCK_SIZE: tl.constexpr,
     REQUEST_SCAN_SIZE: tl.constexpr,
@@ -285,6 +286,22 @@ def _build_qsa_metadata_kernel(
         slot = physical_block * circular_buffer_size + (
             logical_position % circular_buffer_size
         )
+    elif MAP_PLAIN_SLOT:
+        logical_block = tl.maximum(logical_position, 0) // storage_block_size
+        valid = (
+            mapped & (logical_position >= 0) & (logical_block < num_block_table_columns)
+        )
+        physical_block = tl.load(
+            block_table_ptr
+            + request_idx * block_table_stride_0
+            + logical_block * block_table_stride_1,
+            mask=valid,
+            other=-1,
+        )
+        valid &= physical_block >= 0
+        slot = physical_block * storage_block_size + (
+            logical_position % storage_block_size
+        )
     elif compress_ratio != 1:
         compressed_position = tl.maximum(logical_position, 0) // compress_ratio
         logical_block = compressed_position // storage_block_size
@@ -309,7 +326,7 @@ def _build_qsa_metadata_kernel(
         slot = physical_block * storage_block_size + (
             compressed_position % storage_block_size
         )
-    if (circular_buffer_size > 0) or (compress_ratio != 1):
+    if (circular_buffer_size > 0) or (compress_ratio != 1) or MAP_PLAIN_SLOT:
         tl.store(
             slot_mapping_ptr + token_idx,
             tl.where(valid, slot, -1),
@@ -389,6 +406,7 @@ def build_qsa_metadata_triton(
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
     ignore_common_slot_mask: bool = False,
+    map_plain_slot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -446,13 +464,14 @@ def build_qsa_metadata_triton(
         circular_buffer_size,
         block_table.shape[1],
         IGNORE_COMMON_SLOT_MASK=ignore_common_slot_mask,
+        MAP_PLAIN_SLOT=map_plain_slot,
         launch_pdl=_metadata_launch_pdl(),
         TOKEN_BLOCK_SIZE=128,
         REQUEST_SCAN_SIZE=request_scan_size,
         WORK_BLOCK_SIZE=256,
         num_warps=4,
     )
-    if circular_buffer_size == 0 and compress_ratio == 1:
+    if circular_buffer_size == 0 and compress_ratio == 1 and not map_plain_slot:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
     return token_to_req, logical_positions, slot_mapping
 
@@ -469,6 +488,7 @@ def _build_qsa_metadata_torch(
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
     ignore_common_slot_mask: bool = False,
+    map_plain_slot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del request_capacity
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -499,6 +519,16 @@ def _build_qsa_metadata_torch(
             circular_buffer_size,
             query_start_loc=common_attn_metadata.query_start_loc,
             out=slot_mapping_buffer,
+        )
+    elif map_plain_slot:
+        slot_mapping = slot_mapping_buffer[:num_tokens]
+        slot_mapping.copy_(
+            _logical_to_physical_qsa_slots(
+                common_attn_metadata.block_table_tensor,
+                token_to_req,
+                logical_positions,
+                storage_block_size,
+            )
         )
     elif compress_ratio == 1:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]

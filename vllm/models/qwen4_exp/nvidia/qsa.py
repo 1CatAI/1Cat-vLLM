@@ -44,6 +44,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionType,
+    CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.flash_attn import (
@@ -52,13 +53,19 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
 
-from ..common.qsa_cache import QSAForwardMetadata, qsa_dcp_block_geometry
+from ..common.qsa_cache import (
+    QSAForwardMetadata,
+    build_qsa_metadata,
+    qsa_dcp_block_geometry,
+)
 from .indexer_qsa import QSAIndexer
 
 
@@ -66,6 +73,68 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # The replicated draft's slot map depends on logical positions as well
+    # as the block table; FlashAttention's update hook only receives a table.
+    supports_update_block_table: bool = False
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.replicated_draft = (
+            vllm_config.parallel_config.decode_context_parallel_size == 2
+            and all("mtp" in name.split(".") for name in layer_names)
+        )
+        if self.replicated_draft:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.draft_token_to_req = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
+            self.draft_logical_positions = torch.empty(
+                max_tokens, dtype=torch.int64, device=device
+            )
+            self.draft_slot_mapping = torch.empty(
+                max_tokens, dtype=torch.int64, device=device
+            )
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> FlashAttentionMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if not self.replicated_draft:
+            return metadata
+        # The shared target/draft group uses target-local blocks for its
+        # generic slot map. Draft K/V owns the full global span on every DCP
+        # rank, so its physical page is twice as wide and must be mapped from
+        # logical positions independently of the sharded target slot mask.
+        if (
+            getattr(self, "kernel_block_size", None)
+            != self.vllm_config.cache_config.block_size
+        ):
+            raise RuntimeError("QSA draft requires unsplit target-local block IDs")
+        draft_page_size, _, _ = qsa_dcp_block_geometry(
+            self.vllm_config, self.layer_names[0]
+        )
+        _, _, slot_mapping = build_qsa_metadata(
+            common_attn_metadata,
+            self.draft_token_to_req,
+            self.draft_logical_positions,
+            self.draft_slot_mapping,
+            storage_block_size=draft_page_size,
+            compress_ratio=1,
+            map_plain_slot=True,
+        )
+        if common_attn_metadata.is_dummy_batch:
+            slot_mapping.fill_(PAD_SLOT_ID)
+        metadata.slot_mapping = slot_mapping
+        return metadata
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
