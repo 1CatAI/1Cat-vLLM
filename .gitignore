@@ -258,3 +258,4 @@ flash-attention-v100/*.egg-info/
 # Local agent state and benchmark artifacts.
 .serena/
 bench_results/
+*.whl

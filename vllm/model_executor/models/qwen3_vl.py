@@ -845,6 +845,12 @@ class Qwen3_VisionTransformer(nn.Module):
             ("attn.qkv.", "attn.q.", "q"),
             ("attn.qkv.", "attn.k.", "k"),
             ("attn.qkv.", "attn.v.", "v"),
+            # EXL3 repacks ship per-projection tensors with HF-style
+            # _proj suffixes (attn.q_proj.*) instead of attn.q.*;
+            # route them into the fused QKVParallelLinear params too.
+            ("attn.qkv.", "attn.q_proj.", "q"),
+            ("attn.qkv.", "attn.k_proj.", "k"),
+            ("attn.qkv.", "attn.v_proj.", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: set[str] = set()

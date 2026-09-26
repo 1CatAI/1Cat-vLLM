@@ -212,3 +212,11 @@ class QuantizationConfig(ABC):
             True if this config uses MXFP4 quantization, False otherwise
         """
         return False
+
+
+def resolve_quant_method(
+    quant_config: QuantizationConfig, layer: torch.nn.Module, prefix: str
+) -> QuantizeMethodBase | None:
+    """1Cat backport shim: no online-quantization support, so the resolved
+    method is always the checkpoint method."""
+    return quant_config.get_quant_method(layer, prefix)
