@@ -1338,8 +1338,14 @@ def _get_sm70_splitd_d256_ops():
             "sm70_d256_splitd_n32_paged_fwd",
         )
         with suppress(ImportError):
-            # Importing the interface loads the bundled FA2 torch library.
-            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+            # The FA2 library loads on first use, one per process and chosen
+            # for the worker's device; make sure it is there before the
+            # operators are resolved.
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                ensure_fa2_library_loaded,
+            )
+
+            ensure_fa2_library_loaded()
 
         namespace = getattr(torch.ops, "_vllm_fa2_C", None)
         if namespace is None or not all(

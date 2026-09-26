@@ -860,6 +860,7 @@ class precompiled_wheel_utils:
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                            "vllm/vllm_flash_attn/_vllm_fa2_C_sm75.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
@@ -1268,6 +1269,10 @@ if _is_cuda():
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if _cuda_arch_contains(7, 5):
+        # Turing FA2 from a pinned fork, next to the regular library
+        # (cmake/external_projects/vllm_flash_attn_sm75.cmake).
+        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C_sm75"))
     if _cuda_arch_at_least(8, 0):
         if _cuda_arch_at_least(9, 0) and (
             USE_PRECOMPILED_EXTENSIONS
