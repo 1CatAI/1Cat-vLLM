@@ -508,7 +508,9 @@ def _set_parameter(
     # (the default). Pass the flag in directly so the constructor sees it from
     # line one. The trailing param.requires_grad_(False) stays as a no-op
     # idempotent guard for the already-Parameter path.
-    param = value if isinstance(value, Parameter) else Parameter(value, requires_grad=False)
+    param = (
+        value if isinstance(value, Parameter) else Parameter(value, requires_grad=False)
+    )
     param.requires_grad_(False)
     setattr(layer, name, param)
 
