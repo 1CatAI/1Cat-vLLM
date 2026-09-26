@@ -354,10 +354,110 @@ before the separate activation. Warmup now uses the full-width output and
 the same unfused GEMM epilogue. It adds no persistent allocation. The 42
 focused CPU tests pass; the 13 GPU cutoff tests are skipped in that CPU
 run, rather than counted as GPU validation. This last warmup correction is
-being checked in a fresh ordinary service with no worker extension or
+checked below in a fresh ordinary service with no worker extension or
 route overrides. No promotion is claimed.
 
-## Service validation
+### Ordinary serving after logits reuse and matching warmup
+
+The `fulfillment-default` run uses the same original concurrent admission,
+dataset, seeds, sampling and automatic defaults as the saved main reference.
+It has no profiler, worker extension, imported plans or sampling override.
+Each row below reports three measured repetitions:
+
+| Measurement | Reference tok/s | Candidate tok/s | Speed gain | Acceptance change |
+| --- | ---: | ---: | ---: | ---: |
+| C1/16 rolling decode | 243.15 | 245.19 | 0.84% | -0.27 points |
+| C4/32 rolling decode | 297.30 | 330.77 | 11.26% | -0.59 points |
+| C8/48 rolling decode | 365.98 | 388.00 | 6.02% | 0.00 points |
+| C4 first-four-prompts no-prefill window | 477.65 | 590.49 | 23.62% | 0.00 points |
+| C8 full-48-prompts no-prefill windows | 621.91 | 692.62 | 11.37% | -0.98 points |
+
+The C4 and C8 window protocols cover different numbers of prompts; they are
+each paired against their matching reference and should not be used to infer
+a cross-concurrency scaling curve. The C8 individual speeds are
+692.34/692.62/697.28 tok/s and server acceptance is 49.537/49.007/51.762%.
+Every acceptance result is within two points of the saved reference median,
+but three repetitions from one startup do not establish startup invariance.
+The earlier failures remain recorded above.
+
+Across the exact all-eight-alive intervals, the pooled SSE batch-round
+estimate falls 50.301 -> 45.783 ms, saving 4.518 ms. Returned tokens per
+request round change 3.890 -> 3.972. These are client observations over
+q1..q8, with host/transport time, not complete-q8 GPU-forward timings.
+The isolated same-process test establishes the logits-reuse contribution;
+the full 11.37% combined gain is not attributed solely to that change or
+solely to the warmup correction.
+
+The natural-EOS quality pair has 14 correct natural completions and 15
+natural stops out of 16 on both versions. Question 12 is wrong on both;
+question 16 reaches the 4096-token limit on both. The strict 16-natural-stop
+assertion therefore still fails, including on the reference. This is relative
+parity, not an absolute quality pass. The 4K prefix check retains 3296 hit
+tokens and the 32K C2 route smoke completes; these are route checks, not
+long-context throughput baselines.
+
+The final source-built normal extension SHA256 is
+`72e750ee54acc7ca61aadfa8b3e1664974f79305c7b059025310d95f3963e412`.
+The ordinary performance run loaded `d08ae144` before formatting-only native
+source cleanup. All 4,048 GPU kernels have identical instruction hashes after
+rebuild, with no additions/removals. The final artifact passes 105 focused
+tests, including GPU batch/tail/replay and sampling-cutoff checks; the earlier
+CPU-only 42-test run is separate. Resolved dependencies are standard CUDA,
+driver and Torch libraries, with no task-sidecar dependency or preload.
+
+Evidence: `fulfillment-service-comparison.json`, `fulfillment-final-build-manifest.json`,
+`fulfillment-native-sass-comparison.json`, `fulfillment-final-gpu-tests.log`,
+`fulfillment-default-quality16.json` and the matching endpoint/window JSON.
+The C8 20% serving target still fails. PR #691 remains Draft; there is no
+new PRO comparison or 35B-A3B AWQ/FP8 model-speed acceptance claim.
+
+### Final source-built trace and remaining gap
+
+`trace-fulfillment-final` captures the normal `72e750ee` extension with logits
+reuse and matching warmup. Like the earlier control trace, it selects complete
+q8 steps without new prefill. Rank-0 CUDA-event medians are:
+
+| Concurrent requests | Forward reference/final ms | Sampling reference/final ms | Complete round reference/final ms |
+| --- | ---: | ---: | ---: |
+| C1 | 14.073 / 14.046 | 1.044 / 0.984 | 20.275 / 19.968 |
+| C4 | 30.276 / 23.972 | 4.765 / 4.217 | 42.162 / 35.038 |
+| C8 | 36.882 / 33.919 | 6.426 / 5.757 | 51.182 / 47.491 |
+
+C8 saves 2.963 ms in forward and 0.669 ms in sampling; its whole q8 round
+saves 3.691 ms. All 31 observed C8 cutoff fallbacks reuse the existing logits;
+the remaining one of 32 steps succeeds on the compact path. C4 reuses logits
+on all 35 observed steps. The probe subphase now includes the deferred gather
+when reusing logits, so it must not be compared as a probe-only duration.
+
+Six interior C8 graph-node samples per rank give rank-0 FP4 12.424 ->
+10.050 ms and FP8 8.957 -> 8.554 ms: combined GEMM 21.382 -> 18.604 ms,
+saving 2.777 ms (12.99%). Independent startup tuning changes the selected
+plans; the earlier candidate trace's 18.089 ms is not the final trace's
+measurement. The corresponding per-category slowest-rank sums are
+21.593 -> 18.604 ms. Neither sum is a directly measured whole-graph latency.
+The complete target graph's slowest-rank envelope is 37.847 -> 34.704 ms.
+The actual GEMM reduction broadly reaches forward rather than disappearing
+in another target phase, but the standalone 4.263-ms saving is not reproduced
+in the full model. The C8 GEMM reduction gate therefore still fails.
+
+GDN (4.481 ms), target attention (3.266 ms), target TP communication
+(4.092 ms on rank 0; 5.213 ms per-step rank maximum), sampling (5.757 ms)
+and draft (7.600 ms) remain material costs. Category kernel means and phase
+medians have different timing scopes and must not be added as exact totals.
+At unchanged emitted tokens, taking 20% off the control's 21.382-ms GEMM
+would reduce its 51.182-ms round by only 8.36%, or improve round rate by
+9.12%. A 20% faster round rate requires 42.652 ms, another 4.839 ms below
+the final trace. This is a fixed-token diagnostic inference, not an endpoint
+speed or acceptance prediction. The ordinary-service result remains the
+separately measured +11.37% full-48 C8 window result above.
+
+Full events, route exports, Nsight report/database and analysis are retained
+under `trace-fulfillment-final`; `fulfillment-final-trace-comparison.json`
+contains the control/final phase and kernel comparison. All owned benchmark
+services are stopped after capture. Keep Draft PR #691 unmerged pending
+the remaining C8, absolute-quality and cross-model acceptance work.
+
+## Earlier service validation
 
 Candidate `qpn-fc-default` completed the paired serving gates using the normal
 extension and automatic configuration. It failed the C8 guard and is not

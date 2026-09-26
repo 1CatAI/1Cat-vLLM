@@ -2,7 +2,54 @@
 
 Date: 2026-05-30
 
-## Latest C8 acceptance retest, 2026-09-26
+## GEMM savings realized in serving, 2026-09-26
+
+The current Draft PR #691 contains default logits reuse on compact-sampling
+fallback and corrects prescaled FP4 gate/up warmup to match the actual FP16
+output plus separate activation. No extra user switch or persistent weight
+layout is added. In a same-process ordered-admission comparison, logits reuse
+preserves all 48 token arrays, 2714 request rounds and 51.047479% acceptance,
+while improving decode by 1.91%. A direct-dense alternative adds only 0.22%
+and is not shipped. Ordinary admission changes some generated paths even
+with fixed tuned plans; startup variation alone does not explain acceptance.
+
+Three ordinary-service repetitions, same original unordered 2K/256 workload,
+give C1/16, C4/32 and C8/48 rolling medians 245.19/330.77/388.00 tok/s,
+versus 243.15/297.30/365.98 (+0.84%/+11.26%/+6.02%). C8 full-48,
+all-eight-alive no-prefill windows improve 621.91 -> 692.62 tok/s (+11.37%),
+with acceptance 50.51% -> 49.54% (-0.98 points). C4 first-four-prompt
+windows improve 477.65 -> 590.49 (+23.62%), acceptance unchanged. These
+two window protocols have different prompt coverage; use their paired
+references, not a cross-concurrency scaling inference. No diagnostic hooks,
+worker extension, imported LUT or profiler is used for ordinary speed.
+
+Final matched q8 diagnostics give C8 forward 36.882 -> 33.919 ms, sampling
+6.426 -> 5.757 ms and complete round 51.182 -> 47.491 ms. Actual target
+GEMM is 21.382 -> 18.604 ms (-12.99%), below the earlier microbenchmark
+estimate of -20.02%; actual savings broadly reach forward. C4 forward is
+30.276 -> 23.972 ms and whole round 42.162 -> 35.038 ms. GEMM is only
+41.78% of the original C8 round, so a 20% GEMM time reduction alone implies
+about 9.12% higher round rate at fixed accepted tokens, not 20%. The final
+instrumented timings are diagnostic, separate from ordinary speed above.
+
+Normal source-built extension SHA256 is
+`72e750ee54acc7ca61aadfa8b3e1664974f79305c7b059025310d95f3963e412`.
+The measured `d08ae144` and final rebuild have identical instructions in all
+4048 GPU kernels; the final artifact passes 105 focused tests, including GPU
+batch, captured-tail, replay and sampling-cutoff checks. No private sidecar
+or preload is required. Natural-EOS quality remains 14 correct natural
+completions and 15 natural stops of 16 on both versions: the strict
+16-natural-stop gate still fails. The 4K prefix and 32K C2 route smokes pass
+without claiming long-context speed. The C8 GEMM -20% and decode +20%
+goals remain unmet; retain Draft status and do not merge. No new PRO or
+35B-A3B AWQ/FP8 model-speed qualification is claimed.
+
+Evidence in `sm70-gemm-expand-20260926`: `fulfillment-service-comparison.json`,
+`fulfillment-final-trace-comparison.json`, `sampling-paired-comparison.json`,
+`fulfillment-final-build-manifest.json` and `fulfillment-final-gpu-tests.log`.
+See [full implementation and evidence](sm70_quantized_batch_reuse.md).
+
+## Earlier C8 acceptance retest, 2026-09-26
 
 The current unmerged batch candidate uses normal extension
 `d08ae1443aa24f91bddfbc4c80ba2c6dd1122a4368d6b3db4a944cfe537fef68`,
