@@ -54,7 +54,8 @@ path instead of imposing a new request-concurrency restriction. Two of the
 19 GPU graph tests compare these cases with unpadded FP64 attention; six CPU
 policy/padding tests also pass, including an independent uniform-attention
 prefix-mean oracle. The failed C4 benchmark is retained and is not a valid
-throughput measurement. Serving is being repeated after this dispatch fix.
+throughput measurement. After correction, both ON/OFF C1 and C4 benchmark
+waves complete with 32768 input and 256 output tokens per request.
 
 Seven retained model inputs, with 138 selected queries and all keys, heads,
 and output features, pass finite-output checks against a same-input FP64
@@ -86,12 +87,65 @@ Raw receipts: `adaptive-margin0-paired-gpu1.json`,
 artifact. They retain input seeds, native/source hashes, trials and references.
 The first always-complete-max variant was rejected for its measured slowdown.
 
-## Promotion gate
+## Completed model and public-control audit
 
-Kernel regressions alone do not qualify model quality. A same-binary,
-attention-only ON/OFF audit with TP4, NVFP4 27B, DFlash2, E4M3 target KV,
-262144 context capacity and CUDA Graph enabled is still being collected.
-Dataset responses are allowed natural EOS with a 65536-token output budget;
-long prompts are used to exercise this endpoint. Keep this PR in Draft until
-those results and matched long-context latency are reviewed. These tests do
-not establish universal task-level non-inferiority.
+The serving source is `9faa014636`; both conditions use the same native hash,
+launch arguments and environment except the long-prefill attention switch.
+Four V100s run the retained Qwen3.8-27B-QUASAR-NVFP4 checkpoint, FP16 target
+computation, E4M3 target KV and DFlash2 with seven speculative tokens and FP16
+draft KV. Context capacity is 262144, chunk budget 8192, maximum sequences 32,
+and GPU memory utilization 0.85. Workers report FULL_AND_PIECEWISE and
+enforce_eager=false. Variable-length prefill is dispatched outside attention
+capture regions; this is not a whole-request prefill graph claim.
+
+Each task has a deterministic 32768-token WikiText background. This activates
+the long-prefill route but modifies the standard short-prompt benchmark.
+Actual prompts have 32890-33141 tokens. Sampling is temperature 1.0, top-p
+0.95, top-k 20, thinking enabled, concurrency four and max output 65536.
+The same 32 items and request hashes are used on both sides of each suite.
+
+| Suite | OFF pass | ON pass | OFF-only / ON-only |
+| --- | ---: | ---: | ---: |
+| GSM8K | 27/32 | 31/32 | 0 / 4 |
+| MATH-500 | 32/32 | 32/32 | 0 / 0 |
+| MBPP sanitized | 25/32 | 25/32 | 0 / 0 |
+| Total | 84/96 | 88/96 | 0 / 4 |
+
+All 192 responses end naturally; none reaches the output limit. The longest
+has 25192 output tokens. No scorer exceptions occur. MBPP has the same seven
+assertion failures on both paths, with no discordant pass/fail outcomes.
+Both GSM8K responses for item830 express 18 hours 48 minutes, equivalent to
+1128 minutes, but the retained integer extractor selects 48. Primary scores
+are not changed after manual inspection. GSM8K's exact paired McNemar p-value
+is 0.125; a small single-seed audit does not establish non-inferiority or an
+accuracy improvement.
+
+The specialized route count increases on all four ON ranks in each suite
+and remains zero OFF. All retained cache snapshots have zero internal and
+external prefix hits and zero preemptions. Counts establish prefix use, not
+specialization of every final task token: shorter terminal chunks can use
+the fallback. Cold four-integer retrieval succeeds at all four lengths
+(32768, 131072, 256000, 262016) on both paths. At 256000 input tokens, TTFT is
+103.795883 s ON (2466 input tok/s) and 124.822676 s OFF (2051 input tok/s).
+These are single cold request observations, not pure decode measurements.
+
+An independent paired CUDA Graph control forces PyTorch 2.10 efficient SDPA
+with matching lower-right causal bias and stride-zero shared-KV expansion.
+No dense mask, repeated KV or extra output copy is materialized. Across 50
+ABBA trials, Q8192/KV128000 medians are 89.707 ms candidate and 414.028 ms
+SDPA; KV256000 medians are 183.043 and 890.064 ms. Paired ratios are 4.610
+and 4.877. FP64 same-input and changed-input checks pass. These are separate
+paired runs, not timings mixed with the stronger internal exact baseline.
+
+Receipts include `external-sdpa-paired-gpu1.json`, full task response objects,
+per-item outcomes, model/dataset/source/native hashes, and serving counters
+in the precision-revision paper artifact. The measured implementation remains
+`9faa014636`; this post-validation documentation changes no runtime source.
+
+## Review scope
+
+The declared numerical and sampled model checks are complete. Keep the PR in
+Draft for independent review of synchronization, the finite-score range
+contract and the statistical limits. Mixed storage retains rounding error;
+many flagged tiles can raise repair cost. Neither these tests nor the public
+control qualify universal task parity or a dual-FP32 75 TFLOP/s endpoint.
