@@ -115,6 +115,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+    DFlash2LogitsFallback,
     try_dflash2_sparse_target_rejection,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
@@ -1287,10 +1288,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         sampler_output = None
+        cached_logits = None
         if input_batch.num_draft_tokens > 0:
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sampler_output = try_dflash2_sparse_target_rejection(
+            sparse_result = try_dflash2_sparse_target_rejection(
                 self.model,
                 self.speculator,
                 self.rejection_sampler,
@@ -1298,6 +1300,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output,
             )
+            if isinstance(sparse_result, DFlash2LogitsFallback):
+                cached_logits = sparse_result
+            else:
+                sampler_output = sparse_result
         sm70_greedy_decode = (
             sampler_output is None
             and input_batch.num_draft_tokens == 0
@@ -1322,10 +1328,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = (
+                cached_logits.logits
+                if cached_logits is not None
+                else self.model.compute_logits(sample_hidden_states)
+            )
             if (
                 input_batch.num_draft_tokens > 0
                 and os.getenv("VLLM_DFLASH_DEBUG_TARGET_LOGITS", "0") == "1"
+                and logits is not None
             ):
                 debug_positions = input_batch.positions[input_batch.logits_indices]
                 min_position = int(

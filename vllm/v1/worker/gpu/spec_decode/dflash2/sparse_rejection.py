@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -29,6 +30,13 @@ logger = init_logger(__name__)
 _TARGET_TOP_K = 20
 _SELECTOR_ALIGNMENT_DUMP_COUNT = 0
 _SELECTOR_ALIGNMENT_STEP = 0
+
+
+@dataclass(frozen=True)
+class DFlash2LogitsFallback:
+    """A completed dense projection; non-gather ranks may have no logits."""
+
+    logits: torch.Tensor | None
 
 
 def _compact_target_requires_reference(
@@ -231,8 +239,8 @@ def try_dflash2_sparse_target_rejection(
     sample_hidden_states: torch.Tensor,
     input_batch: InputBatch,
     grammar_output: GrammarOutput | None,
-) -> SamplerOutput | None:
-    """Sample from compact target/draft supports, or return ``None`` safely."""
+) -> SamplerOutput | DFlash2LogitsFallback | None:
+    """Sample compact supports or retain computed logits for exact fallback."""
     if not envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION:
         return None
     if not isinstance(speculator, DFlash2Speculator):
@@ -252,10 +260,17 @@ def try_dflash2_sparse_target_rejection(
     if sparse_draft_logits is None:
         return None
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
-    target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
-        sample_hidden_states,
-        _TARGET_TOP_K + 1,
-    )
+    fallback = None
+    if hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
+        target_topk_ids, target_topk_logits, fallback = (
+            model.get_topk_tokens_and_logits_with_fallback(
+                sample_hidden_states, _TARGET_TOP_K + 1
+            )
+        )
+    else:
+        target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
+            sample_hidden_states, _TARGET_TOP_K + 1
+        )
     idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
     # Packed verifier rows need their own request's sampling parameters.
@@ -269,6 +284,8 @@ def try_dflash2_sparse_target_rejection(
         logger.info_once(
             "DFlash2 target cutoff requires full-vocabulary reference sampling."
         )
+        if fallback is not None:
+            return DFlash2LogitsFallback(fallback())
         return None
     target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
     target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]

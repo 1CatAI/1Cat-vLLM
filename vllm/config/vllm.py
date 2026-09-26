@@ -84,14 +84,17 @@ _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
-_SM70_DFLASH2_VERIFIER_DEFAULTS = {
-    # Prepare compressed batch layouts and tune the C8/q8 M64 shapes before
-    # graph capture. The layout policy still checks SM70 and service capacity;
-    # small-M kernels keep their existing layouts and explicit overrides win.
+_SM70_BATCH_GEMM_DEFAULTS = {
+    # Common dense-operator policy, independent of model name, checkpoint
+    # quantization, speculative method/width and service concurrency. Local
+    # operators retain their dtype/layout/shape checks and small-M routes.
     "VLLM_SM70_BATCH_GEMM_LAYOUTS": "1",
     "VLLM_SM70_AWQ_WARMUP_MAX_M": "64",
     "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "64",
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
+}
+
+_SM70_DFLASH2_VERIFIER_DEFAULTS = {
     # Match the measured packed verifier and draft context pipeline without
     # requiring launch-script flags. Operators retain their shape guards.
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "1",
@@ -327,6 +330,18 @@ def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
     return _any_participating_device_is_capability(
         cfg, (7, 0)
     ) or _any_participating_device_is_capability(cfg, (7, 5))
+
+
+def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool) -> tuple[str, ...]:
+    """Enable shared SM70 batch operators without overriding explicit settings."""
+    if not is_sm70:
+        return ()
+    applied = []
+    for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
+        if env_name not in os.environ:
+            os.environ[env_name] = env_value
+            applied.append(env_name)
+    return tuple(applied)
 
 
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
@@ -1737,6 +1752,20 @@ class VllmConfig:
             )
 
         from vllm.platforms import current_platform
+
+        for env_name in _apply_sm70_batch_gemm_defaults(
+            is_sm70=(
+                current_platform.is_cuda()
+                and _any_participating_device_is_capability(self, (7, 0))
+            ),
+        ):
+            logger.info_once(
+                "Auto-setting %s=%s for SM70 batch GEMM. "
+                "Local operators select compatible layouts and shapes. "
+                "Set it explicitly to override.",
+                env_name,
+                os.environ[env_name],
+            )
 
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
             self.model_config,

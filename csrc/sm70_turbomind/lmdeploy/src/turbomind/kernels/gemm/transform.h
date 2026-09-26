@@ -190,4 +190,42 @@ struct Transform_HMMA_SIMT_B_PrescaledE4M3 {
   }
 };
 
+// E2M1 scales absorb the exact 2^14 conversion factor at weight preparation.
+// The packed half values below are E2M1 / 2^14, including signed subnormals.
+// Preparation must reject scale magnitudes above 65504 / 16384.
+struct Transform_HMMA_SIMT_B_PrescaledE2M1 {
+  template <class F, int Nf, int Mf, int K, class D, int Nd, int Md, class S,
+            int Ns, int Ms, int Ks>
+  __device__ static void apply(Array<F, Nf> (&frag)[K][Mf], int k,
+                               Array<D, Nd> (&data)[K][Md],
+                               Array<S, Ns> (&stat)[Ks][Ms], int div) {
+    static_assert(std::is_same_v<D, fp4_e2m1_t>);
+    static_assert(std::is_same_v<F, half> && std::is_same_v<S, uint16_t>);
+    static_assert(Nf * Mf == Nd * Md && Nd % 8 == 0);
+    auto& dst = reinterpret_cast<Array<F, Nd>(&)[Md]>(frag[k]);
+    auto& scales = reinterpret_cast<Array<S, 1>(&)[Ns * Ms]>(stat[k / div]);
+    PRAGMA_UNROLL
+    for (int m = 0; m < Md; ++m) {
+      Array<F, Nd> tmp;
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 8) {
+        const uint32_t x = reinterpret_cast<const uint32_t&>(data[k][m][i]);
+        auto& words = reinterpret_cast<Array<uint32_t, 4>&>(tmp[i]);
+        words[0] = ((x << 12) & 0x80008000U) | ((x << 9) & 0x0e000e00U);
+        words[1] = ((x << 8) & 0x80008000U) | ((x << 5) & 0x0e000e00U);
+        words[2] = ((x << 4) & 0x80008000U) | ((x << 1) & 0x0e000e00U);
+        words[3] = (x & 0x80008000U) | ((x >> 3) & 0x0e000e00U);
+      }
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 2) {
+        uint32_t scale = scales[(m * Nd + i) / Nf][0];
+        scale |= scale << 16;
+        auto& word = reinterpret_cast<uint32_t&>(tmp[i]);
+        asm("mul.f16x2 %0, %1, %2;" : "=r"(word) : "r"(word), "r"(scale));
+      }
+      dst[m] = tmp;
+    }
+  }
+};
+
 }  // namespace turbomind::gemm

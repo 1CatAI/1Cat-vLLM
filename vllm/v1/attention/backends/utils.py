@@ -865,19 +865,22 @@ def get_dcp_local_seq_lens(
     Only consider dcp now, we can extend the case of cp based on this.
     """
     num_requests = seq_lens.size(0)
+    rank_offsets: int | torch.Tensor
     if dcp_rank is None:
         rank_offsets = (
             torch.arange(dcp_size, dtype=torch.int32, device=seq_lens.device)
             .unsqueeze(0)
             .repeat(num_requests, 1)
         )
+        num_rank_columns = dcp_size
     else:
-        rank_offsets = torch.tensor(
-            [[dcp_rank]], dtype=torch.int32, device=seq_lens.device
-        )
-    seq_lens_tiled = (
-        seq_lens.to(torch.int32).unsqueeze(-1).repeat(1, rank_offsets.shape[1])
-    )
+        # Use the Python scalar directly. Building a CUDA tensor from a list is
+        # a pageable H2D copy that synchronizes the stream, and metadata builds
+        # call this on every step, so each call waited for the previous step's
+        # graph replay to drain. Upstream vLLM made the same change.
+        rank_offsets = dcp_rank
+        num_rank_columns = 1
+    seq_lens_tiled = seq_lens.to(torch.int32).unsqueeze(-1).repeat(1, num_rank_columns)
     base = (
         seq_lens_tiled
         // cp_kv_cache_interleave_size
