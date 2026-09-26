@@ -124,6 +124,36 @@ not export their LUTs, so their exact choices cannot be reconstructed from
 this later process. Retain `results/route-restart-comparison.json` and the
 binary caches under `results/routes/`; a controlled replay is still needed.
 
+## TP-rank GEMM plan coordination follow-up
+
+The first cache-broadcast implementation still had two holes. It exported
+after the FP8 warmup, so FP4 dense entries were measured independently, and the
+TurboMind cache importer appended duplicate `(GemmDesc, batch)` entries. If a
+compile warmup had already inserted a local entry, lookup kept that old entry
+because it was first. The FP8/FP4 dense warmups now run in one coordinated
+phase. Rank 0 measures AWQ/FP8/FP4 routes, synchronizes, exports the complete
+cache, and every rank—including rank 0—imports it before replaying warmup. The
+importer replaces an existing batch record with the imported launch plan. The
+default path has no new environment switch; the existing FP8 coordination
+switch remains an explicit rollback/debug override.
+
+The clean post-change service log reports 14 rank-0 LUT records loaded on all
+four TP ranks. An immediate route export contains 28 records on each rank; the
+decoded files have the same SHA256
+`8c4d2d00c6a2a22a6e65e213b21a0efecba703f71676213f83e164d803088d14`. Before
+the importer replacement, rank 1/2 differed at the M16 LM-head swizzle and
+rank 0 diverged later at several M64 entries. This is now a route-consistency
+gate, not a speed claim.
+
+The first ordinary no-instrumentation C8/48 screen after this change completed
+three runs in one fresh service. Decode-capacity results were 379.243,
+383.912 and 371.862 tok/s (median 379.243 tok/s), with acceptance 56.006%,
+56.623% and 52.167% (median 56.006%). Against the retained three-run control
+median 385.783 tok/s, this is -1.70% in this screen; the route fix has not yet
+provided an accepted end-to-end speed gain. It does, however, remove the
+previous cross-rank plan drift and keeps the PR in Draft pending a route-quality
+selection step and a fresh paired control.
+
 ## Initial endpoint screening and real-input audit
 
 The initial clean services used identical newly built common extensions, with
