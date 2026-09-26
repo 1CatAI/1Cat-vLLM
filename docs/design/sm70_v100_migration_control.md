@@ -48076,3 +48076,16 @@ has launched no full model. Details and artifacts are in
   its M10 arithmetic differs and is rejected without a model run.
 - Full reports and negative evidence remain in this task's `.artifacts/`.
   No wheel is built; no private research extension is used in model runs.
+- Implementation is published as Draft PR #703 at `45248dc8d4`; main
+  `1e90d17f2c` is merged at `2e4369373a`. Normal source rebuild succeeds and
+  post-merge CPU regressions give 108 passes/8 GPU skips. These do not replace
+  the accepted endpoint pair's original source and extension identity.
+- Draft follow-up closes the old node-trace rank0 wall at 5.271298 ms, with
+  4.790127 ms kernel union and 0.481171 ms gaps. Full local vocabulary heads
+  use 1.883523 ms, MoE projection service 0.822872 ms; the M1 W13 grid has 30
+  CTAs and the compiled SM70 Triton path uses FP32 FMA rather than MMA.
+  Historical tuned tiles and local argmax are already on. Screen projection
+  geometry before another engine run; retain full-vocabulary sampling.
+- Reject `mtp_stack_trace` for kernel attribution: it contains no kernel
+  activity table. The follow-up explicitly flushes all TP workers before
+  shutdown. Do not substitute its profiled wall for the unprofiled baseline.

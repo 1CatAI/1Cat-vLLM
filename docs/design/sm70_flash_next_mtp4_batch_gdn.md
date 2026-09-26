@@ -361,3 +361,54 @@ flushes profiling in all four TP workers before engine shutdown. The normal
 extension rebuilt after formatting only has SHA256
 `4d9bcd5ac535883f5b7608a3b8e9c37de2fcac15e2165ddfa720b94ff35a22ad`;
 the measured endpoint pair keeps its original build hash above.
+
+The old trace also closes the draft wall on rank0, using 84 identical windows
+from `_prepare_eagle_inputs_kernel` to the sampled/draft-combine entry. First
+draft costs 1.572600 ms and the three continuations about 1.23 ms each. All
+298 kernels occupy a 4.790127-ms union inside a 5.271298-ms window; the
+remaining 0.481171 ms has no recorded kernel. Not every gap is removable host
+work. The exclusive category table closes without adding overlapping service:
+
+| Old-trace draft category | Exclusive wall (ms/round) |
+| --- | ---: |
+| Four full-vocabulary projections | 1.883523 |
+| Draft MoE projections | 0.794247 |
+| Other dense projections and reductions | 0.634174 |
+| Sampling, state and elementwise | 0.547145 |
+| Attention and indexer | 0.344693 |
+| TP communication including waits | 0.322858 |
+| HC postops and fused M1 projections | 0.196853 |
+| Overlapping different kernel families | 0.066633 |
+| No recorded kernel | 0.481171 |
+| Total | **5.271298** |
+
+The checkpoint vocabulary is 248,320, hidden size 2,560, TP4. Each full local
+FP16 head has 317,849,600 weight bytes. Dividing that nominal traffic by the
+roughly 0.47-ms projection gives about 675 GB/s; this is a traffic estimate,
+not an NCU DRAM counter or achieved hardware-utilization measurement. Head
+work is consistent with a substantial bandwidth cost. In contrast, the M1
+MoE W13 projection issues only 30 CTAs and executes sequential SIMT FMA with
+repeated shared-memory staging, which gives a concrete scheduling target.
+Local argmax reduction and the previous tuned MoE tile are already enabled.
+
+### Integration refresh
+
+Draft PR [#703](https://github.com/1CatAI/1Cat-vLLM/pull/703) contains the
+qualified implementation at `45248dc8d4abdd172f6d59e15ab8bb786466bfe1`.
+Main `1e90d17f2c75e443b2a85a576ed68fa04c5f9dd6` is subsequently merged in
+`2e4369373a3cfecbe84c401917c870951e140707`, preserving both migration ledgers.
+The normal source rebuild succeeds, including native attention. Its `_C`
+SHA256 is `eda731ee07bafaae3692226812c8a31833958dd2a2baef7ef55935bbbadc7151`
+and `_vllm_fa2_C` is
+`4fff2e872eeaa48337475c37f546e9b0fdc333c67b1ec9289fbf8d7eef29c86a`.
+Only standard CUDA/Torch dependencies appear in `readelf -d`.
+
+Post-merge CPU regression: **108 passed, 8 GPU cases skipped**, using
+`CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest -q` with
+`tests/compile/test_sm70_decode_graph.py`,
+`tests/models/qwen4_exp/test_sm70_gdn_projection_split.py` and
+`tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py`.
+This CPU result does not replace the prior GPU gates or establish new model
+performance. The accepted 23.849974-ms pair keeps its original source/build
+identity. Draft-MoE geometry and original-layout GDN prototypes are isolated
+component screens; no result is inferred before an owned GPU is available.
