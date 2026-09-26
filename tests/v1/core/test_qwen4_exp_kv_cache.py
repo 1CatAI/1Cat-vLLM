@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
@@ -451,6 +452,47 @@ def test_dcp_prefix_hit_respects_target_draft_and_state_ownership():
     assert tokens == 64
     assert [len(group) for group in blocks.blocks] == [2, 4, 4]
     manager.free(first)
+
+
+def test_dcp_offload_worker_and_scheduler_keep_the_same_group_budget():
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.parallel_config.world_size = 4
+    config.cache_config.block_size = 16
+    config.cache_config.hash_block_size = 4
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.cache_config.mamba_cache_mode = "align"
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector_extra_config={"cpu_bytes_to_use": 16 * 1024**2}
+    )
+    specs = _mixed_dcp_specs()
+    for name, spec in list(specs.items()):
+        if isinstance(spec, MambaSpec):
+            specs[name] = replace(
+                spec, block_size=32, mamba_cache_mode="align", num_speculative_blocks=3
+            )
+    groups = get_kv_cache_groups(config, specs)
+    worker_cache = get_kv_cache_config_from_groups(
+        config, groups, available_memory=1 << 20
+    )
+    scheduler_cache = generate_scheduler_kv_cache_config([worker_cache])
+    worker = CPUOffloadingSpec(config, worker_cache)
+    scheduler = CPUOffloadingSpec(config, scheduler_cache)
+    assert worker.gpu_block_size == scheduler.gpu_block_size == (32, 4, 32, 32, 32, 32)
+    assert worker.hash_block_size == scheduler.hash_block_size == 4
+    assert worker.partition_by_group and scheduler.partition_by_group
+    assert worker.cpu_group_page_sizes == scheduler.cpu_group_page_sizes
+    assert worker.cpu_group_num_blocks == scheduler.cpu_group_num_blocks
+    assert worker.num_blocks > 0
+    used = (
+        sum(
+            worker.cpu_group_page_sizes[i] * n
+            for i, n in worker.cpu_group_num_blocks.items()
+        )
+        * 4
+    )
+    assert used <= 16 * 1024**2
 
 
 def test_qwen4_exp_circular_manager_owns_one_block_per_request() -> None:
