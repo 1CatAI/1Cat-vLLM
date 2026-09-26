@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -377,6 +378,17 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _has_dense_qkv_weight(attn: nn.Module) -> bool:
+    """True when ``attn.qkv_proj.weight`` is the plain ``[N, K]`` matrix.
+
+    Quantized checkpoints keep packed codes under the same attribute name, so
+    slicing rows out of it silently yields a differently shaped tensor.
+    """
+    return isinstance(
+        getattr(attn.qkv_proj, "quant_method", None), UnquantizedLinearMethod
+    )
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
@@ -494,9 +506,20 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+        # KV projection weights: [num_layers * 2 * kv_size, hidden_size].
+        # Only a plain nn.Linear keeps that matrix in `.weight`; a quantized
+        # draft checkpoint stores packed codes there instead (NVFP4 packs two
+        # values per byte, so the tensor is [N, K // 2]), and the dense rows
+        # are reachable only through the quantization method. That method is
+        # not usable yet -- this builder runs at the end of load_weights,
+        # before process_weights_after_loading -- so defer the fusion to the
+        # first projection instead. See _fuse_dense_kv_weight.
+        self._context_kv_attn_layers = layers_attn
+        if all(_has_dense_qkv_weight(a) for a in layers_attn):
+            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight: torch.Tensor | None = torch.cat(kv_weights, dim=0)
+        else:
+            self._fused_kv_weight = None
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
@@ -574,6 +597,25 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def _fuse_dense_kv_weight(self, dtype: torch.dtype, device: torch.device) -> None:
+        """Build the fused context K/V matrix for a quantized draft head.
+
+        Feeding an identity matrix through the layer's own quantization
+        method returns the dense transposed weight, whatever the packing is,
+        so this needs no knowledge of NVFP4/FP8/marlin layouts. Runs once, on
+        the first context projection, when process_weights_after_loading has
+        completed. The per-step decode path keeps using the quantized
+        weights; only this prefill-time fusion is materialized dense.
+        """
+        rows = []
+        for attn in self._context_kv_attn_layers:
+            qkv = attn.qkv_proj
+            eye = torch.eye(qkv.input_size_per_partition, dtype=dtype, device=device)
+            weight_t = qkv.quant_method.apply(qkv, eye, None)
+            rows.append(weight_t.t()[attn.q_size :].contiguous())
+            del eye, weight_t
+        self._fused_kv_weight = torch.cat(rows, dim=0)
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -582,6 +624,8 @@ class DFlashQwen3Model(nn.Module):
         num_kv_heads: int,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fused_kv_weight is None:
+            self._fuse_dense_kv_weight(context_states.dtype, context_states.device)
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = self._normalize_context_states(context_states)
         all_kv_flat = F.linear(
