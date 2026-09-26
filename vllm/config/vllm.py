@@ -362,10 +362,27 @@ def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
 def _apply_sm70_qwen38_hybrid_ple_defaults(
     parallel_config: ParallelConfig,
 ) -> None:
-    """Enable hybrid PLE and complete its late-bound parallel config."""
+    """Enable hybrid PLE and complete its late-bound parallel config.
+
+    The local decode half of hybrid PLE uses a pinned-UVA view.  Leaving the
+    host budget on ``auto`` therefore keeps the rows that happen to fit in
+    VRAM resident on SM70.  That default competes directly with the CUDA
+    graph pool and KV cache; after the high-precision matmul policy is applied
+    it can strand a large amount of otherwise usable KV capacity.  The full
+    Qwen3.8 table is about 11.92 GiB per TP rank, so keep it in host memory by
+    default and let the explicit host-budget override retain the old split
+    placement when a deployment has a different latency/memory trade-off.
+    """
     os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
     os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
     os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
+    if "VLLM_QWEN4EXP_PLE_HOST_GIB" not in os.environ:
+        os.environ["VLLM_QWEN4EXP_PLE_HOST_GIB"] = "12"
+        logger.info_once(
+            "Auto-setting VLLM_QWEN4EXP_PLE_HOST_GIB=12 for the SM70 "
+            "Qwen3.8 hybrid PLE route so the pinned decode view does not "
+            "consume VRAM needed by the KV cache and CUDA graphs."
+        )
     # ParallelConfig is validated before these model-aware defaults are
     # applied, so initialize the endpoint that its validator would have
     # created for an explicit PLE configuration.
@@ -2091,6 +2108,21 @@ class VllmConfig:
                     "Auto-enabling hybrid PLE for the SM70 Qwen3.8 "
                     "dual-compile lane: async disk-mmap prefill plus local "
                     "pinned-UVA decode."
+                )
+            # The benchmark/reproduction lane may provide the three hybrid
+            # switches explicitly, which bypasses the late auto-enable block
+            # above.  Apply the same VRAM-safe host placement in that case;
+            # an explicit host-budget value (including ``auto``) remains an
+            # intentional override.
+            if (
+                envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                and "VLLM_QWEN4EXP_PLE_HOST_GIB" not in os.environ
+            ):
+                os.environ["VLLM_QWEN4EXP_PLE_HOST_GIB"] = "12"
+                logger.info_once(
+                    "Auto-setting VLLM_QWEN4EXP_PLE_HOST_GIB=12 for the "
+                    "explicit SM70 Qwen3.8 hybrid PLE route so PLE does not "
+                    "consume VRAM needed by the KV cache and CUDA graphs."
                 )
             if _is_sm70_dflash2_verifier_contract(
                 self.model_config,

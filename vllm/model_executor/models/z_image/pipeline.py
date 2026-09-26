@@ -41,7 +41,9 @@ class ZImagePipeline:
         ):
             if not (root / component).is_dir():
                 raise ValueError(f"Missing local Z-Image component: {component}")
-        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        from vllm.utils.torch_utils import set_high_precision_cuda_matmul_defaults
+
+        set_high_precision_cuda_matmul_defaults()
 
         def loading(completed, component):
             print(
