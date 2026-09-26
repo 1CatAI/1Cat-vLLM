@@ -26,8 +26,10 @@ def test_qsa_does_not_claim_batch_invariant_reductions() -> None:
 @pytest.mark.parametrize(
     ("prefix", "expected_main_size", "sharded"),
     [
-        ("model.layers.3.self_attn", 1600, True),
-        ("mtp.layers.48.self_attn", 3200, False),
+        # A 1600-token block holds 800 slots per rank of a sharded target
+        # layer and the whole span of the replicated draft.
+        ("model.layers.3.self_attn", 800, True),
+        ("mtp.layers.48.self_attn", 1600, False),
     ],
 )
 def test_qsa_real_cache_specs_keep_only_target_main_sharded(
@@ -55,7 +57,7 @@ def test_qsa_real_cache_specs_keep_only_target_main_sharded(
 
     assert main_spec.block_size == expected_main_size
     assert main_spec.dcp_sharded is sharded
-    assert side_spec.block_size == 3200
+    assert side_spec.block_size == 1600
     assert not side_spec.dcp_sharded
     assert main_spec.global_block_size(2) == side_spec.global_block_size(2)
 
