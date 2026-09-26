@@ -2,6 +2,7 @@
 
 #include "src/turbomind/kernels/gemm/arch/config_sm70_s884.h"
 #include "src/turbomind/kernels/gemm/registry.h"
+#include "src/turbomind/kernels/gemm/batch_kernel_sm70.h"
 #include "src/turbomind/kernels/gemm/types.h"
 
 #include <cstdlib>
@@ -69,6 +70,19 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 }  // namespace
 
 void Registry::sm70_884_4() {
+  {
+    using B = Config_QuantizedBatch<fp4_e2m1_t, kColMajor>;
+    using Rows32 = B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true,
+                          1, 16, 32, 128>;
+    using Rows64 = B::Type<64, 256, 32, 1, 4, 1, D, S, 2, true,
+                          1, 16, 64, 128>;
+    using Full64 = B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true,
+                          1, 16, 64, 128, 1, true>;
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Rows64::Kernel>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
+  }
+
   if constexpr (1) {
     // clang-format off
         using C = Config_U4_d<kColMajor>;

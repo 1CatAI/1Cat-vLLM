@@ -2,6 +2,22 @@
 
 Date: 2026-05-30
 
+## Default batch GEMM reuse and C2 memory, 2026-09-26
+
+The owned FP4/FP8 batch-reuse change recovers M17..32 row sharing, extends
+M9..16 using the existing compressed weights, and adds shared M33..64
+TurboMind tile candidates. No new opt-in flags or persistent weight copies
+are required. The C2 duplicate-layout research cost of about 1.87 GiB per
+rank is eliminated. Final normal-artifact GEMM Graph estimates reduce
+C2/C4/C8 latency by 24.6%/33.8%/19.6%; C1 is within 0.2% of control.
+All 132 focused GPU tests pass. Both normal-source services retain identical
+weight/KV capacity; graph memory changes by about 0.01 GiB per rank. Paired
+quality has the same 14/16 correct natural stops, wrong question and capped
+question. Reference performance/acceptance are pending, so promotion remains
+pending. See [implementation and evidence](sm70_quantized_batch_reuse.md).
+Do not repeat rejected prepared-weight, register-cap-only or M16-slicing
+experiments. No fresh PRO or 35B-A3B AWQ/FP8 model-speed claim is made.
+
 ## TP4 DFlash2 batch GEMM supply experiment, 2026-09-24
 
 For Qwen3.8-27B-NVFP4 at C8/q8, the channel-FP8 TurboMind output
