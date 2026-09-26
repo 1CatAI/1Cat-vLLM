@@ -75,6 +75,9 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     # The replicated draft's slot map depends on logical positions as well
     # as the block table; FlashAttention's update hook only receives a table.
     supports_update_block_table: bool = False
+    # QSA's DCP attention localizes its own selections and never reads the
+    # per-rank context lengths, which cost a dozen small kernels per build.
+    builds_dcp_context_lens: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -335,8 +338,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     ) -> None:
         from vllm.distributed import get_dcp_group
 
-        from .ops.qsa import qsa_sparse_paged_attention
-        from .ops.qsa_dcp import qsa_localize_dcp_indices
+        from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
+        from .ops.qsa_dcp import (
+            qsa_dcp_local_selection_width,
+            qsa_localize_dcp_indices,
+        )
 
         local_indices_buffer = layer.dcp_local_indices_buffer
         partial_output_buffer = layer.dcp_partial_output_buffer
@@ -364,11 +370,19 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         partial_lse = partial_lse_buffer[: query.shape[0]]
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
+        # Only this prefix of the compacted columns can hold an owned token.
+        local_width = qsa_dcp_local_selection_width(
+            layer.indexer.token_topk,
+            layer.indexer.compress_ratio,
+            self.dcp_world_size,
+            layer.cp_kv_cache_interleave_size,
+            local_indices.shape[1],
+        )
         qsa_sparse_paged_attention(
             gathered_query,
             key_cache,
             value_cache,
-            local_indices,
+            local_indices[:, :local_width],
             block_table,
             token_to_req,
             partial_output,
@@ -386,11 +400,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 is_lse_base_on_e=False,
             ),
         )
-        # Match DCP1's attention-output rounding before its sigmoid gate.
-        output.copy_(
-            merged.to(output.dtype).float()
-            * torch.sigmoid(output_gate.view_as(output).float())
-        )
+        # Round to the output dtype first, as DCP1's attention output is, then
+        # apply the Triton gate DCP1's page4 route uses. This replaces a chain
+        # of five elementwise kernels (12.2 us per decode layer on V100).
+        output.copy_(merged)
+        _qsa_output_gate(output, output_gate.view_as(output))
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
