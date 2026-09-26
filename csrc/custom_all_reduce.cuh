@@ -1975,6 +1975,21 @@ class CustomAllreduce {
     }
     threads =
         sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_, bytes);
+    if constexpr (std::is_same_v<T, half>) {
+      // Medium TP4 messages benefit from fewer participating warps/CTAs.
+      // Keep the two-stage partition, rank order and visibility protocol;
+      // explicit diagnostic dispatch overrides retain their existing launch.
+      const char* blocks_override =
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+      if (world_size_ == 4 && fully_connected_ && bytes >= 512 * 1024 &&
+          bytes <= 768 * 1024 && block_limit == defaultBlockLimit &&
+          (blocks_override == nullptr || blocks_override[0] == '\0') &&
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          custom_allreduce_current_device_is_sm70()) {
+        threads = 256;
+        block_limit = 20;
+      }
+    }
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
     if constexpr (std::is_same_v<T, half>) {
