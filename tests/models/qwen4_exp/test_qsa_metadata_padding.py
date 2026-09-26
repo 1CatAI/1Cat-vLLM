@@ -430,3 +430,47 @@ def test_qsa_dcp_local_span_must_divide_kernel_block() -> None:
     table = torch.arange(675, 700, dtype=torch.int32).unsqueeze(0)
     with pytest.raises(RuntimeError, match="must be divisible"):
         builder._canonical_block_table(table)
+
+
+def _bare_flash_builder(builder_cls):
+    """A DCP2 FlashAttention-style builder with only the state build() reads."""
+    builder = object.__new__(builder_cls)
+    builder.aot_schedule = False
+    builder.aot_sliding_window = (-1, -1)
+    builder.use_full_cuda_graph = False
+    builder.max_cudagraph_size = None
+    builder.max_num_splits = 0
+    builder.dcp_world_size = 2
+    builder.dcp_rank = 1
+    builder.cp_kv_cache_interleave_size = 1
+    builder._dcp_context_kv_lens = torch.zeros(4, dtype=torch.int32)
+    builder.replicated_draft = False
+    builder.cache_config = SimpleNamespace(cache_dtype="auto")
+    builder.kv_cache_dtype = torch.float16
+    return builder
+
+
+def test_qsa_builder_skips_flash_dcp_context_lengths():
+    """QSA's DCP attention never reads FlashAttention's per-rank context
+    lengths, so its builder skips them; plain FlashAttention keeps them."""
+    starts = torch.tensor([0, 4, 8], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_actual_tokens=8,
+        num_reqs=2,
+        max_query_len=4,
+        max_seq_len=21,
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([21, 10], dtype=torch.int32),
+        slot_mapping=torch.arange(8, dtype=torch.int64),
+        block_table_tensor=torch.tensor([[3, 4], [5, 6]], dtype=torch.int32),
+    )
+    flash = _bare_flash_builder(FlashAttentionMetadataBuilder).build(0, common)
+    qsa = _bare_flash_builder(Qwen4ExpQSAMetadataBuilder).build(0, common)
+    # Rank 1 of 2 owns the odd positions of each context: 17 -> 8, 6 -> 3.
+    assert flash.dcp_context_kv_lens.tolist() == [8, 3]
+    assert flash.max_dcp_context_kv_len == 11
+    assert qsa.dcp_context_kv_lens is None
+    assert qsa.max_dcp_context_kv_len == 0
+    for field in ("block_table", "slot_mapping", "seq_lens", "query_start_loc"):
+        assert torch.equal(getattr(qsa, field), getattr(flash, field))
