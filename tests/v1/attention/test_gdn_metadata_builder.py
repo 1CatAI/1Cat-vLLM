@@ -121,6 +121,7 @@ def test_mamba_hybrid_passes_seq_lens_cpu_upper_bound(monkeypatch):
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         dcp_local_seq_lens=None,
         prefix_anchor_lens=None,
+        is_dummy_batch=False,
     )
     state.prepare_attn(
         input_batch,
