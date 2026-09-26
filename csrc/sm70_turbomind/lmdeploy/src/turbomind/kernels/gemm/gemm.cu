@@ -7,10 +7,12 @@
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/kernel.h"
 #include "src/turbomind/kernels/gemm/registry.h"
+#include "src/turbomind/kernels/gemm/sm70_dflash_context.h"
 #include "src/turbomind/kernels/gemm/tuner/params.h"
 #include "src/turbomind/kernels/gemm/tuner/sampler.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <iterator>
@@ -118,6 +120,18 @@ struct Sm70AwqTp2FastTarget {
   bool require_mgroup;
   std::string name_contains;
 };
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70DflashContextFcFastTarget(
+    const GemmDesc& desc) {
+  if (desc.arch == 700 && desc.type_a == kHalf && desc.type_b == kHalf &&
+      desc.type_c == kHalf && !desc.quant_a && !desc.quant_b && desc.num == 1 &&
+      UseSm70DflashContextFcStableReduction(desc.m, desc.n, desc.k)) {
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 256, 64, 10, 0, true,
+        "8x256x64_2_1x1_s884_1x4x1_mgroup"};
+  }
+  return std::nullopt;
+}
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(
     const GemmDesc& desc, const std::string_view desc_str) {
@@ -517,6 +531,24 @@ struct Gemm::Impl {
   LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size,
                       size_t partials_size) {
     const auto& desc = ctx.desc();
+    const auto stable_context = GetSm70DflashContextFcFastTarget(desc);
+    if (stable_context) {
+      // Imported/autotuned entries may use a different reduction tree. Cache
+      // the fixed contract separately so they cannot override it, including
+      // on the first captured tail or repeated eager calls.
+      auto& cached = sm70_dflash_context_specs_[desc.m - 1];
+      if (cached && cached->kernel->is_feasible(ctx.get_desc(*cached->kernel))) {
+        return *cached;
+      }
+      auto specs = Find(ctx, barriers_size, partials_size, 0, false);
+      cached = SelectSm70AwqTp2FastSpec(ctx, specs, *stable_context,
+                                      barriers_size, partials_size);
+      if (cached) {
+        cache_.Insert(desc, *cached);
+        return *cached;
+      }
+      return {};
+    }
     const bool allow_prescaled =
         policy & DispatchPolicy::kSm70Fp8PrefillPrescaled;
     const auto is_feasible = [&](const LaunchSpec& spec) {
@@ -821,6 +853,7 @@ struct Gemm::Impl {
   DispatchCache cache_;
 
   DispatchCache sm70_fp8_prefill_cache_;
+  std::array<std::optional<LaunchSpec>, 8> sm70_dflash_context_specs_{};
 
   std::mutex dispatch_mutex_;
 };

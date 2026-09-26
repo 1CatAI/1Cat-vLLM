@@ -35,6 +35,7 @@
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/gemm_universal.h"
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
+#include "src/turbomind/kernels/gemm/sm70_dflash_context.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
 #include "custom_all_reduce.cuh"
@@ -1321,6 +1322,10 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
 
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
+  if (group_size == 0 &&
+      turbomind::gemm::UseSm70DflashContextFcStableReduction(m, n, k)) {
+    return turbomind::gemm::DispatchPolicy::kDefault;
+  }
   const char* dflash2_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
   const char* dflash2_shadow =
       std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");

@@ -4,17 +4,31 @@ Date: 2026-05-30
 
 ## Default batch GEMM reuse and C2 memory, 2026-09-26
 
-The owned FP4/FP8 batch-reuse change recovers M17..32 row sharing, extends
-M9..16 using the existing compressed weights, and adds shared M33..64
-TurboMind tile candidates. No new opt-in flags or persistent weight copies
-are required. The C2 duplicate-layout research cost of about 1.87 GiB per
-rank is eliminated. Final normal-artifact GEMM Graph estimates reduce
-C2/C4/C8 latency by 24.6%/33.8%/19.6%; C1 is within 0.2% of control.
-All 132 focused GPU tests pass. Both normal-source services retain identical
-weight/KV capacity; graph memory changes by about 0.01 GiB per rank. Paired
-quality has the same 14/16 correct natural stops, wrong question and capped
-question. Reference performance/acceptance are pending, so promotion remains
-pending. See [implementation and evidence](sm70_quantized_batch_reuse.md).
+The owned FP4/FP8 batch-reuse candidate recovers M17..32 row sharing and
+extends M9..16 using existing compressed weights. The C2 duplicate-layout
+research cost of approximately 1.87 GiB per rank is eliminated. Normal-artifact
+real-weight Graph estimates reduce C2/C4 GEMM latency by 25.4%/34.5%; FP8-only
+reductions are 23.9%/30.9%. C1 native kernels are unchanged. The 84 focused GPU
+checks pass. Initial M64 tile experiments remain withdrawn pending reevaluation.
+
+C1 serving initially lost acceptance despite unchanged native kernels. An
+artifact A/B audit found 4,023 shared GPU instruction streams identical.
+Controlled LUT imports isolated the varying draft context FC split-K: importing
+only FP16 plans restored every diagnostic token and verification count, whereas
+importing only FP8 plans did not. This startup variability confounds earlier
+acceptance comparisons. A cuBLAS projection candidate was faster locally and
+removed 62.5 MiB per-rank packed weights, but failed the C1 service guard:
+236.50 tok/s and 54.86% acceptance versus 243.15 and 57.04%. It was withdrawn.
+Disabling generic FP16 autotuning alone also failed (227.05 / 52.07%). Fixed
+split-12 failed too (223.08 / 50.94%). The legacy split-10 tactic passed its
+first diagnostic C1 guard (242.89 / 56.77%). The narrow existing TP4 context-FC
+shape now selects it in source; incompatible cached plans cannot override it.
+All 92 focused GPU tests pass, including first-captured tails and changed
+inputs after a conflicting cached plan. The normal extension is
+`75303f12d50f02ebfb1f4f7616e009125851a207041ecda4df9e3ede9ec39d00`.
+Uninstrumented service validation is running without diagnostic flags or LUTs;
+no acceptance threshold has been waived and Draft PR #691 is
+not yet promoted. See [implementation and evidence](sm70_quantized_batch_reuse.md).
 Do not repeat rejected prepared-weight, register-cap-only or M16-slicing
 experiments. No fresh PRO or 35B-A3B AWQ/FP8 model-speed claim is made.
 
