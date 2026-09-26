@@ -27,6 +27,15 @@ else:
 ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda()
 
 
+# Largest finite float16. The model was trained in bfloat16, where the
+# attention-sink row of the residual stream may pass this value in the last
+# layers (measured 63.5k at layer 40, growing 8k a layer). Stored as float16
+# it became inf, and the attention after it turned every token of a short
+# prompt into NaN. Residual stores saturate instead; what the same kernel
+# reuses of the value is the saturated one, so it matches what is stored.
+FP16_MAX = torch.finfo(torch.float16).max
+
+
 @cache
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
@@ -224,6 +233,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         gemm_last_dim = hc_mult3
     hidden_block = math.gcd(1024, hidden_size)
     activation_dtype = T.float16 if use_fp16 else T.bfloat16
+    stash_dtype = T.float32 if use_fp16 else activation_dtype
 
     gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]  # type: ignore[no-redef, valid-type]
     gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]  # type: ignore[no-redef, valid-type]
@@ -309,7 +319,10 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             # Pass 1: stash unnormalized weighted-sum output in shared memory
             # in the activation dtype (matches RMSNorm input rounding) while
             # accumulating the per-position squared sum.
-            output_shared = T.alloc_shared(hidden_size, activation_dtype)
+            # float16 cannot hold the unnormalized sum of an attention-sink
+            # row (four streams near 65504 add up past it) although the
+            # normalized value is small, so float16 runs stash it in float32.
+            output_shared = T.alloc_shared(hidden_size, stash_dtype)
             sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
             T.clear(sumsq_per_pos)
 
@@ -329,9 +342,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
 
                 for i1_h in T.Parallel(hidden_block):
                     sumsq_per_pos[i1_h] += ol[i1_h] * ol[i1_h]
-                    output_shared[i0_h * hidden_block + i1_h] = activation_dtype(
-                        ol[i1_h]
-                    )
+                    output_shared[i0_h * hidden_block + i1_h] = stash_dtype(ol[i1_h])
 
             sumsq = T.alloc_fragment(1, T.float32)
             T.reduce_sum(sumsq_per_pos, sumsq, dim=0)
@@ -392,6 +403,7 @@ def mhc_pre_big_fuse_broadcast_with_norm_tilelang(
         gemm_last_dim = hc_mult3
     hidden_block = math.gcd(1024, hidden_size)
     activation_dtype = T.float16 if use_fp16 else T.bfloat16
+    stash_dtype = T.float32 if use_fp16 else activation_dtype
 
     gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]  # type: ignore[no-redef, valid-type]
     gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]  # type: ignore[no-redef, valid-type]
@@ -474,7 +486,10 @@ def mhc_pre_big_fuse_broadcast_with_norm_tilelang(
                     + hc_pre_eps
                 )
 
-            output_shared = T.alloc_shared(hidden_size, activation_dtype)
+            # float16 cannot hold the unnormalized sum of an attention-sink
+            # row (four streams near 65504 add up past it) although the
+            # normalized value is small, so float16 runs stash it in float32.
+            output_shared = T.alloc_shared(hidden_size, stash_dtype)
             sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
             T.clear(sumsq_per_pos)
 
@@ -496,9 +511,7 @@ def mhc_pre_big_fuse_broadcast_with_norm_tilelang(
 
                 for i1_h in T.Parallel(hidden_block):
                     sumsq_per_pos[i1_h] += ol[i1_h] * ol[i1_h]
-                    output_shared[i0_h * hidden_block + i1_h] = activation_dtype(
-                        ol[i1_h]
-                    )
+                    output_shared[i0_h * hidden_block + i1_h] = stash_dtype(ol[i1_h])
 
             sumsq = T.alloc_fragment(1, T.float32)
             T.reduce_sum(sumsq_per_pos, sumsq, dim=0)
@@ -581,6 +594,7 @@ def sm70_mhc_post_fp32_stage_tilelang(
                 new_r[j] = pm[j] * x_in[i_n, h_idx]
                 for k in T.unroll(hc):
                     new_r[j] += cm[k, j] * residual_in[i_n, k, h_idx]
+                new_r[j] = T.max(T.min(new_r[j], FP16_MAX), -FP16_MAX)
                 residual_fp32[i_n, j, h_idx] = new_r[j]
                 residual_out[i_n, j, h_idx] = new_r[j]
                 sqr[0] += new_r[j] * new_r[j]
@@ -736,6 +750,8 @@ def mhc_fused_tilelang(
                 new_r[j] = pm[j] * x_in[i_n, h_idx]
                 for k in T.unroll(hc):
                     new_r[j] += cm[k, j] * residual_in[i_n, k, h_idx]
+                if use_fp16:
+                    new_r[j] = T.max(T.min(new_r[j], FP16_MAX), -FP16_MAX)
 
             # populate residual_out and compute sqr sum
             if i_nt == 0:
@@ -830,6 +846,11 @@ def mhc_post_tilelang(
                 x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
                 for i_hci in T.vectorized(hc):
                     x_local[i_hco, i1_h] += a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
+            if use_fp16:
+                for i_hco, i1_h in T.Parallel(hc, h_blk):
+                    x_local[i_hco, i1_h] = T.max(
+                        T.min(x_local[i_hco, i1_h], FP16_MAX), -FP16_MAX
+                    )
 
             T.copy(x_local, x[i_n, 0, i0_h * h_blk])
         if ENABLE_PDL:
@@ -880,7 +901,11 @@ def hc_prenorm_gemm_tilelang(
 
         for it in T.serial(k_iters):
             i_k = i_s * k_per_split + it * n_thr + tid
-            x_val = x[i_n, i_k]
+            # Widen before squaring: the product of two fp16 values is
+            # fp16 and overflows beyond |x| = 255.9. An attention-sink row
+            # reaches 35k in the last layers; its square sum became inf, the
+            # norm factor 0, and its mixes fell back to hc_base alone.
+            x_val = T.cast(x[i_n, i_k], T.float32)
             for i_o in T.unroll(tile_n):
                 out_idx = i_t * tile_n + i_o
                 if out_idx < n_out:
@@ -974,7 +999,8 @@ def hc_prenorm_gemm_block_m_tilelang(
             for i_m in T.unroll(block_m):
                 token_idx = i_mt * block_m + i_m
                 if token_idx < num_tokens:
-                    x_val = x[token_idx, i_k]
+                    # fp32 before squaring, see hc_prenorm_gemm_tilelang.
+                    x_val = T.cast(x[token_idx, i_k], T.float32)
                     for i_o in T.unroll(tile_n):
                         acc[i_m, i_o] += x_val * fn_val[i_o]
                     if i_t == 0:
