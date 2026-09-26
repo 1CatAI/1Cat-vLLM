@@ -1844,8 +1844,17 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
 
     padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(query)
     leading_padding = _SM70_79T_MAX_QUERY_LEN - query_len
-    padded_query[:, :leading_padding].zero_()
-    padded_query[:, leading_padding:].copy_(query)
+    # A scheduler can split the first chunk below 8192 while other requests
+    # decode. If KV is also shorter, pad only future keys and shift the real
+    # query slice back by the same amount. For original query i, the last
+    # visible key remains KV - Q + i; padded keys are always masked out.
+    kv_padding = max(0, _SM70_79T_MAX_QUERY_LEN - int(key.shape[1]))
+    if kv_padding:
+        key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, kv_padding))
+        value = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, kv_padding))
+        leading_padding -= kv_padding
+    padded_query.zero_()
+    padded_query[:, leading_padding : leading_padding + query_len].copy_(query)
     _run_sm70_gqa_groups(
         architecture_q8192_op,
         padded_query,
@@ -1855,7 +1864,7 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
         softmax_scale,
         True,
     )
-    out.copy_(padded_out[:, leading_padding:])
+    out.copy_(padded_out[:, leading_padding : leading_padding + query_len])
     return out
 
 
