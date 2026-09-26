@@ -79,13 +79,18 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         self.persistent_layout: dict | None = None
         if self.partition_by_group:
             parallel = vllm_config.parallel_config
+            # Decode context parallelism needs nothing extra: every rank
+            # registers and moves only its own pages, one row slice per
+            # worker, and group spans are already global block sizes.
             if (
                 parallel.pipeline_parallel_size != 1
                 or parallel.prefill_context_parallel_size != 1
-                or parallel.decode_context_parallel_size != 1
                 or parallel.nnodes != 1
             ):
-                raise ValueError("Grouped tiering currently requires single-node TP")
+                raise ValueError(
+                    "Grouped tiering currently requires single-node TP, "
+                    "optionally with decode context parallelism"
+                )
             backend = vllm_config.attention_config.backend
             if backend is None:
                 raise ValueError(
