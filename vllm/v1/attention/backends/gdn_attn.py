@@ -591,6 +591,22 @@ def select_gdn_state_block_ids(
     return block_table[row_indices, state_offsets]
 
 
+def _spec_sequence_masks_on_device(
+    spec_sequence_masks_cpu: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """The per-row speculative mask on ``device``.
+
+    When the speculative rows lead the batch, as in steady decode, the mask is
+    built on the device; uploading the pageable CPU mask would synchronize the
+    stream once per GDN cache group and step.
+    """
+    num_spec_rows = int(spec_sequence_masks_cpu.sum())
+    if bool(spec_sequence_masks_cpu[:num_spec_rows].all()):
+        rows = torch.arange(spec_sequence_masks_cpu.numel(), device=device)
+        return rows < num_spec_rows
+    return spec_sequence_masks_cpu.to(device, non_blocking=True)
+
+
 def build_gdn_spec_decode_state_contract(
     *,
     block_table_tensor: torch.Tensor,
@@ -614,88 +630,80 @@ def build_gdn_spec_decode_state_contract(
     """
     assert spec_sequence_masks_cpu.dtype == torch.bool
     assert num_accepted_tokens is not None
+    num_rows = spec_sequence_masks_cpu.numel()
+    num_spec_rows = int(spec_sequence_masks_cpu.sum())
+    # Speculative rows lead the batch in steady decode: graph padding and any
+    # non-speculative rows follow. Slicing then selects exactly the rows the
+    # mask would, without uploading the CPU mask (a pageable copy, which
+    # synchronizes the stream) or indexing by a device mask (a nonzero, which
+    # synchronizes again). Every GDN cache group repeats this on every step.
+    spec_rows_lead = bool(spec_sequence_masks_cpu[:num_spec_rows].all())
 
     def _mask_for(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.device == spec_sequence_masks_cpu.device:
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
+    row_indices: dict[tuple[torch.device, bool], torch.Tensor] = {}
+
+    def _rows(tensor: torch.Tensor, spec: bool) -> torch.Tensor:
+        if tensor.shape[0] != num_rows:
+            raise IndexError(
+                f"GDN spec mask has {num_rows} rows but the tensor has "
+                f"{tensor.shape[0]}"
+            )
+        if not spec_rows_lead:
+            # The CPU classification fixes the output size. Avoid GPU boolean
+            # indexing, whose nonzero synchronizes to discover that size.
+            key = (tensor.device, spec)
+            indices = row_indices.get(key)
+            if indices is None:
+                mask = spec_sequence_masks_cpu if spec else ~spec_sequence_masks_cpu
+                cpu_indices = torch.nonzero(mask).reshape(-1)
+                indices = cpu_indices.to(tensor.device, non_blocking=True)
+                row_indices[key] = indices
+            return torch.index_select(tensor, 0, indices)
+        rows = tensor[:num_spec_rows] if spec else tensor[num_spec_rows:]
+        # A fresh contiguous tensor, like the mask indexing it replaces.
+        return rows.clone(memory_format=torch.contiguous_format)
+
     if spec_state_slot_selectors is None:
         spec_state_slot_selectors = num_accepted_tokens
 
-    all_spec_rows = False
     if current_state_block_ids is not None:
-        current_mask = _mask_for(current_state_block_ids)
-        accepted_mask = _mask_for(num_accepted_tokens)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
-        spec_state_indices_tensor = state_block_ids[current_mask]
-        non_spec_source = state_block_ids[~current_mask]
+        spec_state_indices_tensor = _rows(state_block_ids, spec=True)
+        non_spec_source = _rows(state_block_ids, spec=False)
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
             non_spec_source,
-            num_accepted_tokens[~accepted_mask],
+            _rows(num_accepted_tokens, spec=False),
             num_spec,
         )
     elif is_mamba_cache_all:
-        block_mask = _mask_for(block_table_tensor)
-        seq_mask = _mask_for(seq_lens)
         spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[block_mask],
-            seq_lens[seq_mask],
+            _rows(block_table_tensor, spec=True),
+            _rows(seq_lens, spec=True),
             block_size,
             num_spec + 1,
         )
         non_spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            seq_lens[~seq_mask],
+            _rows(block_table_tensor, spec=False),
+            _rows(seq_lens, spec=False),
             block_size,
             1,
         ).squeeze(1)
     else:
-        all_spec_rows = bool(spec_sequence_masks_cpu.all().item())
-        if all_spec_rows:
-            # Preserve the independent, contiguous output of boolean indexing
-            # without allocating row indices for the common pure-MTP batch.
-            spec_state_indices_tensor = block_table_tensor[:, : num_spec + 1].clone()
-            non_spec_state_indices_tensor = block_table_tensor.new_empty((0,))
-        else:
-            # The request classification is authoritative on CPU. GPU boolean
-            # indexing invokes nonzero to discover its dynamic output shape and
-            # synchronizes the host. Index selection keeps the same independently
-            # allocated result without that device-side shape query.
-            spec_rows_cpu = torch.nonzero(spec_sequence_masks_cpu).reshape(-1)
-            non_spec_rows_cpu = torch.nonzero(~spec_sequence_masks_cpu).reshape(-1)
-            row_indices: dict[tuple[torch.device, bool], torch.Tensor] = {}
+        spec_state_indices_tensor = _rows(
+            block_table_tensor[:, : num_spec + 1], spec=True
+        )
+        non_spec_state_indices_tensor = select_gdn_state_block_ids(
+            _rows(block_table_tensor, spec=False),
+            _rows(num_accepted_tokens, spec=False),
+            num_spec,
+        )
 
-            def _select_rows(tensor: torch.Tensor, speculative: bool) -> torch.Tensor:
-                key = (tensor.device, speculative)
-                indices = row_indices.get(key)
-                if indices is None:
-                    cpu_indices = spec_rows_cpu if speculative else non_spec_rows_cpu
-                    indices = cpu_indices.to(tensor.device, non_blocking=True)
-                    row_indices[key] = indices
-                return torch.index_select(tensor, 0, indices)
-
-            spec_state_indices_tensor = _select_rows(
-                block_table_tensor[:, : num_spec + 1], True
-            )
-            non_spec_state_indices_tensor = select_gdn_state_block_ids(
-                _select_rows(block_table_tensor, False),
-                _select_rows(num_accepted_tokens, False),
-                num_spec,
-            )
-
-    if current_state_block_ids is None and not is_mamba_cache_all:
-        if all_spec_rows:
-            spec_num_accepted_tokens = num_accepted_tokens.clone()
-            spec_state_slot_selectors = spec_state_slot_selectors.clone()
-        else:
-            spec_num_accepted_tokens = _select_rows(num_accepted_tokens, True)
-            spec_state_slot_selectors = _select_rows(spec_state_slot_selectors, True)
-    else:
-        accepted_mask = _mask_for(num_accepted_tokens)
-        selector_mask = _mask_for(spec_state_slot_selectors)
-        spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-        spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+    spec_num_accepted_tokens = _rows(num_accepted_tokens, spec=True)
+    spec_state_slot_selectors = _rows(spec_state_slot_selectors, spec=True)
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(
@@ -1492,13 +1500,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         spec_sequence_masks_cpu = None
                     else:
                         num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-                        spec_sequence_masks = spec_sequence_masks_cpu.to(
-                            query_start_loc.device, non_blocking=True
+                        spec_sequence_masks = _spec_sequence_masks_on_device(
+                            spec_sequence_masks_cpu, query_start_loc.device
                         )
                 else:
                     num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-                    spec_sequence_masks = spec_sequence_masks_cpu.to(
-                        query_start_loc.device, non_blocking=True
+                    spec_sequence_masks = _spec_sequence_masks_on_device(
+                        spec_sequence_masks_cpu, query_start_loc.device
                     )
 
         if spec_sequence_masks is None:
@@ -1683,10 +1691,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # query_start_loc may be padded for CUDA graph replay. The CPU
                 # metadata is authoritative for the live request count here.
                 query_lens = None
-                if common_gdn_metadata is None:
-                    query_lens = query_lens_cpu.to(
-                        query_start_loc.device, non_blocking=True
-                    )
                 profile_state_contract_t0 = (
                     time.perf_counter() if metadata_profile else 0.0
                 )
@@ -1777,7 +1781,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         non_spec_query_start_loc = None
                         non_spec_query_start_loc_cpu = None
                     else:
-                        assert query_lens is not None
+                        # Only mixed batches need the device query lengths.
+                        query_lens = query_lens_cpu.to(
+                            query_start_loc.device, non_blocking=True
+                        )
                         spec_token_masks = torch.repeat_interleave(
                             spec_sequence_masks,
                             query_lens,
@@ -1837,7 +1844,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
             if common_gdn_metadata is None:
-                assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+                # Reading the device total synchronizes the stream, once per
+                # GDN cache group and step; keep it with the other opt-in
+                # state-contract checks.
+                if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
+                    assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             else:
                 assert (
                     common_gdn_metadata.num_spec_decode_tokens == num_spec_decode_tokens

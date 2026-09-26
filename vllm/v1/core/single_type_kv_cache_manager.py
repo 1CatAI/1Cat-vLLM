@@ -60,11 +60,11 @@ class SingleTypeKVCacheManager(ABC):
                 correct for full-attention-style specs that hold every
                 block until the request finishes.
         """
-        self.block_size = kv_cache_spec.block_size
-        self.dcp_world_size = dcp_world_size
-        self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
-            self.block_size *= dcp_world_size * pcp_world_size
+        self.block_size = kv_cache_spec.global_block_size(
+            dcp_world_size, pcp_world_size
+        )
+        self.dcp_world_size = dcp_world_size if kv_cache_spec.dcp_sharded else 1
+        self.pcp_world_size = pcp_world_size if kv_cache_spec.dcp_sharded else 1
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching

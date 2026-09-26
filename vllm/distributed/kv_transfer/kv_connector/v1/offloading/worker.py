@@ -58,6 +58,14 @@ class OffloadingConnectorWorker:
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ):
         num_blocks = self.spec.kv_cache_config.num_blocks
+        # Packed attention layers split each physical block of one tensor,
+        # interleaved kernel block by kernel block, so they transfer as one
+        # whole physical page registered once, by the first member.
+        packed: dict[str, tuple[int, int]] = {}
+        for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
+            members = getattr(kv_cache_tensor, "packed_members", None) or []
+            for index, layer_name in enumerate(members):
+                packed[layer_name] = (index, len(members))
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -79,10 +87,12 @@ class OffloadingConnectorWorker:
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
                     layer_kv_cache = kv_caches[layer_name]
                     assert isinstance(layer_kv_cache, torch.Tensor)
-                    assert layer_kv_cache.storage_offset() == 0
+                    member_index, member_count = packed.get(layer_name, (0, 1))
+                    # Only the first packed member's view starts the storage.
+                    assert (layer_kv_cache.storage_offset() == 0) == (member_index == 0)
 
                     storage = layer_kv_cache.untyped_storage()
-                    page = layer_kv_cache_spec.page_size_bytes
+                    page = layer_kv_cache_spec.page_size_bytes * member_count
                     tensors_per_block[layer_name] = (
                         torch.tensor(
                             [],
@@ -92,9 +102,11 @@ class OffloadingConnectorWorker:
                         .set_(storage)
                         .view(num_blocks, page),
                     )
-                    page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
+                    page_size_bytes[layer_name] = page
                     unpadded_page_size_bytes[layer_name] = (
-                        layer_kv_cache_spec.real_page_size_bytes
+                        page
+                        if member_count > 1
+                        else layer_kv_cache_spec.real_page_size_bytes
                     )
 
                 elif isinstance(layer_kv_cache_spec, MambaSpec):
@@ -161,6 +173,9 @@ class OffloadingConnectorWorker:
 
                 curr_tensor_idx = len(block_tensors) - 1
                 for layer_name in tensor_layer_names:
+                    if packed.get(layer_name, (0, 1))[0] > 0:
+                        # The first member's reference covers the whole page.
+                        continue
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
                             tensor_idx=curr_tensor_idx,

@@ -598,6 +598,53 @@ def test_ple_offload_uses_capability_not_model_identity(
 
 
 @pytest.mark.parametrize(
+    ("dcp_size", "supported_model", "mtp", "admitted"),
+    [
+        (2, True, None, True),
+        (4, True, None, False),
+        (2, False, None, False),
+        (2, True, object(), False),
+    ],
+)
+def test_ple_offload_qsa_dcp_admission(
+    monkeypatch,
+    dcp_size,
+    supported_model,
+    mtp,
+    admitted,
+):
+    import vllm.config.vllm as config_module
+
+    worker = Worker.__new__(Worker)
+    worker.parallel_config = SimpleNamespace(
+        nnodes=1,
+        data_parallel_backend="mp",
+        data_parallel_size_local=1,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=dcp_size,
+        use_ubatching=False,
+    )
+    worker.model_config = SimpleNamespace()
+    worker.vllm_config = SimpleNamespace(
+        weight_transfer_config=None,
+        speculative_config=mtp,
+    )
+    monkeypatch.setattr(gpu_worker_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        config_module,
+        "_is_sm70_qwen38_decode_compile_contract",
+        lambda *_: supported_model,
+    )
+    if admitted:
+        worker._validate_ple_offload_config()
+    else:
+        with pytest.raises(ValueError, match="DCP="):
+            worker._validate_ple_offload_config()
+
+
+@pytest.mark.parametrize(
     ("dp_rank", "expected_calls"),
     [(0, 1), (1, 0)],
 )

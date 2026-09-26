@@ -150,6 +150,41 @@ _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
     "VLLM_USE_AOT_COMPILE": "0",
 }
 
+# Native MTP verifies a linear draft chain exactly as DFlash2 does, so its GDN
+# layers can reuse DFlash2's shared per-step request metadata and prepare
+# every GDN cache group's state indices in one launch. Qwen4Exp serves 36 GDN
+# layers in three cache groups at DCP1 and six at DCP2, and each per-group
+# build otherwise costs about 0.65 ms of host time per decode step.
+_SM70_QWEN4EXP_MTP_GDN_METADATA_DEFAULTS = {
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
+}
+
+
+def _is_sm70_qwen4exp_native_mtp_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit Qwen4Exp serving with its native MTP drafter.
+
+    The shared and fused GDN metadata paths only prepare state indices and
+    offsets; each falls back to the per-group build for any batch it cannot
+    express, so quantization, KV dtype and TP degree are not part of this.
+    """
+    if any(
+        config is None for config in (model_config, speculative_config, parallel_config)
+    ):
+        return False
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        architectures & {"Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"}
+        and getattr(speculative_config, "method", None) == "mtp"
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
 
 def _is_sm70_dflash2_verifier_contract(
     model_config: Any,
@@ -273,6 +308,31 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     return tuple(range(start, start + parallel.local_world_size))
 
 
+def _apply_sm70_qwen38_kv_defaults(cfg: "VllmConfig", *, is_sm70: bool) -> bool:
+    """Default Qwen3.8 NVFP4 TP4/MTP0 to calibrated E4M3 KV storage.
+
+    Explicit float16 remains the unquantized control. This changes only main
+    KV storage, never GEMM/GDN/HC activation or reduction precision.
+    """
+    if (
+        not is_sm70
+        or not _is_sm70_qwen38_decode_compile_contract(
+            cfg.model_config, cfg.speculative_config, cfg.parallel_config
+        )
+        or cfg.speculative_config is not None
+        or cfg.model_config.quantization != "modelopt_fp4"
+        or cfg.cache_config.cache_dtype != "auto"
+        or cfg.cache_config.calculate_kv_scales
+        or cfg.parallel_config.prefill_context_parallel_size != 1
+        or cfg.parallel_config.decode_context_parallel_size not in (1, 2)
+    ):
+        return False
+    cfg.cache_config.cache_dtype = "fp8_e4m3"
+    # An automatic precision change must not silently use uncalibrated scales.
+    os.environ.setdefault("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "1")
+    return True
+
+
 def _apply_sm70_qwen38_decode_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
@@ -289,7 +349,7 @@ def _apply_sm70_qwen38_decode_defaults(
         or parallel.enable_dbo
         or parallel.data_parallel_size != 1
         or parallel.nnodes_within_dp != 1
-        or cfg.cache_config.cache_dtype not in ("auto", "float16")
+        or cfg.cache_config.cache_dtype not in ("auto", "float16", "fp8_e4m3")
         or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
     ):
         return ()
@@ -370,6 +430,16 @@ def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
     for env_name, env_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
+        if env_name not in os.environ:
+            os.environ[env_name] = env_value
+            applied.append(env_name)
+    return tuple(applied)
+
+
+def _apply_sm70_qwen4exp_mtp_gdn_metadata_defaults() -> tuple[str, ...]:
+    """Set the shared GDN metadata defaults, keeping explicit overrides."""
+    applied = []
+    for env_name, env_value in _SM70_QWEN4EXP_MTP_GDN_METADATA_DEFAULTS.items():
         if env_name not in os.environ:
             os.environ[env_name] = env_value
             applied.append(env_name)
@@ -1555,7 +1625,31 @@ class VllmConfig:
             self.cache_config.cache_dtype = "auto"
             self.cache_config.cache_dtype_from_checkpoint = False
 
+        # Generic/offload-only configs can be built before worker visibility is
+        # established. Only probe CUDA placement for the model using this default.
+        qwen38_kv_route = (
+            self.model_config is not None
+            and self.model_config.quantization == "modelopt_fp4"
+            and _is_sm70_qwen38_decode_compile_contract(
+                self.model_config,
+                self.speculative_config,
+                self.parallel_config,
+            )
+        )
+        if qwen38_kv_route and _apply_sm70_qwen38_kv_defaults(
+            self, is_sm70=_any_participating_device_is_capability(self, (7, 0))
+        ):
+            logger.info_once(
+                "Qwen3.8 SM70 TP4: defaulting main KV cache to calibrated E4M3; "
+                "QSA index and recurrent states retain their original precision. "
+                "Use a checkpoint with QSA K/V scales, or "
+                "--kv-cache-dtype float16 for the unquantized KV control."
+            )
+
         self.try_verify_and_update_config()
+        # Models may have supplied their own DCP defaults above; anything still
+        # unset falls back to the stock ones.
+        self.parallel_config.set_dcp_defaults()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -2133,6 +2227,19 @@ class VllmConfig:
                         "Auto-setting %s=%s for the quality-audited SM70 "
                         "Qwen3.8 DFlash2 verification baseline. "
                         "Set it explicitly to override.",
+                        env_name,
+                        os.environ[env_name],
+                    )
+            if _is_sm70_qwen4exp_native_mtp_contract(
+                self.model_config,
+                self.speculative_config,
+                self.parallel_config,
+            ):
+                for env_name in _apply_sm70_qwen4exp_mtp_gdn_metadata_defaults():
+                    logger.info_once(
+                        "Auto-setting %s=%s so SM70 Qwen4Exp native MTP shares "
+                        "GDN metadata across cache groups. Set it explicitly "
+                        "to override.",
                         env_name,
                         os.environ[env_name],
                     )

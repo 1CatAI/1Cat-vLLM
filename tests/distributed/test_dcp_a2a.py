@@ -104,10 +104,30 @@ def _distributed_run(fn, world_size: int, extra_env: dict[str, str]) -> None:
 class TestDCPCommBackendConfig:
     """Test --dcp-comm-backend config validation."""
 
-    def test_default_is_ag_rs(self):
-        """Default comm backend is ag_rs."""
+    def test_default_is_unset_then_ag_rs(self):
+        """The backend starts unset so a model default can fill it; the stock
+        default is ag_rs."""
         config = ParallelConfig()
+        assert config.dcp_comm_backend is None
+        config.set_dcp_defaults()
         assert config.dcp_comm_backend == "ag_rs"
+
+    def test_model_default_fills_only_unset_backend(self):
+        """A model preference applies only when the user left the option unset."""
+        config = ParallelConfig(tensor_parallel_size=4, decode_context_parallel_size=2)
+        config.set_dcp_defaults(comm_backend="a2a")
+        assert config.dcp_comm_backend == "a2a"
+        # Stock defaults resolved afterwards must not undo the model choice.
+        config.set_dcp_defaults()
+        assert config.dcp_comm_backend == "a2a"
+
+        explicit = ParallelConfig(
+            tensor_parallel_size=4,
+            decode_context_parallel_size=2,
+            dcp_comm_backend="ag_rs",
+        )
+        explicit.set_dcp_defaults(comm_backend="a2a")
+        assert explicit.dcp_comm_backend == "ag_rs"
 
     def test_a2a_requires_dcp_greater_than_1(self):
         """A2A backend requires decode_context_parallel_size > 1."""

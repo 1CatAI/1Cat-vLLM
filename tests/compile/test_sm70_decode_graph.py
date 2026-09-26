@@ -16,6 +16,7 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.vllm import (
     _apply_sm70_qwen38_decode_defaults,
     _apply_sm70_qwen38_hybrid_ple_defaults,
+    _apply_sm70_qwen38_kv_defaults,
     _is_sm70_qwen38_decode_compile_contract,
 )
 
@@ -122,16 +123,60 @@ def _nomtp_default_config():
         parallel_config=SimpleNamespace(
             tensor_parallel_size=4,
             pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
             enable_expert_parallel=False,
             enable_dbo=False,
             data_parallel_size=1,
             nnodes_within_dp=1,
         ),
         cache_config=SimpleNamespace(
-            cache_dtype="float16", mamba_ssm_cache_dtype="float32"
+            cache_dtype="float16",
+            mamba_ssm_cache_dtype="float32",
+            calculate_kv_scales=False,
         ),
         lora_config=None,
     )
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+@pytest.mark.parametrize("dtype", ["auto", "float16", "fp8_e4m3", "fp8_e5m2"])
+def test_qwen38_e4m3_default_preserves_explicit_dtype(monkeypatch, dcp_size, dtype):
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    cfg.cache_config.cache_dtype = dtype
+    cfg.parallel_config.decode_context_parallel_size = dcp_size
+    assert _apply_sm70_qwen38_kv_defaults(cfg, is_sm70=True) == (dtype == "auto")
+    assert cfg.cache_config.cache_dtype == ("fp8_e4m3" if dtype == "auto" else dtype)
+    assert os.environ.get("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES") == (
+        "1" if dtype == "auto" else None
+    )
+
+
+@pytest.mark.parametrize("mismatch", ["device", "mtp", "tp", "pcp", "model", "scales"])
+def test_qwen38_e4m3_default_stays_within_admitted_route(mismatch):
+    cfg = _nomtp_default_config()
+    cfg.cache_config.cache_dtype = "auto"
+    if mismatch == "mtp":
+        cfg.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
+    elif mismatch == "tp":
+        cfg.parallel_config.tensor_parallel_size = 2
+    elif mismatch == "pcp":
+        cfg.parallel_config.prefill_context_parallel_size = 2
+    elif mismatch == "model":
+        cfg.model_config.hf_text_config.hidden_size = 2048
+    elif mismatch == "scales":
+        cfg.cache_config.calculate_kv_scales = True
+    assert not _apply_sm70_qwen38_kv_defaults(cfg, is_sm70=mismatch != "device")
+    assert cfg.cache_config.cache_dtype == "auto"
+
+
+def test_qwen38_e4m3_retains_decode_defaults(monkeypatch):
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    cfg.cache_config.cache_dtype = "fp8_e4m3"
+    assert len(_apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)) == 5
+    assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
 
 
 def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
@@ -194,7 +239,7 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
             True,
         )
     elif mismatch == "kv":
-        cfg.cache_config.cache_dtype = "fp8_e4m3"
+        cfg.cache_config.cache_dtype = "fp8_e5m2"
     elif mismatch == "ssm":
         cfg.cache_config.mamba_ssm_cache_dtype = "float16"
     elif mismatch == "lora":

@@ -211,7 +211,21 @@ class Worker(WorkerBase):
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
-            unsupported.append(f"DCP={parallel_config.decode_context_parallel_size}")
+            from vllm.config.vllm import _is_sm70_qwen38_decode_compile_contract
+
+            # QSA DCP2 partitions KV tokens only. Hidden/input tokens and the
+            # TP group consumed by PLE's producer and clients stay unchanged.
+            qsa_dcp = (
+                parallel_config.decode_context_parallel_size == 2
+                and self.vllm_config.speculative_config is None
+                and _is_sm70_qwen38_decode_compile_contract(
+                    self.model_config, None, parallel_config
+                )
+            )
+            if not qsa_dcp:
+                unsupported.append(
+                    f"DCP={parallel_config.decode_context_parallel_size}"
+                )
         if parallel_config.use_ubatching:
             unsupported.append("ubatching/DBO")
         if self.vllm_config.weight_transfer_config is not None:

@@ -391,6 +391,11 @@ class CommonAttentionMetadata:
     cudagraph_graph_variant: int | None = None
     """Optional semantic variant for CUDA graph capture dummy runs."""
 
+    is_dummy_batch: bool = False
+    """A profile/capture batch has no real cache writes. Under DCP a PAD slot
+    can also mean a different rank owns the token, so side caches need this
+    explicit flag instead of inferring dummy state from the slot mapping."""
+
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
@@ -526,6 +531,7 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
+            is_dummy_batch=self.is_dummy_batch,
             causal=self.causal,
             cudagraph_graph_variant=self.cudagraph_graph_variant,
             logits_indices_padded=self.logits_indices_padded,

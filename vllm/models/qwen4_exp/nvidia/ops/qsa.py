@@ -72,7 +72,7 @@ _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES = (
     _SM70_QSA_XQA_PAGE4_PAGES * _SM70_QSA_GROUPED_PAGE4_QUERIES + 56
 )
 _SM70_QSA_XQA_PAGE4_WORKSPACES: dict[
-    tuple[int, int, int, int, int],
+    tuple[int, int, int, int, int, bool],
     tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
@@ -594,6 +594,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    final_lse_ptr,
     output_gate_ptr,
     stride_q_row,
     stride_q_head,
@@ -730,6 +731,17 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
+        if final_lse_ptr is not None:
+            lse = tl.where(
+                has_values,
+                max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
+                -float("inf"),
+            )
+            tl.store(
+                final_lse_ptr + row * NUM_QUERY_HEADS + first_head + head_offsets,
+                lse,
+                mask=head_offsets < GROUP_SIZE,
+            )
         if KV_E4M3:
             # V dequantization is linear, so apply its scalar after the
             # normalized FP32 accumulation instead of to every loaded value.
@@ -790,6 +802,7 @@ def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    final_lse_ptr,
     output_gate_ptr,
     stride_output_row,
     stride_output_head,
@@ -818,6 +831,13 @@ def _qsa_merge_splitk_kernel(
     shifted = tl.where(split_mask & has_values, lse - lse_max, -float("inf"))
     weights = tl.math.exp2(shifted)
     denominator = tl.sum(weights, axis=0)
+    if final_lse_ptr is not None:
+        merged_lse = tl.where(
+            has_values,
+            lse_max + tl.math.log2(tl.maximum(denominator, 1.0e-20)),
+            -float("inf"),
+        )
+        tl.store(final_lse_ptr + row * NUM_QUERY_HEADS + head, merged_lse)
     partial_output = tl.load(
         partial_output_ptr
         + ((split_offsets[:, None] * num_rows + row) * NUM_QUERY_HEADS + head)
@@ -1654,17 +1674,26 @@ def _qsa_xqa_page4_block_table(
 def _qsa_xqa_page4_workspace(
     q: torch.Tensor,
     num_partitions: int,
+    kv_cache_dtype: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
-    key = (device_index, stream_id, q.shape[1], q.shape[2], num_partitions)
+    e4m3_output = kv_cache_dtype == "fp8_e4m3"
+    key = (
+        device_index,
+        stream_id,
+        q.shape[1],
+        q.shape[2],
+        num_partitions,
+        e4m3_output,
+    )
     workspace = _SM70_QSA_XQA_PAGE4_WORKSPACES.get(key)
     rows = q.shape[0]
     if workspace is None or workspace[0] < rows:
         capacity = 1 << (rows - 1).bit_length()
         temporary_output = torch.empty(
             (capacity, q.shape[1], num_partitions, q.shape[2]),
-            dtype=torch.float16,
+            dtype=torch.float32 if e4m3_output else torch.float16,
             device=q.device,
         )
         max_logits = torch.empty(
@@ -1673,8 +1702,13 @@ def _qsa_xqa_page4_workspace(
             device=q.device,
         )
         exp_sums = torch.empty_like(max_logits)
-        active_num_partitions = torch.tensor(
-            [num_partitions], dtype=torch.int32, device=q.device
+        # torch.tensor([...], device=cuda) does a host->device copy, which is
+        # illegal during CUDA graph capture. The workspace cache is keyed by the
+        # active stream, so an E4M3 >16-row verify batch captured on the graph's
+        # side stream rebuilds here; torch.full fills on-device (scalar kernel
+        # arg, no host copy) and stays capture-safe.
+        active_num_partitions = torch.full(
+            (1,), num_partitions, dtype=torch.int32, device=q.device
         )
         workspace = (
             capacity,
@@ -1911,7 +1945,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
     )
     num_partitions = math.ceil(logical_indices.shape[1] / partition_size)
     temporary_output, max_logits, exp_sums, active_num_partitions = (
-        _qsa_xqa_page4_workspace(q, num_partitions)
+        _qsa_xqa_page4_workspace(q, num_partitions, kv_cache_dtype)
     )
     physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
     flash_attn_v100_cuda.decode_paged_xqa_fwd(
@@ -2099,8 +2133,13 @@ def qsa_sparse_paged_attention(
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA over paged FP16/BF16 or calibrated E4M3 K/V."""
+    """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
+
+    LSE callers may supply FP32 output to avoid rounding each rank's partial
+    result. Apply output gating after the cross-rank merge, not per rank.
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -2145,8 +2184,21 @@ def qsa_sparse_paged_attention(
         out = torch.empty_like(q)
     if out.shape != q.shape:
         raise ValueError("QSA sparse output must match its query")
-    assert out.dtype == q.dtype and out.device == q.device
+    allowed_output_dtypes = (q.dtype, torch.float32) if lse is not None else (q.dtype,)
+    assert out.dtype in allowed_output_dtypes and out.device == q.device
     assert out.stride(2) == 1
+    if lse is not None:
+        if (
+            lse.shape != q.shape[:2]
+            or lse.dtype != torch.float32
+            or lse.device != q.device
+            or not lse.is_contiguous()
+        ):
+            raise ValueError("QSA LSE requires contiguous FP32 [rows, heads] output")
+        if output_gate is not None:
+            raise ValueError(
+                "QSA DCP must apply its gate after merging partial outputs"
+            )
     output_gate_view = output_gate.view_as(q) if output_gate is not None else None
     if output_gate_view is not None:
         if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
@@ -2156,7 +2208,7 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
-    if _use_sm70_qsa_xqa_page4(
+    if lse is None and _use_sm70_qsa_xqa_page4(
         q,
         k_cache,
         v_cache,
@@ -2254,6 +2306,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        lse,
         output_gate_view,
         q.stride(0),
         q.stride(1),
@@ -2296,6 +2349,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        lse,
         output_gate_view,
         out.stride(0),
         out.stride(1),

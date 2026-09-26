@@ -203,6 +203,9 @@ def _flash_next_spec(
         self.kv_cache_config = caches
         self.extra_config = {"cpu_bytes_to_use": 16 * 1024**3, **extra_config}
         self.block_size_factor = 1
+        self.gpu_block_size = tuple(
+            getattr(g.kv_cache_spec, "block_size", 0) for g in caches.kv_cache_groups
+        )
 
     monkeypatch.setattr(OffloadingSpec, "__init__", init)
     fa = FullAttentionSpec(

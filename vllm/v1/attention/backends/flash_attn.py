@@ -298,6 +298,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
+    # FlashAttention's own DCP path reads each rank's context lengths. Subclass
+    # backends that run their own DCP attention can skip building them.
+    builds_dcp_context_lens: ClassVar[bool] = True
 
     @classmethod
     def get_cudagraph_support(
@@ -477,7 +480,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        if self.dcp_world_size > 1:
+        if self.dcp_world_size > 1 and self.builds_dcp_context_lens:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             context_kv_lens = seq_lens - query_lens
             local_context_kv_lens = get_dcp_local_seq_lens(

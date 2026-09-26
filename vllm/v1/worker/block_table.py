@@ -50,6 +50,7 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        dcp_sharded: bool = True,
     ):
         """
         Args:
@@ -123,6 +124,9 @@ class BlockTable:
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        if not dcp_sharded:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
@@ -388,12 +392,17 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        dcp_sharded: list[bool] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
                 f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
+        if dcp_sharded is None:
+            dcp_sharded = [True] * len(block_sizes)
+        if len(dcp_sharded) != len(block_sizes):
+            raise ValueError("dcp_sharded length must match block_sizes length")
         if max_num_blocks is None:
             # Note(hc): each dcp rank only store
             # (max_model_len//dcp_world_size) tokens in kvcache,
@@ -401,8 +410,11 @@ class MultiGroupBlockTable:
             # must be multiplied by dcp_world_size.
             total_cp_world_size = get_total_cp_world_size()
             max_num_blocks = [
-                cdiv(max_model_len, block_size * total_cp_world_size)
-                for block_size in block_sizes
+                cdiv(
+                    max_model_len,
+                    block_size * (total_cp_world_size if sharded else 1),
+                )
+                for block_size, sharded in zip(block_sizes, dcp_sharded)
             ]
 
         if len(max_num_blocks) != len(block_sizes):
@@ -428,9 +440,10 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                sharded,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
+            for block_size, kernel_block_size, max_num_blocks_per_req, sharded in zip(
+                block_sizes, kernel_block_sizes, max_num_blocks, dcp_sharded
             )
         ]
 
