@@ -143,16 +143,18 @@ class MambaHybridModelState(DefaultModelState):
         if self._use_dflash2_common_gdn_metadata:
             logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
         speculative_config = vllm_config.speculative_config
+        # The shared request metadata and the fused state rows depend on the
+        # draft depth only through num_spec_state_tokens, so every native MTP
+        # depth qualifies. The MTP4 prefix on these names is historical.
         self._use_mtp4_common_gdn_metadata = bool(
             envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
             and speculative_config is not None
             and speculative_config.method == "mtp"
-            and speculative_config.num_speculative_tokens == 4
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
         )
         if self._use_mtp4_common_gdn_metadata:
-            logger.info_once("SM70 MTP4 shared GDN batch metadata fast path enabled.")
+            logger.info_once("SM70 MTP shared GDN batch metadata fast path enabled.")
         self._use_common_gdn_metadata = (
             self._use_dflash2_common_gdn_metadata or self._use_mtp4_common_gdn_metadata
         )
@@ -442,7 +444,7 @@ class MambaHybridModelState(DefaultModelState):
                             "Fused speculative GDN metadata active for %d cache "
                             "groups (%s).",
                             len(prepared_dflash2_gdn_metadata),
-                            "MTP4" if self._use_mtp4_fused_gdn_metadata else "DFlash2",
+                            "MTP" if self._use_mtp4_fused_gdn_metadata else "DFlash2",
                         )
                         self._dflash2_fused_gdn_metadata_logged = True
 

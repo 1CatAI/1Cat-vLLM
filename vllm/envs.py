@@ -2245,12 +2245,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
     ),
+    # Classify native MTP batches (any draft depth; the MTP4 prefix is
+    # historical) once per step and share it across GDN cache groups. Set 0 to
+    # restore separate per-group GDN metadata builds.
     "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
     ),
-    # Pure MTP4 graph batches can construct all GDN groups' state rows in one
-    # launch. Mixed/prefill batches still fall back. Set 0 to restore separate
-    # per-group metadata writes while retaining the shared batch classification.
+    # Pure native-MTP graph batches can construct all GDN groups' state rows in
+    # one launch. Mixed/prefill batches still fall back. Set 0 to restore
+    # separate per-group metadata writes while retaining the shared batch
+    # classification.
     "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))
     ),

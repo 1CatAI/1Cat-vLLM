@@ -685,20 +685,21 @@ def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
     _assert_gdn_metadata_equal(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("seq_lens", "query_lens", "drafts", "graph_tokens"),
-    [
-        ([17], [5], [4], 8),
-        ([17, 32, 17], [5, 1, 5], [4, -1, 4], 16),
-    ],
-)
-def test_mtp4_shared_gdn_metadata_matches_legacy(
-    local_gdn_model, seq_lens, query_lens, drafts, graph_tokens
-):
+@pytest.mark.parametrize("num_spec", [1, 2, 3, 4])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_mtp_shared_gdn_metadata_matches_legacy(local_gdn_model, num_spec, mixed):
+    """Shared native-MTP batch metadata matches per-group builds at any depth."""
+    if mixed:
+        seq_lens = [17, 32, 17]
+        query_lens = [num_spec + 1, 1, num_spec + 1]
+        drafts = [num_spec, -1, num_spec]
+        graph_tokens = 16
+    else:
+        seq_lens, query_lens, drafts, graph_tokens = [17], [num_spec + 1], [num_spec], 8
     builders = [
         _create_gdn_builder(
             local_gdn_model,
-            num_speculative_tokens=4,
+            num_speculative_tokens=num_spec,
             use_full_cuda_graph=True,
             mamba_cache_mode="align",
             max_cudagraph_capture_size=16,
@@ -726,7 +727,7 @@ def test_mtp4_shared_gdn_metadata_matches_legacy(
         num_decode_draft_tokens_cpu=draft_cpu,
         query_start_loc=common.query_start_loc,
         query_start_loc_cpu=common.query_start_loc_cpu,
-        num_spec_state_tokens=4,
+        num_spec_state_tokens=num_spec,
         legacy_mixed_decode_routing=(
             qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
         ),
@@ -1106,10 +1107,14 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
 
 
 @pytest.mark.parametrize("cache_mode", ["none", "align"])
-@pytest.mark.parametrize("query_len", [2, 3, 4, 5])
-def test_mtp4_fused_gdn_group_metadata_matches_legacy_replay(
-    monkeypatch, local_gdn_model, cache_mode, query_len
+@pytest.mark.parametrize(
+    ("num_spec", "query_len"),
+    [(num_spec, q) for num_spec in (1, 2, 3, 4) for q in range(2, num_spec + 2)],
+)
+def test_mtp_fused_gdn_group_metadata_matches_legacy_replay(
+    monkeypatch, local_gdn_model, cache_mode, num_spec, query_len
 ):
+    """Fused native-MTP state rows match per-group builds at any depth."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused GDN metadata kernel")
     device = torch.device("cuda")
@@ -1125,7 +1130,7 @@ def test_mtp4_fused_gdn_group_metadata_matches_legacy_replay(
     def make_builder():
         return _create_gdn_builder(
             local_gdn_model,
-            num_speculative_tokens=4,
+            num_speculative_tokens=num_spec,
             use_full_cuda_graph=True,
             mamba_cache_mode=cache_mode,
             max_cudagraph_capture_size=32,
@@ -1149,7 +1154,7 @@ def test_mtp4_fused_gdn_group_metadata_matches_legacy_replay(
         num_decode_draft_tokens_cpu=draft_cpu,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
-        num_spec_state_tokens=4,
+        num_spec_state_tokens=num_spec,
         legacy_mixed_decode_routing=False,
     )
     assert common_metadata is not None
