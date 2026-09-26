@@ -2,6 +2,32 @@
 
 Date: 2026-05-30
 
+## Shared batch defaults and incremental integration, 2026-09-26
+
+The requested integration scope is the current measured C2/C4/C8 improvement,
+with the larger performance targets retained as follow-up work. This supersedes
+the earlier keep-Draft disposition below; it does not turn failed aspirational
+targets or relative output-quality parity into passing acceptance results.
+
+PR #691 now applies the existing batch-layout and M64 warmup/tuning defaults
+to participating SM70 devices before model-specific defaults. Common admission
+does not inspect model architecture/name, quantization label, speculative method
+or width, TP size or maximum service concurrency. The layout helper no longer
+requires DFlash q7 and at least eight sequences. Native dtype/layout/alignment
+checks and operator availability remain local to each format, preserving safe
+fallbacks. Explicit environment overrides still win. Model-specific verifier
+and GDN policies are not broadened by this common GEMM change.
+
+The default-policy/override and batch replay selection covers 37 focused tests.
+An additional 57 warmup, FP4 layout and channel-FP8 tests pass. Four old QPN2
+test doubles initially lacked the new prescale argument; their contracts now
+check both ordinary and prescaled preparation and dispatch. Native sources and
+the normal `72e750ee` extension are unchanged from the previous 105-test audit.
+The fresh ordinary service is labeled `merge-defaults`; its C2 measurements
+complete the current C2/C4/C8 consolidation without substituting earlier C2
+prototype numbers. Exact results and merge status are recorded in
+[the batch reuse report](sm70_quantized_batch_reuse.md).
+
 ## GEMM savings realized in serving, 2026-09-26
 
 The current Draft PR #691 contains default logits reuse on compact-sampling

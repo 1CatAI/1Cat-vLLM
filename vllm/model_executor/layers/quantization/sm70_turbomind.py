@@ -57,24 +57,14 @@ def use_turbomind(default_enabled: bool) -> bool:
 
 
 def use_batched_gemm_layouts() -> bool:
-    """Prepare batch GEMM metadata once for concurrent SM70 DFlash2 decode.
+    """Prepare compatible batch GEMM layouts once on SM70.
 
-    Both NVFP4 and channel-FP8 callers use this decision. Small-M kernels
-    retain their existing packed layouts; larger verifier batches can consume
-    load-time TurboMind layouts without rebuilding weights or scales per step.
+    Format-specific callers validate their own local weights and operators.
+    Model name, quantization label, speculative method/width and max_num_seqs
+    do not restrict this shared policy. Small-M kernels retain their existing
+    packed layouts; larger batches consume prepared TurboMind weights/scales.
     """
-    if not envs.VLLM_SM70_BATCH_GEMM_LAYOUTS or not is_exact_sm70_cuda_platform():
-        return False
-    from vllm.config import get_current_vllm_config
-
-    config = get_current_vllm_config()
-    spec = getattr(config, "speculative_config", None)
-    scheduler = getattr(config, "scheduler_config", None)
-    return bool(
-        getattr(spec, "method", None) == "dflash"
-        and int(getattr(spec, "num_speculative_tokens", 0) or 0) == 7
-        and int(getattr(scheduler, "max_num_seqs", 0) or 0) >= 8
-    )
+    return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
 
 
 def forces_marlin() -> bool:

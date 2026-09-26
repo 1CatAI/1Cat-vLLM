@@ -12,19 +12,22 @@ The fixed performance workload is 2048 input / 256 output with temperature
 0.7, top-p 0.8, top-k 20, seeds starting at 20260923. Performance requests
 ignore EOS; natural-EOS quality is checked separately.
 
-The updated C8 acceptance target is at least 20% lower total GEMM latency
+This integration delivers the measured C2/C4/C8 improvements as defaults.
+The broader C8 optimization target remains at least 20% lower total GEMM latency
 (aiming for 30%) and at least 20% faster complete batch decode. Both rolling
 and no-new-prefill decode are reported against the same saved main baseline;
-neither the acceptance limit of two percentage points nor the C1, quality,
-context-capacity and memory checks is relaxed. The FP8-only candidate below
-is a localization experiment and is insufficient for this updated target.
+the measured acceptance, C1, quality, context-capacity and memory results
+remain recorded without claiming that every aspirational target has passed.
+The older FP8-only candidate below is a localization experiment, not the
+integrated implementation.
 
 The measured QPN implementation extends batch reuse to FP4 and FP8 at M9..32.
 A full DFlash q8 verification step has M=8*C, so these are the C2/C4 paths;
 partial steps also benefit. Target-model M<=8 retains its established kernels.
 The current M33..64 candidate adds padded activation supply and in-place FP4
 scale preparation. Earlier M64 candidates and their failed serving guards are
-recorded below. The current candidate is also not qualified for promotion.
+recorded below. The C8 20% targets remain follow-up work rather than a claim
+made by this incremental integration.
 The follow-up also removes a duplicate logits projection when compact DFlash2
 sampling requires the existing full-vocabulary fallback. Scheduler and
 attention implementations are unchanged.
@@ -45,8 +48,22 @@ attention implementations are unchanged.
   their existing dispatch. The activation pack is transient; the measured
   TP4 projections use at most 160 KiB at C2 and 320 KiB at C4 per invocation.
 
-No new environment switch is introduced. Existing SM70 DFlash2 defaults
-already enable compressed batch layouts and M64 warmup/tuning. Service
+No new environment switch is introduced. Shared SM70 configuration defaults
+enable compressed batch layouts and M64 warmup/tuning independently of model
+name, checkpoint quantization label, speculative method/width and service
+capacity. The old DFlash q7 / max-sequences-at-least-eight layout admission
+is removed, including for C2/C4-capacity services. Format-specific loaders
+still validate weight layout, dtype, alignment and available native operators;
+unsupported local shapes retain their existing fallback. This common policy
+does not enable model-specific verifier/GDN experiments on unrelated models.
+Explicit overrides are preserved, including a layout rollback value of zero.
+
+The four automatic settings are `VLLM_SM70_BATCH_GEMM_LAYOUTS=1`,
+`VLLM_SM70_AWQ_WARMUP_MAX_M=64`, `VLLM_SM70_FP8_DENSE_TUNE_MAX_M=64`
+and `VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M=64`. These are native matrix-row
+limits, not an eight-request service limit; larger batches retain the established
+large-M route. This rollout does not add AWQ/MXFP4 tuning policies or claim
+new speed evidence for their model routes. Service
 launches explicitly unset the four manual batch-layout/tuning overrides;
 worker audits check the automatic settings of 1/64/64/64 and the normal
 source-built extension. This does not enable previously rejected opt-in
@@ -408,8 +425,9 @@ driver and Torch libraries, with no task-sidecar dependency or preload.
 Evidence: `fulfillment-service-comparison.json`, `fulfillment-final-build-manifest.json`,
 `fulfillment-native-sass-comparison.json`, `fulfillment-final-gpu-tests.log`,
 `fulfillment-default-quality16.json` and the matching endpoint/window JSON.
-The C8 20% serving target still fails. PR #691 remains Draft; there is no
-new PRO comparison or 35B-A3B AWQ/FP8 model-speed acceptance claim.
+The C8 20% serving target still fails. At this measurement checkpoint PR #691
+remained Draft; its subsequent incremental default rollout does not establish
+a new PRO comparison or 35B-A3B AWQ/FP8 model-speed acceptance claim.
 
 ### Final source-built trace and remaining gap
 
@@ -454,8 +472,9 @@ separately measured +11.37% full-48 C8 window result above.
 Full events, route exports, Nsight report/database and analysis are retained
 under `trace-fulfillment-final`; `fulfillment-final-trace-comparison.json`
 contains the control/final phase and kernel comparison. All owned benchmark
-services are stopped after capture. Keep Draft PR #691 unmerged pending
-the remaining C8, absolute-quality and cross-model acceptance work.
+services are stopped after capture. This checkpoint preceded the request to
+integrate the measured gains. Remaining C8, absolute-quality and cross-model
+acceptance work stays open after the incremental default rollout.
 
 ## Earlier service validation
 

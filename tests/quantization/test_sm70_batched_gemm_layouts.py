@@ -1,34 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
+import os
 
 import pytest
 import torch
 
+from vllm.config.vllm import (
+    _SM70_BATCH_GEMM_DEFAULTS,
+    _apply_sm70_batch_gemm_defaults,
+)
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w8a16_fp8,  # noqa: F401
 )
 
 
-def test_batched_layout_policy_is_shared_and_reversible(monkeypatch):
-    config = SimpleNamespace(
-        speculative_config=SimpleNamespace(method="dflash", num_speculative_tokens=7),
-        scheduler_config=SimpleNamespace(max_num_seqs=16),
-    )
+def test_batched_layout_policy_does_not_require_a_service_contract(monkeypatch):
+    def fail_config_lookup():
+        raise AssertionError("batch layouts must not require a model/service whitelist")
+
     monkeypatch.setattr(sm70_tm, "is_exact_sm70_cuda_platform", lambda: True)
-    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
-    monkeypatch.setattr(sm70_tm.envs, "VLLM_SM70_BATCH_GEMM_LAYOUTS", True)
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", fail_config_lookup)
+    for name in _SM70_BATCH_GEMM_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+
+    assert set(_apply_sm70_batch_gemm_defaults(is_sm70=True)) == set(
+        _SM70_BATCH_GEMM_DEFAULTS
+    )
 
     assert sm70_tm.use_batched_gemm_layouts()
-    config.scheduler_config.max_num_seqs = 4
+    monkeypatch.setenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0")
     assert not sm70_tm.use_batched_gemm_layouts()
-    config.scheduler_config.max_num_seqs = 16
-    config.speculative_config.method = "mtp"
-    assert not sm70_tm.use_batched_gemm_layouts()
-    config.speculative_config.method = "dflash"
-    monkeypatch.setattr(sm70_tm.envs, "VLLM_SM70_BATCH_GEMM_LAYOUTS", False)
+
+
+@pytest.mark.parametrize("overridden_name", _SM70_BATCH_GEMM_DEFAULTS)
+def test_batch_defaults_preserve_explicit_overrides(monkeypatch, overridden_name):
+    for name in _SM70_BATCH_GEMM_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(overridden_name, "0")
+
+    applied = _apply_sm70_batch_gemm_defaults(is_sm70=True)
+
+    assert overridden_name not in applied
+    assert os.environ[overridden_name] == "0"
+    assert set(applied) == set(_SM70_BATCH_GEMM_DEFAULTS) - {overridden_name}
+    for name in applied:
+        assert os.environ[name] == _SM70_BATCH_GEMM_DEFAULTS[name]
+    assert _apply_sm70_batch_gemm_defaults(is_sm70=True) == ()
+
+
+def test_batch_defaults_and_layouts_reject_non_sm70(monkeypatch):
+    for name in _SM70_BATCH_GEMM_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    assert _apply_sm70_batch_gemm_defaults(is_sm70=False) == ()
+    assert all(name not in os.environ for name in _SM70_BATCH_GEMM_DEFAULTS)
+
+    monkeypatch.setenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "1")
+    monkeypatch.setattr(sm70_tm, "is_exact_sm70_cuda_platform", lambda: False)
     assert not sm70_tm.use_batched_gemm_layouts()
 
 
