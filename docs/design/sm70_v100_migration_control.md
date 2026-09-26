@@ -47678,12 +47678,35 @@ has launched no full model. Details and artifacts are in
   exponential weights in the common grouped-attention combine kernel. No new
   weight-quantization or model-name dispatch is introduced.
 - Focused CPU results: 32 passed/19 skipped and 192 passed/21 skipped. GPU:
-  seven mixed sampler cases, five deferred context cases and 91 grouped-attention
-  cases pass. Endpoint speed and acceptance remain pending; this is not a new
-  PRO performance win or a completed 35B regression gate.
+  25 mixed sampler cases (FP32/FP64 RNG, including the real 248320 vocabulary),
+  five deferred context cases and 91
+  grouped-attention cases pass. Automatic-policy checks add 48 CPU passes.
+  Endpoint acceptance has not passed; this is not a new PRO performance win
+  or a completed 35B regression gate.
 - Reject grouped-scale lifetime and two-CTA GEMM prototypes: reducing registers
   to 128 without spills did not produce a meaningful weighted speed benefit.
   Retain the negative results so later work does not repeat occupancy-only tuning.
 - Other sessions' GPU tests were allowed to finish. A clean control service then
   started on GPUs 4–7. Its 16-question natural-output check matches the previously
   recorded 14 correct/15 natural stops; the strict all-natural-stop gate is open.
+- The initial single-run C8 endpoint screen lost 3.52 acceptance percentage
+  points and is retained as a failed screen. Real-input auditing then finds
+  bitwise context and sampling parity on 64 steps/rank. Same-process C8/48
+  Python ablation gives +5.09% rolling and +5.38% pure decode, with identical
+  full-48 pure acceptance counters. These are diagnostic findings only.
+- The fresh ordinary default services complete three repeats of every cell.
+  C1/C2/C4/C8 rolling medians are 241.739/265.057/326.295/385.783 ->
+  242.487/295.439/327.664/385.374 tok/s. Full-48 pure C8 is
+  680.644 -> 676.332 tok/s (-0.63%). Rolling C8 acceptance falls 2.497
+  percentage points, failing the requested gate. C2's +11.46% speed comes
+  with +6.585 acceptance points, so it is not an isolated compute improvement.
+  Keep PR #697 in Draft; do not promote its single-process +5% as production
+  performance. The natural-EOS pair remains 14 correct/15 natural stops on
+  the same cases. 4K cache-hit and 32K C2 route smokes complete on both.
+- The all-step ledger closes to client request decode duration within 0.14%.
+  In warmed runs, complete C8/q8 occupies 31–33% of that duration and mixed
+  prefill occupies 58–62%. Applying an old q8-only speedup to all rolling time
+  overstates the expected endpoint gain. Do not promote the diagnostic ledger's
+  raw endpoint delta: admission/acceptance differs, and the first pass includes
+  cold sampler/JIT stalls. Default-route logs confirm no manual acceleration
+  flags are necessary. Details and limits are in the batch latency report.

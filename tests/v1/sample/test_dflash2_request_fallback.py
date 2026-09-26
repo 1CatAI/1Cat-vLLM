@@ -26,13 +26,17 @@ def test_reference_mask_keeps_safe_rows():
 @pytest.mark.parametrize("batch_size", [2, 4, 8])
 @pytest.mark.parametrize("ragged", [False, True])
 @pytest.mark.parametrize("use_fp64", [False, True])
+@pytest.mark.parametrize("vocab", [32768, 248320])
 @torch.inference_mode()
 def test_partial_fallback_matches_dense_with_request_slot_permutation(
-    monkeypatch, batch_size, ragged, use_fp64
+    monkeypatch, batch_size, ragged, use_fp64, vocab
 ):
     torch.manual_seed(260926)
     device = "cuda"
-    vocab, steps, slots = 32768, 7, 16
+    # At 248320 tokens, packing reference requests can cross the SM70
+    # top-k/top-p kernel's batch-dependent warp-count boundary. Cover that
+    # real vocabulary as well as the smaller generic dispatch case.
+    steps, slots = 7, 16
     counts = np.resize([1, 8, 5, 3], batch_size) if ragged else np.full(batch_size, 8)
     cu_np = np.concatenate(([0], counts.cumsum())).astype(np.int32)
     rows = int(cu_np[-1])
