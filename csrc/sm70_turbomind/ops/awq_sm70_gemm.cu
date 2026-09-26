@@ -4477,7 +4477,7 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                          torch::Tensor tm_weight, torch::Tensor tm_scales,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
-                         bool gated_silu) {
+                         bool gated_silu, bool prescaled = false) {
   TORCH_CHECK(in_feats.is_cuda(), "nvfp4_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "nvfp4_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "nvfp4_gemm_sm70: scales must be CUDA.");
@@ -4593,6 +4593,11 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.dispatch = select_nvfp4_dense_dispatch_policy(
       device, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
       static_cast<int>(group_size), stream);
+  if (prescaled) {
+    TORCH_CHECK(m > 32, "nvfp4_gemm_sm70: prescaled input requires M>32.");
+    op.dispatch =
+        op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Nvfp4Prescaled;
+  }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
@@ -6294,6 +6299,14 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                          bool gated_silu) {
   vllm::awq_sm70::nvfp4_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
                                       group_size, k_ld, q_ld, gated_silu);
+}
+
+void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, torch::Tensor scales,
+                                   int64_t group_size, int64_t k_ld,
+                                   int64_t q_ld, bool gated_silu) {
+  vllm::awq_sm70::nvfp4_gemm_sm70_out(out, input, weight, scales, group_size,
+                                      k_ld, q_ld, gated_silu, true);
 }
 
 void nvfp4_gemv_sm70_raw_out(torch::Tensor out, torch::Tensor _in_feats,

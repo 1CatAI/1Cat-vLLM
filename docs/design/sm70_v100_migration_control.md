@@ -2,6 +2,34 @@
 
 Date: 2026-05-30
 
+## Latest C8 acceptance retest, 2026-09-26
+
+The current unmerged batch candidate uses normal extension
+`d08ae1443aa24f91bddfbc4c80ba2c6dd1122a4368d6b3db4a944cfe537fef68`,
+retaining the legacy FP8 reference pool and correcting prescaled FP4 warmup.
+52 batch/replay GPU tests pass. Real-weight C8 GEMM is 17.026 ms versus
+21.289 ms (-20.02%). Three default-service 2K/256 C8/48 repetitions, without
+LUT imports, worker extensions or profiling, give median acceptance 51.06%
+versus main's 50.51%, recovering the previous candidate's 46.36%. Per-request
+verification rounds summed over 48 requests fall 2920 -> 2709 (main 2732).
+Individual latest acceptance is 48.07/51.06/51.57%; startup/order variability
+is not yet eliminated.
+
+Pure full-eight-alive decode is 654.76 versus 621.91 tok/s (+5.28%).
+Rolling C8 is 375.24 versus 365.98 (+2.53%) with 55.67% versus 54.92%
+acceptance. C1 remains 243.60 versus 243.15 tok/s and 56.77% versus 57.04%
+acceptance. The C8 20% service-speed target still fails; do not merge on
+the GEMM estimate alone. Earlier family-LUT diagnostics changed uncached
+tail dispatch by disabling tuning; they cannot prove a production-family
+cause. An independent restart gave C8 acceptance 50.829% and 2722 summed
+request verification rounds; C1 acceptance remained 56.766%. Its idle
+route-export extension and single timing result are recorded separately
+from the three primary performance runs. Actual routes were saved and the
+owned service stopped. Existing matched C1/C8 complete-q8 event traces on
+the previous fb606 artifact show forward +19.595 ms, sampling +5.512 ms,
+draft +3.301 ms and total +27.933 ms; these are not a new d08 trace. See
+[implementation and full evidence](sm70_quantized_batch_reuse.md).
+
 ## Default batch GEMM reuse and C2 memory, 2026-09-26
 
 The owned FP4/FP8 batch-reuse candidate recovers M17..32 row sharing and
@@ -26,9 +54,15 @@ shape now selects it in source; incompatible cached plans cannot override it.
 All 92 focused GPU tests pass, including first-captured tails and changed
 inputs after a conflicting cached plan. The normal extension is
 `75303f12d50f02ebfb1f4f7616e009125851a207041ecda4df9e3ede9ec39d00`.
-Uninstrumented service validation is running without diagnostic flags or LUTs;
-no acceptance threshold has been waived and Draft PR #691 is
-not yet promoted. See [implementation and evidence](sm70_quantized_batch_reuse.md).
+Uninstrumented service validation finished without diagnostic flags or LUTs.
+C4 no-new-prefill decode improved 477.65 -> 577.46 tok/s (+20.90%) with identical
+65.16% acceptance; rolling C4 improved 297.30 -> 321.13 (+8.02%). C8 did not
+improve: full-48 windows 621.91 -> 618.40 (-0.56%) and rolling 365.98 -> 363.81
+(-0.59%). Rolling C8 acceptance lost 2.20 points, failing the two-point limit.
+Quality remained 14 correct natural completions and 15 natural stops of 16.
+The FP8-only M64 candidate is being reevaluated with the context-FC fix;
+no acceptance threshold has been waived and Draft PR #691 remains unqualified.
+See [implementation and evidence](sm70_quantized_batch_reuse.md).
 Do not repeat rejected prepared-weight, register-cap-only or M16-slicing
 experiments. No fresh PRO or 35B-A3B AWQ/FP8 model-speed claim is made.
 

@@ -155,6 +155,14 @@ def prepare(args, kind):
             False,
         )
         compact = torch.ops._C.nvfp4_qpn2_prepare_scales_sm70(scales)
+        prescaled = False
+        if hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out"):
+            from vllm.model_executor.layers.quantization.sm70_turbomind import (
+                _prescale_nvfp4_batch_scales,
+            )
+
+            prescaled = _prescale_nvfp4_batch_scales(s)
+        args.prescaled_kinds[kind] = prescaled
 
         def call(x, y):
             torch.ops._C.nvfp4_qpn2_tm_dispatch_sm70_out(
@@ -171,6 +179,7 @@ def prepare(args, kind):
                 int(meta[1]),
                 gated,
                 0,
+                *([True] if prescaled else []),
             )
 
         return k, n, gated, call
@@ -231,6 +240,7 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", default=[8, 16, 17, 24, 32, 64])
     p.add_argument("--kinds", nargs="+", default=list(COUNTS))
     args = p.parse_args()
+    args.prescaled_kinds = {}
     torch.set_num_threads(1)
     torch.manual_seed(931)
     check_exclusive()
@@ -335,6 +345,7 @@ def main():
         summary.append(dict(m=m, fp4_ms=fp4, fp8_ms=fp8, total_ms=fp4 + fp8))
     args.output.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2))
     metadata["gpu_after"] = gpu_state()
+    metadata["prescaled_kinds"] = args.prescaled_kinds
     args.output.with_suffix(".metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
