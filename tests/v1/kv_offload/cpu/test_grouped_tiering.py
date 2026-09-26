@@ -232,6 +232,39 @@ def test_group_routing_forwards_all_lifecycle_hooks():
         child.shutdown.assert_called_once_with()
 
 
+def test_tiering_shared_rows_accept_mixed_gpu_block_sizes():
+    """Distinct group keys may share the tier's fixed-size worker rows."""
+    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+    spec = object.__new__(TieringOffloadingSpec)
+    spec.partition_by_group = False
+    spec.gpu_block_size = (3200, 1600)
+    spec._manager = None
+    spec.vllm_config = SimpleNamespace(
+        instance_id=f"mixed-tier-test-{uuid.uuid4().hex}",
+        parallel_config=SimpleNamespace(world_size=2),
+        kv_events_config=None,
+    )
+    spec.cpu_page_size_per_worker = 64
+    spec.num_blocks = 4
+    spec.eviction_policy = "lru"
+    spec.secondary_tier_configs = []
+    spec.extra_config = {}
+    manager = spec.get_manager()
+    try:
+        keys = [_key(0, 1), _key(1, 1)]
+        prepared = manager.prepare_store(keys, CTX)
+        assert prepared is not None
+        assert set(prepared.keys_to_store) == set(keys)
+        manager.complete_store(keys, CTX)
+        assert all(manager.lookup(key, CTX) is True for key in keys)
+    finally:
+        manager.shutdown()
+        spec._manager = None
+        assert spec._scheduler_mmap is not None
+        spec._scheduler_mmap.cleanup()
+
+
 def test_spec_group_regions_share_geometry_and_cleanup_partial_failure(monkeypatch):
     import vllm.v1.kv_offload.tiering.spec as spec_module
 
