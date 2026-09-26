@@ -13,7 +13,7 @@ _callback: ContextVar[ProgressCallback | None] = ContextVar(
 )
 
 
-def report_loading(completed, total, component, *, rank=0, world_size=1):
+def report_loading(completed, total, component, *, rank=0, world_size=1, detail=None):
     """Startup progress travels via the existing owned process log."""
     import json
 
@@ -28,10 +28,56 @@ def report_loading(completed, total, component, *, rank=0, world_size=1):
                 "unit": "components",
                 "rank": rank,
                 "world_size": world_size,
+                **({"detail": detail} if detail is not None else {}),
             }
         ),
         flush=True,
     )
+
+
+class LoadingProgress:
+    """Bounded-rate preparation detail; does not synchronize a device."""
+
+    def __init__(self, component, component_index, rank, world_size):
+        self.component = component
+        self.index = component_index
+        self.rank = rank
+        self.world_size = world_size
+        self.phase = None
+        self.started_at = 0.0
+        self.last_report = 0.0
+
+    def __call__(self, phase, completed=0, total=None, unit="items"):
+        import time
+
+        now = time.time()
+        changed = phase != self.phase
+        if changed:
+            self.phase, self.started_at = phase, now
+        if not changed and now - self.last_report < 1 and completed != total:
+            return
+        self.last_report = now
+        report_loading(
+            self.index,
+            4,
+            self.component,
+            rank=self.rank,
+            world_size=self.world_size,
+            detail={
+                "phase": phase,
+                "completed": completed,
+                "total": total,
+                "unit": unit,
+                "started_at": self.started_at,
+                "updated_at": now,
+            },
+        )
+
+    def weights(self, values, total):
+        self("reading_weights", 0, total, "tensors")
+        for index, value in enumerate(values, 1):
+            yield value
+            self("reading_weights", index, total, "tensors")
 
 
 @contextmanager

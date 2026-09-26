@@ -99,6 +99,12 @@ class VideoSubcommand(CLISubcommand):
             )
             mode.add_argument("--host-memory-directory")
             mode.add_argument(
+                "--prepared-weight-cache",
+                action="store_true",
+                help="Reuse checksummed, leased H3 CPU weights between service loads",
+            )
+            mode.add_argument("--prepared-weight-cache-gib", type=float, default=128.0)
+            mode.add_argument(
                 "--video-encoder",
                 choices=("libx264", "h264_nvenc"),
                 default="libx264",
@@ -169,6 +175,8 @@ class VideoSubcommand(CLISubcommand):
             weight_offload=args.weight_offload,
             host_memory_mode=args.host_memory_mode,
             host_memory_directory=args.host_memory_directory,
+            prepared_weight_cache=args.prepared_weight_cache,
+            prepared_weight_cache_gib=args.prepared_weight_cache_gib,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve
