@@ -37,18 +37,32 @@ The `prefill_dense_d256_gqa_79t_fp32` counter identifies this compute family;
 The historical 79T recipe uses zero-shift exponentials and unguarded FP16
 accumulation. Real model inputs overflow that recipe, although zero-mean
 random-input tests pass. The qualified integration samples score maxima at
-stride 8 with a fixed margin and exponent cap, centers biased values, and
-scales value residuals by an exact power of two with 64x headroom. PV uses
-FP16 Tensor Core operands with FP32 MMA accumulation, writes each 24K prefix
-block in FP32, and performs the online prefix/tail merge in FP32 before the
-value center is restored. The 128x256 threadblock and 64x64 warp shape avoid
-the register spills that made the earlier FP32 path slow. This remains an
-approximate attention path because scores and probabilities are stored in
-FP16 and score maxima are sampled. It must pass both sampled FP32-oracle
-checks and cold model requests. Current qualified medians exceed 75 TFLOPS
-at KV128K and KV256K; see `VALIDATION.md` for the exact contract and quality
-limits. The build option defaults to ON for SM70 FA2 builds, and the runtime
-route defaults to this FP32-accumulated kernel.
+stride 8, checks every consumed prefix score, and recomputes tiles whose
+missed maximum would activate the exponent cap. The tail always uses complete
+maxima. Biased values are centered and residuals are scaled by a power of two;
+the current FP32 prefix does not require extra value headroom. QK and PV use
+FP16 Tensor Core operands with FP32 accumulation. The cuBLAS handles also
+disallow reduced-precision intermediate reductions. Each 8192-key prefix
+partial and the online prefix/tail merge remain FP32 before value restoration.
+The 128x256 threadblock and 64x64 warp shape avoid the earlier register spills.
+
+FP32 accumulation does not protect the compact FP16 score store. If a block's
+maximum exceeds the compact range, a device flag requests recomputation of
+the affected 64-token query tile from original Q/K with FP32 logits. That
+recomputation preserves centered/scaled V, writes normalized FP32 residuals
+into the completed prefix workspace, and restores V only at final output.
+Flags reset on each graph replay. This adds no GPU-count, quantization or
+request-concurrency restriction, no host readback and no extra score slab.
+
+The normal route still has FP16 score/probability storage and is approximate;
+these guards do not prove general numerical or model-output equivalence.
+The earlier September 26 dual-FP32 graph medians were 69.12--69.26 useful
+TFLOP/s; the isolated September 27 re-audit measured 69.11 TFLOP/s with a
+0.062% pooled latency change. Historical 75-TFLOP/s results used FP16 QK
+accumulation and must not be reported as current dual-FP32 performance. See
+`docs/design/sm70-prefill-range-repair.md` and `VALIDATION.md` for dated
+contracts and evidence. The build option defaults to ON for SM70 FA2 builds,
+and the runtime route defaults to this FP32-accumulated kernel.
 
 The private `MmaPipelined79T` template retains transform `set_valid()` and
 `finalize()` hooks. Without finalization the tail row masses remain zero and

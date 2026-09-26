@@ -1,5 +1,11 @@
 # SM70 Q8000/Q8192 integration validation (2026-09-14)
 
+The measurements below are historical. In particular, the original 75-TFLOP/s
+configuration had FP16 QK and FP32 PV accumulation; it is not the later
+dual-FP32 precision repair. Its fixed margins, clipping and value headroom
+have also been superseded. For the September 26/27 source, model audit and
+FP16 score-storage recovery, see `docs/design/sm70-prefill-range-repair.md`.
+
 The first integration measurements below are retained as historical evidence
 and explicitly identify their eager configuration. Follow-up validation from
 the E4M3 route-parity work uses normal CUDA graphs. The current

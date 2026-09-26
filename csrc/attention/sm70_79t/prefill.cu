@@ -2118,12 +2118,12 @@ struct PrefixFloatPVLauncher {
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  smem_bytes),
             "set FP32-output prefix PV dynamic shared memory");
-  #if defined(PREFIX_TORCH_STABLE_ROWS)
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
       check(cudaFuncSetAttribute(repair_prefix_pv_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  smem_bytes),
             "set repaired prefix PV dynamic shared memory");
-  #endif
+    #endif
     }
   }
 
@@ -2131,11 +2131,11 @@ struct PrefixFloatPVLauncher {
     cutlass::Kernel<PrefixFloatPVKernel>
         <<<grid, block, smem_bytes, stream>>>(params);
   }
-  #if defined(PREFIX_TORCH_STABLE_ROWS)
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
   void repair(cudaStream_t stream) const {
     repair_prefix_pv_kernel<<<grid, block, smem_bytes, stream>>>(params);
   }
-  #endif
+    #endif
 };
   #endif
 
@@ -5840,6 +5840,12 @@ extern "C" cudaError_t onecat_sm70_d256_dense_state_raw(
     const void*, const void*, const void*, float*, float*, void*, int, int, int,
     int, float, cudaStream_t);
 
+extern "C" cudaError_t onecat_v37_recover_score_tiles_raw(const void*,
+                                                          const void*,
+                                                          const void*, void*,
+                                                          const int*, int, int,
+                                                          cudaStream_t);
+
 namespace FLASH_NAMESPACE {
 
   #if PREFIX_TORCH_QUERY_TOKENS == 8192
@@ -5941,12 +5947,16 @@ struct Sm70GqaHalf2Runtime {
                   "create SM70 half2 prefix cuBLAS handle failed");
       TORCH_CHECK(cublasCreate(&tail_cublas) == CUBLAS_STATUS_SUCCESS,
                   "create SM70 half2 tail cuBLAS handle failed");
-      TORCH_CHECK(cublasSetMathMode(prefix_cublas, CUBLAS_TENSOR_OP_MATH) ==
-                      CUBLAS_STATUS_SUCCESS,
-                  "enable SM70 half2 prefix tensor-op math failed");
-      TORCH_CHECK(cublasSetMathMode(tail_cublas, CUBLAS_TENSOR_OP_MATH) ==
-                      CUBLAS_STATUS_SUCCESS,
-                  "enable SM70 half2 tail tensor-op math failed");
+      // FP16 output storage must not permit FP16 intermediate reductions.
+      constexpr auto math_mode = static_cast<cublasMath_t>(
+          CUBLAS_TENSOR_OP_MATH |
+          CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
+      TORCH_CHECK(
+          cublasSetMathMode(prefix_cublas, math_mode) == CUBLAS_STATUS_SUCCESS,
+          "enable SM70 half2 prefix tensor-op math failed");
+      TORCH_CHECK(
+          cublasSetMathMode(tail_cublas, math_mode) == CUBLAS_STATUS_SUCCESS,
+          "enable SM70 half2 tail tensor-op math failed");
     } catch (...) {
       release();
       throw;
@@ -5997,7 +6007,8 @@ __global__ void set_half2_runtime_globals(int rows, float* row_sum,
                                           int tail_rows, float* tail_sum,
                                           const float* row_max,
                                           const float* tail_max,
-                                          int* prefix_outliers) {
+                                          int* prefix_outliers,
+                                          int* score_recovery) {
   g_rows = rows;
   g_row_sum_out = row_sum;
   g_tail_rows = tail_rows;
@@ -6007,6 +6018,7 @@ __global__ void set_half2_runtime_globals(int rows, float* row_sum,
   g_row_max = row_max;
   g_79t_tail_row_max = tail_max;
   g_79t_prefix_outliers = prefix_outliers;
+  g_79t_score_recovery = score_recovery;
     #endif
 }
 
@@ -6060,7 +6072,9 @@ struct Sm70GqaHalf2Workspace {
     #if defined(PREFIX_TORCH_STABLE_ROWS)
   at::Tensor value_scaled, value_center, value_max, block_sum, block_max,
       prefix_max;
-  at::Tensor prefix_accumulator, max_partials, tail_max_partials, prefix_outliers;
+  at::Tensor prefix_accumulator, max_partials, tail_max_partials,
+      prefix_outliers;
+  at::Tensor score_recovery;
     #endif
   // Graph memcpy nodes retain their host source addresses. Keep metadata
   // immutable for each KV length/value buffer, including after later captures.
@@ -6180,6 +6194,9 @@ struct Sm70GqaHalf2Workspace {
     prefix_outliers = at::empty(
         {(kRows + PVThreadblockShape::kM - 1) / PVThreadblockShape::kM},
         q.options().dtype(at::ScalarType::Int));
+    static_assert(kRows % kStableRecoveryRows == 0);
+    score_recovery = at::empty({kRows / kStableRecoveryRows},
+                               q.options().dtype(at::ScalarType::Int));
     #endif
   }
 
@@ -6284,6 +6301,9 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
                                  prefix_stream));
   C10_CUDA_CHECK(
       cudaMemsetAsync(maximum_value, 0, sizeof(float), prefix_stream));
+  C10_CUDA_CHECK(cudaMemsetAsync(workspace->score_recovery.data_ptr<int>(), 0,
+                                 workspace->score_recovery.nbytes(),
+                                 prefix_stream));
   stable_value_center<<<1, 256, 0, prefix_stream>>>(
       reinterpret_cast<__half const*>(value), value_center, total_kv);
   stable_value_amax<<<1024, 256, 0, prefix_stream>>>(
@@ -6305,11 +6325,12 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
       Workspace::kRows, prefix_sum_output, Workspace::kTailTileRows,
       tail_row_sums, row_max_output, tail_max,
     #if defined(PREFIX_TORCH_STABLE_ROWS)
-      workspace->prefix_outliers.data_ptr<int>()
+      workspace->prefix_outliers.data_ptr<int>(),
+      workspace->score_recovery.data_ptr<int>()
     #else
-      nullptr
+      nullptr, nullptr
     #endif
-      );
+  );
 
   dim3 transpose_threads(32, 8);
   dim3 query_transpose_grid((Workspace::kHeadDim + 31) / 32,
@@ -6497,9 +6518,10 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         reinterpret_cast<__half const*>(tail_scores),
         workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows,
         Workspace::kQuery);
-    stable_finish_max<true><<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
-        workspace->tail_max_partials.data_ptr<float>(), tail_max,
-        Workspace::kRows, 1);
+    stable_finish_max<true>
+        <<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
+            workspace->tail_max_partials.data_ptr<float>(), tail_max,
+            Workspace::kRows, 1);
     #endif
     if (direct_tail_debug) {
       set_pv_task_base_kernel<<<1, 1, 0, tail_stream>>>(0);
@@ -6549,10 +6571,10 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(
         reinterpret_cast<__half const*>(scores),
         workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
-    stable_finish_max<false><<<(Workspace::kRows + 255) / 256, 256, 0,
-                        prefix_stream>>>(
-        workspace->max_partials.data_ptr<float>(), block_max, Workspace::kRows,
-        tiles);
+    stable_finish_max<false>
+        <<<(Workspace::kRows + 255) / 256, 256, 0, prefix_stream>>>(
+            workspace->max_partials.data_ptr<float>(), block_max,
+            Workspace::kRows, tiles);
     #endif
     prefix_pv[block]->launch(prefix_stream);
     #if defined(PREFIX_TORCH_STABLE_ROWS)
@@ -6561,10 +6583,10 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     stable_row_max_partials<false, true><<<max_grid, 128, 0, prefix_stream>>>(
         reinterpret_cast<__half const*>(scores),
         workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
-    stable_finish_max<false, true><<<(Workspace::kRows + 255) / 256, 256, 0,
-                                    prefix_stream>>>(
-        workspace->max_partials.data_ptr<float>(), block_max, Workspace::kRows,
-        tiles);
+    stable_finish_max<false, true>
+        <<<(Workspace::kRows + 255) / 256, 256, 0, prefix_stream>>>(
+            workspace->max_partials.data_ptr<float>(), block_max,
+            Workspace::kRows, tiles);
     prefix_pv[block]->repair(prefix_stream);
     stable_merge_prefix<<<(Workspace::kRows + 3) / 4, 256, 0, prefix_stream>>>(
         reinterpret_cast<StablePrefixPartial const*>(prefix_numerator),
@@ -6715,6 +6737,19 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
       reinterpret_cast<__half const*>(tail_numerator), tail_sum, tail_max,
       value_center, maximum_value, reinterpret_cast<__half*>(output),
       repaired_rows, prefix > 0);
+  // Overwrite only flagged query tiles. The guard is device-side and reset
+  // on every replay; no host readback, new score slab, or graph branch.
+  // Reuse the now-dead prefix accumulator for normalized FP32 residuals.
+  // Large biased V must retain the same centering as the normal route.
+  C10_CUDA_CHECK(onecat_v37_recover_score_tiles_raw(
+      q.data_ptr<at::Half>(), k.data_ptr<at::Half>(), scaled_value,
+      prefix_accumulator, workspace->score_recovery.data_ptr<int>(),
+      Workspace::kQuery, total_kv, prefix_stream));
+  stable_restore_recovered<<<Workspace::kRows / kStableRecoveryRows, 256, 0,
+                             prefix_stream>>>(
+      prefix_accumulator, value_center, maximum_value,
+      workspace->score_recovery.data_ptr<int>(),
+      reinterpret_cast<__half*>(output));
     #else
       #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
   merge_float_prefix_direct_round_major_tail<<<

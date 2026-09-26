@@ -47522,3 +47522,30 @@ has launched no full model. Details and artifacts are in
 - Fresh default-configuration service logs, smoke requests, CI and merge
   records are retained under task-private
   `verification/batch-followup-20260925/merge-defaults/`.
+
+## 2026-09-27 Long-prefill numerical range follow-up (PR #693)
+
+- Owned source branch `codex/v100-paper-precision-20260926-054955`, integration
+  base `fcf59f8e9ae5`; native SHA
+  `4f98f15288bd7d459080a982faa6b8037fc1643a3d5ed18c06c6e896413302d9`.
+  FP32 QK/PV accumulation is retained; compact-score range violations select
+  original-Q/K tile recovery with centered/scaled V and FP32 normalization.
+  Device flags reset per replay. No new TP, quantization or concurrency gate.
+- Final source-built extension: 27 Graph stability and nine FP8 bridge cases
+  pass. Seven retained activations remain finite and bitwise unchanged.
+  Isolated GPU1 KV256000 Graph timing is 183.333 -> 183.447 ms (+0.062%),
+  69.157 -> 69.114 useful TFLOP/s. Isolated GPU7 capture deltas range
+  -0.042% to +0.807%; both 152K inputs are below +0.21%.
+- Keep the earlier 96-task model cohort pinned to source `9faa014636` and
+  native `72d98d57a333...`; the added guard has operator/capture validation,
+  not a new 96-task service run. No new 35B speed gate is claimed.
+- Do not reuse the uncentered-V recovery variant: near-65504 constant values
+  expose accumulated rounding over long KV. Final recovery uses normalized
+  FP32 residuals and restores the shared scale/center after normalization.
+  The host compute-sanitizer injector could not attach; no sanitizer pass is
+  claimed. Measurements contaminated by foreign GPU processes were rejected.
+- Artifacts: task-cache `paper-precision-20260926/artifacts/numerical-reaudit/`;
+  see `docs/design/sm70-prefill-range-repair.md` for commands and cohort scope.
+  No wheel, main merge, or active task-owned service remains. Draft PR #693
+  keeps the numerical change reviewable; the paper's accepted target is
+  approximately 69 useful TFLOP/s with dual-FP32 accumulation.

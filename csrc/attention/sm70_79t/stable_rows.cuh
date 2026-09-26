@@ -6,6 +6,13 @@
 // accumulator in FP32, and bound each FP16 PV operation by scaling V.
 __device__ float const* g_79t_tail_row_max = nullptr;
 __device__ int* g_79t_prefix_outliers = nullptr;
+__device__ int* g_79t_score_recovery = nullptr;
+// FP32 accumulation alone does not protect an FP16 score workspace. Beyond
+// this range, recompute the affected 64-token query tile from the original
+// Q/K with FP32 logits, avoiding both storage overflow and coarse rounding.
+// Reuse centered/scaled V and restore only after FP32 normalization.
+constexpr float kStableCompactScoreLimit = 128.0f;
+constexpr int kStableRecoveryRows = 64 * 6;
 // The complete tail maximum and prefix repair make a safety margin redundant.
 // An extra positive shift pushes useful probabilities into FP16 subnormals.
 constexpr float kStableScoreMargin = 0.0f;
@@ -103,6 +110,23 @@ __global__ void stable_scale_values(__half const* input, __half* output,
         __float2half_rn((__half2float(input[i]) - center[i & 255]) * inverse);
 }
 
+__global__ void stable_restore_recovered(float const* recovered,
+                                         float const* center,
+                                         float const* maximum,
+                                         int const* recovery_tiles,
+                                         __half* output) {
+  int tile = blockIdx.x;
+  if (!recovery_tiles[tile]) return;
+  int d = threadIdx.x;
+  float scale = stable_value_scale(*maximum);
+  float bias = center[d];
+  for (int local = 0; local < kStableRecoveryRows; ++local) {
+    int row = tile * kStableRecoveryRows + local;
+    int64_t index = int64_t(row) * 256 + d;
+    output[index] = __float2half_rn(recovered[index] * scale + bias);
+  }
+}
+
 // Each lane reads a pair of adjacent query rows. K tiles stay independent,
 // preserving coalesced loads from the transposed cuBLAS score workspace.
 template <bool Tail, bool Repair = false>
@@ -155,6 +179,14 @@ __global__ void stable_finish_max(float const* partials, float* maxima,
   for (int tile = 0; tile < tiles; ++tile)
     value = fmaxf(value, partials[int64_t(tile) * rows + row]);
   maxima[row] = value + kStableScoreMargin;
+  // A prefix sample can miss a peak by at most kStableMaxExpInput without
+  // triggering the complete-max repair. Reserve that gap in the admission
+  // bound; the repair and tail scans already see the complete maximum.
+  constexpr float upper =
+      kStableCompactScoreLimit - ((Tail || Repair) ? 0.0f : kStableMaxExpInput);
+  if (!isfinite(value) || value > upper || value < -kStableCompactScoreLimit) {
+    atomicExch(g_79t_score_recovery + row / kStableRecoveryRows, 1);
+  }
   if constexpr (!Tail) {
     if constexpr (Repair) {
       // The replacement PV must overwrite both numerator and denominator.

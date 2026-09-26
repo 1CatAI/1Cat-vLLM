@@ -352,7 +352,7 @@ paged_kv_thread_offset(int tid, int n_block, int d_chunk, int page_size,
 
 template <typename Element, bool PagedKV, bool SplitKV3 = false,
           bool StoreState = false, bool FloatOutput = false,
-          bool Unnormalized = false>
+          bool Unnormalized = false, bool RecoverScoreTiles = false>
 __global__ __launch_bounds__(
     Sm70D256SplitDTraits::kNThreads,
     1) void sm70_d256_splitd_dense_kernel(const Element* __restrict__ q,
@@ -373,11 +373,15 @@ __global__ __launch_bounds__(
                                           int block_table_batch_stride,
                                           float* __restrict__ partial_out,
                                           float* __restrict__ partial_max,
-                                          float* __restrict__ partial_sum) {
+                                          float* __restrict__ partial_sum,
+                                          const int* recovery_tiles = nullptr) {
   using Traits = Sm70D256SplitDTraits;
   constexpr int kBlockM = Traits::kBlockM;
   constexpr int kBlockN = Traits::kBlockN;
   constexpr int kDChunk = Traits::kDChunk;
+  if constexpr (RecoverScoreTiles) {
+    if (!recovery_tiles[blockIdx.x]) return;
+  }
 
   const int tid = threadIdx.x;
   const int warp = tid / Traits::kMmaThreads;
@@ -847,8 +851,36 @@ extern "C" cudaError_t onecat_v37_dense_state_float_raw(
       kv_len * heads_kv * Sm70D256SplitDTraits::kHeadDim,
       heads_kv * Sm70D256SplitDTraits::kHeadDim, Sm70D256SplitDTraits::kHeadDim,
       query_len, kv_len, heads_q, heads_kv, softmax_scale * float(M_LOG2E),
-      nullptr, 0, 0, nullptr, state_max, state_sum);
+      nullptr, 0, 0, nullptr, state_max, state_sum, nullptr);
   return cudaPeekAtLastError();
 }
 
+// The compact-score operator calls this after joining its prefix and tail.
+// Flags cover 64 query tokens (all six heads); only flagged tiles overwrite
+// normalized FP32 residuals. Logits, statistics and PV accumulation stay FP32;
+// the caller supplies centered/scaled V and restores its output afterwards.
+extern "C" cudaError_t onecat_v37_recover_score_tiles_raw(
+    const void* q, const void* k, const void* v, void* out,
+    const int* recovery_tiles, int query_len, int kv_len, cudaStream_t stream) {
+  if (q == nullptr || k == nullptr || v == nullptr || out == nullptr ||
+      recovery_tiles == nullptr || query_len <= 0 || query_len % 64 != 0 ||
+      kv_len < query_len || kv_len % 32 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  using Traits = Sm70D256SplitDTraits;
+  auto kernel = sm70_d256_splitd_dense_kernel<cutlass::half_t, false, false,
+                                              false, true, false, true>;
+  cudaError_t result = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes);
+  if (result != cudaSuccess) return result;
+  kernel<<<dim3(query_len / 64, 1, 6), Traits::kNThreads, Traits::kSmemBytes,
+           stream>>>(static_cast<const cutlass::half_t*>(q),
+                     static_cast<const cutlass::half_t*>(k),
+                     static_cast<const cutlass::half_t*>(v),
+                     static_cast<float*>(out), query_len * 6 * 256, 6 * 256,
+                     256, kv_len * 256, 256, 256, kv_len * 256, 256, 256,
+                     query_len, kv_len, 6, 1, 0.0625f * float(M_LOG2E), nullptr,
+                     0, 0, nullptr, nullptr, nullptr, recovery_tiles);
+  return cudaPeekAtLastError();
+}
 }  // namespace FLASH_NAMESPACE

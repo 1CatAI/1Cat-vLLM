@@ -1,5 +1,65 @@
 # SM70 long-prefill range repair
 
+## 2026-09-27 numerical re-audit follow-up
+
+The first repair addressed missed maxima that activated the exponent cap. A
+separate audit then found a narrower failure upstream of that check: a finite
+FP32 QK result could still overflow, or lose a difference between close large
+scores, when it was materialized in the FP16 score slab. The normal FP32
+accumulator therefore did not by itself make the score representation safe.
+
+The current source adds a device-side compact-score guard to the existing
+`stable_finish_max` pass. A sampled prefix maximum outside the conservative
+`[-128, 118]` admission interval, or a complete repair/tail maximum outside
+`[-128, 128]`, marks the 64-query-token tile shared by all six query heads.
+The existing consumer-side missed-peak flag remains in place for unequal
+scores hidden between samples. Marked tiles are recomputed with the original
+Q/K and centered, power-of-two-scaled V. The raw SM70 state kernel writes
+normalized residuals into the already-dead FP32 prefix accumulator; a device
+restore kernel then applies the shared V scale and center to the output. This
+keeps the recovery path on the captured stream, with no host readback, graph
+branch, or second score slab. The cuBLAS handles also set
+`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` alongside Tensor Core math.
+
+The range guard is a finite-input representation contract, not a claim of
+exact attention for arbitrary FP16 tensors. Scores and probabilities still
+cross FP16 storage boundaries on unmarked tiles, so ordinary rounding and
+underflow remain measurable. The guard replaces final outputs affected by the observed score-store
+overflow and large-score collapse. It runs after the normal merge and does
+not reuse a corrupted partial. It adds one small integer flag array and a recovery launch whose
+CTAs exit uniformly when no tile is marked.
+
+The source-built final extension (`4f98f15288bd7d459080a982faa6b8037fc1643a3d5ed18c06c6e896413302d9`)
+passes 27 CUDA-Graph stability cases and 9 fresh FP8 E4M3 bridge cases. The
+suite covers Q8000/Q8192, prefix/last-prefix/tail placements, changing graph
+inputs, a 256K KV boundary, score overflow, close-score rounding, a missed
+sample peak, negative logits, and near-65504 values. The overflow and
+large-constant cases agree with FP64 to 0 and `7.21e-10` maximum absolute
+error, respectively; the close-score case is finite with `2.85e-4` maximum
+absolute error. Seven retained model captures remain finite and bitwise equal
+to the pre-guard output. This establishes unchanged outputs for those
+inputs, not a claim about every possible model activation.
+
+An isolated GPU1 interleaved comparison (30 CUDA-Graph event trials per
+cell, 60 per version; foreign-process intervals are rejected) measured
+183.333 ms / 69.157 TFLOP/s before and 183.447 ms / 69.114 TFLOP/s after,
+a `+0.062%` pooled latency change. A separate isolated GPU7 comparison on
+seven retained model captures uses 40 trials per version/input and measures
+latency changes from -0.042% to +0.807%; the two 152K inputs change +0.207%
+and +0.165%. All four processes produce bitwise-identical outputs per input. A compute-sanitizer pass was
+attempted but the host's packaged injector could not attach to the Python CUDA
+process; it is not counted as a passing memory-safety result. No wheel was
+built and the Draft PR remains the integration boundary.
+
+Raw follow-up receipts and harnesses are retained under
+`/data/minimax-h3/task-cache/paper-precision-20260926/artifacts/numerical-reaudit/`.
+The primary 96-task service cohort below uses the pre-score-guard binary;
+it was not rerun after this additional guard. The main paper foregrounds
+the final dataflow, essential ablations and approximately 69 useful TFLOP/s;
+development failures are documented in its reproducibility appendix.
+
+## Primary clipping repair
+
 The sampled maximum in the Q8000/Q8192 D256 GQA endpoint could miss isolated
 large logits. Its exponent guard then clipped unequal logits to the same
 weight. FP32 QK and PV accumulators cannot recover the resulting distribution.
