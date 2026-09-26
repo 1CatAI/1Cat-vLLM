@@ -212,7 +212,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL: bool = True
-    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = False
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
+    VLLM_SM70_MTP4_FUSED_GDN_METADATA: bool = True
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
@@ -276,7 +278,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QUANT_LM_HEAD: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = True
-    VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
@@ -2097,10 +2099,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Direct fifty-route verifier expert path for Qwen3.8 MTP4. This consumes
     # checkpoint-native NVFP4 weights with FP16 activations; it does not enable
-    # online QPN8 activation quantization. Keep opt-in until the TP4 endpoint
-    # quality and acceptance gates are recorded.
+    # online QPN8 activation quantization. The TP4/M5 shape gate is retained;
+    # set 0 to restore the grouped expert path and its accumulation order.
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1"))
     ),
     # Exact single-token Qwen3.8 W2 epilogue. Ten expert warps retain the
     # established FP16 route rounding and reduce in top-k order with FP32 FMA.
@@ -2242,6 +2244,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate until the fixed-trajectory and mixed-batch Graph checks pass.
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
+    ),
+    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
+    ),
+    # Pure MTP4 graph batches can construct all GDN groups' state rows in one
+    # launch. Mixed/prefill batches still fall back. Set 0 to restore separate
+    # per-group metadata writes while retaining the shared batch classification.
+    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))
     ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.
@@ -2414,9 +2425,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
-    # only. Keep opt-in until the TP4 dynamic-graph gate is recorded.
+    # only. Other shapes/topologies retain their gates; explicit 0 rolls back.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "0"))
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "1"))
     ),
     # Bitwise-equal push collectives for FP16 [4|8|16, 2560] payloads on
     # fully-connected SM70 TP4 CUDA Graphs. Other shapes, topologies, devices,
