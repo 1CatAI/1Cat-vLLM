@@ -92,7 +92,8 @@ def _get_ddtree_gdn_fast_common_buffers(
     buffers = _GDN_DDTREE_FAST_COMMON_BUFFERS.get(key)
     if buffers is not None:
         return buffers
-    spec_sequence_masks = torch.empty(
+    # Zeroed so rows past a step's batch never read as live speculative rows.
+    spec_sequence_masks = torch.zeros(
         (decode_cudagraph_max_bs,),
         dtype=torch.bool,
         device=device,
@@ -872,7 +873,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     and envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
                     and self.vllm_config.speculative_config is not None
                     and self.vllm_config.speculative_config.method == "mtp"
-                    and self.vllm_config.speculative_config.num_speculative_tokens == 4
                     and device.type == "cuda"
                 )
             )
@@ -2260,11 +2260,11 @@ def prepare_dflash2_gdn_group_metadata(
 
     ``mamba_cache_mode=none`` reads the first speculative state columns.
     ``mamba_cache_mode=align`` supplies the authoritative, post-precopy state
-    column for each live request. MTP4 uses the legacy sequence-length-derived
-    align column instead. Both paths keep live speculative rows at
-    the front and CUDA-graph padding at the back, so one pointer-table kernel can
-    perform the same state selection and tail fill without ten independent
-    gather/copy pipelines.
+    column for each live request. Native MTP, at any draft depth, uses the
+    legacy sequence-length-derived align column instead. Both paths keep live
+    speculative rows at the front and CUDA-graph padding at the back, so one
+    pointer-table kernel can perform the same state selection and tail fill
+    without ten independent gather/copy pipelines.
     """
     if enable_mtp4:
         if not envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA:
@@ -2591,7 +2591,12 @@ def prepare_dflash2_gdn_group_metadata(
             rtol=0,
             atol=0,
         )
-        if torch.any(common_buffers.spec_sequence_masks[num_spec_decodes:]).item():
+        # Only this step's graph rows are written and replayed; rows past
+        # num_actual_tokens belong to larger batches and are never read here.
+        padded_rows = common_buffers.spec_sequence_masks[
+            num_spec_decodes:num_actual_tokens
+        ]
+        if torch.any(padded_rows).item():
             raise AssertionError("DFlash2 fused GDN metadata left a live padded row")
 
     return prepared, descriptor
