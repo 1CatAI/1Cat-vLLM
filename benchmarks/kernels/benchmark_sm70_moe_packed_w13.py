@@ -128,12 +128,23 @@ def main():
     p.add_argument("--routes", type=Path, help="Saved topk_ids tensor or {tensor: ...}")
     p.add_argument("--route-glob", help="Sweep saved routes instead of synthetic cases")
     p.add_argument("--tokens", default="4,8,16")
-    p.add_argument("--splits", default="1,2,4,5,8")
+    p.add_argument(
+        "--splits", default="1,2,4,5,8", help="Comma-separated splits, or exact"
+    )
     p.add_argument("--interleaved", action="store_true")
     p.add_argument("--packed-w2", action="store_true", help="Reuse grouping in W2")
+    p.add_argument(
+        "--batch-reduce", action="store_true", help="Fuse batched W2 and ordered reduce"
+    )
     p.add_argument("--repeats", type=int, default=20)
     p.add_argument("--samples", type=int, default=7)
     args = p.parse_args()
+    if args.batch_reduce and not args.packed_w2:
+        p.error("--batch-reduce requires --packed-w2")
+    if args.batch_reduce and not ops.has_nvfp4_grouped_batch_reduce_dispatch():
+        p.error("--batch-reduce requires a matching native build")
+    if args.batch_reduce and not set(map(int, args.tokens.split(","))) <= {8, 16}:
+        p.error("--batch-reduce supports --tokens 8,16 only")
     if torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("SM70 only")
     if "TORCH_EXTENSIONS_DIR" not in os.environ:
@@ -219,7 +230,12 @@ def main():
                 args.interleaved,
             )
             if args.packed_w2:
-                torch.ops._C.nvfp4_grouped_w2_sm70_out(
+                w2_op = (
+                    ops.nvfp4_grouped_w2_batch_reduce_sm70_out
+                    if args.batch_reduce
+                    else ops.nvfp4_grouped_w2_sm70_out
+                )
+                w2_op(
                     packed_out,
                     routed_out,
                     packed_mid,
@@ -251,7 +267,12 @@ def main():
                 p.error(f"Insufficient captured rows in {name} for M{m}")
             ids.copy_(case)
             control = graph(direct)
-            for split in map(int, args.splits.split(",")):
+            splits = (
+                [{4: 5, 8: 4, 16: 1}[m]]
+                if args.splits == "exact"
+                else list(map(int, args.splits.split(",")))
+            )
+            for split in splits:
                 packed = graph(lambda: candidate(split))
                 # Replay uses new values and poisoned scratch, not capture-time
                 # values. All source/output pointers remain fixed.
@@ -326,6 +347,7 @@ def main():
         graph_unroll=16,
         interleaved=args.interleaved,
         packed_w2=args.packed_w2,
+        batch_reduce=args.batch_reduce,
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         route_sha256={
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()

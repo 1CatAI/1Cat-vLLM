@@ -1,5 +1,112 @@
 # Qwen3.8 no-MTP batch decode: exact follow-up
 
+## Expert-reuse follow-up: batched W2 reduction (2026-09-26)
+
+This follow-up remains on the owned branch / Draft #692 and integration base
+`fcf59f8e9ae50c186333e98e5cf6aae705f320de`. The grouped candidate is still
+default-off. There is no precision, router, top-k, K-split or sampling change.
+
+The retained C16 step across 48 layers has 160 routes but only 1.83 routes per
+active expert on average; 61% of active experts receive one token. C2/C4 do not
+become large GEMMs just by admitting grouping. Their direct batch paths remain
+unchanged: 45 of 48 real C4 route prefixes regressed under unconditional
+grouping, while every screened C8/C16 route improved with the selected chain.
+
+The new W2 operator assigns each CTA a 32-column tile for **the whole batch**.
+Thirty-two warps traverse the GPU planner's actual expert packs, reusing the
+weights for up to eight routed rows. They materialize W2's original FP16
+results in 10 KiB of CTA shared memory; one barrier then permits the unchanged
+ten ordered FP32 FMA contributions per token. This removes global scatter
+materialization and the separate reduction launch. It adds no weight replica,
+host route-count readback, floating-point atomics or persistent GPU worker.
+The old grouped W2 operator remains available as the microbenchmark control.
+
+The Python opt-in requires the new native capability explicitly and logs
+`batch-column W2 with ordered CTA reduction`; an older extension cannot
+silently substantiate the new route. Native registration, fake implementation,
+production dispatch and the public benchmark are shipped together.
+
+### Measured native microbenchmark
+
+Normal source `setup.py build_ext --inplace` exits 0. The optional Rust
+frontend reports a missing compiler; it is not used by the Python-engine
+tests. No Rust frontend or complete wheel release is claimed. Required native
+SM70 extensions and Flash-V100 components build normally, with no private
+DSO, preload or RPATH/RUNPATH dependency. `_C.abi3.so` SHA256:
+`01e0d9ffb37d2471affa74bbfafb33b686e0c9ffb40cc8d24fb987cc66b94f25`.
+
+Physical GPU4 V100-SXM2-32GB, Torch 2.10.0+cu128, CUDA 12.8, driver 580.173.02;
+actual layer-0/rank-0 checkpoint weights, 48 retained real routing patterns
+(prefixes for C8), synthetic activations. Five alternating samples, ten graph
+replays/sample, 16 whole expert calls/replay; includes planner, W13/SwiGLU,
+W2 and ordered merge. No full-model or per-token wall claim in this table:
+
+| Width | Direct mean | New grouped chain mean | Reduction | Sum of paired savings |
+| --- | ---: | ---: | ---: | ---: |
+| C8 | 88.45200 us | 75.50280 us | 14.64% | 0.62156 ms |
+| C16 | 176.73800 us | 106.67747 us | 39.64% | 3.36291 ms |
+
+All 48 patterns improve at both widths. Reusing one layer's weights for 48
+routes is not measuring 48 different layers. The earlier independent GPU1
+three-arm screen isolates the **increment over existing grouping**: 5.159 us
+at C8 and 4.375 us at C16, averaged across the same 48 route patterns. Most of
+the direct-to-candidate gain is the existing exact W13/W2 expert reuse; do not
+add that gain to the previous grouping estimate a second time.
+
+Focused native tests: **78 pass**, including M8/M16, both W13 layouts, changed
+activations/routes/top-k weights, invalid IDs, poisoned metadata/outputs,
+canaries and changed-input CUDA Graph replay. W13 and final W2 match the direct
+path bit-for-bit. The fused operator leaves poisoned global routed scratch
+untouched, confirming no hidden scatter/reduce fallback. Kernel parity is not
+a full-model quality result.
+
+Public reproduction after normal native build:
+
+```bash
+CUDA_VISIBLE_DEVICES=4 CUDA_DEVICE_ORDER=PCI_BUS_ID OMP_NUM_THREADS=1 \
+  TORCH_EXTENSIONS_DIR="$TASK_CACHE" \
+  .venv/bin/python benchmarks/kernels/benchmark_sm70_moe_packed_w13.py \
+    --model "$MODEL" --layer 0 --rank 0 --tokens 8,16 --splits exact \
+    --interleaved --packed-w2 --batch-reduce --samples 5 --repeats 10 \
+    --route-glob "$ROUTE_GLOB" --out "$RESULT"
+.venv/bin/python -m pytest -q \
+  tests/kernels/quantization/test_sm70_moe_packed_w13.py \
+  tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py \
+  tests/benchmarks/test_sm70_qwen38_concurrency.py
+```
+
+Raw local artifacts: `.artifacts/moe_batch_native_48.{json,log}`,
+`moe_batch_native_tests.log`, `moe_reuse_w2_sweep.{json,log}` and
+`build_moe_batch_reduce.log`. The retained local `moe_root_cause.md` separates
+NCU instrumentation, real graph service and unprofiled engine wall contracts.
+
+### Rejected schedules and next gate
+
+- W13 register-only activation did not earn a win; retain the prior cached
+  same-split implementation.
+- Different experts per Volta quad-pair fragmented weight/scale access and
+  made the full chain much slower; numerical equality alone does not admit it.
+- Real SM70 software producer/consumer double buffering with 4/8/16 K groups
+  per stage preserves arithmetic but increases the complete chain from about
+  118 us to 132--142 us. Do not repeat this as simple register prefetch.
+- Fused W2 eight-column variants regress to 148--161 us. A sixteen-column
+  eight-warp variant is comparable to, not a demonstrated substantial gain
+  over, the selected coalesced 32-column variant. No autotuning flag is added.
+
+All research-only variant sources/results are retained locally in
+`.artifacts/moe_batch_reuse*`; none of those DSOs is used in engine tests.
+The next measurement uses exactly one control and one MoE-only candidate
+initialization, same new native hash, GPU4--7, 8K/256 tokens, TP4, no MTP/prefix
+cache, max context 256K, FP16 activation/KV and the existing hybrid PLE policy.
+Other experimental HC, sum2, gate and GDN flags remain off in both arms.
+
+The concurrency harness now reports p90 and runs concurrent natural-EOS
+text-health checks after timed cohorts. An explicit `--diagnostic-reference`
+can consume a fully measured nonrepeatable control, but propagates its failed
+acceptance into the candidate and never marks it accepted. This avoids another
+model reload just to collect the cases omitted by a quality-fail-fast harness.
+Matched endpoint results and quality status follow after that measurement.
+
 ## Scope and baseline
 
 Integration: `onecat/main`, base `fcf59f8e9ae50c186333e98e5cf6aae705f320de`.

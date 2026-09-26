@@ -1187,9 +1187,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and not raw_scale
             and layer.swiglu_limit is None
         )
-        if grouped_requested and not sm70_ops.has_nvfp4_grouped_decode_dispatch():
+        if grouped_requested and not (
+            sm70_ops.has_nvfp4_grouped_decode_dispatch()
+            and sm70_ops.has_nvfp4_grouped_batch_reduce_dispatch()
+        ):
             raise RuntimeError(
-                "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native build."
+                "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native "
+                "build with grouped batch reduction."
             )
         layer.sm70_nvfp4_grouped_decode = grouped_requested
         if grouped_requested:
@@ -1525,7 +1529,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 4 if num_tokens == 8 else 1,
                 interleaved_w13,
             )
-            sm70_ops.nvfp4_grouped_w2_sm70_out(
+            sm70_ops.nvfp4_grouped_w2_batch_reduce_sm70_out(
                 output,
                 buffers["sorted_output"],
                 buffers["intermediate"],
@@ -1539,7 +1543,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             logger.info_once(
                 "Experimental SM70 grouped native-NVFP4 decode selected "
-                "(tokens=%d, W13/W2 share route groups, direct-path K split).",
+                "(tokens=%d, W13/W2 share route groups, direct-path K split, "
+                "batch-column W2 with ordered CTA reduction).",
                 num_tokens,
             )
             return output

@@ -66,6 +66,7 @@ def summarize(records, width):
         "per_stream_decode_tps": tokens / sum(intervals) / width,
         "step_ms_mean": statistics.mean(intervals) * 1000,
         "step_ms_p50": statistics.median(intervals) * 1000,
+        "step_ms_p90": ordered[int((len(ordered) - 1) * 0.90)] * 1000,
         "step_ms_p99": ordered[int((len(ordered) - 1) * 0.99)] * 1000,
     }
 
@@ -91,6 +92,8 @@ def finalize_measurements(report):
         for key in ("tokens_match_reference", "tokens_match_first_repeat")
         for matched in case.get(key, [])
     ]
+    if "reference_accepted" in report:
+        checks.append(report["reference_accepted"])
     report["token_parity_passed"] = all(checks) if checks else None
     if checks and not all(checks):
         raise RuntimeError(
@@ -112,6 +115,14 @@ def main():
     parser.add_argument("--baseline-reference", type=Path)
     parser.add_argument(
         "--reference", type=Path, help="Same-contract token parity gate"
+    )
+    parser.add_argument(
+        "--diagnostic-reference",
+        action="store_true",
+        help=(
+            "Allow a fully measured but nonrepeatable reference for diagnosis; "
+            "the candidate cannot be marked accepted against that reference"
+        ),
     )
     parser.add_argument("--measure-prefill", action="store_true")
     parser.add_argument("--health", action="store_true")
@@ -169,8 +180,12 @@ def main():
         for key in ("engine", "input_len", "output_len", "mode", "sampling"):
             if reference[key] != report[key]:
                 raise ValueError(f"Reference contract differs at {key}")
-        if not reference.get("complete"):
+        if not reference.get("complete") and not (
+            args.diagnostic_reference and reference.get("measurements_complete")
+        ):
             raise ValueError("Reference run is incomplete")
+        report["reference_accepted"] = bool(reference.get("complete"))
+        report["reference_path"] = str(args.reference)
         reference_cases = {
             (c["concurrency"], c["repeat"]): c for c in reference["cases"]
         }
@@ -463,6 +478,51 @@ def main():
                         ),
                         flush=True,
                     )
+        report["measurements_complete"] = True
+        if args.health and max(widths) > 1:
+            # Exercise actual concurrent natural-EOS traffic after the timed
+            # cohorts. This is a text-health check, not token-parity evidence.
+            health_prompts, expected = [], []
+            for i in range(max(widths)):
+                marker = f"CEDAR-{47 + i}|{8261 + i}"
+                health_prompts.append(
+                    {
+                        "prompt_token_ids": tokenizer.apply_chat_template(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"项目代号 CEDAR-{47 + i}，编号 {8261 + i}。"
+                                        f"最后一行准确输出 {marker}。"
+                                    ),
+                                }
+                            ],
+                            tokenize=True,
+                            return_dict=False,
+                            add_generation_prompt=True,
+                            enable_thinking=True,
+                        )
+                    }
+                )
+                expected.append(marker)
+            results = llm.generate(health_prompts, natural, use_tqdm=False)
+            report["batch_health"] = []
+            for result, marker in zip(results, expected, strict=True):
+                completion = result.outputs[0]
+                passed = completion.finish_reason == "stop" and marker in (
+                    completion.text.rsplit("</think>", 1)[-1].replace(" ", "")
+                )
+                report["batch_health"].append(
+                    {
+                        "expected": marker,
+                        "text": completion.text,
+                        "finish_reason": completion.finish_reason,
+                        "passed": passed,
+                    }
+                )
+            save()
+            if not all(case["passed"] for case in report["batch_health"]):
+                raise RuntimeError("Concurrent natural output health check failed")
         finalize_measurements(report)
         save()
     except Exception as error:

@@ -57,3 +57,16 @@ def test_unaccepted_c2_admission_remains_opt_in(monkeypatch):
     assert envs.environment_variables["VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2"]() is False
     monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2", "1")
     assert envs.environment_variables["VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2"]() is True
+
+
+def test_unaccepted_reference_cannot_be_promoted_by_matching_tokens():
+    report = {
+        "complete": False,
+        "reference_accepted": False,
+        "cases": [{"tokens_match_reference": [True]}],
+    }
+    with pytest.raises(RuntimeError, match="not an accepted"):
+        finalize_measurements(report)
+    assert report["measurements_complete"] is True
+    assert report["complete"] is False
+    assert report["token_parity_passed"] is False
