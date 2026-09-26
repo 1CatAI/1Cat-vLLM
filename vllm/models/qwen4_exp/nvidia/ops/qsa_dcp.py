@@ -37,6 +37,30 @@ def _localize_indices(
     tl.store(dst + row * dst_stride + position, local, owned)
 
 
+def qsa_dcp_local_selection_width(
+    token_topk: int,
+    compress_ratio: int,
+    dcp_world_size: int,
+    interleave_size: int,
+    full_width: int,
+) -> int:
+    """Return how many localized columns can hold a selected token.
+
+    A selection is up to ``token_topk // compress_ratio`` complete compressed
+    groups plus the causal tail of the open group, and every group covers
+    ``compress_ratio`` consecutive positions starting at a multiple of it. When
+    one group divides evenly over the ranks, each rank owns exactly
+    ``compress_ratio // dcp_world_size`` positions of every group and at most
+    that many of the tail, so compaction never writes past this bound and the
+    columns after it are always -1. The sparse kernel iterates every column it
+    is given, so passing only this prefix halves its work at DCP2.
+    """
+    if dcp_world_size <= 1 or compress_ratio % (interleave_size * dcp_world_size):
+        return full_width
+    groups = token_topk // compress_ratio + 1
+    return min(full_width, groups * (compress_ratio // dcp_world_size))
+
+
 def qsa_localize_dcp_indices(
     indices: torch.Tensor,
     out: torch.Tensor,
