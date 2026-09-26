@@ -27,6 +27,7 @@ def worker_manifest(worker):
         "rank": worker.rank,
         "source": vllm.__file__,
         "torch": torch.__version__,
+        "vllm_version": vllm.__version__,
         "cuda": torch.version.cuda,
         "kv_dtype": cfg.cache_config.cache_dtype,
         "ssm_dtype": cfg.cache_config.mamba_ssm_cache_dtype,
@@ -72,7 +73,9 @@ def run(args):
 
     report = {
         "source_sha": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True,
         ).strip(),
         "args": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
