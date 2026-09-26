@@ -648,12 +648,19 @@ class Platform:
 
         # Get kernel block alignment from the backend's supported sizes
         with set_current_vllm_config(vllm_config):
-            kernel_block_alignment_size = max(
-                min(
-                    s.base if isinstance(s, MultipleOf) else s
-                    for s in backend_cls.get_supported_kernel_block_sizes()
-                ),
-                cache_config.block_size,
+            kernel_block_size = min(
+                s.base if isinstance(s, MultipleOf) else s
+                for s in backend_cls.get_supported_kernel_block_sizes()
+            )
+        kernel_block_alignment_size = max(kernel_block_size, cache_config.block_size)
+
+        # A model that shards part of each block over DCP ranks can require the
+        # rank-local share to stay kernel aligned as well.
+        block_multiple = getattr(model_cls, "get_kv_block_size_multiple", None)
+        if block_multiple is not None:
+            kernel_block_alignment_size = lcm(
+                kernel_block_alignment_size,
+                kernel_block_size * block_multiple(vllm_config),
             )
 
         if cache_config.mamba_cache_mode == "all":

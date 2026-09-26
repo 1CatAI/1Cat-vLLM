@@ -203,8 +203,10 @@ def test_qwen4_exp_real_dcp_cache_geometry() -> None:
     config.parallel_config.decode_context_parallel_size = 2
     target = qsa_dcp_block_geometry(config, "model.layers.3.self_attn")
     draft = qsa_dcp_block_geometry(config, "mtp.layers.48.self_attn")
-    assert target == (1600, 3200, True)
-    assert draft == (3200, 3200, False)
+    # A block spans block_size global tokens at every DCP size; each rank holds
+    # half of a sharded target page, and the replicated draft a whole one.
+    assert target == (800, 1600, True)
+    assert draft == (1600, 1600, False)
     config.parallel_config.decode_context_parallel_size = 1
     assert qsa_dcp_block_geometry(config, "model.layers.3.self_attn") == (
         1600,
@@ -340,18 +342,30 @@ def test_qwen4_exp_replicated_cache_memory_and_merge(spec_cls) -> None:
         spec_cls.merge([spec, replace(spec, dcp_sharded=True)])
 
 
-@pytest.mark.parametrize("dcp,expected_tokens", [(1, 775_096), (2, 1_178_375)])
-def test_qwen4_exp_capacity_projection_runs_through_allocator(dcp, expected_tokens):
+@pytest.mark.parametrize(
+    "dcp,target_slots,expected_tokens",
+    [
+        (1, 1600, 775_096),
+        # 1600 target slots per rank: a 3200-token span, one page per layer.
+        (2, 1600, 1_178_375),
+        # 800 target slots per rank: DCP1's 1600-token span, two target
+        # layers per physical page, six GDN groups over seven owners.
+        (2, 800, 1_215_037),
+    ],
+)
+def test_qwen4_exp_capacity_projection_runs_through_allocator(
+    dcp, target_slots, expected_tokens
+):
     config = _vllm_config()
     config.model_config.max_model_len = 262_144
     config.parallel_config.decode_context_parallel_size = dcp
     config.cache_config.mamba_cache_mode = "align"
-    span = 1600 * dcp
+    span = target_slots * dcp
     specs = {}
     for layer in range(13):
         name = f"model.layers.{layer}.self_attn"
         specs[name] = FullAttentionSpec(
-            block_size=1600 if layer < 12 else span,
+            block_size=target_slots if layer < 12 else span,
             num_kv_heads=1,
             head_size=256,
             dtype=torch.uint8,
@@ -374,9 +388,10 @@ def test_qwen4_exp_capacity_projection_runs_through_allocator(dcp, expected_toke
             dcp_sharded=False,
         )
     for layer in range(36):
+        # One real MTP3 GDN state: 817,152 bytes.
         specs[f"model.layers.{layer}.linear_attn"] = MambaSpec(
             block_size=span,
-            shapes=((1, 64),),
+            shapes=((1, 408_576),),
             dtypes=(torch.float16,),
             mamba_cache_mode="align",
             num_speculative_blocks=3,
@@ -389,8 +404,8 @@ def test_qwen4_exp_capacity_projection_runs_through_allocator(dcp, expected_toke
         num_speculative_blocks=3,
         tp_replicated=True,
     )
-    # State shapes are synthetic but fit each real QSA page; the allocator
-    # pads them exactly as it does for the measured 12 QSA / 36 GDN / 1 draft.
+    # The allocator pads the states exactly as it does for the measured
+    # 12 QSA / 36 GDN / 1 draft.
     groups = get_kv_cache_groups(config, specs)
     cache = get_kv_cache_config_from_groups(
         config, groups, available_memory=547 * 11_980_800
@@ -611,3 +626,237 @@ def test_qwen4_exp_dcp2_selector_canonicalizes_local_group_expansion() -> None:
         physical[:, None] * expansion + torch.arange(expansion, dtype=torch.int32)
     ).reshape(1, -1)
     assert torch.equal(builder._canonical_block_table(expanded), physical[None])
+
+
+def _packed_dcp_specs(span: int = 16, state_width: int = 5000):
+    """DCP2 specs for a ``span``-token block: two sharded target layers whose
+    half pages cannot hold a recurrent state alone, one replicated draft
+    layer, and states between the two page sizes."""
+    specs = {}
+    for prefix, sharded in (
+        ("model.layers.3.self_attn", True),
+        ("model.layers.7.self_attn", True),
+        ("mtp.layers.8.self_attn", False),
+    ):
+        specs[prefix] = FullAttentionSpec(
+            block_size=span // 2 if sharded else span,
+            num_kv_heads=1,
+            head_size=256,
+            head_size_v=256,
+            dtype=torch.float16,
+            dcp_sharded=sharded,
+        )
+        specs[f"{prefix}.compressed"] = MLAAttentionSpec(
+            block_size=span,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.float16,
+            compress_ratio=4,
+            dcp_sharded=False,
+        )
+        specs[f"{prefix}.compressor_state"] = CircularBufferSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.float16,
+            dcp_sharded=False,
+        )
+    for layer in (0, 1, 2, 4, 5, 6):
+        specs[f"model.layers.{layer}.linear_attn"] = MambaSpec(
+            block_size=span,
+            shapes=((1, state_width),),
+            dtypes=(torch.float16,),
+            dcp_sharded=False,
+        )
+    specs["model.layers.2.ple"] = MambaSpec(
+        block_size=span,
+        shapes=((1, 64),),
+        dtypes=(torch.float16,),
+        tp_replicated=True,
+        dcp_sharded=False,
+    )
+    return specs
+
+
+def test_qwen4_exp_dcp_packs_sharded_pages_that_cannot_hold_a_state() -> None:
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.cache_config.num_gpu_blocks_override = 3
+    groups = get_kv_cache_groups(config, _packed_dcp_specs())
+    layout = _get_csa_linear_tensor_layout(groups)
+    assert layout is not None
+    # 8 KiB sharded pages are packed in pairs; the 16 KiB draft page is alone.
+    assert layout.main_kv_page_sizes == [8_192, 8_192, 16_384]
+    assert layout.main_kv_owners == [[0, 1], [2]]
+    assert [layout.owner_page_size(i) for i in range(2)] == [16_384, 16_384]
+    # Six recurrent states over two physical owners need three groups.
+    gdn_groups = [
+        g for g in groups if any(n.endswith("linear_attn") for n in g.layer_names)
+    ]
+    assert len(gdn_groups) == 3
+    caches = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 30)
+    main = caches.kv_cache_tensors[:2]
+    assert main[0].packed_members == [
+        "model.layers.3.self_attn",
+        "model.layers.7.self_attn",
+    ]
+    assert main[1].packed_members is None
+    assert [t.size for t in main] == [16_384 * 3, 16_384 * 3]
+    # Packing does not change the bytes a pool block costs.
+    assert sum(t.size for t in caches.kv_cache_tensors) == (
+        layout.bytes_per_block * caches.num_blocks
+    )
+
+
+@pytest.mark.parametrize("cache_layout", ["NHD", "HND"])
+def test_qwen4_exp_packed_members_interleave_kernel_blocks(
+    monkeypatch, cache_layout: str
+) -> None:
+    """Both members of a packed page tile it exactly, one kernel block at a
+    time, through the real worker reshape path. The QSA target backend keeps
+    FlashAttention's block-outermost cache shape in either layout."""
+    from vllm.v1.attention.backends import flash_attn
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+
+    monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: cache_layout)
+
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.cache_config.num_gpu_blocks_override = 3
+    # 32 local slots per sharded page (32 KiB), 64 KiB draft page, 40 KB state.
+    specs = _packed_dcp_specs(span=64, state_width=20_000)
+    groups = get_kv_cache_groups(config, specs)
+    caches = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 30)
+    tensor = caches.kv_cache_tensors[0]
+    members = tensor.packed_members
+    assert members is not None
+    raw = torch.zeros(tensor.size, dtype=torch.int8)
+    spec = specs[members[0]]
+    kernel_block = 16
+    views = _reshape_kv_cache(
+        attn_groups=[AttentionGroup(FlashAttentionBackend, members, spec, 0)],
+        kv_cache_raw_tensors={name: raw for name in members},
+        cache_dtype="auto",
+        kernel_block_sizes=[kernel_block],
+        shared_kv_cache_layers={},
+        packed_members={name: (i, len(members)) for i, name in enumerate(members)},
+    )
+    first, second = (views[name] for name in members)
+    # Three physical blocks of 32 local slots are six 16-slot kernel blocks.
+    assert first.shape[0] == second.shape[0] == 3 * 32 // kernel_block
+    kernel_bytes = 2 * kernel_block * 256 * 2  # K and V, one head, fp16
+    assert first.stride(0) * first.element_size() == 2 * kernel_bytes
+    assert second.storage_offset() * second.element_size() == kernel_bytes
+
+    first.fill_(1)
+    second.fill_(2)
+    chunks = raw.view(torch.float16).view(-1, kernel_bytes // 2)
+    # The members alternate chunk by chunk and together cover every byte.
+    assert torch.equal(chunks[0::2], torch.ones_like(chunks[0::2]))
+    assert torch.equal(chunks[1::2], torch.full_like(chunks[1::2], 2))
+
+    # A single kernel-block write lands at its interleaved offset: member 1's
+    # kernel block 3 is chunk 3 * 2 + 1, inside physical block 1, which is
+    # the pool block the block table expands kernel blocks 2 and 3 from.
+    raw.zero_()
+    second[3].fill_(5)
+    written = (chunks != 0).any(dim=1).nonzero().flatten().tolist()
+    assert written == [3 * 2 + 1]
+    chunks_per_physical_block = tensor.size // 3 // kernel_bytes
+    assert written[0] // chunks_per_physical_block == 3 // (32 // kernel_block)
+
+
+def test_qwen4_exp_offload_registers_a_packed_page_once(monkeypatch) -> None:
+    """The offload worker copies a packed physical page as one reference that
+    covers every member's kernel blocks of that pool block."""
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.attention.backends import flash_attn
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm.v1.kv_offload.base import OffloadingSpec
+
+    monkeypatch.setattr(flash_attn, "get_kv_cache_layout", lambda: "NHD")
+    config = _vllm_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.cache_config.num_gpu_blocks_override = 3
+    specs = _packed_dcp_specs(span=64, state_width=20_000)
+    groups = get_kv_cache_groups(config, specs)
+    caches = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 30)
+    layout = _get_csa_linear_tensor_layout(groups)
+    assert layout is not None
+    owner_tensors = caches.kv_cache_tensors[: len(layout.main_kv_owners)]
+    packed = {
+        name: (index, len(t.packed_members))
+        for t in owner_tensors
+        for index, name in enumerate(t.packed_members or [])
+    }
+    # Main K/V and recurrent states go through the real worker reshape path;
+    # the side caches only need to expose their storage.
+    kv_caches = {}
+    for tensor in caches.kv_cache_tensors:
+        raw = torch.zeros(tensor.size, dtype=torch.int8)
+        for group_id, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            layer_specs = (
+                spec.kv_cache_specs
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else {name: spec for name in group.layer_names}
+            )
+            for name in set(tensor.shared_by) & set(layer_specs):
+                layer_spec = layer_specs[name]
+                if type(layer_spec) is FullAttentionSpec:
+                    backend = FlashAttentionBackend
+                elif isinstance(layer_spec, MambaSpec):
+                    backend = QSAStateBackend
+                else:
+                    kv_caches[name] = raw
+                    continue
+                kv_caches.update(
+                    _reshape_kv_cache(
+                        attn_groups=[AttentionGroup(backend, [name], layer_spec, 0)],
+                        kv_cache_raw_tensors={name: raw},
+                        cache_dtype="auto",
+                        kernel_block_sizes=[16],
+                        shared_kv_cache_layers={},
+                        packed_members=packed,
+                    )
+                )
+
+    spec = MagicMock(spec=OffloadingSpec)
+    spec.kv_cache_config = caches
+    spec.vllm_config = MagicMock()
+    spec.get_handlers.return_value = iter([])
+    worker = OffloadingConnectorWorker(spec=spec)
+    worker.worker = MagicMock()
+    worker.register_kv_caches(kv_caches)
+    canonical = spec.get_handlers.call_args[0][0]
+
+    page = 65_536
+    # The two physical owners come first, one canonical tensor each.
+    assert [t.tensor.shape for t in canonical.tensors[:2]] == [(3, page), (3, page)]
+    main_names = set(layout.main_kv_names)
+    main_group = next(
+        i for i, g in enumerate(groups) if main_names & set(g.layer_names)
+    )
+    main_refs = [r for r in canonical.group_data_refs[main_group] if r.tensor_idx < 2]
+    # One whole-page reference per physical owner, not one per layer.
+    assert [(r.tensor_idx, r.page_size_bytes) for r in main_refs] == [
+        (0, page),
+        (1, page),
+    ]
+    assert sum(r.page_size_bytes for r in main_refs) == sum(layout.main_kv_page_sizes)
+
+    # Both members' kernel blocks of pool block 1 (kernel blocks 2 and 3 at 32
+    # local slots per page) lie inside the bytes the reference moves.
+    first, second = (kv_caches[name] for name in owner_tensors[0].packed_members)
+    first[2:4].fill_(1)
+    second[2:4].fill_(2)
+    block = canonical.tensors[0].tensor[1]
+    assert torch.count_nonzero(canonical.tensors[0].tensor[0]) == 0
+    assert torch.count_nonzero(canonical.tensors[0].tensor[2]) == 0
+    values = block.view(torch.float16)
+    assert torch.count_nonzero(values) == values.numel()

@@ -1065,6 +1065,12 @@ class Qwen4ExpForCausalLM(
         }
 
     @classmethod
+    def get_kv_block_size_multiple(cls, vllm_config: VllmConfig) -> int:
+        """Each DCP rank holds ``block_size // dcp`` slots of the sharded main
+        K/V, so the block size must keep that share kernel-block aligned."""
+        return vllm_config.parallel_config.decode_context_parallel_size
+
+    @classmethod
     def get_mamba_specs_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
@@ -1353,6 +1359,10 @@ class Qwen4ExpForConditionalGeneration(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
         return Qwen4ExpForCausalLM.get_mamba_specs_from_config(vllm_config)
+
+    @classmethod
+    def get_kv_block_size_multiple(cls, vllm_config: VllmConfig) -> int:
+        return Qwen4ExpForCausalLM.get_kv_block_size_multiple(vllm_config)
 
 
 __all__ = [

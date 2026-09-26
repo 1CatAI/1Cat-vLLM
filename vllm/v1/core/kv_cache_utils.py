@@ -1697,18 +1697,21 @@ def _get_kv_cache_config_csa_linear(
 
     num_blocks = available_memory // layout.bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    kv_cache_tensors = [
-        KVCacheTensor(
-            size=layout.main_kv_page_sizes[index] * num_blocks,
-            shared_by=[main_kv_name]
-            + [
-                group.layer_names[index]
-                for group in layout.mamba_groups
-                if index < len(group.layer_names)
-            ],
+    kv_cache_tensors = []
+    for index, owner in enumerate(layout.main_kv_owners):
+        members = [layout.main_kv_names[i] for i in owner]
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=layout.owner_page_size(index) * num_blocks,
+                shared_by=members
+                + [
+                    group.layer_names[index]
+                    for group in layout.mamba_groups
+                    if index < len(group.layer_names)
+                ],
+                packed_members=members if len(members) > 1 else None,
+            )
         )
-        for index, main_kv_name in enumerate(layout.main_kv_names)
-    ]
     kv_cache_tensors.extend(
         KVCacheTensor(
             size=layout.compressed_page_sizes[index] * num_blocks,
@@ -2010,10 +2013,55 @@ class _CSALinearTensorLayout:
     mamba_groups: list[KVCacheGroupSpec]
     main_kv_page_sizes: list[int]
     compressed_page_sizes: list[int]
+    # Physical main-KV owners, as indices into ``main_kv_names``.
+    main_kv_owners: list[list[int]]
 
     @property
     def bytes_per_block(self) -> int:
         return sum(self.main_kv_page_sizes) + sum(self.compressed_page_sizes)
+
+    def owner_page_size(self, owner: int) -> int:
+        return sum(self.main_kv_page_sizes[i] for i in self.main_kv_owners[owner])
+
+
+def _csa_linear_state_page(mamba_specs: Iterable[KVCacheSpec]) -> int:
+    """Largest unpadded recurrent-state page among the given owners."""
+    pages = [
+        replace(spec, page_size_padded=None).page_size_bytes
+        for spec in mamba_specs
+        if isinstance(spec, MambaSpec)
+    ]
+    return max(pages, default=0)
+
+
+def _pack_csa_linear_main_kv(
+    page_sizes: Sequence[int], state_page: int
+) -> list[list[int]]:
+    """Group main-KV owners so that every physical page holds a recurrent state.
+
+    An owner whose page already holds one stays alone; that is the DCP1 layout
+    and any layout with large enough pages. Under DCP a sharded main K/V page
+    holds only ``block_size // dcp`` slots per rank, too few for a state, so
+    such owners are packed in layer order, as few per physical page as hold a
+    state; a packed page interleaves its members one kernel block at a time.
+    """
+    owners: list[list[int]] = []
+    pending: dict[int, list[int]] = {}
+    for index, page in enumerate(page_sizes):
+        if page >= state_page:
+            owners.append([index])
+            continue
+        members = pending.setdefault(page, [])
+        members.append(index)
+        if len(members) == cdiv(state_page, page):
+            owners.append(members)
+            del pending[page]
+    if pending:
+        raise ValueError(
+            "CSA+linear main-KV owners do not fill whole physical pages: "
+            f"{ {page: len(members) for page, members in pending.items()} }."
+        )
+    return owners
 
 
 class _CSALinearRoles(NamedTuple):
@@ -2204,6 +2252,21 @@ def _get_kv_cache_groups_csa_linear(
         KVCacheGroupSpec(list(padded_compressor_specs), compressor_uniform),
     ]
     main_kv_names = [cache.main_kv[0] for cache in tuples]
+    owners = _pack_csa_linear_main_kv(
+        main_kv_pages, _csa_linear_state_page(roles.mamba.values())
+    )
+    owner_pages = [sum(main_kv_pages[i] for i in owner) for owner in owners]
+    # One representative name per physical owner; recurrent states are placed
+    # per physical owner, whatever it packs.
+    owner_names = [main_kv_names[owner[0]] for owner in owners]
+    if (
+        any(len(owner) > 1 for owner in owners)
+        and vllm_config.parallel_config.pipeline_parallel_size > 1
+    ):
+        raise NotImplementedError(
+            "Packed CSA+linear main-KV pages are not supported with pipeline "
+            "parallelism."
+        )
     for tp_replicated in (False, True):
         names = [
             name
@@ -2219,14 +2282,13 @@ def _get_kv_cache_groups_csa_linear(
                 f"CSA+linear {policy} Mamba owners must use one cache spec."
             )
         unpadded_page = replace(representative, page_size_padded=None).page_size_bytes
-        if unpadded_page > min(main_kv_pages):
+        if unpadded_page > min(owner_pages):
             raise ValueError(
                 f"CSA+linear Mamba owner {names[0]!r} needs {unpadded_page} "
-                f"bytes, but the smallest main-KV page has {min(main_kv_pages)} bytes."
+                f"bytes, but the smallest physical main-KV page has "
+                f"{min(owner_pages)} bytes."
             )
-        num_groups = _get_csa_linear_mamba_group_count(
-            vllm_config, names, main_kv_names
-        )
+        num_groups = _get_csa_linear_mamba_group_count(vllm_config, names, owner_names)
         if num_groups is None:
             raise ValueError(
                 "CSA+linear pipeline stage has Mamba owners but no main-KV slots."
@@ -2236,7 +2298,7 @@ def _get_kv_cache_groups_csa_linear(
             grouped_names[index % num_groups].append(name)
         for group_names in grouped_names:
             padded_specs: dict[str, KVCacheSpec] = {
-                name: replace(representative, page_size_padded=main_kv_pages[index])
+                name: replace(representative, page_size_padded=owner_pages[index])
                 for index, name in enumerate(group_names)
             }
             if len({spec.page_size_bytes for spec in padded_specs.values()}) == 1:
@@ -2289,17 +2351,30 @@ def _get_csa_linear_tensor_layout(
     if not main_kv_names or not compressed_names:
         return None
 
+    main_kv_page_sizes = [
+        compressed_sparse[name].page_size_bytes for name in main_kv_names
+    ]
     return _CSALinearTensorLayout(
         main_kv_names=main_kv_names,
         compressed_names=compressed_names,
         compressor_state_names=list(compressor_state),
         mamba_groups=mamba_groups,
-        main_kv_page_sizes=[
-            compressed_sparse[name].page_size_bytes for name in main_kv_names
-        ],
+        main_kv_page_sizes=main_kv_page_sizes,
         compressed_page_sizes=[
             compressed_sparse[name].page_size_bytes for name in compressed_names
         ],
+        main_kv_owners=_pack_csa_linear_main_kv(
+            main_kv_page_sizes,
+            _csa_linear_state_page(
+                member
+                for group in mamba_groups
+                for member in (
+                    group.kv_cache_spec.kv_cache_specs.values()
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else [group.kv_cache_spec]
+                )
+            ),
+        ),
     )
 
 

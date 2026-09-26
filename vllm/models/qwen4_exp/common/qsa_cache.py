@@ -691,12 +691,12 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         # The common block table enumerates the kernel blocks this rank owns.
         # When the group's main K/V is DCP-sharded those entries count local
         # tokens, while a QSA side page declares the global span it covers
-        # because qsa_dcp_block_geometry multiplies the side span by the DCP
-        # world size. Convert that span back to local tokens before deriving
-        # the virtual expansion. This applies to a replicated selector sharing
-        # a sharded main owner's table just as much as to a sharded page: both
-        # read the same local table. A standalone draft keeps every QSA cache
-        # replicated, so its table is already global and must not be divided.
+        # (see qsa_dcp_block_geometry). Convert that span back to local tokens
+        # before deriving the virtual expansion. This applies to a replicated
+        # selector sharing a sharded main owner's table just as much as to a
+        # sharded page: both read the same local table. A standalone draft
+        # keeps every QSA cache replicated, so its table is already global and
+        # must not be divided.
         table_counts_local_tokens = (
             self.kv_cache_spec.dcp_sharded or self.has_sharded_main_owner
         )
@@ -843,18 +843,25 @@ def qsa_dcp_block_geometry(
 ) -> tuple[int, int, bool]:
     """Return local main slots, replicated side span, and main DCP ownership.
 
-    The standalone MTP drafter keeps its entire QSA cache replicated. A target
-    main page retains the DCP1 physical size while covering twice as many
-    global tokens; its selector page covers that full global span on each rank.
+    A cache block spans ``block_size`` global tokens at every DCP size, so the
+    prefix-cache and recurrent-state granularity match DCP1. The target main
+    K/V is sharded: each rank holds ``block_size // dcp`` slots of it, and the
+    allocator packs ``dcp`` such layers into one physical page, the page a
+    recurrent state needs. The standalone MTP drafter keeps its entire QSA cache
+    replicated, and every selector covers the full span on each rank.
     """
     block_size = vllm_config.cache_config.block_size
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     if dcp not in (1, 2):
         raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
+    if block_size % dcp:
+        raise ValueError(
+            f"Qwen4Exp QSA block size {block_size} must divide over DCP {dcp}"
+        )
     is_draft = "mtp" in prefix.split(".")
     return (
-        block_size * dcp if is_draft else block_size,
-        block_size * dcp,
+        block_size if is_draft else block_size // dcp,
+        block_size,
         not is_draft,
     )
 

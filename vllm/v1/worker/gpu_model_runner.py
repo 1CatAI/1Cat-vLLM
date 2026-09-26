@@ -12613,6 +12613,10 @@ class GPUModelRunner(
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        if any(t.packed_members for t in kv_cache_config.kv_cache_tensors):
+            raise NotImplementedError(
+                "Packed attention pages are laid out only by the v2 GPU model runner"
+            )
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype

@@ -113,14 +113,17 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
             return metadata
         # Draft K/V owns the full global span on every DCP rank. The mixed
         # target/draft group has already expanded each scheduler page into
-        # kernel blocks using the target page size. The draft needs twice as
-        # many kernel blocks per page, so only expand the remaining ratio.
+        # kernel blocks using the target's rank-local page size, so only
+        # expand the remaining draft-to-target ratio.
         draft_page_size, _, _ = qsa_dcp_block_geometry(
             self.vllm_config, self.layer_names[0]
         )
         if draft_page_size % self.block_size:
             raise RuntimeError("QSA draft kernel block must divide its physical page")
-        group_page_size = self.vllm_config.cache_config.block_size
+        group_page_size = (
+            self.vllm_config.cache_config.block_size
+            // self.vllm_config.parallel_config.decode_context_parallel_size
+        )
         if group_page_size >= self.block_size and group_page_size % self.block_size:
             raise RuntimeError("QSA group page must divide into kernel blocks")
         group_blocks_per_page = max(1, group_page_size // self.block_size)

@@ -967,6 +967,10 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
+    packed_members: list[str] | None = None
+    """Attention layers that split each physical block of this tensor,
+    interleaved one kernel block at a time in this order. ``None`` means at
+    most one attention layer owns each block."""
 
 
 @dataclass
