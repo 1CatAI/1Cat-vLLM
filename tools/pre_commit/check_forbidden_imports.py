@@ -85,6 +85,9 @@ CHECK_IMPORTS = {
             # AOT inspection needs compiler/backend modules that the vLLM
             # runtime shim deliberately does not export.
             "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",
+            # Standalone source-built kernel screen: run before installing a
+            # vLLM runtime, including CPU-only layout tests and compilation.
+            "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",
         },
     ),
 }
