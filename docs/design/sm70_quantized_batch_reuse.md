@@ -34,6 +34,36 @@ attention implementations are unchanged.
 
 ## Implementation and defaults
 
+The consolidated ordinary-service results below use three measured repetitions
+per row and the workload above. C2 was refreshed with common default admission
+in `merge-defaults`; C4/C8 retain `fulfillment-default`, whose effective settings
+and native instructions are unchanged by moving the common policy. Each row
+is compared against its matching saved main reference:
+
+| Concurrency | Rolling reference / current tok/s | Rolling gain | No-prefill reference / current tok/s | No-prefill gain | Window acceptance reference / current |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| C2 | 266.85 / 289.26 | 8.40% | 369.04 / 408.07 | 10.58% | 63.31% / 63.31% |
+| C4 | 297.30 / 330.77 | 11.26% | 477.65 / 590.49 | 23.62% | 65.16% / 65.16% |
+| C8 | 365.98 / 388.00 | 6.02% | 621.91 / 692.62 | 11.37% | 50.51% / 49.54% |
+
+Rolling workloads contain 24/32/48 requests at C2/C4/C8. C2/C4 no-prefill
+windows repeat the first two/four prompts, while C8 covers all 48 prompts in
+six eight-request waves. These are paired within each row, not a common
+cross-concurrency scaling dataset. The earlier C2 +29.71% window result had
+higher acceptance and is superseded by the current equal-acceptance pair.
+C2 rolling acceptance changes 55.19% -> 54.98% (-0.21 points). The current
+C1 guard remains 245.19 versus 243.15 tok/s, with -0.27-point acceptance.
+
+GEMM evidence retains its own scope: real-weight layer-weighted Graph micros
+show C2/C4 time reductions of 25.4%/34.5%; the final complete-service C8 trace
+shows 12.99%. None of those percentages is substituted for serving speed.
+The refreshed service retains 9.57 GiB model memory per rank, 11.45 GiB KV
+budget and the 262144 configured context limit. All four workers load the
+normal `72e750ee` extension and automatic settings 1/64/64/64, with no
+diagnostic instrumentation or imported plans. Fresh results and runtime maps
+are retained in `merge-defaults-consolidated.json`, `merge-defaults-runtime-manifest.json`
+and the corresponding endpoint/window JSON files.
+
 - M9..16: a common paired-projection kernel shares each packed activation
   fragment between two output tiles. Format-specific readers consume existing
   compressed FP4/FP8 weights and scales. No second persistent weight layout

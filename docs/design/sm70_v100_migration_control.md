@@ -23,9 +23,16 @@ An additional 57 warmup, FP4 layout and channel-FP8 tests pass. Four old QPN2
 test doubles initially lacked the new prescale argument; their contracts now
 check both ordinary and prescaled preparation and dispatch. Native sources and
 the normal `72e750ee` extension are unchanged from the previous 105-test audit.
-The fresh ordinary service is labeled `merge-defaults`; its C2 measurements
-complete the current C2/C4/C8 consolidation without substituting earlier C2
-prototype numbers. Exact results and merge status are recorded in
+The fresh ordinary service `merge-defaults` gives three-run C2 rolling decode
+266.85 -> 289.26 tok/s (+8.40%) and first-two-prompt no-prefill windows
+369.04 -> 408.07 (+10.58%), with identical 63.31% window acceptance. This
+supersedes the earlier +29.71% window pair whose acceptance also increased.
+Current C4/C8 no-prefill gains remain +23.62%/+11.37%, with the distinct
+prompt coverage retained. Four worker maps confirm automatic 1/64/64/64
+settings and the normal source artifact; memory remains 9.57 GiB model plus
+11.45 GiB available KV per rank at the existing service configuration.
+All owned measurement services are stopped. Exact results are recorded in
+`merge-defaults-consolidated.json` and
 [the batch reuse report](sm70_quantized_batch_reuse.md).
 
 ## GEMM savings realized in serving, 2026-09-26
