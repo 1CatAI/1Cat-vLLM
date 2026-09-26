@@ -636,6 +636,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if not isinstance(meta_weight, torch.Tensor):
             raise RuntimeError("Qwen4Exp PLE meta weight was not initialized")
         self._meta_weight_shape = tuple(meta_weight.shape)
+        # The gather op resolves this module by name at run time (see
+        # qwen4_exp_ple_pinned_gather): a raw table pointer must never enter a
+        # compiled graph, because a reloaded AOT artifact would carry the
+        # address of a buffer that no longer exists in the new process.
+        self.layer_name = prefix
+        static_forward_context = (
+            get_current_vllm_config().compilation_config.static_forward_context
+        )
+        if prefix in static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        static_forward_context[prefix] = self
         self._meta_weight_dtype = meta_weight.dtype
         # Placeholder parameter: keeps the loader contract (a CPU-resident
         # ``weight`` that must not be moved to the device) without holding
@@ -865,12 +876,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         out_flat = output.reshape(-1, self.embedding_dim)
         if self._host_rows == 0 or self._device_rows == 0:
-            table_ptr = self._device_table_ptr if self._host_rows == 0 else host_ptr
             torch.ops.vllm.qwen4_exp_ple_pinned_gather(
                 flat_ids,
                 out_flat,
                 self.weight_scale,
-                table_ptr,
+                self.layer_name,
+                self._host_rows != 0,
                 self.embedding_dim,
             )
             return output
@@ -884,14 +895,16 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             device_ids,
             out_flat,
             self.weight_scale,
-            self._device_table_ptr,
+            self.layer_name,
+            False,
             self.embedding_dim,
         )
         torch.ops.vllm.qwen4_exp_ple_pinned_gather(
             host_ids,
             host_out,
             self.weight_scale,
-            host_ptr,
+            self.layer_name,
+            True,
             self.embedding_dim,
         )
         out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
@@ -2438,11 +2451,24 @@ def qwen4_exp_ple_pinned_gather(
     input_ids: torch.Tensor,
     output: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_ptr: int,
+    layer_name: str,
+    use_host_table: bool,
     embedding_dim: int,
 ) -> None:
     if input_ids.numel() == 0:
         return
+    # Resolve the table pointer here, inside the opaque op, so that neither
+    # torch.compile nor a serialized AOT artifact ever sees the address.
+    table = get_forward_context().no_compile_layers[layer_name]
+    if use_host_table:
+        device_index = (
+            torch.accelerator.current_device_index()
+            if input_ids.device.index is None
+            else input_ids.device.index
+        )
+        weight_ptr = table._accelerator_weight_ptrs[device_index]
+    else:
+        weight_ptr = table._device_table_ptr
     block_d = triton.next_power_of_2(embedding_dim)
     _gather_ple_fp8_from_pinned_kernel[(input_ids.numel(),)](
         weight_ptr,
@@ -2459,7 +2485,8 @@ def qwen4_exp_ple_pinned_gather_fake(
     input_ids: torch.Tensor,
     output: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_ptr: int,
+    layer_name: str,
+    use_host_table: bool,
     embedding_dim: int,
 ) -> None:
     return
