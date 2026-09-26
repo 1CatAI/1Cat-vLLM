@@ -98,6 +98,7 @@ constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
     5 * 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen38M2Bytes = 2 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38M4Bytes = 4 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38M8Bytes = 8 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
@@ -168,7 +169,8 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
   }
   const char* batch = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
   const bool batch_enabled = batch == nullptr || std::strcmp(batch, "1") == 0;
-  if (batch_enabled && (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
+  if (batch_enabled && (bytes == kSm70Tp4PushAllreduceQwen38M2Bytes ||
+                        bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
                         bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
     const char* blocks =
         std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS");
@@ -182,7 +184,7 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
         return parsed;
       }
     }
-    return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
+    return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&
@@ -2197,9 +2199,13 @@ class CustomAllreduce {
           std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
       const bool qwen38_batch =
           (batch == nullptr || std::strcmp(batch, "1") == 0) &&
-          (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
+          (bytes == kSm70Tp4PushAllreduceQwen38M2Bytes ||
+           bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
            bytes == kSm70Tp4PushAllreduceBytes);
+      const char* m2 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2");
+      const bool m2_enabled = bytes != kSm70Tp4PushAllreduceQwen38M2Bytes ||
+                              m2 == nullptr || std::strcmp(m2, "1") == 0;
       const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
       const bool qwen38_mtp5 = mtp5 != nullptr && std::strcmp(mtp5, "1") == 0 &&
                                bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
@@ -2224,7 +2230,8 @@ class CustomAllreduce {
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          (qwen38_batch || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
+          ((qwen38_batch && m2_enabled) || qwen38_mtp5 ||
+           qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
         if (push_blocks > 0) {
