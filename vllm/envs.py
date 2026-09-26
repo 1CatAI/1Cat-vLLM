@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_1CAT_PREFILL_PACE_STEPS: int = 0
     VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
@@ -416,6 +417,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE: bool = True
+    VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE: bool = False
     VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P: bool = True
     VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH: bool = True
     VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268: bool = True
@@ -1650,6 +1652,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
     # not warn users that our own documented knobs are unknown.
+    # Experimental (1CatAI/1Cat-vLLM#490): while another running request is
+    # decoding, a request that is still prefilling is scheduled a chunk only
+    # every N engine steps; the other N-1 steps are decode-only. 0 = off.
+    "VLLM_1CAT_PREFILL_PACE_STEPS": lambda: int(
+        os.getenv("VLLM_1CAT_PREFILL_PACE_STEPS", "0")
+    ),
     "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": lambda: bool(
         int(os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS", "0"))
     ),
@@ -2953,6 +2961,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1"))
+    ),
+    # Experimental (1CatAI/1Cat-vLLM#490): let the D256 BM32 phase paged-prefill
+    # kernel run at any KV page size that is a multiple of 16 (MTP makes the
+    # align-mode block 816, which otherwise falls off the page-784 fast path).
+    "VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ANY_PAGE", "0"))
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P", "1"))
