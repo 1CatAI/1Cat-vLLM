@@ -412,3 +412,80 @@ This CPU result does not replace the prior GPU gates or establish new model
 performance. The accepted 23.849974-ms pair keeps its original source/build
 identity. Draft-MoE geometry and original-layout GDN prototypes are isolated
 component screens; no result is inferred before an owned GPU is available.
+
+### Refreshed node trace and exact draft-MoE screen
+
+`mtp_stack_trace_flush` uses the refreshed source/native build above. The
+report contains all four TP workers and **84 closed rounds**. Generation
+finishes, but capture shutdown terminates the primary process (exit 143) and
+leaves workers waiting; only these owned processes are cleaned up. The
+post-trace phase request does not run. Retain this limitation: the kernel
+intervals are usable, but this is not a successful endpoint or phase run.
+The next capture launcher explicitly sets `--kill=none --wait=primary`.
+
+The rank0 intervals close as follows; these are **profiled milliseconds**:
+
+| Interval | Mean ms |
+| --- | ---: |
+| Metadata to first target graph node | 0.782884 |
+| Target graph, first to last node | 22.614401 |
+| Target end to gather | 0.020994 |
+| Sampling/state handoff | 0.949621 |
+| Four drafts including combine | 5.266901 |
+| Next-round preparation | 0.044608 |
+| Complete closed interval | **29.679408** |
+
+The mean per-round slowest-rank interval is 29.681317 ms. The target graph
+contains 2,060 kernels: kernel union 16.933081 ms, no-kernel intervals
+5.681320 ms. Of the latter, 3.661182 ms overlaps the long target
+`cudaGraphLaunch` API. This is evidence of substantial profiling/launch
+interference, not 3.66 ms of newly removable model computation. It cannot
+replace or be rescaled to the accepted 23.849974-ms unprofiled endpoint.
+Target dense service remains 7.320460 ms; the largest repeated grid groups
+are HC down `(8,3,20)` / 1.525945 ms and HC up `(8,80,1)` / 1.354346 ms.
+Service sums can overlap and are not an additive critical-path table.
+
+The draft wall excludes the final combine kernel and closes independently:
+
+| Draft category, rank0 | Exclusive ms |
+| --- | ---: |
+| Four full-vocabulary projections | 1.812865 |
+| MoE projections | 0.690810 |
+| Other dense projections/reductions | 0.614226 |
+| Sampling, state and elementwise | 0.529273 |
+| TP communication including waits | 0.524088 |
+| Attention and indexer | 0.342716 |
+| HC postops and fused M1 projections | 0.201451 |
+| Overlapping kernel families | 0.065627 |
+| No recorded kernel | 0.481110 |
+| Total | **5.262167** |
+
+The first admitted draft screen preserves original FP16 weights, sequential
+FP32 FMA, and W2's router multiplication before FP16 storage. On GPU1 with
+real rank0 checkpoint weights, five activation scales, changing routes and
+poisoned outputs, every tested variant is bit-exact. Selected projections:
+
+| Projection | Tuned Triton us | Selected native us |
+| --- | ---: | ---: |
+| M1 W13, direct vector8 loads / 64 columns | 105.395 | 61.395 |
+| M1 W2, tile64 / K64 | 24.960 | 13.024 |
+| M5 W13, tile32 / K128, captured fixed routes | 170.989 | 88.070 |
+| M5 W13, same tile, captured code routes | 172.147 | 96.800 |
+| M5 W2, tile64 / K64, captured fixed routes | 95.258 | 52.294 |
+| M5 W2, same tile, captured code routes | 94.874 | 51.130 |
+
+These are isolated component results (`draft_moe_exact.{json,cu,py}`), not
+complete-round savings. M5 captured routes come from the first draft pass;
+continuation routes are synthetic. The implementation is now registered in
+the normal `_C` build, guarded by opt-in `VLLM_SM70_MTP_MOE_FP16_EXACT=1`,
+exact M1/M5/E512/H2560/I160/top10 geometry, FP16 contiguous tensors, the
+audited BM2 tile, SM70, and no bias/quantization/sorted assignment. Unsupported
+inputs retain their existing route. It adds no persistent weight copy and
+leaves target batch decode unchanged. Native GPU and full-model gates are
+pending; do not promote this component number to a new endpoint result.
+
+Reject the original-layout GDN screen without another engine run: all 36
+real rank0 layers remain exact, but the M5 chain costs 1.104200 ms packed
+versus 1.510728 ms original / 1.444454 ms with read-only loads; M10 costs
+1.126441 versus 1.929830 / 1.706721 ms. Record
+`gdn_input_original.{json,cu,py}` so this layout change is not repeated.

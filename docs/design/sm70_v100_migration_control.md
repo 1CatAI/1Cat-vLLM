@@ -48089,3 +48089,18 @@ has launched no full model. Details and artifacts are in
 - Reject `mtp_stack_trace` for kernel attribution: it contains no kernel
   activity table. The follow-up explicitly flushes all TP workers before
   shutdown. Do not substitute its profiled wall for the unprofiled baseline.
+- `mtp_stack_trace_flush` recovers four-rank kernel records and 84 closed
+  rounds. Capture shutdown exits 143 and prevents the later phase request;
+  retain the valid intervals plus this failure. Rank0 profiled cycle is
+  29.679408 ms, target graph 22.614401 and draft (excluding combine)
+  5.262167 ms. Target gaps include 3.661182 ms inside graph-launch API;
+  neither profiled time nor subtracted gaps are a new endpoint claim.
+- The draft screen preserves every FP16 bit and admits an original-layout
+  native projection schedule: M1 W13 105.395 -> 61.395 us, M1 W2
+  24.960 -> 13.024 us; captured first-draft M5 routes improve W13
+  170.989 -> 88.070 us and W2 95.258 -> 52.294 us. Native integration is
+  opt-in (`VLLM_SM70_MTP_MOE_FP16_EXACT`); normal-build GPU/model gates are
+  pending. Keep full vocabulary and target batch decode.
+- Reject original-layout GDN: exact M5 36-layer chain regresses from
+  1.104200 to 1.444454 ms even with read-only loads; M10 also regresses.
+  Do not spend another full-model run on this variant.

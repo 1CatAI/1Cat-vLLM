@@ -623,6 +623,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
     VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = True
+    VLLM_SM70_MTP_MOE_FP16_EXACT: bool = False
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -3733,6 +3734,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable to zero is the explicit rollback.
     "VLLM_SM70_MTP_MOE_TUNED_CONFIG": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1"))
+    ),
+    # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
+    # BM2 Triton accumulation order, original weights, and FP16 boundaries.
+    "VLLM_SM70_MTP_MOE_FP16_EXACT": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "0"))
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on
