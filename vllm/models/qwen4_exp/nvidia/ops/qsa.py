@@ -66,6 +66,7 @@ _SM70_QSA_XQA_PAGE4_PARTITION = 1024
 _SM70_QSA_XQA_PAGE4_PAGES = 513
 _SM70_QSA_XQA_PAGE4_MARKER = 1 << 30
 _SM70_QSA_GROUPED_PAGE4 = os.getenv("VLLM_SM70_QSA_GROUPED_PAGE4", "1") == "1"
+_SM70_QSA_GROUPED_PAD_FIX = os.getenv("VLLM_SM70_QSA_GROUPED_PAD_FIX", "1") == "1"
 _SM70_QSA_GROUPED_PAGE4_QUERIES = 8
 _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES = (
     _SM70_QSA_XQA_PAGE4_PAGES * _SM70_QSA_GROUPED_PAGE4_QUERIES + 56
@@ -1842,6 +1843,18 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         physical_page_stride,
         k_cache.shape[0],
     )
+    if _SM70_QSA_GROUPED_PAD_FIX:
+        # W12: the planner pads each category to a multiple of 8 with
+        # (physical microblock 0 = null block, mask 0) and counts the
+        # padding in seq_len. The forward loads page 0's K/V for those
+        # padded rows, sets P=0, but 0 * NaN survives the P@V MMA when page
+        # 0 holds fp16 GDN state that decodes to E4M3 NaN (W8). Repoint
+        # every mask==0 (padding) entry at this group's first real
+        # microblock (column 0; real entries always carry a nonzero mask).
+        # torch.where + copy_ has no host sync -> CUDA-graph capturable.
+        grouped_pages.copy_(
+            torch.where(token_masks == 0, grouped_pages[:, :1], grouped_pages)
+        )
     physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
     _qsa_grouped_page4_forward(
         flash_attn_v100_cuda,

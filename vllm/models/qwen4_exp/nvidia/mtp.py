@@ -22,12 +22,13 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -157,6 +158,35 @@ def _validate_mtp_expert_weights_loaded(
         )
 
 
+def _mtp_fp8_experts_supported(
+    draft_vllm_config: VllmConfig,
+    draft_quant_config: QuantizationConfig,
+    speculative_config: SpeculativeConfig,
+    exact_sm70: bool,
+    online_fp8: bool,
+) -> bool:
+    """Whether the SM70 FP8 MTP expert method can serve this draft.
+
+    Checkpoint FP8 experts are allowed under pipeline parallelism: the V2
+    runner builds the speculator only on the last pipeline rank, so the
+    drafter is stage-local and the FP8 expert padding follows that stage's
+    tensor-parallel size. Online conversion keeps the single-stage limit
+    until it is validated under pipeline parallelism as well.
+    """
+    return (
+        exact_sm70
+        and (
+            not online_fp8
+            or draft_vllm_config.parallel_config.pipeline_parallel_size == 1
+        )
+        and draft_vllm_config.model_config.dtype == torch.float16
+        and draft_quant_config.get_name()
+        in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
+        and not draft_vllm_config.parallel_config.enable_expert_parallel
+        and speculative_config.rejection_sample_method == "standard"
+    )
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -215,20 +245,17 @@ def _make_draft_vllm_config(
         }
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
     if online_fp8 or checkpoint_prefixes:
-        if (
-            not is_exact_sm70_cuda_platform()
-            or draft_vllm_config.model_config.dtype != torch.float16
-            or draft_quant_config is None
-            or draft_quant_config.get_name()
-            not in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
-            or draft_vllm_config.parallel_config.pipeline_parallel_size != 1
-            or draft_vllm_config.parallel_config.enable_expert_parallel
-            or speculative_config.rejection_sample_method != "standard"
+        if draft_quant_config is None or not _mtp_fp8_experts_supported(
+            draft_vllm_config,
+            draft_quant_config,
+            speculative_config,
+            is_exact_sm70_cuda_platform(),
+            online_fp8,
         ):
             raise ValueError(
                 "MTP FP8 experts require SM70, FP16, an AWQ/ModelOpt/FP8 draft "
-                "checkpoint, tensor parallelism without PP or EP, and standard "
-                "rejection sampling"
+                "checkpoint, no expert parallelism, standard rejection sampling, "
+                "and pipeline-parallel size 1 for online conversion"
             )
         draft_quant_config = MTPExpertFp8Config(
             draft_quant_config,

@@ -481,6 +481,19 @@ def _get_ple_embedding_quant_method(
 
     if force_fp8_storage:
         return Qwen4ExpPLEFp8EmbeddingMethod()
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        # ModelOpt mixed-precision checkpoints (e.g. nvidia's Flash-Next NVFP4)
+        # declare the FP8 PLE table per layer in quantized_layers instead of
+        # setting ple_embedding_dtype in the model config.
+        if quant_config.is_layer_excluded(prefix):
+            return None
+        if quant_config._resolve_quant_algo(prefix) != "FP8":
+            return None
+        return Qwen4ExpPLEFp8EmbeddingMethod()
     if not isinstance(quant_config, Fp8Config):
         return None
     if not quant_config.is_checkpoint_fp8_serialized:

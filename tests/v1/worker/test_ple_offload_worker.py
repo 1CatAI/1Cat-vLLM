@@ -1028,3 +1028,130 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+
+
+def _registration_with_cpu_inputs(
+    input_ids: torch.Tensor,
+) -> ple_offload_connector_module.PleOffloadRegistration:
+    return ple_offload_connector_module.PleOffloadRegistration(
+        worker_id=0,
+        tp_rank=0,
+        dp_rank=0,
+        gpu_output_buffers={},
+        sem_flag_tensors={},
+        input_ids_buf=input_ids,
+        query_start_loc_buf=torch.zeros(3, dtype=torch.int32).share_memory_(),
+        ngram_context_buf=None,
+    )
+
+
+def test_ple_registration_keeps_input_storage_without_shm_manager() -> None:
+    import psutil
+    import torch.multiprocessing as torch_mp
+
+    def shm_managers() -> set[int]:
+        return {
+            child.pid
+            for child in psutil.Process().children(recursive=True)
+            if "torch_shm_manager" in child.name()
+        }
+
+    input_ids = torch.zeros(8, dtype=torch.int32).share_memory_()
+    data_ptr = input_ids.data_ptr()
+    strategy = torch_mp.get_sharing_strategy()
+    managers_before = shm_managers()
+
+    payload = ple_offload_connector_module._dump_registration(
+        _registration_with_cpu_inputs(input_ids)
+    )
+
+    assert payload
+    # The "file_system" strategy moved this storage under a torch_shm_manager
+    # whose death made the GPU worker abort on release.
+    assert input_ids.data_ptr() == data_ptr
+    assert shm_managers() == managers_before
+    assert torch_mp.get_sharing_strategy() == strategy
+
+
+_REGISTRATION_TRANSFER_SCRIPT = """
+import ctypes, multiprocessing, os, signal, sys
+
+import psutil
+import torch
+from multiprocessing.reduction import ForkingPickler
+
+from vllm.v1.ple_offload.connector import _dump_registration
+from vllm.v1.ple_offload.protocol import PleOffloadRegistration
+
+
+def no_core_dump():
+    # A regression must not leave an apport report behind (PR_SET_DUMPABLE).
+    ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+
+
+def sender(conn):
+    no_core_dump()
+    input_ids = torch.zeros(8, dtype=torch.int32).share_memory_()
+    registration = PleOffloadRegistration(
+        worker_id=0, tp_rank=0, dp_rank=0,
+        gpu_output_buffers={}, sem_flag_tensors={},
+        input_ids_buf=input_ids,
+        query_start_loc_buf=torch.zeros(3, dtype=torch.int32).share_memory_(),
+        ngram_context_buf=None,
+    )
+    conn.send_bytes(_dump_registration(registration))
+    conn.recv()
+    input_ids[0] = 7
+    conn.send("written")
+    signal.pause()
+
+
+if __name__ == "__main__":
+    no_core_dump()
+    context = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = context.Pipe()
+    proc = context.Process(target=sender, args=(child_conn,), daemon=True)
+    proc.start()
+    registration = ForkingPickler.loads(parent_conn.recv_bytes())
+    parent_conn.send("write")
+    assert parent_conn.recv() == "written"
+    managers = [
+        p for p in psutil.Process().children(recursive=True)
+        if "torch_shm_manager" in p.name()
+    ]
+    print(f"value={int(registration.input_ids_buf[0])} managers={len(managers)}")
+    os.kill(proc.pid, signal.SIGKILL)
+    proc.join()
+    del registration
+    print("released", flush=True)
+"""
+
+
+def test_ple_registration_outlives_its_sender(tmp_path) -> None:
+    """The offload process reads the sender's writes through the shared input
+    buffers and still releases them cleanly after the sender was killed."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import vllm
+
+    script = tmp_path / "registration_transfer.py"
+    script.write_text(_REGISTRATION_TRANSFER_SCRIPT)
+    # A script's sys.path starts at its own directory, so point the child at
+    # the vllm under test instead of whichever one is installed.
+    vllm_root = str(Path(vllm.__file__).parents[1])
+    python_path = os.pathsep.join(
+        filter(None, [vllm_root, os.environ.get("PYTHONPATH")])
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONPATH": python_path},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "value=7 managers=0" in result.stdout, result.stdout + result.stderr
+    assert "released" in result.stdout
