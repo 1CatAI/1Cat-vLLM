@@ -321,13 +321,37 @@ def test_hybrid_ple_admits_target_decode_widths(monkeypatch, tokens):
 
 
 @pytest.mark.parametrize("decode_tokens", [1, 5])
-def test_shared_capture_context_reaches_target_and_draft(monkeypatch, decode_tokens):
+@pytest.mark.parametrize(
+    "compile_graph,capability,extra_warmup",
+    [
+        (False, (7, 0), False),
+        (True, (7, 0), True),
+        (True, (7, 5), True),
+        (True, (8, 0), False),
+    ],
+)
+def test_shared_capture_context_reaches_target_and_draft(
+    monkeypatch, decode_tokens, compile_graph, capability, extra_warmup
+):
     from contextlib import nullcontext
 
     from vllm.config.compilation import CUDAGraphMode
+    from vllm.platforms.interface import DeviceCapability
     from vllm.v1.worker.gpu import cudagraph_utils as cg
 
-    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "0")
+    monkeypatch.setenv(
+        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", str(int(compile_graph))
+    )
+    queried_devices = []
+
+    def get_capability(device_id):
+        queried_devices.append(device_id)
+        return DeviceCapability(*capability)
+
+    monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(cg.current_platform, "get_device_capability", get_capability)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(cg, "graph_capture", lambda **kwargs: nullcontext())
     monkeypatch.setattr(cg, "is_global_first_rank", lambda: False)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
@@ -360,5 +384,6 @@ def test_shared_capture_context_reaches_target_and_draft(monkeypatch, decode_tok
         return forward, (None, None)
 
     manager.capture(create_forward)
-    assert phases == [False, False, True, True]
+    assert phases == [False, False] + [True] * (3 if extra_warmup else 2)
+    assert queried_devices == ([1] if compile_graph else [])
     assert not is_sm70_decode_graph_compiling()
