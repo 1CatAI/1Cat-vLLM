@@ -6,6 +6,11 @@ it is not target-forward-only latency. Reuse this recorded baseline and run only
 the focused case affected by the next concrete optimization. No more wheel
 packaging, no-MTP baseline sweeps or repeated broad quality matrices are needed.
 
+The [timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md)
+adds a matched capture off/on/off comparison and historical-method target
+timing. Target verification is 21.95-22.24 ms across rank means at 8K;
+the 29.32-ms node-traced target below is not its normal latency.
+
 ## Shared implementation
 
 PR #684 enables the direct M5 experts and TP4 push collective from merged
@@ -116,7 +121,7 @@ verifier is a traced measurement only. Rank-0 target kernel busy-time union is
 includes graph gaps and possible tracing/dependency effects; it is not a proven
 CPU bottleneck or an independently removable latency budget.
 
-## Where the GPU time goes
+## Whole-round GPU service
 
 Service durations below can overlap and include collective dependency waits;
 they do not add into the wall table. Rank maxima may come from different ranks.
@@ -147,11 +152,13 @@ split kernels, 12 common FP16 row-GEMV calls, six native HC up/mix and six HC
 down/all-gather calls. The latter GEMV/HC calls have nonzero graph-node IDs.
 PLE is one local pinned gather (0.1144 ms on rank 0), already a small cost.
 
-The next optimization should first attribute the dominant M=5 verifier GEMMs
-to projection shapes/call sites using this retained trace, then test the
-existing common operators' small-batch extension/fusion on those exact shapes.
-Keep the common dispatch and numerical contract; do not clone the single-token
-path or apply M=1 assumptions to M=5. Collective service is strongly skewed
+The target-only decomposition and historical candidate audit are in the
+[timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
+Ordinary M5 FP16 projection replacements were already screened at only
+0.190 ms weighted microbenchmark savings; do not repeat that campaign merely
+because dense service leads this table. Any new small-batch extension/fusion
+needs a specific component win while preserving common dispatch and the
+numerical contract. Collective service is strongly skewed
 across ranks (1.34-4.78 ms), so isolate readiness waits before blaming transfer
 bandwidth. PLE and another metadata rewrite are not the leading candidates.
 

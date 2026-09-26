@@ -47930,3 +47930,31 @@ has launched no full model. Details and artifacts are in
 - Full contract, baseline manifest, raw artifacts and analysis are linked in
   [the accepted profile](sm70_flash_next_mtp4_default_profile.md). All owned
   model/profiler workers exited; preserve the worktree and evidence.
+
+## 2026-09-26 MTP4 trace and historical-verifier timing reconciliation
+
+- Retain the accepted 27.3963-ms full-round baseline. Same 8192/129 request,
+  one engine, capture off/on/off: **27.1598 / 35.4506 / 28.0762 ms/round**.
+  All 129 output tokens, 85 rounds and 43 accepted drafts match the original
+  trace. Node capture adds 7.3743-8.2908 ms against the two off arms; do not
+  assume all of the older unmatched 9.1424-ms difference is precisely attributed.
+- Existing V2 phase timer, separate process without Nsight: target verifier
+  wall **21.9472-22.2415 ms** across rank means at 8K. TP0 forward/sample/state
+  event intervals are 21.1253/0.7477/0.0164 ms. Same historical 152-token
+  HumanEval/0 input gives 21.5247-21.8349-ms target wall and exactly the old
+  62 output tokens/acceptance counters. Old #398 23.409 ms includes sampling
+  and state, and differs in batch/memory settings; it is not a node-service sum.
+- Original target-only graph: 23.6025-ms kernel sum minus 2.2471-ms overlap
+  plus 7.9613-ms no-kernel time equals 29.3167-ms wall. Dense target service is
+  9.3119 ms; the older 12.8330-ms table describes the entire round. Direct
+  M5 experts/push remain active. Ordinary M5 dense replacements were already
+  screened at only 0.1902-ms projected savings; preserve those rejected paths.
+- Measurement source `3ed85627c8` matches the frozen baseline runtime except
+  for the typing-only overload. This documentation update is not a GPU
+  qualification of later main changes. No source kernel/default change or wheel.
+- Retain both harness failures: initial configuration serialization after
+  warmup, and callable-RPC rejection after the successful off/on/off segment.
+  The separate named-worker phase probe completes with exit 0. No insecure
+  serialization override, repeated node capture or broad quality rerun.
+- Full scope, per-rank values, artifact paths and limitations:
+  [MTP4 timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
