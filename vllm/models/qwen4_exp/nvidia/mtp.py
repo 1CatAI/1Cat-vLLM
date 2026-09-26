@@ -271,6 +271,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             )
         }
         self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
+        # Phase 2: the drafter shares the target cache_config; remember the main
+        # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
+        self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
             # embedding, fc_hidden (shared across HC branches) projects the
@@ -564,6 +567,18 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             )
         )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)
+        # Phase 2: an E4M3 main KV cache makes the drafter's QSA layer E4M3 too.
+        # Finalize its calibrated k/v scales strictly from the checkpoint (no
+        # runtime fallback; missing names are listed). No-op for FP16/BF16 caches
+        # and on the PLE offload process (is_offload_process()).
+        from .model import _finalize_qsa_e4m3_scale_load
+
+        _finalize_qsa_e4m3_scale_load(
+            self,
+            loaded_weights,
+            self.model._kv_cache_dtype,
+            require_calibrated_speculative_draft=True,
+        )
         return loaded_weights
 
 

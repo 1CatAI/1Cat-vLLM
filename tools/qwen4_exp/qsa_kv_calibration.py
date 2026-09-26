@@ -726,6 +726,91 @@ def build_overlay(args: argparse.Namespace) -> None:
     )
 
 
+def _load_scale_tensors(path: Path) -> dict[str, dict[str, float]]:
+    """Normalize a summarize report OR a published kvscales-manifest.json to
+    {model.layers.<id>.self_attn.<kind>_scale: {"scale", "max_abs"}}.
+
+    A summarize report indexes tensors by name (dict); the published scale-pack
+    manifest lists them as {"kind", "layer", "scale", "max_abs", ...}. Both are
+    collapsed to the same per-layer/per-kind naming so an old published manifest
+    and a freshly calibrated report can be compared directly.
+    """
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    tensors = doc.get("tensors")
+    out: dict[str, dict[str, float]] = {}
+    if isinstance(tensors, dict):
+        for name, details in tensors.items():
+            out[name] = {
+                "scale": float(details["scale"]),
+                "max_abs": float(details.get("max_abs", 0.0)),
+            }
+    elif isinstance(tensors, list):
+        for entry in tensors:
+            name = f"model.layers.{int(entry['layer'])}.self_attn.{entry['kind']}_scale"
+            out[name] = {
+                "scale": float(entry["scale"]),
+                "max_abs": float(entry.get("max_abs", 0.0)),
+            }
+    else:
+        raise ValueError(f"Unrecognized tensors container in {path}")
+    if not out:
+        raise ValueError(f"No scale tensors found in {path}")
+    return out
+
+
+def compare_targets(args: argparse.Namespace) -> None:
+    """Compare target-layer scale envelopes between an old and a new source.
+
+    Either source may be a summarize report or a published kvscales-manifest.json
+    (see _load_scale_tensors). W2 reuses the already-published 24 target scales
+    and appends only the 2 new MTP scales; this shows the freshly calibrated
+    target scales still match the published ones (per-tensor scale, max_abs and
+    new/old ratio). The MTP layer (default id 48) is excluded.
+    """
+    old_t = _load_scale_tensors(Path(args.old_report))
+    new_t = _load_scale_tensors(Path(args.new_report))
+    mtp_suffix = f".layers.{args.mtp_layer_id}."
+    target_names = sorted(name for name in old_t if mtp_suffix not in name)
+    if not target_names:
+        raise ValueError("No target tensors found in the old report")
+    rows = []
+    max_ratio_dev = 0.0
+    for name in target_names:
+        if name not in new_t:
+            raise ValueError(f"New report is missing target tensor: {name}")
+        old_scale = old_t[name]["scale"]
+        new_scale = new_t[name]["scale"]
+        ratio = new_scale / old_scale if old_scale > 0 else float("inf")
+        max_ratio_dev = max(max_ratio_dev, abs(ratio - 1.0))
+        rows.append(
+            {
+                "tensor": name,
+                "old_scale": old_scale,
+                "new_scale": new_scale,
+                "new_over_old": ratio,
+                "old_max_abs": old_t[name]["max_abs"],
+                "new_max_abs": new_t[name]["max_abs"],
+            }
+        )
+    report = {
+        "schema_version": 1,
+        "old_report": str(Path(args.old_report).resolve()),
+        "new_report": str(Path(args.new_report).resolve()),
+        "excluded_mtp_layer_id": args.mtp_layer_id,
+        "target_tensor_count": len(rows),
+        "max_scale_ratio_deviation": max_ratio_dev,
+        "tensors": rows,
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(
+        f"Compared {len(rows)} target scales; max |new/old - 1| = {max_ratio_dev:.4g}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -773,6 +858,13 @@ def parse_args() -> argparse.Namespace:
     overlay.add_argument("--expected-layers", type=int, default=12)
     overlay.add_argument("--unit-scale-negative-control", action="store_true")
     overlay.set_defaults(func=build_overlay)
+
+    compare = subparsers.add_parser("compare-targets")
+    compare.add_argument("--old-report", required=True)
+    compare.add_argument("--new-report", required=True)
+    compare.add_argument("--output", required=True)
+    compare.add_argument("--mtp-layer-id", type=int, default=48)
+    compare.set_defaults(func=compare_targets)
     return parser.parse_args()
 
 
