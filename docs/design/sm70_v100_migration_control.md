@@ -48185,3 +48185,15 @@ has launched no full model. Details and artifacts are in
   observer; there is no resident no-CUPTI result yet. Both GPU groups are
   occupied at this checkpoint. No model/code change or quality regression
   is inferred from this resource failure.
+- The bounded retry subsequently completes on idle GPU4--7; all tokens,
+  acceptance and cross-rank route IDs agree. The resident runner replays
+  **one captured M1 graph three times**. Its end-of-proposal event value
+  therefore covers only the last M1 step, not three independent kernels.
+  On 84 aligned rounds/rank, last-step event means are 75.447/65.938/66.280/
+  75.106 us; all maxima <=82.944 us. The node trace has 39/336 last-step
+  calls >250 us, versus zero in this instrumented no-CUPTI observation.
+  Record measurement sensitivity, not a proven ordinary scheduling bug.
+  An existing stream-synchronize API overlaps both fast and slow traced
+  calls and is not a causal explanation. Preserve the observer source/hash
+  and comparison artifacts. Any follow-up must collect after each graph
+  replay before overwrite; do not repeat the end-of-proposal-only observer.

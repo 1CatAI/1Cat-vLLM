@@ -779,3 +779,49 @@ load: a foreign GPU4--7 job appears after preflight, leaving only
 No resident event result exists from this failed attempt. At this checkpoint
 both four-GPU groups are occupied; the bounded retry waits for an idle group.
 Do not treat the observer's standalone smoke as evidence about model tails.
+
+#### Resident graph-event observation, without Nsight
+
+After GPU4--7 becomes idle, `mtp_draft_kernel_events_retry` completes with
+exit 0 on the same runtime source/build. All three requests' token IDs,
+finish reasons and acceptance statistics match `mtp_draft_exact_trace2531`.
+Actual expert IDs also agree across all four ranks. The resource-failed
+attempt above is retained separately.
+
+There is an important scope correction: the runtime captures **one M1
+single-step graph and replays it three times** in `multi_step_decode`.
+Consequently, each worker reports one event pair and a counter increment of
+three per proposal. The event pair and route buffer retain only the **last
+M1 step**. This observation does not time the first two M1 steps separately.
+The standalone smoke's three distinct captured calls had three event pairs;
+it did not establish how the resident engine reuses a captured graph.
+
+Each rank records 87 proposals. Aligning the full-range M1 call order to the
+84 closed trace rounds gives the following final-step comparison:
+
+| TP rank | Node trace mean/max us | No-CUPTI graph-event mean/max us |
+| --- | ---: | ---: |
+| 0 | 122.073 / 338.844 | 75.447 / 82.944 |
+| 1 | 85.656 / 306.973 | 65.938 / 70.656 |
+| 2 | 81.641 / 305.628 | 66.280 / 72.704 |
+| 3 | 113.559 / 335.421 | 75.106 / 82.944 |
+
+The final-step node trace has 39/336 calls above 250 us; the aligned event
+observation has **zero**. Therefore, do not treat the node trace's 300-us
+W13 calls as an established ordinary-kernel bottleneck. These runs differ
+in instrumentation: the graph-event observer adds event/route/counter nodes
+and fences each proposal, so this is evidence of measurement sensitivity,
+not proof that CUPTI alone caused every tail. The trace's overlapping runtime
+APIs do not distinguish slow and fast W13 calls: both overlap an existing
+`cudaStreamSynchronize`, so that correlation also supplies no causal fix.
+
+Retain `mtp_draft_kernel_events_retry{,_analysis}.json`, its observer source
+hash, `mtp_draft_last_step_profile_comparison.json` and
+`mtp_draft_exact_trace2531_native_api_overlap.json`. The next observer should
+collect the pair immediately after **each** `decode_cudagraph_manager`
+`run_fullgraph` call, before the following replay overwrites it, preferably
+within a resident engine that stays open for diagnostic RPCs. Do not repeat
+an identical end-of-proposal observer expecting three independent timings.
+All owned workers shut down; subsequent GPU4--7 owners belong to another task.
+The qualified 23.657858-ms endpoint and the <20-ms remaining objective are
+unchanged by this diagnostic run.
