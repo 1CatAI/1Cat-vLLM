@@ -2006,6 +2006,10 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
+        cache_config.cache_dtype_from_checkpoint = (
+            self.kv_cache_dtype == "auto" and resolved_cache_dtype != "auto"
+        )
+
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
