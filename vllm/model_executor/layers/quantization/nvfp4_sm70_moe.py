@@ -1520,7 +1520,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer._nvfp4_grouped_experts,
                 layer._nvfp4_grouped_sizes,
                 layer._nvfp4_grouped_total,
-                4 if num_tokens == 8 else 8,
+                # Match the direct path's accumulation tree at both widths.
+                # M16 split8 was faster but changed FP32 association.
+                4 if num_tokens == 8 else 1,
                 interleaved_w13,
             )
             sm70_ops.nvfp4_grouped_w2_sm70_out(
@@ -1537,7 +1539,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             logger.info_once(
                 "Experimental SM70 grouped native-NVFP4 decode selected "
-                "(tokens=%d, W13/W2 share route groups).",
+                "(tokens=%d, W13/W2 share route groups, direct-path K split).",
                 num_tokens,
             )
             return output

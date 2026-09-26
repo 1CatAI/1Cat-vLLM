@@ -358,8 +358,8 @@ def _hc_combine_norm(
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     # The M=1 SM70 path is register-bound with the generic 512-wide tile.
-    # A 1024-wide tile keeps identical reduction/rounding results and is
-    # measurably faster on V100; retain the generic tile for larger batches.
+    # Keep its established 1024-wide policy. Batch retains the 512-wide
+    # reduction tree: switching tiles can change FP32 association and FP16 bits.
     sm70_decode = N == 1 and current_platform.is_device_capability(70)
     sm70_batch_prefetch = (
         2 <= N <= 16

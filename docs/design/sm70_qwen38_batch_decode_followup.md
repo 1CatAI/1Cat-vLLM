@@ -107,3 +107,139 @@ sequences and the native hash. `--reference` requires same-contract per-request
 greedy token equality; `--health` separately uses official sampling/natural EOS.
 `--measure-prefill` reports a separate one-output cohort using the union of
 scheduled-to-first-token intervals, not a sum of overlapping request TTFTs.
+
+## Native microbenchmark results and priority correction
+
+The initial candidates pass their local tests but are **not sufficient** for
+the user's substantial concurrency-speedup objective. Do not start a full
+model simply to measure these small components:
+
+- Shared-gate epilogue, 48 actual gate weights: saves 0.158--0.164 ms at
+  M2/M4/M8/M16. All 65,536 FP16 logit encodings pass the arithmetic check;
+  11 targeted GPU tests pass.
+- C2 sum2 admission: 48 ordinary plus 48 sum2 collectives fall from
+  0.70780 to 0.31534 ms in the paired TP4 microbenchmark (0.39246 ms saved).
+  Both arms already use ordinary small-message push. Mixed-size/poisoned
+  graph checks pass for random, signed-zero and special-value inputs, 64
+  cycles per family on all four ranks.
+- HC combine/norm prefetch: only about 0.02 ms, as above. The remaining HC
+  projection work is not solved by this pointwise change.
+
+The next screen therefore targets MoE, which accounts for about 7.825 ms of
+the C1-to-C16 increase in the retained trace's rank-average service view.
+This is hotspot selection, not an additive endpoint prediction.
+
+### Hardware evidence and rejected variants
+
+One NCU sample of the production C16 W13 kernel, layer-0/rank-0 checkpoint
+weights and a retained real routing pattern, reports:
+
+| Counter | Value |
+| --- | ---: |
+| DRAM throughput | 50.19% (416.15 GB/s) |
+| SM throughput | 33.08% |
+| Achieved occupancy | 30.22% |
+| L2 hit rate | 32.37% |
+| Long-scoreboard share of warp cycles between issued instructions | 64.1% |
+
+This is a single instrumented kernel sample, not a whole-model utilization
+claim. It justifies investigating memory latency and instruction scheduling;
+there is no evidence here of a saturated HBM or compute ceiling.
+
+Source-derived research screens retain the original ordered HMMA sequence and
+all FP16 boundaries. Results, including negatives, are retained in task-local
+`moe_iteration_v1/v2/v3` and `moe_group_v1/v2` JSON/log artifacts:
+
+- Removing masked input loads or changing unroll factors alone is neutral or
+  slower. Explicit 2/4/8-group staging does not earn integration.
+- Read-only caching plus suitable launch bounds saves about 1.85 ms projected
+  over 48 C16 calls, without grouping. The same direct-kernel edit regresses
+  C4 and gives only a small C8 gain; **it is not installed in direct dispatch**.
+- Applying scheduling/cache changes to the existing grouped implementation,
+  while keeping C16 at **split1**, earns the larger result below. This reuses
+  the already-main grouping and W2 code; it does not duplicate Draft #504's
+  HC private-channel work.
+
+### Source-built exact C16 grouped MoE
+
+The final implementation is in the normal
+`csrc/sm70_turbomind/ops/nvfp4_grouped_decode_sm70.cu` build:
+
+1. Reuse packed expert weights for rows routed to the same expert, using the
+   existing integer planner and original-route scatter.
+2. Use the read-only cache and 64-thread/eight-resident-block launch bounds
+   for the single-split W13 kernel. This permits latency-hiding instruction
+   scheduling without introducing more K splits.
+3. Remove the redundant split reduction and one barrier when there is only
+   one partial, retaining the direct path's FP16 rounding (including zero
+   sign). W2 and its ordered FP32 top-k reduction are unchanged.
+4. The existing experimental opt-in now selects M16 **split1**, not split8;
+   M8 retains split4. No new flag is added. The default remains off until the
+   matched full-model gate; C1, direct C2/C4, MTP and prefill are untouched.
+
+Normal source CMake `_C` rebuild/install succeeded. No research DSO is loaded
+in the following native benchmark or GPU tests. Measured `_C` SHA256:
+`9230c386d485a29ed2f6571ba88b7b2bd9064ded4f94d40fdddbe0a0581e3787`.
+It has no RPATH/RUNPATH or private-library dependency. Subsequent source-only
+formatting/braces do not change the algorithm. Full package build had an
+unrelated missing-`patchelf` failure while packaging Flash-V100; no complete
+wheel or full-engine run is claimed for this task.
+
+Native screen: Torch 2.10.0+cu128, CUDA 12.8, physical V100-SXM2-32GB GPU2,
+FP16 activations/prepared scales, unchanged NVFP4 weights and FP32 accumulation,
+actual layer-0/TP4-rank-0 weights, 48 retained C16 routing patterns. Five
+alternating samples, ten graph replays/sample, 16 complete MoE calls/replay.
+Timing includes planning, W13/SiLU, grouped W2, scatter and ordered reduction.
+
+| Complete MoE call across 48 routing patterns | Result |
+| --- | ---: |
+| Mean direct control | 175.81693 us |
+| Mean exact grouped candidate | 111.40787 us |
+| Time reduction | 36.63% |
+| Sum of paired microbenchmark savings | 3.09164 ms |
+| Per-pattern saving range | 44.448--80.275 us |
+| Changed-input W13/W2 maximum absolute difference | 0 |
+
+All 48 improve. **This reuses one layer's weights with different real routes;
+it is not a measured 48-layer model round or a new endpoint tokens/s result.**
+It clears the small-gain screen and warrants a matched engine A/B, not default
+enablement or a claimed C16 step of `28.94 - 3.09` ms.
+
+Reproduce with the public benchmark and local checkpoint/retained route paths:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=1 \
+  TORCH_EXTENSIONS_DIR="$TASK_CACHE" \
+  .venv/bin/python benchmarks/kernels/benchmark_sm70_moe_packed_w13.py \
+    --model "$MODEL" --layer 0 --rank 0 --tokens 16 --splits 1 \
+    --interleaved --packed-w2 --route-glob "$ROUTE_GLOB" \
+    --samples 5 --repeats 10 --out "$RESULT"
+```
+
+Without retained routes, omit `--route-glob` to screen distinct/shared/random
+routes; those synthetic-route numbers must be reported separately.
+
+Validation:
+
+- 57 tests pass: 24 grouped GPU tests plus the then-current 33 dispatch tests.
+  New C16 tests exercise 32 changing-input graph replays for each W13 layout,
+  eight routing patterns, four activation scales, output canaries and poisoned
+  metadata/output. Both W13 output and complete W2 result are bitwise equal
+  to the existing direct kernels. Full same-split M4/M8 tests also pass.
+- After adding the M8/split4 and M16/split1 production-dispatch assertions,
+  the grouped-dispatch plus NVFP4 integration suites pass **76 tests**. These
+  suites overlap the preceding run; do not sum the counts.
+- Targeted Ruff and whitespace checks pass. This is not a full pre-commit,
+  long-output-quality or token-sequence acceptance claim.
+
+Raw native artifacts: `grouped_native_48.{json,log}`,
+`grouped_native_pytest.log`, `grouped_dispatch_pytest.log`, and
+`build_grouped_incremental.log` under the task's `.artifacts` directory.
+The public benchmark now additionally enforces bit equality for same-split
+paths, rather than treating positive/negative zero as equal.
+
+No full model/API was started. Task GPU workers exited. An attempted extra
+layer/rank sweep yielded its cooperative GPU lock when another task acquired
+GPU0--3, before launching any new CUDA process. Next: finish the extra-weight
+screen when cards are free, then one matched native-engine control/candidate
+test with endpoint timing and greedy/text-health gates. Keep Draft.

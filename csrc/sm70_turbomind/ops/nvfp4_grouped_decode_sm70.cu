@@ -65,11 +65,13 @@ __device__ __forceinline__ void decode(unsigned packed, half2 scale,
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <int Split, bool Interleaved>
-__global__ void w13_kernel(const half* x, const uint32_t* weights,
-                           const half* scales, const int32_t* rows,
-                           const int32_t* experts, const int32_t* sizes,
-                           const int32_t* total, half* out) {
+template <int Split, bool Interleaved, bool Cached = false>
+__device__ __forceinline__ void w13_body(const half* x, const uint32_t* weights,
+                                         const half* scales,
+                                         const int32_t* rows,
+                                         const int32_t* experts,
+                                         const int32_t* sizes,
+                                         const int32_t* total, half* out) {
   // Split within the CTA: no floating-point atomics or global partial tensor.
   __shared__ float partial[2][Split][kPack][32];
   __shared__ half projected[2][kPack][32];
@@ -97,8 +99,12 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
                                  __float2half_rn(16384.0f));
       const half2 scale = __halves2half2(scalar, scalar);
       half2 decoded[8];
-      decode(__ldcs(w + offset), scale, decoded);
-      decode(__ldcs(w + offset + 32), scale, decoded + 4);
+      // Repeated experts can reuse cache lines across route packs. Keep all
+      // HMMA operations and FP16 materialization points in their original
+      // order.
+      decode(Cached ? __ldg(w + offset) : __ldcs(w + offset), scale, decoded);
+      decode(Cached ? __ldg(w + offset + 32) : __ldcs(w + offset + 32), scale,
+             decoded + 4);
       const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
       uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
       if (mma_row < count) {
@@ -115,19 +121,27 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
   for (int i = 0; i < 8; ++i) {
     const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
     const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-    partial[projection][split][r][quad * 8 + c] = accum[i];
+    if constexpr (Cached && Split == 1) {
+      projected[projection][r][quad * 8 + c] = __float2half_rn(accum[i]);
+    } else {
+      partial[projection][split][r][quad * 8 + c] = accum[i];
+    }
   }
   __syncthreads();
-  for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
-    const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
-    // FP16 materialization is retained before SiLU, then again before the
-    // multiplication. Split>1 changes FP32 association, not quantization.
-    float value = 0;
+  if constexpr (!Cached || Split != 1) {
+    for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
+      const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
+      // FP16 materialization is retained before SiLU, then again before the
+      // multiplication. Split>1 changes FP32 association, not quantization.
+      float value = 0;
 #pragma unroll
-    for (int s = 0; s < Split; ++s) value += partial[p][s][r][c];
-    projected[p][r][c] = __float2half_rn(value);
+      for (int s = 0; s < Split; ++s) {
+        value += partial[p][s][r][c];
+      }
+      projected[p][r][c] = __float2half_rn(value);
+    }
+    __syncthreads();
   }
-  __syncthreads();
   for (int idx = threadIdx.x; idx < count * 32; idx += blockDim.x) {
     const int r = idx / 32, c = idx % 32;
     const int p = Interleaved ? c / 16 : 0;
@@ -139,6 +153,27 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
     out[static_cast<size_t>(rows[group_id * kPack + r]) * 160 +
         blockIdx.x * 32 + c] = __hmul(activated, up);
   }
+}
+
+template <int Split, bool Interleaved>
+__global__ void w13_kernel(const half* x, const uint32_t* weights,
+                           const half* scales, const int32_t* rows,
+                           const int32_t* experts, const int32_t* sizes,
+                           const int32_t* total, half* out) {
+  w13_body<Split, Interleaved>(x, weights, scales, rows, experts, sizes, total,
+                               out);
+}
+
+// M16's direct route uses one K split. Do not accelerate grouped M16 by
+// changing it to split8: that changes FP32 association. Launch bounds let
+// ptxas use more registers for latency hiding without changing that sum.
+template <bool Interleaved>
+__global__ __launch_bounds__(64, 8) void w13_single_split_cached_kernel(
+    const half* x, const uint32_t* weights, const half* scales,
+    const int32_t* rows, const int32_t* experts, const int32_t* sizes,
+    const int32_t* total, half* out) {
+  w13_body<1, Interleaved, true>(x, weights, scales, rows, experts, sizes,
+                                 total, out);
 }
 
 void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
@@ -180,11 +215,25 @@ void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
     }                   \
     break
   switch (split) {
-    CASE(1);
-    CASE(2);
-    CASE(4);
-    CASE(5);
-    CASE(8);
+    case 1:
+#define LAUNCH_EXACT(I)                                                      \
+  w13_single_split_cached_kernel<I><<<dim3(5, routes), 64, 0, stream>>>(     \
+      reinterpret_cast<const half*>(x.data_ptr()),                           \
+      reinterpret_cast<const uint32_t*>(w.data_ptr()),                       \
+      reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(), \
+      experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),                \
+      total.data_ptr<int32_t>(), reinterpret_cast<half*>(out.data_ptr()))
+      if (interleaved) {
+        LAUNCH_EXACT(true);
+      } else {
+        LAUNCH_EXACT(false);
+      }
+#undef LAUNCH_EXACT
+      break;
+      CASE(2);
+      CASE(4);
+      CASE(5);
+      CASE(8);
     default:
       TORCH_CHECK(false, "Unsupported split");
   }

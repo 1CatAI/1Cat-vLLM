@@ -112,6 +112,7 @@ def error(a, b):
     delta = a.float() - b.float()
     return dict(
         exact=torch.equal(a, b),
+        bit_exact=torch.equal(a.view(torch.int16), b.view(torch.int16)),
         max_abs=delta.abs().max().item(),
         relative_l2=(delta.norm() / b.float().norm().clamp_min(1e-12)).item(),
         finite=torch.isfinite(a).all().item(),
@@ -303,7 +304,7 @@ def main():
                 ):
                     raise AssertionError(f"Non-finite output: M{m}/{name}/split{split}")
                 if split == {4: 5, 8: 4, 16: 1}[m] and not all(
-                    c[stage]["exact"] for c in checks for stage in ("mid", "out")
+                    c[stage]["bit_exact"] for c in checks for stage in ("mid", "out")
                 ):
                     raise AssertionError("Packing changed same-split arithmetic")
                 results.append(result)

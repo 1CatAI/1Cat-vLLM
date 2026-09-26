@@ -132,3 +132,66 @@ def test_same_split_matches_production(weights, tokens, split, interleaved):
         out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
     )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_single_split_complete_chain_bitwise_dynamic_graph(weights, interleaved):
+    """The optimized C16 kernel must preserve both FP16 boundaries bitwise."""
+    from vllm import _sm70_ops as ops
+
+    w, s, w2, s2 = weights
+    x = torch.empty(16, 2560, device="cuda", dtype=torch.float16)
+    ids = torch.zeros(160, device="cuda", dtype=torch.int32)
+    topk = torch.softmax(torch.randn(16, 10, device="cuda"), dim=-1)
+    expected_mid = torch.empty(160, 160, device="cuda", dtype=torch.float16)
+    actual_mid = torch.empty_like(expected_mid)
+    expected = torch.empty_like(x)
+    # Guard both ends against packed-route tail overruns.
+    guarded = torch.full((x.numel() + 32,), 7, device="cuda", dtype=x.dtype)
+    actual = guarded[16:-16].view_as(x)
+    routed = torch.empty(160, 2560, device="cuda", dtype=x.dtype)
+    rows = torch.empty(160, 8, device="cuda", dtype=torch.int32)
+    experts = torch.empty(160, device="cuda", dtype=torch.int32)
+    sizes = torch.empty_like(experts)
+    total = torch.empty(1, device="cuda", dtype=torch.int32)
+
+    def candidate():
+        ops.nvfp4_grouped_w13_sm70_out(
+            actual_mid, x, w, s, ids, rows, experts, sizes, total, 1, interleaved
+        )
+        ops.nvfp4_grouped_w2_sm70_out(
+            actual, routed, actual_mid, w2, s2, topk, rows, experts, sizes, total
+        )
+
+    x.normal_(0, 0.1)
+    candidate()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        candidate()
+    patterns = (
+        torch.arange(160),
+        torch.arange(160) % 10,
+        torch.zeros(160, dtype=torch.int64),
+        torch.full((160,), -1),
+        torch.arange(160) % 17,
+        torch.arange(160).flip(0),
+        torch.arange(160) % 3 + 510,  # Valid experts and positive invalid IDs.
+        torch.randint(0, 512, (160,)),
+    )
+    for index in range(32):
+        ids.copy_(patterns[index % len(patterns)])
+        x.normal_(0, (0.001, 0.1, 1.0, 3.0)[index // len(patterns)])
+        for buffer in (rows, experts, sizes, total):
+            buffer.fill_(-9999)
+        actual_mid.fill_(float("nan"))
+        routed.fill_(float("nan"))
+        actual.fill_(float("nan"))
+        graph.replay()
+        ops.nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(
+            expected_mid, x, w, s, ids, interleaved
+        )
+        ops.nvfp4_moe_qpn_w2_reduce_sm70_out(expected, expected_mid, w2, s2, ids, topk)
+        assert torch.equal(actual_mid.view(torch.int16), expected_mid.view(torch.int16))
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert torch.all(guarded[:16] == 7) and torch.all(guarded[-16:] == 7)
