@@ -500,11 +500,13 @@ class GroupCoordinator:
         # watchdog then kills the waiting rank and the boot dies at a timeout
         # instead of an error. The subgroups follow the configured value;
         # unset keeps PyTorch's default.
-        device_timeout = get_distributed_timeout_or_none()
+        self._device_group_timeout = get_distributed_timeout_or_none()
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend, timeout=device_timeout
+                ranks,
+                backend=torch_distributed_backend,
+                timeout=self._device_group_timeout,
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
@@ -578,6 +580,7 @@ class GroupCoordinator:
             group = torch.distributed.new_group(
                 ranks,
                 backend=self.torch_distributed_backend,
+                timeout=self._device_group_timeout,
                 group_desc=group_desc,
             )
             if self.rank in ranks:
