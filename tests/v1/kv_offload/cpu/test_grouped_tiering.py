@@ -346,8 +346,10 @@ def test_spec_tier_creation_failure_closes_all_regions(tmp_path, monkeypatch):
         assert not Path(region.mmap_path).exists()
 
 
-@pytest.mark.parametrize("invalid", [None, "backend", "pipeline", "nodes"])
-def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, invalid):
+@pytest.mark.parametrize(
+    "topology", [None, "decode_cp", "backend", "pipeline", "prefill_cp", "nodes"]
+)
+def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, topology):
     import vllm.v1.kv_offload.tiering.spec as spec_module
 
     def parent_init(self, config, cache):
@@ -358,13 +360,14 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, inva
     monkeypatch.setattr(spec_module.CPUOffloadingSpec, "__init__", parent_init)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=2 if invalid == "pipeline" else 1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-            nnodes=2 if invalid == "nodes" else 1,
+            pipeline_parallel_size=2 if topology == "pipeline" else 1,
+            prefill_context_parallel_size=2 if topology == "prefill_cp" else 1,
+            # DCP ranks are ordinary single-node workers with their own rows.
+            decode_context_parallel_size=2 if topology == "decode_cp" else 1,
+            nnodes=2 if topology == "nodes" else 1,
         ),
         attention_config=SimpleNamespace(
-            backend=None if invalid == "backend" else "FLASH_ATTN_V100"
+            backend=None if topology == "backend" else "FLASH_ATTN_V100"
         ),
         model_config=SimpleNamespace(revision="fixed-model-revision"),
         compute_hash=lambda: "configuration-hash",
@@ -373,7 +376,7 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, inva
         num_blocks=2,
         kv_cache_tensors=[SimpleNamespace(size=8192, shared_by=["a", "b"])],
     )
-    if invalid:
+    if topology not in (None, "decode_cp"):
         with pytest.raises(ValueError, match="Grouped tiering"):
             spec_module.TieringOffloadingSpec(config, cache)
         return
