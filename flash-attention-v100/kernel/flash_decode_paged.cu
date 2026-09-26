@@ -2718,7 +2718,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
       grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
   __shared__ float split_lse[Traits::kSplits];
   __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
-  __shared__ float final_max;
+  __shared__ float split_weight[Traits::kSplits];
   __shared__ float final_inv_sum;
 
   if (threadIdx.x < Traits::kSplits) {
@@ -2747,6 +2747,9 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     for (int split = 0; split < active_splits; ++split) {
       if (split_lse[split] > -1.0e20f) {
         const float weight = __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        // Every output dimension uses the same partition weight. Reuse the
+        // value computed for the denominator without changing reduction order.
+        split_weight[split] = weight;
         if constexpr (ROW_SEQLENS) {
           sum = fmaf(weight, split_sum[split], sum);
         } else {
@@ -2754,7 +2757,6 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         }
       }
     }
-    final_max = max_lse;
     final_inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
   }
   __syncthreads();
@@ -2764,8 +2766,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     float accumulator = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
       if (split_lse[split] > -1.0e20f) {
-        const float weight =
-            __expf(fmaxf(split_lse[split] - final_max, -80.0f)) * final_inv_sum;
+        const float weight = split_weight[split] * final_inv_sum;
         const int64_t partial_idx =
             (((static_cast<int64_t>(split) * MAX_QUERY_TOKENS + token_idx) *
                   kGroupedVerifyHeads +

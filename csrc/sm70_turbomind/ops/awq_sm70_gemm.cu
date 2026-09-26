@@ -1156,7 +1156,18 @@ bool fp8_grouped_bmm_decode_enabled() {
 
 bool awq_reuse_imported_cache_enabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE");
-  return raw != nullptr && std::atoi(raw) != 0;
+  // An imported plan is produced by the coordinated warmup on rank 0.  Keep
+  // it as the default source of truth on the other TP ranks; an explicit 0
+  // remains available for cache-debugging and old standalone warmups.
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
+bool fp8_reuse_imported_cache_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE");
+  // See awq_reuse_imported_cache_enabled().  The Python warmup only marks an
+  // imported cache after rank 0 has finished measuring the shape, so this
+  // does not change the no-cache path.
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool awq_preserve_default_splits_enabled() {
@@ -1357,11 +1368,13 @@ turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
   if (fp8_0dot3_dense_selector_enabled()) {
     return select_dense_dispatch_policy_impl(
         device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-        tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
+        tune_small_shapes_enabled(), fp8_reuse_imported_cache_enabled(),
+        generic_dense_tune_max_m());
   }
   auto policy = select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kFp8Dense,
-      fp8_tune_small_shapes_enabled(), false, fp8_dense_tune_max_m());
+      fp8_tune_small_shapes_enabled(), fp8_reuse_imported_cache_enabled(),
+      fp8_dense_tune_max_m());
   if (!fp8_safe_fast_selector_enabled()) {
     return policy;
   }
@@ -1372,7 +1385,7 @@ turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kMxfp4Dense,
-      mxfp4_tune_small_shapes_enabled(), false, mxfp4_dense_tune_max_m());
+      mxfp4_tune_small_shapes_enabled(), true, mxfp4_dense_tune_max_m());
 }
 
 turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
@@ -1384,7 +1397,7 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
   }
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kNvfp4Dense,
-      nvfp4_tune_small_shapes_enabled(), false, nvfp4_dense_tune_max_m());
+      nvfp4_tune_small_shapes_enabled(), true, nvfp4_dense_tune_max_m());
 }
 
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
