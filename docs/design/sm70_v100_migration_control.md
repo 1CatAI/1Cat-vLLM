@@ -48104,3 +48104,21 @@ has launched no full model. Details and artifacts are in
 - Reject original-layout GDN: exact M5 36-layer chain regresses from
   1.104200 to 1.444454 ms even with read-only loads; M10 also regresses.
   Do not spend another full-model run on this variant.
+- Normal-build draft tests pass 14 cases; the real-weight benchmark covers
+  all four TP slices and 16 M1/M5/W13/W2 cases at six scales with zero bit
+  differences. Native `_C` SHA256 is
+  `647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`.
+- The first engine candidate missed the native route because modular
+  `TritonExperts` bypassed the common dispatcher. Retain the stopped attempt
+  (exit -15), route both projections through the common entry, and require
+  the native route log in the corrected candidate. Two additional GPU tests
+  verify this modular entry, both operator hits and graph output bit parity.
+  The same-GPU control completes at **23.950179 ms**; its corrected candidate
+  remains pending. Do not relabel the older 23.849974-ms pair.
+- The refreshed Nsight report warns of unsupported driver CUDA 13.0 and
+  possibly incomplete CUDA/NVTX records on all four workers. Empty intervals
+  mean no recorded kernel; they do not prove removable GPU idle time.
+- Reject original-layout HC shared staging: exact M5 13.664 ->
+  18.052--21.776 us and M10 14.424 -> 20.924--23.592 us. Asking the identical
+  kernel to prefer L1 also gives no gain (M5 12.696 -> 12.716 us). Retain
+  `hc_up_original_shared` and `hc_up_cache`; skip full-model runs for both.

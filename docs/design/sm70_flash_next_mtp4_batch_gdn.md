@@ -410,18 +410,24 @@ Post-merge CPU regression: **108 passed, 8 GPU cases skipped**, using
 `tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py`.
 This CPU result does not replace the prior GPU gates or establish new model
 performance. The accepted 23.849974-ms pair keeps its original source/build
-identity. Draft-MoE geometry and original-layout GDN prototypes are isolated
-component screens; no result is inferred before an owned GPU is available.
+identity. Subsequent draft-MoE and original-layout component screens are
+recorded below; their timings do not replace this endpoint pair.
 
 ### Refreshed node trace and exact draft-MoE screen
 
 `mtp_stack_trace_flush` uses the refreshed source/native build above. The
 report contains all four TP workers and **84 closed rounds**. Generation
-finishes, but capture shutdown terminates the primary process (exit 143) and
+finishes, but the primary exits during capture shutdown (exit 143) and
 leaves workers waiting; only these owned processes are cleaned up. The
 post-trace phase request does not run. Retain this limitation: the kernel
 intervals are usable, but this is not a successful endpoint or phase run.
 The next capture launcher explicitly sets `--kill=none --wait=primary`.
+
+The Nsight diagnostic table warns for all four TP workers that the driver's
+CUDA 13.0 version is unsupported by Nsight Systems 2025.1.1 (tracing uses
+12.8 libraries), and that CUDA and NVTX records may be incomplete. Each
+selected target/draft window contains 2,060/298 recorded kernels, but empty
+intervals must remain **no recorded kernel**, not proven GPU idle time.
 
 The rank0 intervals close as follows; these are **profiled milliseconds**:
 
@@ -481,11 +487,72 @@ the normal `_C` build, guarded by opt-in `VLLM_SM70_MTP_MOE_FP16_EXACT=1`,
 exact M1/M5/E512/H2560/I160/top10 geometry, FP16 contiguous tensors, the
 audited BM2 tile, SM70, and no bias/quantization/sorted assignment. Unsupported
 inputs retain their existing route. It adds no persistent weight copy and
-leaves target batch decode unchanged. Native GPU and full-model gates are
-pending; do not promote this component number to a new endpoint result.
+leaves target batch decode unchanged. Normal-build component gates are
+reported below; do not promote projection times to an endpoint result.
 
 Reject the original-layout GDN screen without another engine run: all 36
 real rank0 layers remain exact, but the M5 chain costs 1.104200 ms packed
 versus 1.510728 ms original / 1.444454 ms with read-only loads; M10 costs
 1.126441 versus 1.929830 / 1.706721 ms. Record
 `gdn_input_original.{json,cu,py}` so this layout change is not repeated.
+
+### Normal-build draft gates and modular dispatch
+
+The normal `_C` build has SHA256
+`647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`.
+Its dependencies resolve only to the declared Torch/CUDA runtime. The
+draft test suite passes 14 cases (9 metadata/default tests and 5 GPU tests).
+The normal-build benchmark covers all four real TP weight slices, M1/M5,
+W13/W2, six activation scales, changed routes and poisoned graph outputs:
+all 16 projection cases have zero FP16-bit differences.
+
+```bash
+.venv/bin/python -m benchmarks.kernels.benchmark_sm70_mtp_moe_fp16 \
+  --model /data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --out .artifacts/draft_moe_native_checkpoint.json
+```
+
+These are isolated projection times across the four weight slices on one
+leased GPU, not four-rank engine timings:
+
+| Projection | Tuned Triton us | Native us |
+| --- | ---: | ---: |
+| M1 W13 | 105.267--105.434 | 58.931--63.526 |
+| M1 W2 | 24.858--25.472 | 12.922--13.536 |
+| M5 W13 | 173.338--174.502 | 101.875--109.670 |
+| M5 W2 | 95.206--95.706 | 54.394--55.328 |
+
+The first model candidate revealed that `TritonExperts.apply` bypassed the
+common dispatcher and called the low-level Triton implementation directly.
+It never selected the new operator and was stopped (exit -15); retain
+`mtp_draft_exact_candidate` as an invalid route-hit attempt, not performance
+evidence. Both modular projections now use the common dispatcher. W13
+receives the routing-weight pointer with multiplication still disabled.
+Two additional GPU tests exercise this actual modular entry at M1/M5,
+assert both native operator calls, and preserve the entire MoE output bits
+under changed-input CUDA Graph replay. This correction is Python-only;
+the native extension hash is unchanged.
+
+The same-GPUs0--3 control on this native build completes at
+23.955188/23.945170 ms, median **23.950179 ms**, with the three previously
+qualified optimizations enabled and the new draft flag disabled. The
+corrected candidate is queued for the same physical GPU group. Keep this
+new pair distinct from the earlier 23.849974-ms build identity; no new
+complete-round improvement is claimed before its candidate gate finishes.
+
+### Additional HC screens rejected before model testing
+
+`hc_up_original_shared` preserves gate and mixed-output bits on eight real
+weight pairs and five scales, but staging original-layout weights in shared
+memory regresses M5 from 13.664 us to 18.052--21.776 us per pair and M10
+from 14.424 us to 20.924--23.592 us. Reject all four tile/padding variants.
+
+`hc_up_cache` compares identical original-layout arithmetic with default
+cache configuration and `cudaFuncCachePreferL1`/zero preferred shared
+carveout. M5 changes 12.696 -> 12.716 us; M10 15.528 -> 15.588 us, with
+zero bit differences. L1 preference supplies no gain. The separate M5
+fusion is only about 0.99 us faster than the unfused reference and regresses
+M10; this is no qualified engine improvement. The cache hypothesis follows
+the [Volta unified-cache documentation](https://docs.nvidia.com/cuda/volta-tuning-guide/index.html#unified-shared-memory-l1-texture-cache),
+not an observed hardware counter. NCU remains blocked by
+`ERR_NVGPUCTRPERM`. Retain both screen reports and skip engine runs for them.

@@ -173,3 +173,74 @@ def test_native_rejects_unaligned_weight(cuda_weights):
             torch.tensor([20], device="cuda", dtype=torch.int32),
             True,
         )
+
+
+@pytest.mark.parametrize("m", [1, 5])
+@torch.inference_mode()
+def test_modular_experts_route_and_graph(cuda_weights, monkeypatch, m):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    envs.disable_envs_cache()
+    experts = TritonExperts(make_dummy_moe_config(), FUSED_MOE_UNQUANTIZED_CONFIG)
+    x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
+    ids = torch.zeros(m, 10, device="cuda", dtype=torch.int32)
+    weights = torch.softmax(torch.randn(m, 10, device="cuda"), -1)
+    shapes = experts.workspace_shapes(
+        m, 320, 2560, 10, 512, 512, None, MoEActivation.SILU
+    )
+    workspaces = [x.new_empty(shape) for shape in shapes[:2]]
+    outputs = [torch.empty_like(x) for _ in range(2)]
+    native = torch.ops._C.sm70_mtp_moe_fp16_out
+    hits = []
+
+    def tracked(*args):
+        hits.append(args[-1])
+        native(*args)
+
+    monkeypatch.setattr(torch.ops._C, "sm70_mtp_moe_fp16_out", tracked)
+
+    def run(arm):
+        experts.apply(
+            outputs[arm],
+            x,
+            *cuda_weights,
+            weights,
+            ids,
+            MoEActivation.SILU,
+            512,
+            None,
+            None,
+            None,
+            *workspaces,
+            None,
+            False,
+        )
+
+    graphs = []
+    for arm in range(2):
+        monkeypatch.setenv("VLLM_SM70_MTP_MOE_FP16_EXACT", str(arm))
+        envs.disable_envs_cache()
+        hits.clear()
+        run(arm)
+        assert hits == ([False, True] if arm else [])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(arm)
+        graphs.append(graph)
+    for scale in (0.0, 0.001, 0.1, 1.0, 3.0):
+        x.normal_(0, scale)
+        ids.random_(0, 512)
+        ids[0, 0] = -1
+        weights.copy_(torch.softmax(torch.randn_like(weights), -1))
+        for workspace in workspaces:
+            workspace.fill_(float("nan"))
+        for output in outputs:
+            output.fill_(float("nan"))
+        for graph in graphs:
+            graph.replay()
+        assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
