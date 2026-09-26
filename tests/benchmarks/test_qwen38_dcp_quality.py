@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only validation of the offline qualification transport."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from benchmarks.benchmark_qwen38_dcp_quality import (
+    build_prompts,
+    run,
     validate_manifest_transport,
     worker_manifest,
 )
@@ -63,3 +66,121 @@ def test_manifest_callable_and_result_roundtrip(monkeypatch):
     assert decoded == manifest
     assert decoded["physical_kv_bytes"] == 4096
     assert decoded["dcp"] == 2
+
+
+class TemplateTokenizer:
+    def apply_chat_template(self, messages, *, tokenize, return_dict=True, **kwargs):
+        if not tokenize:
+            return "START ARCHIVE_BODY END"
+        return {"input_ids": [1, 2, 3]} if return_dict else [1, 2, 3]
+
+    def encode(self, text, **kwargs):
+        return [ord(c) for c in text]
+
+
+@pytest.mark.parametrize("long_context", [False, True])
+def test_all_prompt_inputs_are_ready_before_model_load(long_context):
+    cases, boundary = build_prompts(TemplateTokenizer(), long_context)
+    assert [len(ids) for _, ids, _ in cases[:4]] == [3, 3, 3, 3]
+    assert [len(ids) for _, ids, _ in cases[4:]] == (
+        [8192, 32768, 261632] if long_context else [8192]
+    )
+    assert (len(boundary) if boundary is not None else 0) == (
+        262143 if long_context else 0
+    )
+
+
+def test_bad_tokenizer_output_fails_before_model_load():
+    class BrokenTokenizer(TemplateTokenizer):
+        def apply_chat_template(self, *args, tokenize, **kwargs):
+            if tokenize:
+                return {"input_ids": [1, 2, 3]}
+            return super().apply_chat_template(*args, tokenize=False, **kwargs)
+
+    with pytest.raises(TypeError, match="integer token IDs"):
+        build_prompts(BrokenTokenizer(), False)
+
+
+@pytest.mark.parametrize("healthy", [False, True])
+def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, healthy):
+    import transformers
+
+    import vllm
+
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: TemplateTokenizer(),
+    )
+    shutdowns = []
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            self.llm_engine = SimpleNamespace(
+                engine_core=SimpleNamespace(
+                    shutdown=lambda **kwargs: shutdowns.append(True)
+                )
+            )
+
+        def collective_rpc(self, *args, **kwargs):
+            return [
+                dict(
+                    mtp=False,
+                    prefix_cache=False,
+                    ssm_dtype="float32",
+                    fp16_reduced_reduction=False,
+                    bf16_reduced_reduction=False,
+                    fp16_accumulation=False,
+                    dcp=1,
+                    kv_dtype="fp8_e4m3",
+                    ple_environment={"VLLM_PLE_DISK_OFFLOAD": "1"},
+                )
+            ]
+
+        def generate(self, prompts, sampling, **kwargs):
+            assert all(isinstance(t, int) for t in prompts[0]["prompt_token_ids"])
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            text="437 CEDAR-47|8261 MAPLE-8261" if healthy else "bad",
+                            token_ids=[7],
+                            finish_reason="stop",
+                            logprobs=[{7: SimpleNamespace(logprob=-0.5)}],
+                        )
+                    ],
+                    metrics=SimpleNamespace(
+                        is_corrupted=False,
+                        scheduled_ts=1.0,
+                        first_token_ts=2.0,
+                        last_token_ts=3.0,
+                    ),
+                )
+            ]
+
+    monkeypatch.setattr(vllm, "LLM", FakeLLM)
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps(dict(temperature=0.7, top_p=0.8, top_k=20))
+    )
+    args = SimpleNamespace(
+        model=str(tmp_path),
+        dcp=1,
+        kv_gib=4.0,
+        kv_dtype="auto",
+        long_context=True,
+        preflight_only=False,
+        reference=None,
+        output=tmp_path / "report.json",
+    )
+    if healthy:
+        run(args)
+    else:
+        with pytest.raises(RuntimeError, match="Quality gate failed"):
+            run(args)
+    report = json.loads(args.output.read_text())
+    assert report["complete"] is healthy
+    assert len(report["cases"]) == (7 if healthy else 1)
+    if healthy:
+        assert report["exact_256k_boundary"]["finite"]
+    assert shutdowns == [True]

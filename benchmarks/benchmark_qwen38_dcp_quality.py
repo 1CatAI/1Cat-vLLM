@@ -75,6 +75,65 @@ def validate_manifest_transport():
     MsgpackEncoder().encode((0, 0, "collective_rpc", (worker_manifest, 30, (), {})))
 
 
+def build_prompts(tokenizer, long_context):
+    """Materialize and validate every input before allocating the model."""
+    cases = []
+    for name, text, expected in (
+        ("arithmetic", "请计算 19 × 23，在最后写出 RESULT=计算结果。", "437"),
+        ("copy", "档案编号是 CEDAR-47|8261。请准确复述编号。", "CEDAR-47|8261"),
+    ):
+        ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=True,
+            return_dict=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        cases.extend(
+            [("official_" + name, ids, expected), ("greedy_" + name, ids, expected)]
+        )
+
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "ARCHIVE_BODY\n找到档案口令，只输出口令。"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    lead, tail = [
+        tokenizer.encode(s, add_special_tokens=False)
+        for s in rendered.split("ARCHIVE_BODY")
+    ]
+    filler = tokenizer.encode(
+        "这是一条普通档案记录，没有口令。\n", add_special_tokens=False
+    )
+    record = tokenizer.encode(
+        "\n唯一档案口令：MAPLE-8261。\n", add_special_tokens=False
+    )
+    for length in [8192, 32768, 261632] if long_context else [8192]:
+        count = length - len(lead) - len(tail) - len(record)
+        body = (filler * ((count + len(filler) - 1) // len(filler)))[:count]
+        ids = lead + body[: count // 2] + record + body[count // 2 :] + tail
+        if len(ids) != length:
+            raise ValueError(f"Retrieval prompt length mismatch: {length}")
+        cases.append((f"greedy_retrieval_{length}", ids, "MAPLE-8261"))
+    boundary_ids = (
+        (filler * ((262143 + len(filler) - 1) // len(filler)))[:262143]
+        if long_context
+        else None
+    )
+    prompts = [(name, ids) for name, ids, _ in cases]
+    if boundary_ids is not None:
+        prompts.append(("exact_256k_boundary", boundary_ids))
+    for name, ids in prompts:
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or not all(isinstance(token, int) and token >= 0 for token in ids)
+        ):
+            raise TypeError(f"{name}: expected a nonempty list of integer token IDs")
+    return cases, boundary_ids
+
+
 def run(args):
     from transformers import AutoTokenizer
 
@@ -111,6 +170,15 @@ def run(args):
     )
     # Greedy, natural EOS is used ONLY for deterministic DCP1/2 token comparison.
     deterministic = SamplingParams(max_tokens=512, temperature=0, seed=0)
+    prompts, boundary_ids = build_prompts(tokenizer, args.long_context)
+    report["preflight"] = {
+        "prompt_lengths": {name: len(ids) for name, ids, _ in prompts},
+        "boundary_tokens": len(boundary_ids) if boundary_ids is not None else 0,
+    }
+    if args.preflight_only:
+        save()
+        print(json.dumps(report["preflight"]), flush=True)
+        return
     reference = {}
     if args.reference:
         previous = json.loads(args.reference.read_text())
@@ -212,47 +280,11 @@ def run(args):
             if not passed:
                 raise RuntimeError(f"Quality gate failed: {name}")
 
-        for name, text, expected in (
-            ("arithmetic", "请计算 19 × 23，在最后写出 RESULT=计算结果。", "437"),
-            ("copy", "档案编号是 CEDAR-47|8261。请准确复述编号。", "CEDAR-47|8261"),
-        ):
-            ids = tokenizer.apply_chat_template(
-                [{"role": "user", "content": text}],
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            )
-            check("official_" + name, ids, official, expected)
-            check("greedy_" + name, ids, deterministic, expected)
-
-        # Crosses scheduler and compressed-index pages, including chunked prefill.
-        lengths = [8192, 32768, 261632] if args.long_context else [8192]
-        rendered = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "ARCHIVE_BODY\n找到档案口令，只输出口令。"}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        lead, tail = [
-            tokenizer.encode(s, add_special_tokens=False)
-            for s in rendered.split("ARCHIVE_BODY")
-        ]
-        filler = tokenizer.encode(
-            "这是一条普通档案记录，没有口令。\n", add_special_tokens=False
-        )
-        record = tokenizer.encode(
-            "\n唯一档案口令：MAPLE-8261。\n", add_special_tokens=False
-        )
-        for length in lengths:
-            count = length - len(lead) - len(tail) - len(record)
-            body = (filler * ((count + len(filler) - 1) // len(filler)))[:count]
-            ids = lead + body[: count // 2] + record + body[count // 2 :] + tail
-            check(f"greedy_retrieval_{length}", ids, deterministic, "MAPLE-8261")
-        if args.long_context:
+        for name, ids, expected in prompts:
+            sampling = official if name.startswith("official_") else deterministic
+            check(name, ids, sampling, expected)
+        if boundary_ids is not None:
             # An allocation/finite-output gate, not complete-answer quality.
-            boundary_ids = (filler * ((262143 + len(filler) - 1) // len(filler)))[
-                :262143
-            ]
             boundary = llm.generate(
                 [{"prompt_token_ids": boundary_ids}],
                 SamplingParams(max_tokens=1, temperature=0, logprobs=1),
@@ -291,6 +323,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--kv-gib", type=float, default=4.0)
     parser.add_argument("--long-context", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     run(parser.parse_args())
