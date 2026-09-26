@@ -47666,3 +47666,267 @@ has launched no full model. Details and artifacts are in
 - Fresh default-configuration service logs, smoke requests, CI and merge
   records are retained under task-private
   `verification/batch-followup-20260925/merge-defaults/`.
+
+## 2026-09-24 Qwen3.8 Flash-Next NVFP4 MTP4 full-round cost
+
+- The acceptance contract is the **complete** TP4/V2 MTP4 verification round,
+  not the target-only forward: 8,192 fixed input tokens, 513 greedy output
+  tokens, disk-backed PLE without prefault, FP16 activations/KV, full/piecewise
+  CUDA Graph, four V100-SXM2-32GB GPUs. The retained control is
+  13.13857 s / 307 rounds = 42.797 ms/round, with 1.671 accepted tokens per
+  round. The low-overhead trace attributes 33.35 ms to PLE-input submission
+  through verifier-result sampling and 10.92 ms to sampling, draft, and
+  next-round preparation. The post-PLE target graph alone is 24.66 ms, so a
+  20-ms **complete** round cannot come from a PLE-only tweak.
+- Direct NVFP4 MTP5 expert and 25-KiB TP push together reached
+  5.16974 s / 131 rounds = 39.464 ms/round on disk PLE, but the deterministic
+  fixed output first diverged at token index 8. Two of three natural prompts
+  also diverged. The higher acceptance is from a changed output stream, not a
+  qualified speedup. Do not enable this pair by default or reuse its
+  99-tok/s emitted rate as a quality-preserving result.
+- Draft PR [#684](https://github.com/1CatAI/1Cat-vLLM/pull/684) instead
+  accelerates only the byte-exact short disk-PLE gather. The steady complete
+  round first fell to 11.85655 s / 307 = 38.621 ms (9.8% below the control)
+  with sorted-scatter. Direct copying from retained mmap addresses then cut the
+  matched repeat to 11.38005 s / 307 = 37.069 ms (13.4% below the original
+  control). Both fixed requests and all three natural-prompt outputs match
+  token-for-token with unchanged draft counts. Twelve targeted CPU tests pass.
+  Larger prefill gathers retain their deduplicated, parallel route; the direct
+  copy does not allocate a second table. The complete 20-ms goal remains open.
+- An exact Triton screen of the M=5, 50-route MoE sort/expand matched all
+  output bytes and routing metadata and reduced that isolated operator from
+  25.6 to 13.3 microseconds. Across 48 target layers it projects only about
+  0.6 ms/round, so no extra full-model startup is warranted for this candidate
+  while the 20-ms gap remains. Prior direct-W13 split-K 1/4/5/8/10/16/20/32
+  screens were all non-bitwise relative to the generic path; do not repeat them
+  as an output-parity fix.
+- The 4.87-ms draft-completion to next-PLE-input interval has only about
+  0.43 ms of visible rank-0 GPU kernels and is largely host/launch/coordination.
+  A single 12-step scheduled Torch CPU/GPU profile was deliberately diagnostic
+  only: it slowed a 129-token request to 11.11 seconds of decode, so its times
+  are not endpoint speed figures. Python-stack attribution nonetheless found
+  three GDN metadata-builder calls per step. Over those 12 steps,
+  `build_gdn_spec_decode_state_contract` performed 180 `aten::index` and 180
+  `aten::nonzero` calls, all under target `execute_model`; its nested CPU span
+  accounted for about 7.38 ms/step in the perturbed trace. The existing pure
+  DDTree state path avoids those dynamic boolean indices, but ordinary MTP4
+  does not select it. An isolated single-request, all-spec fixed-slice GDN
+  candidate matched its masked-index tensors in CPU/GPU unit tests and reduced
+  one standalone call from 0.189 to 0.027 ms. The necessary full-model gate
+  **failed**: with the same direct-copy PLE route, fixed output first diverged
+  at token 25 and verification grew from 307 to 441 rounds; natural prompts
+  0 and 2 diverged at tokens 36 and 208. It is not in PR #684 and must not be
+  counted as a speedup. The isolated candidate was reverted after the run;
+  unit-level tensor equality did not establish whole-graph state equivalence.
+- A GPU-only SM70 M=5 FP16 projection screen tested a five-row Triton GEMV
+  with FP32 accumulation against the existing PyTorch linear graph, without
+  loading the model. At K=2560/N=4096 its best graph median was 44.0 vs
+  49.2 microseconds, but 130 of 20,480 FP16 outputs differed (max 0.125).
+  K=10240/N=336 and K=1536/N=2560 were slower (best 39.9 vs 19.5 and 23.6
+  vs 21.5 microseconds) and also non-bitwise. The direct M=5 GEMV is therefore
+  not a quality-preserving or sufficiently large target-graph optimization;
+  do not start a whole model for this candidate.
+- A representative steady node-trace round has 427 CUTLASS FP16 `Kernel2`
+  launches taking 7.699 ms of perturbed kernel service; MoE expert GEMM is
+  another 3.696 ms. These are diagnostic GPU service times, not additive
+  untraced wall time. A GPU-only PyTorch BLAS-preference screen found cuBLASLt
+  faster than cuBLAS only at M=5/K=2560/N=4096 (45.1 vs 49.2 microseconds),
+  but 5,619 outputs differed; at K=10240/N=336 and K=1536/N=2560 cuBLASLt
+  was slower and non-bitwise. Neither a BLAS toggle nor the direct GEMV passes
+  the exact-output gate. Reaching 20 ms/round requires substantial target-graph
+  and draft/preparation changes, not further PLE-only tuning. At the retained
+  1.671 accepted tokens/round, 20 ms/round is only 83.6 emitted tokens/s; to
+  exceed the approximately 98-token/s no-MTP baseline at unchanged acceptance
+  requires below 17.1 ms/round.
+- The latest direct-copy low-overhead Nsight graph capture at source
+  `48be98393d` matches all 513 fixed output tokens and 307 verifier rounds.
+  Its **decode-only** metric is 12.505251 s / 307 = 40.734 ms/round under
+  tracing, versus the same-code untraced repeat of 37.069 ms/round. Across
+  306 closed PLE-to-PLE intervals, 40.669 ms mean divides without overlap
+  into PLE input-to-four-rank-result readiness **4.437 ms**, post-PLE target
+  **25.112 ms**, verifier sampling/draft **6.169 ms**, and next-round
+  preparation **4.951 ms**. The 4.437-ms PLE-related window includes IPC,
+  fanout, and overlapping pre-PLE GPU work, not just mmap lookup. Five rounds
+  have request-to-first-result waits over 10 ms, so the complete-round p99 is
+  56.223 ms; the trace cannot alone attribute those stalls to disk faults or
+  worker scheduling. The 13.482920-s traced request wall includes prefill and
+  must not be divided by 307 as a decode metric. Full local report and raw
+  SQLite are in `.artifacts/mtp_disk_memmove_graph_report.md` and
+  `.artifacts/mtp_disk_memmove_graph_trace.sqlite`.
+
+## 2026-09-24 Qwen3.8 MTP4 draft-combine to next-PLE reduction
+
+- Follow-up to PR #684 uses the same 8,192-token fixed prompt, 513 greedy
+  output tokens, TP4 on V100-SXM2-32GB, MTP4, disk-backed PLE without prefault,
+  FP16 activation/KV, and CUDA Graph settings above. The target is the **closed
+  draft-combine to next PLE-input interval**, not an estimate from Python
+  profiler inclusive spans. Its GPU-combine-to-host-PLE boundary can include
+  queueing/handoff and must not be labeled wholly as CPU execution. No model
+  precision or sampling setting changed.
+- The PLE worker now computes at most 16 offloaded n-gram IDs with scalar
+  signed-int64-wrap arithmetic instead of many tiny CPU Torch operations, and
+  enqueues a byte-exact pinned H2D copy directly on each rank's existing copy
+  stream before its completion semaphore. The 5-by-16-ID CPU microbenchmark
+  fell from 0.379 to 0.035 ms median; four-rank fanout enqueue from 0.126
+  to 0.033 ms median. The short-ID path has randomized EOS, padding, and
+  multi-request equality tests; larger gathers keep their prior route.
+- The GPU runner submits PLE as soon as token/query/context inputs are ready,
+  overlapping CPU lookup with attention and Mamba metadata preparation. The
+  ordinary MTP4 GDN contract does **not** receive `current_state_block_ids`,
+  so optimizing that other branch would miss this workload. The active branch
+  now converts authoritative CPU speculative-row masks into GPU `index_select`
+  indices instead of GPU boolean indexing and its dynamic-shape synchronization.
+  For an all-speculative batch it clones the selected block/count/selector
+  tensors and creates an empty non-spec result, retaining the independent,
+  contiguous copy semantics. CPU/GPU pure-spec, mixed, and pure non-spec tests
+  match the masked-index reference; the standalone pure-spec contract fell from
+  about 0.11 to 0.055 ms per call. The previously rejected fixed-slice/no-copy
+  candidate remains rejected because it failed the whole-model quality gate.
+- One same-setting low-overhead graph capture per accepted stage reports 306
+  closed rounds: original combine-to-next-PLE mean **4.951 ms**, after PLE
+  submission and active-branch `index_select` **3.503 ms**, and after the
+  independent-copy pure-spec fast path **3.248 ms** (1.703 ms / 34.4% below
+  original). The final captured complete-round mean is 36.865 ms versus
+  original 40.669 ms; captures perturb throughput, so compare their stage
+  boundaries, not their wall time to an untraced run. Final untraced fixed
+  repeat decode is **10.82794 s / 307 = 35.270 ms/round** versus the original
+  11.38005 s / 307 = 37.069 ms/round. Two fixed and three natural-prompt
+  outputs match their pre-change token IDs and verifier-round counts exactly.
+  The three affected test files passed 188 tests before the final pure-spec
+  addition; its expanded pure/mixed/non-spec matrix then passed ten cases.
+  Local raw evidence: `.artifacts/mtp_disk_pure_clone_probe.json` and
+  `.artifacts/mtp_disk_pure_clone_graph_trace.sqlite`; the earlier-stage
+  comparison is `.artifacts/mtp_disk_early_ple_probe.json` and
+  `.artifacts/mtp_disk_early_ple_graph_trace.sqlite`.
+- The remaining 3.248-ms stage is still worth profiling, but the final trace
+  already spends 25.120 ms from four-rank PLE readiness to verifier gather and
+  6.172 ms in verifier sampling/draft. Thus eliminating this preparation stage
+  entirely would still leave over 31 ms/round under the current target graph
+  and acceptance rate. The 20-ms complete-round objective is not achieved by
+  this change; next decisions should prioritize target-graph/draft cost rather
+  than repeatedly loading the model for sub-0.1-ms host candidates.
+
+## 2026-09-24 Qwen3.8 MTP4 shared and fused GDN metadata follow-up
+
+- The preceding 3.248-ms draft-combine-to-next-PLE trace showed 102 CUDA
+  runtime calls in one representative rank-0 interval, including 57 kernel
+  launches and 39 asynchronous copies. Three GDN builders independently
+  classified the same request batch. MTP4 on SM70 now computes their common
+  classification, query offsets, and token indices once. This default path is
+  controlled by `VLLM_SM70_MTP4_SHARED_GDN_METADATA=1`; setting it to `0`
+  restores the old per-builder path. No model arithmetic or precision changed.
+- A further opt-in, `VLLM_SM70_MTP4_FUSED_GDN_METADATA=1`, reuses the grouped
+  pointer-table kernel to populate all GDN cache groups and shared graph
+  buffers in one launch for pure speculative FULL-graph batches. The MTP4
+  align-mode state column is selected from sequence length and Mamba block
+  size, matching `mamba_get_block_table_tensor`; DFlash2 retains its separate
+  post-precopy start-index contract. Mixed/prefill or unsupported batches
+  fall back. The fusion flag defaults to `0` pending the verifier-trajectory
+  audit below.
+- At the three-group, MTP4 width-5 V100 micro shape, pure-single-request
+  metadata submission was 1.757 ms legacy, 1.434 ms shared, and 0.120 ms
+  fused (full GPU completion: 1.776, 1.454, 0.136 ms respectively).
+  Three-request pure-spec behaved similarly. Mixed three-request metadata
+  submission was 2.515 ms legacy versus 1.562 ms shared; fusion is not used
+  for mixed batches. Twelve targeted tests cover shared pure/mixed metadata,
+  fused MTP4 query lengths 2-5 in both `none` and `align` modes, changing
+  sequence lengths/accepted counts, and existing DFlash2 fused behavior. All
+  compared scalar and tensor metadata fields match the original builders.
+- Three single-start TP4 V100 full-model runs used identical 8,192-token
+  fixed input, 513 greedy output tokens, MTP4, FP16 activation/KV, disk PLE
+  without prefault, and the same graph configuration. On the same committed
+  source, the unchanged GDN path and shared-only path each used **306**
+  verification rounds and generated identical tokens for both fixed prompts
+  and all three natural prompts. The second fixed request's pure decode fell
+  from **10.756 to 10.032 s** (47.60 to 51.04 emitted tok/s, +7.2%); the first
+  repeat showed the same direction. This is a matched endpoint measurement,
+  not a per-kernel attribution. The earlier pre-commit record used 307 rounds,
+  so it is not substituted for this same-source control.
+- The opt-in fused run also produced identical output tokens, but required
+  **308** fixed-prompt verification rounds versus the same-source control's
+  306. Its low-overhead trace reduced the target interval from the preceding
+  3.248-ms reference to **0.896 ms** mean (p50 0.857 ms) across 307 closed
+  rounds; the captured complete-round mean was 34.529 ms. Because the draft
+  acceptance trajectory differs, this is a promising speed experiment, **not
+  the default quality-approved route**. Do not infer arithmetic parity from
+  matching final tokens alone or compare whole-round means as exact A/B
+  throughput. Next work should isolate graph-buffer aliasing/metadata reuse
+  effects before enabling the fusion default. Raw local evidence is in
+  `.artifacts/mtp4_fused_gdn_probe.json`,
+  `.artifacts/mtp4_fused_gdn_graph_trace.sqlite`,
+  `.artifacts/mtp4_shared_only_probe.json`, and
+  `.artifacts/mtp4_current_source_old_gdn_probe.json`. All GPU test processes
+  exited.
+
+## 2026-09-26 Flash-Next MTP4 combined acceleration defaults
+
+- The user explicitly requested merging PR #684 and enabling its accelerated
+  paths together with the already-merged PR #398. This supersedes the earlier
+  default-off deployment decision. It does not turn the historical output or
+  acceptance differences into an exact-output performance result.
+- Integration base is `fcf59f8e9ae50c186333e98e5cf6aae705f320de` on
+  `onecat/main`; PR #684 starts at `98b81ea69c09ae494e22bc7f22f2f7219065023a`.
+  The integration preserves both sides of the append-only worklog conflict.
+  Native M5 direct experts, the 25-KiB push collective, shared MTP4 GDN
+  classification, and fused pure-speculative GDN writes now default on.
+  Explicit zero overrides and all existing capability/shape gates remain.
+- Both native push dispatch sites now agree with the Python default; changing
+  only `envs.py` would leave the real collective disabled when the variable
+  is absent. Rebuild the normal package extension for the new default.
+- The earlier PR CI failures were a missing `list[int]` annotation and CUDA
+  device-count/device-context calls in its new four-GPU PLE test. Those calls
+  now use `torch.accelerator`.
+- Fresh qualification uses TP4 V100-SXM2-32GB, Torch 2.10.0+cu128 and CUDA
+  12.8.93, FP16 activations/KV, max length 32768, batch limit 8192, one request,
+  GPU memory utilization 0.95, prefix caching, V2 runner and
+  FULL_AND_PIECEWISE CUDA Graphs. RAM PLE and disk mmap PLE are measured
+  separately. Fixed speed requests use 8192 input/513 output tokens,
+  temperature 0/seed 0/forced length; natural quality uses temperature 1.0,
+  top-p 0.95/top-k 20 and natural EOS. HumanEval 0-7 uses deterministic
+  code generation and executable assertions.
+- Build, focused tests, matched endpoint runs and trace qualification are
+  retained in this task's `.artifacts/`; results will be recorded after the
+  freshly built artifact completes these gates. No new speed result is
+  claimed by this integration commit.
+
+## 2026-09-26 Accepted MTP4 common-path baseline and trace
+
+- The owner accepted **27.3963 ms per complete MTP round** as the development
+  baseline. This is decode time / speculative rounds, including target,
+  draft and host work. Freeze this result; do not repeat no-MTP baseline or
+  broad quality sweeps. Development uses the owned source/in-place build;
+  no further wheel packaging is requested.
+- Exact MTP4 now shares the existing FP16 GEMV/GDN/HC admission and defaults,
+  hybrid pinned-UVA PLE and dual compilation. The drafter shares parameters
+  through a decode compiler view and uses the existing split graph manager.
+  The first combined trace exposed missing M=1 draft graphs; the corrected
+  run captures target `(5, 10)` and draft `(1)` and proves GEMV/HC execution.
+- Measured source is `6b8cc4eaa7bed73b56176549ab6dbcce940b5887` plus saved
+  patch `35f8cb9ac6ebea7ce4cf58562c503c376596ba0991532dfa8193376b348a5636`.
+  TP4 V100, FP16 activation/KV, FP32 SSM, 32768 capacity, 8192 chunk,
+  C=1, memory 0.95, prefix cache on, MTP4; all PLE rows occupy pinned host RAM
+  (11.92 GiB/rank). Acceleration switches are unset and resolve on by default.
+- The 8192/513 fixed fixture takes 9.177750 s decode / 335 rounds =
+  27.3963 ms/round, acceptance length 1.5284 and 55.79 emitted tok/s.
+  This forced-length fixture continues after EOS and is a cost reference.
+  Natural EOS cases emit 284/329/421 tokens at 135.23/148.36/86.94 tok/s;
+  all answers are healthy and exactly match the preceding common-stack run,
+  with identical acceptance counters. Scoped coverage: 46 passed, one skipped;
+  five generated-LIS assertions pass. Earlier HumanEval 8/8 is not a new run.
+- The corresponding 8192/129 node trace has 84 closed cycles/rank. Rank 0:
+  metadata/pre-graph 0.9242 ms, target graph 29.3167 ms, gather gap 0.0199 ms,
+  sampling/state/handoff 0.9540 ms, four drafts/combine 5.2779 ms, next-round
+  preparation 0.0459 ms, total 36.5387 ms. Capture-disabled endpoint timing
+  and profiled stage timing remain separate; do not rescale these stages.
+- Dense matrix operations lead GPU service (12.83 ms round rank-max),
+  followed by TP communication including waits (4.83 ms), elementwise/copy
+  (4.48 ms) and direct experts (3.02 ms). Pinned PLE is only 0.116 ms.
+  Next: map hot M=5 GEMMs to shapes/call sites and extend/fuse the existing
+  shared operators where justified, without another standalone fast path.
+- Earlier 73-75 tok/s no-MTP used CPU-worker PLE and does not reproduce the
+  historical 97.7-97.9 tok/s hybrid baseline. One 262144-capacity attempt
+  failed before generation (3.24 GiB required KV vs 1.25 GiB available).
+  Retain that failure and do not repeat it under the narrowed scope.
+- Full contract, baseline manifest, raw artifacts and analysis are linked in
+  [the accepted profile](sm70_flash_next_mtp4_default_profile.md). All owned
+  model/profiler workers exited; preserve the worktree and evidence.

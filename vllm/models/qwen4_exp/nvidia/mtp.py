@@ -19,9 +19,12 @@ import regex as re
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -66,7 +69,12 @@ from .model import (
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
+    _make_qwen38_decode_compile_config,
 )
+from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
+from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+
+logger = init_logger(__name__)
 
 
 def _remap_ignored_layers(
@@ -474,6 +482,49 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
+class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
+    """Small-shape compiled view sharing all drafter parameters and state."""
+
+    def __init__(
+        self,
+        *,
+        target_model: Qwen4ExpMultiTokenPredictor,
+        vllm_config: VllmConfig,
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+        )
+
+
+@support_torch_compile(
+    # As on the target, selection between the two compiled backbones must
+    # remain outside the first, prefill-specialized compiled wrapper.
+    enable_if=lambda cfg: not envs.VLLM_SM70_QWEN38_DUAL_COMPILE,
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    },
+)
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
     # target experts and PLE tables. Loading the standalone drafter from that
@@ -536,6 +587,26 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        config_dtype = vllm_config.model_config.dtype
+        enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
+        enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
+        object.__setattr__(self, "_sm70_decode_graph_model", None)
+
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+            return False
+        if self._sm70_decode_graph_model is None:
+            decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
+            with set_current_vllm_config(decode_config):
+                decode_model = _Qwen4ExpMTPDecodeGraphModel(
+                    target_model=self.model, vllm_config=decode_config
+                )
+            object.__setattr__(self, "_sm70_decode_graph_model", decode_model)
+            logger.info_once(
+                "Prepared shared-weight SM70 Qwen3.8 MTP decode compiler; "
+                "supported draft shapes reuse the common FP16 GEMV/HC routes."
+            )
+        return True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -549,7 +620,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
-        return self.model(
+        backbone = self.model
+        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+            backbone = self._sm70_decode_graph_model
+            if backbone is None:
+                raise RuntimeError("SM70 Qwen3.8 MTP decode compiler was not prepared")
+        return backbone(
             input_ids,
             positions,
             hidden_states,

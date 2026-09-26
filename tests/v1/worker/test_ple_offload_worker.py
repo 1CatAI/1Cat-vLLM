@@ -945,6 +945,70 @@ def test_ple_offload_runner_routes_requests_layer_first(
     )
 
 
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="requires four CUDA GPUs"
+)
+def test_ple_offload_four_rank_direct_h2d_and_semaphore() -> None:
+    class FakeLayer:
+        def forward_impl(
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor | None,
+            output_buffer: torch.Tensor,
+        ) -> torch.Tensor:
+            del hidden_states, query_start_loc, ngram_context
+            output = output_buffer[: input_ids.numel()]
+            output.copy_(input_ids.to(torch.uint8).unsqueeze(1))
+            return output
+
+    runner = ple_offload_worker.PleOffloadRunner.__new__(
+        ple_offload_worker.PleOffloadRunner
+    )
+    runner._clamp_input_ids = False
+    runner._layers = {"ple": FakeLayer()}
+    input_ids = torch.tensor([11, 13, 17, 19, 23], dtype=torch.int32)
+    runner._input_bufs = {
+        0: ple_offload_worker.PleOffloadInputBuffers(
+            input_ids_buf=input_ids,
+            query_start_loc_buf=torch.tensor([0, 5], dtype=torch.int32),
+            ngram_context_buf=None,
+        )
+    }
+    runner._pinned_bufs = {
+        0: {"ple": torch.empty(5, 2560, dtype=torch.uint8, pin_memory=True)}
+    }
+    targets = []
+    for rank in range(4):
+        with torch.accelerator.device_index(rank):
+            targets.append(
+                ple_offload_worker.PleOffloadOutputTarget(
+                    tp_rank=rank,
+                    gpu_output_buffer=torch.empty(
+                        5, 2560, dtype=torch.uint8, device=f"cuda:{rank}"
+                    ),
+                    sem=ple_offload_layer.CpuGpuSemaphore(torch.device(f"cuda:{rank}")),
+                    copy_stream=torch.cuda.Stream(device=rank),
+                )
+            )
+    runner._worker_targets = {0: {"ple": targets}}
+    request = ple_offload_worker.PleOffloadRequest(dp_rank=0, num_tokens=5, num_reqs=1)
+
+    for expected in (11, 29):
+        input_ids.fill_(expected)
+        runner._handle_requests([request])
+        for target in targets:
+            target.copy_stream.synchronize()
+            assert torch.equal(
+                target.gpu_output_buffer.cpu(),
+                torch.full((5, 2560), expected, dtype=torch.uint8),
+            )
+            assert target.sem.flag_tensor.cpu().item() == 1
+            target.sem.reset(target.copy_stream)
+            target.copy_stream.synchronize()
+
+
 def test_wait_for_ready_closes_pipe() -> None:
     context = ple_offload_worker.get_mp_context()
     ready_reader, ready_writer = context.Pipe(duplex=False)

@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
     prepare_dflash2_gdn_group_metadata,
+    select_gdn_state_block_ids,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -265,6 +266,7 @@ def _create_gdn_builder(
     mamba_cache_mode: str = "none",
     max_cudagraph_capture_size: int = 4,
     device: torch.device = DEVICE,
+    speculative_method: str = "ngram",
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(model_name=model_name, block_size=BLOCK_SIZE)
@@ -284,6 +286,10 @@ def _create_gdn_builder(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
+        # MTP construction normally needs the target/draft model configs. The
+        # metadata-only fixture has no draft model, but the builder only needs
+        # its method and width.
+        vllm_config.speculative_config.method = speculative_method
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
@@ -679,6 +685,63 @@ def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
     _assert_gdn_metadata_equal(actual, expected)
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "query_lens", "drafts", "graph_tokens"),
+    [
+        ([17], [5], [4], 8),
+        ([17, 32, 17], [5, 1, 5], [4, -1, 4], 16),
+    ],
+)
+def test_mtp4_shared_gdn_metadata_matches_legacy(
+    local_gdn_model, seq_lens, query_lens, drafts, graph_tokens
+):
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=4,
+            use_full_cuda_graph=True,
+            mamba_cache_mode="align",
+            max_cudagraph_capture_size=16,
+            speculative_method="mtp",
+        )
+        for _ in range(2)
+    ]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens), BLOCK_SIZE, DEVICE
+    ).replace(
+        block_table_tensor=torch.arange(
+            len(seq_lens) * 6, dtype=torch.int32, device=DEVICE
+        ).reshape(len(seq_lens), 6),
+        num_actual_tokens=graph_tokens,
+    )
+    draft_cpu = torch.tensor(drafts, dtype=torch.int32)
+    accepted = torch.ones(len(drafts), dtype=torch.int32, device=DEVICE)
+    expected = builders[0].build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=draft_cpu,
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=draft_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=4,
+        legacy_mixed_decode_routing=(
+            qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+        ),
+    )
+    assert common_metadata is not None
+    actual = builders[1].build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=draft_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+    _assert_gdn_metadata_equal(actual, expected)
+
+
 def test_prepared_dflash2_metadata_belongs_to_exact_builder(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,
@@ -1042,6 +1105,104 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
         )
 
 
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+@pytest.mark.parametrize("query_len", [2, 3, 4, 5])
+def test_mtp4_fused_gdn_group_metadata_matches_legacy_replay(
+    monkeypatch, local_gdn_model, cache_mode, query_len
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused GDN metadata kernel")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) != (7, 0):
+        pytest.skip("the fused GDN metadata kernel is SM70-only")
+
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0")
+    monkeypatch.delenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", raising=False)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
+    qwen_gdn.envs.disable_envs_cache()
+
+    def make_builder():
+        return _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=4,
+            use_full_cuda_graph=True,
+            mamba_cache_mode=cache_mode,
+            max_cudagraph_capture_size=32,
+            device=device,
+            speculative_method="mtp",
+        )
+
+    legacy_builders = [make_builder() for _ in range(3)]
+    fused_builders = [make_builder() for _ in range(3)]
+    assert all(b._ddtree_fast_common_buffers is not None for b in fused_builders)
+    seq_lens = torch.tensor([16, 17, 63], dtype=torch.int32, device=device)
+    query_start_loc = torch.arange(
+        0, 4 * query_len, query_len, dtype=torch.int32, device=device
+    )
+    query_start_loc_cpu = query_start_loc.cpu()
+    draft_cpu = torch.full((3,), query_len - 1, dtype=torch.int32)
+    accepted = torch.tensor(
+        [1, min(3, query_len), query_len], dtype=torch.int32, device=device
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=draft_cpu,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        num_spec_state_tokens=4,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+    tables = tuple(
+        torch.arange(3 * 8, dtype=torch.int32, device=device).reshape(3, 8)
+        + group_id * 100
+        for group_id in range(3)
+    )
+    descriptor = None
+    for new_seq_lens, new_accepted in (
+        ([16, 17, 63], [1, min(3, query_len), query_len]),
+        ([31, 32, 48], [query_len, 1, min(4, query_len)]),
+    ):
+        seq_lens.copy_(torch.tensor(new_seq_lens, dtype=torch.int32, device=device))
+        accepted.copy_(torch.tensor(new_accepted, dtype=torch.int32, device=device))
+        expected = []
+        for builder, table in zip(legacy_builders, tables, strict=True):
+            common = create_common_attn_metadata(
+                BatchSpec(seq_lens=new_seq_lens, query_lens=[query_len] * 3),
+                BLOCK_SIZE,
+                device,
+            ).replace(block_table_tensor=table, num_actual_tokens=16)
+            expected.append(
+                builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                    num_accepted_tokens=accepted,
+                    num_decode_draft_tokens_cpu=draft_cpu,
+                )
+            )
+        result = prepare_dflash2_gdn_group_metadata(
+            builders_by_group=list(enumerate(fused_builders)),
+            block_tables=tables,
+            common_gdn_metadata=common_metadata,
+            num_accepted_tokens=accepted,
+            num_actual_tokens=16,
+            descriptor=descriptor,
+            seq_lens=seq_lens if cache_mode == "align" else None,
+            enable_mtp4=True,
+        )
+        assert result is not None
+        actual_by_builder, new_descriptor = result
+        if descriptor is not None:
+            assert new_descriptor is descriptor
+        descriptor = new_descriptor
+        for builder, expected_metadata in zip(fused_builders, expected, strict=True):
+            _assert_gdn_metadata_equal(
+                actual_by_builder[id(builder)], expected_metadata
+            )
+        for table in tables:
+            table.add_(1000)
+
+
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,
@@ -1341,6 +1502,56 @@ def test_align_cache_mixed_non_spec_uses_legacy_current_state_slot0(
     assert _effective_spec_initial_state_slots(meta) == [41]
     assert meta.non_spec_state_indices_tensor is not None
     assert meta.non_spec_state_indices_tensor.tolist() == [30]
+
+
+@pytest.mark.parametrize(
+    "mask_values",
+    [[True], [True] * 5, [True, False, True], [False], [False] * 3],
+)
+@pytest.mark.parametrize("device_name", ["cpu", "cuda:0"])
+def test_active_align_state_selection_matches_masked_copy(
+    mask_values: list[bool], device_name: str
+) -> None:
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    device = torch.device(device_name)
+    count = len(mask_values)
+    mask_cpu = torch.tensor(mask_values, dtype=torch.bool)
+    mask = mask_cpu.to(device)
+    block = torch.arange(count * 8, device=device, dtype=torch.int32).reshape(count, 8)
+    accepted = torch.arange(1, count + 1, device=device, dtype=torch.int32)
+    selectors = accepted.flip(0).contiguous()
+    result = build_gdn_spec_decode_state_contract(
+        block_table_tensor=block,
+        seq_lens=torch.full((count,), 32, device=device, dtype=torch.int32),
+        block_size=16,
+        num_spec=4,
+        spec_sequence_masks_cpu=mask_cpu,
+        num_accepted_tokens=accepted,
+        current_state_block_ids=None,
+        is_mamba_cache_all=False,
+        spec_state_slot_selectors=selectors,
+    )
+    expected = (
+        block[mask, :5],
+        select_gdn_state_block_ids(block[~mask], accepted[~mask], 4),
+        accepted[mask],
+        selectors[mask],
+    )
+    actual = (
+        result.spec_state_indices_tensor,
+        result.non_spec_state_indices_tensor,
+        result.num_accepted_tokens,
+        result.spec_state_slot_selectors,
+    )
+    for observed, reference in zip(actual, expected, strict=True):
+        assert observed is not None
+        assert torch.equal(observed, reference)
+        assert observed.is_contiguous() == reference.is_contiguous()
+    assert result.spec_state_indices_tensor is not None
+    assert result.spec_state_indices_tensor.data_ptr() != block.data_ptr()
+    assert result.num_accepted_tokens is not None
+    assert result.num_accepted_tokens.data_ptr() != accepted.data_ptr()
 
 
 def test_align_active_mtp_rollover_contract_near_block_boundary(

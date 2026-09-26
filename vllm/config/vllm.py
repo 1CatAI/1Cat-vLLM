@@ -199,16 +199,17 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
-def _is_sm70_qwen38_nomtp_dual_compile_contract(
+def _is_sm70_qwen38_decode_compile_contract(
     model_config: Any,
     speculative_config: Any,
     parallel_config: Any,
 ) -> bool:
-    """Admit only the exact Qwen3.8 TP4 no-MTP dual-compile topology."""
-    if (
-        model_config is None
-        or parallel_config is None
-        or speculative_config is not None
+    """Admit the shared Qwen3.8 TP4 decode topology, including MTP4."""
+    if model_config is None or parallel_config is None:
+        return False
+    if speculative_config is not None and not (
+        getattr(speculative_config, "method", None) == "mtp"
+        and getattr(speculative_config, "num_speculative_tokens", None) == 4
     ):
         return False
 
@@ -272,11 +273,11 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     return tuple(range(start, start + parallel.local_world_size))
 
 
-def _apply_sm70_qwen38_nomtp_defaults(
+def _apply_sm70_qwen38_decode_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
     """Complete the admitted NVFP4 baseline without global experimental defaults."""
-    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+    if not is_sm70 or not _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     ):
         return ()
@@ -300,6 +301,10 @@ def _apply_sm70_qwen38_nomtp_defaults(
         "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
         "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
     }
+    if cfg.speculative_config is not None:
+        # Keep M=1 draft graphs when target graph sizes are multiples of five.
+        # Otherwise the prepared single-token operators never reach capture.
+        defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
@@ -2034,7 +2039,7 @@ class VllmConfig:
                 and not sm70_no_compile_decode_graph_requested
                 and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             ):
-                for env_name in _apply_sm70_qwen38_nomtp_defaults(
+                for env_name in _apply_sm70_qwen38_decode_defaults(
                     self,
                     is_sm70=all(
                         current_platform.is_device_capability((7, 0), device_id=i)
@@ -2043,11 +2048,11 @@ class VllmConfig:
                 ):
                     logger.info_once(
                         "Auto-setting %s=1 for the quality-qualified SM70 "
-                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
+                        "Qwen3.8 NVFP4 TP4 decode path. Set it explicitly to override.",
                         env_name,
                     )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,
@@ -2066,7 +2071,7 @@ class VllmConfig:
                     "large prefill and FULL decode graphs share one model."
                 )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,

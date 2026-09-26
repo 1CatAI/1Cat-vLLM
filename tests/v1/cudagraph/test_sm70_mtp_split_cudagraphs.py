@@ -34,6 +34,7 @@ def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
 @pytest.mark.parametrize(
     ("max_num_seqs", "request_sizes", "verifier_sizes"),
     [
+        (1, [1], [1, 2, 4, 5, 8, 9, 18]),
         (16, [1, 2, 4, 6, 8, 12, 16], [5, 10, 20, 30, 40, 60, 80]),
         (32, [1, 2, 4, 6, 8, 12, 16, 32], [5, 10, 20, 30, 40, 60, 80, 160]),
     ],

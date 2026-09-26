@@ -38,6 +38,7 @@ import psutil
 import torch
 import torch.distributed as dist
 import zmq
+from cuda.bindings import driver as cuda_driver
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -884,9 +885,34 @@ class PleOffloadRunner:
                 # The result is identical on every TP rank in this DP group.
                 # Each copy stream signals only after its DMA completes.
                 slices = tuple(slice(0, size) for size in result.shape)
+                direct_copy = (
+                    result.device.type == "cpu"
+                    and result.is_pinned()
+                    and result.is_contiguous()
+                )
+                result_bytes = result.numel() * result.element_size()
                 for target in targets:
-                    with torch.cuda.stream(target.copy_stream):
-                        target.gpu_output_buffer[slices].copy_(
-                            result[slices], non_blocking=True
+                    destination = target.gpu_output_buffer[slices]
+                    if (
+                        direct_copy
+                        and destination.is_cuda
+                        and destination.is_contiguous()
+                        and destination.dtype == result.dtype
+                        and destination.numel() == result.numel()
+                    ):
+                        # The pinned source and IPC destination need no Torch
+                        # dtype/stride handling. Enqueue directly on the same
+                        # stream used by the per-rank completion semaphore.
+                        status = cuda_driver.cuMemcpyHtoDAsync(
+                            cuda_driver.CUdeviceptr(destination.data_ptr()),
+                            result.data_ptr(),
+                            result_bytes,
+                            cuda_driver.CUstream(target.copy_stream.cuda_stream),
                         )
+                        if status[0].value != 0:
+                            raise RuntimeError(f"PLE H2D copy failed: {status[0]}")
                         target.sem.signal(target.copy_stream)
+                    else:
+                        with torch.cuda.stream(target.copy_stream):
+                            destination.copy_(result, non_blocking=True)
+                            target.sem.signal(target.copy_stream)

@@ -1519,10 +1519,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        early_ple_model_inputs: dict[str, Any] | None = None
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            if (
+                self._ple_offload_connector is not None
+                and batch_desc.cg_mode != CUDAGraphMode.FULL
+            ):
+                # PLE needs only the token/query buffers and n-gram context.
+                # Submit them before attention/Mamba metadata construction so
+                # CPU table lookup overlaps the remaining host preparation.
+                early_ple_model_inputs = self.model_state.prepare_inputs(
+                    input_batch, self.req_states
+                )
+                self._ple_offload_connector.prepare_forward(
+                    input_batch.num_reqs,
+                    input_batch.num_tokens_after_padding,
+                    dummy_run=False,
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Hybrid Mamba align-mode prefix caching migrates recurrent state
             # across block boundaries before attention metadata consumes it.
@@ -1618,9 +1634,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "inputs_embeds": inputs_embeds,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **(
+                early_ple_model_inputs
+                if early_ple_model_inputs is not None
+                else self.model_state.prepare_inputs(input_batch, self.req_states)
+            ),
         }
-        if self._ple_offload_connector is not None:
+        if self._ple_offload_connector is not None and early_ple_model_inputs is None:
             self._ple_offload_connector.prepare_forward(
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,

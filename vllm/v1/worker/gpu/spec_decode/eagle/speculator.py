@@ -563,6 +563,9 @@ class EagleSpeculator:
         attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
     ) -> None:
         logger.info("Capturing model for Eagle speculator...")
+        prepare_decode = getattr(self.model, "prepare_sm70_decode_graph_model", None)
+        if prepare_decode is not None:
+            prepare_decode()
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
         self.last_token_indices.zero_()
