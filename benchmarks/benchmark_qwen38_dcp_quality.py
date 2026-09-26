@@ -5,6 +5,8 @@
 Run separate DCP1 and DCP2 processes with the same calibrated checkpoint and
 compare the saved token IDs. No private extension or runtime overlay is loaded.
 An 8K smoke is not a 256K quality claim; use --long-context for that boundary.
+The worker manifest uses a trusted local callable RPC. Explicitly opt in with
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 for this offline check only, not a service.
 """
 
 import argparse
@@ -66,10 +68,19 @@ def worker_manifest(worker):
     }
 
 
+def validate_manifest_transport():
+    """Reject unsupported callable RPC before loading any model weights."""
+    from vllm.v1.serial_utils import MsgpackEncoder
+
+    MsgpackEncoder().encode((0, 0, "collective_rpc", (worker_manifest, 30, (), {})))
+
+
 def run(args):
     from transformers import AutoTokenizer
 
     from vllm import LLM, SamplingParams
+
+    validate_manifest_transport()
 
     report = {
         "source_sha": subprocess.check_output(

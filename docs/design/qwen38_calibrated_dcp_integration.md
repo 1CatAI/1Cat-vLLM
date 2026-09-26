@@ -66,6 +66,8 @@ export CUDA_VISIBLE_DEVICES=4,5,6,7
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS=1
 export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1
+# Trusted local benchmark RPC only; do not enable on a public service.
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export TORCH_EXTENSIONS_DIR="$PWD/.cache/torch_extensions"
 export TRITON_CACHE_DIR="$PWD/.cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="$PWD/.cache/inductor"
@@ -86,6 +88,8 @@ official-sampling short output health, deterministic token comparisons,
 Prefill and decode metrics are recorded separately. Short health responses
 are not sustained-decode speed benchmarks. Omit `--long-context` only for a
 short preliminary check; never label that result 256K quality acceptance.
+The manifest transport is checked before model loading, so a missing local
+RPC opt-in fails without spending time loading weights or capturing graphs.
 
 ## Qualification status
 
