@@ -10,9 +10,10 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
 
+@pytest.mark.parametrize("num_reqs", [1, 2, 3, 4, 8])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_context_pipeline_defers_writes_and_refreshes_accepted_slots():
+def test_context_pipeline_defers_writes_and_refreshes_accepted_slots(num_reqs):
     """Computing rejected rows early must never write their scratch K/V."""
     device = torch.device("cuda")
     gen = torch.Generator(device=device).manual_seed(717)
@@ -47,16 +48,24 @@ def test_context_pipeline_defers_writes_and_refreshes_accepted_slots():
         )
 
     caches = [
-        torch.full((4, 2, block, heads, dim), 0.125, device=device, dtype=torch.float16)
+        torch.full(
+            (num_reqs + 3, 2, block, heads, dim),
+            0.125,
+            device=device,
+            dtype=torch.float16,
+        )
         for _ in range(layers)
     ]
     model._attn_layers = [
         SimpleNamespace(kv_cache=c, impl=SimpleNamespace(do_kv_cache_update=update))
         for c in caches
     ]
-    states = torch.randn(8, hidden, generator=gen, device=device).half()
-    positions = torch.arange(8, device=device)
-    slots = [torch.full((8,), -1, device=device, dtype=torch.int64) for _ in caches]
+    states = torch.randn(num_reqs * 8, hidden, generator=gen, device=device).half()
+    positions = torch.arange(8, device=device).repeat(num_reqs)
+    slots = [
+        torch.full((num_reqs * 8,), -1, device=device, dtype=torch.int64)
+        for _ in caches
+    ]
     model.precompute_and_store_context_kv(states, positions, slots)
     compute, write = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
     with torch.cuda.graph(compute):
@@ -65,18 +74,24 @@ def test_context_pipeline_defers_writes_and_refreshes_accepted_slots():
         model.store_context_kv(key, value, slots)
 
     for step in range(16):
-        accepted = step % 8 + 1
+        accepted = (torch.arange(num_reqs, device=device) + step) % 8 + 1
+        valid = torch.arange(8, device=device)[None] < accepted[:, None]
         states.copy_(torch.randn(states.shape, generator=gen, device=device).half())
-        positions.copy_(torch.arange(4080 - step, 4088 - step, device=device))
+        positions.copy_(
+            torch.arange(4080 - step, 4088 - step, device=device).repeat(num_reqs)
+        )
         before = [c.clone() for c in caches]
         compute.replay()
         # Acceptance and cache placement are intentionally unknown until after
         # projection. Change both between every replay, including invalid slots.
         for layer, mapping in enumerate(slots):
             mapping.copy_(
-                block * (1 + layer % 3) + torch.arange(8, device=device).roll(step)
+                (
+                    block * (1 + torch.arange(num_reqs, device=device)[:, None])
+                    + torch.arange(8, device=device).roll(step + layer)[None]
+                ).flatten()
             )
-            mapping[accepted:] = -1
+            mapping[~valid.flatten()] = -1
         for actual, expected in zip(caches, before):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         write.replay()
@@ -84,7 +99,7 @@ def test_context_pipeline_defers_writes_and_refreshes_accepted_slots():
         for c, snapshot in zip(caches, before):
             c.copy_(snapshot)
         reference_positions = positions.clone()
-        reference_positions[accepted:] = 0
+        reference_positions[~valid.flatten()] = 0
         model.precompute_and_store_context_kv(states, reference_positions, slots)
         for got, expected in zip(actual, caches):
             torch.testing.assert_close(got, expected, rtol=0, atol=0)

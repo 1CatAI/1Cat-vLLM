@@ -139,6 +139,71 @@ def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
         return int(sm70_ops.sm70_gemm_import_cache(device_hint, str(path)))
 
 
+def _run_coordinated_dense_warmup(
+    warmup: Callable[[], Any],
+    device: torch.device,
+    label: str,
+) -> Any:
+    """Measure dense GEMM routes once and replay the plan on every TP rank.
+
+    TurboMind's dispatch cache is keyed by shape, but its local measurement
+    starts independently in every worker.  For the small SM70 batch shapes
+    that can select different split-K/swizzle plans on otherwise identical TP
+    ranks.  The leader owns the measurement; followers import the complete
+    cache before replaying warmup, so their first calls take the same plan.
+    """
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    if tp_group.world_size <= 1:
+        return warmup()
+
+    is_leader = tp_group.rank_in_group == 0
+    if is_leader:
+        warmup()
+        torch.accelerator.synchronize(device)
+        payload, _ = _export_lut_bytes(device)
+    else:
+        payload = None
+
+    payload = tp_group.broadcast_object(payload, src=0)
+    if payload is None:
+        # Keep all ranks in lockstep even if the extension was built without
+        # cache export/import support.  The second pass also preserves the
+        # existing warmup contract: it initializes the replay buffers after
+        # the first tuning pass on every rank.
+        tp_group.barrier()
+        if not is_leader:
+            logger.warning(
+                "SM70 %s coordinated tuning produced no LUT; rank %d is "
+                "falling back to local tuning.",
+                label,
+                tp_group.rank_in_group,
+            )
+        return warmup()
+
+    # Import on the leader as well.  Besides replacing any pre-warmup local
+    # entries, this marks its cache as imported so later graph capture cannot
+    # silently remeasure a batch-tail shape after the broadcast.  All TP ranks
+    # therefore remain on the same authoritative plan for the whole service
+    # lifetime.
+    imported_records = _import_lut_bytes(device, payload)
+    # The leader must not start the next warmup phase while followers are
+    # still importing the plan.  This also keeps CUDA graph capture setup
+    # deterministic across TP workers.
+    tp_group.barrier()
+    logger.info(
+        "SM70 %s coordinated tuning loaded %d rank0 LUT records on rank %d.",
+        label,
+        imported_records,
+        tp_group.rank_in_group,
+    )
+    # Replay on the leader too.  Its second pass is a cache hit, while the
+    # followers' first pass after import is the corresponding cache hit.
+    return warmup()
+
+
 def _warmup_fp8_dense_layers_coordinated(
     layers: list[tuple[torch.nn.Module, bool]],
     m_values: list[int],
@@ -152,42 +217,34 @@ def _warmup_fp8_dense_layers_coordinated(
     ):
         return _warmup_fp8_dense_layers(layers, m_values)
 
-    from vllm.distributed.parallel_state import get_tp_group
+    return _run_coordinated_dense_warmup(
+        lambda: _warmup_fp8_dense_layers(layers, m_values),
+        device,
+        "FP8",
+    )
 
-    tp_group = get_tp_group()
-    if tp_group.world_size <= 1:
-        return _warmup_fp8_dense_layers(layers, m_values)
 
-    is_leader = tp_group.rank_in_group == 0
-    if is_leader:
-        _warmup_fp8_dense_layers(layers, m_values)
-        torch.accelerator.synchronize(device)
-        payload, exported_records = _export_lut_bytes(device)
-    else:
-        payload = None
-        exported_records = 0
+def _warmup_dense_quantized_layers_coordinated(
+    awq_layers: list[torch.nn.Module],
+    fp8_layers: list[tuple[torch.nn.Module, bool]],
+    fp4_layers: list[Any],
+    m_values: list[int],
+    device: torch.device,
+) -> tuple[int, int, int]:
+    """Coordinate all compressed dense routes in one complete cache export."""
 
-    payload = tp_group.broadcast_object(payload, src=0)
-    if payload is None:
-        logger.warning(
-            "SM70 FP8 coordinated tuning produced no LUT; rank %d is "
-            "falling back to local tuning.",
-            tp_group.rank_in_group,
+    def warmup() -> tuple[int, int, int]:
+        return (
+            _warmup_dense_layers(awq_layers, m_values),
+            _warmup_fp8_dense_layers(fp8_layers, m_values),
+            _warmup_fp4_dense_layers(fp4_layers, m_values),
         )
-        return _warmup_fp8_dense_layers(layers, m_values)
 
-    imported_records = (
-        exported_records if is_leader else _import_lut_bytes(device, payload)
-    )
-    tp_group.barrier()
-    calls = _warmup_fp8_dense_layers(layers, m_values)
-    torch.accelerator.synchronize(device)
-    logger.info(
-        "SM70 FP8 coordinated tuning loaded %d rank0 LUT records on rank %d.",
-        imported_records,
-        tp_group.rank_in_group,
-    )
-    return calls
+    if not (awq_layers or fp8_layers or fp4_layers):
+        return 0, 0, 0
+    if not envs.VLLM_SM70_FP8_COORDINATED_TUNING:
+        return warmup()
+    return _run_coordinated_dense_warmup(warmup, device, "AWQ/FP8/FP4")
 
 
 def _silu_and_mul_w13(
@@ -1125,13 +1182,17 @@ def sm70_awq_warmup(worker: Worker) -> None:
         lut_path,
     )
     with torch.inference_mode():
-        dense_calls = _warmup_dense_layers(dense_layers, m_values)
-        fp8_dense_calls = _warmup_fp8_dense_layers_coordinated(
+        (
+            dense_calls,
+            fp8_dense_calls,
+            fp4_dense_calls,
+        ) = _warmup_dense_quantized_layers_coordinated(
+            dense_layers,
             fp8_dense_layers,
+            fp4_dense_layers,
             m_values,
             device,
         )
-        fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
         moe_stage_calls = _warmup_moe_dense_stage_layers(moe_layers, moe_token_counts)
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
         mxfp4_moe_stage_calls = _warmup_mxfp4_moe_b1_layers(mxfp4_moe_layers)

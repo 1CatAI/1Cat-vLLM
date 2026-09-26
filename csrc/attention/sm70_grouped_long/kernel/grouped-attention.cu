@@ -2072,12 +2072,20 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     return;
   }
 
+  if constexpr (ROW_SEQLENS) {
+    // Request-major q8 batches carry one contiguous row-length panel per
+    // request. Keep the per-group pointer aligned with the q/block-table
+    // offsets before any visibility or max-length reads.
+    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+  }
+
   if constexpr (!SPARSE_PAGE4) {
     partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                    kGroupedVerifyHeadDim;
     partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                   (ROW_SEQLENS ? 2 : 1);
   }
 
   int total_kv = seq_lens[group_idx];
@@ -2652,12 +2660,17 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     return;
   }
 
+  if constexpr (ROW_SEQLENS) {
+    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+  }
+
   if constexpr (!SPARSE_PAGE4) {
     partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                    kGroupedVerifyHeadDim;
     partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                   (ROW_SEQLENS ? 2 : 1);
   }
 
   int total_kv = seq_lens[group_idx];
@@ -3263,10 +3276,15 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
                  MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
   partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
-                 MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                 (ROW_SEQLENS ? 2 : 1);
   seq_lens += request_idx;
   out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
          kGroupedVerifyHeadDim;
+
+  if constexpr (ROW_SEQLENS) {
+    row_lengths += static_cast<int64_t>(request_idx) * MAX_QUERY_TOKENS;
+  }
 
   int total_kv = seq_lens[0];
   if constexpr (ROW_SEQLENS) {
@@ -4865,32 +4883,42 @@ at::Tensor private_grouped_e4m3_fp32_paged(
     float scale, float k_scale, float v_scale) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
-                  q.size(0) <= 8 && q.size(1) == 6 && q.size(2) == 256,
-              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [2..8,6,256]");
+                  q.size(1) == 6 && q.size(2) == 256,
+              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [rows,6,256]");
   TORCH_CHECK(
       k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
           k.size(1) > 0 && k.size(1) % 16 == 0 &&
           k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
           v.sizes() == k.sizes(),
       "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
+  const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
   TORCH_CHECK(
-      block_table.dim() == 2 && block_table.size(0) == 1 &&
+      block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
           block_table.size(1) * k.size(1) <= 266240 &&
+          q.size(0) % batch_size == 0 &&
+          (batch_size == 1
+               ? (q.size(0) >= 2 && q.size(0) <= 8)
+               : q.size(0) == batch_size * 8) &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "E4M3 grouped FP32 requires one KV sequence and per-query int32 lengths");
+      "E4M3 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
-  TORCH_CHECK(partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
-                  partial.is_contiguous() &&
-                  partial.scalar_type() == at::kFloat &&
-                  lse.sizes() == at::IntArrayRef({80, 8, 6, 2}) &&
-                  lse.is_contiguous() && lse.scalar_type() == at::kFloat,
-              "E4M3 grouped FP32 requires numerator [80,8,6,256] and max/sum "
-              "[80,8,6,2]");
+  const bool workspace_shapes =
+      batch_size == 1
+          ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
+          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+  TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
+                  partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
+                  lse.scalar_type() == at::kFloat,
+              "E4M3 grouped FP32 requires request-major FP32 numerator "
+              "and max/sum workspaces");
   TORCH_CHECK(
       std::isfinite(scale) && std::isfinite(k_scale) &&
           std::isfinite(v_scale) && k_scale > 0 && v_scale > 0,
@@ -4937,7 +4965,8 @@ at::Tensor private_grouped_e4m3_fp32_paged(
           false, float, true, true, false>;
   if (k.size(1) == 1648) kernel = paired ? flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 1648, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, true> : flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 1648, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, false>;
   if (k.size(1) == 3296) kernel = paired ? flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 3296, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, true> : flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 3296, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, false>;
-  if (q.size(0) == 8) {
+  const int query_len = static_cast<int>(q.size(0) / batch_size);
+  if (query_len == 8) {
   kernel = paired
       ? flash_attention_grouped_verify_e4m3_full_q8_kernel<
           8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
@@ -4961,18 +4990,20 @@ at::Tensor private_grouped_e4m3_fp32_paged(
                            kCompensatedSmemBytes));
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  kernel<<<dim3(1, 80), kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
+  kernel<<<dim3(1, 80, static_cast<unsigned>(batch_size)),
+           kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
       reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
       v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
-      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
+      partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      1, row_lengths.data_ptr<int>());
+      static_cast<int>(batch_size), row_lengths.data_ptr<int>());
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-      <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
+      <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+         kGroupedVerifyThreads, 0, stream>>>(
           partial.data_ptr<float>(), lse.data_ptr<float>(),
           row_lengths.data_ptr<int>(),
-          reinterpret_cast<__half*>(out.data_ptr()), q.size(0),
+          reinterpret_cast<__half*>(out.data_ptr()), query_len,
           row_lengths.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
@@ -5003,6 +5034,10 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   // Python uses this capability to avoid widening admission for stale DSOs.
   ops.def("sm70_grouped_long_page_revision() -> int",
           []() -> int64_t { return 1; });
+  // Older builds only admit B1. Python must query the loaded binary before
+  // capturing a request-major batch with its larger workspace.
+  ops.def("sm70_grouped_long_max_batch_size() -> int",
+          []() -> int64_t { return 16; });
   ops.def(
       "sm70_grouped_long_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(a!) partial, "

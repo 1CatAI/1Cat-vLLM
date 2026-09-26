@@ -47930,3 +47930,86 @@ has launched no full model. Details and artifacts are in
 - Full contract, baseline manifest, raw artifacts and analysis are linked in
   [the accepted profile](sm70_flash_next_mtp4_default_profile.md). All owned
   model/profiler workers exited; preserve the worktree and evidence.
+
+## 2026-09-26 DFlash2 batch latency follow-up
+
+- Owned branch `codex/v100-decode-round-20260926-111504` starts from
+  `e889919e2192fa36b25c922366526fa3fe62edbc`. The current implementation and
+  acceptance ledger are in
+  [the batch latency report](sm70_dflash2_batch_latency_20260926.md).
+- Expand the existing context/metadata graph capability by captured query shape,
+  retain exact dense sampling only for ambiguous requests, and share partition
+  exponential weights in the common grouped-attention combine kernel. No new
+  weight-quantization or model-name dispatch is introduced.
+- Focused CPU results: 32 passed/19 skipped and 192 passed/21 skipped. GPU:
+  25 mixed sampler cases (FP32/FP64 RNG, including the real 248320 vocabulary),
+  five deferred context cases and 91
+  grouped-attention cases pass. Automatic-policy checks add 48 CPU passes.
+  Endpoint acceptance has not passed; this is not a new PRO performance win
+  or a completed 35B regression gate.
+- Reject grouped-scale lifetime and two-CTA GEMM prototypes: reducing registers
+  to 128 without spills did not produce a meaningful weighted speed benefit.
+  Retain the negative results so later work does not repeat occupancy-only tuning.
+- Other sessions' GPU tests were allowed to finish. A clean control service then
+  started on GPUs 4–7. Its 16-question natural-output check matches the previously
+  recorded 14 correct/15 natural stops; the strict all-natural-stop gate is open.
+- The initial single-run C8 endpoint screen lost 3.52 acceptance percentage
+  points and is retained as a failed screen. Real-input auditing then finds
+  bitwise context and sampling parity on 64 steps/rank. Same-process C8/48
+  Python ablation gives +5.09% rolling and +5.38% pure decode, with identical
+  full-48 pure acceptance counters. These are diagnostic findings only.
+- The fresh ordinary default services complete three repeats of every cell.
+  C1/C2/C4/C8 rolling medians are 241.739/265.057/326.295/385.783 ->
+  242.487/295.439/327.664/385.374 tok/s. Full-48 pure C8 is
+  680.644 -> 676.332 tok/s (-0.63%). Rolling C8 acceptance falls 2.497
+  percentage points, failing the requested gate. C2's +11.46% speed comes
+  with +6.585 acceptance points, so it is not an isolated compute improvement.
+  This campaign does not qualify its single-process +5% as production
+  performance. The natural-EOS pair remains 14 correct/15 natural stops on
+  the same cases. 4K cache-hit and 32K C2 route smokes complete on both.
+- The all-step ledger closes to client request decode duration within 0.14%.
+  In warmed runs, complete C8/q8 occupies 31–33% of that duration and mixed
+  prefill occupies 58–62%. Applying an old q8-only speedup to all rolling time
+  overstates the expected endpoint gain. Do not promote the diagnostic ledger's
+  raw endpoint delta: admission/acceptance differs, and the first pass includes
+  cold sampler/JIT stalls. Default-route logs confirm no manual acceleration
+  flags are necessary. Details and limits are in the batch latency report.
+
+## 2026-09-27 DFlash2 long-context q8 batches
+
+- Extend the existing built-in compensated E4M3 attention from B1 to
+  request-major q8 B2–B16. Correct request offsets for row lengths and FP32
+  max/sum panels, query native batch capacity, capture compatible batch graphs,
+  and inspect all live CPU length hints. Single-request tails retain their
+  route. No new enable switch, model-name or weight-quantization gate is added.
+- Share compatible graph workspaces within a device/stream/bound contract and
+  retain older allocations when growing. The graph pool falls from the initial
+  candidate's 1.13 GiB to 0.99 GiB (control 0.88 GiB). Unsupported head geometry
+  or KV dtype does not capture extra batch graphs; 35B-A3B TP4's local GQA=4
+  remains on the existing route. This is not a new 35B AWQ/FP8 speed result.
+- Normal FA2 extension rebuilt from owned source. The initial focused suite has
+  41 passes; after main b034648012 integration, the relevant graph/operator and
+  quantized-draft regressions have 50 passes. The expanded CPU admission matrix
+  has 49 passes (overlapping suites). Changed-input, padding, zero-length rows,
+  old-graph replay after workspace growth and FP64 oracle checks pass through
+  262144 context. Batch results equal independent-request execution bitwise.
+- TP4 V100, Qwen3.8-27B-NVFP4, FP16 execution/E4M3 KV, DFlash2 q7, 262144 service
+  limit, memory 0.8, prefix caching, same 32K/256 tokenized fixture and sampling.
+  Three warm client all-live decode medians C1/C4/C8 are
+  159.300/326.832/492.025 -> 159.324/429.134/624.863 tok/s
+  (+0.02%/+31.30%/+27.00%). No later arrivals; TTFT is separate. Aggregate
+  acceptance is 33.395/38.961/47.904 -> 33.395/41.889/53.968%. Both control and
+  final natural-EOS retrieval score 8/8 correct and 8/8 normal stops. C4/C8
+  acceptance varies between waves: do not assign all endpoint gain to compute.
+- Actual C4/C8 graph selection is logged on all four TP workers. KV budget
+  before graph capture is 11.45 GiB control versus 11.00 GiB candidates; this
+  separate difference remains unisolated. Do not claim unchanged total KV
+  capacity, C8 at 256K, a PRO win or completion of the prior rolling gate.
+- Source, hashes, both intermediate/final service pairs, failed first startup,
+  measurements and limits are in
+  [the long-batch report](sm70_dflash2_long_batch_20260927.md). On 2026-09-27,
+  the project owner requested merging PR #697 after disclosure of the earlier
+  rolling-acceptance failure and KV-budget difference. Both remain follow-up
+  items; merging does not mark them as passed. Capability-based defaults need
+  no additional enable switches. Public API and gateway were stopped at the
+  user's request; local benchmark services are shut down.
