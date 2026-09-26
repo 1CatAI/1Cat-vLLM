@@ -47930,3 +47930,66 @@ has launched no full model. Details and artifacts are in
 - Full contract, baseline manifest, raw artifacts and analysis are linked in
   [the accepted profile](sm70_flash_next_mtp4_default_profile.md). All owned
   model/profiler workers exited; preserve the worktree and evidence.
+
+## 2026-09-27 MTP4 batch GDN input qualification
+
+- Keep the accepted 27.3963-ms complete-round reference. The target verifier
+  is M5/M10 batch decode; M1 GEMV remains the single-token/draft route.
+- Reuse PR #692's packed GDN input operator at `bcf0efa914`, on integration
+  base `b034648012`. This scope imports no other no-MTP candidates from that
+  PR. The existing shared split-copy fallback is already present on main.
+- `VLLM_SM70_QWEN38_GDN_INPUT_BATCH` remains opt-in while M5/M10 real-weight
+  bit parity, engine token/acceptance parity, memory and complete-round timing
+  are qualified. Do not infer MTP performance from the previous M2/4/8/16
+  component benchmark or repeat the rejected generic FP16 GEMM substitution.
+- Build and measurements use the owned source tree and CUDA 12.8, with no
+  wheel packaging. Record results and commands in the
+  [MTP4 batch GDN report](sm70_flash_next_mtp4_batch_gdn.md).
+- The batch candidate passes the component and full-model gates: 114 targeted
+  tests pass; all 36 real target GDN weight pairs across four TP slices are
+  FP16-bit exact; fixed and natural endpoint token IDs and MTP acceptance
+  statistics are identical. On the matched 8192/513 fixture, complete-round
+  median falls from 27.309572 ms (control) to 26.495768 ms (candidate), a
+  0.813804-ms (2.980%) saving. Natural EOS rounds also improve by
+  0.550--0.606 ms.
+- Keep the new environment variable default-off for now. Retaining packed
+  QKVZ/BA buffers adds 725.625 MiB per rank and reduces the engine's KV cache
+  from 153,910 to 122,631 tokens (maximum concurrency 4.70x to 3.74x). The
+  next optimization is to preserve the batch-decode speed without duplicating
+  the original weight storage; only then revisit a default-on change.
+- The trace confirms this is a batch Tensor Core path, not GEMV: the critical
+  target graph is 28.389041 to 26.740710 ms, dense service drops 9.735184 to
+  7.667470 ms, and 36 `gdn_input_batch_kernel` launches account for
+  1.306008 ms/round. Nsight Compute counters remain unavailable because the
+  driver returns `ERR_NVGPUCTRPERM`; do not claim measured occupancy or HBM
+  utilization.
+
+## 2026-09-27 MTP4 grouped experts and gated norm
+
+- The complete unprofiled MTP4 round must be below 20 ms, retaining the frozen
+  Flash-Next TP4/8K/513/MTP4 workload. Target-only verifier times do not qualify.
+- Extend existing grouped batch experts to M5, preserving W13 split4 and all
+  FP16 boundaries; reuse PR #692's grouped W2/ordered reduction at `2c5b584468`.
+  Add the common N128 native gated RMSNorm fusion, including sigmoid, with
+  ATen's exact vector4 mean and pointwise arithmetic. Both new flags are
+  opt-in: `VLLM_SM70_NVFP4_MOE_GROUPED_MTP5` and
+  `VLLM_SM70_RMSNORM_GATED_EXACT`.
+- Source-built component gates pass: four TP expert weight slices, changing
+  routes/inputs, 36 real norm weights, CUDA Graph poison/canary checks and all
+  FP16 gate payloads. See the [batch decode report](sm70_flash_next_mtp4_batch_gdn.md)
+  for commands, native hashes and the corrected test-fixture failure.
+- Same-build, same-GPUs0--3 full-model pair: with packed GDN enabled in both,
+  complete-round median **26.696061 -> 23.849974 ms**, saving **2.846087 ms
+  (10.6611%)**. Fixed repeats and all three natural EOS outputs retain every
+  token and acceptance count. KV capacity remains 122,631 tokens. The
+  less-than-20-ms target is still **3.849974 ms away**.
+- After ordinary timing, separate CUDA-event profiling gives critical-rank
+  target forward 18.208780 ms, verifier GPU 18.963904, drafts 5.038821 and total
+  wall 24.155889. The 18.96-ms verifier is not the complete-round result.
+- Do not repeat rejected screens: original-layout HC down regresses; packed
+  HC gives about 0.47 ms projected over 96 pairs but needs roughly 1.20 GiB/rank
+  and regresses M10 down; shared-gate vector8 dot changes FP16 logits. A fused
+  packed output projection is exact at M5 but costs 22--28 us versus 16--17 us;
+  its M10 arithmetic differs and is rejected without a model run.
+- Full reports and negative evidence remain in this task's `.artifacts/`.
+  No wheel is built; no private research extension is used in model runs.

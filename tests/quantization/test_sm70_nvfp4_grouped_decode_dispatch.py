@@ -23,6 +23,40 @@ def test_grouped_decode_defaults_off(monkeypatch):
     assert not envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
 
 
+@pytest.mark.parametrize("tokens", [1, 2, 4, 5, 8, 10, 16, 17])
+def test_grouped_mtp5_preserves_direct_admission(monkeypatch, tokens):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1")
+    envs.disable_envs_cache()
+    layer = NS(
+        sm70_nvfp4_grouped_mtp5=True,
+        moe_config=NS(tp_size=4),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+    )
+    x = torch.empty(tokens, 2560, dtype=torch.float16)
+    ids = torch.empty(tokens, 10, dtype=torch.int32)
+    assert moe._use_grouped_mtp5(layer, x, ids) == (tokens == 5)
+    layer.moe_config.tp_size = 2
+    assert not moe._use_grouped_mtp5(layer, x, ids)
+    layer.moe_config.tp_size = 4
+    layer.sm70_nvfp4_grouped_mtp5 = False
+    assert not moe._use_grouped_mtp5(layer, x, ids)
+
+
+def test_grouped_mtp5_defaults_off(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", raising=False)
+    envs.disable_envs_cache()
+    assert not envs.VLLM_SM70_NVFP4_MOE_GROUPED_MTP5
+
+
+def test_grouped_mtp5_unprepared_layer_falls_back():
+    x = torch.empty(5, 2560, dtype=torch.float16)
+    ids = torch.empty(5, 10, dtype=torch.int32)
+    assert not moe._use_grouped_mtp5(NS(), x, ids)
+
+
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 32, 64, 2048])
 def test_runtime_shape_not_scheduler_configuration(monkeypatch, tokens):
     # No TP, model name, KV dtype, max-num-seqs or chunk-size fields needed.

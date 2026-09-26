@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
+    VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
@@ -205,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
+    VLLM_SM70_NVFP4_MOE_GROUPED_MTP5: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
@@ -602,6 +604,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GDN_QPN8_BA_SPLIT: bool = False
     VLLM_SM70_GDN_RMSNORM_ONEPASS: bool = False
+    VLLM_SM70_RMSNORM_GATED_EXACT: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
@@ -1859,6 +1862,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
     ),
+    # Qualified M2..16 input chain. Keep opt-in because its packed weights
+    # consume another 725.625 MiB/rank in the Flash-Next TP4 configuration.
+    "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"))
+    ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.
     # This remains opt-in pending the same model-level quality gates as GEMV.
@@ -2047,6 +2055,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default off pending endpoint and model-quality admission.
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))
+    ),
+    # Reuse the batched expert grouping for the exact TP4 MTP4 verifier.
+    # Preserve its W13 split4 and ordered FP16 W2/FP32 weighted reduction.
+    "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "0"))
     ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
     # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the
@@ -3636,6 +3649,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_GDN_RMSNORM_ONEPASS": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0"))
+    ),
+    # Fuse the native FP32 N128 gated RMSNorm chain without changing its
+    # vector4 mean reduction, sigmoid/SiLU, or FP16 output boundary.
+    "VLLM_SM70_RMSNORM_GATED_EXACT": lambda: bool(
+        int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0"))
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
