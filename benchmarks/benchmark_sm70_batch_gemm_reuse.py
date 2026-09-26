@@ -226,6 +226,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--oracles", type=Path, required=True)
     p.add_argument("--write-oracles", action="store_true")
+    p.add_argument("--require-bitwise", action="store_true")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--rows", type=int, nargs="+", default=[8, 16, 17, 24, 32, 64])
     p.add_argument("--kinds", nargs="+", default=list(COUNTS))
@@ -241,6 +242,7 @@ def main():
         torch=torch.__version__,
         cuda=torch.version.cuda,
         layer=args.layer,
+        require_bitwise=args.require_bitwise,
         gpu_before=gpu_state(),
         env={k: v for k, v in os.environ.items() if k.startswith("VLLM_SM70_")},
         note="Single GPU TP4 shards; layer-weighted estimate, no service/profiler.",
@@ -270,7 +272,7 @@ def main():
                     torch.save(y.cpu(), path)
                 else:
                     oracle = torch.load(path, weights_only=True).cuda()
-                    if m <= 32:
+                    if m <= 32 or args.require_bitwise:
                         assert torch.equal(
                             oracle.view(torch.int16), y.view(torch.int16)
                         ), (kind, m, i, float((oracle - y).abs().max()))
@@ -315,7 +317,7 @@ def main():
                 eager_graph_exact=True,
                 oracle_check="saved"
                 if args.write_oracles
-                else ("bitwise" if m <= 32 else "tolerance"),
+                else ("bitwise" if m <= 32 or args.require_bitwise else "tolerance"),
             )
             print(json.dumps(row), flush=True)
             results.append(row)
