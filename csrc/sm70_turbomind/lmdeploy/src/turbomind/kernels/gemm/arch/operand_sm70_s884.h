@@ -49,34 +49,6 @@ struct Operand_A_Swizzle_8x64: Operand_A<T> {
     };
 };
 
-// Pad each activation row by eight half values. For K32/K64 batch
-// tiles this avoids repeatedly addressing the same shared-memory banks.
-// Weight layout and arithmetic remain unchanged.
-template<class T>
-struct Operand_A_BatchPadded: Operand_A<T> {
-    template<int M, int K>
-    struct Layout: SmemLayoutV2<M, K, 1, 1> {
-        static constexpr int kSize = M * (K + 8);
-        static constexpr bool kIsTrivial = false;
-        __forceinline__ __device__ static int apply(int s, int c, int offset = 0)
-        {
-            return s * (K + 8) + c + offset;
-        }
-        __forceinline__ __device__ int operator()(int s, int c, int offset = 0)
-        {
-            return apply(s, c, offset);
-        }
-    };
-
-    struct GetSmemLayout {
-        template<int M, int K>
-        static constexpr auto apply(pair<M, K>)
-        {
-            return Layout<M, K>{};
-        }
-    };
-};
-
 template<class T>
 struct Operand_B {
     using Dtype = T;

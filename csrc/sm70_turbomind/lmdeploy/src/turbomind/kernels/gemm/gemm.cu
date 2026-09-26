@@ -58,35 +58,6 @@ bool GemmTraceFilterAllows(const std::string& desc) {
   return !raw || !*raw || desc.find(raw) != std::string::npos;
 }
 
-bool IsSm70BatchSupply(const Kernel* kernel) {
-  return kernel &&
-         kernel->name().find("_sm70_batch_supply") != std::string::npos;
-}
-
-// SchedulerSm70 distributes whole K chunks, with larger partitions last.
-// Equal split counts alone are insufficient when CTA_K changes the chunk size.
-bool SameSm70SplitKPartition(const LaunchSpec& control,
-                            const LaunchSpec& candidate, int k) {
-  if (control.splits != candidate.splits ||
-      control.kernel->desc().op_class != candidate.kernel->desc().op_class ||
-      control.kernel->warp_tile_size().z != candidate.kernel->warp_tile_size().z) {
-    return false;
-  }
-  const auto boundary = [k](const LaunchSpec& spec, int split) {
-    const int chunk = spec.kernel->chunk_size_k();
-    const int chunks = cdiv(k, chunk);
-    const int offset = spec.splits - chunks % spec.splits;
-    return std::min(k, (split * (chunks / spec.splits) +
-                       std::max(split - offset, 0)) * chunk);
-  };
-  for (int split = 1; split < control.splits; ++split) {
-    if (boundary(control, split) != boundary(candidate, split)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool Sm70AwqTp2FastSelectorEnabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR");
   return !raw || std::atoi(raw) != 0;
@@ -659,31 +630,11 @@ struct Gemm::Impl {
         return {};
       }
     }
-    const bool batch_tail =
-        arch_ == 700 && desc.num == 1 && desc.m > 32 && desc.m <= 64;
-    if ((policy & DispatchPolicy::kReuse) || batch_tail) {
-      if (auto spec = cache_.LowerBound(desc);
-          spec && ((policy & DispatchPolicy::kReuse) ||
-                   IsSm70BatchSupply(spec->kernel))) {
-        if (is_feasible(*spec)) {
-          return *spec;
-        }
-        if (spec->kernel && IsSm70BatchSupply(spec->kernel) &&
-            desc.num == 1 && desc.m > 32 && desc.m <= 64) {
-          // A full-M64 iterator cannot execute a smaller captured tail.
-          // Preserve its K partition when returning to a masked K32 kernel.
-          const auto fallbacks =
-              Find(ctx, barriers_size, partials_size, 0, false);
-          for (const auto& fallback : fallbacks) {
-            if (fallback.kernel->cta_tile_size().z == 32 &&
-                SameSm70SplitKPartition(*spec, fallback, desc.k)) {
-              cache_.Insert(desc, fallback);
-              return fallback;
-            }
-          }
-        }
+    if (policy & DispatchPolicy::kReuse) {
+      if (auto spec = cache_.LowerBound(desc); spec && is_feasible(*spec)) {
+        return *spec;
       }
-      if (warn_cache_miss_ && (policy & DispatchPolicy::kReuse)) {
+      if (warn_cache_miss_) {
         std::cerr << "Failed to find a feasible kernel in the cache, will "
                      "dispatch by heuristic: "
                   << to_string(ctx.desc()) << std::endl;
@@ -713,15 +664,8 @@ struct Gemm::Impl {
 
   std::vector<LaunchSpec> Find(Context& ctx, size_t barrier_size,
                                size_t partials_size, int top_k,
-                               bool include_prescaled,
-                               bool include_batch_supply = false) {
+                               bool include_prescaled) {
     std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
-    // Untuned/cache-miss dispatch retains the existing numerical family.
-    // Batch supply candidates are admitted only by the two-stage measurement.
-    if (!include_batch_supply) {
-      feasible.erase(std::remove_if(feasible.begin(), feasible.end(),
-                                    IsSm70BatchSupply), feasible.end());
-    }
     if (!include_prescaled) {
       feasible.erase(
           std::remove_if(feasible.begin(), feasible.end(), [](const Kernel* k) {
@@ -833,57 +777,7 @@ struct Gemm::Impl {
       specs.insert(specs.end(), swis.begin(), swis.end());
     }
 
-    std::vector<LaunchSpec> batch_candidates;
-    if (arch_ == 700 && ctx.desc().num == 1 &&
-        ctx.desc().m > 32 && ctx.desc().m <= 64) {
-      batch_candidates =
-          Find(ctx, barriers_size, partials_size, tuning_.top_k, false, true);
-      batch_candidates.erase(
-          std::remove_if(batch_candidates.begin(), batch_candidates.end(),
-                         [](const LaunchSpec& spec) {
-                           return !IsSm70BatchSupply(spec.kernel);
-                         }),
-          batch_candidates.end());
-      if (!batch_candidates.empty()) {
-        // Keep the accepted K32 batch reduction family as the reference.
-        // Prefill-oriented K16 tiles can change summation even before the
-        // activation-supply candidates are measured.
-        std::vector<LaunchSpec> reference_specs;
-        std::copy_if(specs.begin(), specs.end(),
-                     std::back_inserter(reference_specs),
-                     [](const LaunchSpec& spec) {
-                       return spec.kernel->cta_tile_size().z == 32;
-                     });
-        if (!reference_specs.empty()) {
-          specs = std::move(reference_specs);
-        }
-      }
-    }
-
     specs = Sampler{*measurer_, tuning_.clusters}.Run(specs, launch_func, st);
-
-    if (!specs.empty() && !batch_candidates.empty()) {
-      const auto control = specs.front();
-      std::vector<LaunchSpec> batch_specs{control};
-      for (const auto& candidate : batch_candidates) {
-        if (SameSm70SplitKPartition(control, candidate, ctx.desc().k)) {
-          const auto swis = ctx.Swizzle(candidate, tuning_.swizzle);
-          batch_specs.insert(batch_specs.end(), swis.begin(), swis.end());
-        }
-      }
-      if (batch_specs.size() > 1) {
-        if (GemmTraceEnabled() && GemmTraceFilterAllows(to_string(ctx.desc()))) {
-          std::cerr << "[TM_GEMM_BATCH_CONTROL] desc=" << to_string(ctx.desc())
-                    << " kernel=" << control.kernel->name()
-                    << " splits=" << control.splits
-                    << " chunk_k=" << control.kernel->chunk_size_k() << '\n';
-        }
-        // Preserve the best existing launch's reduction boundaries while
-        // measuring faster M/N tiles and activation supply for FP4 and FP8.
-        specs = Sampler{*measurer_, tuning_.clusters}.Run(
-            batch_specs, launch_func, st);
-      }
-    }
 
     // for (const auto& s : specs) {
     //     std::cout << s.kernel->name()          //

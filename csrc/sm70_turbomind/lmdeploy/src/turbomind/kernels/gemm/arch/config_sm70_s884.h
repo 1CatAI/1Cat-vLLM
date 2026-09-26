@@ -141,14 +141,6 @@ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               half,                        // Tc
                               raster_order, group_axis>;
 
-// Dense batch FP4/FP8 share the activation supply and warp tiling policy.
-// Their packed weights and numerical transforms are the existing ones.
-template <class Weight, Order raster_order>
-using Config_QuantizedBatch = Sm70_s884<
-    Operand_A_BatchPadded<half>, Transform_Default, VoidOperand,
-    Operand_B_Pack<Weight>, Transform_HMMA_SIMT_B, Operand_V_Pack<uint16_t>,
-    kRowMajor, half, raster_order, -1>;
-
 template <Order raster_order, int group_axis = -1>
 using Config_E4M3_Prescaled =
     Sm70_s884<Operand_A<half>,             // A
