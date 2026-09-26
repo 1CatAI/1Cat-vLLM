@@ -1,7 +1,13 @@
 # Flash-Next MTP4 batch decode qualification
 
-The accepted reference is **27.3963 ms per complete MTP4 round**. The target
-verifier uses M5/M10 matrix batches; the draft loop uses M1. This work ports
+The latest qualified fixed-fixture result is **23.657858 ms per complete
+MTP4 round**, versus a matched 23.874188-ms control before the exact draft
+MoE schedule. Natural EOS timings do not improve in that pair; keep the new
+draft route opt-in. The requested **less-than-20-ms** threshold is unmet.
+
+The original accepted reference is **27.3963 ms per complete MTP4 round**.
+The target verifier uses M5/M10 matrix batches; draft step0 uses M5 and its
+three continuations use M1. This work ports
 the packed GDN input candidate from [PR #692](https://github.com/1CatAI/1Cat-vLLM/pull/692)
 at `bcf0efa914e5e84b38164359563931e8a82e5f57` onto the shared MTP4 defaults,
 then extends grouped expert reuse to M5 and fuses native gated RMSNorm.
@@ -556,3 +562,220 @@ M10; this is no qualified engine improvement. The cache hypothesis follows
 the [Volta unified-cache documentation](https://docs.nvidia.com/cuda/volta-tuning-guide/index.html#unified-shared-memory-l1-texture-cache),
 not an observed hardware counter. NCU remains blocked by
 `ERR_NVGPUCTRPERM`. Retain both screen reports and skip engine runs for them.
+
+### Full-vocabulary head screen
+
+`draft_head_screen` uses the real rank0 FP16 head `[62080,2560]`, M1,
+six synthetic activation scales and alternating graph measurements on GPU4.
+The only bit-exact cuBLASLt heuristic costs 475.104 us versus 474.944 us for
+the existing full projection. Other heuristics and the packed full-head
+operator change FP16 logits, so they are rejected without timing or engine
+tests. This screen does not justify changing the target's batch GEMM.
+
+The existing raw/packed fused top1 operators take 399.264/418.240 us and
+match the selected value/index on these six inputs. That is a narrower
+check than full-logit bit parity. The raw operator uses `__hmul2`, rounding
+each product to FP16 before summation, so it fails this task's arithmetic
+contract outright. The packed operator also changes accumulation order;
+historical model tests have reported output divergence. Neither shortcut is
+enabled by this change. Preserve the full-vocabulary arithmetic.
+
+### Endpoint resource handoff
+
+The modular fix is committed at `6bcffbb7968711babe44dfcf0986500377fb13ab`.
+GPU0--3 remained occupied by another evaluation, so an additional same-source
+control completed on GPU4--7: **23.880598/23.867778 ms**, median
+**23.874188 ms**. Its emitted tokens and acceptance records all match the
+GPU0--3 control. Keep timings paired within a physical GPU group.
+
+`mtp_draft_exact_candidate_4567` failed before weight loading: another task
+started on GPU4--7 after the launcher's idle check, leaving 24.38/31.73 GiB
+free, below the unchanged 0.95 memory-utilization request. Retain this failed
+startup; do not reduce memory utilization or terminate the foreign workers.
+`mtp_draft_exact_candidate_auto` subsequently used GPU4--7 and its matching
+control, as reported below. No additional control was run.
+
+The first isolated NVIDIA Nsight Systems **2025.3.2.474** attempt completes
+its 129-token model request and all four profiler RPC start/stop calls, but
+prints **No reports were generated**. It supplies no kernel timing evidence.
+Its package SHA256 is
+`c7cfe27e2250eb91e1a67e7feb5f2c490c7f598e3b3a3d047aff000bc49f9d6b`.
+A small single-GPU reproduction finds the cause: this package loads CUPTI
+13.1, reports `CUPTI_ERROR_INVALID_DEVICE`, and produces zero CUDA events.
+Whole-process tracing yields only NVTX events; API-range tracing yields no
+report. Retain `nsys_smoke_{api,all}2532` and the failed model capture log.
+
+An isolated **2025.3.1.90** CLI package, SHA256
+`d2484ad0faf6831b11fa0bf73c54232d9ea8beafb50414019e6ba299c4ed5718`, loads
+CUPTI 12.9 instead. The identical API-range smoke captures all **40 expected
+kernels** (20 graph replays of GEMM + sine) and 20 NVTX ranges. It still warns
+about the driver's CUDA 13.0 version and possible incomplete events at range
+closure. Whole-process smoke captures its 47 expected warmup/capture/replay
+kernels with no incomplete-events warning. This local count check justifies
+one model capture, not a general guarantee of trace completeness.
+
+The source build and CUDA 12.8 runtime remain unchanged; both profilers live
+only in the task cache. The model capture uses `--cuda-event-trace=false`,
+node tracing, all-rank flush and `--kill=none --wait=primary`.
+[Nsight's release notes](https://docs.nvidia.com/nsight-systems/ReleaseNotes/index.html)
+exclude Volta from 2025.4 and later, so upgrading to those versions is not a
+recovery route. Do not interpret an unrecorded interval as proven GPU idle.
+
+### Complete draft-MoE endpoint gate
+
+`mtp_draft_exact_candidate_auto` obtains GPU4--7 after the unrelated service
+exits. Compare it only with `mtp_draft_exact_control_4567`: both use source
+`6bcffbb7968711babe44dfcf0986500377fb13ab`, the same native `_C` hash, GPU
+group and engine contract. The only environment difference is
+`VLLM_SM70_MTP_MOE_FP16_EXACT=0/1`; retained source patches contain only this
+report. Both processes exit successfully. Workers log the actual native
+route. Model memory stays 23.61 GiB and KV capacity stays 122,631 tokens.
+
+| Ordinary request | Control round ms | Exact draft round ms |
+| --- | ---: | ---: |
+| Fixed 8192/513 A | 23.880598 | 23.632925 |
+| Fixed 8192/513 B | 23.867778 | 23.682790 |
+| Fixed median | **23.874188** | **23.657858** |
+| Natural EOS code, 284 tokens | 24.957797 | 25.067507 |
+| Natural EOS arithmetic, 329 tokens | 24.920565 | 25.013588 |
+| Natural EOS explanation, 421 tokens | 24.962826 | 24.962961 |
+
+The fixed-fixture saving is **0.216330 ms (0.9061%)**. The natural requests
+show no gain (two are 0.110/0.093 ms slower); do not claim a universal speedup
+or enable the flag by default. The below-20-ms objective remains
+**3.657858 ms away** on the fixed fixture.
+
+Every token ID, finish reason and acceptance statistic matches in both
+fixed repeats and all three natural requests, as well as warmup and the
+separate phase request. The fixed fixture still emits 513 tokens with 335
+draft rounds and 177 accepted drafts, position counts `[125,36,10,6]`.
+Natural outputs stop normally. The generated LIS function passes empty,
+duplicate, negative and example inputs; the arithmetic answer is 240 km /
+68.57 km/h, and the signed-division example reconstructs its dividend.
+These are three text-health cases, not broad model-quality qualification.
+
+Separate CUDA-event phase measurements show per-rank draft means changing
+from **5.011584--5.034362 ms** to **4.879756--4.902546 ms**. On the same rank1,
+draft is 5.011584 -> 4.902546 ms and target verifier GPU is
+19.008792 -> 18.872125 ms. The highest-mean-total rank changes from rank1 to
+rank3; do not mix category maxima into a synthetic round. Instrumented phase
+requests and the upcoming node trace do not replace the ordinary endpoint.
+
+Retain `mtp_draft_exact_comparison.{json,log}`, both endpoint reports/logs,
+contracts/source patches and `draft_moe_output_health.json`. The component
+gains only partly appear in the engine; the next node capture checks the
+native projections' actual scheduling and the remaining dense/HC work.
+
+### Successful current-build node capture and remaining bottlenecks
+
+`mtp_draft_exact_trace2531` uses the same source, normal `_C`, GPU4--7 and
+all four flags as the qualified candidate. Generation and profiler exit 0;
+all four worker start/stop RPCs return success. Its 129 tokens and acceptance
+(85 drafts, 43 accepted, positions `[16,13,8,6]`) match the preceding capture.
+No owned GPU workers remain after shutdown. Keep the report, SQLite export,
+contracts, diagnostics and analysis JSON under that artifact prefix.
+
+Four ranks each contain 212,131 recorded kernels over the whole range.
+All **84 closed steady rounds** contain exactly **2,060 target kernels** and
+**298 draft kernels**. Every rank and selected round contains exactly one
+native M5 W13, three native M1 W13 and four native W2 calls. The new path is
+actually used; no draft step silently falls back to the old Triton projection.
+Driver-version and possible incomplete-CUDA/NVTX-events diagnostics remain.
+Stable selected counts support these route observations; they do not prove
+that every unrecorded interval is idle.
+
+Rank0's *profiled* cycle closes at **29.391136 ms** (mean per-cycle slowest
+rank 29.393058): metadata-to-target 0.845020, target graph 22.668388,
+target-to-gather 0.009949, sampling/state handoff 0.788612, four drafts plus
+combine 5.032932, next-round preparation 0.046235. The target graph contains
+16.806997 ms of recorded-kernel union and 5.861392 ms without a recorded
+kernel; 3.834410 ms of the latter overlaps its 4.116641-ms graph-launch API.
+This is **not a new 29-ms endpoint** and is not rescaled or subtracted from
+the measured 23.657858-ms ordinary round. Low-overhead phase observations
+remain around 19 ms for target verification and 4.9 ms for the four drafts.
+
+The rank0 draft interval, excluding final combine, closes independently:
+
+| Current traced draft category | Exclusive wall ms/round |
+| --- | ---: |
+| Four full-vocabulary heads | 1.881527 |
+| Other dense projections/reductions | 0.629245 |
+| Draft MoE projections | 0.613238 |
+| Sampling, state and elementwise | 0.544494 |
+| TP communication and dependency waits | 0.405687 |
+| Attention/indexer | 0.343567 |
+| HC postops/fused M1 projections | 0.199544 |
+| Overlapping kernel families | 0.067603 |
+| No recorded kernel | 0.343043 |
+| **Draft wall** | **5.027947** |
+
+Draft steps 0/1/2/3 close at 1.384795/1.266408/1.175003/1.201741 ms.
+The first step is M5; subsequent steps are M1. Each local vocabulary head
+still reads a nominal 317,849,600 weight bytes and takes about 0.469--0.471 ms
+on rank0. The byte/time quotient is about 675--678 GB/s of *nominal weight
+traffic*, not a measured memory-bandwidth counter. The already rejected
+non-exact head alternatives cannot establish an available speedup.
+
+Target's remaining dense service is **7.565656 ms**, including HC down
+97 calls / 1.627876 ms and HC up 98 calls / 1.394273 ms. HC postops add
+1.055227 ms service. Other target services include grouped experts 2.498326,
+QSA 1.805013, packed GDN input 1.299056 and GDN core 0.887810 ms. These service
+sums overlap and must not be added to the target wall. This still makes the
+repeated target dense/HC operations the main place to pursue the several
+milliseconds needed for <20-ms complete rounds.
+
+#### M1 W13 long-tail investigation
+
+The new native M1 W13 trace is not uniformly as fast as its isolated screen.
+Across 252 calls per rank, medians are 72.559/62.064/63.248/71.584 us, but
+means are 146.829/97.180/87.968/123.266 us. **171 of 1,008 calls exceed
+250 us**; maxima reach 306.748--340.413 us. The slow calls can overlap only
+about 4--8 us of shared-expert work on another stream, so that recorded work
+alone does not explain a roughly 260-us tail. This is a trace observation,
+not yet a proven unprofiled scheduling or hardware root cause.
+
+Targeted follow-up screens avoid another model startup:
+
+- `draft_moe_context_screen`: real rank0 weights, 96 changing routes/scales
+  in each warm/cold condition, alternating arm order and one-replay CUDA
+  event timing. Native direct64 means 80.811/88.544 us; maxima 89.088/98.304 us.
+  A 64-MiB cache-clearing memset does not reproduce the 300-us tail.
+- `draft_moe_context_screen_nsys`: the same screen under 2025.3.1 node
+  tracing also does not reproduce that tail; cold direct64 mean 89.681 us,
+  maximum 100.384 us. Nsight on/off alone is insufficient to explain it.
+- `draft_moe_tlb_screen`: a 24-GiB pressure tensor is touched every 64 KiB
+  before each projection, outside the timed window. Across 48 changed
+  routes, direct64 mean/max are 88.021/95.232 us. This artificial address
+  pressure also does not reproduce the model trace's tail. It is not a
+  measurement of TLB misses or proof that model residency is irrelevant.
+- All screened outputs match the Triton control bit for bit. Shared32/K256
+  gives 75.904 us under the last condition, but its earlier warm screen is
+  essentially tied with direct64. This is not a full-model admission; no
+  further kernel switch or default change is made from these component data.
+
+The next discriminating measurement is graph-internal CUDA-event timing of
+M1 W13 in the resident engine without CUPTI, with actual route IDs and rank
+arrival times, to establish whether these tails exist in ordinary execution.
+It should reuse the qualified workload and control instead of repeating the
+full endpoint suite. Then choose a scheduling change only if that evidence
+supports it. In parallel as an optimization direction, target batch dense/HC
+fusion and launch-count reduction have substantially more total headroom
+than another isolated draft tile sweep. Historical rejected shared staging,
+packing, prefetch and arithmetic variants remain closed until a concrete new
+mechanism addresses their recorded failure. No achieved SM/HBM utilization
+is claimed while Nsight Compute counter access is unavailable.
+
+The task-local `mtp_kernel_observer` implements that follow-up using external
+CUDA event nodes around the unchanged normal `_C` projection, plus small
+route/counter copies after the end event. A standalone replay smoke passes:
+three event pairs, three changed-route replays, exact route/counter tracking
+and bit-identical outputs. This observer synchronizes after each proposal,
+so its whole-request latency would remain diagnostic only. It does not
+replace a kernel or alter routing/weights.
+
+The first resident attempt, `mtp_draft_kernel_events`, exits 1 before weights
+load: a foreign GPU4--7 job appears after preflight, leaving only
+20.43/31.73 GiB free on one rank versus the unchanged 30.15-GiB request.
+No resident event result exists from this failed attempt. At this checkpoint
+both four-GPU groups are occupied; the bounded retry waits for an idle group.
+Do not treat the observer's standalone smoke as evidence about model tails.

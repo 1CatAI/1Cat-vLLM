@@ -48122,3 +48122,66 @@ has launched no full model. Details and artifacts are in
   18.052--21.776 us and M10 14.424 -> 20.924--23.592 us. Asking the identical
   kernel to prefer L1 also gives no gain (M5 12.696 -> 12.716 us). Retain
   `hc_up_original_shared` and `hc_up_cache`; skip full-model runs for both.
+- Draft-MoE full-model gate completes on GPU4--7 at source `6bcffbb796`,
+  same native extension and engine settings in both arms. Only the new draft
+  flag changes. Fixed 8192/513 round median is **23.874188 -> 23.657858 ms**,
+  saving **0.216330 ms (0.9061%)**. The <20-ms objective is still unmet by
+  3.657858 ms. Do not subtract this delta from a different historical pair.
+- Both fixed repeats and all three natural EOS cases preserve every token,
+  finish reason and acceptance count. Natural outputs stop at 284/329/421
+  tokens and pass the code/arithmetic/explanation health checks. Natural
+  round timings do not improve (24.957797/24.920565/24.962826 ->
+  25.067507/25.013588/24.962961 ms). Keep the new draft flag opt-in; no
+  universal throughput gain or default-on qualification is claimed.
+- Separate per-rank CUDA-event draft means fall from 5.011584--5.034362 to
+  4.879756--4.902546 ms. This is less than the isolated projection saving.
+  A new node trace is needed to inspect actual scheduling; event-profiled
+  or heavily traced request timing is not a replacement endpoint result.
+- Retain the pre-weight-load GPU4--7 resource-conflict failure. The
+  successful retry reused its completed same-GPU control and waited for
+  foreign jobs to exit, without changing the .95 memory contract. Normal
+  model memory remains 23.61 GiB, with 122,631 KV tokens.
+- The real-weight full-vocabulary head screen finds no exact cuBLASLt gain.
+  Reject other full-head algorithms for FP16-logit differences. Raw fused
+  top1 additionally rounds products to FP16 via `__hmul2`, violating this
+  arithmetic contract; six matching selected tokens do not admit it.
+- Reject the Nsight 2025.3.2.474 model capture: it completes generation and
+  profiler RPCs but emits no report. A tiny reproduction identifies CUPTI
+  13.1 `CUPTI_ERROR_INVALID_DEVICE` and zero CUDA events. The same smoke with
+  isolated 2025.3.1.90/CUPTI 12.9 captures exactly 40/40 graph kernels. A
+  driver-version warning remains, so preserve diagnostics and distinguish
+  unrecorded intervals from idle. This is the gate for one model recapture.
+  Model runtime/build remain unchanged; do not install Nsight 2025.4+ for
+  Volta, which those versions no longer support.
+
+### Current-build draft trace and long-tail screen, 2026-09-27
+
+- `mtp_draft_exact_trace2531` exits 0 and preserves the 129-token request and
+  85/43 draft/accepted counts. Four ranks and 84 closed intervals pass the
+  marker checks: 2,060 target and 298 draft kernels each; every round uses
+  exactly 1 M5 W13 + 3 M1 W13 + 4 W2 native projections. Keep compatibility
+  diagnostics. The 29.391136-ms profiled cycle is not the 23.657858-ms ordinary
+  endpoint. Target graph-launch overlap explains a large part of its extra
+  unrecorded span, without establishing all such spans as idle.
+- Current traced rank0 draft wall is 5.027947 ms: full heads 1.881527, MoE
+  0.613238, other dense 0.629245, sampling/state 0.544494, communication/waits
+  0.405687, attention 0.343567, HC 0.199544, overlap 0.067603, unrecorded
+  0.343043. Target dense service is 7.565656 ms, including 3.022150 ms HC
+  down/up; HC postops add 1.055227 ms service. Service is nonadditive.
+- Native M1 W13 has 62--73-us medians but 171/1,008 traced calls exceed
+  250 us. Do not equate isolated 59--64-us timing with all model calls.
+  Changed-route screens, 64-MiB cache flush, Nsight on/off and 24-GiB strided
+  address pressure do not reproduce those tails (direct64 maxima <=101 us).
+  Preserve `draft_moe_{context,tlb}_screen*`; do not re-run these hypotheses
+  or install a new schedule from a cold-only component win.
+- The discriminating next observation is CUDA-event timing within the
+  resident draft graph without CUPTI, actual routes and rank arrival times.
+  Root cause remains unresolved. Prioritize target batch dense/HC fusion
+  for the remaining several milliseconds; the <20-ms goal is still unmet.
+- The task-local graph-event observer passes a three-replay changed-route,
+  counter and bit-parity smoke. Its first resident attempt fails before
+  weight loading when a foreign service races startup (20.43 GiB free versus
+  the unchanged 30.15-GiB request). Preserve the failed log and pending
+  observer; there is no resident no-CUPTI result yet. Both GPU groups are
+  occupied at this checkpoint. No model/code change or quality regression
+  is inferred from this resource failure.
