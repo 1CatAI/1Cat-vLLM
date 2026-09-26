@@ -46,6 +46,7 @@ def test_manifest_callable_and_result_roundtrip(monkeypatch):
             compilation_config=SimpleNamespace(cudagraph_mode="FULL_AND_PIECEWISE"),
         ),
         model_runner=SimpleNamespace(
+            sampler=SimpleNamespace(compute_nans=True),
             kv_cache_config=SimpleNamespace(
                 num_blocks=32,
                 kv_cache_tensors=[SimpleNamespace(size=4096)],
@@ -57,7 +58,7 @@ def test_manifest_callable_and_result_roundtrip(monkeypatch):
                         ),
                     )
                 ],
-            )
+            ),
         ),
     )
     encoder, decoder = MsgpackEncoder(), MsgpackDecoder()
@@ -67,6 +68,7 @@ def test_manifest_callable_and_result_roundtrip(monkeypatch):
     assert decoded == manifest
     assert decoded["physical_kv_bytes"] == 4096
     assert decoded["dcp"] == 2
+    assert decoded["sampler_checks_nans"] is True
 
 
 class TemplateTokenizer:
@@ -109,6 +111,7 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
     import vllm
 
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0")
     monkeypatch.setattr(
         transformers.AutoTokenizer,
         "from_pretrained",
@@ -118,6 +121,9 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
 
     class FakeLLM:
         def __init__(self, **kwargs):
+            import os
+
+            assert os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] == "1"
             self.llm_engine = SimpleNamespace(
                 engine_core=SimpleNamespace(
                     shutdown=lambda **kwargs: shutdowns.append(True)
@@ -133,6 +139,7 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
                     fp16_reduced_reduction=False,
                     bf16_reduced_reduction=False,
                     fp16_accumulation=False,
+                    sampler_checks_nans=True,
                     dcp=1,
                     kv_dtype="fp8_e4m3",
                     ple_environment={"VLLM_PLE_DISK_OFFLOAD": "1"},

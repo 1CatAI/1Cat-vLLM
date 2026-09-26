@@ -91,6 +91,10 @@ are not sustained-decode speed benchmarks. Omit `--long-context` only for a
 short preliminary check; never label that result 256K quality acceptance.
 The manifest transport is checked before model loading, so a missing local
 RPC opt-in fails without spending time loading weights or capturing graphs.
+The driver enables the native sampler NaN check and verifies it in worker
+manifests. Without that opt-in, the corruption metric alone is not evidence
+that logits were checked. It disables the greedy-only argmax shortcut, so these
+health timings are not production speed baselines.
 All tokenizer inputs are also materialized and type-checked before loading.
 Use `--preflight-only` to check the complete input set on CPU with the actual
 checkpoint tokenizer. Chat templates explicitly request `return_dict=False`

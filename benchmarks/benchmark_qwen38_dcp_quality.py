@@ -63,6 +63,7 @@ def worker_manifest(worker):
         "fp16_accumulation": getattr(
             torch.backends.cuda.matmul, "allow_fp16_accumulation", False
         ),
+        "sampler_checks_nans": worker.model_runner.sampler.compute_nans,
         "ple_environment": {
             k: v for k, v in os.environ.items() if "PLE" in k and k.startswith("VLLM_")
         },
@@ -154,6 +155,11 @@ def token_difference(control, candidate):
 
 
 def run(args):
+    # The corruption metric stays false when this opt-in is disabled. Enable
+    # the native sampler check before worker startup; no production default is
+    # changed. This diagnostic disables the greedy-only argmax fast path, so
+    # these health timings must not be presented as production speed results.
+    os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = "1"
     from transformers import AutoTokenizer
 
     from vllm import LLM, SamplingParams
@@ -262,6 +268,7 @@ def run(args):
                 or worker["fp16_reduced_reduction"]
                 or worker["bf16_reduced_reduction"]
                 or worker["fp16_accumulation"]
+                or not worker["sampler_checks_nans"]
                 or worker["dcp"] != args.dcp
                 or worker["kv_dtype"]
                 != ("fp8_e4m3" if args.kv_dtype == "auto" else args.kv_dtype)
