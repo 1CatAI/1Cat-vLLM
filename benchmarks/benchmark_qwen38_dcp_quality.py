@@ -3,7 +3,8 @@
 """Bounded source-installed Qwen3.8 DCP/KV qualification; no resident server.
 
 Run separate DCP1 and DCP2 processes with the same calibrated checkpoint and
-compare the saved token IDs. No private extension or runtime overlay is loaded.
+compare task scores, with token IDs retained as diagnostics. Exact token parity
+is opt-in, not the default acceptance gate. No private runtime overlay is loaded.
 An 8K smoke is not a 256K quality claim; use --long-context for that boundary.
 The worker manifest uses a trusted local callable RPC. Explicitly opt in with
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 for this offline check only, not a service.
@@ -134,6 +135,24 @@ def build_prompts(tokenizer, long_context):
     return cases, boundary_ids
 
 
+def token_difference(control, candidate):
+    """Report the first divergence without equating text health with parity."""
+    common = 0
+    for expected, actual in zip(control, candidate):
+        if expected != actual:
+            break
+        common += 1
+    matches = common == len(control) == len(candidate)
+    return {
+        "matches": matches,
+        "first_differing_token_0based": None if matches else common,
+        "reference_tokens": len(control),
+        "candidate_tokens": len(candidate),
+        "reference_token": control[common] if common < len(control) else None,
+        "candidate_token": candidate[common] if common < len(candidate) else None,
+    }
+
+
 def run(args):
     from transformers import AutoTokenizer
 
@@ -151,6 +170,7 @@ def run(args):
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
         "cases": [],
+        "quality_failures": [],
         "complete": False,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -160,6 +180,9 @@ def run(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     generation = json.loads((Path(args.model) / "generation_config.json").read_text())
+    report["generation_sampling"] = {
+        key: generation[key] for key in ("temperature", "top_p", "top_k")
+    }
     official = SamplingParams(
         max_tokens=1024,
         temperature=generation["temperature"],
@@ -175,11 +198,20 @@ def run(args):
         "prompt_lengths": {name: len(ids) for name, ids, _ in prompts},
         "boundary_tokens": len(boundary_ids) if boundary_ids is not None else 0,
     }
+    dataset_bundle = None
+    if args.dataset_spec:
+        if __package__:
+            from .qwen38_dcp_datasets import evaluate_datasets, prepare_datasets
+        else:
+            from qwen38_dcp_datasets import evaluate_datasets, prepare_datasets
+        dataset_bundle = prepare_datasets(args.dataset_spec, tokenizer)
+        report["preflight"]["dataset_manifest"] = dataset_bundle[2]
     if args.preflight_only:
         save()
         print(json.dumps(report["preflight"]), flush=True)
         return
     reference = {}
+    dataset_reference = None
     if args.reference:
         previous = json.loads(args.reference.read_text())
         previous_args = previous["args"]
@@ -189,6 +221,15 @@ def run(args):
             if previous_args[key] != report["args"][key]:
                 raise ValueError(f"Reference contract mismatch: {key}")
         reference = {case["name"]: case for case in previous["cases"]}
+        if dataset_bundle:
+            dataset_reference = previous.get("dataset")
+            if (
+                not dataset_reference
+                or not dataset_reference.get("complete")
+                or dataset_reference["manifest"] != dataset_bundle[2]
+                or previous["generation_sampling"] != report["generation_sampling"]
+            ):
+                raise ValueError("Dataset reference contract mismatch")
 
     llm = None
     try:
@@ -238,7 +279,10 @@ def run(args):
             metrics = result.metrics
             answer = out.text.rsplit("</think>", 1)[-1]
             prompt_hash = hashlib.sha256(json.dumps(ids).encode()).hexdigest()
-            passed = out.finish_reason == "stop" and expected in answer
+            corrupted = metrics is not None and metrics.is_corrupted
+            passed = (
+                out.finish_reason == "stop" and expected in answer and not corrupted
+            )
             case = {
                 "name": name,
                 "input_tokens": len(ids),
@@ -263,13 +307,22 @@ def run(args):
                 )
             if reference and name.startswith("greedy_"):
                 control = reference[name]
+                case["token_difference"] = token_difference(
+                    control["token_ids"], case["token_ids"]
+                )
                 case["matches_reference"] = (
                     control["prompt_hash"] == prompt_hash
                     and control["sampling"] == case["sampling"]
-                    and control["token_ids"] == case["token_ids"]
+                    and case["token_difference"]["matches"]
                 )
-                passed = passed and case["matches_reference"]
+                case["final_answer_matches_reference"] = (
+                    control["text"].rsplit("</think>", 1)[-1] == answer
+                )
+                if args.require_token_parity:
+                    passed = passed and case["matches_reference"]
             report["cases"].append(case)
+            if not passed:
+                report["quality_failures"].append(name)
             save()
             print(
                 json.dumps(
@@ -277,8 +330,8 @@ def run(args):
                 ),
                 flush=True,
             )
-            if not passed:
-                raise RuntimeError(f"Quality gate failed: {name}")
+            if corrupted:
+                raise RuntimeError(f"Non-finite model output: {name}")
 
         for name, ids, expected in prompts:
             sampling = official if name.startswith("official_") else deterministic
@@ -304,6 +357,20 @@ def run(args):
             if not boundary_finite:
                 raise RuntimeError("Exact 256K boundary failed")
         report["workers_after"] = llm.collective_rpc(worker_manifest, timeout=30)
+        if dataset_bundle:
+            evaluate_datasets(
+                llm, *dataset_bundle, generation, report, save, dataset_reference
+            )
+            report["workers_after"] = llm.collective_rpc(worker_manifest, timeout=30)
+            if dataset_reference:
+                for name, summary in report["dataset"]["summary"].items():
+                    if not summary["observed_no_regression"]:
+                        report["quality_failures"].append(f"dataset/{name}")
+        report["checks_finished"] = True
+        # A bounded text/parity failure must not discard the remaining quality
+        # evidence and force another startup. Runtime/NaN failures still abort.
+        if report["quality_failures"]:
+            raise RuntimeError(f"Quality gate failed: {report['quality_failures']}")
         report["complete"] = True
     except BaseException as error:
         report["error"] = f"{type(error).__name__}: {error}"
@@ -324,6 +391,8 @@ if __name__ == "__main__":
     parser.add_argument("--kv-gib", type=float, default=4.0)
     parser.add_argument("--long-context", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--require-token-parity", action="store_true")
+    parser.add_argument("--dataset-spec", type=Path)
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     run(parser.parse_args())

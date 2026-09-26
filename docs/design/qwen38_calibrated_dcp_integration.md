@@ -66,16 +66,17 @@ export CUDA_VISIBLE_DEVICES=4,5,6,7
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS=1
 export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1
-# Trusted local benchmark RPC only; do not enable on a public service.
-export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export TORCH_EXTENSIONS_DIR="$PWD/.cache/torch_extensions"
 export TRITON_CACHE_DIR="$PWD/.cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="$PWD/.cache/inductor"
 
-.venv/bin/python -m benchmarks.benchmark_qwen38_dcp_quality \
+# Callable RPC opt-in is scoped to each trusted offline benchmark process.
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+  .venv/bin/python -m benchmarks.benchmark_qwen38_dcp_quality \
   --model /path/to/calibrated-model --dcp 1 --kv-gib 4 \
   --long-context --output /path/to/dcp1.json
-.venv/bin/python -m benchmarks.benchmark_qwen38_dcp_quality \
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+  .venv/bin/python -m benchmarks.benchmark_qwen38_dcp_quality \
   --model /path/to/calibrated-model --dcp 2 --kv-gib 4 \
   --long-context --reference /path/to/dcp1.json --output /path/to/dcp2.json
 ```
@@ -83,7 +84,7 @@ export TORCHINDUCTOR_CACHE_DIR="$PWD/.cache/inductor"
 The controls keep max context 262144, chunk8192, C4 admission, no MTP,
 no prefix caching and a fixed 4 GiB/card KV budget. They record physical
 cache allocations, per-owner geometry, resolved graph/precision/PLE settings,
-official-sampling short output health, deterministic token comparisons,
+official-sampling short output health, diagnostic deterministic token comparisons,
 8K/32K/near-256K retrieval and the exact 262143+1 finite-logprob boundary.
 Prefill and decode metrics are recorded separately. Short health responses
 are not sustained-decode speed benchmarks. Omit `--long-context` only for a
@@ -94,6 +95,49 @@ All tokenizer inputs are also materialized and type-checked before loading.
 Use `--preflight-only` to check the complete input set on CPU with the actual
 checkpoint tokenizer. Chat templates explicitly request `return_dict=False`
 to preserve integer token inputs with Transformers 5.
+
+## Task-score acceptance policy
+
+Per the user's updated acceptance criterion, reduction-order/rounding token
+differences alone do not reject a candidate. `--require-token-parity` retains
+the previous optional strict gate. The default retains the first divergent
+token and final-answer comparison as diagnostics. It does not lower arithmetic
+precision, suppress NaNs, ignore EOS, or waive actual task-score regressions.
+
+Pass `--dataset-spec /path/to/spec.json` to both DCP1 and DCP2 processes. A
+bounded score failure is accumulated so remaining cases can run in the same
+instance; exceptions and non-finite output still abort. Example:
+
+```json
+{
+  "selection_seed": 20260927,
+  "generation_seed": 0,
+  "batch_size": 4,
+  "gsm8k": {"path": "/path/to/gsm8k/test.jsonl", "count": 128, "max_tokens": 2048},
+  "longbench": {
+    "metrics_root": "/path/to/LongBench/LongBench",
+    "data_dir": "/path/to/longbench/data",
+    "datasets": {"multifieldqa_en": 32, "multifieldqa_zh": 32}
+  }
+}
+```
+
+The first screen uses 192 fixed, sampled-without-replacement questions:
+[GSM8K](https://github.com/openai/grade-school-math) exact numeric answers and
+[LongBench](https://github.com/THUDM/LongBench) official English/Chinese QA F1.
+GSM8K uses the existing repository boxed-answer extractor, thinking enabled,
+and a 2048 output cap. LongBench uses its published prompts/scorers and 64-token
+cap with thinking disabled. Both use the model's official temperature/top-p/
+top-k and identical per-question seeds, source hashes, prompt hashes, batch
+size, and output limits. No context truncation is needed for this subset.
+The reference manifest is checked before model loading.
+
+Report per-dataset scores and paired wins/losses, not only a combined average.
+The initial screen requires no observed per-dataset score decrease or increase
+in truncated/empty outputs, and zero non-finite outputs. If results are close
+or regress, examine paired cases and extend the predetermined sampling study;
+do not choose a favorable seed post hoc. This finite subset is a regression
+screen, not proof of universal equivalence or full benchmark performance.
 
 ## Qualification status
 
@@ -113,6 +157,32 @@ On the integration worktree, before full native rebuild completion:
   in subsequent PLE dispatch tests.
 - Merge pre-commit checks passed, including mypy and forbidden CUDA API checks.
 
-These are component gates, not full-model accuracy or throughput acceptance.
-Full-model DCP1/2, exact 256K quality, actual usable capacity and matched speed
-remain promotion gates. Imported PR author measurements are not our results.
+An additional 12 exact-256K address/LSE operator cases passed against FP32, and
+the normal source build was installed as a fresh wheel. Runtime source:
+`f6c62234e9959edb5ea2fda2b386ee0cd71d276b`; wheel SHA256:
+`e1cb69363ff7e1ff66c2fc04f25564f6d52bb17cc9f8d278177f9e9fd29460be`.
+
+Initial source-installed observations (same 4 GiB/card KV budget):
+
+| Measurement | DCP1 | DCP2 |
+| --- | ---: | ---: |
+| Actual physical KV allocation, GiB/card | 3.9971 | 3.9982 |
+| Allocator global-token capacity | 600,052 | 1,061,981 |
+| Allocator estimated 256K concurrency | 2.29 | 4.05 |
+| Allocated after startup, GiB/card | 25.414 | 25.567 |
+
+The allocator increase is 76.98%, not an assertion that four simultaneous
+full-length requests have been tested. DCP1 passed all seven health cases and
+the exact 262143+1 finite-logprob gate. Its long-context allocated peak was
+27.009 GiB/card. Initial DCP2 arithmetic outputs were correct, but greedy
+generation diverged at zero-based token27 while the final answer matched.
+That run stopped under the former strict policy, before its long-context cases;
+it is not a failed task-score dataset evaluation.
+
+The model-free `benchmark_qwen38_dcp_numerics.py` reproduces small differences
+on identical synthetic inputs across G6/page4 and sharded G12: max absolute
+2.44e-4 decode / 9.77e-4 prefill after gating, across three seeds. Both remain
+close to the FP64 oracle; DCP2 was not farther from it in those prefill cases.
+This supports an arithmetic-order investigation, not a causal attribution of
+the model's divergent token. Imported author measurements are not our results.
+The paired dataset screen and DCP2 256K validation are still pending.

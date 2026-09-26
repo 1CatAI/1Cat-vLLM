@@ -11,6 +11,7 @@ import torch
 from benchmarks.benchmark_qwen38_dcp_quality import (
     build_prompts,
     run,
+    token_difference,
     validate_manifest_transport,
     worker_manifest,
 )
@@ -170,6 +171,8 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
         kv_dtype="auto",
         long_context=True,
         preflight_only=False,
+        require_token_parity=False,
+        dataset_spec=None,
         reference=None,
         output=tmp_path / "report.json",
     )
@@ -180,7 +183,19 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
             run(args)
     report = json.loads(args.output.read_text())
     assert report["complete"] is healthy
-    assert len(report["cases"]) == (7 if healthy else 1)
+    assert len(report["cases"]) == 7
+    assert report["checks_finished"]
+    assert len(report["quality_failures"]) == (0 if healthy else 7)
     if healthy:
         assert report["exact_256k_boundary"]["finite"]
     assert shutdowns == [True]
+
+
+@pytest.mark.parametrize(
+    ("control", "candidate", "position"),
+    [([1, 2], [1, 2], None), ([1, 2], [1, 3], 1), ([1, 2], [1], 1)],
+)
+def test_token_difference(control, candidate, position):
+    result = token_difference(control, candidate)
+    assert result["matches"] == (position is None)
+    assert result["first_differing_token_0based"] == position
