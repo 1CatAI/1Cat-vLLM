@@ -70,6 +70,36 @@ def summarize(records, width):
     }
 
 
+def compare_tokens(requests, reference):
+    """Report the first zero-based difference without aborting a loaded engine."""
+    differences = []
+    for actual, expected in zip(requests, reference, strict=True):
+        a, b = actual["token_ids"], expected["token_ids"]
+        first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        if first is None and len(a) != len(b):
+            first = min(len(a), len(b))
+        differences.append(first)
+    return differences
+
+
+def finalize_measurements(report):
+    """Collect every planned case, but never accept failed token parity."""
+    report["measurements_complete"] = True
+    checks = [
+        matched
+        for case in report["cases"]
+        for key in ("tokens_match_reference", "tokens_match_first_repeat")
+        for matched in case.get(key, [])
+    ]
+    report["token_parity_passed"] = all(checks) if checks else None
+    if checks and not all(checks):
+        raise RuntimeError(
+            "Token parity failed; all planned measurements were collected, "
+            "but this run is not an accepted quality/speed result"
+        )
+    report["complete"] = True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
@@ -124,6 +154,7 @@ def main():
         "cases": [],
         "prefill_cases": [],
         "traces": [],
+        "measurements_complete": False,
         "complete": False,
     }
     import vllm._C as native
@@ -184,7 +215,7 @@ def main():
         )[0]
         report["warmup_text"] = warm.outputs[0].text
         if args.health:
-            import re
+            import regex as re
 
             official = json.loads((Path(model) / "generation_config.json").read_text())
             natural = SamplingParams(
@@ -352,17 +383,29 @@ def main():
                     "raw_steps": records,
                 }
                 report["cases"].append(case)
+                if repeat > 0:
+                    first = next(
+                        c
+                        for c in report["cases"]
+                        if c["concurrency"] == width and c["repeat"] == 0
+                    )
+                    differences = compare_tokens(requests, first["requests"])
+                    case["first_repeat_token_differences"] = differences
+                    case["tokens_match_first_repeat"] = [i is None for i in differences]
                 if args.reference:
                     expected = reference_cases[(width, repeat)]
-                    case["tokens_match_reference"] = [
-                        a["token_ids"] == b["token_ids"]
-                        for a, b in zip(requests, expected["requests"], strict=True)
-                    ]
-                    if not all(case["tokens_match_reference"]):
-                        save()
-                        raise RuntimeError(
-                            f"C{width} greedy tokens differ from control"
-                        )
+                    differences = compare_tokens(requests, expected["requests"])
+                    case["reference_token_differences"] = differences
+                    case["tokens_match_reference"] = [i is None for i in differences]
+                if any(
+                    not all(case.get(key, [True]))
+                    for key in ("tokens_match_reference", "tokens_match_first_repeat")
+                ):
+                    print(
+                        f"C{width} repeat {repeat}: token parity FAILED; "
+                        "retaining remaining diagnostic cases before failing the run",
+                        flush=True,
+                    )
                 save()
                 print(json.dumps({"repeat": repeat, **case["summary"]}), flush=True)
             if args.measure_prefill:
@@ -420,7 +463,7 @@ def main():
                         ),
                         flush=True,
                     )
-        report["complete"] = True
+        finalize_measurements(report)
         save()
     except Exception as error:
         report["error"] = repr(error)

@@ -73,17 +73,34 @@ def _measure_graph_us(
 def _load_extension() -> Any:
     source = Path(__file__).with_name("csrc") / "benchmark_sm70_cublaslt_algorithms.cpp"
     cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
-    cublas_library = Path(torch.__file__).parent.parent / "nvidia" / "cublas" / "lib"
+    nvidia = Path(torch.__file__).parent.parent / "nvidia"
+    cublas_library = nvidia / "cublas" / "lib"
+    includes = [
+        str(nvidia / package / "include")
+        for package in ("cublas", "cusparse", "cusolver")
+        if (nvidia / package / "include").is_dir()
+    ]
+    # Pip CUDA wheels expose versioned libraries without the development
+    # symlinks. These are the declared Torch runtime, not a kernel overlay.
+    libraries = [
+        cublas_library / name for name in ("libcublasLt.so.12", "libcublas.so.12")
+    ]
+    ldflags = (
+        [str(path) for path in libraries]
+        if all(path.is_file() for path in libraries)
+        else [
+            f"-L{cuda_home / 'lib64'}",
+            f"-L{cublas_library}",
+            "-lcublasLt",
+            "-lcublas",
+        ]
+    )
     return load(
         name="benchmark_sm70_cublaslt_algorithms_ext",
         sources=[str(source)],
         extra_cflags=["-O3"],
-        extra_ldflags=[
-            f"-L{cuda_home / 'lib'}",
-            f"-L{cublas_library}",
-            "-lcublasLt",
-            "-lcublas",
-        ],
+        extra_include_paths=includes,
+        extra_ldflags=ldflags,
         with_cuda=True,
         verbose=True,
     )

@@ -280,7 +280,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
-    VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2: bool = True
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
@@ -2436,9 +2436,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH", "1"))
     ),
-    # Independent C2 rollback, without changing C1 or the existing C4/8/16 path.
+    # Experimental C2 admission; keep off until matched engine token parity
+    # passes. C1 and the existing C4/8/16 path are unchanged.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2", "1"))
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2", "0"))
     ),
     # Exact Qwen3.8 single-token MoE payload: FP16 [1, 2560]. Reuse the
     # already-registered SM70 TP4 push buffers for all_reduce_sum2 while

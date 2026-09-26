@@ -2205,7 +2205,7 @@ class CustomAllreduce {
            bytes == kSm70Tp4PushAllreduceBytes);
       const char* m2 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2");
       const bool m2_enabled = bytes != kSm70Tp4PushAllreduceQwen38M2Bytes ||
-                              m2 == nullptr || std::strcmp(m2, "1") == 0;
+                              (m2 != nullptr && std::strcmp(m2, "1") == 0);
       const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
       const bool qwen38_mtp5 = mtp5 != nullptr && std::strcmp(mtp5, "1") == 0 &&
                                bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;

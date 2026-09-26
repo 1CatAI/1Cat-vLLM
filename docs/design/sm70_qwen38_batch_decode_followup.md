@@ -19,7 +19,9 @@ source-built native artifact; a newly built extension requires its own control.
 - Admit the missing FP16 `[2, 2560]` sum2 payload to the existing graph-only,
   fully-connected SM70 TP4 push path. Five 128-thread CTAs cover its 10 KiB.
   Preserve the established FP16 local sum and rank-ordered FP32 reduction.
-  `VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2=0` rolls back only this admission.
+  `VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2=1` opts into only this admission.
+  The initial default-on proposal was withdrawn after the engine quality gate
+  below failed; this does not attribute the failure to the collective.
 - Keep the batched shared-expert linear unchanged. Fuse only its FP16 sigmoid
   and output multiply, preserving the intermediate FP16 rounding. The M1
   fused dot is unchanged. The new operator is registered in the normal `_C`
@@ -243,3 +245,228 @@ layer/rank sweep yielded its cooperative GPU lock when another task acquired
 GPU0--3, before launching any new CUDA process. Next: finish the extra-weight
 screen when cards are free, then one matched native-engine control/candidate
 test with endpoint timing and greedy/text-health gates. Keep Draft.
+
+## Broader batch-benefit screen (2026-09-26 afternoon)
+
+The 3.09-ms MoE estimate above is still not sufficient evidence of a substantial
+**whole-engine** concurrency benefit. Reuse the retained trace instead of
+reprofiling a full model for every candidate. C1 to C2 increases rank-average
+HC service from 2.043 to 4.016 ms and other dense projections from 3.687 to
+5.765 ms. Those are priority-selection numbers, not additive endpoint savings.
+
+### Fixed-arithmetic HC output sharding
+
+Simply allowing a new GEMM shape to select its own cuBLAS heuristic changes
+the K partition. The new **benchmark-only** screen pins the replicated
+projection's algorithm, K partition, reduction storage type and stages while
+reducing each rank's output columns. No accumulation precision is reduced.
+In the declared CUDA 12.8 runtime, the matched down configuration is algorithm
+21 / tile 5 / stages 14 / split 22 / reduction 4; up is the same algorithm and
+tile with split 1 / reduction 0. These IDs are runtime-specific, not a portable
+production default.
+
+The fused SiLU/gather and mix/gather research code is adapted from
+[Draft #504](https://github.com/1CatAI/1Cat-vLLM/pull/504), revision
+`5a049230cda498087a537efd292fe7fa386f8e81`. Unlike that draft's ordinary local
+GEMM heuristic, this screen retains the original replicated GEMM's arithmetic.
+Signed zero is not canonicalized through a disjoint-output sum. The fixture
+passes raw IPC buffer addresses from its own dedicated channel, never an
+opaque communicator object across extension ABIs. It does not install an HC
+model wrapper, enable a runtime flag, or load a research library in serving.
+
+TP4 V100 GPUs 4--7, Torch 2.10.0+cu128, CUDA 12.8, FP16 checkpoint weights and
+activations, FP32 accumulators; all **96 different checkpoint HC weight pairs**.
+Fixed-pointer graphs, six alternating trials, 24 replays/trial. Maximum rank
+time per trial is retained. Includes down/up, SiLU, gate mix and both gathers;
+excludes combine/norm, the final mixer, attention, MoE and scheduler work:
+
+| Width | Replicated control | Exact sharded chain | Saved | Chain reduction |
+| --- | ---: | ---: | ---: | ---: |
+| C2 | 3.16211 ms | 2.54441 ms | 0.61771 ms | 19.53% |
+| C4 | 3.21811 ms | 2.58321 ms | 0.63490 ms | 19.73% |
+| C8 | 3.29751 ms | 2.66477 ms | 0.63275 ms | 19.19% |
+| C16 | 3.44267 ms | 2.81483 ms | 0.62784 ms | 18.24% |
+
+All four ranks, four widths, 96 pairs and six input scales
+`0/0.001/0.03/0.1/1/3` have zero bit differences for block and injection outputs,
+including changed-input graph replay with poisoned outputs. These are kernel
+checks, not a model-quality score. The speedup is a component result, **not
+19% whole-engine improvement**. Additional packed-up storage would cost about
+150 MiB/rank across these pairs; production integration remains deferred until
+the extra complexity earns a sufficiently large complete-step benefit.
+
+Portable reproduction (research-only JIT is built from these shipped sources):
+
+```bash
+CUDA_VISIBLE_DEVICES='' TORCH_CUDA_ARCH_LIST=7.0 \
+  .venv/bin/python -m benchmarks.kernels.benchmark_sm70_hc_batch_exact --build-only
+CUDA_VISIBLE_DEVICES=4,5,6,7 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  VLLM_SM70_TP4_PUSH_ALLREDUCE=1 TORCH_CUDA_ARCH_LIST=7.0 \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  --module benchmarks.kernels.benchmark_sm70_hc_batch_exact \
+  --model "$MODEL" --rows 2,4,8,16 --out "$RESULT"
+```
+
+Use a declared CUDA 12.8 `CUDA_HOME`, task-owned Torch/Triton caches and GPU
+locks. The cuBLAS benchmark helper now supports the versioned standard CUDA
+libraries supplied by Torch wheels, without requiring private library paths.
+Raw initial results: `.artifacts/hc_shard_tp4_v1.{json,log}`; projection-only
+screens: `hc_dense_v1`, `hc_shard_fixed_v1` JSON/log pairs in the same directory.
+
+### Rejected additional schedules
+
+- Plain cuBLASLt heuristic changes produced no useful exact winner. Fixing the
+  K partition while varying output tiling saves only about 1 us per router,
+  b/a or output projection. This does not justify new production dispatch.
+- Six CUTLASS WMMA small-M schedules preserve the exercised outputs but are
+  slower: GDN QKVZ C2 best 51.63 us versus 40.02 us; HC up C2 best 11.84 us
+  versus 11.27 us. Eight distinct real-weight allocations rotate through each
+  timed graph, avoiding a one-weight hot-cache claim.
+- Narrowing grouped MoE output tiles preserves all 24 changed-input/route
+  checks, but increases total call cost at C16: 117.33 us for the current exact
+  grouped path versus 152.57 us with half-width tiles, or 205.21 us with quarter
+  width. More resident work alone is not an efficiency win. The full-width
+  one-warp variant is neutral at C16 and saves only about 0.24 ms projected
+  across C8's 48 calls. No variant is added to production.
+
+Raw artifacts: `dense_v1`, `dense_schedule_v1`, `dense_wmma_v1`,
+`moe_narrow_v1` JSON/log pairs. These are research screens, not native-engine
+speed claims. GPU microbenchmark workers exited after each run.
+
+The source packaging failure noted above was resolved by installing `patchelf`
+in the task uv environment and resuming the same incremental build. Normal
+source build now completes, without copying another tree's kernels. Rebuilt
+`_C` SHA256 is
+`ac11029627cc046e9e06d3392a1ce5de376fdc6faa3524ee7af9074ca3592a03`;
+no RPATH/RUNPATH or private DSO dependency is present. The subsequent native
+engine A/B uses the already-implemented grouped MoE/gate/norm/sum2 candidates,
+**not** the research-only sharded HC route.
+
+### Whole-engine check: not accepted
+
+Exactly two model initializations were used: one control, then one candidate.
+Both use the same source-built `_C` hash above, physical GPUs 4--7,
+TP4 V100-SXM2-32GB / driver 580.173.02 / CUDA 12.8 / Torch 2.10.0+cu128,
+8,192 input tokens, 256 forced greedy output tokens, two repetitions per
+width, no MTP or prefix cache, 262,144 configured context, FP16 activations/KV,
+the ordinary dual-compile/full-decode-graph defaults and memory utilization
+0.9. PLE uses mmap prefill plus **12 GiB/rank pinned-UVA decode**. This is the
+97-tok/s contract, not disk-only decode. Generation and prefill are separate.
+
+The control reproduces the prior performance. The following are complete
+engine intervals, **not** kernel-service sums or accepted candidate gains:
+
+| Width | Control aggregate decode, two repetitions | Control step |
+| --- | ---: | ---: |
+| C1 | 96.824 / 96.808 tok/s | 10.328 / 10.330 ms |
+| C2 | 114.077 / 113.996 tok/s | 17.532 / 17.544 ms |
+| C4 | 221.655 / 221.571 tok/s | 18.046 / 18.053 ms |
+| C8 | 371.203 / 371.417 tok/s | 21.552 / 21.539 ms |
+| C16 | 556.707 / 556.771 tok/s | 28.740 / 28.737 ms |
+
+Control prefill is 6,872--6,915 input tok/s across the ten separate cohorts.
+Both natural-output checks pass and stop at EOS in both arms. However, the
+candidate's first C1 case (96.640 tok/s) differs from both control C1 repeats
+at **zero-based token 63**. Both outputs are readable; readability is not
+token-parity admission. The then-fail-fast harness stops there, so candidate
+C2/C4/C8/C16 and prefill were **not measured**. Do not claim that the projected
+3.09-ms MoE saving has become a measured whole-engine improvement.
+
+Offline comparison of already-saved data also finds control C2 request 0
+differs between its own repetitions. C1/C4/C8/C16 control repeats match.
+Consequently the observed difference does not by itself identify a new kernel
+as the cause. C1's dispatch guards exclude the new batched arithmetic paths;
+graph initialization/state or existing reproducibility must be localized
+before acceptance. No logit-margin or per-layer activation comparison was
+captured, so **no root cause or harmlessness claim is made**.
+
+Decisions:
+
+- Keep Draft; no merge, default promotion or end-to-end speedup claim.
+- New C2 sum2 admission is also made explicitly opt-in, matching the other
+  experimental candidates. Existing C1/C4/C8/C16 default collectives are not
+  changed. The native default-off rebuild is separate from the measured hash.
+- Fix benchmark efficiency: preserve first-difference positions and within-run
+  repeatability, collect the remaining planned cases after token differences,
+  then fail the final gate. `measurements_complete=true` is distinct from
+  `complete=true`; a parity failure leaves the latter false and exits nonzero.
+  Health/structural failures still abort. No third model restart this turn.
+- Before another engine run, localize the first differing greedy prefix with
+  fixed-input/logit and layer-boundary checks; do not combine four unknown
+  switches and blindly restart. Existing saved control evidence is retained.
+
+Reproduction uses the public concurrency harness. Set the four switches
+`VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE`,
+`VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH`,
+`VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2`,
+`VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` to 0 for control and 1 for candidate.
+Keep other task environment variables/caches explicit and identical in
+meaning, without private DSO/preload overrides:
+
+```bash
+export PYTHONPATH="$PWD/flash-attention-v100:$PWD"
+export CUDA_VISIBLE_DEVICES=4,5,6,7 CUDA_DEVICE_ORDER=PCI_BUS_ID
+export VLLM_QWEN4EXP_PLE_HOST_GIB=12 VLLM_PLE_OFFLOAD_PREFAULT=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn OMP_NUM_THREADS=1
+.venv/bin/python -m benchmarks.benchmark_sm70_qwen38_concurrency \
+  --model "$MODEL" --mode nomtp --widths 1,2,4,8,16 \
+  --input-len 8192 --output-len 256 --repeats 2 --health --measure-prefill \
+  --out "$CONTROL"
+# The candidate adds --reference "$CONTROL" and writes a distinct output.
+# Do not reuse a reference whose quality/repeatability gate has failed.
+```
+
+Artifacts: `.artifacts/control_gpu4567.{json,log}` and
+`.artifacts/candidate_gpu4567.{json,log}`. The control was generated before the
+new repeatability gate, so its old `complete=true` must not be interpreted as
+passing that newly added gate. All engine workers exited after the failure.
+
+### Deeper HC fusion and remaining work
+
+A subsequent isolated microbenchmark fuses the local up projection, FP16 gate
+materialization, exact sigmoid/mix and IPC gather into one CUTLASS WMMA CTA
+epilogue. It uses a separate IPC channel and four-branch output tiling; it
+does not change FP32 accumulation or FP16 rounding points. This research
+variant is **not** installed in the model or added to production dispatch.
+
+All 96 real HC pairs, four ranks, six changed-input scales and M2/4/8/16 have
+zero block/injection bit differences. The portable exact-sharding fixture
+also passes in this three-arm run. Maximum-rank median component timings:
+
+| Width | Replicated | Exact shard | Up/mix/gather fused |
+| --- | ---: | ---: | ---: |
+| C2 | 3.16806 ms | 2.55388 ms | 2.60736 ms |
+| C4 | 3.22458 ms | 2.58223 ms | 2.65658 ms |
+| C8 | 3.29758 ms | 2.66507 ms | 2.72378 ms |
+| C16 | 3.44213 ms | 2.81583 ms | 2.86933 ms |
+
+Fusion alone loses 0.053--0.074 ms relative to the exact sharded chain and is
+rejected. It removes a kernel boundary but makes the compute/communication
+schedule worse. Raw research: `.artifacts/hc_up_fused_96.{json,log}`. The
+two-pair smoke is used only for correctness, not a cold-layer throughput claim.
+
+CPU analysis of the 48 retained C16 routing patterns used for the MoE screen
+finds 160 routed slots spread over 87.29 distinct experts on average (53--126
+depending on layer), for 1.83x potential weight reuse. Actual 8-row grouping
+needs 87.85 groups on average: only 22.76% of row slots are occupied. These are
+**one retained step's route statistics, not measured SM utilization or a
+hardware throughput ceiling**. Prefixes of that batch give reuse ratios of
+1.02/1.12/1.39 at C2/C4/C8. More thread blocks did not help the earlier screen;
+future MoE work should target small-group load/dequantization pipelining, while
+HC/other dense projections still dominate the C1-to-C2 jump. Do not assume
+either direction will earn a large endpoint gain before measurement.
+
+Raw CPU analysis: `.artifacts/route_reuse_stats.json`. The new benchmark
+bookkeeping tests pass (11 tests); no full-model quality acceptance is inferred.
+
+The default-off guard's ordinary source rebuild exits successfully; `_C` SHA256
+is `863e344fb063cf7d0d383fba188ac2b4f3a9c65570ab1918b744b17b0657bd5e`,
+with no RPATH/RUNPATH/private DSO dependency. The optional Rust frontend is
+not built (no Rust compiler); this does not fail the Python/CUDA build.
+A finite native TP4 smoke captures both C2 sum2 flags 0 and 1, interleaves
+five graphs across 14 message sizes, and passes random, signed-zero and
+special-value checks with poisoned outputs/canaries, four cycles per family.
+This narrowly validates the opt-in change; it does not repeat the full earlier
+64-cycle matrix or excuse the model token difference. Artifacts:
+`.artifacts/build_native_optin.log`, `.artifacts/optin_native_mixed_size.{json,log}`.
+All owned GPU workers are released; no API is left resident.
