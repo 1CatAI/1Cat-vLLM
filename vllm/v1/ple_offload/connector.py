@@ -47,6 +47,28 @@ def _cuda_check(result: Any, operation: str) -> Any:
     return result
 
 
+def _dump_registration(registration: PleOffloadRegistration) -> bytes:
+    """Serialize a registration for the offload process.
+
+    CUDA tensors travel through CUDA IPC. The shared CPU input buffers are
+    sent as file descriptors: the "file_system" strategy would move their
+    storage under a torch_shm_manager owned by one GPU worker, and every
+    process holding such a storage reports its release to that manager. When
+    the engine is torn down, the manager can die first; libshm then throws
+    std::system_error ("Broken pipe") inside a storage destructor, and the
+    GPU worker or the offload process aborts with SIGABRT instead of exiting.
+    File-descriptor storages are released locally and need no manager.
+    """
+    import torch.multiprocessing as torch_mp
+
+    original_strategy = torch_mp.get_sharing_strategy()
+    torch_mp.set_sharing_strategy("file_descriptor")
+    try:
+        return bytes(ForkingPickler.dumps(registration))
+    finally:
+        torch_mp.set_sharing_strategy(original_strategy)
+
+
 class PleOffloadConnector:
     """Connect a GPU runner to the shared PLE CPU worker.
 
@@ -230,15 +252,7 @@ class PleOffloadConnector:
             ngram_context_buf=self._ngram_context_buf,
         )
 
-        # ForkingPickler transmits tensors through shared-memory and CUDA IPC.
-        import torch.multiprocessing as torch_mp
-
-        original_strategy = torch_mp.get_sharing_strategy()
-        torch_mp.set_sharing_strategy("file_system")
-        try:
-            payload = ForkingPickler.dumps(registration)
-        finally:
-            torch_mp.set_sharing_strategy(original_strategy)
+        payload = _dump_registration(registration)
         assert self._registration_socket is not None
         self._registration_socket.send(payload)
 
