@@ -51,7 +51,10 @@ from vllm.v1.worker.gpu.mamba_align import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
+from vllm.v1.worker.gpu.spec_decode import (
+    uses_dflash_selector_engine,
+    uses_native_mtp,
+)
 from vllm.v1.worker.mamba_utils import (
     MambaSpecDecodeGPUContext,
     get_mamba_groups,
@@ -136,9 +139,13 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # Native MTP verifies a linear draft chain exactly as DFlash does, so
+        # it can share the per-step GDN request metadata across cache groups.
         self._use_dflash2_common_gdn_metadata = bool(
             envs.VLLM_SM70_DFLASH2_VERIFY_FASTPATH
-            and uses_dflash_selector_engine(vllm_config)
+            and (
+                uses_dflash_selector_engine(vllm_config) or uses_native_mtp(vllm_config)
+            )
         )
         if self._use_dflash2_common_gdn_metadata:
             logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
