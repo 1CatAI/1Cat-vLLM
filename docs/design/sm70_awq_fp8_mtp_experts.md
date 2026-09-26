@@ -20,7 +20,7 @@ This flag is for unquantized MTP experts in AWQ or ModelOpt checkpoints. Seriali
 {"method": "mtp", "num_speculative_tokens": 3, "model": "/path/to/fp8-mtp-checkpoint", "quantization": "modelopt_mixed"}
 ```
 
-The SM70 adaptation requires FP16 execution, the `Qwen4ExpMTP` draft architecture, ordinary tensor parallelism, pipeline-parallel size 1 and standard rejection sampling. Expert parallelism and synthetic acceptance are rejected. Checkpoint-native weights must use E4M3 with 128x128 block scales and separate per-expert gate/up/down tensors. Excluded unquantized experts retain their original method unless online conversion is explicitly requested. Other GPU architectures retain upstream dispatch.
+The SM70 adaptation requires FP16 execution, the `Qwen4ExpMTP` draft architecture, ordinary tensor parallelism and standard rejection sampling. Checkpoint-native FP8 experts are also accepted under pipeline parallelism, because the V2 runner builds the speculator only on the last pipeline rank; this was validated with `nvidia/Qwen3.8-Flash-Next-NVFP4` on TP2 x PP2 with a Volta last stage. Online conversion still requires pipeline-parallel size 1. Expert parallelism and synthetic acceptance are rejected. Checkpoint-native weights must use E4M3 with 128x128 block scales and separate per-expert gate/up/down tensors. Excluded unquantized experts retain their original method unless online conversion is explicitly requested. Other GPU architectures retain upstream dispatch.
 
 ## Storage and kernel adaptation
 

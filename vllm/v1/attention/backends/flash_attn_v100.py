@@ -2154,6 +2154,31 @@ def _get_fp8_e5m2_paged_kv_bridge_op():
     return _fp8_e5m2_paged_kv_to_fp16
 
 
+def _allocate_growing_workspace(
+    allocate: Callable[[], tuple[torch.Tensor, ...]],
+    *,
+    on_cuda: bool,
+) -> tuple[torch.Tensor, ...] | None:
+    """Allocate a grown workspace, retrying once after releasing cached blocks.
+
+    The caller must drop its reference to the previous workspace *before*
+    calling this, otherwise the old and the new buffer are resident at the same
+    time and the growth can fail on memory its own predecessor is holding.
+    Freed segments are smaller than the grown request, so a retry after
+    ``empty_cache`` is what actually recovers the fragmented headroom.
+    """
+    try:
+        return allocate()
+    except torch.OutOfMemoryError:
+        pass
+    if on_cuda:
+        torch.accelerator.empty_cache()
+    try:
+        return allocate()
+    except torch.OutOfMemoryError:
+        return None
+
+
 def _get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
@@ -2161,9 +2186,13 @@ def _get_fp8_prefill_bridge_workspace(
     device_index = (
         key_cache.device.index
         if key_cache.device.index is not None
-        else torch.accelerator.current_device_index()
+        else (torch.accelerator.current_device_index() if key_cache.is_cuda else -1)
     )
-    stream_id = int(torch.cuda.current_stream(key_cache.device).cuda_stream)
+    stream_id = (
+        int(torch.cuda.current_stream(key_cache.device).cuda_stream)
+        if key_cache.is_cuda
+        else 0
+    )
     cache_key = (
         device_index,
         stream_id,
@@ -2178,7 +2207,7 @@ def _get_fp8_prefill_bridge_workspace(
             workspace[2][:, :required_blocks],
         )
 
-    if torch.cuda.is_current_stream_capturing():
+    if _is_cuda_graph_capturing(key_cache):
         return None
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
@@ -2189,7 +2218,8 @@ def _get_fp8_prefill_bridge_workspace(
         key_cache.shape[2],
         key_cache.shape[3],
     )
-    try:
+
+    def _allocate() -> tuple[torch.Tensor, ...]:
         key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
         value_out = torch.empty_like(key_out)
         block_table = torch.arange(
@@ -2197,8 +2227,21 @@ def _get_fp8_prefill_bridge_workspace(
             dtype=torch.int32,
             device=key_cache.device,
         ).unsqueeze(0)
-    except torch.OutOfMemoryError:
+        return key_out, value_out, block_table
+
+    # Drop the old buffers before allocating the grown ones; see
+    # _allocate_growing_workspace. The stale entry is not restored on failure
+    # so that a later, smaller request re-allocates from scratch instead of
+    # inheriting a doubled capacity that already failed once.
+    workspace = None
+    _fp8_prefill_bridge_workspaces.pop(cache_key, None)
+    allocated = _allocate_growing_workspace(
+        _allocate,
+        on_cuda=key_cache.is_cuda,
+    )
+    if allocated is None:
         return None
+    key_out, value_out, block_table = allocated
     _fp8_prefill_bridge_workspaces[cache_key] = (
         key_out,
         value_out,
@@ -2218,9 +2261,11 @@ def _get_fp8_prefill_bridge_tail_workspace(
     device_index = (
         query.device.index
         if query.device.index is not None
-        else torch.accelerator.current_device_index()
+        else (torch.accelerator.current_device_index() if query.is_cuda else -1)
     )
-    stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+    stream_id = (
+        int(torch.cuda.current_stream(query.device).cuda_stream) if query.is_cuda else 0
+    )
     cache_key = (
         device_index,
         stream_id,
@@ -2235,17 +2280,23 @@ def _get_fp8_prefill_bridge_tail_workspace(
             workspace[1][:, :padded_query_len],
         )
 
-    if torch.cuda.is_current_stream_capturing():
+    if _is_cuda_graph_capturing(query):
         return None
 
     previous_capacity = workspace[0].shape[1] if workspace is not None else 0
     capacity = max(padded_query_len, previous_capacity * 2)
     shape = (1, capacity, query.shape[2], query.shape[3])
-    try:
+
+    def _allocate() -> tuple[torch.Tensor, ...]:
         padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
-        padded_output = torch.empty_like(padded_query)
-    except torch.OutOfMemoryError:
+        return padded_query, torch.empty_like(padded_query)
+
+    workspace = None
+    _fp8_prefill_bridge_tail_workspaces.pop(cache_key, None)
+    allocated = _allocate_growing_workspace(_allocate, on_cuda=query.is_cuda)
+    if allocated is None:
         return None
+    padded_query, padded_output = allocated
     _fp8_prefill_bridge_tail_workspaces[cache_key] = (
         padded_query,
         padded_output,
@@ -2954,6 +3005,7 @@ def _contiguous_paged_kv_bhmd(
 def _get_prefill_gather_dense_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
+    max_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     global _warned_prefill_gather_oom
 
@@ -2985,11 +3037,21 @@ def _get_prefill_gather_dense_workspace(
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
     capacity = max(required_blocks, previous_capacity * 2)
+    if max_blocks is not None:
+        # Doubling must not reserve more than the block table can ever address
+        # (max_model_len worth of pages); beyond that the overshoot is pure
+        # loss against the KV cache.
+        capacity = min(capacity, max(required_blocks, int(max_blocks)))
     shape = (capacity, *key_cache.shape[1:])
-    try:
+
+    def _allocate() -> tuple[torch.Tensor, ...]:
         key_out = torch.empty(shape, dtype=key_cache.dtype, device=key_cache.device)
-        value_out = torch.empty_like(key_out)
-    except torch.OutOfMemoryError:
+        return key_out, torch.empty_like(key_out)
+
+    workspace = None
+    _prefill_gather_dense_workspaces.pop(cache_key, None)
+    allocated = _allocate_growing_workspace(_allocate, on_cuda=key_cache.is_cuda)
+    if allocated is None:
         if not _warned_prefill_gather_oom:
             logger.warning(
                 "Insufficient memory for the long-prefill dense KV workspace; "
@@ -2997,6 +3059,7 @@ def _get_prefill_gather_dense_workspace(
             )
             _warned_prefill_gather_oom = True
         return None
+    key_out, value_out = allocated
     _prefill_gather_dense_workspaces[cache_key] = key_out, value_out
     return key_out[:required_blocks], value_out[:required_blocks]
 
@@ -3024,7 +3087,11 @@ def _gather_paged_kv_to_exact_dense(
     required_blocks = _cdiv_int(seq_len, block_size)
     if required_blocks > int(block_table_row.shape[0]):
         return None
-    workspace = _get_prefill_gather_dense_workspace(key_cache, required_blocks)
+    workspace = _get_prefill_gather_dense_workspace(
+        key_cache,
+        required_blocks,
+        max_blocks=int(block_table_row.shape[0]),
+    )
     if workspace is None:
         return None
 

@@ -142,12 +142,31 @@ class MambaHybridModelState(DefaultModelState):
         )
         if self._use_dflash2_common_gdn_metadata:
             logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
+        speculative_config = vllm_config.speculative_config
+        self._use_mtp4_common_gdn_metadata = bool(
+            envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+            and speculative_config is not None
+            and speculative_config.method == "mtp"
+            and speculative_config.num_speculative_tokens == 4
+            and device.type == "cuda"
+            and current_platform.is_device_capability(70)
+        )
+        if self._use_mtp4_common_gdn_metadata:
+            logger.info_once("SM70 MTP4 shared GDN batch metadata fast path enabled.")
+        self._use_common_gdn_metadata = (
+            self._use_dflash2_common_gdn_metadata or self._use_mtp4_common_gdn_metadata
+        )
         self._use_dflash2_fused_gdn_metadata = bool(
             self._use_dflash2_common_gdn_metadata
             and envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
             and self.cache_config.mamba_cache_mode in ("none", "align")
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
+        )
+        self._use_mtp4_fused_gdn_metadata = bool(
+            self._use_mtp4_common_gdn_metadata
+            and envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+            and self.cache_config.mamba_cache_mode in ("none", "align")
         )
         self._dflash2_gdn_builders: (
             list[tuple[int, GDNAttentionMetadataBuilder]] | None
@@ -366,7 +385,7 @@ class MambaHybridModelState(DefaultModelState):
                     -1,
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
-            if self._use_dflash2_common_gdn_metadata:
+            if self._use_common_gdn_metadata:
                 speculative_config = self.vllm_config.speculative_config
                 assert speculative_config is not None
                 common_gdn_metadata = compute_common_gdn_attn_metadata(
@@ -382,7 +401,10 @@ class MambaHybridModelState(DefaultModelState):
                 )
 
             if (
-                self._use_dflash2_fused_gdn_metadata
+                (
+                    self._use_dflash2_fused_gdn_metadata
+                    or self._use_mtp4_fused_gdn_metadata
+                )
                 and cudagraph_mode == CUDAGraphMode.FULL
                 and common_gdn_metadata is not None
             ):
@@ -394,11 +416,21 @@ class MambaHybridModelState(DefaultModelState):
                     num_actual_tokens=num_tokens,
                     descriptor=self._dflash2_gdn_group_descriptor,
                     state_start_indices=(
-                        self._mamba_state_idx_gpu if self._align_mode else None
+                        self._mamba_state_idx_gpu
+                        if self._use_dflash2_fused_gdn_metadata and self._align_mode
+                        else None
                     ),
                     req_index_mapping=(
-                        input_batch.idx_mapping if self._align_mode else None
+                        input_batch.idx_mapping
+                        if self._use_dflash2_fused_gdn_metadata and self._align_mode
+                        else None
                     ),
+                    seq_lens=(
+                        input_batch.seq_lens
+                        if self._use_mtp4_fused_gdn_metadata and self._align_mode
+                        else None
+                    ),
+                    enable_mtp4=self._use_mtp4_fused_gdn_metadata,
                 )
                 if prepared_result is not None:
                     (
@@ -407,8 +439,10 @@ class MambaHybridModelState(DefaultModelState):
                     ) = prepared_result
                     if not self._dflash2_fused_gdn_metadata_logged:
                         logger.info(
-                            "DFlash2 fused GDN metadata active for %d cache groups.",
+                            "Fused speculative GDN metadata active for %d cache "
+                            "groups (%s).",
                             len(prepared_dflash2_gdn_metadata),
+                            "MTP4" if self._use_mtp4_fused_gdn_metadata else "DFlash2",
                         )
                         self._dflash2_fused_gdn_metadata_logged = True
 

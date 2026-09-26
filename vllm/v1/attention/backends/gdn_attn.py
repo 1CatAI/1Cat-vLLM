@@ -178,6 +178,7 @@ def _dflash2_gdn_group_metadata_kernel(
     block_table_strides,
     state_start_indices,
     req_index_mapping,
+    seq_lens,
     spec_query_start_loc_src,
     num_accepted_src,
     state_selector_src,
@@ -191,6 +192,8 @@ def _dflash2_gdn_group_metadata_kernel(
     PAD_ID: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_STATE_START: tl.constexpr,
+    USE_SEQ_LEN_START: tl.constexpr,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
 ):
     """Write every GDN group's state IDs and the shared graph metadata."""
     group_id = tl.program_id(0)
@@ -218,6 +221,10 @@ def _dflash2_gdn_group_metadata_kernel(
         )
         state_columns = columns + state_starts
         live_state_mask &= (state_starts >= 0) & (state_columns < block_table_stride)
+    if USE_SEQ_LEN_START:
+        seq_len = tl.load(seq_lens + rows, mask=live_state_mask, other=0)
+        state_columns = columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
+        live_state_mask &= state_columns < block_table_stride
     state_ids = tl.load(
         block_table + rows * block_table_stride + state_columns,
         mask=live_state_mask,
@@ -612,15 +619,13 @@ def build_gdn_spec_decode_state_contract(
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
-    block_mask = _mask_for(block_table_tensor)
-    seq_mask = _mask_for(seq_lens)
-    accepted_mask = _mask_for(num_accepted_tokens)
     if spec_state_slot_selectors is None:
         spec_state_slot_selectors = num_accepted_tokens
-    selector_mask = _mask_for(spec_state_slot_selectors)
 
+    all_spec_rows = False
     if current_state_block_ids is not None:
         current_mask = _mask_for(current_state_block_ids)
+        accepted_mask = _mask_for(num_accepted_tokens)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
         spec_state_indices_tensor = state_block_ids[current_mask]
         non_spec_source = state_block_ids[~current_mask]
@@ -630,6 +635,8 @@ def build_gdn_spec_decode_state_contract(
             num_spec,
         )
     elif is_mamba_cache_all:
+        block_mask = _mask_for(block_table_tensor)
+        seq_mask = _mask_for(seq_lens)
         spec_state_indices_tensor = gather_gdn_state_block_ids(
             block_table_tensor[block_mask],
             seq_lens[seq_mask],
@@ -643,15 +650,51 @@ def build_gdn_spec_decode_state_contract(
             1,
         ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
-        non_spec_state_indices_tensor = select_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            num_accepted_tokens[~accepted_mask],
-            num_spec,
-        )
+        all_spec_rows = bool(spec_sequence_masks_cpu.all().item())
+        if all_spec_rows:
+            # Preserve the independent, contiguous output of boolean indexing
+            # without allocating row indices for the common pure-MTP batch.
+            spec_state_indices_tensor = block_table_tensor[:, : num_spec + 1].clone()
+            non_spec_state_indices_tensor = block_table_tensor.new_empty((0,))
+        else:
+            # The request classification is authoritative on CPU. GPU boolean
+            # indexing invokes nonzero to discover its dynamic output shape and
+            # synchronizes the host. Index selection keeps the same independently
+            # allocated result without that device-side shape query.
+            spec_rows_cpu = torch.nonzero(spec_sequence_masks_cpu).reshape(-1)
+            non_spec_rows_cpu = torch.nonzero(~spec_sequence_masks_cpu).reshape(-1)
+            row_indices: dict[tuple[torch.device, bool], torch.Tensor] = {}
 
-    spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-    spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+            def _select_rows(tensor: torch.Tensor, speculative: bool) -> torch.Tensor:
+                key = (tensor.device, speculative)
+                indices = row_indices.get(key)
+                if indices is None:
+                    cpu_indices = spec_rows_cpu if speculative else non_spec_rows_cpu
+                    indices = cpu_indices.to(tensor.device, non_blocking=True)
+                    row_indices[key] = indices
+                return torch.index_select(tensor, 0, indices)
+
+            spec_state_indices_tensor = _select_rows(
+                block_table_tensor[:, : num_spec + 1], True
+            )
+            non_spec_state_indices_tensor = select_gdn_state_block_ids(
+                _select_rows(block_table_tensor, False),
+                _select_rows(num_accepted_tokens, False),
+                num_spec,
+            )
+
+    if current_state_block_ids is None and not is_mamba_cache_all:
+        if all_spec_rows:
+            spec_num_accepted_tokens = num_accepted_tokens.clone()
+            spec_state_slot_selectors = spec_state_slot_selectors.clone()
+        else:
+            spec_num_accepted_tokens = _select_rows(num_accepted_tokens, True)
+            spec_state_slot_selectors = _select_rows(spec_state_slot_selectors, True)
+    else:
+        accepted_mask = _mask_for(num_accepted_tokens)
+        selector_mask = _mask_for(spec_state_slot_selectors)
+        spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
+        spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(
@@ -824,6 +867,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and (
                 envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
                 or envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
+                or (
+                    envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+                    and envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+                    and self.vllm_config.speculative_config is not None
+                    and self.vllm_config.speculative_config.method == "mtp"
+                    and self.vllm_config.speculative_config.num_speculative_tokens == 4
+                    and device.type == "cuda"
+                )
             )
             and _dflash_ddtree_gdn_shared_common_enabled()
         ):
@@ -2196,6 +2247,8 @@ def prepare_dflash2_gdn_group_metadata(
     descriptor: DFlash2GDNGroupDescriptor | None,
     state_start_indices: torch.Tensor | None = None,
     req_index_mapping: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    enable_mtp4: bool = False,
 ) -> (
     tuple[
         dict[int, GDNAttentionMetadata],
@@ -2203,16 +2256,20 @@ def prepare_dflash2_gdn_group_metadata(
     ]
     | None
 ):
-    """Prepare all pure-MRV2 DFlash2 GDN graph metadata in one launch.
+    """Prepare pure-speculative GDN graph metadata for all groups in one launch.
 
     ``mamba_cache_mode=none`` reads the first speculative state columns.
     ``mamba_cache_mode=align`` supplies the authoritative, post-precopy state
-    column for each live request. DFlash2 batches keep live speculative rows at
+    column for each live request. MTP4 uses the legacy sequence-length-derived
+    align column instead. Both paths keep live speculative rows at
     the front and CUDA-graph padding at the back, so one pointer-table kernel can
     perform the same state selection and tail fill without ten independent
     gather/copy pipelines.
     """
-    if not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
+    if enable_mtp4:
+        if not envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA:
+            return None
+    elif not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
         return None
     if not builders_by_group or num_actual_tokens <= 0:
         return None
@@ -2222,6 +2279,11 @@ def prepare_dflash2_gdn_group_metadata(
         return None
 
     use_state_start = state_start_indices is not None
+    use_seq_len_start = seq_lens is not None
+    if use_seq_len_start and not enable_mtp4:
+        return None
+    if use_state_start and use_seq_len_start:
+        return None
     if use_state_start != (req_index_mapping is not None):
         return None
     if use_state_start:
@@ -2234,6 +2296,14 @@ def prepare_dflash2_gdn_group_metadata(
             or req_index_mapping.device != num_accepted_tokens.device
             or req_index_mapping.dtype != torch.int32
             or req_index_mapping.ndim != 1
+        ):
+            return None
+    if use_seq_len_start:
+        assert seq_lens is not None
+        if (
+            seq_lens.device != num_accepted_tokens.device
+            or seq_lens.dtype != torch.int32
+            or seq_lens.ndim != 1
         ):
             return None
 
@@ -2272,7 +2342,16 @@ def prepare_dflash2_gdn_group_metadata(
     mamba_cache_mode = first_builder.vllm_config.cache_config.mamba_cache_mode
     if mamba_cache_mode not in ("none", "align"):
         return None
-    if use_state_start != (mamba_cache_mode == "align"):
+    if enable_mtp4:
+        if use_state_start or use_seq_len_start != (mamba_cache_mode == "align"):
+            return None
+    elif use_state_start != (mamba_cache_mode == "align"):
+        return None
+    if (
+        use_seq_len_start
+        and seq_lens is not None
+        and seq_lens.numel() < num_spec_decodes
+    ):
         return None
     width = first_builder.num_spec_state_tokens + 1
     common_buffers = first_builder._ddtree_fast_common_buffers
@@ -2349,6 +2428,8 @@ def prepare_dflash2_gdn_group_metadata(
         tuple(state.data_ptr() for state in output_states),
         tuple(table.stride(0) for table in input_tables),
         use_state_start,
+        use_seq_len_start,
+        first_builder.kv_cache_spec.block_size,
         common_buffers.spec_sequence_masks.data_ptr(),
         common_buffers.spec_token_indx.data_ptr(),
         common_buffers.non_spec_token_indx.data_ptr(),
@@ -2385,6 +2466,7 @@ def prepare_dflash2_gdn_group_metadata(
         descriptor.block_table_strides,
         num_accepted_tokens if state_start_indices is None else state_start_indices,
         num_accepted_tokens if req_index_mapping is None else req_index_mapping,
+        num_accepted_tokens if seq_lens is None else seq_lens,
         query_start_loc,
         num_accepted_tokens,
         num_accepted_tokens,
@@ -2398,6 +2480,8 @@ def prepare_dflash2_gdn_group_metadata(
         PAD_ID=PAD_SLOT_ID,
         BLOCK=block,
         USE_STATE_START=use_state_start,
+        USE_SEQ_LEN_START=use_seq_len_start,
+        MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
         num_warps=1,
     )
     common_buffers.initialized_key = (
@@ -2471,6 +2555,17 @@ def prepare_dflash2_gdn_group_metadata(
                     width,
                     dtype=torch.long,
                     device=source_table.device,
+                )
+                expected_state = torch.gather(source_table, 1, columns)
+            elif use_seq_len_start:
+                assert seq_lens is not None
+                starts = torch.clamp(
+                    (seq_lens[:num_spec_decodes] - 1)
+                    // first_builder.kv_cache_spec.block_size,
+                    min=0,
+                ).to(torch.long)
+                columns = starts[:, None] + torch.arange(
+                    width, dtype=torch.long, device=source_table.device
                 )
                 expected_state = torch.gather(source_table, 1, columns)
             else:

@@ -380,14 +380,14 @@ def test_glm5_dflash_tp4_push_allreduce_is_quality_safe_by_default(monkeypatch):
         envs.disable_envs_cache()
 
 
-def test_sm70_tp4_push_allreduce_mtp5_is_opt_in(monkeypatch):
+def test_sm70_tp4_push_allreduce_mtp5_defaults_on_with_rollback(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", raising=False)
     envs.disable_envs_cache()
     try:
-        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5
-        monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "1")
-        envs.disable_envs_cache()
         assert envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5
+        monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5
     finally:
         envs.disable_envs_cache()
 
