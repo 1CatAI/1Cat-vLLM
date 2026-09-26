@@ -253,6 +253,9 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
 def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
     monkeypatch,
 ) -> None:
+    # The helper writes defaults itself; delenv cannot undo keys that were
+    # already absent. Isolate those writes from subsequent PLE dispatch tests.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
     for env_name in (
         "VLLM_SM70_QWEN38_HYBRID_PLE",
         "VLLM_PLE_CPU_OFFLOAD",

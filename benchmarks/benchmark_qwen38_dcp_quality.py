@@ -56,6 +56,9 @@ def worker_manifest(worker):
         "bf16_reduced_reduction": (
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
         ),
+        "fp16_accumulation": getattr(
+            torch.backends.cuda.matmul, "allow_fp16_accumulation", False
+        ),
         "ple_environment": {
             k: v for k, v in os.environ.items() if "PLE" in k and k.startswith("VLLM_")
         },
@@ -98,6 +101,8 @@ def run(args):
     if args.reference:
         previous = json.loads(args.reference.read_text())
         previous_args = previous["args"]
+        if not previous.get("complete"):
+            raise ValueError("Reference run did not complete")
         for key in ("model", "kv_dtype", "kv_gib", "long_context"):
             if previous_args[key] != report["args"][key]:
                 raise ValueError(f"Reference contract mismatch: {key}")
@@ -133,6 +138,11 @@ def run(args):
                 or worker["ssm_dtype"] != "float32"
                 or worker["fp16_reduced_reduction"]
                 or worker["bf16_reduced_reduction"]
+                or worker["fp16_accumulation"]
+                or worker["dcp"] != args.dcp
+                or worker["kv_dtype"]
+                != ("fp8_e4m3" if args.kv_dtype == "auto" else args.kv_dtype)
+                or worker["ple_environment"].get("VLLM_PLE_DISK_OFFLOAD") != "1"
             ):
                 raise RuntimeError("Worker precision/state contract mismatch")
         save()
