@@ -44,8 +44,12 @@ shared graph-size list is normalized for speculative verification.
 
 The existing dependent selectors can then enable dual compilation and hybrid
 PLE automatically. Prefill uses asynchronous disk-mmap lookup; decode uses
-local pinned-UVA lookup. **Hybrid PLE still needs substantial host RAM** and
-must not be described as a disk-only, low-RAM mode.
+local pinned-UVA lookup. The default keeps the full approximately 11.92 GiB
+table per TP rank in pinned host memory (`VLLM_QWEN4EXP_PLE_HOST_GIB=12`) so
+the pinned decode view does not consume VRAM needed by the KV cache and CUDA
+graphs. **Hybrid PLE still needs substantial host RAM** and must not be
+described as a disk-only, low-RAM mode; an explicit host-budget override can
+restore split placement when that trade-off is intentional.
 
 ## Configuration verification
 

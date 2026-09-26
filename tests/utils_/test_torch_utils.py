@@ -7,6 +7,7 @@ from vllm.utils.torch_utils import (
     common_broadcastable_dtype,
     current_stream,
     is_lossless_cast,
+    set_high_precision_cuda_matmul_defaults,
 )
 
 
@@ -114,3 +115,30 @@ def test_current_stream_multithread():
     )
 
     _test_stream_thread(main_dedicated_stream)
+
+
+def test_high_precision_cuda_matmul_defaults():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    matmul = torch.backends.cuda.matmul
+    old_fp16_reduction = matmul.allow_fp16_reduced_precision_reduction
+    old_bf16_reduction = matmul.allow_bf16_reduced_precision_reduction
+    old_fp16_accumulation = getattr(matmul, "allow_fp16_accumulation", None)
+    try:
+        matmul.allow_fp16_reduced_precision_reduction = True
+        matmul.allow_bf16_reduced_precision_reduction = True
+        if hasattr(matmul, "allow_fp16_accumulation"):
+            matmul.allow_fp16_accumulation = True
+
+        set_high_precision_cuda_matmul_defaults()
+
+        assert matmul.allow_fp16_reduced_precision_reduction is False
+        assert matmul.allow_bf16_reduced_precision_reduction is False
+        if hasattr(matmul, "allow_fp16_accumulation"):
+            assert matmul.allow_fp16_accumulation is False
+    finally:
+        matmul.allow_fp16_reduced_precision_reduction = old_fp16_reduction
+        matmul.allow_bf16_reduced_precision_reduction = old_bf16_reduction
+        if hasattr(matmul, "allow_fp16_accumulation"):
+            matmul.allow_fp16_accumulation = old_fp16_accumulation

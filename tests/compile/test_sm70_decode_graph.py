@@ -212,6 +212,7 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
         "VLLM_SM70_QWEN38_HYBRID_PLE",
         "VLLM_PLE_CPU_OFFLOAD",
         "VLLM_PLE_DISK_OFFLOAD",
+        "VLLM_QWEN4EXP_PLE_HOST_GIB",
     ):
         monkeypatch.delenv(env_name, raising=False)
     parallel_config = ParallelConfig()
@@ -223,6 +224,7 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
     assert os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] == "1"
     assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
     assert os.environ["VLLM_PLE_DISK_OFFLOAD"] == "1"
+    assert os.environ["VLLM_QWEN4EXP_PLE_HOST_GIB"] == "12"
     assert ipc_path.startswith("ipc://")
     parallel_config.ensure_ple_offload_ipc_path()
     assert parallel_config._ple_offload_ipc_path == ipc_path

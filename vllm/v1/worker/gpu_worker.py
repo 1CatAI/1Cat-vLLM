@@ -54,7 +54,10 @@ from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import (
+    set_high_precision_cuda_matmul_defaults,
+    set_random_seed,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -130,6 +133,10 @@ class Worker(WorkerBase):
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
+        # Do this before loading weights or compiling/capturing any model
+        # graphs. Reduced-precision FP16/BF16 reductions are opt-in only;
+        # production defaults must not trade numerical precision for speed.
+        set_high_precision_cuda_matmul_defaults()
 
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 

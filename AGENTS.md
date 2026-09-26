@@ -116,6 +116,13 @@ Co-authored-by: gemini-code-assist
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
+## 3. Numerical Precision Invariant
+
+Production paths must not trade numerical precision for throughput. Keep
+FP16/BF16 reduced-precision reductions and FP16 accumulation disabled by
+default; any precision-reducing experiment must be explicit, temporary, and
+must not become a runtime default.
+
 ---
 
 ## Domain-Specific Guides
