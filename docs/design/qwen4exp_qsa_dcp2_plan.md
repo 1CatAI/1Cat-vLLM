@@ -1,8 +1,10 @@
 # Qwen4Exp QSA DCP2 implementation and V100 validation plan
 
-Status: allocator and operator prototype, 2026-09-24 (America/Vancouver).
-CPU ownership/prefix/offload geometry and bounded V100 operator tests have
-passed. QSA DCP serving is still disabled; the full model has not run with DCP2.
+Status, 2026-09-25 (America/Vancouver): target-only DCP2 serves the real
+checkpoint on TP4 V100 with MTP3, E4M3 KV, prefix caching, grouped CPU offload
+and CUDA graphs. Fixed-prompt token outputs and MTP acceptance match DCP1
+exactly; see "Validation results" for capacity, latency and the remaining
+gaps. The sections up to "Prototype checkpoint" record the original plan.
 
 ## Frozen source stack
 
@@ -146,7 +148,7 @@ minimal reproducer and exact tested head, and fix the isolated branch before
 another A/B. A decision to deploy follows a separate full-stack acceptance
 and review of measured capacity, latency, and output parity.
 
-## Current checkpoint
+## Prototype checkpoint (2026-09-24)
 
 - Source merges completed without conflicts; `git diff --check` and merge
   pre-commit hooks passed.
@@ -198,18 +200,56 @@ Evidence directory: `/home/leon/1Cat/research/qsa-dcp2-assessment-20260924/`:
 `v100-indices-r1.log`, `v100-attention.log`, `cpu-cache-utils.log`,
 `baseline-deepseek-fixture.log`, and `restored-serving-smoke.json`.
 
-## Next integration boundary
+## Final layout
 
-1. Emit the correct target/selector/ring/draft ownership from the model's
-   real cache specs and propagate it through worker block tables and slot
-   mapping. Existing QSA DCP rejection must remain until these agree.
-2. Wire localized metadata, query gather, LSE/output collectives, and the final
-   output gate into `Qwen4ExpQSAFlashAttentionImpl`. Validate actual two-rank
-   communication, including empty owners and graph replay. TP4 has two KV
-   heads, so DCP pairs must stay within each replicated KV-head pair.
-3. Allocate model-level persistent workspaces and measure their true footprint.
-   Current LSE output is an operator API, not a graph-memory optimization.
-4. Build a complete image from this main-plus-PR stack before full-model A/B;
-   the old image used for operator tests does not validate current main's
-   native libraries. Then qualify MTP3 metadata, offload transfers/restart,
-   long-context cache pressure, output parity, and serving performance.
+- A block spans `cache_config.block_size` global tokens at every DCP size:
+  1,600 on the E4M3/MTP3 checkpoint, the same as DCP1. The platform aligns it
+  to kernel block x DCP so each rank's share stays kernel aligned.
+- Target QSA main K/V is sharded, 800 slots per rank. Two target layers share
+  one 819,200-byte physical page, interleaved one 32-token kernel block at a
+  time (`KVCacheTensor.packed_members`); each member is a strided view, so the
+  cache writer and the QSA kernels need no change. The v2 GPU runner builds the
+  views; the offload worker registers a packed page once.
+- Selector, GDN, PLE, ring and the single MTP draft QSA layer stay replicated.
+  Seven physical owners per block (DCP1: thirteen) hold the recurrent states,
+  so there are six GDN state groups and 36 auxiliary blocks per request.
+- Attention: query all-gather, localized selection limited to 1,026 of 2,051
+  columns, G12 partial attention with base-2 LSE, one all-to-all combine (the
+  Qwen4Exp default under DCP), and DCP1's fused output gate.
+
+## Validation results (2026-09-25)
+
+Evidence: `/home/leon/1Cat/research/qsa-dcp2-assessment-20260924/validation-20260925.md`
+with the scripts and result files it names.
+
+- Accuracy gate, identical to DCP1: six fixed MTP prompts including accepted
+  and drafted counts, five code repeats, a 30,030-token prompt (first, repeat
+  with prefix hit, changed suffix).
+- Regressions: offload eviction under pressure then CPU->GPU recovery with
+  external prefix hits and unchanged output; mixed 30K prefill with decode;
+  five 30K admissions with identical outputs and stable peak memory.
+- Capacity (GPU KV tokens): 32K/C2 396,336 -> 493,244 (+24.5%); 262,144/C4/
+  GMU 0.96 775,096 -> 1,178,337 (+52.0%, 4.50x concurrency, C4 x 256K on GPU).
+- Prefix reuse: repeated 2K/8K prompts reuse 1,600-token blocks as on DCP1;
+  TTFT 270/256 ms against DCP1's 228/245 ms in the same window.
+- Decode (C1, same time window, interleaved fresh servers): 71.3 tok/s against
+  73.0 for DCP1 before this round (-2.3%, from -5.4%, and -22% before the host
+  sync fix). The GDN spec-row change is shared code and lifts DCP1 itself to
+  77.2 tok/s, so against the same code DCP2 decodes 7.6% slower: six GDN state
+  groups instead of three (about 650 us of CPU metadata per group and step),
+  the replicated draft's metadata, and the DCP collectives.
+- TTFT: short prompt +2.3%, repeated 8K prompt +4.4%.
+
+## Remaining gaps and limits
+
+- DCP2 prefill cannot use DCP1's XQA page4 route: a repeated 2K prompt
+  recomputes 418 tokens about 20% slower. Short prompts above the largest
+  graph size prefill eagerly, where the DCP collectives add launch overhead.
+- Six GDN state groups instead of three cost per-group metadata CPU time.
+  Sharing request metadata across groups (the DFlash-only common/fused GDN
+  metadata paths) would remove most of it, for DCP1 as well.
+- One of twelve DCP2 gate runs counted one more accepted draft token on the
+  code prompt, after the answer's end; outputs were identical and restarts
+  were bit-identical. See the evidence file.
+- Packed pages are rejected with pipeline parallelism and by the v1 GPU
+  runner. QSA supports DCP1 and DCP2 only.
