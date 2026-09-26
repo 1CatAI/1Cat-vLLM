@@ -1579,7 +1579,7 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
       include(cmake/external_projects/vllm_flash_attn.cmake)
     else()
       cuda_archs_loose_intersection(VLLM_FLASH_ATTN_SM70_ARCHS
-        "7.0" "${CUDA_ARCHS}")
+        "7.0;7.2" "${CUDA_ARCHS}")
       if(VLLM_FLASH_ATTN_SM70_ARCHS)
         set(VLLM_FLASH_ATTN_SM70 ON)
         include(cmake/external_projects/vllm_flash_attn.cmake)
