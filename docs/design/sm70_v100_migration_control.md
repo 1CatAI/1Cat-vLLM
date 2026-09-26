@@ -47888,3 +47888,45 @@ has launched no full model. Details and artifacts are in
   retained in this task's `.artifacts/`; results will be recorded after the
   freshly built artifact completes these gates. No new speed result is
   claimed by this integration commit.
+
+## 2026-09-26 Accepted MTP4 common-path baseline and trace
+
+- The owner accepted **27.3963 ms per complete MTP round** as the development
+  baseline. This is decode time / speculative rounds, including target,
+  draft and host work. Freeze this result; do not repeat no-MTP baseline or
+  broad quality sweeps. Development uses the owned source/in-place build;
+  no further wheel packaging is requested.
+- Exact MTP4 now shares the existing FP16 GEMV/GDN/HC admission and defaults,
+  hybrid pinned-UVA PLE and dual compilation. The drafter shares parameters
+  through a decode compiler view and uses the existing split graph manager.
+  The first combined trace exposed missing M=1 draft graphs; the corrected
+  run captures target `(5, 10)` and draft `(1)` and proves GEMV/HC execution.
+- Measured source is `6b8cc4eaa7bed73b56176549ab6dbcce940b5887` plus saved
+  patch `35f8cb9ac6ebea7ce4cf58562c503c376596ba0991532dfa8193376b348a5636`.
+  TP4 V100, FP16 activation/KV, FP32 SSM, 32768 capacity, 8192 chunk,
+  C=1, memory 0.95, prefix cache on, MTP4; all PLE rows occupy pinned host RAM
+  (11.92 GiB/rank). Acceleration switches are unset and resolve on by default.
+- The 8192/513 fixed fixture takes 9.177750 s decode / 335 rounds =
+  27.3963 ms/round, acceptance length 1.5284 and 55.79 emitted tok/s.
+  This forced-length fixture continues after EOS and is a cost reference.
+  Natural EOS cases emit 284/329/421 tokens at 135.23/148.36/86.94 tok/s;
+  all answers are healthy and exactly match the preceding common-stack run,
+  with identical acceptance counters. Scoped coverage: 46 passed, one skipped;
+  five generated-LIS assertions pass. Earlier HumanEval 8/8 is not a new run.
+- The corresponding 8192/129 node trace has 84 closed cycles/rank. Rank 0:
+  metadata/pre-graph 0.9242 ms, target graph 29.3167 ms, gather gap 0.0199 ms,
+  sampling/state/handoff 0.9540 ms, four drafts/combine 5.2779 ms, next-round
+  preparation 0.0459 ms, total 36.5387 ms. Capture-disabled endpoint timing
+  and profiled stage timing remain separate; do not rescale these stages.
+- Dense matrix operations lead GPU service (12.83 ms round rank-max),
+  followed by TP communication including waits (4.83 ms), elementwise/copy
+  (4.48 ms) and direct experts (3.02 ms). Pinned PLE is only 0.116 ms.
+  Next: map hot M=5 GEMMs to shapes/call sites and extend/fuse the existing
+  shared operators where justified, without another standalone fast path.
+- Earlier 73-75 tok/s no-MTP used CPU-worker PLE and does not reproduce the
+  historical 97.7-97.9 tok/s hybrid baseline. One 262144-capacity attempt
+  failed before generation (3.24 GiB required KV vs 1.25 GiB available).
+  Retain that failure and do not repeat it under the narrowed scope.
+- Full contract, baseline manifest, raw artifacts and analysis are linked in
+  [the accepted profile](sm70_flash_next_mtp4_default_profile.md). All owned
+  model/profiler workers exited; preserve the worktree and evidence.

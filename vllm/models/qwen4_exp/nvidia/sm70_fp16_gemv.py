@@ -3,7 +3,7 @@
 """Opt-in checkpoint-FP16 Qwen3.8 decode GEMV kernels for SM70.
 
 The route is deliberately narrow: exact Qwen3.8 Flash Next topology, TP4,
-no speculative decoding, FP16 checkpoint weights, and one decode token. All
+no speculation or MTP4, FP16 checkpoint weights, and one decode token. All
 prefill and unsupported shapes retain the ordinary unquantized linear path.
 """
 
@@ -362,7 +362,14 @@ def _exact_runtime_contract(vllm_config=None) -> bool:
 
     return bool(
         tp_size == 4
-        and config.speculative_config is None
+        and (
+            config.speculative_config is None
+            or (
+                getattr(config.speculative_config, "method", None) == "mtp"
+                and getattr(config.speculative_config, "num_speculative_tokens", None)
+                == 4
+            )
+        )
         and int(getattr(text_config, "hidden_size", 0)) == 2560
         and int(getattr(text_config, "num_hidden_layers", 0)) == 48
         and int(getattr(text_config, "num_experts", 0)) == 512
