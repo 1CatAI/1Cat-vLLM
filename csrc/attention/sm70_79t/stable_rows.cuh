@@ -5,7 +5,6 @@
 // Model scores violate both assumptions. Keep block masses and the online
 // accumulator in FP32, and bound each FP16 PV operation by scaling V.
 __device__ float const* g_79t_tail_row_max = nullptr;
-constexpr int kStableScoreSampleStride = 8;
 constexpr float kStableScoreMargin = 4.0f;
 constexpr float kStableValueCenterThreshold = 0.05f;
 constexpr float kStableMaxExpInput = 10.0f;
@@ -115,8 +114,9 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   float2 maximum = {-CUDART_INF_F, -CUDART_INF_F};
   int end = min(width, int(blockIdx.y + 1) * 8192);
 #pragma unroll 4
-  for (int col = int(blockIdx.y) * 8192; col < end;
-       col += kStableScoreSampleStride) {
+  // Every score participates: subsampling can miss isolated large logits and
+  // make the exponent guard change the attention distribution.
+  for (int col = int(blockIdx.y) * 8192; col < end; ++col) {
     float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
         scores + base + int64_t(col) * stride + local_row));
     maximum.x = fmaxf(maximum.x, value.x);
