@@ -47666,3 +47666,24 @@ has launched no full model. Details and artifacts are in
 - Fresh default-configuration service logs, smoke requests, CI and merge
   records are retained under task-private
   `verification/batch-followup-20260925/merge-defaults/`.
+
+## 2026-09-26 DFlash2 batch latency follow-up
+
+- Owned branch `codex/v100-decode-round-20260926-111504` starts from
+  `e889919e2192fa36b25c922366526fa3fe62edbc`. The current implementation and
+  acceptance ledger are in
+  [the batch latency report](sm70_dflash2_batch_latency_20260926.md).
+- Expand the existing context/metadata graph capability by captured query shape,
+  retain exact dense sampling only for ambiguous requests, and share partition
+  exponential weights in the common grouped-attention combine kernel. No new
+  weight-quantization or model-name dispatch is introduced.
+- Focused CPU results: 32 passed/19 skipped and 192 passed/21 skipped. GPU:
+  seven mixed sampler cases, five deferred context cases and 91 grouped-attention
+  cases pass. Endpoint speed and acceptance remain pending; this is not a new
+  PRO performance win or a completed 35B regression gate.
+- Reject grouped-scale lifetime and two-CTA GEMM prototypes: reducing registers
+  to 128 without spills did not produce a meaningful weighted speed benefit.
+  Retain the negative results so later work does not repeat occupancy-only tuning.
+- Other sessions' GPU tests were allowed to finish. A clean control service then
+  started on GPUs 4–7. Its 16-question natural-output check matches the previously
+  recorded 14 correct/15 natural stops; the strict all-natural-stop gate is open.

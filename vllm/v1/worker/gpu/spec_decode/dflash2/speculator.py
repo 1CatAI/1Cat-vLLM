@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -354,11 +355,13 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        self._context_kv_graph: torch.cuda.CUDAGraph | None = None
-        self._context_compute_graph: torch.cuda.CUDAGraph | None = None
-        self._context_store_graph: torch.cuda.CUDAGraph | None = None
+        self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._context_compute_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._context_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._context_projected_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._context_target_positions: torch.Tensor | None = None
         self._prepared_context_batch: InputBatch | None = None
-        self._draft_metadata_graph: torch.cuda.CUDAGraph | None = None
+        self._draft_metadata_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
@@ -762,38 +765,72 @@ class DFlash2Speculator(DFlashSpeculator):
             or not self.query_cudagraph_manager.graphs
         ):
             return
-        slots = (
-            [self._context_slot_mappings[i][:8] for i in self._layer_group_idx]
-            if self._layer_group_idx is not None
-            else self._context_slot_mappings[0][:8]
+        # Match the existing FULL query graphs, rather than a model name or a
+        # concurrency whitelist. Context graphs use exact real token counts;
+        # padding target context would otherwise write stale rejected rows.
+        shapes = sorted(
+            {
+                (desc.num_reqs, desc.num_tokens)
+                for desc in self.query_cudagraph_manager.graphs
+                if desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs is not None
+                and desc.num_tokens == desc.num_reqs * self.num_query_per_req
+                and desc.num_tokens <= self.hidden_states.shape[0]
+            }
         )
-        graph = torch.cuda.CUDAGraph()
-        # All inputs are persistent draft buffers refreshed by propose().
-        # A separate pool keeps these intermediates independent of query graphs.
-        with torch.cuda.graph(graph):
-            super()._precompute_context_kv(
-                self.hidden_states[:8], self.context_positions[:8], slots
-            )
-        self._context_kv_graph = graph
-        logger.info("SM70 DFlash2 q8 context KV CUDA graph captured.")
-        if not envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE:
+        if not shapes:
             return
-        self._context_target_positions = torch.zeros_like(self.context_positions[:8])
-        compute = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(compute):
-            all_k, all_v = self.model.model.compute_context_kv(
-                self.hidden_states[:8], self._context_target_positions
+        # Capturing a write graph must not race multiple dummy rows into the
+        # null KV block. Real accepted slots are refreshed before each replay.
+        self._context_slot_mappings.fill_(PAD_SLOT_ID)
+        pipeline = envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE
+        if pipeline:
+            self._context_target_positions = torch.zeros_like(
+                self.context_positions[: max(tokens for _, tokens in shapes)]
             )
-        write = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(write):
-            self.model.model.store_context_kv(all_k, all_v, slots)
-        self._context_compute_graph = compute
-        self._context_store_graph = write
-        self._context_projected_kv = (all_k, all_v)
-        logger.info("SM70 DFlash2 context computation is staged before sampling.")
-        self._capture_draft_metadata_graph()
+        for _, num_tokens in shapes:
+            slots = (
+                [
+                    self._context_slot_mappings[i][:num_tokens]
+                    for i in self._layer_group_idx
+                ]
+                if self._layer_group_idx is not None
+                else self._context_slot_mappings[0][:num_tokens]
+            )
+            graph = torch.cuda.CUDAGraph()
+            # All inputs are persistent draft buffers refreshed by propose().
+            # Separate pools keep these intermediates independent of query graphs.
+            with torch.cuda.graph(graph):
+                super()._precompute_context_kv(
+                    self.hidden_states[:num_tokens],
+                    self.context_positions[:num_tokens],
+                    slots,
+                )
+            self._context_kv_graphs[num_tokens] = graph
+            if not pipeline:
+                continue
+            assert self._context_target_positions is not None
+            compute = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(compute):
+                all_k, all_v = self.model.model.compute_context_kv(
+                    self.hidden_states[:num_tokens],
+                    self._context_target_positions[:num_tokens],
+                )
+            write = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(write):
+                self.model.model.store_context_kv(all_k, all_v, slots)
+            self._context_compute_graphs[num_tokens] = compute
+            self._context_store_graphs[num_tokens] = write
+            self._context_projected_kv[num_tokens] = (all_k, all_v)
+        logger.info(
+            "SM70 DFlash2 context KV CUDA graphs captured for token counts %s; "
+            "pre-sampling projection=%s.",
+            sorted(self._context_kv_graphs),
+            pipeline,
+        )
+        self._capture_draft_metadata_graph(shapes)
 
-    def _capture_draft_metadata_graph(self) -> None:
+    def _capture_draft_metadata_graph(self, shapes: list[tuple[int, int]]) -> None:
         from vllm.v1.attention.backends.flash_attn_v100 import (
             FlashAttnV100Impl,
             FlashAttnV100MetadataBuilder,
@@ -827,23 +864,26 @@ class DFlash2Speculator(DFlashSpeculator):
                 builders.append((gid, builder))
         if not builders:
             return
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for gid, builder in builders:
-                builder.copy_dflash_graph_metadata(
-                    self.block_tables.input_block_tables[gid][:1],
-                    self.input_buffers.seq_lens[:1],
-                    self.input_buffers.query_start_loc[:2],
-                )
-        self._draft_metadata_graph = graph
-        logger.info("SM70 DFlash2 B1 paged graph metadata refresh captured.")
+        for num_reqs, num_tokens in shapes:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for gid, builder in builders:
+                    builder.copy_dflash_graph_metadata(
+                        self.block_tables.input_block_tables[gid][:num_reqs],
+                        self.input_buffers.seq_lens[:num_reqs],
+                        self.input_buffers.query_start_loc[: num_reqs + 1],
+                    )
+            self._draft_metadata_graphs[num_reqs, num_tokens] = graph
+        logger.info("SM70 DFlash2 paged graph metadata refresh captured: %s.", shapes)
 
     def _refresh_draft_graph_metadata(self, num_reqs: int, num_tokens: int) -> bool:
-        if self._draft_metadata_graph is None or (num_reqs, num_tokens) != (1, 8):
+        graph = self._draft_metadata_graphs.get((num_reqs, num_tokens))
+        if graph is None:
             return False
-        # The non-causal paged query graph reads only these persistent buffers;
-        # prepare_dflash_inputs has already refreshed its query slots and rows.
-        self._draft_metadata_graph.replay()
+        # prepare_dflash_inputs refreshes real rows and zeroes padded seq_lens.
+        # Copy the entire captured batch so shrinking batches cannot retain
+        # another request's metadata from a previous replay.
+        graph.replay()
         return True
 
     def prepare_target_context(
@@ -853,22 +893,27 @@ class DFlash2Speculator(DFlashSpeculator):
         aux_hidden_states: list[torch.Tensor] | None,
     ) -> None:
         self._prepared_context_batch = None
+        num_tokens = input_batch.num_tokens
+        graph = self._context_compute_graphs.get(num_tokens)
         if (
-            self._context_compute_graph is None
-            or input_batch.num_reqs != 1
-            or input_batch.num_tokens != 8
-            or input_batch.num_draft_tokens != 7
-            or input_batch.is_prefilling_np[0]
+            graph is None
+            or input_batch.num_reqs * self.num_query_per_req != num_tokens
+            or input_batch.num_draft_tokens
+            != input_batch.num_reqs * (self.num_query_per_req - 1)
+            or np.any(input_batch.is_prefilling_np)
+            or np.any(input_batch.num_scheduled_tokens != self.num_query_per_req)
         ):
             return
         if aux_hidden_states:
             hidden_states = self._combine_aux_hidden_states(aux_hidden_states)
-        self.hidden_states[:8].copy_(hidden_states[:8])
-        self._context_target_positions.copy_(input_batch.positions[:8])
-        # Context projection does not depend on the acceptance decision. Raw
-        # positions equal the later masked positions for every accepted row.
-        # Rejected rows remain scratch data and never reach the KV cache.
-        self._context_compute_graph.replay()
+        self.hidden_states[:num_tokens].copy_(hidden_states[:num_tokens])
+        assert self._context_target_positions is not None
+        self._context_target_positions[:num_tokens].copy_(
+            input_batch.positions[:num_tokens]
+        )
+        # Each request's accepted rows retain their original positions. Only
+        # after sampling does prepare_dflash_inputs mark rejected KV slots PAD.
+        graph.replay()
         self._prepared_context_batch = input_batch
         logger.info_once("Using SM70 DFlash2 context pipeline before target sampling.")
 
@@ -876,7 +921,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self, input_batch: InputBatch
     ) -> torch.Tensor | None:
         if self._prepared_context_batch is input_batch:
-            return self.hidden_states[:8]
+            return self.hidden_states[: input_batch.num_tokens]
         return None
 
     def _precompute_context_kv(
@@ -885,17 +930,19 @@ class DFlash2Speculator(DFlashSpeculator):
         positions: torch.Tensor,
         slots: torch.Tensor | list[torch.Tensor | None] | None,
     ) -> None:
-        if self._prepared_context_batch is not None and slots is not None:
-            assert self._context_store_graph is not None
-            self._context_store_graph.replay()
-            self._prepared_context_batch = None
-            return
+        num_tokens = hidden_states.shape[0]
+        prepared = self._prepared_context_batch
+        self._prepared_context_batch = None
         if (
-            self._context_kv_graph is not None
-            and hidden_states.shape[0] == 8
+            prepared is not None
+            and prepared.num_tokens == num_tokens
             and slots is not None
         ):
-            self._context_kv_graph.replay()
+            self._context_store_graphs[num_tokens].replay()
+            return
+        graph = self._context_kv_graphs.get(num_tokens)
+        if graph is not None and slots is not None:
+            graph.replay()
             return
         super()._precompute_context_kv(hidden_states, positions, slots)
 
