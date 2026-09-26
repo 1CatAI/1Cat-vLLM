@@ -280,8 +280,9 @@ def test_dcp_draft_main_builder_suppresses_dummy_writes(
     )
     builder = object.__new__(Qwen4ExpQSAMetadataBuilder)
     builder.replicated_draft = True
+    # 16-token blocks: 8 target slots per rank, 16 draft slots.
     builder.vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=8),
+        cache_config=SimpleNamespace(block_size=16),
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),
         scheduler_config=SimpleNamespace(max_num_seqs=1),
     )

@@ -167,12 +167,25 @@ def _allocate_kv_cache(
     return kv_cache_raw_tensors
 
 
+def _packed_attention_members(
+    kv_cache_config: KVCacheConfig,
+) -> dict[str, tuple[int, int]]:
+    """Map each packed attention layer to (member index, member count)."""
+    packed: dict[str, tuple[int, int]] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        members = getattr(tensor, "packed_members", None) or []
+        for index, layer_name in enumerate(members):
+            packed[layer_name] = (index, len(members))
+    return packed
+
+
 def _reshape_kv_cache(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, torch.Tensor],
     cache_dtype: str,
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
+    packed_members: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
     has_attn, has_mamba = False, False
@@ -206,8 +219,12 @@ def _reshape_kv_cache(
                 continue
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            packed = (packed_members or {}).get(layer_name)
+            member_index, member_count = packed if packed is not None else (0, 1)
+            # A packed physical block holds one page of every member.
+            block_bytes = kv_cache_spec.page_size_bytes * member_count
+            assert kv_raw_tensor.numel() % block_bytes == 0
+            num_blocks = kv_raw_tensor.numel() // block_bytes
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -238,7 +255,30 @@ def _reshape_kv_cache(
 
                 dtype = kv_cache_spec.dtype
                 kv_tensor = kv_raw_tensor.view(dtype)
-                if kv_cache_spec.page_size_padded is not None:
+                if packed is not None:
+                    if kv_cache_spec.page_size_padded is not None:
+                        raise ValueError("Packed attention pages cannot be padded")
+                    if inv_order[0] != 0:
+                        raise ValueError(
+                            "Packed attention pages need the block dimension "
+                            "outermost in physical memory"
+                        )
+                    # Members interleave one kernel block at a time, so member
+                    # j's kernel block k starts (k * count + j) kernel blocks
+                    # into the tensor: a uniform stride of `count` kernel
+                    # blocks with an offset of j. That holds across physical
+                    # block boundaries because each block holds `count` pages.
+                    # A meta tensor gives the strides without allocating.
+                    strides = list(torch.empty(kv_cache_shape, device="meta").stride())
+                    kernel_block_numel = strides[0]
+                    strides[0] = kernel_block_numel * member_count
+                    kv_cache = torch.as_strided(
+                        kv_tensor,
+                        size=kv_cache_shape,
+                        stride=tuple(strides),
+                        storage_offset=kernel_block_numel * member_index,
+                    )
+                elif kv_cache_spec.page_size_padded is not None:
                     if kernel_num_blocks != num_blocks:
                         raise ValueError(
                             "Virtually split compressed KV caches cannot use "
@@ -296,6 +336,7 @@ def _reshape_kv_cache(
             kv_caches=kv_caches,
             kernel_block_sizes=kernel_block_sizes,
             cache_dtype=cache_dtype,
+            packed_members=packed_members,
         )
 
     # Map any sharing layers to their target layer's KV cache.
@@ -310,6 +351,7 @@ def _update_hybrid_attention_layout(
     kv_caches: dict[str, Any],
     kernel_block_sizes: list[int],
     cache_dtype: str,
+    packed_members: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -337,6 +379,10 @@ def _update_hybrid_attention_layout(
             if layer_name not in kv_caches:
                 # Shared layer — will be aliased to its target after this pass.
                 continue
+            if layer_name in (packed_members or {}):
+                raise ValueError(
+                    "Packed attention pages need the block dimension first"
+                )
 
             kv_cache = kv_caches[layer_name]
             if kv_cache.shape[0] == 2:
@@ -375,6 +421,7 @@ def init_kv_cache(
         kernel_block_sizes=kernel_block_sizes,
         cache_dtype=cache_dtype,
         shared_kv_cache_layers=shared_kv_cache_layers,
+        packed_members=_packed_attention_members(kv_cache_config),
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
