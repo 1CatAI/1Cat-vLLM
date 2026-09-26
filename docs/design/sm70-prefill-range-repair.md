@@ -39,10 +39,22 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH="$PWD" \
   tests/kernels/attention/test_sm70_79t_stability.py -q
 ```
 
-The 17 tests cover both query sizes, prefix/tail outliers, dense/single-row
+The 19 GPU tests cover both query sizes, prefix/tail outliers, dense/single-row
 outliers, biased values, and repeated graph input changes including a return
 to benign inputs. All pass. The unequal-peak regression fails with the retained
 main-equivalent extension.
+
+The first long-prompt C4 serving benchmark exposed another boundary bug: a
+mixed prefill/decode scheduler step produced Q8160/KV8160, but query-only
+padding dispatched it to the native Q8192 kernel. The runtime rejected KV8160.
+The wrapper now pads only future K/V positions and moves the real query slice
+back by that padding amount. Its last visible key remains KV - Q + i, and
+padded keys never enter a real query's causal domain. This preserves the fast
+path instead of imposing a new request-concurrency restriction. Two of the
+19 GPU graph tests compare these cases with unpadded FP64 attention; six CPU
+policy/padding tests also pass, including an independent uniform-attention
+prefix-mean oracle. The failed C4 benchmark is retained and is not a valid
+throughput measurement. Serving is being repeated after this dispatch fix.
 
 Seven retained model inputs, with 138 selected queries and all keys, heads,
 and output features, pass finite-output checks against a same-input FP64

@@ -1214,6 +1214,38 @@ def test_sm70_79t_q8192_dispatch_leading_pads_mixed_chunks(query_len):
     assert torch.all(out == 11)
 
 
+@pytest.mark.parametrize(
+    ("query_len", "kv_len"), [(8001, 8032), (8064, 8128), (8160, 8160)]
+)
+def test_sm70_79t_short_first_chunk_preserves_causal_visibility(query_len, kv_len):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    query = torch.zeros((1, query_len, 6, 1), dtype=torch.float32)
+    key = torch.zeros((1, kv_len, 1, 1), dtype=torch.float32)
+    value = torch.arange(kv_len, dtype=torch.float32).view(1, kv_len, 1, 1)
+    out = torch.empty_like(query)
+
+    def uniform_causal_attention(q, k, v, output, scale, causal):
+        assert q.shape[1] == k.shape[1] == 8192
+        assert causal
+        # For zero Q/K, exact causal attention is the prefix mean of V.
+        count = torch.arange(1, 8193).view(1, 8192, 1, 1)
+        output.copy_((v.cumsum(dim=1) / count).expand_as(output))
+        return output
+
+    flash_v100._run_sm70_d256_gqa_79t_q8192_dispatch(
+        query,
+        key,
+        value,
+        out,
+        softmax_scale=0.0625,
+        architecture_q8192_op=uniform_causal_attention,
+    )
+    last_visible = kv_len - query_len + torch.arange(query_len)
+    expected = (last_visible / 2).view(1, query_len, 1, 1).expand_as(out)
+    torch.testing.assert_close(out, expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prefill_d256_gqa_architecture_oom_uses_dense_fallback(monkeypatch):
     import vllm.envs as envs

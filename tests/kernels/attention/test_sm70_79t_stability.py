@@ -17,6 +17,47 @@ def _capture_attention(op, q, k, v, output):
     return graph
 
 
+@pytest.mark.parametrize(("query_len", "kv_len"), [(8001, 8032), (8160, 8160)])
+@torch.inference_mode()
+def test_short_first_chunk_graph_matches_unpadded_reference(query_len, kv_len):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA test")
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _run_sm70_d256_gqa_79t_q8192_dispatch,
+    )
+    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+    native = getattr(
+        torch.ops._vllm_fa2_C, "sm70_d256_gqa_architecture_q8192_fwd", None
+    )
+    if native is None:
+        pytest.skip("SM70 architecture operator was not built")
+    torch.manual_seed(8173)
+    q = torch.randn(1, query_len, 6, 256, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, kv_len, 1, 256, device="cuda", dtype=torch.float16)
+    v = torch.randn_like(k) + 1
+    output = torch.empty_like(q)
+
+    def dispatch(q, k, v, out, scale, causal):
+        return _run_sm70_d256_gqa_79t_q8192_dispatch(
+            q, k, v, out, softmax_scale=scale, architecture_q8192_op=native
+        )
+
+    graph = _capture_attention(dispatch, q, k, v, output)
+    rows = torch.tensor([0, 1, 63, 255, 4095, query_len - 1], device="cuda")
+    scores = torch.einsum("rhd,kd->hrk", q[0, rows].double(), k[0, :, 0].double()) / 16
+    keys = torch.arange(kv_len, device="cuda")
+    scores.masked_fill_(
+        keys[None, None, :] > (kv_len - query_len + rows)[None, :, None], -torch.inf
+    )
+    reference = (scores.softmax(-1) @ v[0, :, 0].double()).permute(1, 0, 2)
+    torch.testing.assert_close(
+        output[0, rows].double(), reference, rtol=0.003, atol=0.003
+    )
+    assert torch.isfinite(output).all()
+    del graph
+
+
 @pytest.mark.parametrize("kv_len", [16000, 128000])
 @pytest.mark.parametrize(
     ("query_len", "op_name"),
