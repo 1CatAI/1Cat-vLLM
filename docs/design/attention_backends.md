@@ -199,7 +199,9 @@ hardware and configuration.
 
 > **‡** Automatic selection tries FlashAttention first. On Blackwell
 > (SM100), the fallback order is TRT-LLM Ragged, FlashInfer, then
-> TokenSpeed MLA. On other GPUs, only FlashAttention is considered.
+> TokenSpeed MLA. On other GPUs, only FlashAttention is considered. TokenSpeed
+> MLA is optional; its package must use an `apache-tvm-ffi` version compatible
+> with the installed TileLang release.
 
 ### Decode Backends
 
