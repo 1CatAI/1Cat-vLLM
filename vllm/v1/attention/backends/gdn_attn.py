@@ -92,7 +92,8 @@ def _get_ddtree_gdn_fast_common_buffers(
     buffers = _GDN_DDTREE_FAST_COMMON_BUFFERS.get(key)
     if buffers is not None:
         return buffers
-    spec_sequence_masks = torch.empty(
+    # Zeroed so rows past a step's batch never read as live speculative rows.
+    spec_sequence_masks = torch.zeros(
         (decode_cudagraph_max_bs,),
         dtype=torch.bool,
         device=device,
@@ -2591,7 +2592,12 @@ def prepare_dflash2_gdn_group_metadata(
             rtol=0,
             atol=0,
         )
-        if torch.any(common_buffers.spec_sequence_masks[num_spec_decodes:]).item():
+        # Only this step's graph rows are written and replayed; rows past
+        # num_actual_tokens belong to larger batches and are never read here.
+        padded_rows = common_buffers.spec_sequence_masks[
+            num_spec_decodes:num_actual_tokens
+        ]
+        if torch.any(padded_rows).item():
             raise AssertionError("DFlash2 fused GDN metadata left a live padded row")
 
     return prepared, descriptor
