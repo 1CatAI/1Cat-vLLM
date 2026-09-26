@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -99,6 +99,16 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    dcp_sharded: bool = field(default=False, kw_only=True)
+    """Whether context parallel ranks own disjoint token slots in this cache."""
+
+    def global_block_size(
+        self, dcp_world_size: int = 1, pcp_world_size: int = 1
+    ) -> int:
+        """Token span represented by one physical block on this rank."""
+        if self.dcp_sharded:
+            return self.block_size * dcp_world_size * pcp_world_size
+        return self.block_size
 
     @property
     def prefix_cacheable(self) -> bool:
@@ -151,6 +161,7 @@ class KVCacheSpec:
 
 @dataclass(frozen=True, kw_only=True)
 class AttentionSpec(KVCacheSpec):
+    dcp_sharded: bool = True
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
@@ -222,7 +233,7 @@ class FullAttentionSpec(AttentionSpec):
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         # Note(hc): each dcp rank only need save
         # (max_model_len//dcp_world_size) tokens locally.
-        if dcp_world_size * pcp_world_size > 1:
+        if self.dcp_sharded and dcp_world_size * pcp_world_size > 1:
             max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
@@ -261,6 +272,7 @@ class FullAttentionSpec(AttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -387,6 +399,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
+        assert len({spec.dcp_sharded for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -400,6 +413,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         return cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -452,6 +466,7 @@ class PrefixAnchoredSWASpec(FullAttentionSpec):
         base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
         return cls(
             block_size=base.block_size,
+            dcp_sharded=base.dcp_sharded,
             num_kv_heads=base.num_kv_heads,
             head_size=base.head_size,
             head_size_v=base.head_size_v,
@@ -615,6 +630,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             "All attention layers in the same KV cache group must be "
             "SlidingWindowMLASpec."
         )
+        assert len({spec.dcp_sharded for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -631,6 +647,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         )
         return cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -750,6 +767,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
+            dcp_sharded=specs[0].dcp_sharded,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             head_size_v=specs[0].head_size_v,
@@ -785,6 +803,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     """
 
     kv_cache_specs: dict[str, KVCacheSpec]
+    dcp_sharded: bool = field(default=True, kw_only=True)
 
     @property
     def prefix_cacheable(self) -> bool:
@@ -802,11 +821,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return max_num_pages * self.page_size_bytes
 
     @classmethod
-    def is_uniform_type(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> bool:
+    def is_uniform_type(
+        cls, kv_cache_specs: dict[str, KVCacheSpec], dcp_world_size: int = 1
+    ) -> bool:
         """
         Whether all layers have the same type of KV cache spec.
         """
-        block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+        block_sizes = {
+            spec.global_block_size(dcp_world_size) for spec in kv_cache_specs.values()
+        }
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
@@ -858,14 +881,21 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             )
 
     @classmethod
-    def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:
+    def from_specs(
+        cls, kv_cache_specs: dict[str, KVCacheSpec], dcp_world_size: int = 1
+    ) -> Self | None:
         """
         Return a SameTypeKVCacheSpecs object if all layers have the same type
         of KV cache spec. Return None if not.
         """
-        if cls.is_uniform_type(kv_cache_specs):
-            block_size = next(iter(kv_cache_specs.values())).block_size
-            return cls(block_size=block_size, kv_cache_specs=kv_cache_specs)
+        if cls.is_uniform_type(kv_cache_specs, dcp_world_size):
+            specs = list(kv_cache_specs.values())
+            representative = next((s for s in specs if s.dcp_sharded), specs[0])
+            return cls(
+                block_size=representative.block_size,
+                kv_cache_specs=kv_cache_specs,
+                dcp_sharded=representative.dcp_sharded,
+            )
         else:
             return None
 
