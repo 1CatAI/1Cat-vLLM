@@ -5,10 +5,21 @@
 // Model scores violate both assumptions. Keep block masses and the online
 // accumulator in FP32, and bound each FP16 PV operation by scaling V.
 __device__ float const* g_79t_tail_row_max = nullptr;
-constexpr float kStableScoreMargin = 4.0f;
+__device__ int* g_79t_prefix_outliers = nullptr;
+// The complete tail maximum and prefix repair make a safety margin redundant.
+// An extra positive shift pushes useful probabilities into FP16 subnormals.
+constexpr float kStableScoreMargin = 0.0f;
 constexpr float kStableValueCenterThreshold = 0.05f;
 constexpr float kStableMaxExpInput = 10.0f;
+#if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
+// Prefix partials cannot overflow FP32 at the supported block widths. The
+// complete tail maximum bounds each tail weight by exp(-margin), so even
+// 8192 unit-magnitude values fit FP16. Extra headroom would only discard small
+// residuals and amplify tail-numerator rounding during restoration.
+constexpr float kStableValueHeadroom = 1.0f;
+#else
 constexpr float kStableValueHeadroom = 64.0f;
+#endif
 
 #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
 using StablePrefixPartial = float;
@@ -94,11 +105,14 @@ __global__ void stable_scale_values(__half const* input, __half* output,
 
 // Each lane reads a pair of adjacent query rows. K tiles stay independent,
 // preserving coalesced loads from the transposed cuBLAS score workspace.
-template <bool Tail>
+template <bool Tail, bool Repair = false>
 __global__ void stable_row_max_partials(__half const* scores, float* partials,
                                         int rows, int width) {
   int row = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
   int stride = rows;
   int local_row = row;
   int64_t base = 0;
@@ -113,10 +127,12 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   }
   float2 maximum = {-CUDART_INF_F, -CUDART_INF_F};
   int end = min(width, int(blockIdx.y + 1) * 8192);
+  // Tail numerators are stored in FP16, so their shift always uses every key.
+  // Prefix PV detects missed peaks while reading all scores; flagged tiles are
+  // rescanned completely and recomputed before their output can be merged.
+  constexpr int kStride = (Tail || Repair) ? 1 : 8;
 #pragma unroll 4
-  // Every score participates: subsampling can miss isolated large logits and
-  // make the exponent guard change the attention distribution.
-  for (int col = int(blockIdx.y) * 8192; col < end; ++col) {
+  for (int col = int(blockIdx.y) * 8192; col < end; col += kStride) {
     float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
         scores + base + int64_t(col) * stride + local_row));
     maximum.x = fmaxf(maximum.x, value.x);
@@ -127,14 +143,26 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   partials[offset + 1] = maximum.y;
 }
 
+template <bool Tail, bool Repair = false>
 __global__ void stable_finish_max(float const* partials, float* maxima,
                                   int rows, int tiles) {
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
   float value = -CUDART_INF_F;
   for (int tile = 0; tile < tiles; ++tile)
     value = fmaxf(value, partials[int64_t(tile) * rows + row]);
   maxima[row] = value + kStableScoreMargin;
+  if constexpr (!Tail) {
+    if constexpr (Repair) {
+      // The replacement PV must overwrite both numerator and denominator.
+      g_row_sum_out[row] = 0.0f;
+    } else if (row % PVThreadblockShape::kM == 0) {
+      g_79t_prefix_outliers[row / PVThreadblockShape::kM] = 0;
+    }
+  }
 }
 
 __global__ void stable_merge_prefix(StablePrefixPartial const* partial,

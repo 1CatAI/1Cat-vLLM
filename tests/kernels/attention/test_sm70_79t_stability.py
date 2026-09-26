@@ -9,7 +9,7 @@ import torch
 def _capture_attention(op, q, k, v, output):
     # Initialize handles/workspaces outside capture, then validate only replay.
     op(q, k, v, output, 0.0625, True)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         op(q, k, v, output, 0.0625, True)
@@ -89,6 +89,7 @@ def test_periodic_score_spikes_do_not_overflow(query_len, op_name):
     del graph
 
 
+@pytest.mark.parametrize("sparse", [False, True])
 @pytest.mark.parametrize("location", ["prefix", "tail"])
 @pytest.mark.parametrize(
     ("query_len", "op_name"),
@@ -98,7 +99,7 @@ def test_periodic_score_spikes_do_not_overflow(query_len, op_name):
     ],
 )
 @torch.inference_mode()
-def test_unsampled_unequal_peaks_preserve_weights(query_len, op_name, location):
+def test_unsampled_unequal_peaks_preserve_weights(query_len, op_name, location, sparse):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA test")
     from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
@@ -110,7 +111,10 @@ def test_unsampled_unequal_peaks_preserve_weights(query_len, op_name, location):
     q = torch.zeros(1, query_len, 6, 256, device="cuda", dtype=torch.float16)
     k = torch.zeros(1, kv_len, 1, 256, device="cuda", dtype=torch.float16)
     v = torch.zeros_like(k)
-    q[..., 0] = 16
+    if sparse:
+        q[:, 3653, 2, 0] = 16
+    else:
+        q[..., 0] = 16
     start = 0 if location == "prefix" else prefix
     # Both peaks evade the former stride-8 sample. Clipping their distinct
     # logits to the same value gives roughly zero instead of almost +/-1.
@@ -120,9 +124,9 @@ def test_unsampled_unequal_peaks_preserve_weights(query_len, op_name, location):
     k[:, start + 3, :, 0] = 16
     k[:, start + 5, :, 0] = 24
     graph = _capture_attention(getattr(torch.ops._vllm_fa2_C, op_name), q, k, v, output)
-    rows = torch.tensor([255, 256, 4095, query_len - 1], device="cuda")
+    rows = torch.tensor([255, 256, 3653, 4095, query_len - 1], device="cuda")
     keys = torch.arange(kv_len, device="cuda")
-    for first, second in [(16, 24), (28, 20)]:
+    for first, second in [(16, 24), (28, 20), (2, 3)]:
         # Replay must recompute maxima when tensor values change in place.
         k[:, start + 3, :, 0] = first
         k[:, start + 5, :, 0] = second

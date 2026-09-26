@@ -952,6 +952,9 @@ struct ExpRowSumTransformAImpl {
   #endif
   bool valid = true;
   int k_tile = 0;
+  #if defined(PREFIX_TORCH_STABLE_ROWS)
+  bool score_outlier = false;
+  #endif
 
   CUTLASS_DEVICE
   void set_valid(bool is_valid) { valid = is_valid; }
@@ -1228,6 +1231,9 @@ struct ExpRowSumTransformAImpl {
                 float const maximum = row_max[s];
       #endif
       #if defined(PREFIX_TORCH_STABLE_ROWS)
+            if constexpr (!FuseCausalMask) {
+              score_outlier |= value - maximum > kStableMaxExpInput;
+            }
             float weight = stable_exp(value, maximum);
       #else
             float weight = exp2f((value - maximum) * kLog2E);
@@ -1310,6 +1316,14 @@ struct ExpRowSumTransformAImpl {
 
   CUTLASS_DEVICE
   void finalize() {
+  #if defined(PREFIX_TORCH_STABLE_ROWS)
+    if constexpr (!FuseCausalMask) {
+      int outlier = __syncthreads_or(score_outlier);
+      if (threadIdx.x == 0 && outlier) {
+        atomicExch(g_79t_prefix_outliers + blockIdx.x, 1);
+      }
+    }
+  #endif
   #if defined(PREFIX_PV_SKIP_ROW_SUM)
     return;
   #else
@@ -1791,6 +1805,18 @@ using PrefixFloatPVDefaultKernel = typename cutlass::gemm::kernel::DefaultGemm<
     cutlass::arch::OpMultiplyAdd>::GemmKernel;
 using PrefixFloatPVKernel = cutlass::gemm::kernel::Gemm<
     PVMma, typename PrefixFloatPVDefaultKernel::Epilogue, PVSwizzle, false>;
+  #if defined(PREFIX_TORCH_STABLE_ROWS)
+__global__ void repair_prefix_pv_kernel(
+    typename PrefixFloatPVKernel::Params params) {
+  if (!g_79t_prefix_outliers[blockIdx.x]) return;
+  extern __shared__ int shared_storage_base[];
+  auto* shared_storage =
+      reinterpret_cast<typename PrefixFloatPVKernel::SharedStorage*>(
+          shared_storage_base);
+  PrefixFloatPVKernel operation;
+  operation(params, *shared_storage);
+}
+  #endif
 #endif
 #if defined(PREFIX_BATCHED_TRI_FUSE_CAUSAL_MASK) || \
     defined(PREFIX_TAIL_IDLE_SM_FINE_PV)
@@ -2092,6 +2118,12 @@ struct PrefixFloatPVLauncher {
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  smem_bytes),
             "set FP32-output prefix PV dynamic shared memory");
+  #if defined(PREFIX_TORCH_STABLE_ROWS)
+      check(cudaFuncSetAttribute(repair_prefix_pv_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem_bytes),
+            "set repaired prefix PV dynamic shared memory");
+  #endif
     }
   }
 
@@ -2099,6 +2131,11 @@ struct PrefixFloatPVLauncher {
     cutlass::Kernel<PrefixFloatPVKernel>
         <<<grid, block, smem_bytes, stream>>>(params);
   }
+  #if defined(PREFIX_TORCH_STABLE_ROWS)
+  void repair(cudaStream_t stream) const {
+    repair_prefix_pv_kernel<<<grid, block, smem_bytes, stream>>>(params);
+  }
+  #endif
 };
   #endif
 
@@ -5959,7 +5996,8 @@ struct Sm70GqaHalf2Runtime {
 __global__ void set_half2_runtime_globals(int rows, float* row_sum,
                                           int tail_rows, float* tail_sum,
                                           const float* row_max,
-                                          const float* tail_max) {
+                                          const float* tail_max,
+                                          int* prefix_outliers) {
   g_rows = rows;
   g_row_sum_out = row_sum;
   g_tail_rows = tail_rows;
@@ -5968,6 +6006,7 @@ __global__ void set_half2_runtime_globals(int rows, float* row_sum,
     #if defined(PREFIX_TORCH_STABLE_ROWS)
   g_row_max = row_max;
   g_79t_tail_row_max = tail_max;
+  g_79t_prefix_outliers = prefix_outliers;
     #endif
 }
 
@@ -6021,7 +6060,7 @@ struct Sm70GqaHalf2Workspace {
     #if defined(PREFIX_TORCH_STABLE_ROWS)
   at::Tensor value_scaled, value_center, value_max, block_sum, block_max,
       prefix_max;
-  at::Tensor prefix_accumulator, max_partials, tail_max_partials;
+  at::Tensor prefix_accumulator, max_partials, tail_max_partials, prefix_outliers;
     #endif
   // Graph memcpy nodes retain their host source addresses. Keep metadata
   // immutable for each KV length/value buffer, including after later captures.
@@ -6138,6 +6177,9 @@ struct Sm70GqaHalf2Workspace {
     prefix_accumulator = at::empty({kRows, kHeadDim}, fp32);
     max_partials = at::empty({16, kRows}, fp32);
     tail_max_partials = at::empty({16, kRows}, fp32);
+    prefix_outliers = at::empty(
+        {(kRows + PVThreadblockShape::kM - 1) / PVThreadblockShape::kM},
+        q.options().dtype(at::ScalarType::Int));
     #endif
   }
 
@@ -6261,7 +6303,13 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     #endif
   set_half2_runtime_globals<<<1, 1, 0, prefix_stream>>>(
       Workspace::kRows, prefix_sum_output, Workspace::kTailTileRows,
-      tail_row_sums, row_max_output, tail_max);
+      tail_row_sums, row_max_output, tail_max,
+    #if defined(PREFIX_TORCH_STABLE_ROWS)
+      workspace->prefix_outliers.data_ptr<int>()
+    #else
+      nullptr
+    #endif
+      );
 
   dim3 transpose_threads(32, 8);
   dim3 query_transpose_grid((Workspace::kHeadDim + 31) / 32,
@@ -6449,7 +6497,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
         reinterpret_cast<__half const*>(tail_scores),
         workspace->tail_max_partials.data_ptr<float>(), Workspace::kRows,
         Workspace::kQuery);
-    stable_finish_max<<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
+    stable_finish_max<true><<<(Workspace::kRows + 255) / 256, 256, 0, tail_stream>>>(
         workspace->tail_max_partials.data_ptr<float>(), tail_max,
         Workspace::kRows, 1);
     #endif
@@ -6501,13 +6549,23 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(
         reinterpret_cast<__half const*>(scores),
         workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
-    stable_finish_max<<<(Workspace::kRows + 255) / 256, 256, 0,
+    stable_finish_max<false><<<(Workspace::kRows + 255) / 256, 256, 0,
                         prefix_stream>>>(
         workspace->max_partials.data_ptr<float>(), block_max, Workspace::kRows,
         tiles);
     #endif
     prefix_pv[block]->launch(prefix_stream);
     #if defined(PREFIX_TORCH_STABLE_ROWS)
+    // No host readback or graph branch: these kernels exit immediately for
+    // tiles whose complete PV traversal proved that no exponent was clipped.
+    stable_row_max_partials<false, true><<<max_grid, 128, 0, prefix_stream>>>(
+        reinterpret_cast<__half const*>(scores),
+        workspace->max_partials.data_ptr<float>(), Workspace::kRows, width);
+    stable_finish_max<false, true><<<(Workspace::kRows + 255) / 256, 256, 0,
+                                    prefix_stream>>>(
+        workspace->max_partials.data_ptr<float>(), block_max, Workspace::kRows,
+        tiles);
+    prefix_pv[block]->repair(prefix_stream);
     stable_merge_prefix<<<(Workspace::kRows + 3) / 4, 256, 0, prefix_stream>>>(
         reinterpret_cast<StablePrefixPartial const*>(prefix_numerator),
         block_sum, block_max, prefix_accumulator, prefix_sum, prefix_max,
