@@ -466,6 +466,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             sm70_tm.prepare_nvfp4_linear(
                 layer,
                 interleave_gated_silu=use_gated_silu,
+                prescale_for_batch=(
+                    use_qpn2
+                    and qpn2_shared
+                    and sm70_tm.use_batched_gemm_layouts()
+                    and not (qpn2_shared and _compact_qpn2_scales_enabled())
+                ),
             )
             if use_qpn2:
                 suffix = layer.prefix.rsplit(".", 1)[-1]
@@ -618,6 +624,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 state.q_ld,
                 gated_silu,
                 min_prefill_m,
+                state.prescaled_scales,
             )
         elif getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
             sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(

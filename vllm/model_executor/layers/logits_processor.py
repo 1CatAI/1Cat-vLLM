@@ -5,6 +5,7 @@
 import json
 import os
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -223,6 +224,11 @@ class LogitsProcessor(PluggableLayer):
         else:
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, lm_head, embedding_bias)
+        return self._apply_logits_transforms(logits)
+
+    def _apply_logits_transforms(
+        self, logits: torch.Tensor | None
+    ) -> torch.Tensor | None:
         if logits is not None:
             if self.soft_cap is not None:
                 logits = logits / self.soft_cap
@@ -514,6 +520,43 @@ class LogitsProcessor(PluggableLayer):
         top_k: int,
         embedding_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        ids, values, _ = self._get_topk_tokens_and_logits(
+            lm_head, hidden_states, top_k, embedding_bias, retain_local_logits=False
+        )
+        return ids, values
+
+    def get_topk_tokens_and_logits_with_fallback(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        """Retain an existing dense projection for a possible sampling fallback.
+
+        The callback gathers and transforms the original local logits only if
+        needed. Fused candidate kernels that never materialize dense logits
+        return no callback and retain their established fallback.
+        """
+        return self._get_topk_tokens_and_logits(
+            lm_head, hidden_states, top_k, embedding_bias, retain_local_logits=True
+        )
+
+    def _gather_cached_logits(self, local_logits: torch.Tensor) -> torch.Tensor | None:
+        logits = self._gather_logits(local_logits)
+        if logits is not None:
+            logits = logits[..., : self.org_vocab_size]
+        return self._apply_logits_transforms(logits)
+
+    def _get_topk_tokens_and_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        embedding_bias: torch.Tensor | None,
+        *,
+        retain_local_logits: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         """Vocab-parallel global top-k logits without gathering full vocab."""
         if top_k <= 0:
             raise ValueError("top_k must be positive")
@@ -533,6 +576,7 @@ class LogitsProcessor(PluggableLayer):
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
 
         stage_start = _cuda_stage_start(profile_enabled)
+        local_logits = None
         local_candidates = lm_head.maybe_get_sm70_dflash2_top20(
             hidden_states,
             top_k,
@@ -542,6 +586,8 @@ class LogitsProcessor(PluggableLayer):
             logits = lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
             )
+            if retain_local_logits:
+                local_logits = logits
             local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             stage_start = _cuda_stage_start(profile_enabled)
@@ -552,6 +598,8 @@ class LogitsProcessor(PluggableLayer):
 
             num_pad = lm_head.shard_indices.num_org_vocab_padding
             if num_pad > 0:
+                if logits is local_logits:
+                    logits = logits.clone()
                 logits[..., -num_pad:] = -float("inf")
 
             logits_float = logits.float()
@@ -642,7 +690,10 @@ class LogitsProcessor(PluggableLayer):
                 pre_stream_sync_ms,
                 pre_device_extra_sync_ms,
             )
-        return top_indices.to(torch.int64), top_vals.float()
+        fallback = None
+        if local_logits is not None:
+            fallback = lambda: self._gather_cached_logits(local_logits)
+        return top_indices.to(torch.int64), top_vals.float(), fallback
 
     def _maybe_dump_top_token_margin(
         self,

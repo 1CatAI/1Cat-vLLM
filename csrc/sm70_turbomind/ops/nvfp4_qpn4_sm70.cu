@@ -679,6 +679,12 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
 }
 
 #ifndef VLLM_QPN4_STANDALONE
+void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, torch::Tensor scales,
+                                   int64_t group_size, int64_t k_ld,
+                                   int64_t q_ld, bool gated_silu);
+void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+
 void nvfp4_qpn2_shared_decode_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor codes,
     torch::Tensor scales, double global_scale, int64_t split_k,
@@ -692,7 +698,8 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor tm_weight,
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_scales, int64_t tm_group_size,
-    int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m) {
+    int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
+    bool prescaled_scales) {
   TORCH_CHECK(min_prefill_m == 0 || min_prefill_m > 8,
               "Shared QPN2 prefill threshold must be zero or exceed M=8");
   TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && tm_weight.dim() == 2 &&
@@ -710,6 +717,18 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     auto prefill_scales = scales.view({k / 16, n});
     nvfp4_qpn4_prefill_sm70_impl<true>(out, 0, input, codes, prefill_scales,
                                        global_scale, true, gated_silu);
+    return;
+  }
+  // Keep the M-dependent route opaque to Dynamo's compiled token ranges.
+  // Small M consumes independent compact scales and keeps the QPN2 fast path.
+  if (prescaled_scales && input.size(0) > 32) {
+    auto full =
+        gated_silu ? torch::empty({input.size(0), n}, input.options()) : out;
+    nvfp4_gemm_sm70_prescaled_out(full, input, tm_weight, tm_scales,
+                                  tm_group_size, tm_k_ld, tm_q_ld, false);
+    if (gated_silu) {
+      silu_and_mul(out, full);
+    }
     return;
   }
   nvfp4_qpn2_shared_decode_sm70_out(

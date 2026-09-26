@@ -1377,6 +1377,7 @@ def nvfp4_qpn2_tm_dispatch_sm70_out(
     tm_q_ld: int,
     gated_silu: bool,
     min_prefill_m: int,
+    prescaled_scales: bool = False,
 ) -> None:
     """Use shared TurboMind codes for QPN2, TurboMind and dense prefill."""
     _op("nvfp4_qpn2_tm_dispatch_sm70_out")(
@@ -1393,6 +1394,7 @@ def nvfp4_qpn2_tm_dispatch_sm70_out(
         tm_q_ld,
         gated_silu,
         min_prefill_m,
+        *([True] if prescaled_scales else []),
     )
 
 
@@ -1413,6 +1415,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_tm_dispatch_sm70_out"):
         tm_q_ld: int,
         gated_silu: bool,
         min_prefill_m: int,
+        prescaled_scales: bool = False,
     ) -> None:
         return None
 
@@ -2433,6 +2436,37 @@ if hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
 
     @register_fake("_C::nvfp4_gemm_sm70_out")
     def _nvfp4_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_gemm_sm70_prescaled_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    _op("nvfp4_gemm_sm70_prescaled_out")(
+        out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out"):
+
+    @register_fake("_C::nvfp4_gemm_sm70_prescaled_out")
+    def _nvfp4_gemm_sm70_prescaled_out_fake(
         out: torch.Tensor,
         input: torch.Tensor,
         qweight: torch.Tensor,

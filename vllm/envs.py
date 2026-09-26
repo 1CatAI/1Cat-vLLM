@@ -2779,6 +2779,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASH_ATTN_V100": lambda: bool(
         int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))
     ),
+    # Enabled by shared SM70 configuration for compatible local operators,
+    # independent of the model/quantization label or speculative method.
+    # An explicit zero preserves the original layout policy.
     "VLLM_SM70_BATCH_GEMM_LAYOUTS": lambda: bool(
         int(os.getenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0"))
     ),

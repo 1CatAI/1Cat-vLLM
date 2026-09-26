@@ -7,10 +7,12 @@
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/kernel.h"
 #include "src/turbomind/kernels/gemm/registry.h"
+#include "src/turbomind/kernels/gemm/sm70_dflash_context.h"
 #include "src/turbomind/kernels/gemm/tuner/params.h"
 #include "src/turbomind/kernels/gemm/tuner/sampler.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <iterator>
@@ -58,6 +60,37 @@ bool GemmTraceFilterAllows(const std::string& desc) {
   return !raw || !*raw || desc.find(raw) != std::string::npos;
 }
 
+bool IsSm70BatchSupply(const Kernel* kernel) {
+  return kernel &&
+         kernel->name().find("_sm70_batch_supply") != std::string::npos;
+}
+
+// SchedulerSm70 distributes whole K chunks, with larger partitions last.
+// Equal split counts alone are insufficient when CTA_K changes the chunk size.
+bool SameSm70SplitKPartition(const LaunchSpec& control,
+                             const LaunchSpec& candidate, int k) {
+  if (control.splits != candidate.splits ||
+      control.kernel->desc().op_class != candidate.kernel->desc().op_class ||
+      control.kernel->warp_tile_size().z !=
+          candidate.kernel->warp_tile_size().z) {
+    return false;
+  }
+  const auto boundary = [k](const LaunchSpec& spec, int split) {
+    const int chunk = spec.kernel->chunk_size_k();
+    const int chunks = cdiv(k, chunk);
+    const int offset = spec.splits - chunks % spec.splits;
+    return std::min(
+        k,
+        (split * (chunks / spec.splits) + std::max(split - offset, 0)) * chunk);
+  };
+  for (int split = 1; split < control.splits; ++split) {
+    if (boundary(control, split) != boundary(candidate, split)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool Sm70AwqTp2FastSelectorEnabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR");
   return !raw || std::atoi(raw) != 0;
@@ -91,8 +124,7 @@ bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled() {
 }
 
 bool Sm70Nvfp4Qwen38MoeFastPrefillEnabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
+  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL");
   return !raw || std::atoi(raw) != 0;
 }
 
@@ -118,6 +150,19 @@ struct Sm70AwqTp2FastTarget {
   bool require_mgroup;
   std::string name_contains;
 };
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70DflashContextFcFastTarget(
+    const GemmDesc& desc) {
+  if (desc.arch == 700 && desc.type_a == kHalf && desc.type_b == kHalf &&
+      desc.type_c == kHalf && !desc.quant_a && !desc.quant_b && desc.num == 1 &&
+      UseSm70DflashContextFcStableReduction(desc.m, desc.n, desc.k)) {
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8,
+        256,    64,     10,
+        0,      true,   "8x256x64_2_1x1_s884_1x4x1_mgroup"};
+  }
+  return std::nullopt;
+}
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(
     const GemmDesc& desc, const std::string_view desc_str) {
@@ -304,15 +349,20 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
   if (desc.m > 32 && desc.m <= 64 && desc.num == 1 && desc.k == 5120 &&
       (desc.n == 4096 || desc.n == 3584) &&
       desc_str.starts_with("sm70_f16_e4m3k128_f16_tnt_")) {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 32, 256, 32, 5,
-                                desc.n == 4096 ? 3 : 0, true,
+    return Sm70AwqTp2FastTarget{desc.n,
+                                desc.k,
+                                32,
+                                256,
+                                32,
+                                5,
+                                desc.n == 4096 ? 3 : 0,
+                                true,
                                 "sm70_fp8_pscale_batch"};
   }
   if (desc.m > 32 && desc.m <= 64 && desc.num == 1 && desc.n == 5120 &&
-      desc.k == 1536 &&
-      desc_str.starts_with("sm70_f16_e4m3k128_f16_tnt_")) {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 16, 256, 32, 3, 3, true,
-                                "sm70_fp8_pscale_batch"};
+      desc.k == 1536 && desc_str.starts_with("sm70_f16_e4m3k128_f16_tnt_")) {
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 16, 256, 32, 3, 3, true, "sm70_fp8_pscale_batch"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {
@@ -320,21 +370,21 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
         desc.n, desc.k, 64, 256, 16, 1, 3, true, "sm70_fp8_pscale_full"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1536x4096_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 5, 1, true,
-                                "sm70_fp8_pscale_m1"};
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 128, 64, 5, 1, true, "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x8192x1024_1" ||
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x2048_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 3, true,
-                                "sm70_fp8_pscale_m1"};
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 128, 64, 2, 3, true, "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1024x4096_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 7, 1, true,
-                                "sm70_fp8_pscale_m1"};
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 128, 64, 7, 1, true, "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x512_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 1, true,
-                                "sm70_fp8_pscale_m1"};
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 128, 64, 2, 1, true, "sm70_fp8_pscale_m1"};
   }
   return std::nullopt;
 }
@@ -405,13 +455,15 @@ const char* ToString(DispatchPolicy policy) {
   if ((policy & DispatchPolicy::kPreserveDefaultSplits) ||
       (policy & DispatchPolicy::kPreserveDefaultSplitCount) ||
       (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) ||
-      (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled)) {
+      (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) ||
+      (policy & DispatchPolicy::kSm70Nvfp4Prescaled)) {
     static thread_local std::string text;
     auto base = static_cast<DispatchPolicy>(
         (int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits &
         ~(int)DispatchPolicy::kPreserveDefaultSplitCount &
         ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast &
-        ~(int)DispatchPolicy::kSm70Fp8PrefillPrescaled);
+        ~(int)DispatchPolicy::kSm70Fp8PrefillPrescaled &
+        ~(int)DispatchPolicy::kSm70Nvfp4Prescaled);
     text = std::string(ToString(base));
     if (policy & DispatchPolicy::kPreserveDefaultSplits) {
       text += "|preserve_default_splits";
@@ -424,6 +476,9 @@ const char* ToString(DispatchPolicy policy) {
     }
     if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
       text += "|sm70_fp8_prefill_prescaled";
+    }
+    if (policy & DispatchPolicy::kSm70Nvfp4Prescaled) {
+      text += "|sm70_nvfp4_prescaled";
     }
     return text.c_str();
   }
@@ -517,13 +572,44 @@ struct Gemm::Impl {
   LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size,
                       size_t partials_size) {
     const auto& desc = ctx.desc();
+    if (policy & DispatchPolicy::kSm70Nvfp4Prescaled) {
+      auto ordinary_policy = static_cast<DispatchPolicy>(
+          (int)policy & ~(int)DispatchPolicy::kSm70Nvfp4Prescaled);
+      auto spec = Dispatch(ctx, ordinary_policy, barriers_size, partials_size);
+      if (!spec.kernel || desc.type_b != kFloat4_e2m1 || desc.num != 1 ||
+          desc.m <= 32) {
+        return {};
+      }
+      // Keep the ordinary launch and exact reduction partition. Do not expose
+      // scaled-weight transforms to ordinary tuning or imported plan caches.
+      spec.kernel = Sm70Nvfp4PrescaledCounterpart(*spec.kernel);
+      return spec.kernel ? spec : LaunchSpec{};
+    }
+    const auto stable_context = GetSm70DflashContextFcFastTarget(desc);
+    if (stable_context) {
+      // Imported/autotuned entries may use a different reduction tree. Cache
+      // the fixed contract separately so they cannot override it, including
+      // on the first captured tail or repeated eager calls.
+      auto& cached = sm70_dflash_context_specs_[desc.m - 1];
+      if (cached &&
+          cached->kernel->is_feasible(ctx.get_desc(*cached->kernel))) {
+        return *cached;
+      }
+      auto specs = Find(ctx, barriers_size, partials_size, 0, false);
+      cached = SelectSm70AwqTp2FastSpec(ctx, specs, *stable_context,
+                                        barriers_size, partials_size);
+      if (cached) {
+        cache_.Insert(desc, *cached);
+        return *cached;
+      }
+      return {};
+    }
     const bool allow_prescaled =
         policy & DispatchPolicy::kSm70Fp8PrefillPrescaled;
     const auto is_feasible = [&](const LaunchSpec& spec) {
       return spec.kernel &&
-             (allow_prescaled ||
-              spec.kernel->name().find("_sm70_fp8_pscale") ==
-                  std::string::npos) &&
+             (allow_prescaled || spec.kernel->name().find("_sm70_fp8_pscale") ==
+                                     std::string::npos) &&
              spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
     };
     if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
@@ -581,13 +667,12 @@ struct Gemm::Impl {
           // different family. Reselect the locked ordinary launch instead of
           // turning a default-on route into a cache-dependent hard failure.
           const Sm70AwqTp2FastTarget audited_control_target{
-              desc.n, desc.k, 8, 128, 64, 7, 0, true,
-              "c8x128_a1x1x64_01"};
+              desc.n, desc.k, 8, 128, 64, 7, 0, true, "c8x128_a1x1x64_01"};
           auto control_specs =
               Find(ctx, barriers_size, partials_size, 0, false);
-          control_spec = SelectSm70AwqTp2FastSpec(
-              ctx, control_specs, audited_control_target, barriers_size,
-              partials_size);
+          control_spec = SelectSm70AwqTp2FastSpec(ctx, control_specs,
+                                                  audited_control_target,
+                                                  barriers_size, partials_size);
           if (control_spec) {
             cache_.Insert(desc, *control_spec);
           }
@@ -630,11 +715,30 @@ struct Gemm::Impl {
         return {};
       }
     }
-    if (policy & DispatchPolicy::kReuse) {
-      if (auto spec = cache_.LowerBound(desc); spec && is_feasible(*spec)) {
-        return *spec;
+    const bool batch_tail =
+        arch_ == 700 && desc.num == 1 && desc.m > 32 && desc.m <= 64;
+    if ((policy & DispatchPolicy::kReuse) || batch_tail) {
+      if (auto spec = cache_.LowerBound(desc);
+          spec && ((policy & DispatchPolicy::kReuse) ||
+                   IsSm70BatchSupply(spec->kernel))) {
+        if (is_feasible(*spec)) {
+          return *spec;
+        }
+        if (spec->kernel && IsSm70BatchSupply(spec->kernel) && desc.num == 1 &&
+            desc.m > 32 && desc.m <= 64) {
+          // A full-M64 iterator cannot execute a smaller captured tail.
+          // Preserve its K partition when returning to a masked kernel.
+          const auto fallbacks =
+              Find(ctx, barriers_size, partials_size, 0, false);
+          for (const auto& fallback : fallbacks) {
+            if (SameSm70SplitKPartition(*spec, fallback, desc.k)) {
+              cache_.Insert(desc, fallback);
+              return fallback;
+            }
+          }
+        }
       }
-      if (warn_cache_miss_) {
+      if (warn_cache_miss_ && (policy & DispatchPolicy::kReuse)) {
         std::cerr << "Failed to find a feasible kernel in the cache, will "
                      "dispatch by heuristic: "
                   << to_string(ctx.desc()) << std::endl;
@@ -664,13 +768,23 @@ struct Gemm::Impl {
 
   std::vector<LaunchSpec> Find(Context& ctx, size_t barrier_size,
                                size_t partials_size, int top_k,
-                               bool include_prescaled) {
+                               bool include_prescaled,
+                               bool include_batch_supply = false) {
     std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
+    // Untuned/cache-miss dispatch retains the existing numerical family.
+    // Batch supply candidates are admitted only by the two-stage measurement.
+    if (!include_batch_supply) {
+      feasible.erase(
+          std::remove_if(feasible.begin(), feasible.end(), IsSm70BatchSupply),
+          feasible.end());
+    }
     if (!include_prescaled) {
       feasible.erase(
-          std::remove_if(feasible.begin(), feasible.end(), [](const Kernel* k) {
-            return k->name().find("_sm70_fp8_pscale") != std::string::npos;
-          }),
+          std::remove_if(feasible.begin(), feasible.end(),
+                         [](const Kernel* k) {
+                           return k->name().find("_sm70_fp8_pscale") !=
+                                  std::string::npos;
+                         }),
           feasible.end());
     }
 
@@ -777,7 +891,58 @@ struct Gemm::Impl {
       specs.insert(specs.end(), swis.begin(), swis.end());
     }
 
+    std::vector<LaunchSpec> batch_candidates;
+    if (arch_ == 700 && ctx.desc().num == 1 && ctx.desc().m > 32 &&
+        ctx.desc().m <= 64) {
+      batch_candidates =
+          Find(ctx, barriers_size, partials_size, tuning_.top_k, false, true);
+      batch_candidates.erase(
+          std::remove_if(batch_candidates.begin(), batch_candidates.end(),
+                         [](const LaunchSpec& spec) {
+                           return !IsSm70BatchSupply(spec.kernel);
+                         }),
+          batch_candidates.end());
+      if (!batch_candidates.empty()) {
+        // Keep the ordinary FP8 candidate set unchanged. Filtering its K16
+        // plans here also changes the LM-head and MLP reduction reference;
+        // supply tuning must preserve the reference, not redefine it.
+        if (ctx.desc().type_b == kFloat4_e2m1) {
+          // Timer noise must not redefine the FP4 reduction partition before
+          // supply tuning. The established deterministic selector supplies the
+          // reference; timing can change M/N tiles only within that partition.
+          auto reference = Find(ctx, barriers_size, partials_size, 1, false);
+          if (!reference.empty()) {
+            specs = {reference.front()};
+          }
+        }
+      }
+    }
+
     specs = Sampler{*measurer_, tuning_.clusters}.Run(specs, launch_func, st);
+
+    if (!specs.empty() && !batch_candidates.empty()) {
+      const auto control = specs.front();
+      std::vector<LaunchSpec> batch_specs{control};
+      for (const auto& candidate : batch_candidates) {
+        if (SameSm70SplitKPartition(control, candidate, ctx.desc().k)) {
+          const auto swis = ctx.Swizzle(candidate, tuning_.swizzle);
+          batch_specs.insert(batch_specs.end(), swis.begin(), swis.end());
+        }
+      }
+      if (batch_specs.size() > 1) {
+        if (GemmTraceEnabled() &&
+            GemmTraceFilterAllows(to_string(ctx.desc()))) {
+          std::cerr << "[TM_GEMM_BATCH_CONTROL] desc=" << to_string(ctx.desc())
+                    << " kernel=" << control.kernel->name()
+                    << " splits=" << control.splits
+                    << " chunk_k=" << control.kernel->chunk_size_k() << '\n';
+        }
+        // Preserve the best existing launch's reduction boundaries while
+        // measuring faster M/N tiles and activation supply for FP4 and FP8.
+        specs = Sampler{*measurer_, tuning_.clusters}.Run(batch_specs,
+                                                          launch_func, st);
+      }
+    }
 
     // for (const auto& s : specs) {
     //     std::cout << s.kernel->name()          //
@@ -821,6 +986,7 @@ struct Gemm::Impl {
   DispatchCache cache_;
 
   DispatchCache sm70_fp8_prefill_cache_;
+  std::array<std::optional<LaunchSpec>, 8> sm70_dflash_context_specs_{};
 
   std::mutex dispatch_mutex_;
 };
@@ -850,6 +1016,15 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
   }
 
   const auto launch = [=](LaunchSpec spec, cudaStream_t st) {
+    if ((operation.dispatch & DispatchPolicy::kSm70Nvfp4Prescaled) &&
+        spec.kernel->name().find("_sm70_nvfp4_prescaled") == std::string::npos) {
+      // Measure the transform that will actually consume the shifted scales.
+      // The cache still stores an ordinary descriptor, shared by both formats.
+      spec.kernel = Sm70Nvfp4PrescaledCounterpart(*spec.kernel);
+      if (!spec.kernel) {
+        return -1;
+      }
+    }
     auto _workspace = workspace;
     return spec.kernel->Launch(operation, alpha, A, Adesc, U, Udesc, B, Bdesc,
                                V, Vdesc, beta, C, Cdesc, D, Ddesc, spec.swizzle,
