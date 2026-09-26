@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     dflash2_sparse_topk_rejection_sample,
+    rejection_sample,
 )
 
 if TYPE_CHECKING:
@@ -39,11 +40,11 @@ class DFlash2LogitsFallback:
     logits: torch.Tensor | None
 
 
-def _compact_target_requires_reference(
+def _compact_target_reference_rows(
     probe_logits: torch.Tensor,
     temperature: float | np.ndarray,
     top_p: float | np.ndarray,
-) -> bool:
+) -> np.ndarray:
     """Keep ambiguous cutoffs on the full-vocabulary sampling contract.
 
     The 21st candidate detects a tie crossing top-20. Ties wholly inside the
@@ -68,7 +69,70 @@ def _compact_target_requires_reference(
     ).any(axis=-1)
     near_cutoff = np.abs(before - top_p).min(axis=-1) <= (16 * np.finfo(np.float32).eps)
     ambiguous = cutoff_tie | ((nucleus_tie | near_cutoff) & (top_p[:, 0] < 1.0))
-    return bool(ambiguous.any())
+    return ambiguous
+
+
+def _compact_target_requires_reference(
+    probe_logits: torch.Tensor,
+    temperature: float | np.ndarray,
+    top_p: float | np.ndarray,
+) -> bool:
+    return bool(_compact_target_reference_rows(probe_logits, temperature, top_p).any())
+
+
+def _sample_reference_requests(
+    logits: torch.Tensor,
+    reference_reqs: np.ndarray,
+    input_batch: InputBatch,
+    rejection_sampler: RejectionSampler,
+    draft_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the unchanged dense contract for whole ambiguous requests.
+
+    Compact sampling admits no penalties, logprobs, grammar or synthetic
+    rejection. Keep original request-slot IDs, positions and local draft-step
+    indices here: packing a subset must never renumber its random streams.
+    """
+    cu = input_batch.cu_num_logits_np
+    row_indices = np.concatenate([np.arange(cu[i], cu[i + 1]) for i in reference_reqs])
+    sub_cu = np.zeros(len(reference_reqs) + 1, dtype=np.int32)
+    np.cumsum(np.diff(cu)[reference_reqs], out=sub_cu[1:])
+    # Pack metadata into a single CPU-to-GPU transfer.
+    # The rejection kernels accept either int32 or int64 cumulative offsets.
+    packed = np.concatenate((row_indices, reference_reqs, sub_cu)).astype(np.int64)
+    metadata = torch.from_numpy(packed).to(device=logits.device, non_blocking=True)
+    rows, reqs, cu_num_logits = metadata.split(
+        [row_indices.size, reference_reqs.size, sub_cu.size]
+    )
+    indices = input_batch.logits_indices[rows]
+    draft_sampled = input_batch.input_ids[indices]
+    pos = input_batch.positions[indices]
+    expanded_idx_mapping = input_batch.expanded_idx_mapping[rows]
+    expanded_local_pos = input_batch.expanded_local_pos[rows]
+    sampler = rejection_sampler.sampler
+    processed = sampler.apply_sampling_params(
+        logits[rows],
+        expanded_idx_mapping,
+        input_batch.idx_mapping_np[reference_reqs],
+        pos,
+        draft_sampled,
+        expanded_local_pos,
+    )
+    sampled, num_sampled = rejection_sample(
+        processed,
+        draft_logits,
+        draft_sampled,
+        cu_num_logits,
+        pos,
+        input_batch.idx_mapping[reqs],
+        expanded_idx_mapping,
+        expanded_local_pos,
+        sampler.sampling_states.temperature.gpu,
+        sampler.sampling_states.seeds.gpu,
+        rejection_sampler.num_speculative_steps,
+        use_fp64=sampler.use_fp64_gumbel,
+    )
+    return reqs, sampled, num_sampled
 
 
 def _parse_alignment_steps(raw_steps: str | None) -> set[int] | None:
@@ -276,22 +340,29 @@ def try_dflash2_sparse_target_rejection(
     # Packed verifier rows need their own request's sampling parameters.
     # Reusing the first request misses ambiguous nuclei in heterogeneous batches.
     num_logits = np.diff(input_batch.cu_num_logits_np)
-    if _compact_target_requires_reference(
+    reference_rows = _compact_target_reference_rows(
         target_topk_logits,
         np.repeat(states.temperature.np[idx], num_logits),
         np.repeat(states.top_p.np[idx], num_logits),
-    ):
+    )
+    reference_reqs = np.flatnonzero(
+        np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
+    )
+    reference_logits = None
+    if reference_reqs.size:
         logger.info_once(
             "DFlash2 target cutoff requires full-vocabulary reference sampling."
         )
-        if fallback is not None:
-            return DFlash2LogitsFallback(fallback())
-        return None
+        if fallback is None:
+            return None
+        reference_logits = fallback()
+        if reference_reqs.size == idx.size or reference_logits is None:
+            return DFlash2LogitsFallback(reference_logits)
     target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
     target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
     num_rows = target_topk_ids.shape[0]
     if input_batch.num_tokens == num_rows:
-        # For the gated B1 decode, logits_indices spans the entire real query.
+        # Uniform decode logits_indices spans the entire real query.
         # Keep views instead of launching two identity gather kernels.
         draft_sampled = input_batch.input_ids[:num_rows]
         pos = input_batch.positions[:num_rows]
@@ -313,6 +384,16 @@ def try_dflash2_sparse_target_rejection(
         rejection_sampler.num_speculative_steps,
         use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
     )
+    if reference_logits is not None:
+        reqs, dense_sampled, dense_num_sampled = _sample_reference_requests(
+            reference_logits,
+            reference_reqs,
+            input_batch,
+            rejection_sampler,
+            speculator.draft_logits,
+        )
+        sampled.index_copy_(0, reqs, dense_sampled)
+        num_sampled.index_copy_(0, reqs, dense_num_sampled)
     if envs.VLLM_SPEC_DUMP_ALIGNMENT:
         _maybe_dump_selector_alignment(
             speculator=speculator,

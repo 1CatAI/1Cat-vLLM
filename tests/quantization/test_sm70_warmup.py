@@ -513,6 +513,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
 
     calls = []
     broadcasts = []
+    imports = []
     barriers = []
 
     def broadcast_object(payload, src):
@@ -539,11 +540,12 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
         warmup_layers,
     )
     monkeypatch.setattr(warmup, "_export_lut_bytes", lambda device: (b"lut", 7))
-    monkeypatch.setattr(
-        warmup,
-        "_import_lut_bytes",
-        lambda device, payload: (_ for _ in ()).throw(AssertionError()),
-    )
+
+    def import_lut(device, payload):
+        imports.append((device, payload))
+        return 7
+
+    monkeypatch.setattr(warmup, "_import_lut_bytes", import_lut)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
 
     layers = [(nn.Module(), False)]
@@ -556,6 +558,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
     assert count == 5
     assert calls == [(layers, [1, 4]), (layers, [1, 4])]
     assert broadcasts == [(b"lut", 0)]
+    assert imports == [(torch.device("cuda:0"), b"lut")]
     assert barriers == [True]
 
 
