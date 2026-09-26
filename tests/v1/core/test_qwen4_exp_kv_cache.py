@@ -144,8 +144,8 @@ def test_qwen4_exp_csa_linear_cache_layout() -> None:
         hash_block_size=4,
     )
     assert all(
-        not isinstance(spec, CircularBufferSpec)
-        for spec, _, _ in prefix_coordinator.attention_groups
+        not isinstance(group.spec, CircularBufferSpec)
+        for group in prefix_coordinator.attention_groups
     )
 
 
