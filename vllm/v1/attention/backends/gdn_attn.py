@@ -583,6 +583,22 @@ def select_gdn_state_block_ids(
     return block_table[row_indices, state_offsets]
 
 
+def _spec_sequence_masks_on_device(
+    spec_sequence_masks_cpu: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """The per-row speculative mask on ``device``.
+
+    When the speculative rows lead the batch, as in steady decode, the mask is
+    built on the device; uploading the pageable CPU mask would synchronize the
+    stream once per GDN cache group and step.
+    """
+    num_spec_rows = int(spec_sequence_masks_cpu.sum())
+    if bool(spec_sequence_masks_cpu[:num_spec_rows].all()):
+        rows = torch.arange(spec_sequence_masks_cpu.numel(), device=device)
+        return rows < num_spec_rows
+    return spec_sequence_masks_cpu.to(device, non_blocking=True)
+
+
 def build_gdn_spec_decode_state_contract(
     *,
     block_table_tensor: torch.Tensor,
@@ -606,52 +622,70 @@ def build_gdn_spec_decode_state_contract(
     """
     assert spec_sequence_masks_cpu.dtype == torch.bool
     assert num_accepted_tokens is not None
+    num_rows = spec_sequence_masks_cpu.numel()
+    num_spec_rows = int(spec_sequence_masks_cpu.sum())
+    # Speculative rows lead the batch in steady decode: graph padding and any
+    # non-speculative rows follow. Slicing then selects exactly the rows the
+    # mask would, without uploading the CPU mask (a pageable copy, which
+    # synchronizes the stream) or indexing by a device mask (a nonzero, which
+    # synchronizes again). Every GDN cache group repeats this on every step.
+    spec_rows_lead = bool(spec_sequence_masks_cpu[:num_spec_rows].all())
 
     def _mask_for(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.device == spec_sequence_masks_cpu.device:
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
-    block_mask = _mask_for(block_table_tensor)
-    seq_mask = _mask_for(seq_lens)
-    accepted_mask = _mask_for(num_accepted_tokens)
+    def _rows(tensor: torch.Tensor, spec: bool) -> torch.Tensor:
+        if not spec_rows_lead:
+            mask = _mask_for(tensor)
+            return tensor[mask if spec else ~mask]
+        if tensor.shape[0] != num_rows:
+            raise IndexError(
+                f"GDN spec mask has {num_rows} rows but the tensor has "
+                f"{tensor.shape[0]}"
+            )
+        rows = tensor[:num_spec_rows] if spec else tensor[num_spec_rows:]
+        # A fresh contiguous tensor, like the mask indexing it replaces.
+        return rows.clone(memory_format=torch.contiguous_format)
+
     if spec_state_slot_selectors is None:
         spec_state_slot_selectors = num_accepted_tokens
-    selector_mask = _mask_for(spec_state_slot_selectors)
 
     if current_state_block_ids is not None:
-        current_mask = _mask_for(current_state_block_ids)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
-        spec_state_indices_tensor = state_block_ids[current_mask]
-        non_spec_source = state_block_ids[~current_mask]
+        spec_state_indices_tensor = _rows(state_block_ids, spec=True)
+        non_spec_source = _rows(state_block_ids, spec=False)
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
             non_spec_source,
-            num_accepted_tokens[~accepted_mask],
+            _rows(num_accepted_tokens, spec=False),
             num_spec,
         )
     elif is_mamba_cache_all:
         spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[block_mask],
-            seq_lens[seq_mask],
+            _rows(block_table_tensor, spec=True),
+            _rows(seq_lens, spec=True),
             block_size,
             num_spec + 1,
         )
         non_spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            seq_lens[~seq_mask],
+            _rows(block_table_tensor, spec=False),
+            _rows(seq_lens, spec=False),
             block_size,
             1,
         ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
+        spec_state_indices_tensor = _rows(
+            block_table_tensor[:, : num_spec + 1], spec=True
+        )
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            num_accepted_tokens[~accepted_mask],
+            _rows(block_table_tensor, spec=False),
+            _rows(num_accepted_tokens, spec=False),
             num_spec,
         )
 
-    spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-    spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+    spec_num_accepted_tokens = _rows(num_accepted_tokens, spec=True)
+    spec_state_slot_selectors = _rows(spec_state_slot_selectors, spec=True)
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(
@@ -1441,13 +1475,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         spec_sequence_masks_cpu = None
                     else:
                         num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-                        spec_sequence_masks = spec_sequence_masks_cpu.to(
-                            query_start_loc.device, non_blocking=True
+                        spec_sequence_masks = _spec_sequence_masks_on_device(
+                            spec_sequence_masks_cpu, query_start_loc.device
                         )
                 else:
                     num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-                    spec_sequence_masks = spec_sequence_masks_cpu.to(
-                        query_start_loc.device, non_blocking=True
+                    spec_sequence_masks = _spec_sequence_masks_on_device(
+                        spec_sequence_masks_cpu, query_start_loc.device
                     )
 
         if spec_sequence_masks is None:
@@ -1632,10 +1666,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # query_start_loc may be padded for CUDA graph replay. The CPU
                 # metadata is authoritative for the live request count here.
                 query_lens = None
-                if common_gdn_metadata is None:
-                    query_lens = query_lens_cpu.to(
-                        query_start_loc.device, non_blocking=True
-                    )
                 profile_state_contract_t0 = (
                     time.perf_counter() if metadata_profile else 0.0
                 )
@@ -1726,7 +1756,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         non_spec_query_start_loc = None
                         non_spec_query_start_loc_cpu = None
                     else:
-                        assert query_lens is not None
+                        # Only mixed batches need the device query lengths.
+                        query_lens = query_lens_cpu.to(
+                            query_start_loc.device, non_blocking=True
+                        )
                         spec_token_masks = torch.repeat_interleave(
                             spec_sequence_masks,
                             query_lens,
@@ -1786,7 +1819,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
             if common_gdn_metadata is None:
-                assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+                # Reading the device total synchronizes the stream, once per
+                # GDN cache group and step; keep it with the other opt-in
+                # state-contract checks.
+                if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
+                    assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             else:
                 assert (
                     common_gdn_metadata.num_spec_decode_tokens == num_spec_decode_tokens
