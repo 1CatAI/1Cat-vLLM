@@ -563,8 +563,19 @@ def _warmup_fp4_dense_layers(
         kernel_output_size = int(state.padded_output_size or state.output_size)
         n_dim = kernel_output_size // (2 if gated_silu else 1)
         for m_dim in m_values:
+            prescaled = state.op_kind == "nvfp4" and getattr(
+                state, "prescaled_scales", False
+            )
+            if prescaled and m_dim <= 32:
+                # These states keep independent QPN2 scales for small rows.
+                # The shifted TurboMind scales belong only to the batch route.
+                continue
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
-            out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
+            # QPN2's prescaled batch dispatcher rounds gate/up to FP16 before
+            # its separate activation. Tune that same GEMM epilogue, without
+            # allocating the smaller fused-activation output first.
+            gemm_n = kernel_output_size if prescaled else n_dim
+            out = torch.empty((m_dim, gemm_n), dtype=torch.float16, device=device)
             if state.op_kind == "mxfp4":
                 if not hasattr(torch.ops._C, "mxfp4_gemm_sm70_out"):
                     continue
@@ -594,7 +605,12 @@ def _warmup_fp4_dense_layers(
                     )
                     calls += 1
                     continue
-                sm70_ops.nvfp4_gemm_sm70_out(
+                op = (
+                    sm70_ops.nvfp4_gemm_sm70_prescaled_out
+                    if prescaled
+                    else sm70_ops.nvfp4_gemm_sm70_out
+                )
+                op(
                     out,
                     x,
                     state.weight,
@@ -602,7 +618,7 @@ def _warmup_fp4_dense_layers(
                     int(state.group_size),
                     int(state.k_ld),
                     int(state.q_ld),
-                    gated_silu,
+                    gated_silu and not prescaled,
                 )
             else:
                 continue

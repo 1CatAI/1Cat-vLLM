@@ -80,11 +80,28 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
-_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
+_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
+_SM70_BATCH_GEMM_DEFAULTS = {
+    # Common dense-operator policy, independent of model name, checkpoint
+    # quantization, speculative method/width and service concurrency. Local
+    # operators retain their dtype/layout/shape checks and small-M routes.
+    "VLLM_SM70_BATCH_GEMM_LAYOUTS": "1",
+    "VLLM_SM70_AWQ_WARMUP_MAX_M": "64",
+    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "64",
+    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
+}
+
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # Match the measured packed verifier and draft context pipeline without
+    # requiring launch-script flags. Operators retain their shape guards.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": "1",
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": "1",
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "1",
+    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": "1",
     # Preserve candidate and dense logits in FP32 through sampling.
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
     # This is the target projection's memory-neutral FP8 layout, not the
@@ -99,6 +116,9 @@ _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": "1",
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
+    # Keep the no-residual/FP16-residual reductions consistent across ranks
+    # and process starts. Autotuning them perturbs the initial GDN state.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": "1",
     "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",
@@ -179,16 +199,17 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
-def _is_sm70_qwen38_nomtp_dual_compile_contract(
+def _is_sm70_qwen38_decode_compile_contract(
     model_config: Any,
     speculative_config: Any,
     parallel_config: Any,
 ) -> bool:
-    """Admit only the exact Qwen3.8 TP4 no-MTP dual-compile topology."""
-    if (
-        model_config is None
-        or parallel_config is None
-        or speculative_config is not None
+    """Admit the shared Qwen3.8 TP4 decode topology, including MTP4."""
+    if model_config is None or parallel_config is None:
+        return False
+    if speculative_config is not None and not (
+        getattr(speculative_config, "method", None) == "mtp"
+        and getattr(speculative_config, "num_speculative_tokens", None) == 4
     ):
         return False
 
@@ -252,11 +273,11 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     return tuple(range(start, start + parallel.local_world_size))
 
 
-def _apply_sm70_qwen38_nomtp_defaults(
+def _apply_sm70_qwen38_decode_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
     """Complete the admitted NVFP4 baseline without global experimental defaults."""
-    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+    if not is_sm70 or not _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     ):
         return ()
@@ -280,6 +301,10 @@ def _apply_sm70_qwen38_nomtp_defaults(
         "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
         "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
     }
+    if cfg.speculative_config is not None:
+        # Keep M=1 draft graphs when target graph sizes are multiples of five.
+        # Otherwise the prepared single-token operators never reach capture.
+        defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
@@ -312,6 +337,18 @@ def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
     ) or _any_participating_device_is_capability(cfg, (7, 5))
 
 
+def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool) -> tuple[str, ...]:
+    """Enable shared SM70 batch operators without overriding explicit settings."""
+    if not is_sm70:
+        return ()
+    applied = []
+    for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
+        if env_name not in os.environ:
+            os.environ[env_name] = env_value
+            applied.append(env_name)
+    return tuple(applied)
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -336,7 +373,10 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
-    max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
+    # B32 is the largest concurrency with end-to-end SM70 graph validation.
+    # Keep larger scheduler capacities usable through the regular piecewise
+    # path without forcing an unvalidated, memory-heavy full-graph capture.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
     capture_sizes = {
         size for size in _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES if size <= max_graph_reqs
     }
@@ -511,10 +551,14 @@ def _sm70_speculative_cudagraph_capture_sizes(
     decode_query_len: int,
 ) -> list[int]:
     """Return bounded auxiliary and verifier shapes without a TP contract."""
-    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
-        max_num_seqs,
-        decode_query_len,
-    )
+    # DFlash verification has the same B32 attention/layout coverage as
+    # ordinary decode. A 16-request cap leaves C32 outside CUDA Graph replay.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
+    request_sizes = {
+        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
+    }
+    request_sizes.add(max_graph_reqs)
+    verifier_sizes = [decode_query_len * size for size in request_sizes]
     return sorted(
         set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
     )
@@ -1714,6 +1758,20 @@ class VllmConfig:
 
         from vllm.platforms import current_platform
 
+        for env_name in _apply_sm70_batch_gemm_defaults(
+            is_sm70=(
+                current_platform.is_cuda()
+                and _any_participating_device_is_capability(self, (7, 0))
+            ),
+        ):
+            logger.info_once(
+                "Auto-setting %s=%s for SM70 batch GEMM. "
+                "Local operators select compatible layouts and shapes. "
+                "Set it explicitly to override.",
+                env_name,
+                os.environ[env_name],
+            )
+
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
             self.model_config,
             self.speculative_config,
@@ -1981,7 +2039,7 @@ class VllmConfig:
                 and not sm70_no_compile_decode_graph_requested
                 and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             ):
-                for env_name in _apply_sm70_qwen38_nomtp_defaults(
+                for env_name in _apply_sm70_qwen38_decode_defaults(
                     self,
                     is_sm70=all(
                         current_platform.is_device_capability((7, 0), device_id=i)
@@ -1990,11 +2048,11 @@ class VllmConfig:
                 ):
                     logger.info_once(
                         "Auto-setting %s=1 for the quality-qualified SM70 "
-                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
+                        "Qwen3.8 NVFP4 TP4 decode path. Set it explicitly to override.",
                         env_name,
                     )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,
@@ -2013,7 +2071,7 @@ class VllmConfig:
                     "large prefill and FULL decode graphs share one model."
                 )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,
@@ -2160,11 +2218,14 @@ class VllmConfig:
                         "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
                         "SM70 Flash-V100 0.0.3 compile graph startup."
                     )
-                if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ:
+                if (
+                    not self.use_v2_model_runner
+                    and "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ
+                ):
                     os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
                     logger.info_once(
-                        "Auto-setting VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 "
-                        "for SM70 Flash-V100 0.0.3 compile graph startup."
+                        "Disabling the legacy SM70 graph memory profiler; "
+                        "V2 budgets its graph reserve before KV allocation."
                     )
                 if "VLLM_SM70_LM_HEAD_TOP1" not in os.environ:
                     os.environ["VLLM_SM70_LM_HEAD_TOP1"] = "0"

@@ -192,8 +192,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
-    VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = False
-    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = True
+    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = True
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
@@ -212,7 +212,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL: bool = True
-    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = False
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
+    VLLM_SM70_MTP4_FUSED_GDN_METADATA: bool = True
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
@@ -276,7 +278,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QUANT_LM_HEAD: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = True
-    VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
@@ -356,6 +358,7 @@ if TYPE_CHECKING:
     VLLM_MOE_DP_CHUNK_SIZE: int = 256
     VLLM_ENABLE_MOE_DP_CHUNK: bool = False
     VLLM_SM70_FLASH_ATTN_V100: bool = True
+    VLLM_SM70_BATCH_GEMM_LAYOUTS: bool = False
     VLLM_SM70_PROFILE_TRACE: bool = False
     VLLM_SM70_DECODE_EVENT_TRACE: bool = False
     VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS: float = 1.0
@@ -403,6 +406,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
+    VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
     VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
@@ -429,7 +433,10 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL: bool = False
     VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
-    VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = True
+    VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS: int = 8192
+    VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE: bool = True
+    VLLM_DFLASH_COMPACT_AUX_HIDDEN: bool = True
+    VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -1906,13 +1913,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
-    # Share TurboMind B/Pack1 codes with QPN2, preserving both scale formats.
-    # Opt in until same-contract GPU correctness and performance gates pass.
+    # Share TurboMind B/Pack1 codes with compatible QPN2 projections. Compact
+    # scales additionally require native support for reusable graph scratch.
     "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "1"))
     ),
     "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1"))
     ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
@@ -2092,10 +2099,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Direct fifty-route verifier expert path for Qwen3.8 MTP4. This consumes
     # checkpoint-native NVFP4 weights with FP16 activations; it does not enable
-    # online QPN8 activation quantization. Keep opt-in until the TP4 endpoint
-    # quality and acceptance gates are recorded.
+    # online QPN8 activation quantization. The TP4/M5 shape gate is retained;
+    # set 0 to restore the grouped expert path and its accumulation order.
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1"))
     ),
     # Exact single-token Qwen3.8 W2 epilogue. Ten expert warps retain the
     # established FP16 route rounding and reduce in top-k order with FP32 FMA.
@@ -2238,6 +2245,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
     ),
+    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
+    ),
+    # Pure MTP4 graph batches can construct all GDN groups' state rows in one
+    # launch. Mixed/prefill batches still fall back. Set 0 to restore separate
+    # per-group metadata writes while retaining the shared batch classification.
+    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))
+    ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.
     "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
@@ -2305,10 +2321,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
     ),
-    # Experimental fixed 8192/16-warp reduction for the FP16 no-residual and
+    # Fixed 8192/16-warp reduction for the FP16 no-residual and
     # FP16-residual Gemma norms not covered by the existing FP32-residual path.
-    # Prevents per-rank/startup autotune from changing reduction order. Keep
-    # disabled until fixed-prefix, natural-output and full-round gates pass.
+    # Prevents per-rank/startup autotune from changing reduction order. Enabled
+    # by the SM70 DFlash2 profile; explicit zero retains the rollback path.
     "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))
     ),
@@ -2409,9 +2425,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
-    # only. Keep opt-in until the TP4 dynamic-graph gate is recorded.
+    # only. Other shapes/topologies retain their gates; explicit 0 rolls back.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "0"))
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "1"))
     ),
     # Bitwise-equal push collectives for FP16 [4|8|16, 2560] payloads on
     # fully-connected SM70 TP4 CUDA Graphs. Other shapes, topologies, devices,
@@ -2774,6 +2790,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASH_ATTN_V100": lambda: bool(
         int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))
     ),
+    # Enabled by shared SM70 configuration for compatible local operators,
+    # independent of the model/quantization label or speculative method.
+    # An explicit zero preserves the original layout policy.
+    "VLLM_SM70_BATCH_GEMM_LAYOUTS": lambda: bool(
+        int(os.getenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0"))
+    ),
     "VLLM_SM70_PROFILE_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))
         or int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))
@@ -2899,6 +2921,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_ROUTE_SUMMARY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))
     ),
+    # Mixed chunked-prefill batches send resident decode and short verification
+    # rows through the partitioned paged-decode kernels. This prevents a q=1
+    # row from walking a long prefix serially in the paged-prefill kernel.
+    "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS", "1"))
+    ),
     "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))
     ),
@@ -2979,8 +3007,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    # The qualified Q8000 FP32-accumulated route is the default. Keep v37 as
+    # an explicit rollback and matched-control selection.
     "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "1"))
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0"))
+    ),
+    # Reuse decode scratch across row capacities on the same CUDA stream.
+    "VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE": lambda: os.getenv(
+        "VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1"
+    )
+    != "0",
+    # Concatenate auxiliary states directly into the draft projection dtype.
+    "VLLM_DFLASH_COMPACT_AUX_HIDDEN": lambda: os.getenv(
+        "VLLM_DFLASH_COMPACT_AUX_HIDDEN", "1"
+    )
+    != "0",
+    # Native Q8000/Q8192 prefix score capacity; read once per worker workspace.
+    # Multiples of 8192 in [8192, 131072]. Use 16384 for the previous capacity.
+    "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS": lambda: int(
+        os.getenv("VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS", "8192")
     ),
     "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
         int(

@@ -48,10 +48,12 @@ dedicated operator name, `sm70_d256_gqa_v37_fwd`, prevents an old FA2 library
 from being mistaken for this implementation. If the operator is absent, the
 backend warns and falls back instead of selecting the legacy architecture.
 
-`VLLM_FLASH_V100_PREFILL_D256_GQA_V37=0` restores the old architecture loader
-and disables the new E4M3 bridge. The existing long-prefill architecture
-switch remains an additional gate. Explicit `fp8_e4m3` and `fp8_e5m2` retain
-their respective byte encodings; this change does not reinterpret `fp8`.
+`VLLM_FLASH_V100_PREFILL_D256_GQA_V37=1` explicitly selects this v37 operator;
+the default value of 0 selects the qualified Q8000 architecture operator on its
+narrow shape family. The E4M3 bridge is resolved independently of the compute
+operator. The existing long-prefill architecture switch remains an additional
+gate. Explicit `fp8_e4m3` and `fp8_e5m2` retain their respective byte encodings;
+this change does not reinterpret `fp8`.
 
 The `prefill_dense_d256_gqa_v37` and `prefill_prefix_fp8_e4m3_bridge` route
 counters identify actual execution. A requested environment variable alone

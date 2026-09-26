@@ -945,6 +945,70 @@ def test_ple_offload_runner_routes_requests_layer_first(
     )
 
 
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="requires four CUDA GPUs"
+)
+def test_ple_offload_four_rank_direct_h2d_and_semaphore() -> None:
+    class FakeLayer:
+        def forward_impl(
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor | None,
+            output_buffer: torch.Tensor,
+        ) -> torch.Tensor:
+            del hidden_states, query_start_loc, ngram_context
+            output = output_buffer[: input_ids.numel()]
+            output.copy_(input_ids.to(torch.uint8).unsqueeze(1))
+            return output
+
+    runner = ple_offload_worker.PleOffloadRunner.__new__(
+        ple_offload_worker.PleOffloadRunner
+    )
+    runner._clamp_input_ids = False
+    runner._layers = {"ple": FakeLayer()}
+    input_ids = torch.tensor([11, 13, 17, 19, 23], dtype=torch.int32)
+    runner._input_bufs = {
+        0: ple_offload_worker.PleOffloadInputBuffers(
+            input_ids_buf=input_ids,
+            query_start_loc_buf=torch.tensor([0, 5], dtype=torch.int32),
+            ngram_context_buf=None,
+        )
+    }
+    runner._pinned_bufs = {
+        0: {"ple": torch.empty(5, 2560, dtype=torch.uint8, pin_memory=True)}
+    }
+    targets = []
+    for rank in range(4):
+        with torch.accelerator.device_index(rank):
+            targets.append(
+                ple_offload_worker.PleOffloadOutputTarget(
+                    tp_rank=rank,
+                    gpu_output_buffer=torch.empty(
+                        5, 2560, dtype=torch.uint8, device=f"cuda:{rank}"
+                    ),
+                    sem=ple_offload_layer.CpuGpuSemaphore(torch.device(f"cuda:{rank}")),
+                    copy_stream=torch.cuda.Stream(device=rank),
+                )
+            )
+    runner._worker_targets = {0: {"ple": targets}}
+    request = ple_offload_worker.PleOffloadRequest(dp_rank=0, num_tokens=5, num_reqs=1)
+
+    for expected in (11, 29):
+        input_ids.fill_(expected)
+        runner._handle_requests([request])
+        for target in targets:
+            target.copy_stream.synchronize()
+            assert torch.equal(
+                target.gpu_output_buffer.cpu(),
+                torch.full((5, 2560), expected, dtype=torch.uint8),
+            )
+            assert target.sem.flag_tensor.cpu().item() == 1
+            target.sem.reset(target.copy_stream)
+            target.copy_stream.synchronize()
+
+
 def test_wait_for_ready_closes_pipe() -> None:
     context = ple_offload_worker.get_mp_context()
     ready_reader, ready_writer = context.Pipe(duplex=False)
@@ -964,3 +1028,130 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+
+
+def _registration_with_cpu_inputs(
+    input_ids: torch.Tensor,
+) -> ple_offload_connector_module.PleOffloadRegistration:
+    return ple_offload_connector_module.PleOffloadRegistration(
+        worker_id=0,
+        tp_rank=0,
+        dp_rank=0,
+        gpu_output_buffers={},
+        sem_flag_tensors={},
+        input_ids_buf=input_ids,
+        query_start_loc_buf=torch.zeros(3, dtype=torch.int32).share_memory_(),
+        ngram_context_buf=None,
+    )
+
+
+def test_ple_registration_keeps_input_storage_without_shm_manager() -> None:
+    import psutil
+    import torch.multiprocessing as torch_mp
+
+    def shm_managers() -> set[int]:
+        return {
+            child.pid
+            for child in psutil.Process().children(recursive=True)
+            if "torch_shm_manager" in child.name()
+        }
+
+    input_ids = torch.zeros(8, dtype=torch.int32).share_memory_()
+    data_ptr = input_ids.data_ptr()
+    strategy = torch_mp.get_sharing_strategy()
+    managers_before = shm_managers()
+
+    payload = ple_offload_connector_module._dump_registration(
+        _registration_with_cpu_inputs(input_ids)
+    )
+
+    assert payload
+    # The "file_system" strategy moved this storage under a torch_shm_manager
+    # whose death made the GPU worker abort on release.
+    assert input_ids.data_ptr() == data_ptr
+    assert shm_managers() == managers_before
+    assert torch_mp.get_sharing_strategy() == strategy
+
+
+_REGISTRATION_TRANSFER_SCRIPT = """
+import ctypes, multiprocessing, os, signal, sys
+
+import psutil
+import torch
+from multiprocessing.reduction import ForkingPickler
+
+from vllm.v1.ple_offload.connector import _dump_registration
+from vllm.v1.ple_offload.protocol import PleOffloadRegistration
+
+
+def no_core_dump():
+    # A regression must not leave an apport report behind (PR_SET_DUMPABLE).
+    ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+
+
+def sender(conn):
+    no_core_dump()
+    input_ids = torch.zeros(8, dtype=torch.int32).share_memory_()
+    registration = PleOffloadRegistration(
+        worker_id=0, tp_rank=0, dp_rank=0,
+        gpu_output_buffers={}, sem_flag_tensors={},
+        input_ids_buf=input_ids,
+        query_start_loc_buf=torch.zeros(3, dtype=torch.int32).share_memory_(),
+        ngram_context_buf=None,
+    )
+    conn.send_bytes(_dump_registration(registration))
+    conn.recv()
+    input_ids[0] = 7
+    conn.send("written")
+    signal.pause()
+
+
+if __name__ == "__main__":
+    no_core_dump()
+    context = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = context.Pipe()
+    proc = context.Process(target=sender, args=(child_conn,), daemon=True)
+    proc.start()
+    registration = ForkingPickler.loads(parent_conn.recv_bytes())
+    parent_conn.send("write")
+    assert parent_conn.recv() == "written"
+    managers = [
+        p for p in psutil.Process().children(recursive=True)
+        if "torch_shm_manager" in p.name()
+    ]
+    print(f"value={int(registration.input_ids_buf[0])} managers={len(managers)}")
+    os.kill(proc.pid, signal.SIGKILL)
+    proc.join()
+    del registration
+    print("released", flush=True)
+"""
+
+
+def test_ple_registration_outlives_its_sender(tmp_path) -> None:
+    """The offload process reads the sender's writes through the shared input
+    buffers and still releases them cleanly after the sender was killed."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import vllm
+
+    script = tmp_path / "registration_transfer.py"
+    script.write_text(_REGISTRATION_TRANSFER_SCRIPT)
+    # A script's sys.path starts at its own directory, so point the child at
+    # the vllm under test instead of whichever one is installed.
+    vllm_root = str(Path(vllm.__file__).parents[1])
+    python_path = os.pathsep.join(
+        filter(None, [vllm_root, os.environ.get("PYTHONPATH")])
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONPATH": python_path},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "value=7 managers=0" in result.stdout, result.stdout + result.stderr
+    assert "released" in result.stdout

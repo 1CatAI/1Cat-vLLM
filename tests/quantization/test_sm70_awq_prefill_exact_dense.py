@@ -33,7 +33,7 @@ def test_awq_exact_f16_weight_matches_half_fma_rounding():
     assert expected != naive
 
 
-def test_awq_prefill_exact_dense_shape_gate_is_narrow():
+def test_awq_prefill_exact_dense_admits_aligned_local_layouts():
     qweight = SimpleNamespace(shape=(5120, 1088))
     layer = SimpleNamespace(
         tp_size=4,
@@ -44,12 +44,12 @@ def test_awq_prefill_exact_dense_shape_gate_is_narrow():
     assert _is_sm70_awq_prefill_exact_dense_layer(layer)
 
     layer.tp_size = 2
-    assert not _is_sm70_awq_prefill_exact_dense_layer(layer)
+    assert _is_sm70_awq_prefill_exact_dense_layer(layer)
     layer.tp_size = 4
     layer.prefix = "model.language_model.layers.1.self_attn.qkv_proj"
     assert not _is_sm70_awq_prefill_exact_dense_layer(layer)
     layer.prefix = "model.language_model.layers.1.mlp.gate_up_proj"
-    layer.qweight = SimpleNamespace(shape=(5120, 1024))
+    layer.qweight = SimpleNamespace(shape=(5120, 1023))
     assert not _is_sm70_awq_prefill_exact_dense_layer(layer)
 
 
@@ -67,7 +67,7 @@ def test_awq_prefill_exact_dense_workspace_is_reused(monkeypatch):
 
     _sm70_awq_prefill_dense_workspaces.clear()
     monkeypatch.setattr(torch, "empty", fake_empty)
-    weight = SimpleNamespace(device=torch.device("cuda:0"))
+    weight = SimpleNamespace(device=torch.device("cuda:0"), numel=lambda: 5120 * 1088)
 
     try:
         first = _get_sm70_awq_prefill_exact_dense_workspace(weight)

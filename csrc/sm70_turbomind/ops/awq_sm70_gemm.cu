@@ -35,6 +35,7 @@
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/gemm_universal.h"
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
+#include "src/turbomind/kernels/gemm/sm70_dflash_context.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
 #include "custom_all_reduce.cuh"
@@ -1321,6 +1322,10 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
 
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
+  if (group_size == 0 &&
+      turbomind::gemm::UseSm70DflashContextFcStableReduction(m, n, k)) {
+    return turbomind::gemm::DispatchPolicy::kDefault;
+  }
   const char* dflash2_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
   const char* dflash2_shadow =
       std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
@@ -4182,9 +4187,12 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
         m == 1 && ((n == 1536 && k == 4096) || (n == 8192 && k == 1024) ||
                    (n == 4096 && k == 2048) || (n == 1024 && k == 4096) ||
                    (n == 4096 && k == 512));
-    TORCH_CHECK(qwen38_prefill || prescaled_m1,
+    const bool prescaled_batch =
+        m > 32 && m <= 64 &&
+        ((n == 5120 && k == 1536) || ((n == 4096 || n == 3584) && k == 5120));
+    TORCH_CHECK(qwen38_prefill || prescaled_m1 || prescaled_batch,
                 "fp8_gemm_sm70: pre-scaled block-FP8 requires an accepted "
-                "8K prefill or M=1 tensor shape.");
+                "8K prefill, M=1, or M=33..64 tensor shape.");
     TORCH_CHECK(!gated_silu,
                 "fp8_gemm_sm70: pre-scaled path does not fuse gated SILU.");
   }
@@ -4291,8 +4299,10 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 bool sm70_fp8_prefill_cutlass_gated_silu_enabled(
     const torch::Tensor& in_feats, const torch::Tensor& dense_weight) {
   const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
-  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) == 8000 &&
-         in_feats.size(1) == 5120 && dense_weight.size(1) == 8704;
+  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) >= 8000 &&
+         in_feats.size(0) <= 8192 && in_feats.size(1) > 0 &&
+         in_feats.size(1) % 128 == 0 && dense_weight.size(1) > 0 &&
+         dense_weight.size(1) % 128 == 0;
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
@@ -4467,7 +4477,7 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                          torch::Tensor tm_weight, torch::Tensor tm_scales,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
-                         bool gated_silu) {
+                         bool gated_silu, bool prescaled = false) {
   TORCH_CHECK(in_feats.is_cuda(), "nvfp4_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "nvfp4_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "nvfp4_gemm_sm70: scales must be CUDA.");
@@ -4583,6 +4593,11 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.dispatch = select_nvfp4_dense_dispatch_policy(
       device, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
       static_cast<int>(group_size), stream);
+  if (prescaled) {
+    TORCH_CHECK(m > 32, "nvfp4_gemm_sm70: prescaled input requires M>32.");
+    op.dispatch =
+        op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Nvfp4Prescaled;
+  }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
@@ -6284,6 +6299,14 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                          bool gated_silu) {
   vllm::awq_sm70::nvfp4_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
                                       group_size, k_ld, q_ld, gated_silu);
+}
+
+void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, torch::Tensor scales,
+                                   int64_t group_size, int64_t k_ld,
+                                   int64_t q_ld, bool gated_silu) {
+  vllm::awq_sm70::nvfp4_gemm_sm70_out(out, input, weight, scales, group_size,
+                                      k_ld, q_ld, gated_silu, true);
 }
 
 void nvfp4_gemv_sm70_raw_out(torch::Tensor out, torch::Tensor _in_feats,

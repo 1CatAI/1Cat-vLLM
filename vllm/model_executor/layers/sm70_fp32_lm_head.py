@@ -36,7 +36,7 @@ def indexed_fp32_logits(
 ) -> None:
     """Evaluate contiguous FP16 rows into an owned FP32 candidate buffer.
 
-    The caller gates the SM70 TP4 DFlash2 shape and candidate bounds. Each
+    The caller gates the supported SM70 local shape and candidate bounds. Each
     program computes one dot, avoiding both expanded cross-row products and
     FP16 storage of the logits used for top-k/top-p.
     """

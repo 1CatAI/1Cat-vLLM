@@ -10,8 +10,13 @@ import torch.nn.functional as F
 import vllm.v1.sample.rejection_sampler as rejection_sampler_module
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import (
+    MinPLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
+from vllm.v1.sample.logits_processor.interface import AddedRequest
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
@@ -497,6 +502,10 @@ def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
         top_k=torch.tensor([10], dtype=torch.int32, device=device),
         top_p=torch.tensor([0.95], dtype=torch.float32, device=device),
     )
+    # Both paths must draw from the same torch generator to be comparable
+    # token by token. Where FlashInfer runs (sm75 and newer) the regular
+    # sampler would draw the legacy bonus token from FlashInfer's own one.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
     rejection_sampler = RejectionSampler(Sampler())
 
     if DEVICE_TYPE == "cuda":
@@ -915,6 +924,75 @@ def test_top_k(rejection_sampler, top_k):
         unmasked_indices=top_k_indices,
         sampling_metadata=sampling_metadata,
     )
+
+
+def _min_p_processor(min_p_per_request: list[float]) -> MinPLogitsProcessor:
+    vllm_config = Mock()
+    vllm_config.scheduler_config.max_num_seqs = len(min_p_per_request)
+    processor = MinPLogitsProcessor(vllm_config, DEVICE_TYPE, is_pin_memory=False)
+    added: list[AddedRequest] = [
+        (index, SamplingParams(min_p=min_p), None, [])
+        for index, min_p in enumerate(min_p_per_request)
+    ]
+    processor.update_state(
+        BatchUpdate(
+            batch_size=len(min_p_per_request), removed=[], added=added, moved=[]
+        )
+    )
+    return processor
+
+
+def test_min_p_filters_draft_positions_like_the_regular_sampler():
+    """Every draft position of a request gets the cut the regular sampler
+    applies to a single position: temperature first, then min_p."""
+    torch.manual_seed(0)
+    vocab_size = 50
+    min_p_per_request = [0.0, 0.3, 0.05]
+    cu_num_tokens = torch.tensor([3, 4, 8], dtype=torch.int32, device=DEVICE_TYPE)
+    request_of_token = [0, 0, 0, 1, 2, 2, 2, 2]
+    temperature = torch.tensor([1.0, 0.7, 1.6], device=DEVICE_TYPE)
+    logits = 3 * torch.randn((8, vocab_size), device=DEVICE_TYPE)
+
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False, temperature=temperature
+    )
+    sampling_metadata.logitsprocs = LogitsProcessors(
+        [_min_p_processor(min_p_per_request)]
+    )
+    probs = F.softmax(logits / temperature[request_of_token, None], dim=-1)
+    min_p = torch.tensor(min_p_per_request, device=DEVICE_TYPE)[request_of_token]
+    expected_dropped = probs < min_p[:, None] * probs.amax(dim=-1, keepdim=True)
+
+    constrained = rejection_sampler_module.apply_sampling_constraints(
+        logits.clone(), cu_num_tokens, sampling_metadata
+    )
+
+    assert torch.equal(constrained == float("-inf"), expected_dropped)
+    assert not expected_dropped[:3].any()  # min_p = 0 drops nothing
+    assert expected_dropped[3:].any()
+
+
+def test_min_p_keeps_the_combined_bonus_fast_path():
+    processors = LogitsProcessors([_min_p_processor([0.2])])
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False, temperature=torch.ones(1, device=DEVICE_TYPE)
+    )
+    sampling_metadata.logitsprocs = processors
+
+    assert rejection_sampler_module._combined_bonus_sampling_enabled(
+        sampling_metadata, needs_output_logprobs=False
+    )
+    # Token matching hands per-token logits to the per-request processor.
+    assert not rejection_sampler_module._token_matching_processor_safe(
+        processors.argmax_invariant[0]
+    )
+
+
+def test_speculative_decoding_accepts_min_p_and_rejects_logit_bias():
+    speculative_config = Mock()
+    SamplingParams(min_p=0.1)._validate_spec_decode(speculative_config)
+    with pytest.raises(ValueError, match="logit_bias"):
+        SamplingParams(logit_bias={1: 2.0})._validate_spec_decode(speculative_config)
 
 
 @pytest.mark.parametrize("top_p", [0.5, 0.9, 0.99])

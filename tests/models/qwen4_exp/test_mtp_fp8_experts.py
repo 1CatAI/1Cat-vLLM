@@ -162,3 +162,57 @@ def test_only_unquantized_draft_experts_are_overridden(monkeypatch):
     fallback.get_quant_method = lambda layer, prefix: object()
     with pytest.raises(ValueError, match="unquantized checkpoint"):
         wrapped.get_quant_method(expert, "mtp.layers.48.mlp.experts")
+
+
+def _draft_config(dtype=torch.float16, pp_size=1, expert_parallel=False):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(dtype=dtype),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp_size, enable_expert_parallel=expert_parallel
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,supported",
+    [
+        ({}, True),
+        # The drafter is stage-local (built only on the last pipeline rank),
+        # so pipeline parallelism must not disable checkpoint FP8 experts.
+        ({"pp_size": 2}, True),
+        ({"pp_size": 5}, True),
+        # Online conversion is only validated on a single stage.
+        ({"online": True}, True),
+        ({"online": True, "pp_size": 2}, False),
+        ({"expert_parallel": True}, False),
+        ({"dtype": torch.bfloat16}, False),
+        ({"exact_sm70": False}, False),
+        ({"quant": "gptq"}, False),
+        ({"sampler": "synthetic"}, False),
+    ],
+)
+def test_fp8_experts_support_allows_checkpoint_experts_under_pp(overrides, supported):
+    from vllm.models.qwen4_exp.nvidia.mtp import _mtp_fp8_experts_supported
+
+    quant_config = Mock(
+        get_name=Mock(return_value=overrides.get("quant", "modelopt_mixed"))
+    )
+    draft = _draft_config(
+        dtype=overrides.get("dtype", torch.float16),
+        pp_size=overrides.get("pp_size", 1),
+        expert_parallel=overrides.get("expert_parallel", False),
+    )
+    speculative = SimpleNamespace(
+        rejection_sample_method=overrides.get("sampler", "standard")
+    )
+
+    assert (
+        _mtp_fp8_experts_supported(
+            draft,
+            quant_config,
+            speculative,
+            overrides.get("exact_sm70", True),
+            overrides.get("online", False),
+        )
+        is supported
+    )

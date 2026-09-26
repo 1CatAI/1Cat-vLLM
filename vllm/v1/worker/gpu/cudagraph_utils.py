@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -54,6 +55,22 @@ def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
         reserve_bytes / 2**30,
     )
     return reserve_bytes
+
+
+def get_sm70_cudagraph_memory_reserve(
+    cudagraph_mode: CUDAGraphMode, activation_peak_bytes: int
+) -> int:
+    """Budget a profiled activation peak for graph pools, unless overridden.
+
+    V2 cannot capture the real graphs before allocating KV. Reserve the measured
+    forward scratch peak instead of silently reserving zero on SM70. This is an
+    admission estimate, not a hard cap on the CUDA caching allocator.
+    """
+    if "VLLM_V2_CUDAGRAPH_MEM_MIB" in os.environ:
+        return get_explicit_cudagraph_memory_reserve(cudagraph_mode)
+    if cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+    return max(0, activation_peak_bytes)
 
 
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
@@ -135,6 +152,15 @@ def get_uniform_token_count(
     ):
         return max_query_len
     return None
+
+
+def get_uniform_decode_token_count(
+    num_reqs: int, num_tokens: int, max_query_len: int, has_prefill: bool
+) -> int | None:
+    """Classify decode by request phase as well as shape (upstream #51865)."""
+    if has_prefill or num_reqs == 0:
+        return None
+    return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
 
 
 class CudaGraphManager:
@@ -335,56 +361,59 @@ class CudaGraphManager:
                 descs = self._capture_descs[mode]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
-                for desc in descs:
-                    # Prepare inputs and get forward function
-                    forward_fn, attn_state = create_forward_fn(desc)
-
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
-
-                    # Capture
-                    logger.debug(
-                        "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
-                    )
-                    if desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                        captured_attn_states[desc] = attn_state
-                        forward_fn(CUDAGraphMode.PIECEWISE)
-                    else:
-                        # Capture with fresh attention state. The warmup
-                        # attention state is discarded because some backends
-                        # (e.g. FlashMLA) perform lazy initializations that
-                        # must be captured in the graph.
+                with sm70_decode_graph_compilation(mode == CUDAGraphMode.FULL):
+                    for desc in descs:
+                        # Prepare inputs and get forward function
                         forward_fn, attn_state = create_forward_fn(desc)
-                        captured_attn_states[desc] = attn_state
-                        assert desc not in self.graphs, (
-                            f"Graph already captured for {desc}"
+
+                        # Warmup
+                        forward_fn(CUDAGraphMode.NONE)
+
+                        # Capture
+                        logger.debug(
+                            "CG Capture: mode=%s, batch_desc=%s",
+                            desc.cg_mode.name,
+                            desc,
                         )
-                        if (
-                            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-                            and current_platform.is_cuda()
-                            and current_platform.is_device_capability((7, 0))
-                        ):
-                            logger.info_once(
-                                "Running SM70 Flash-V100 compile full-graph "
-                                "pre-capture warmup for stable replay."
+                        if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                            captured_attn_states[desc] = attn_state
+                            forward_fn(CUDAGraphMode.PIECEWISE)
+                        else:
+                            # Capture with fresh attention state. The warmup
+                            # attention state is discarded because some backends
+                            # (e.g. FlashMLA) perform lazy initializations that
+                            # must be captured in the graph.
+                            forward_fn, attn_state = create_forward_fn(desc)
+                            captured_attn_states[desc] = attn_state
+                            assert desc not in self.graphs, (
+                                f"Graph already captured for {desc}"
                             )
+                            if (
+                                envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                                and current_platform.is_cuda()
+                                and current_platform.is_device_capability((7, 0))
+                            ):
+                                logger.info_once(
+                                    "Running SM70 Flash-V100 compile full-graph "
+                                    "pre-capture warmup for stable replay."
+                                )
+                                get_offloader().sync_prev_onload()
+                                forward_fn(CUDAGraphMode.NONE)
+                                get_offloader().join_after_forward()
+                                torch.accelerator.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            # Sync offloader's copy stream before capture.
+                            # Finish any pre-capture offloader prefetches.
                             get_offloader().sync_prev_onload()
-                            forward_fn(CUDAGraphMode.NONE)
-                            get_offloader().join_after_forward()
-                            torch.accelerator.synchronize()
-                        graph = torch.cuda.CUDAGraph()
-                        # Sync offloader's copy stream before capture.
-                        # Ensure any pre-capture prefetches from offloader are complete.
-                        get_offloader().sync_prev_onload()
-                        with torch.cuda.graph(graph, self.pool):
-                            forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
-                            get_offloader().join_after_forward()
-                        self.graphs[desc] = graph
-                        compilation_counter.num_cudagraph_captured += 1
+                            with torch.cuda.graph(graph, self.pool):
+                                forward_fn(CUDAGraphMode.NONE)
+                                # Join offloader's copy stream after forward to avoid
+                                # unjoined stream error. The last layer's start_prefetch
+                                # forks copy_stream, but wait_prefetch only happens in
+                                # the next forward pass.
+                                get_offloader().join_after_forward()
+                            self.graphs[desc] = graph
+                            compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
         return captured_attn_states
 
@@ -574,7 +603,6 @@ class ModelCudaGraphManager(CudaGraphManager):
                         attention_context_bucket=desc.attention_context_bucket,
                     )
                 with (
-                    sm70_decode_graph_compilation(desc.cg_mode == CUDAGraphMode.FULL),
                     set_forward_context(
                         attn_metadata,
                         self.vllm_config,

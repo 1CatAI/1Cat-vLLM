@@ -364,6 +364,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor scales, float global_scale) -> ()");
   ops.impl("nvfp4_qpn2_restore_tm_scales_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_restore_tm_scales_sm70_out);
+  // Python may be newer than the loaded extension. Only this version retains
+  // compact-scale scratch across layers in larger CUDA graphs.
+  ops.def("nvfp4_qpn2_compact_scales_version_sm70() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "nvfp4_qpn2_compact_tm_gemm_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor weight, Tensor scales, float global_scale, int k_ld, "
@@ -376,7 +380,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "nvfp4_qpn2_tm_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains, Tensor tm_scales, int tm_group_size, "
-      "int tm_k_ld, int tm_q_ld, bool gated_silu, int min_prefill_m) -> ()");
+      "int tm_k_ld, int tm_q_ld, bool gated_silu, int min_prefill_m, "
+      "bool prescaled_scales=False) -> ()");
   ops.impl("nvfp4_qpn2_tm_dispatch_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_tm_dispatch_sm70_out);
 
@@ -429,6 +434,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu) -> ()");
   ops.impl("nvfp4_gemm_sm70_out", torch::kCUDA, &nvfp4_gemm_sm70_out);
+
+  ops.def(
+      "nvfp4_gemm_sm70_prescaled_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("nvfp4_gemm_sm70_prescaled_out", torch::kCUDA,
+           &nvfp4_gemm_sm70_prescaled_out);
 
   ops.def(
       "nvfp4_gemv_sm70_raw_out(Tensor(a!) out, Tensor _in_feats, "

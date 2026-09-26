@@ -185,8 +185,8 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
     return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
-  return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&
-                 std::strcmp(mtp5, "1") == 0
+  return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
+                 (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0)
              ? 13
              : 0;
 }
@@ -2201,8 +2201,9 @@ class CustomAllreduce {
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
            bytes == kSm70Tp4PushAllreduceBytes);
       const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
-      const bool qwen38_mtp5 = mtp5 != nullptr && std::strcmp(mtp5, "1") == 0 &&
-                               bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
+      const bool qwen38_mtp5 =
+          (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0) &&
+          bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
       const char* qwen4_exp_m1 =
           std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1");
       const bool qwen4_exp_m1_enabled =

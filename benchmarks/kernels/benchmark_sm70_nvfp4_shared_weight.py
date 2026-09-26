@@ -17,6 +17,7 @@ import statistics
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from benchmark_sm70_quasar_nvfp4_oracle import (
@@ -70,7 +71,9 @@ def _equal_bits(actual, expected):
     return torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-def _check_projection(projection, rank, rows, compact_scales=False):
+def _check_projection(projection, rank, rows, compact_scales=False, control_ops=None):
+    if control_ops is None:
+        control_ops = torch.ops._qpn2_shared_control
     packed = projection.packed.cuda()
     raw_scales = projection.scales.cuda()
     logical_n = packed.shape[0]
@@ -85,7 +88,7 @@ def _check_projection(projection, rank, rows, compact_scales=False):
     tm_weight, tm_scales, meta = torch.ops._C.nvfp4_sm70_prepare(
         _unpack_codes(padded), effective_scales, 16, False
     )
-    codes, scales = torch.ops._qpn2_shared_control.prepare(padded, padded_scales)
+    codes, scales = control_ops.prepare(padded, padded_scales)
     shared_scales = torch.ops._C.nvfp4_qpn2_prepare_scales_sm70(raw_scales)
     assert torch.equal(shared_scales, scales), "Scale-only preparation differs"
     if compact_scales:
@@ -107,7 +110,7 @@ def _check_projection(projection, rank, rows, compact_scales=False):
     )
     assert torch.equal(mapped.flatten(), codes.flatten()), "4-bit code mapping differs"
     del mapped, effective_scales, padded, padded_scales, packed, raw_scales
-    split_k, nacc = QPN2_CONFIGS[(k, n)]
+    split_k, nacc = QPN2_CONFIGS.get((k, n), (8 if k % 256 else 16, 2))
     result = {
         "rank": rank,
         "projection": projection.name,
@@ -123,11 +126,12 @@ def _check_projection(projection, rank, rows, compact_scales=False):
     }
     for m in rows:
         for gated in [False, True] if projection.name == "mlp_gate_up" else [False]:
+            split_k, nacc = QPN2_CONFIGS.get((k, n), (8 if gated or k % 256 else 16, 2))
             x = torch.randn((m, k), dtype=torch.float16, device="cuda") * 0.1
             old = torch.empty((m, n // 2 if gated else n), device="cuda", dtype=x.dtype)
             new = torch.empty_like(old)
 
-            def control(old=old, x=x, gated=gated):
+            def control(old=old, x=x, gated=gated, split_k=split_k, nacc=nacc):
                 if compact_scales:
                     torch.ops._C.nvfp4_qpn2_tm_dispatch_sm70_out(
                         old,
@@ -145,7 +149,7 @@ def _check_projection(projection, rank, rows, compact_scales=False):
                         1024,
                     )
                     return
-                torch.ops._qpn2_shared_control.dispatch(
+                control_ops.dispatch(
                     old,
                     x,
                     codes,
@@ -162,7 +166,7 @@ def _check_projection(projection, rank, rows, compact_scales=False):
                     1024,
                 )
 
-            def shared(new=new, x=x, gated=gated):
+            def shared(new=new, x=x, gated=gated, split_k=split_k, nacc=nacc):
                 torch.ops._C.nvfp4_qpn2_tm_dispatch_sm70_out(
                     new,
                     x,
@@ -208,9 +212,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--core-library", type=Path, required=True)
-    parser.add_argument("--shared-library", type=Path, required=True)
+    parser.add_argument(
+        "--shared-library",
+        type=Path,
+        help="Legacy research sidecar; omit for the shipped operators.",
+    )
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--ranks", type=int, nargs="+", default=[0, 1, 2, 3])
+    parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument(
         "--compact-scales",
         action="store_true",
@@ -229,7 +238,14 @@ def main():
     spec.loader.exec_module(module)
     stable_library = args.core_library.with_name("_C_stable_libtorch.abi3.so")
     torch.ops.load_library(str(stable_library))
-    torch.ops.load_library(str(args.shared_library))
+    control_ops = None
+    if args.shared_library:
+        torch.ops.load_library(str(args.shared_library))
+    else:
+        control_ops = SimpleNamespace(
+            prepare=torch.ops._C.nvfp4_qpn2_prepare_sm70,
+            dispatch=torch.ops._C.nvfp4_qpn2_prefill_dispatch_sm70_out,
+        )
     assert torch.cuda.get_device_capability() == (7, 0)
     torch.manual_seed(20260908)
     report = {
@@ -237,6 +253,7 @@ def main():
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
         "model": str(args.model),
+        "tp_size": args.tp_size,
         "source_sha": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
@@ -246,14 +263,17 @@ def main():
         "libraries": {
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in [args.core_library, stable_library, args.shared_library]
+            if path is not None
         },
         "results": [],
     }
     try:
         for rank in args.ranks:
-            for projection in _load_projections(args.model, rank, 4):
+            if not 0 <= rank < args.tp_size:
+                raise ValueError("rank must be smaller than TP size")
+            for projection in _load_projections(args.model, rank, args.tp_size):
                 result = _check_projection(
-                    projection, rank, args.rows, args.compact_scales
+                    projection, rank, args.rows, args.compact_scales, control_ops
                 )
                 report["results"].append(result)
                 print(json.dumps(result), flush=True)

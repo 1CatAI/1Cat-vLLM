@@ -52,7 +52,7 @@ _SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES = (
     _SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
 )
 _sm70_awq_prefill_dense_workspaces: weakref.WeakValueDictionary[
-    tuple[int, torch.dtype], torch.Tensor
+    tuple[int, torch.dtype, int], torch.Tensor
 ] = weakref.WeakValueDictionary()
 
 
@@ -98,13 +98,11 @@ def _awq_exact_f16_weight(
 
 
 def _is_sm70_awq_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
-    if getattr(layer, "tp_size", 1) != 4:
-        return False
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    expected = _SM70_AWQ_PREFILL_DENSE_SHAPES.get(suffix)
-    if expected is None:
+    if suffix not in _SM70_AWQ_PREFILL_DENSE_SHAPES or len(layer.qweight.shape) != 2:
         return False
-    return (layer.qweight.shape[0], layer.qweight.shape[1] * 8) == expected
+    k, packed_n = layer.qweight.shape
+    return k > 0 and k % 128 == 0 and packed_n > 0 and packed_n % 16 == 0
 
 
 def _get_sm70_awq_prefill_exact_dense_workspace(
@@ -113,13 +111,14 @@ def _get_sm70_awq_prefill_exact_dense_workspace(
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    cache_key = (device_index, torch.float16)
+    elements = max(_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 8)
+    cache_key = (device_index, torch.float16, elements)
     workspace = _sm70_awq_prefill_dense_workspaces.get(cache_key)
     if workspace is not None:
         return workspace
     try:
         workspace = torch.empty(
-            (_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS,),
+            (elements,),
             dtype=torch.float16,
             device=weight.device,
         )
@@ -515,7 +514,7 @@ class AWQLinearMethod(LinearMethodBase):
                 layer._awq_sm70_prefill_exact_dense_workspace = workspace
                 logger.info_once(
                     "SM70 AWQ exact-dense prefill path enabled with a bounded "
-                    "85 MiB workspace."
+                    "layout-sized workspace."
                 )
         logger.info_once("SM70 AWQ TurboMind dense path enabled.")
 
@@ -594,7 +593,7 @@ class AWQLinearMethod(LinearMethodBase):
                 and reshaped_x.shape[0] == _SM70_AWQ_PREFILL_DENSE_M
             ):
                 logger.info_once(
-                    "SM70 AWQ bounded-workspace exact-dense TP4 4096-token "
+                    "SM70 AWQ bounded-workspace exact-dense 4096-token "
                     "prefill runtime path active."
                 )
                 k = reshaped_x.shape[1]

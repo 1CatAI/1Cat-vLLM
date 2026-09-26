@@ -95,6 +95,49 @@ an incomplete 128-shard table. The pooled implementation additionally exercised
 duplicate IDs spanning two shards. The three full-model random-input cases
 produced the same output token IDs and hashes as the resident-RAM path.
 
+## MTP4 decode short-gather follow-up (2026-09-24)
+
+The 5-token verifier gathers 80 FP8 rows. The disk-backed path now sorts
+these short requests by shard and scatters directly into the pinned output,
+skipping the unique/inverse map and its second output copy. It retains NumPy
+views of the existing file mappings; this is not a 47.684-GiB anonymous table
+copy. Requests above 128 rows keep the globally deduplicated prefill path.
+
+A CPU-only screen on all 128 real checkpoint shards found that cached 80-row
+lookups fell from 4.60 to 3.45 ms median at 32 workers. With independently
+sampled rows and cold faults, the medians were 9.29 and 8.96 ms. The cold
+screen also showed why replacing the pool with one worker is unsafe: its
+legacy lookup took 22.23 ms median. The 32-worker pool remains in place.
+
+One full-model TP4/V2 run used four V100-SXM2-32GB GPUs, the native NVFP4
+checkpoint, FP16 activations/KV, 8,192 input tokens, 513 greedy output tokens,
+MTP4, disk-backed PLE without prefault, full/piecewise CUDA Graph, and a second
+identical request for the steady measurement. The unchanged-source control
+took 13.1386 s / 307 rounds = 42.797 ms per complete verification round. The
+short-gather route took 11.8565 s / 307 rounds = 38.621 ms/round, saving
+4.176 ms (9.8%). The first fixed request and all three natural-prompt outputs
+also matched the control token-for-token, with identical draft counts. This is
+a single-start A/B result, not a claim that the complete round has reached its
+20-ms target. It changes no PLE bytes or model arithmetic.
+
+The next short-gather revision removes shard sorting and thread-pool dispatch
+for at most 128 rows. It validates the logical IDs, then copies each FP8 row
+directly from the already-retained mmap address into the pinned output. It
+does not allocate a second table; larger prefill requests still use the
+deduplicated, parallel path. In one same-input CPU-only 80-row screen, the
+cached scatter/32-worker median was 5.166 ms versus 0.275 ms for direct row
+copy. With independently sampled IDs and page faults, medians were 8.332 and
+7.013 ms. These are lookup timings, not full-round savings.
+
+The matched TP4/V2 full-model repeat then took 11.38005 s / 307 rounds =
+37.069 ms per complete round, down 1.552 ms (4.0%) from the sorted-scatter
+revision and 5.728 ms (13.4%) from the original control. Both fixed requests
+and all three natural-prompt outputs and draft counts remained identical to
+the sorted-scatter run. Their emitted decode rates were 44.99, 63.70, 83.09,
+and 46.25 tokens/s for the fixed repeat and natural prompts respectively.
+The full-round 20-ms target is still unmet; do not extrapolate the CPU lookup
+delta into GPU time.
+
 ## Prefill results
 
 ### Repeated prompt, warm page cache
@@ -205,3 +248,30 @@ Keep disk offload opt-in until all of the following hold:
 - PLE worker RSS plus its bounded cache stays within the documented budget;
 - cancellation, multiple requests, prefix reuse, and decode do not consume a
   stale prefetched buffer.
+
+## MTP4 acceleration defaults
+
+The SM70 Flash-Next NVFP4 MTP4 path enables the native five-position direct
+expert kernel, TP4 25-KiB push all-reduce, shared GDN batch metadata, and fused
+pure-speculative GDN metadata by default. Operator capability, dtype, shape,
+topology, and CUDA Graph gates still apply; unsupported batches use the
+existing fallback. This does not change the selected PLE storage mode.
+
+The direct expert path retains checkpoint-native NVFP4 weights and FP16
+activations, but uses a different accumulation order. Outputs and speculative
+acceptance can differ from the grouped expert path. Compare functional quality
+and complete-round latency separately from emitted-token throughput.
+
+Set these overrides before starting workers to restore the earlier paths:
+
+```bash
+export VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=0
+export VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5=0
+export VLLM_SM70_MTP4_SHARED_GDN_METADATA=0
+export VLLM_SM70_MTP4_FUSED_GDN_METADATA=0
+```
+
+The shared classification and fused write flags can also be disabled
+independently. Short PLE gather/ID generation and asynchronous transfer
+optimizations remain enabled. See the migration control record for the
+TP4 V100, Torch/CUDA, sampling, memory, and performance qualification.

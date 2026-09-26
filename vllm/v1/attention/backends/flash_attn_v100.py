@@ -512,6 +512,8 @@ _sm70_splitd_d256_ops = None
 _sm70_splitd_d256_ops_checked = False
 _sm70_d256_gqa_architecture_op = None
 _sm70_d256_gqa_architecture_op_checked = False
+_sm70_d256_gqa_architecture_q8192_op = None
+_sm70_d256_gqa_architecture_q8192_op_checked = False
 _sm70_fa2_cu_seqlens_cache: dict[
     tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
@@ -533,6 +535,7 @@ _logged_prefill_prefix_bfla = False
 _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
+_logged_prefill_prefix_decode_rows = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
@@ -566,6 +569,11 @@ _VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
 _DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 _FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
+_SM70_79T_CORE_QUERY_LEN = 8000
+_SM70_79T_MAX_QUERY_LEN = 8192
+_SM70_79T_EXACT_QUERY_ALIGNMENT = 64
+_SM70_79T_KV_ALIGNMENT = 32
+_SM70_SPLITD_KV_ALIGNMENT = 32
 _fp8_prefill_bridge_workspaces: dict[
     tuple[int, int, int, int],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -582,6 +590,10 @@ _prefill_dense_splitkv3_workspaces: dict[
     tuple[int, int, torch.dtype],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
+_sm70_79t_q8192_padding_workspaces: dict[
+    tuple[int, int, torch.dtype, int, int, int],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
 
 
 def clear_flash_attn_v100_workspaces() -> None:
@@ -591,6 +603,7 @@ def clear_flash_attn_v100_workspaces() -> None:
     _fp8_prefill_bridge_tail_workspaces.clear()
     _prefill_gather_dense_workspaces.clear()
     _prefill_dense_splitkv3_workspaces.clear()
+    _sm70_79t_q8192_padding_workspaces.clear()
 
 
 def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
@@ -744,11 +757,15 @@ def _g6_aligned_page_partition_size_hint(
     if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
         return None
     if not (
-        query.shape == (1, 6, 256)
+        query.ndim == 3
+        and query.shape[0] == 1
+        and query.shape[2] == 256
         and key_cache.ndim == 4
         and key_cache.shape[1] >= _DEFAULT_DECODE_PARTITION_SIZE
         and key_cache.shape[1] % 16 == 0
-        and key_cache.shape[2:] == (1, 256)
+        and key_cache.shape[2] > 0
+        and key_cache.shape[3] == 256
+        and query.shape[1] == 6 * key_cache.shape[2]
         and value_cache.shape == key_cache.shape
         and value_cache.dtype == key_cache.dtype
     ):
@@ -763,10 +780,9 @@ def _g6_aligned_page_partition_size_hint(
         # envelope once.
         return 256
     if kv_cache_dtype in ("fp8", "fp8_e4m3") and key_cache.dtype == torch.uint8:
-        # Qwen3.8 TP4 has G6/D256 attention and checkpoint-provided E4M3
-        # scales. The p64 route wins the accepted 1K-2K operator sweep while
-        # preserving the p256 scalar route's E4M3 conversion within one fp16
-        # output ULP.
+        # Plan a p64 workspace envelope. The native G6 path keeps this captured
+        # shape while selecting p64/p256 and long wave partitions from device
+        # sequence lengths.
         return 64
     if kv_cache_dtype == "fp8_e5m2" and key_cache.dtype == torch.uint8:
         # Plan the largest p256 workspace once. The extension selects p256 or
@@ -785,7 +801,7 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
         logger.warning(
             "SM70 Flash-V100 received an unresolved `fp8` KV-cache dtype and "
             "will interpret it as upstream E4M3. Normal EngineArgs processing "
-            "rewrites the SM70 `fp8` shorthand to `fp8_e5m2`; this warning "
+            "rewrites the SM70 `fp8` shorthand to `fp8_e4m3`; this warning "
             "usually means the backend was constructed directly. KV-cache "
             "dtype is independent of model weight quantization."
         )
@@ -936,11 +952,14 @@ def _decode_xqa_allowed_for_q_per_kv(
 
 
 def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
-    """Gate the exact SM70 E4M3 G6 batched XQA route."""
+    """Admit GQA6 batches independently of the number of local KV heads."""
     return (
         envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
-        and 1 < query.shape[0] <= 16
-        and query.shape[1:] == (6, 256)
+        and query.ndim == 3
+        and query.shape[0] > 1
+        and query.shape[1] > 0
+        and query.shape[1] % 6 == 0
+        and query.shape[2] == 256
     )
 
 
@@ -1361,6 +1380,17 @@ def _get_sm70_splitd_d256_ops():
     return _sm70_splitd_d256_ops
 
 
+def _sm70_gqa_has_fp32_accumulation() -> bool:
+    capability = getattr(torch.ops._vllm_fa2_C, "sm70_d256_gqa_accumulation_bits", None)
+    if capability is not None and capability() == 32:
+        return True
+    logger.warning_once(
+        "SM70 Q8000/Q8192 prefill requires rebuilt FA2 with FP32 QK and PV "
+        "accumulation; using exact dense prefill until the library is updated."
+    )
+    return False
+
+
 def _get_sm70_d256_gqa_architecture_op():
     """Load the optional SM70 GQA long-prefill architecture operator."""
     global _sm70_d256_gqa_architecture_op
@@ -1383,6 +1413,12 @@ def _get_sm70_d256_gqa_architecture_op():
         ):
             _get_sm70_splitd_d256_ops()
 
+        if (
+            not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            and not _sm70_gqa_has_fp32_accumulation()
+        ):
+            _sm70_d256_gqa_architecture_op = None
+            return None
         _sm70_d256_gqa_architecture_op = getattr(
             torch.ops._vllm_fa2_C,
             op_name,
@@ -1406,10 +1442,34 @@ def _get_sm70_d256_gqa_architecture_op():
     return _sm70_d256_gqa_architecture_op
 
 
+def _get_sm70_d256_gqa_architecture_q8192_op():
+    """Load the native Q8192 specialization when the extension provides it."""
+    global _sm70_d256_gqa_architecture_q8192_op
+    global _sm70_d256_gqa_architecture_q8192_op_checked
+    if _sm70_d256_gqa_architecture_q8192_op_checked:
+        return _sm70_d256_gqa_architecture_q8192_op
+
+    _sm70_d256_gqa_architecture_q8192_op_checked = True
+    op_name = "sm70_d256_gqa_architecture_q8192_fwd"
+    try:
+        if not hasattr(torch.ops._vllm_fa2_C, op_name):
+            _get_sm70_splitd_d256_ops()
+        if not _sm70_gqa_has_fp32_accumulation():
+            _sm70_d256_gqa_architecture_q8192_op = None
+            return None
+        _sm70_d256_gqa_architecture_q8192_op = getattr(
+            torch.ops._vllm_fa2_C,
+            op_name,
+            None,
+        )
+    except (AttributeError, ImportError, RuntimeError):
+        _sm70_d256_gqa_architecture_q8192_op = None
+    return _sm70_d256_gqa_architecture_q8192_op
+
+
 def _get_sm70_v37_e4m3_bridge_op():
     """Resolve the format-specific bridge from the same FA2 runtime."""
-    if not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
-        return None
+    # E4M3 storage conversion is independent of the dense compute kernel.
     _get_sm70_splitd_d256_ops()
     return getattr(torch.ops._vllm_fa2_C, "sm70_v37_e4m3_bridge", None)
 
@@ -1537,7 +1597,7 @@ def _should_use_prefill_d256_gqa_architecture(
     softmax_scale: float,
     architecture_op: Callable[..., torch.Tensor] | None,
 ) -> bool:
-    """Use the v37 tile-aligned family or the original rollback shape gate."""
+    """Use the v37 family or the Q8000-core long-prefill dispatcher."""
     if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
         shape_allowed = (
             64 <= max_seqlen_q <= 8192
@@ -1547,18 +1607,23 @@ def _should_use_prefill_d256_gqa_architecture(
         )
     else:
         shape_allowed = (
-            max_seqlen_q == 8000
-            and 16000 <= max_seqlen_k <= 256000
-            and max_seqlen_k % 8000 == 0
+            _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
+            and max_seqlen_q <= max_seqlen_k <= 262144
+            and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
         )
     return (
         envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
         and architecture_op is not None
         and shape_allowed
-        and query.shape == (1, max_seqlen_q, 6, 256)
+        and query.ndim == 4
+        and query.shape[0] > 0
+        and query.shape[1] == max_seqlen_q
+        and query.shape[3] == 256
         and key.ndim == 4
-        and key.shape[0] == 1
-        and key.shape[2:] == (1, 256)
+        and key.shape[0] == query.shape[0]
+        and key.shape[2] > 0
+        and key.shape[3] == 256
+        and query.shape[2] == 6 * key.shape[2]
         and value.shape == key.shape
         and max_seqlen_k == key.shape[1]
         and query.dtype == torch.float16
@@ -1572,6 +1637,226 @@ def _should_use_prefill_d256_gqa_architecture(
         and abs(softmax_scale - 0.0625) <= 1.0e-8
         and not _is_cuda_graph_capturing(query)
     )
+
+
+# Native prefill storage is shared by all layers on a device. Initialize it
+# during memory profiling so the KV allocator does not consume its budget.
+_sm70_prefill_profiled_workspaces: set[tuple[torch.device, int]] = set()
+
+
+def _profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> None:
+    if (
+        not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+        or not envs.VLLM_FLASH_V100_FA2_D256_PREFILL
+        or envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        or not query.is_cuda
+        or query.dtype != torch.float16
+        or query.ndim != 3
+        or query.shape[2] != 256
+        or query.shape[1] != 6 * num_kv_heads
+        or query.shape[0] < _SM70_79T_CORE_QUERY_LEN
+        or not current_platform.is_device_capability(70)
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    q_len = (
+        _SM70_79T_CORE_QUERY_LEN
+        if query.shape[0] == _SM70_79T_CORE_QUERY_LEN
+        else _SM70_79T_MAX_QUERY_LEN
+    )
+    cache_key = (query.device, q_len)
+    if cache_key in _sm70_prefill_profiled_workspaces:
+        return
+    op = (
+        _get_sm70_d256_gqa_architecture_op()
+        if q_len == _SM70_79T_CORE_QUERY_LEN
+        else _get_sm70_d256_gqa_architecture_q8192_op()
+    )
+    if op is None:
+        return
+    q = torch.zeros((1, q_len, 6, 256), device=query.device, dtype=query.dtype)
+    kv = torch.zeros((1, q_len, 1, 256), device=query.device, dtype=query.dtype)
+    op(q, kv, kv, torch.empty_like(q), 0.0625, True)
+    _sm70_prefill_profiled_workspaces.add(cache_key)
+    logger.info_once("SM70 Q%d prefill workspace included in memory profiling.", q_len)
+
+
+def _run_sm70_gqa_groups(
+    op: Callable[..., torch.Tensor],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Apply the native GQA6 core independently to each local KV head."""
+    if query.shape[0] == 1 and key.shape[2] == 1:
+        return op(query, key, value, out, softmax_scale, causal)
+    for batch in range(query.shape[0]):
+        for head in range(key.shape[2]):
+            group_q = query[batch : batch + 1, :, head * 6 : (head + 1) * 6]
+            group_out = torch.empty_like(group_q, memory_format=torch.contiguous_format)
+            op(
+                group_q.contiguous(),
+                key[batch : batch + 1, :, head : head + 1].contiguous(),
+                value[batch : batch + 1, :, head : head + 1].contiguous(),
+                group_out,
+                softmax_scale,
+                causal,
+            )
+            out[batch : batch + 1, :, head * 6 : (head + 1) * 6].copy_(group_out)
+    return out
+
+
+def _run_sm70_d256_gqa_79t_dispatch(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    softmax_scale: float,
+    architecture_op: Callable[..., torch.Tensor],
+    dense_op: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """Run Q8000 directly and preserve it as the core of Q8001..Q8192.
+
+    For a Q8000+R causal chunk, the leading R rows attend K[:KV-8000].
+    The remaining 8000 rows have the same causal alignment as the qualified
+    Q8000 operator against the full K/V tensors.  Padding only the small
+    leading fringe to 64 rows keeps the exact Split-D contract without adding
+    work to the Q8000 core.
+    """
+    query_len = int(query.shape[1])
+    fringe_len = query_len - _SM70_79T_CORE_QUERY_LEN
+    if fringe_len < 0 or query_len > _SM70_79T_MAX_QUERY_LEN:
+        raise ValueError(f"unsupported SM70 79T query length {query_len}")
+    if fringe_len == 0:
+        return _run_sm70_gqa_groups(
+            architecture_op,
+            query,
+            key,
+            value,
+            out,
+            softmax_scale,
+            True,
+        )
+
+    core_query = query[:, fringe_len:]
+    core_out = out[:, fringe_len:]
+    _run_sm70_gqa_groups(
+        architecture_op,
+        core_query,
+        key,
+        value,
+        core_out,
+        softmax_scale,
+        True,
+    )
+
+    fringe_kv_len = int(key.shape[1]) - _SM70_79T_CORE_QUERY_LEN
+    padded_fringe_len = (
+        _cdiv_int(fringe_len, _SM70_79T_EXACT_QUERY_ALIGNMENT)
+        * _SM70_79T_EXACT_QUERY_ALIGNMENT
+    )
+    if padded_fringe_len == fringe_len:
+        fringe_query = query[:, :fringe_len]
+        fringe_out = out[:, :fringe_len]
+        fringe_prefix = 0
+    else:
+        fringe_query = torch.zeros(
+            (query.shape[0], padded_fringe_len, *query.shape[2:]),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        fringe_out = torch.empty_like(fringe_query)
+        fringe_prefix = padded_fringe_len - fringe_len
+        fringe_query[:, fringe_prefix:].copy_(query[:, :fringe_len])
+
+    dense_op(
+        fringe_query,
+        key[:, :fringe_kv_len],
+        value[:, :fringe_kv_len],
+        fringe_out,
+        softmax_scale,
+        True,
+    )
+    if fringe_prefix:
+        out[:, :fringe_len].copy_(fringe_out[:, fringe_prefix:])
+    return out
+
+
+def _get_sm70_79t_q8192_padding_workspace(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not query.is_cuda:
+        padded_query = torch.empty(
+            (query.shape[0], _SM70_79T_MAX_QUERY_LEN, *query.shape[2:]),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        return padded_query, torch.empty_like(padded_query)
+
+    device_index = query.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+    cache_key = (
+        device_index,
+        stream_id,
+        query.dtype,
+        int(query.shape[0]),
+        int(query.shape[2]),
+        int(query.shape[3]),
+    )
+    workspace = _sm70_79t_q8192_padding_workspaces.get(cache_key)
+    if workspace is None:
+        shape = (query.shape[0], _SM70_79T_MAX_QUERY_LEN, *query.shape[2:])
+        padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
+        workspace = padded_query, torch.empty_like(padded_query)
+        _sm70_79t_q8192_padding_workspaces[cache_key] = workspace
+    return workspace
+
+
+def _run_sm70_d256_gqa_79t_q8192_dispatch(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    softmax_scale: float,
+    architecture_q8192_op: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    """Run Q8001..Q8192 through the native Q8192 specialization."""
+    query_len = int(query.shape[1])
+    if not _SM70_79T_CORE_QUERY_LEN < query_len <= _SM70_79T_MAX_QUERY_LEN:
+        raise ValueError(f"unsupported SM70 Q8192 dispatch length {query_len}")
+    if query_len == _SM70_79T_MAX_QUERY_LEN:
+        return _run_sm70_gqa_groups(
+            architecture_q8192_op,
+            query,
+            key,
+            value,
+            out,
+            softmax_scale,
+            True,
+        )
+
+    padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(query)
+    leading_padding = _SM70_79T_MAX_QUERY_LEN - query_len
+    padded_query[:, :leading_padding].zero_()
+    padded_query[:, leading_padding:].copy_(query)
+    _run_sm70_gqa_groups(
+        architecture_q8192_op,
+        padded_query,
+        key,
+        value,
+        padded_out,
+        softmax_scale,
+        True,
+    )
+    out.copy_(padded_out[:, leading_padding:])
+    return out
 
 
 def _try_sm70_fa2_d256_prefill(
@@ -1667,12 +1952,23 @@ def _try_sm70_fa2_d256_prefill(
         return None
 
     splitd_ops = _get_sm70_splitd_d256_ops()
+    q8000_core_dispatch_eligible = (
+        not paged_kv
+        and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        and _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
+    )
+    architecture_kv_eligible = (
+        q8000_core_dispatch_eligible and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
+    )
+    exact_splitd_shape_eligible = (
+        max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+        and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+    )
     splitd_eligible = (
         splitd_ops is not None
         and query.ndim == 4
         and query.shape[1] == max_seqlen_q
-        and max_seqlen_q % 64 == 0
-        and max_seqlen_k % 32 == 0
+        and (architecture_kv_eligible or exact_splitd_shape_eligible)
     )
     if splitd_eligible:
         dense_op, paged_op, splitkv3_op = splitd_ops
@@ -1711,6 +2007,13 @@ def _try_sm70_fa2_d256_prefill(
                     if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
                     else None
                 )
+                architecture_q8192_op = (
+                    _get_sm70_d256_gqa_architecture_q8192_op()
+                    if architecture_op is not None
+                    and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                    and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
+                    else None
+                )
                 if _should_use_prefill_d256_gqa_architecture(
                     query,
                     key,
@@ -1722,14 +2025,38 @@ def _try_sm70_fa2_d256_prefill(
                 ):
                     assert architecture_op is not None
                     try:
-                        splitd_result = architecture_op(
-                            query,
-                            key,
-                            value,
-                            splitd_out,
-                            softmax_scale,
-                            True,
-                        )
+                        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+                            splitd_result = _run_sm70_gqa_groups(
+                                architecture_op,
+                                query,
+                                key,
+                                value,
+                                splitd_out,
+                                softmax_scale,
+                                True,
+                            )
+                        elif architecture_q8192_op is not None:
+                            splitd_result = _run_sm70_d256_gqa_79t_q8192_dispatch(
+                                query,
+                                key,
+                                value,
+                                splitd_out,
+                                softmax_scale=softmax_scale,
+                                architecture_q8192_op=architecture_q8192_op,
+                            )
+                        elif (
+                            max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
+                            or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+                        ):
+                            splitd_result = _run_sm70_d256_gqa_79t_dispatch(
+                                query,
+                                key,
+                                value,
+                                splitd_out,
+                                softmax_scale=softmax_scale,
+                                architecture_op=architecture_op,
+                                dense_op=dense_op,
+                            )
                     except torch.OutOfMemoryError:
                         if not _warned_prefill_d256_gqa_architecture_oom:
                             logger.warning(
@@ -1745,12 +2072,27 @@ def _try_sm70_fa2_d256_prefill(
                                 "long-prefill architecture route active (%s).",
                                 "v37 FP32"
                                 if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
-                                else "legacy",
+                                else "Q8000 core / Q8192 QK+PV FP32 dispatch",
                             )
                             _logged_prefill_d256_gqa_architecture = True
                         _record_route("prefill_dense_d256_gqa_arch_long")
                         if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
                             _record_route("prefill_dense_d256_gqa_v37")
+                        else:
+                            _record_route("prefill_dense_d256_gqa_79t_fp32")
+                            if max_seqlen_q > _SM70_79T_CORE_QUERY_LEN:
+                                if architecture_q8192_op is not None:
+                                    _record_route(
+                                        "prefill_dense_d256_gqa_79t_fp32_q8192"
+                                    )
+                                    if max_seqlen_q < _SM70_79T_MAX_QUERY_LEN:
+                                        _record_route(
+                                            "prefill_dense_d256_gqa_79t_fp32_q8192_pad"
+                                        )
+                                else:
+                                    _record_route(
+                                        "prefill_dense_d256_gqa_79t_fp32_fringe_fallback"
+                                    )
                 if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
@@ -1782,7 +2124,11 @@ def _try_sm70_fa2_d256_prefill(
                             )
                             _logged_prefill_dense_splitkv3 = True
                         _record_route("prefill_dense_splitd_d256_splitkv3_kernel")
-                if splitd_result is None and max_seqlen_k % 32 == 0:
+                if (
+                    splitd_result is None
+                    and max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+                    and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+                ):
                     splitd_result = dense_op(
                         query, key, value, splitd_out, softmax_scale, True
                     )
@@ -1808,6 +2154,31 @@ def _get_fp8_e5m2_paged_kv_bridge_op():
     return _fp8_e5m2_paged_kv_to_fp16
 
 
+def _allocate_growing_workspace(
+    allocate: Callable[[], tuple[torch.Tensor, ...]],
+    *,
+    on_cuda: bool,
+) -> tuple[torch.Tensor, ...] | None:
+    """Allocate a grown workspace, retrying once after releasing cached blocks.
+
+    The caller must drop its reference to the previous workspace *before*
+    calling this, otherwise the old and the new buffer are resident at the same
+    time and the growth can fail on memory its own predecessor is holding.
+    Freed segments are smaller than the grown request, so a retry after
+    ``empty_cache`` is what actually recovers the fragmented headroom.
+    """
+    try:
+        return allocate()
+    except torch.OutOfMemoryError:
+        pass
+    if on_cuda:
+        torch.accelerator.empty_cache()
+    try:
+        return allocate()
+    except torch.OutOfMemoryError:
+        return None
+
+
 def _get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
@@ -1815,9 +2186,13 @@ def _get_fp8_prefill_bridge_workspace(
     device_index = (
         key_cache.device.index
         if key_cache.device.index is not None
-        else torch.accelerator.current_device_index()
+        else (torch.accelerator.current_device_index() if key_cache.is_cuda else -1)
     )
-    stream_id = int(torch.cuda.current_stream(key_cache.device).cuda_stream)
+    stream_id = (
+        int(torch.cuda.current_stream(key_cache.device).cuda_stream)
+        if key_cache.is_cuda
+        else 0
+    )
     cache_key = (
         device_index,
         stream_id,
@@ -1832,7 +2207,7 @@ def _get_fp8_prefill_bridge_workspace(
             workspace[2][:, :required_blocks],
         )
 
-    if torch.cuda.is_current_stream_capturing():
+    if _is_cuda_graph_capturing(key_cache):
         return None
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
@@ -1843,7 +2218,8 @@ def _get_fp8_prefill_bridge_workspace(
         key_cache.shape[2],
         key_cache.shape[3],
     )
-    try:
+
+    def _allocate() -> tuple[torch.Tensor, ...]:
         key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
         value_out = torch.empty_like(key_out)
         block_table = torch.arange(
@@ -1851,8 +2227,21 @@ def _get_fp8_prefill_bridge_workspace(
             dtype=torch.int32,
             device=key_cache.device,
         ).unsqueeze(0)
-    except torch.OutOfMemoryError:
+        return key_out, value_out, block_table
+
+    # Drop the old buffers before allocating the grown ones; see
+    # _allocate_growing_workspace. The stale entry is not restored on failure
+    # so that a later, smaller request re-allocates from scratch instead of
+    # inheriting a doubled capacity that already failed once.
+    workspace = None
+    _fp8_prefill_bridge_workspaces.pop(cache_key, None)
+    allocated = _allocate_growing_workspace(
+        _allocate,
+        on_cuda=key_cache.is_cuda,
+    )
+    if allocated is None:
         return None
+    key_out, value_out, block_table = allocated
     _fp8_prefill_bridge_workspaces[cache_key] = (
         key_out,
         value_out,
@@ -1872,9 +2261,11 @@ def _get_fp8_prefill_bridge_tail_workspace(
     device_index = (
         query.device.index
         if query.device.index is not None
-        else torch.accelerator.current_device_index()
+        else (torch.accelerator.current_device_index() if query.is_cuda else -1)
     )
-    stream_id = int(torch.cuda.current_stream(query.device).cuda_stream)
+    stream_id = (
+        int(torch.cuda.current_stream(query.device).cuda_stream) if query.is_cuda else 0
+    )
     cache_key = (
         device_index,
         stream_id,
@@ -1889,17 +2280,23 @@ def _get_fp8_prefill_bridge_tail_workspace(
             workspace[1][:, :padded_query_len],
         )
 
-    if torch.cuda.is_current_stream_capturing():
+    if _is_cuda_graph_capturing(query):
         return None
 
     previous_capacity = workspace[0].shape[1] if workspace is not None else 0
     capacity = max(padded_query_len, previous_capacity * 2)
     shape = (1, capacity, query.shape[2], query.shape[3])
-    try:
+
+    def _allocate() -> tuple[torch.Tensor, ...]:
         padded_query = torch.empty(shape, dtype=query.dtype, device=query.device)
-        padded_output = torch.empty_like(padded_query)
-    except torch.OutOfMemoryError:
+        return padded_query, torch.empty_like(padded_query)
+
+    workspace = None
+    _fp8_prefill_bridge_tail_workspaces.pop(cache_key, None)
+    allocated = _allocate_growing_workspace(_allocate, on_cuda=query.is_cuda)
+    if allocated is None:
         return None
+    padded_query, padded_output = allocated
     _fp8_prefill_bridge_tail_workspaces[cache_key] = (
         padded_query,
         padded_output,
@@ -2268,7 +2665,7 @@ def _get_paged_kv_utils():
     global _paged_kv_utils
     if _paged_kv_utils is None:
         try:
-            from flash_attn_v100 import paged_kv_utils
+            from flash_attn_v100 import paged_kv_utils  # type: ignore[attr-defined]
 
             _paged_kv_utils = paged_kv_utils
         except ImportError:
@@ -2608,6 +3005,7 @@ def _contiguous_paged_kv_bhmd(
 def _get_prefill_gather_dense_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
+    max_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     global _warned_prefill_gather_oom
 
@@ -2639,11 +3037,21 @@ def _get_prefill_gather_dense_workspace(
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
     capacity = max(required_blocks, previous_capacity * 2)
+    if max_blocks is not None:
+        # Doubling must not reserve more than the block table can ever address
+        # (max_model_len worth of pages); beyond that the overshoot is pure
+        # loss against the KV cache.
+        capacity = min(capacity, max(required_blocks, int(max_blocks)))
     shape = (capacity, *key_cache.shape[1:])
-    try:
+
+    def _allocate() -> tuple[torch.Tensor, ...]:
         key_out = torch.empty(shape, dtype=key_cache.dtype, device=key_cache.device)
-        value_out = torch.empty_like(key_out)
-    except torch.OutOfMemoryError:
+        return key_out, torch.empty_like(key_out)
+
+    workspace = None
+    _prefill_gather_dense_workspaces.pop(cache_key, None)
+    allocated = _allocate_growing_workspace(_allocate, on_cuda=key_cache.is_cuda)
+    if allocated is None:
         if not _warned_prefill_gather_oom:
             logger.warning(
                 "Insufficient memory for the long-prefill dense KV workspace; "
@@ -2651,6 +3059,7 @@ def _get_prefill_gather_dense_workspace(
             )
             _warned_prefill_gather_oom = True
         return None
+    key_out, value_out = allocated
     _prefill_gather_dense_workspaces[cache_key] = key_out, value_out
     return key_out[:required_blocks], value_out[:required_blocks]
 
@@ -2678,7 +3087,11 @@ def _gather_paged_kv_to_exact_dense(
     required_blocks = _cdiv_int(seq_len, block_size)
     if required_blocks > int(block_table_row.shape[0]):
         return None
-    workspace = _get_prefill_gather_dense_workspace(key_cache, required_blocks)
+    workspace = _get_prefill_gather_dense_workspace(
+        key_cache,
+        required_blocks,
+        max_blocks=int(block_table_row.shape[0]),
+    )
     if workspace is None:
         return None
 
@@ -5584,7 +5997,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and key_cache.dtype == torch.uint8
             and value_cache.dtype == torch.uint8
         )
-        if not (fp16_kv or fp8_e5m2_kv):
+        fp8_e4m3_kv = (
+            self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+            and not getattr(attn_metadata, "is_dflash_selector_target", False)
+        )
+        if not (fp16_kv or fp8_e4m3_kv or fp8_e5m2_kv):
+            return False
+        if fp8_e4m3_kv and (
+            q_per_kv != 6 or (query.shape[0] > 1 and not _e4m3_batch_xqa_allowed(query))
+        ):
             return False
 
         graph_capture = bool(
@@ -5705,6 +6128,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 max_seq_len_hint=max_seq_len_hint,
                 workspace_seq_capacity_hint=workspace_seq_capacity_hint,
                 partition_size_hint=verifier_partition_size_hint,
+                batch_context_routing=bool(
+                    getattr(
+                        attn_metadata,
+                        "flash_v100_batch_context_routing",
+                        False,
+                    )
+                ),
             )
             _record_route("prefill_smallq_decode_xqa")
             return
@@ -5812,6 +6242,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if attn_metadata is None:
             assert output is not None
+            if (
+                self.attn_type == AttentionType.DECODER
+                and self.sliding_window == (-1, -1)
+                and self.alibi_slopes is None
+                and not self.logits_soft_cap
+                and self.sinks is None
+                and abs(self.scale - 0.0625) <= 1.0e-8
+            ):
+                _profile_sm70_prefill_workspace(query, self.num_kv_heads)
             _record_route("metadata_none_zero_output")
             return output.fill_(0)
 
@@ -6894,9 +7333,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 self.kv_cache_dtype,
             )
             if partition_size_hint is not None:
-                _record_route(
-                    f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
-                )
+                if (
+                    self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    and query.shape[0] == 1
+                    and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1")
+                    != "0"
+                ):
+                    _record_route(f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}")
+                else:
+                    _record_route(
+                        f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
+                    )
             self.flash_attn_decode_paged_xqa(
                 query,
                 key_cache,
@@ -7785,14 +8232,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         num_seqs: int,
     ) -> bool:
         graph_capture = _is_cuda_graph_capturing(key_cache)
+        q8192_family = (
+            not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            and _SM70_79T_CORE_QUERY_LEN <= q_len <= _SM70_79T_MAX_QUERY_LEN
+        )
+        aligned_shape = (q8192_family and seq_len % _SM70_79T_KV_ALIGNMENT == 0) or (
+            q_len % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+            and seq_len % _SM70_SPLITD_KV_ALIGNMENT == 0
+        )
         eligible = (
             self.use_flash_v100_prefill_gather_dense
-            and num_seqs == 1
             and q_len >= self.prefill_gather_dense_min_q
             and seq_len >= self.prefill_gather_dense_min_kv
-            and seq_len > q_len
-            and q_len % 64 == 0
-            and seq_len % 64 == 0
+            and seq_len >= q_len
+            and aligned_shape
             and head_dim == 256
             and causal
             and window_size == (-1, -1)
@@ -7821,6 +8274,222 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             graph_capture,
         )
         return eligible
+
+    def _prefill_prefix_decode_rows_allowed(
+        self,
+        *,
+        causal: bool,
+        anchor_lens: torch.Tensor | None,
+        num_seqs: int,
+        query: torch.Tensor,
+        window_size: tuple[int, int],
+    ) -> bool:
+        return (
+            envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS
+            and causal
+            and anchor_lens is None
+            and num_seqs > 1
+            and self.use_flash_v100_decode
+            and self.use_flash_v100_prefill_paged
+            and not self.use_decode_paged_prefill
+            and not self.use_decode_dense_cache
+            and not self.use_decode_dense_reference
+            and window_size == (-1, -1)
+            and not _is_cuda_graph_capturing(query)
+        )
+
+    def _run_prefill_prefix_decode_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        out_view: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window_size: tuple[int, int],
+    ) -> set[int]:
+        """Run the small-query rows of a mixed batch as one paged-decode batch.
+
+        Inside a chunked-prefill batch every row takes the prefill route, and
+        ``prefill_paged_fwd`` gives a small-q row one CTA per query head for
+        the whole context (kernel/fused_mha_api.cpp launches ``grid(ceil(q/BM),
+        1, B*H)``). A resident decoder at 240K pays ~58 ms per layer that way
+        versus ~1.8 ms on the partitioned decode kernel (1CatAI/1Cat-vLLM#490),
+        and an MTP/DFlash verify row (q = K+1) has the same grid. Every query
+        token of a selected row becomes one decode row whose visible KV length
+        grows by one, the expansion _flash_v100_small_query_prefill_as_decode
+        uses for the verifier, so the causal mask is preserved. Returns the row
+        indices consumed here; the caller's per-sequence loop skips them.
+        """
+        global _logged_prefill_prefix_decode_rows
+        num_seqs = len(query_start_loc) - 1
+        qsl = query_start_loc[: num_seqs + 1].tolist()
+        seq_lens_host = seq_lens[:num_seqs].tolist()
+        max_q = max(1, int(self.smallq_decode_max_query_len))
+        rows = [
+            i
+            for i in range(num_seqs)
+            if 1 <= qsl[i + 1] - qsl[i] <= max_q
+            and int(seq_lens_host[i]) > qsl[i + 1] - qsl[i]
+        ]
+        if not rows or len(rows) == num_seqs:
+            return set()
+
+        token_idx: list[int] = []
+        token_rows: list[int] = []
+        token_seq_lens: list[int] = []
+        for i in rows:
+            q_len = qsl[i + 1] - qsl[i]
+            seq_len = int(seq_lens_host[i])
+            for j in range(q_len):
+                token_idx.append(qsl[i] + j)
+                token_rows.append(i)
+                token_seq_lens.append(seq_len - q_len + 1 + j)
+        device = query.device
+        start_idx = torch.tensor(token_idx, device=device, dtype=torch.long)
+        q_rows = query.index_select(0, start_idx)
+        out_rows = torch.empty_like(q_rows)
+        block_table = attn_metadata.block_table.index_select(
+            0, torch.tensor(token_rows, device=device, dtype=torch.long)
+        )
+        seq_lens_rows = torch.tensor(
+            token_seq_lens, device=device, dtype=attn_metadata.seq_lens.dtype
+        )
+        max_seq_len_hint = max(token_seq_lens)
+        max_query_len_rows = max(qsl[i + 1] - qsl[i] for i in rows)
+
+        num_kv_heads = int(key_cache.shape[2])
+        q_per_kv = (
+            int(q_rows.shape[1]) // num_kv_heads
+            if num_kv_heads > 0 and int(q_rows.shape[1]) % num_kv_heads == 0
+            else 0
+        )
+        fp16_kv = (
+            self.kv_cache_dtype in ("auto", "float16", "bfloat16")
+            and key_cache.dtype == torch.float16
+            and value_cache.dtype == torch.float16
+        )
+        fp8_e5m2_kv = (
+            self.kv_cache_dtype == "fp8_e5m2"
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+        )
+        fp8_e4m3_kv = (
+            self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+            # DFlash2 selector rows keep their dedicated grouped FP32 route.
+            and not getattr(attn_metadata, "is_dflash_selector_target", False)
+        )
+        # Same selection as the uniform-decode path (_flash_v100_decode), with
+        # the sequence hint taken from this batch's rows because build() only
+        # attaches decode shape hints when max_query_len == 1.
+        use_xqa = (
+            self.use_decode_xqa
+            and self.flash_attn_decode_paged_xqa is not None
+            and (fp16_kv or fp8_e5m2_kv or fp8_e4m3_kv)
+            and int(q_rows.shape[2]) == 256
+            and (
+                q_per_kv in (6, 8)
+                or (q_per_kv == 4 and max_seq_len_hint >= _decode_xqa_q4_min_seq_len())
+            )
+            and (
+                not fp8_e4m3_kv
+                or (
+                    q_per_kv == 6
+                    and (q_rows.shape[0] == 1 or _e4m3_batch_xqa_allowed(q_rows))
+                )
+            )
+            and (
+                not fp8_e5m2_kv
+                or (q_per_kv != 4 and max_seq_len_hint >= _decode_fp8_xqa_min_seq_len())
+            )
+        )
+        partition_size_hint = (
+            _g6_aligned_page_partition_size_hint(
+                q_rows, key_cache, value_cache, self.kv_cache_dtype
+            )
+            if use_xqa
+            else None
+        )
+        k_scale = float(layer._k_scale_float)
+        v_scale = float(layer._v_scale_float)
+        if use_xqa:
+            route = "prefill_prefix_decode_rows_xqa"
+
+            def run() -> torch.Tensor:
+                self.flash_attn_decode_paged_xqa(
+                    q_rows,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seq_lens_rows,
+                    softmax_scale=self.scale,
+                    out=out_rows,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    window_size=window_size,
+                    max_seq_len_hint=max_seq_len_hint,
+                    partition_size_hint=partition_size_hint,
+                    # This path runs outside a decode graph, so the live
+                    # context length can safely select the same optimized
+                    # batch/long-context routes used by uniform decode.
+                    batch_context_routing=True,
+                )
+                return out_rows
+
+        else:
+            route = "prefill_prefix_decode_rows_scalar"
+
+            def run() -> torch.Tensor:
+                self._call_flash_attn_decode_paged(
+                    q_rows,
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seq_lens_rows,
+                    softmax_scale=self.scale,
+                    out=out_rows,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    window_size=window_size,
+                    max_seq_len_hint=max_seq_len_hint,
+                )
+                return out_rows
+
+        if not _logged_prefill_prefix_decode_rows:
+            logger.info(
+                "FLASH_ATTN_V100 mixed-batch small-query rows take the paged "
+                "decode route (%s, rows=%d of %d, max_q=%d, max_seq_len=%d).",
+                route,
+                len(rows),
+                num_seqs,
+                max_query_len_rows,
+                max_seq_len_hint,
+            )
+            _logged_prefill_prefix_decode_rows = True
+        self._run_prefill_paged_call(
+            route=route,
+            q_len=max_query_len_rows,
+            seq_len=max_seq_len_hint,
+            heads_q=int(q_rows.shape[1]),
+            heads_kv=num_kv_heads,
+            head_dim=int(q_rows.shape[2]),
+            block_size=int(key_cache.shape[1]),
+            fn=run,
+        )
+        _log_fp8_kv_cache_route(
+            "decode",
+            self.kv_cache_dtype,
+            "xqa_paged" if use_xqa else "scalar_paged",
+        )
+        _record_route(route)
+        out_view.index_copy_(0, start_idx, out_rows)
+        return set(rows)
 
     def _run_prefill_paged_call(
         self,
@@ -7928,6 +8597,57 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
+        if (
+            self.use_flash_v100_prefill_paged
+            and not causal
+            and bool(getattr(layer, "is_dflash_draft_attn", False))
+            and anchor_lens is None
+            and num_seqs > 1
+            and 0 < max_query_len <= 16
+            and query.shape[0] == num_seqs * max_query_len
+            and bool(torch.all(query_lens == max_query_len).item())
+            and out_view.is_contiguous()
+            and not debug_compare
+            and not dflash_dump
+        ):
+            # The native paged kernel already has a batch grid dimension.
+            # Keep all uniform draft rows in one launch instead of capturing
+            # one small attention kernel per request. Only the query shape is
+            # static: live GPU sequence lengths and block tables must remain
+            # inputs so replay can advance or replace individual requests.
+            shape = (num_seqs, max_query_len, query.shape[1], head_dim)
+            logger.info_once(
+                "FLASH_ATTN_V100 DFlash uniform noncausal paged batch route "
+                "active (batch=%d, q=%d, page=%d).",
+                num_seqs,
+                max_query_len,
+                block_size,
+            )
+            _record_route("prefill_prefix_dflash_noncausal_batch")
+            self._run_prefill_paged_call(
+                route="prefill_prefix_dflash_noncausal_batch",
+                q_len=max_query_len,
+                seq_len=int(seq_lens.max().item()),
+                heads_q=query.shape[1],
+                heads_kv=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                fn=lambda: self.flash_attn_prefill_paged(
+                    query.reshape(shape),
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table[:num_seqs],
+                    attn_metadata.seq_lens[:num_seqs],
+                    out=out_view.view(shape),
+                    softmax_scale=self.scale,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    causal=False,
+                    window_size=window_size,
+                ),
+            )
+            return output
         if causal and _ddtree_parent_metadata_requires_branch(
             attn_metadata,
             query_start_loc,
@@ -7981,7 +8701,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 seq_lens,
             )
 
+        decode_rows: set[int] = set()
+        if self._prefill_prefix_decode_rows_allowed(
+            causal=causal,
+            anchor_lens=anchor_lens,
+            num_seqs=num_seqs,
+            query=query,
+            window_size=window_size,
+        ):
+            decode_rows = self._run_prefill_prefix_decode_rows(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out_view,
+                query_start_loc,
+                seq_lens,
+                window_size,
+            )
+
         for i in range(num_seqs):
+            if i in decode_rows:
+                continue
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
             if end <= start:

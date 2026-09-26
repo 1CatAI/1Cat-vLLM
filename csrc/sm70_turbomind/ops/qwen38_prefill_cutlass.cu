@@ -67,12 +67,8 @@ bool sm70_fp8_prefill_cutlass_out(torch::Tensor out, torch::Tensor in_feats,
   }
   const int64_t k = in_feats.size(1);
   const int64_t n = dense_weight.size(1);
-  const bool exact_qkv = k == 5120 && (n == 4096 || n == 3584);
-  const bool exact_gate_up = k == 5120 && n == 8704;
-  const bool exact_down = k == 4352 && n == 5120;
-  const bool exact_attention_output = k == 1536 && n == 5120;
-  if (in_feats.size(0) != 8000 || (!exact_qkv && !exact_gate_up &&
-                                   !exact_down && !exact_attention_output)) {
+  if (in_feats.size(0) < 8000 || in_feats.size(0) > 8192 || k <= 0 ||
+      k % 128 != 0 || n <= 0 || n % 128 != 0) {
     return false;
   }
 

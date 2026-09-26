@@ -984,6 +984,38 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             context_states, context_positions, context_slot_mapping
         )
 
+    def get_aux_hidden_state_dtype(self) -> torch.dtype | None:
+        if (
+            not envs.VLLM_DFLASH_COMPACT_AUX_HIDDEN
+            or not self.model.use_aux_hidden_state
+        ):
+            return None
+        weight = getattr(self.model.fc, "weight", None)
+        return (
+            weight.dtype if weight is not None and weight.is_floating_point() else None
+        )
+
+    def combine_aux_hidden_states(
+        self, aux_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
+        projection_dtype = self.get_aux_hidden_state_dtype()
+        if projection_dtype is not None:
+            # The projection already casts its concatenated input to this dtype.
+            # Copy/cast directly into the final buffer to avoid keeping a full
+            # FP32 concatenation alongside the FP16 projection input. The
+            # projection's arithmetic stays unchanged.
+            shape = (
+                *aux_hidden_states[0].shape[:-1],
+                sum(hidden.shape[-1] for hidden in aux_hidden_states),
+            )
+            combined = torch.empty(
+                shape, dtype=projection_dtype, device=aux_hidden_states[0].device
+            )
+            torch.cat(aux_hidden_states, dim=-1, out=combined)
+        else:
+            combined = torch.cat(aux_hidden_states, dim=-1)
+        return self.combine_hidden_states(combined)
+
     def combine_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -1056,6 +1088,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
+        # Missing draft weights are supplied by load_dflash_model's target
+        # sharing step. Drop their uninitialized placeholders before the
+        # generic post-loader prepares quantized/packed LM-head copies.
+        # A full TP1 vocabulary otherwise adds several GiB of transient state.
+        if not getattr(self, "has_own_embed_tokens", False):
+            del self.model.embed_tokens
+        if not getattr(self, "has_own_lm_head", False):
+            del self.lm_head
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

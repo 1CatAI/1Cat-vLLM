@@ -257,7 +257,8 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor tm_weight,
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_scales, int64_t tm_group_size,
-    int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m);
+    int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
+    bool prescaled_scales = false);
 
 void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
@@ -299,6 +300,11 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                          torch::Tensor _kernel, torch::Tensor _scaling_factors,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
                          bool gated_silu);
+
+void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, torch::Tensor scales,
+                                   int64_t group_size, int64_t k_ld,
+                                   int64_t q_ld, bool gated_silu);
 
 void nvfp4_gemv_sm70_raw_out(torch::Tensor out, torch::Tensor _in_feats,
                              torch::Tensor _kernel,

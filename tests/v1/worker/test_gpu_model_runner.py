@@ -694,6 +694,67 @@ def test_update_states_pp_async_multi_request_keeps_rank_state_consistent(
         )
 
 
+def test_update_states_pp_async_spec_trims_optimistic_tokens_on_every_rank(
+    model_runner, model_runner_2, dist_init, monkeypatch
+):
+    """The optimistic spec-decode extend is not gated on the pipeline rank,
+    so the trim that undoes it must not be either.
+
+    With async scheduling every rank appends ``prev_num_draft_len``
+    placeholders to ``output_token_ids`` before the model runs, and the
+    deferred correction only fixes the token *counts* -- it never removes the
+    placeholders. Only the trim does, and on a non-final pipeline rank it has
+    to run for the cached state to stay aligned with the scheduler's view.
+    """
+    req_ids = ["req_0"]
+    non_last_runner = model_runner
+    last_runner = model_runner_2
+    for runner in (non_last_runner, last_runner):
+        runner.use_async_scheduling = True
+        runner.sync_spec_decode_accept_counts = False
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
+    )
+    non_last_runner._update_states(_schedule_new_request(*req_ids))
+    last_runner._update_states(_schedule_new_request(*req_ids))
+
+    # One token was really sampled last step; three drafts were scheduled on
+    # top of it and are optimistically assumed accepted.
+    num_draft_tokens = 3
+    for runner in (non_last_runner, last_runner):
+        req_state = runner.requests[req_ids[0]]
+        req_state.output_token_ids.append(111)
+        req_state.prev_num_draft_len = num_draft_tokens
+
+    # The scheduler saw a single output token: all three drafts were rejected.
+    scheduler_output = _schedule_cached_requests(
+        req_ids=req_ids,
+        num_scheduled_tokens={req_ids[0]: 1},
+        new_token_ids=[],
+        num_computed_tokens=[4],
+        num_output_tokens=[1],
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False, world_size=2),
+    )
+    non_last_runner._update_states(scheduler_output)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True, world_size=2),
+    )
+    last_runner._update_states(scheduler_output)
+
+    non_last_state = non_last_runner.requests[req_ids[0]]
+    last_state = last_runner.requests[req_ids[0]]
+    assert len(last_state.output_token_ids) == 1
+    assert len(non_last_state.output_token_ids) == len(last_state.output_token_ids)
+    assert -1 not in non_last_state.output_token_ids
+
+
 def test_kv_cache_stride_order(monkeypatch, model_runner):
     # This test checks if GPUModelRunner initializes correctly when an attention
     # backend enforces a non-default KV cache stride order.

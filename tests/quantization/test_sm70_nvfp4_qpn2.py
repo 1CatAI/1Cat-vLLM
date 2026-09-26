@@ -102,7 +102,7 @@ def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
             "get_current_vllm_config",
             lambda: _runtime_config(tp=2),
         )
-        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
 
         monkeypatch.setattr(
             nvfp4_scheme,
@@ -129,7 +129,7 @@ def test_nvfp4_qpn2_dflash2_explicit_rollback(monkeypatch):
         envs.disable_envs_cache()
 
 
-def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
+def test_nvfp4_qpn2_shape_gate_ignores_tp_size():
     layer = SimpleNamespace(
         tp_size=4,
         prefix="model.language_model.layers.0.mlp.gate_up_proj",
@@ -140,7 +140,7 @@ def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     assert nvfp4_scheme._is_qpn2_layer(layer)
 
     layer.tp_size = 2
-    assert not nvfp4_scheme._is_qpn2_layer(layer)
+    assert nvfp4_scheme._is_qpn2_layer(layer)
     layer.tp_size = 4
     compatible = (
         ("linear_attn.in_proj_qkvz", 5120, 4120, (4120, 2560)),
@@ -253,8 +253,9 @@ def _make_small_layer() -> torch.nn.Module:
         (True, True, True),
     ],
 )
+@pytest.mark.parametrize("batch_layouts", [False, True])
 def test_nvfp4_qpn2_prepare_and_dispatch_contract(
-    monkeypatch, shared_requested, shared_available, compact
+    monkeypatch, shared_requested, shared_available, compact, batch_layouts
 ):
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "1")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", str(int(shared_requested)))
@@ -264,6 +265,9 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
     layer = _make_small_layer()
     calls = []
     monkeypatch.setattr(nvfp4_scheme, "_compact_qpn2_scales_enabled", lambda: compact)
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_tm, "use_batched_gemm_layouts", lambda: batch_layouts
+    )
 
     monkeypatch.setattr(nvfp4_scheme.sm70_tm, "use_turbomind", lambda enabled: True)
     scheme = CompressedTensorsW4A4Fp4()
@@ -299,8 +303,11 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
         nvfp4_scheme.sm70_ops, "nvfp4_qpn2_prepare_scales_sm70", fake_prepare_scales
     )
 
-    def fake_prepare(prepared_layer, *, interleave_gated_silu=False):
+    def fake_prepare(
+        prepared_layer, *, interleave_gated_silu=False, prescale_for_batch=False
+    ):
         assert not interleave_gated_silu
+        assert prescale_for_batch == (shared and batch_layouts and not compact)
         state = sm70_tm.SM70TurboMindLinearState(
             weight=torch.empty((1,), dtype=torch.int32),
             scales=torch.empty((1,), dtype=torch.float16),
@@ -309,6 +316,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
             q_ld=64,
             output_size=64,
             op_kind="nvfp4",
+            prescaled_scales=prescale_for_batch,
         )
         setattr(prepared_layer, sm70_tm.STATE_ATTR, state)
 
@@ -335,8 +343,10 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 
     def fake_shared_dispatch(*args):
         assert shared
-        assert args[2] is getattr(layer, sm70_tm.STATE_ATTR).weight
-        fake_combined_dispatch(*args)
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        assert args[2] is state.weight
+        assert args[-1] == state.prescaled_scales
+        fake_combined_dispatch(*args[:-1])
 
     monkeypatch.setattr(
         nvfp4_scheme.sm70_ops,
@@ -388,16 +398,46 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 
 
 @pytest.mark.parametrize(
-    "capture_sizes,expected", [([], True), ([1, 8, 32], True), ([8, 64], False)]
+    "capture_sizes,expected", [([], True), ([1, 8, 32], True), ([8, 64, 256], True)]
 )
-def test_compact_scales_exclude_fallback_sized_graphs(
+def test_compact_scales_support_fallback_sized_graphs(
     monkeypatch, capture_sizes, expected
 ):
-    monkeypatch.setattr(envs, "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
     monkeypatch.setattr(
         torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", lambda: 1, raising=False
     )
     config = _runtime_config()
     config.compilation_config = SimpleNamespace(cudagraph_capture_sizes=capture_sizes)
     monkeypatch.setattr(nvfp4_scheme, "get_current_vllm_config", lambda: config)
     assert nvfp4_scheme._compact_qpn2_scales_enabled() == expected
+
+
+def test_shared_layout_defaults_and_rollback(monkeypatch):
+    for name in (
+        "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT",
+        "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+        envs.disable_envs_cache()
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
+
+
+@pytest.mark.parametrize("version", [None, lambda: 0])
+def test_compact_scales_reject_old_extension(monkeypatch, version):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", version, raising=False
+    )
+    assert not nvfp4_scheme._compact_qpn2_scales_enabled()

@@ -51,15 +51,16 @@ class _FakeRunner:
 
 
 @pytest.mark.parametrize(
-    "graph_mode,estimate_graphs,graph_bytes",
+    "graph_mode,estimate_graphs,graph_bytes,use_v2",
     [
-        (CUDAGraphMode.NONE, True, 0),
-        (CUDAGraphMode.FULL, False, 0),
-        (CUDAGraphMode.FULL, True, 32 * MiB),
+        (CUDAGraphMode.NONE, True, 0, False),
+        (CUDAGraphMode.FULL, False, 0, False),
+        (CUDAGraphMode.FULL, True, 32 * MiB, False),
+        (CUDAGraphMode.FULL, True, 256 * MiB, True),
     ],
 )
 def test_kv_budget_ignores_cold_compile_scratch(
-    monkeypatch, graph_mode, estimate_graphs, graph_bytes
+    monkeypatch, graph_mode, estimate_graphs, graph_bytes, use_v2
 ) -> None:
     monkeypatch.setattr(
         envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", estimate_graphs
@@ -67,6 +68,9 @@ def test_kv_budget_ignores_cold_compile_scratch(
     device = torch.device("cuda:0")
     torch.accelerator.empty_cache()
     worker = Worker.__new__(Worker)
+    worker.use_v2_model_runner = use_v2
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.delenv("VLLM_V2_CUDAGRAPH_MEM_MIB", raising=False)
     worker.device = device
     worker.init_snapshot = MemorySnapshot(device=device)
     weights_bytes = 512 * MiB
