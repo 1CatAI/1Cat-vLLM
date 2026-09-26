@@ -495,6 +495,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target (~160 GB for DSv4-Flash) only for
+        # load_weights to drop everything but mtp.*.
+        return self._remap_dspark_name(name) is None
+
     @staticmethod
     def _remap_dspark_name(name: str) -> str | None:
         match = re.match(r"mtp\.(\d+)\.(.*)", name)

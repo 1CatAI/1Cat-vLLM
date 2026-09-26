@@ -112,6 +112,15 @@ def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
     )
 
 
+def test_dspark_skips_every_checkpoint_weight_it_does_not_load() -> None:
+    drafter = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
+
+    assert drafter.skip_checkpoint_weight("layers.3.attn.wq_a.weight")
+    assert drafter.skip_checkpoint_weight("head.weight")
+    assert not drafter.skip_checkpoint_weight("mtp.0.main_proj.weight")
+    assert not drafter.skip_checkpoint_weight("mtp.1.ffn.experts.7.w2.weight")
+
+
 class _FakeDSparkModel:
     vocab_size = 6
 
