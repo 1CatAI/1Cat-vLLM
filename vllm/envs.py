@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE: bool = False
+    VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
@@ -1875,6 +1876,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in until batched endpoint equivalence and performance are validated.
     "VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE", "0"))
+    ),
+    # Keep batch's 512-wide reduction tree; only move the norm-weight load.
+    "VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH", "0"))
     ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit

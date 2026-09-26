@@ -34,6 +34,14 @@ def test_qwen3next_shared_gate_fusion_defaults_on_and_can_be_disabled(monkeypatc
         envs.disable_envs_cache()
 
 
+def test_batch_gate_capability_is_independent_of_m1(monkeypatch):
+    native = SimpleNamespace(qwen38_shared_gate_exact_out=object())
+    monkeypatch.setattr(torch.ops, "_C", native)
+    assert not online_qpn8.sm70_ops.has_qwen38_shared_gate_sigmoid_mul()
+    native.qwen38_shared_gate_sigmoid_mul_out = object()
+    assert online_qpn8.sm70_ops.has_qwen38_shared_gate_sigmoid_mul()
+
+
 def test_qpn_sidecars_respect_safe_online_default(monkeypatch):
     calls: list[str] = []
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_LIBRARY", "/tmp/qpn8.so")

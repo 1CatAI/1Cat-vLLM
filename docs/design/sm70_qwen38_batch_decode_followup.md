@@ -74,3 +74,36 @@ below once measured. No endpoint gain or completed quality gate is claimed yet.
 
 AI assistance: implementation and test drafting assisted by Codex. Human
 review and acceptance remain required before promotion from Draft.
+
+## HC combine/norm screen
+
+The production Triton kernel was screened verbatim at 512/1024 tiles, with
+and without early weight loads, 32 changed-input cases per width, four input
+scales, and six alternating timing samples. Batch's existing 512 tile plus
+prefetch remains bitwise equal. Timings for 96 repeated combine/norm calls:
+
+| Rows | Existing (ms) | Prefetch (ms) | Saving (ms) |
+| ---: | ---: | ---: | ---: |
+| 2 | 0.24248 | 0.22268 | 0.01980 |
+| 4 | 0.24783 | 0.22505 | 0.02277 |
+| 8 | 0.24979 | 0.22832 | 0.02147 |
+| 16 | 0.27026 | 0.25100 | 0.01926 |
+
+This is a small pointwise-component gain, not the entire HC chain or endpoint.
+The 1024-tile variants change reduction association and fail bitwise parity
+(up to 0.00390625 in these batch cases); they are rejected. This does not
+change the established M1 policy or by itself prove a model-quality defect.
+
+Only weight-load scheduling is added behind
+`VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH=1` for FP16 H2560/HC4, M2--M16.
+M1, other architectures, shapes and large-prefill dispatch remain unchanged.
+Raw task artifacts: `.artifacts/hc_combine_screen.{json,log}`. The standalone
+screen extracts the unchanged JIT function to avoid needing unrelated native
+operators during the first source build; full runtime gates remain pending.
+
+The public `benchmarks/benchmark_sm70_qwen38_concurrency.py` retains the prior
+measurement's complete engine-timestamp criterion. It records complete token
+sequences and the native hash. `--reference` requires same-contract per-request
+greedy token equality; `--health` separately uses official sampling/natural EOS.
+`--measure-prefill` reports a separate one-output cohort using the union of
+scheduled-to-first-token intervals, not a sum of overlapping request TTFTs.
