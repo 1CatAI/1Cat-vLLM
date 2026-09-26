@@ -470,3 +470,147 @@ This narrowly validates the opt-in change; it does not repeat the full earlier
 64-cycle matrix or excuse the model token difference. Artifacts:
 `.artifacts/build_native_optin.log`, `.artifacts/optin_native_mixed_size.{json,log}`.
 All owned GPU workers are released; no API is left resident.
+
+## Follow-up: packed batched GDN input, 2026-09-26
+
+Continue on the same owned branch/PR and integration base, from source
+`9b7fdd40072e0c81280a5271f344278ebc3bb0b0` plus this change. No additional
+model initialization was used. The whole-engine token/repeatability issue
+above is still unresolved; this section does **not** supersede that gate.
+
+### Native candidate and numerical contract
+
+Add `qwen38_gdn_input_batch_sm70_out` to the normal SM70 CMake build, selected
+only with `VLLM_SM70_QWEN38_GDN_INPUT_BATCH=1`. The existing exact-model,
+TP4, no-MTP, checkpoint-FP16/fused-GDN admissions must also pass. The new
+runtime guard admits contiguous/aligned FP16 M2..16 only; M1, prefill,
+batch-invariant mode and unsupported layouts retain the previous path.
+
+The loader copies, rather than quantizes, FP16 weight bits into N32/K16 tiles.
+One kernel writes QKV, Z, b and a directly, replacing two projections, the
+small projection's reduction and output-layout copies. QKVZ retains a single
+ordered K reduction; b/a retains four contiguous 640-element partitions and
+the original left-to-right FP32 partial sum. Balanced b/a sums are rejected:
+they produce FP16 bit differences. There is no precision or rounding-point
+reduction. Original weights remain available for M1/prefill; packed buffers
+are nonpersistent and rebuilt after weight reload.
+
+Extra allocation is **725.625 MiB per rank across 36 GDN layers**. This is a
+real capacity tradeoff, not a free optimization. Production promotion still
+requires checking available KV-cache capacity and model-level equivalence.
+
+### Complete 36-layer component benchmark
+
+V100-SXM2-32GB, driver 580.173.02, CUDA 12.8, Torch 2.10.0+cu128. Real
+Qwen3.8-Flash-Next-NVFP4 checkpoint FP16 projection weights, synthetic FP16
+activations, FP32 accumulation. Both arms have split-copy fusion enabled.
+Each graph runs all **36 different GDN weight pairs**, not repeated layer0
+weights. Seven alternating trials, 16 graph replays/trial. Physical GPU0
+tests TP weight ranks 0/1/2 separately; GPU2 tests rank3. These are independent
+single-device component tests, **not simultaneous TP4 engine wall time**.
+Clocks/caches are not fixed by a profiler.
+
+Rank0 median whole-input-chain results:
+
+| Width | Previous chain | Packed fused chain | Saved | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| C2 | 1.810624 ms | 1.098304 ms | 0.712320 ms | 39.34% |
+| C4 | 1.795968 ms | 1.095168 ms | 0.700800 ms | 39.02% |
+| C8 | 1.812864 ms | 1.120512 ms | 0.692352 ms | 38.19% |
+| C16 | 1.851520 ms | 1.171072 ms | 0.680448 ms | 36.75% |
+
+Ranks1/2 have C16 pairs 1.850944 -> 1.168320 ms and
+1.851520 -> 1.168960 ms; rank3 on physical GPU2 has
+2.005376 -> 1.191552 ms. Do not attribute a device-dependent timing
+difference to rank arithmetic. All 36 layers, all four rank weight sets,
+M2/4/8/16 and six changed input scales (0/0.001/0.03/0.1/1/3) have **zero
+FP16 bit differences for all four outputs**, including fixed-pointer graph
+replay and poisoned candidate outputs.
+
+This saves approximately 0.68--0.71 ms of component work on GPU0. It does not
+establish a new endpoint tok/s result, and must not be added to previous
+MoE/HC service sums as if they were non-overlapping engine wall time.
+
+Reproduce after building this worktree's ordinary native extension:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID OMP_NUM_THREADS=1 \
+  VLLM_SM70_QWEN38_GDN_INPUT_BATCH=1 VLLM_SM70_GDN_BATCH_SPLIT_COPY=1 \
+  PYTHONPATH="$PWD" \
+  .venv/bin/python benchmarks/kernels/benchmark_sm70_gdn_input_batch.py \
+  --model "$MODEL" --layers all --rank 0 --rows 2,4,8,16 --out "$RESULT"
+```
+
+The benchmark uses installed native registration, no JIT sidecar. Use the
+task GPU lock and explicit task caches. Repeat `--rank 1/2/3` to cover the
+other checkpoint slices. It exits nonzero on any bit mismatch and retains
+the mismatch counts instead of timing a rejected candidate.
+
+### MoE/QSA rejected variants and confirmed limits
+
+- NCU on the actual retained C16 layer0 route (99 distinct experts) measures
+  current grouped W13 DRAM throughput **72.81%, 621.82 GB/s**, SM throughput
+  32.62%, achieved occupancy 18.72%. Grid (5,160), 64 threads, 78 registers.
+  These counters are from one instrumented kernel, not the whole MoE chain
+  or an absolute hardware ceiling. The earlier synthetic 160-distinct-expert
+  counter sample is not substituted for this real-route sample.
+- Explicit cross-iteration MoE prefetch variants and W2 read/prefetch
+  variants preserve tested bits but regress: current grouped chain about
+  118.4 us; best new W13 variant about 122.19 us. No new MoE schedule is
+  shipped in this follow-up; the prior grouped candidate remains separate.
+- Batched QSA physical-index resolution saves only about 0.1 ms across
+  twelve selected-attention calls, insufficient to justify another route.
+  Register limits, more warps and small tile variants are neutral, slower
+  or numerically different.
+- Capacity-sized QSA scoring launches many inactive CTAs at short contexts.
+  Bounded/strided Triton scheduling is exact and improves an isolated C16
+  8K score call (about 69 -> 48 us), but regresses the 256K boundary. No
+  static-policy switch is admitted.
+- Inspection of this Triton 3.6 SM70 score kernel finds ordered FP32 SIMT
+  FMA, not Tensor Core MMA, despite padding four heads to sixteen. Native
+  MMA experiments change FP32 score bits and are rejected, even where the
+  error is small. This is a statement about this compiled kernel, not all
+  V100 attention implementations.
+- A native SIMT rewrite preserves the original 128-term FMA and
+  left-associative head sum, passing all score/visibility bit checks through
+  256K. It is nevertheless slower. Hoisting page arithmetic and fully
+  unrolling the reduction still gives C16 8K about 99 us versus 65 us,
+  and 64K about 765 us versus 299 us. Neither native scorer is integrated.
+  All experimental QSA dispatch/scheduling edits were removed.
+
+Raw results are retained under the owned worktree's `.artifacts/`:
+`gdn_input_all36_r{0,1,2,3}.{json,log}`, `gdn_input_packed_v1`,
+`dense_packed_v1`, `moe_pipeline_v1`, `grouped_real_ncu.csv`,
+`qsa_batch_indices_v1`, `qsa_schedule_v1`, `qsa_score_capacity_v1`,
+`qsa_score_native_v1`, and `qsa_score_simt_v{1,2,3}`. Research experiments
+used isolated source-built JIT libraries; none are runtime dependencies.
+
+The focused native GDN/previous split-copy suite passes **72 tests**,
+including M2..16, opaque-op graph replay, M1/M17 fallbacks, unaligned-storage
+fallbacks, output canaries, invalid output geometry, exact weight packing,
+reload/nonpersistent buffers, and disabled/batch-invariant admission.
+These are kernel/dispatch tests, not full-model output-quality acceptance.
+
+The source-complete build exits successfully; the optional Rust frontend is
+not built in this environment. The timing-confirmation `_C` SHA256 is
+`5af5b4310919d039dc9a31f7b129023bef8b8dbdc2466c35544e134b2ccb1c0b`.
+`readelf -d` has no RPATH/RUNPATH or private DSO dependency. A fresh-process
+36-layer C16 native check with `LD_PRELOAD`/`LD_LIBRARY_PATH` explicitly unset
+passes all six-scale bit comparisons and measures 1.883712 -> 1.194368 ms
+(0.689344 ms saved). The all-rank
+matrix above used the earlier GDN build
+`6ea6685d43b3bb44d1340f2156d0887982eb50d217bf276c4ea2c8567d7017b5`.
+The rebuild removes an unrelated research-only registration guard; GDN
+arithmetic is unchanged. Artifacts: `build_gdn_final.log`,
+`gdn_input_final_r0_m16.{json,log}`, `gdn_batch_tests_final.log`.
+
+After final formatting and a local-variable spelling fix, the final native
+build hash is
+`c22e3d18ccc71f9f8943afed89fd1e900afd3f701c0e9afb129a638d7c199404`.
+It retains only standard CUDA/Torch dependencies, with no RPATH/RUNPATH.
+Declared packages include cuBLAS 12.8.4.1 and CUDA runtime 12.8.90.
+The focused fresh-process final-build smoke passes four tests: M2/M16 opaque-op graphs,
+M9 output canaries and packed-weight reload. No whole-engine rerun or
+whole-model quality approval is claimed. All changed-file pre-commit checks
+pass; no repository-wide sweep was needed. All owned GPU workers exited;
+no API or automatic GPU queue is left running.
