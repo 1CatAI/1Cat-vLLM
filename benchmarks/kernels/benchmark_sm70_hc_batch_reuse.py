@@ -147,6 +147,11 @@ def main():
     p.add_argument("--rows", default="2,4,8,16")
     p.add_argument("--hidden", default="640,2560")
     p.add_argument("--rank", type=int, default=0)
+    p.add_argument(
+        "--selected-only",
+        action="store_true",
+        help="Validate only the admitted non-paired, 1-warp, unroll-4 schedule",
+    )
     args = p.parse_args()
     if not args.build_only and (args.model is None or not 0 <= args.rank < 4):
         p.error("--model and a TP rank in [0, 4) are required")
@@ -221,8 +226,12 @@ def main():
                 x.normal_(0, 0.1)
                 b.normal_()
             bg = capture(baseline)
-            combinations = itertools.product(
-                (False, True) if rows > 8 else (False,), (1, 4), (4, 8)
+            combinations = (
+                [(False, 1, 4)]
+                if args.selected_only
+                else itertools.product(
+                    (False, True) if rows > 8 else (False,), (1, 4), (4, 8)
+                )
             )
             for paired, warps, unroll in combinations:
                 candidate = partial(

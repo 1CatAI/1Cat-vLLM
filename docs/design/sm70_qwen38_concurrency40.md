@@ -105,6 +105,41 @@ requires all 96 HC pairs, all TP shards, dynamic batches, four-card
 communication, source-complete build, natural-output health/token checks,
 matched unprofiled endpoint measurements and a confirming critical-path trace.
 
-Current validation: SM70 source compilation succeeds without local-memory
-spills; CPU layout/writer coverage tests pass (11 tests). GPU numerical and
-performance results are pending. The 40% target is not achieved by this PR.
+## First screen: exact but insufficient endpoint budget
+
+On an exclusively locked V100, 8 distinct checkpoint HC weights, 40 schedule
+configurations and six dynamic-input scales all matched gate and mix outputs
+bit-for-bit. This includes the replicated-projection comparison for shards.
+These are synthetic activation tests, not full-model output validation.
+
+Representative non-paired, one-warp, unroll-4 graph results (microseconds per
+up/mix pair; paired A/B measurements):
+
+| Tokens | Replicated baseline | Fused | Quarter-hidden baseline | Fused |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 13.05 | 10.04 | 8.69 | 6.17 |
+| 4 | 13.37 | 10.23 | 8.80 | 6.30 |
+| 8 | 13.86 | 10.72 | 8.40 | 6.15 |
+| 16 | 14.87 | 12.06 | 8.43 | 6.22 |
+
+The quarter-hidden timings **exclude TP communication** and must not be
+compared directly with the replicated timings as an endpoint speedup.
+The local fusion savings extrapolate to only approximately 0.21–0.30 ms
+across 96 up/mix pairs. That is insufficient for the 6.14/8.20 ms C8/C16
+step-time reductions needed for the target.
+
+The proposed C16 paired weight reuse did not help: at one warp the
+quarter-hidden candidate regressed from 6.22 to 7.22 microseconds; replicated
+12.06 versus 12.05 microseconds is neutral. Four-warps-per-CTA was also
+slower. Reject these schedules rather than promoting "less traffic" without
+measured benefit. `--selected-only` retains the non-paired one-warp candidate
+for broader validation without repeating that search.
+
+The measured source was the integration base plus the benchmark patch;
+kernel source SHA256 `d0a88b63bc96579a67d98ca10d6246c0b76c75ba5c109900f59be85f36e51b00`,
+extension SHA256 `2253c7079d14475e00ff7ad6561055325cd8eb435509c0a3020307040096c811`.
+Raw measurements are retained task-locally as `.artifacts/hc_batch_v1.json`.
+Build, CPU tests (11) and repository pre-commit gates passed. All-96-pair,
+all-shard validation and full-engine integration remain pending. No default
+changed and no new endpoint throughput is claimed. **The 40% target is not
+achieved by this PR.**
