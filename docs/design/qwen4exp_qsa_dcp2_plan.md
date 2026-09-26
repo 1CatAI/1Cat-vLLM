@@ -232,22 +232,23 @@ with the scripts and result files it names.
   GMU 0.96 775,096 -> 1,178,337 (+52.0%, 4.50x concurrency, C4 x 256K on GPU).
 - Prefix reuse: repeated 2K/8K prompts reuse 1,600-token blocks as on DCP1;
   TTFT 270/256 ms against DCP1's 228/245 ms in the same window.
-- Decode (C1, same time window, interleaved fresh servers): 71.3 tok/s against
-  73.0 for DCP1 before this round (-2.3%, from -5.4%, and -22% before the host
-  sync fix). The GDN spec-row change is shared code and lifts DCP1 itself to
-  77.2 tok/s, so against the same code DCP2 decodes 7.6% slower: six GDN state
-  groups instead of three (about 650 us of CPU metadata per group and step),
-  the replicated draft's metadata, and the DCP collectives.
-- TTFT: short prompt +2.3%, repeated 8K prompt +4.4%.
+- Decode (C1, same time window, interleaved fresh servers): 75.8 tok/s against
+  73.0 for DCP1 before this round (+3.8%; it was -22% before the host sync fix
+  and -5.4% after it). Two of the changes are shared code and speed up DCP1
+  as well: GDN spec rows without host syncs, and native MTP sharing GDN
+  metadata across cache groups (one fused launch for all groups). Against DCP1
+  with the same code, DCP2 decodes 2.8% slower (the DCP collectives and the
+  replicated draft's metadata).
+- TTFT: short prompt and repeated 8K prompt within 1% of DCP1.
 
 ## Remaining gaps and limits
 
 - DCP2 prefill cannot use DCP1's XQA page4 route: a repeated 2K prompt
   recomputes 418 tokens about 20% slower. Short prompts above the largest
   graph size prefill eagerly, where the DCP collectives add launch overhead.
-- Six GDN state groups instead of three cost per-group metadata CPU time.
-  Sharing request metadata across groups (the DFlash-only common/fused GDN
-  metadata paths) would remove most of it, for DCP1 as well.
+- Six GDN state groups instead of three: with the fused metadata path their
+  per-step host cost is one launch, but batches it cannot express (prefill,
+  mixed) still build each group.
 - One of twelve DCP2 gate runs counted one more accepted draft token on the
   code prompt, after the answer's end; outputs were identical and restarts
   were bit-identical. See the evidence file.
