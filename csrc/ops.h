@@ -438,6 +438,9 @@ void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
 void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor weight);
 
+void qwen38_shared_gate_sigmoid_mul_out(torch::Tensor out,
+                                        torch::Tensor logits);
+
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
 

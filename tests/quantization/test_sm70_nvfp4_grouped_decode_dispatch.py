@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -62,13 +63,16 @@ def test_no_context_falls_back(monkeypatch):
     assert not moe._grouped_decode_context_ok()
 
 
-def test_grouped_ops_have_fake_implementations():
+@pytest.mark.parametrize("batch_reduce", [False, True])
+def test_grouped_ops_have_fake_implementations(batch_reduce):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     from vllm import _sm70_ops as ops
 
     if not ops.has_nvfp4_grouped_decode_dispatch():
         pytest.skip("Build native grouped-decode ops first")
+    if batch_reduce and not ops.has_nvfp4_grouped_batch_reduce_dispatch():
+        pytest.skip("Build native grouped batch reduction first")
     with FakeTensorMode():
         x = torch.empty(16, 2560, dtype=torch.float16)
         mid = torch.empty(160, 160, dtype=torch.float16)
@@ -82,7 +86,12 @@ def test_grouped_ops_have_fake_implementations():
         ops.nvfp4_grouped_w13_sm70_out(
             mid, x, w13, s13, ids, rows, experts, sizes, total, 8, True
         )
-        ops.nvfp4_grouped_w2_sm70_out(
+        w2_op = (
+            ops.nvfp4_grouped_w2_batch_reduce_sm70_out
+            if batch_reduce
+            else ops.nvfp4_grouped_w2_sm70_out
+        )
+        w2_op(
             torch.empty_like(x),
             routed,
             mid,
@@ -121,3 +130,45 @@ def test_bad_tensor_contract_falls_back(monkeypatch, bad):
     else:
         x = torch.empty(2560, 16, dtype=torch.float16).t()
     assert not moe._use_grouped_decode(NS(sm70_nvfp4_grouped_decode=True), x, ids)
+
+
+@pytest.mark.parametrize("tokens,split", [(8, 4), (16, 1)])
+def test_grouped_apply_preserves_direct_k_split(monkeypatch, tokens, split):
+    from vllm import _sm70_ops as ops
+
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(moe, "is_exact_sm70_cuda", lambda *a, **k: True)
+    monkeypatch.setattr(moe, "_use_qwen38_indexed_prefill", lambda *a: False)
+    monkeypatch.setattr(moe, "_use_grouped_decode", lambda *a: True)
+    layer = NS(
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_top_k=10,
+        sm70_nvfp4_qwen38_fused_swiglu_prefill=True,
+        w13_tm_weight=object(),
+        w13_tm_scales=object(),
+        w2_tm_weight=object(),
+        w2_tm_scales=object(),
+        _nvfp4_grouped_rows=object(),
+        _nvfp4_grouped_experts=object(),
+        _nvfp4_grouped_sizes=object(),
+        _nvfp4_grouped_total=object(),
+    )
+    buffers = {
+        key: torch.empty(1) for key in ("output", "intermediate", "sorted_output")
+    }
+    method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
+    method._get_buffers = Mock(return_value=buffers)
+    w13, w2 = Mock(), Mock()
+    monkeypatch.setattr(ops, "nvfp4_grouped_w13_sm70_out", w13)
+    monkeypatch.setattr(ops, "nvfp4_grouped_w2_batch_reduce_sm70_out", w2)
+    actual = method.apply(
+        layer,
+        torch.zeros(tokens, 2560, dtype=torch.float16),
+        torch.ones(tokens, 10),
+        torch.zeros(tokens, 10, dtype=torch.int32),
+        None,
+        None,
+    )
+    assert actual is buffers["output"]
+    assert w13.call_args.args[-2:] == (split, True)
+    w2.assert_called_once()

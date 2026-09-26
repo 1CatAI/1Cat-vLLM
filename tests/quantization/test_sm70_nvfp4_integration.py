@@ -111,6 +111,7 @@ def test_shared_gate_m1_kernel_is_not_called_for_batch(monkeypatch, rows, availa
     layer = NS(
         layer_idx=0,
         _sm70_exact_shared_expert_gate=True,
+        _sm70_batch_shared_expert_gate=False,
         gate_up_proj=NS(forward_fused_silu_and_mul=lambda x: x),
         down_proj=lambda x: (x, None),
         expert_gate=gate,
@@ -122,3 +123,31 @@ def test_shared_gate_m1_kernel_is_not_called_for_batch(monkeypatch, rows, availa
     assert gate.call_count == int(not use_fused)
     if not use_fused:
         torch.testing.assert_close(result, torch.sigmoid(torch.ones_like(x)))
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16, 17])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+def test_batch_shared_gate_preserves_linear(monkeypatch, rows, enabled, available):
+    monkeypatch.setattr(
+        qwen2_moe, "_sm70_dump_qwen_mlp_tensor", lambda label, idx, x: x
+    )
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_exact", lambda: False)
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_sigmoid_mul", lambda: available)
+    fused = Mock(side_effect=lambda out, gate: out.mul_(torch.sigmoid(gate)))
+    monkeypatch.setattr(ops, "qwen38_shared_gate_sigmoid_mul_out", fused)
+    logits = torch.linspace(-3, 3, rows, dtype=torch.float16).reshape(rows, 1)
+    gate = Mock(return_value=(logits, None))
+    layer = NS(
+        layer_idx=0,
+        _sm70_exact_shared_expert_gate=True,
+        _sm70_batch_shared_expert_gate=enabled,
+        gate_up_proj=NS(forward_fused_silu_and_mul=lambda x: x.clone()),
+        down_proj=lambda x: (x, None),
+        expert_gate=gate,
+    )
+    x = torch.ones(rows, 2560, dtype=torch.float16)
+    result = qwen2_moe.Qwen2MoeMLP.forward(layer, x)
+    gate.assert_called_once_with(x)
+    assert fused.call_count == int(enabled and available and 2 <= rows <= 16)
+    torch.testing.assert_close(result, x * torch.sigmoid(logits), atol=0, rtol=0)

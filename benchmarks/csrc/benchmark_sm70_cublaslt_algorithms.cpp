@@ -153,6 +153,35 @@ class LtRunner {
     return output;
   }
 
+  // Pin the reduction scheme when screening an output shard. A different
+  // shape's default heuristic may silently choose a different K partition.
+  int64_t add_configuration(int id, uint32_t tile, uint32_t stages,
+                            uint32_t custom, uint32_t swizzle, int32_t split_k,
+                            uint32_t reduction) {
+    cublasLtMatmulAlgo_t algorithm{};
+    auto status = cublasLtMatmulAlgoInit(
+        at::cuda::getCurrentCUDABlasLtHandle(), CUBLAS_COMPUTE_32F, CUDA_R_32F,
+        CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, id, &algorithm);
+    if (status != CUBLAS_STATUS_SUCCESS ||
+        !set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_TILE_ID,
+                                 tile) ||
+        !set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                                 stages) ||
+        !set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+                                 custom) ||
+        !set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+                                 swizzle) ||
+        !set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                                 split_k) ||
+        !set_algorithm_attribute(
+            &algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, reduction)) {
+      return -1;
+    }
+    const auto before = algorithms_.size();
+    add_checked_algorithm(algorithm);
+    return algorithms_.size() == before ? -1 : static_cast<int64_t>(before);
+  }
+
   void run(int64_t algorithm_index, torch::Tensor output, torch::Tensor input,
            torch::Tensor weight, torch::Tensor workspace) const {
     TORCH_CHECK(algorithm_index >= 0 &&
@@ -226,7 +255,8 @@ class LtRunner {
         "cublasLtMatmulAlgoGetIds");
     algorithm_ids.resize(returned_ids);
 
-    constexpr int32_t split_k_values[] = {2, 3, 4, 5, 6, 8, 12, 16, 24, 32};
+    constexpr int32_t split_k_values[] = {2,  3,  4,  5,  6,  8,
+                                          12, 16, 20, 22, 24, 32};
     constexpr uint32_t reduction_values[] = {
         CUBLASLT_REDUCTION_SCHEME_INPLACE,
         CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE,
@@ -358,5 +388,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   py::class_<LtRunner, std::shared_ptr<LtRunner>>(module, "LtRunner")
       .def(py::init<int64_t, int64_t, int64_t, int64_t, int, bool>())
       .def("algorithm_info", &LtRunner::algorithm_info)
+      .def("add_configuration", &LtRunner::add_configuration)
       .def("run", &LtRunner::run);
 }

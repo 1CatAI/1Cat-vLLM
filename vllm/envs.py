@@ -179,9 +179,12 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
+    VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
+    VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE: bool = False
+    VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
@@ -278,6 +281,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
@@ -1857,6 +1861,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
     ),
+    # Research-qualified M2..16 input chain. Retain M1/prefill unchanged and
+    # keep opt-in until matched whole-engine token equivalence is accepted.
+    "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"))
+    ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.
     # This remains opt-in pending the same model-level quality gates as GEMV.
@@ -1868,6 +1877,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # retaining the checkpoint's FP16 accumulation and output rounding.
     "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "1"))
+    ),
+    # Preserve the batched gate linear, fusing only FP16 sigmoid and multiply.
+    # Opt-in until batched endpoint equivalence and performance are validated.
+    "VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE", "0"))
+    ),
+    # Keep batch's 512-wide reduction tree; only move the norm-weight load.
+    "VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH", "0"))
     ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit
@@ -2423,6 +2441,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and eager execution retain the normal custom-allreduce path.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH", "1"))
+    ),
+    # Experimental C2 admission; keep off until matched engine token parity
+    # passes. C1 and the existing C4/8/16 path are unchanged.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2", "0"))
     ),
     # Exact Qwen3.8 single-token MoE payload: FP16 [1, 2560]. Reuse the
     # already-registered SM70 TP4 push buffers for all_reduce_sum2 while

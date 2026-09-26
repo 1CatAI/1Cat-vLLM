@@ -66,6 +66,22 @@ __global__ void qwen38_shared_gate_exact_kernel(
   }
 }
 
+__global__ void qwen38_shared_gate_sigmoid_mul_kernel(
+    half* __restrict__ output, const half* __restrict__ logits) {
+  constexpr int kTilesPerRow = kQwen38SharedGateHidden / 512;
+  const int row = blockIdx.x / kTilesPerRow;
+  const int tile = blockIdx.x % kTilesPerRow;
+  // Keep the eager FP16 sigmoid materialization before the FP16 multiply.
+  // The batched linear is deliberately NOT replaced: its reduction order
+  // differs from the single-token fused gate's dot product.
+  const float logit = __half2float(logits[row]);
+  const half gate = __float2half_rn(1.0f / (1.0f + expf(-logit)));
+  auto* output2 = reinterpret_cast<half2*>(output);
+  const int index =
+      row * (kQwen38SharedGateHidden / 2) + tile * 256 + threadIdx.x;
+  output2[index] = __hmul2(output2[index], __half2half2(gate));
+}
+
 __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
                                                half2 out[4]) {
   constexpr unsigned kSign = 0x80008000u;
@@ -1416,6 +1432,32 @@ void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void qwen38_shared_gate_sigmoid_mul_out(torch::Tensor out,
+                                        torch::Tensor logits) {
+  TORCH_CHECK(out.is_cuda() && logits.is_cuda(),
+              "qwen38_shared_gate_sigmoid_mul_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  logits.scalar_type() == torch::kFloat16,
+              "qwen38_shared_gate_sigmoid_mul_out: tensors must be float16");
+  TORCH_CHECK(out.is_contiguous() && logits.is_contiguous(),
+              "qwen38_shared_gate_sigmoid_mul_out: tensors must be contiguous");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) >= 2 && out.size(0) <= 16 &&
+                  out.size(1) == kQwen38SharedGateHidden && logits.dim() == 2 &&
+                  logits.size(0) == out.size(0) && logits.size(1) == 1,
+              "qwen38_shared_gate_sigmoid_mul_out: expected M2-16/H2560 "
+              "output and [M, 1] logits");
+  TORCH_CHECK(out.get_device() == logits.get_device(),
+              "qwen38_shared_gate_sigmoid_mul_out: device mismatch");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % alignof(half2) == 0,
+              "qwen38_shared_gate_sigmoid_mul_out: output must be half2 aligned");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
+  qwen38_shared_gate_sigmoid_mul_kernel<<<out.size(0) * 5, 256, 0,
+                                          at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(logits.data_ptr<at::Half>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

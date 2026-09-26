@@ -110,17 +110,16 @@ def _sm70_fused_shared_expert_gate_shape_supported(
     x: torch.Tensor,
     out: torch.Tensor,
 ) -> bool:
-    """Return whether the exact small-batch SM70 gate kernel can run.
-
-    The native kernel has always been row-independent and accepts arbitrary
-    ``M``.  Keep the optimized range bounded by the measured CUDA-graph
-    crossover instead of coupling it to the server's concurrency setting.
-    """
+    """Shared shape gate; the fused dot remains M1-only at its call site."""
     return bool(
         x.ndim == 2
         and out.ndim == 2
         and 0 < x.shape[0] <= _SM70_FUSED_SHARED_GATE_MAX_TOKENS
         and out.shape[0] == x.shape[0]
+        and x.shape[1] == 2560
+        and out.shape[1] == 2560
+        and x.is_contiguous()
+        and out.is_contiguous()
         and x.dtype == torch.float16
         and out.dtype == torch.float16
     )
@@ -193,6 +192,10 @@ class Qwen2MoeMLP(nn.Module):
             logger.info_once(
                 "SM70 Qwen3Next exact single-token shared-expert gate enabled."
             )
+        self._sm70_batch_shared_expert_gate = (
+            self._sm70_exact_shared_expert_gate
+            and envs.VLLM_SM70_QWEN38_SHARED_GATE_BATCH_EPILOGUE
+        )
 
     def forward(self, x):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
@@ -233,11 +236,27 @@ class Qwen2MoeMLP(nn.Module):
             expert_gate = _sm70_dump_qwen_mlp_tensor(
                 "mlp_expert_gate", self.layer_idx, expert_gate
             )
-            expert_gate = F.sigmoid(expert_gate)
-            expert_gate = _sm70_dump_qwen_mlp_tensor(
-                "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
-            )
-            out = expert_gate * out
+            used_batch_epilogue = False
+            if (
+                self._sm70_batch_shared_expert_gate
+                and x.shape[0] > 1
+                and _sm70_fused_shared_expert_gate_shape_supported(x, out)
+            ):
+                from vllm import _sm70_ops as sm70_ops
+
+                if sm70_ops.has_qwen38_shared_gate_sigmoid_mul():
+                    sm70_ops.qwen38_shared_gate_sigmoid_mul_out(out, expert_gate)
+                    used_batch_epilogue = True
+                    logger.info_once(
+                        "SM70 Qwen3.8 batch shared-expert sigmoid/multiply "
+                        "fusion enabled (linear unchanged)."
+                    )
+            if not used_batch_epilogue:
+                expert_gate = F.sigmoid(expert_gate)
+                expert_gate = _sm70_dump_qwen_mlp_tensor(
+                    "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
+                )
+                out = expert_gate * out
             out = _sm70_dump_qwen_mlp_tensor(
                 "mlp_after_expert_gate", self.layer_idx, out
             )

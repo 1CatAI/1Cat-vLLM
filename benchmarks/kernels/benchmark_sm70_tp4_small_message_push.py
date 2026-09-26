@@ -19,6 +19,7 @@ from vllm import envs
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
 FLAG = "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES"
+M2_FLAG = "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M2"
 # Include partial CTAs, HC payloads, established sizes and the pull fallback.
 SIZES = (
     16,
@@ -28,6 +29,7 @@ SIZES = (
     5120,
     5376,
     8192,
+    10240,
     10752,
     20480,
     25600,
@@ -52,6 +54,7 @@ def main():
     assert torch.cuda.get_device_capability() == (7, 0)
     ca = CustomAllreduce(group, rank, max_size=128 * 1024)
     old = os.environ.get(FLAG)
+    old_m2 = os.environ.get(M2_FLAG)
     try:
         assert not ca.disabled and ca.fully_connected
         assert ca.sm70_tp4_push_buffer_ptrs is not None
@@ -59,13 +62,15 @@ def main():
             torch.zeros(n // 2, device="cuda", dtype=torch.float16) for n in SIZES
         ]
         graphs, storage = [], []
-        for enabled, reverse, sum2 in (
-            (False, False, False),
-            (True, False, False),
-            (True, True, False),
-            (True, False, True),
+        for enabled, reverse, sum2, m2 in (
+            (False, False, False, False),
+            (True, False, False, False),
+            (True, True, False, False),
+            (True, False, True, False),
+            (True, False, True, True),
         ):
             os.environ[FLAG] = str(int(enabled))
+            os.environ[M2_FLAG] = str(int(m2))
             envs.disable_envs_cache()
             buffers = [x.new_full((x.numel() + 16,), -37) for x in inputs]
             outputs = [x[8:-8] for x in buffers]
@@ -81,8 +86,8 @@ def main():
                 for i in order:
                     ca.all_reduce(inputs[i], out=outputs[i], registered=True)
                     if sum2:
-                        # Same push storage, but sum2 retains its old launch
-                        # policy. Exercise transitions between both protocols.
+                        # Same push storage; exercise both the default pull
+                        # and explicitly enabled C2 sum2 admission.
                         ca.all_reduce_sum2(inputs[i], inputs[i], out=outputs[i])
             graphs.append(graph)
             storage.append(buffers)
@@ -125,7 +130,7 @@ def main():
                     for b in buffers:
                         b[8:-8].fill_(float("nan"))
                 dist.barrier()
-                for which in (0, 1, 2, 3) if cycle % 2 else (3, 2, 0, 1):
+                for which in (0, 1, 2, 3, 4) if cycle % 2 else (4, 3, 2, 0, 1):
                     if rank == cycle % 4:
                         torch.cuda._sleep(10000)
                     graphs[which].replay()
@@ -143,7 +148,7 @@ def main():
                     expected_sum2 = expected_sum2.half()
                     for graph_id, buffers in enumerate(storage):
                         actual = buffers[i][8:-8]
-                        reference = expected_sum2 if graph_id == 3 else expected
+                        reference = expected_sum2 if graph_id >= 3 else expected
                         finite = torch.isfinite(reference)
                         torch.testing.assert_close(
                             actual, reference, rtol=0, atol=0, equal_nan=True
@@ -173,6 +178,7 @@ def main():
                 library=library,
                 finite_bits_exact=True,
                 sum2_interleaved=True,
+                sum2_m2_capture_flags=[0, 1],
                 nan_payload_identity_required=False,
                 model_quality_test=False,
             )
@@ -187,6 +193,10 @@ def main():
             os.environ.pop(FLAG, None)
         else:
             os.environ[FLAG] = old
+        if old_m2 is None:
+            os.environ.pop(M2_FLAG, None)
+        else:
+            os.environ[M2_FLAG] = old_m2
         envs.disable_envs_cache()
         ca.close()
         dist.destroy_process_group(group)

@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -357,9 +358,14 @@ def _hc_combine_norm(
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     # The M=1 SM70 path is register-bound with the generic 512-wide tile.
-    # A 1024-wide tile keeps identical reduction/rounding results and is
-    # measurably faster on V100; retain the generic tile for larger batches.
+    # Keep its established 1024-wide policy. Batch retains the 512-wide
+    # reduction tree: switching tiles can change FP32 association and FP16 bits.
     sm70_decode = N == 1 and current_platform.is_device_capability(70)
+    sm70_batch_prefetch = (
+        2 <= N <= 16
+        and envs.VLLM_SM70_QWEN38_HC_BATCH_NORM_PREFETCH
+        and current_platform.is_device_capability(70)
+    )
     BLOCK_SIZE = 1024 if sm70_decode else 512
     _hc_combine_norm_kernel[(N, hc_count)](
         block_output,
@@ -380,7 +386,7 @@ def _hc_combine_norm(
         BLOCK_SIZE=BLOCK_SIZE,
         launch_pdl=current_platform.is_arch_support_pdl(),
         PREFETCH_WEIGHT=(
-            sm70_decode
+            (sm70_decode or sm70_batch_prefetch)
             and hc_dim == 2560
             and hc_count == 4
             and residual.dtype == torch.float16
