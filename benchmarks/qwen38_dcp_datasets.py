@@ -6,20 +6,35 @@ import hashlib
 import importlib.util
 import json
 import random
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-if __package__:
-    from .benchmark_sm70_dflash2_gsm8k import (
-        GSM8K_PROMPT_SUFFIX,
-        INVALID_ANSWER,
-        _answer_value,
-    )
-else:
-    from benchmark_sm70_dflash2_gsm8k import (
-        GSM8K_PROMPT_SUFFIX,
-        INVALID_ANSWER,
-        _answer_value,
-    )
+import regex as re
+
+# Mirror the existing GSM8K scoring convention without importing benchmark
+# entrypoints: benchmark_sm70_decode changes sys.path at import time, which
+# would make spawned workers import the source checkout instead of the wheel.
+INVALID_ANSWER = -9_999_999
+GSM8K_PROMPT_SUFFIX = (
+    "\nPlease reason step by step, and put your final answer within \\boxed{}."
+)
+_NUMBER_RE = re.compile(r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w.])")
+_BOXED_RE = re.compile(r"\\boxed\{(?P<value>(?:[^{}]+|\{(?&value)\})*)\}")
+
+
+def _answer_value(text: str) -> int:
+    boxed = list(_BOXED_RE.finditer(text))
+    answer_text = boxed[-1].group("value") if boxed else text
+    numbers = _NUMBER_RE.findall(answer_text)
+    if not numbers:
+        return INVALID_ANSWER
+    try:
+        value = Decimal(numbers[-1].replace(",", ""))
+    except InvalidOperation:
+        return INVALID_ANSWER
+    if not value.is_finite() or value != value.to_integral_value():
+        return INVALID_ANSWER
+    return int(value)
 
 
 def prepare_datasets(spec_path, tokenizer):

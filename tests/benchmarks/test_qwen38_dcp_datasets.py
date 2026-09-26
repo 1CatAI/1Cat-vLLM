@@ -2,18 +2,51 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from benchmarks.qwen38_dcp_datasets import (
+    INVALID_ANSWER,
+    _answer_value,
     evaluate_datasets,
     prepare_datasets,
     summarize_dataset,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_dataset_import_does_not_inject_source_paths():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; before = sys.path[:]; "
+                "import benchmarks.qwen38_dcp_datasets; "
+                "assert sys.path == before, (before, sys.path)"
+            ),
+        ],
+        check=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "answer"),
+    [
+        (r"reason 42 then \\boxed{1,234}", 1234),
+        (r"\\boxed{-7}", -7),
+        ("reference reasoning\n#### 437", 437),
+        (r"\\boxed{1.5}", INVALID_ANSWER),
+        ("unfinished without answer", INVALID_ANSWER),
+    ],
+)
+def test_answer_extractor_keeps_existing_integer_contract(text, answer):
+    assert _answer_value(text) == answer
 
 
 def test_dataset_preflight_selection_and_scoring(tmp_path):

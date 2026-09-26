@@ -12,11 +12,46 @@ VLLM_ALLOW_INSECURE_SERIALIZATION=1 for this offline check only, not a service.
 
 import argparse
 import hashlib
+import importlib
 import json
+import multiprocessing
 import os
 import subprocess
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+
+def runtime_sources():
+    """Record actual package/extension locations, not only the driver cwd."""
+    names = (
+        "vllm",
+        "vllm._C",
+        "vllm._C_stable_libtorch",
+        "vllm._moe_C",
+        "flash_attn_v100",
+        "flash_qla",
+    )
+    result = {
+        name: str(Path(importlib.import_module(name).__file__).resolve())
+        for name in names
+    }
+    result["version"] = importlib.import_module("vllm").__version__
+    return result
+
+
+def validate_spawn_runtime():
+    """Catch dataset-import sys.path poisoning before loading model weights."""
+    expected = runtime_sources()
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        actual = pool.submit(runtime_sources).result(timeout=60)
+    if actual != expected:
+        raise RuntimeError(
+            f"Spawned runtime differs from driver: {actual} != {expected}"
+        )
+    return expected
 
 
 def worker_manifest(worker):
@@ -29,6 +64,7 @@ def worker_manifest(worker):
     return {
         "rank": worker.rank,
         "source": vllm.__file__,
+        "runtime": runtime_sources(),
         "torch": torch.__version__,
         "vllm_version": vllm.__version__,
         "cuda": torch.version.cuda,
@@ -212,6 +248,7 @@ def run(args):
             from qwen38_dcp_datasets import evaluate_datasets, prepare_datasets
         dataset_bundle = prepare_datasets(args.dataset_spec, tokenizer)
         report["preflight"]["dataset_manifest"] = dataset_bundle[2]
+    report["preflight"]["runtime"] = validate_spawn_runtime()
     if args.preflight_only:
         save()
         print(json.dumps(report["preflight"]), flush=True)
@@ -223,9 +260,20 @@ def run(args):
         previous_args = previous["args"]
         if not previous.get("complete"):
             raise ValueError("Reference run did not complete")
-        for key in ("model", "kv_dtype", "kv_gib", "long_context"):
-            if previous_args[key] != report["args"][key]:
+        for key in (
+            "model",
+            "kv_dtype",
+            "kv_gib",
+            "gpu_memory_utilization",
+            "long_context",
+        ):
+            if previous_args.get(key) != report["args"][key]:
                 raise ValueError(f"Reference contract mismatch: {key}")
+        if (
+            previous.get("preflight", {}).get("runtime")
+            != report["preflight"]["runtime"]
+        ):
+            raise ValueError("Reference runtime contract mismatch")
         reference = {case["name"]: case for case in previous["cases"]}
         if dataset_bundle:
             dataset_reference = previous.get("dataset")
@@ -247,7 +295,7 @@ def run(args):
             decode_context_parallel_size=args.dcp,
             kv_cache_dtype=args.kv_dtype,
             kv_cache_memory_bytes=int(args.kv_gib * (1 << 30)),
-            gpu_memory_utilization=0.90,
+            gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=262144,
             max_num_batched_tokens=8192,
             max_num_seqs=4,
@@ -269,6 +317,7 @@ def run(args):
                 or worker["bf16_reduced_reduction"]
                 or worker["fp16_accumulation"]
                 or not worker["sampler_checks_nans"]
+                or worker["runtime"] != report["preflight"]["runtime"]
                 or worker["dcp"] != args.dcp
                 or worker["kv_dtype"]
                 != ("fp8_e4m3" if args.kv_dtype == "auto" else args.kv_dtype)
@@ -396,6 +445,7 @@ if __name__ == "__main__":
         "--kv-dtype", choices=("auto", "float16", "fp8_e4m3"), default="auto"
     )
     parser.add_argument("--kv-gib", type=float, default=4.0)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--long-context", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--require-token-parity", action="store_true")

@@ -74,10 +74,12 @@ export TORCHINDUCTOR_CACHE_DIR="$PWD/.cache/inductor"
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   .venv/bin/python -m benchmarks.benchmark_qwen38_dcp_quality \
   --model /path/to/calibrated-model --dcp 1 --kv-gib 4 \
+  --gpu-memory-utilization 0.85 \
   --long-context --output /path/to/dcp1.json
 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
   .venv/bin/python -m benchmarks.benchmark_qwen38_dcp_quality \
   --model /path/to/calibrated-model --dcp 2 --kv-gib 4 \
+  --gpu-memory-utilization 0.85 \
   --long-context --reference /path/to/dcp1.json --output /path/to/dcp2.json
 ```
 
@@ -91,6 +93,10 @@ are not sustained-decode speed benchmarks. Omit `--long-context` only for a
 short preliminary check; never label that result 256K quality acceptance.
 The manifest transport is checked before model loading, so a missing local
 RPC opt-in fails without spending time loading weights or capturing graphs.
+After preparing dataset inputs, a real CPU spawn checks that child package and
+extension paths/version match the driver. Loaded worker manifests must also
+match. This catches benchmark helpers that mutate `sys.path` and accidentally
+select the source checkout instead of the installed artifact.
 The driver enables the native sampler NaN check and verifies it in worker
 manifests. Without that opt-in, the corruption metric alone is not evidence
 that logits were checked. It disables the greedy-only argmax shortcut, so these
@@ -190,3 +196,38 @@ close to the FP64 oracle; DCP2 was not farther from it in those prefill cases.
 This supports an arithmetic-order investigation, not a causal attribution of
 the model's divergent token. Imported author measurements are not our results.
 The paired dataset screen and DCP2 256K validation are still pending.
+
+### Dataset qualification interruption and correction
+
+The first 192-question DCP1 screen finished, but its results are **diagnostic
+only**, not promotion evidence: importing the old GSM8K benchmark helper
+indirectly imported `benchmark_sm70_decode`, whose module initialization
+prepended checkout paths to `sys.path`. Spawned workers then selected the
+checkout, not the driver's installed wheel. Source/native build activity during
+that run prevents treating it as a frozen-artifact comparison. The earlier
+non-dataset health/capacity runs did not import this helper; their worker
+manifests confirm the installed package paths.
+
+The dataset scorer now retains the same integer-answer convention without
+importing benchmark entrypoints. A subprocess regression test rejects path
+mutation; the real CPU spawn and final worker manifests verify actual runtime
+locations. Twenty driver/scorer CPU tests pass after the correction.
+
+The first DCP2 dataset attempt stopped at startup: device0 free memory was
+28.15 GiB, below the requested 28.56 GiB (utilization0.90), before output
+evaluation. Its NCCL disconnects were subsequent shutdown errors. This is not
+evidence of a DCP numerical failure. The exact transient memory owner was not
+recorded, so it is not attributed to another task.
+
+The next matched pair uses utilization0.85 on both sides and an explicit,
+unchanged 4 GiB/card KV budget. The explicit KV budget bypasses utilization-based
+pool sizing; this adjustment only relaxes the pre-load reservation check, not
+precision, context length or allocated KV capacity. Four idle GPUs and leases
+are still required. Do not reuse the diagnostic DCP1 dataset JSON as reference.
+
+Latest-main integration source: `d6ff5be48848718c57ec9aca869c7beb3e92abc5`
+(main `1e90d17f2c`). Normal native build and wheel completed; SHA256:
+`3687562a695ccc2052059eb503aefce705e6a72555a324173cc8c9feac0ec091`.
+Sixty-five targeted warmup/graph CPU tests passed after the merge. The new
+artifact is installed for the corrected future pair; its full-model dataset
+acceptance is still pending.

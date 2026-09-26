@@ -27,6 +27,10 @@ def test_manifest_transport_requires_explicit_opt_in(monkeypatch):
 
 
 def test_manifest_callable_and_result_roundtrip(monkeypatch):
+    monkeypatch.setattr(
+        "benchmarks.benchmark_qwen38_dcp_quality.runtime_sources",
+        lambda: {"version": "test"},
+    )
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     validate_manifest_transport()
     for name in ("memory_allocated", "memory_reserved", "max_memory_allocated"):
@@ -113,6 +117,10 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     monkeypatch.setenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0")
     monkeypatch.setattr(
+        "benchmarks.benchmark_qwen38_dcp_quality.validate_spawn_runtime",
+        lambda: {"version": "test"},
+    )
+    monkeypatch.setattr(
         transformers.AutoTokenizer,
         "from_pretrained",
         lambda *args, **kwargs: TemplateTokenizer(),
@@ -140,6 +148,7 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
                     bf16_reduced_reduction=False,
                     fp16_accumulation=False,
                     sampler_checks_nans=True,
+                    runtime={"version": "test"},
                     dcp=1,
                     kv_dtype="fp8_e4m3",
                     ple_environment={"VLLM_PLE_DISK_OFFLOAD": "1"},
@@ -176,6 +185,7 @@ def test_driver_saves_result_and_always_shuts_down(monkeypatch, tmp_path, health
         dcp=1,
         kv_gib=4.0,
         kv_dtype="auto",
+        gpu_memory_utilization=0.90,
         long_context=True,
         preflight_only=False,
         require_token_parity=False,
