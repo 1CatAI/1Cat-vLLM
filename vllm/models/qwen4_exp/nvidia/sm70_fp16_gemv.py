@@ -380,6 +380,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
+            from .sm70_fp16_hc import _prepare_hc_batch_weight
+
+            _prepare_hc_batch_weight(layer)
         if not getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):
             return
         weight = layer.weight

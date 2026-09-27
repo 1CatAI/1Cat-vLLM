@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = False
+    VLLM_SM70_MTP_HC_BATCH: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
@@ -1867,6 +1868,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # consume another 725.625 MiB/rank in the Flash-Next TP4 configuration.
     "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"))
+    ),
+    # TP4 MTP4 batch HC, sharing the concurrent-decode packed MMA/gather
+    # implementation while preserving the current FP16 split-K boundaries.
+    "VLLM_SM70_MTP_HC_BATCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_HC_BATCH", "0"))
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.
