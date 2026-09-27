@@ -14,6 +14,9 @@ import vllm.models.qwen4_exp.nvidia.ops.hc as hc
     [
         (1, 2560, torch.float16, True, True),
         (2, 2560, torch.float16, True, False),
+        (5, 2560, torch.float16, True, True),
+        (10, 2560, torch.float16, True, True),
+        (16, 2560, torch.float16, True, False),
         (1, 2560, torch.float32, True, False),
         (1, 1280, torch.float16, True, False),
         (1, 2560, torch.float16, False, False),
