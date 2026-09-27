@@ -5,6 +5,12 @@ MTP4 round**, versus a matched 23.874188-ms control before the exact draft
 MoE schedule. Natural EOS timings do not improve in that pair; keep the new
 draft route opt-in. The requested **less-than-20-ms** threshold is unmet.
 
+The retained 29.391136-ms node trace has **not passed perturbation
+calibration** and cannot provide an absolute breakdown of the 23.657858-ms
+endpoint. The separate CUDA-event phase observer also changes request
+latency. See the capture representativeness audit below before using their
+category timings to estimate an optimization's available endpoint gain.
+
 The original accepted reference is **27.3963 ms per complete MTP4 round**.
 The target verifier uses M5/M10 matrix batches; draft step0 uses M5 and its
 three continuations use M1. This work ports
@@ -691,8 +697,10 @@ combine 5.032932, next-round preparation 0.046235. The target graph contains
 16.806997 ms of recorded-kernel union and 5.861392 ms without a recorded
 kernel; 3.834410 ms of the latter overlaps its 4.116641-ms graph-launch API.
 This is **not a new 29-ms endpoint** and is not rescaled or subtracted from
-the measured 23.657858-ms ordinary round. Low-overhead phase observations
-remain around 19 ms for target verification and 4.9 ms for the four drafts.
+the measured 23.657858-ms ordinary round. Separate phase observations
+remain around 19 ms for target verification and 4.9 ms for the four drafts;
+their enclosing request is 26.885772 ms/round, so they are diagnostic rather
+than a calibrated low-overhead decomposition of the ordinary endpoint.
 
 The rank0 draft interval, excluding final combine, closes independently:
 
@@ -940,3 +948,64 @@ The subsequent 600-second lease wait (`mtp_pending_gates_retry1.log`) also
 expires before any CUDA work. Both foreign TP4 groups remain occupied;
 all four prepared jobs and whole-model qualification are pending. The wait
 process has exited. The accepted 23.657858-ms endpoint is unchanged.
+
+### Capture representativeness audit, 2026-09-27
+
+The current trace is retained for route identification and recorded ordering,
+but is **not admitted for absolute normal-execution latency attribution**.
+Checking the saved request metrics independently of the SQLite parser gives:
+
+| Measurement | Complete round ms | Scope |
+| --- | ---: | --- |
+| Qualified ordinary endpoint | 23.657858 | Median of two 8192/513 requests |
+| Node-captured request's own decode metrics | 29.350420 | 8192/129, 85 drafts |
+| Same node trace, closed intervals | 29.391136 | Rank0, 84 closed rounds |
+| Separate CUDA-event phase request | 26.885772 | 8192/513, 335 drafts |
+
+The captured request and trace agree within 0.139%, supporting that the
+captured application really ran slower. This does not identify the cause of
+the 24.06% difference from the qualified endpoint: output length and warmup
+history differ, and capture overhead has no matched off/on/off control.
+Do not attribute the entire difference to CUPTI or subtract it from kernels.
+
+The phase observer's enclosing request is 13.64% slower than the ordinary
+endpoint. Source inspection finds an event synchronization after the target
+phase and another at round reporting. Worker-local timing averages exclude
+some enclosing request cost; they cannot be added into a purported exact
+23.657858-ms decomposition. This observer was off during the node trace.
+
+An independent correlation-ID join within the same 84 closed rank0 windows
+finds 84 target graph-launch calls with 2,060 kernels each, mean host API
+duration 4.116641 ms. Draft graph-launch calls carry 81 nodes / 0.232171 ms
+and 65 nodes / 0.163631 ms. The target's 3.834410 ms of unrecorded-kernel
+intervals overlapping graph launch remains a diagnostic lead, not confirmed
+idle time or removable overhead. See `mtp_capture_graphlaunch_audit.json`.
+
+The original Nsight 2025.3.1 tool uses CUPTI 12.9 and warns about the CUDA-13
+driver interface. The previously attempted 2025.3.2/CUPTI-13.1 smoke emits
+`CUPTI_ERROR_INVALID_DEVICE` and no CUDA events; do not repeat that failed
+upgrade or claim that a version change has fixed the capture. NVIDIA's
+[CUDA graph tracing documentation](https://docs.nvidia.com/nsight-systems/UserGuide/)
+also distinguishes lower-overhead whole-graph tracing from potentially
+expensive node tracing. That documented possibility is not a causal result
+for this workload.
+
+Prepared `run_mtp_trace_calibration.py` uses the current owned runtime and a
+fresh same-source clean control, then graph and node captures only while the
+preceding control passes. Every arm warms the full 8192/513 workload and
+measures identical 513-token requests before/during/after collection. It
+keeps the phase profiler off, records host graph replay duration without
+CUDA events or per-round synchronization, and checks every token, finish
+reason and acceptance statistic against the saved fixed fixture. A 3% bound
+on control drift, inactive injection overhead and capture perturbation is a
+local admission gate, not an assumed profiler guarantee. The newer router
+source is explicitly recorded; a new run is not relabeled as source
+`6bcffbb796`.
+
+The first launch attempt fails before CUDA at the per-GPU lease check.
+GPU4--7 had briefly released memory between foreign jobs but were reserved
+by PID2418031 (`serve_with_lock.py`); workers2418667--2418670 then loaded.
+No calibration inference, new trace, owned GPU worker or waiter exists at
+this checkpoint. Syntax checks pass for the prepared artifact scripts.
+Retain `mtp_capture_representativeness_audit.json` and the calibration
+scripts. Corrected plot titles explicitly mark the old trace uncalibrated.

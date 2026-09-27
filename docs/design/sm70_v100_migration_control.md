@@ -48235,3 +48235,20 @@ has launched no full model. Details and artifacts are in
   the four prepared jobs and model admission are unrun. No owned worker or
   pending wait process remains. Latest qualified complete round stays
   23.657858 ms, with <20 ms still unmet.
+- Capture qualification correction: the 29.391136-ms node trace is not an
+  admitted absolute decomposition of the ordinary 23.657858-ms round. Its
+  request's own decode metrics give 29.350420 ms (0.139% closure difference),
+  but use 129 rather than 513 output tokens and lack matched capture-off
+  controls. The separate phase observer's enclosing request is 26.885772 ms,
+  +13.64%; its target/round event fences preclude calling it an unperturbed
+  breakdown. The phase observer was disabled in the node trace.
+- A correlation-ID audit finds target graph host launch 4.116641 ms for
+  2,060 nodes, versus draft 0.232171/0.163631 ms for 81/65 nodes. This is a
+  capture-overhead lead, not evidence that all unrecorded gaps are idle or
+  removable. Retain the existing Nsight-2025.3.2 invalid-device/no-events
+  failure. New clean/graph/node calibration scripts fix 8192/513, warm the
+  actual shape, compare identical resident-engine before/during/after
+  requests, avoid CUDA-event fences and require token/acceptance equality
+  plus a 3% perturbation/drift gate. The first launch was rejected before
+  CUDA by a foreign GPU4--7 lease; no new speed/trace result or owned waiter
+  exists. See the detailed capture audit in the MTP batch qualification doc.
