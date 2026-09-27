@@ -48414,3 +48414,27 @@ has launched no full model. Details and artifacts are in
   explicitly pinning the original BV32 arithmetic restores all output/state
   bits, but exact BV8/BV16 saves only ~0.05 ms per 36-layer component chain.
   Keep it as research rather than rerunning a full model for that small gain.
+
+### 2026-09-27 PR #703 audit and authorized main integration
+
+- The user explicitly requested audit and merge. Merge latest `onecat/main`
+  `ef6909830cbb7b40a24413bfe74ab49a4f7e1b90` (#706) into the owned published
+  MTP branch without rebasing; integration commit is `b772a0e962`.
+- Fix one numerical-contract bug in `4d4cb68dac`: batch GDN must fall back
+  when the caller requests FP16 accumulation. M5/M10 GPU regressions and
+  the focused 185-test integration suite pass; changed-file pre-commit and
+  normal native rebuild pass. Optional Rust frontend remains unavailable.
+- Fresh source-built TP4 GPU4–7 all-acceleration gate preserves all fixed and
+  natural IDs/EOS/acceptance. Complete ordinary rounds are 21.421255 /
+  21.401212 ms, mean **21.411234 ms**; pure decode 71.347743 / 71.414562
+  tokens/s. Deferred observer adds +0.468769%; rank0 cycle is 21.515078 ms.
+- Native SHA256 is
+  `790ca7b49e83c2289c98b167ca070146d10643f63dab653ee6a54e95f56a175f`;
+  no preload/private kernel dependency. Raw artifacts use
+  `pr703_merge_all_accel_20260927*` in the existing owned MTP worktree.
+  Full commands, audit and dependency hashes are in the final section of
+  `sm70_flash_next_mtp4_batch_gdn.md`.
+- Admit PR #703 for the authorized main merge. Retain opt-in defaults,
+  original precision and batch decode. <20 ms and reliable internal HC
+  attribution remain unmet follow-ups. All owned GPU workers are stopped;
+  no foreign service was interrupted and no wheel was built.

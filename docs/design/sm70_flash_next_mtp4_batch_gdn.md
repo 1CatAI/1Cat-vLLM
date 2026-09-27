@@ -1,18 +1,19 @@
 # Flash-Next MTP4 batch decode qualification
 
-The latest qualified complete MTP4 round averages **21.507750 ms** with
-shared-expert and PLE fusions; final ordinary confirmations in the same
-engine average **21.427792 ms**. All fixed and natural token IDs, acceptance
-statistics and normal EOS match the retained oracle. The requested
-**less-than-20-ms** threshold remains unmet. New flags remain opt-in.
+The post-main-merge audit measures **21.411234 ms** per complete MTP4
+round (ordinary controls 21.421255 / 21.401212 ms). All fixed and natural
+token IDs, acceptance statistics and normal EOS match the retained oracle.
+The requested **less-than-20-ms** threshold remains unmet. New flags remain
+opt-in. The earlier 21.507750-ms result and 21.427792-ms same-engine
+confirmations are retained below as historical evidence.
 
-The calibrated outer trace closes at **21.542208 ms** with only +0.1405%
-request perturbation: target forward 15.534391, sampling/state 0.780901,
-four drafts 4.574895 and preparation 0.652021 ms. Current internal timestamp
+The current calibrated outer trace closes at **21.515078 ms** with +0.4688%
+request perturbation: target forward 15.479071, sampling/state 0.784805,
+four drafts 4.664252 and preparation 0.586950 ms. Current internal timestamp
 observers still fail perturbation calibration. Neither the retained
-29.391136-ms Nsight capture nor new internal marker sums are an absolute
-breakdown of ordinary execution. See the final PLE section for the source,
-native hashes, quality gates and raw reports.
+29.391136-ms Nsight capture nor internal marker sums are an absolute
+breakdown of ordinary execution. See the final merge-audit section for the
+latest source, native hashes, quality gates and raw reports.
 
 The original accepted reference is **27.3963 ms per complete MTP4 round**.
 The target verifier uses M5/M10 matrix batches; draft step0 uses M5 and its
@@ -1578,3 +1579,114 @@ The complete-round **<20 ms goal remains unmet**.
   meaningful endpoint gain. Preserve `hc_sigmoid_rcp*` and
   `hc_fast_rcp_gate_20260927*`. All follow-up research workers exited; owned
   GPU leases are released. Runtime source remains PLE commit `763189d9a8`.
+
+## Merge audit against main (2026-09-27)
+
+The user explicitly requested an audit and merge of PR #703. The integration
+line is `onecat/main`, fetched at
+`ef6909830cbb7b40a24413bfe74ab49a4f7e1b90` (#706). It was merged into the
+published owned branch without rebasing, using merge commit
+`b772a0e96271dc11b21509b80aa0fb8999885d26`. There were no conflicts. Main's
+medium-message TP4 all-reduce tuning and concurrent/draft projection changes
+remain intact. The native source and Python candidate were subsequently
+validated together, not just against the earlier PR base.
+
+The review covered native registration/build integration, tensor geometry and
+alignment guards, communicator-owned HC packets and changing graph widths,
+PLE rollback/cache writes, ordered projection/activation rounding, shared
+classic/modular MoE dispatch, mixed-QKV state preservation, and QSA/router
+selection fallbacks. One actionable numerical-contract defect was found:
+GDN batch dispatch did not reject `allow_fp16_accumulation=True`. A five-row
+screen produced 12,002 / 7,192 / 54 / 56 differing half elements in QKV / Z /
+B / A against the original projection. The admitted FP32-accumulation modes
+had zero differences. Commit `4d4cb68dac0976e6c8c1394729a01ac98ff18146`
+adds that fallback and GPU M5/M10 regression checks. It does not change the
+frozen performance contract, which uses FP32 accumulation.
+
+Normal native rebuild succeeds (`bash .artifacts/build.sh`); the optional
+Rust frontend remains unavailable in this environment. No wheel was built.
+Fresh-process import with both `LD_PRELOAD` and `LD_LIBRARY_PATH` unset,
+`readelf -d`, and the resolved Torch/CUDA/cuBLAS mappings show no private
+kernel dependency. Rebuilt `_C` SHA256:
+`790ca7b49e83c2289c98b167ca070146d10643f63dab653ee6a54e95f56a175f`.
+Stable-native SHA256 remains
+`ea479867dce18c14b91c16045b62ef1ab20634a211069c3d89ace7d252ddda63`.
+Changed-file pre-commit passes, including the audit fix.
+
+The following focused source-built GPU/CPU suite passes **185 tests** in
+53.50 seconds, including graph replay, full cache/state bits, dispatch and
+fallback checks. It was run through the task GPU-lease wrapper on GPU0:
+
+```bash
+MTP_RESEARCH_GPU=0 .venv/bin/python .artifacts/run_research.py -m pytest -q \
+  tests/models/qwen4_exp/test_sm70_gdn_input_batch.py \
+  tests/models/qwen4_exp/test_sm70_mtp_hc_batch.py \
+  tests/kernels/test_sm70_mtp_ple_conv.py \
+  tests/kernels/test_sm70_mtp_shared_batch.py \
+  tests/kernels/test_sm70_mtp_router_batch.py \
+  tests/kernels/moe/test_sm70_mtp_moe_fp16.py \
+  tests/kernels/moe/test_sm70_router_key_dispatch.py \
+  tests/kernels/test_sm70_mtp_gdn_mixed_qkv.py \
+  tests/models/qwen4_exp/test_hc_norm_dispatch.py \
+  tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py
+```
+
+The first test invocation used an incorrect directory for the grouped-decode
+file and collected no tests; its log is retained separately. The corrected
+command above is the accepted result.
+
+Raw audit artifacts remain under
+`/home/ymzx/桌面/1cat-vllm/worktrees/v100-mtp4-batch-gemm-20260926-155343/.artifacts/`:
+`pr703_merge_build_20260927.log`,
+`pr703_merge_runtime_audit_20260927.json`,
+`pr703_gdn_precision_audit.log`,
+`pr703_merge_targeted_tests_corrected_20260927.log`,
+`pr703_merge_precommit_20260927.log`, and
+`pr703_audit_fix_precommit_20260927.log`.
+
+### Matched integration gate and merge disposition
+
+A fresh engine at source `4d4cb68dac0976e6c8c1394729a01ac98ff18146`
+uses the unchanged workload contract above, GPU4–7 and every admitted MTP
+acceleration enabled. The source diff is empty; no untracked source file or
+private library override participates. The command is:
+
+```bash
+MTP_WAIT_SECONDS=900 .venv/bin/python .artifacts/run_mtp_optimization_gate.py \
+  pr703_merge_all_accel_20260927 --hc-batch 1 --gdn-mixed 1 \
+  --hc-cooperative 1 --router-batch 1 --hc-full-unroll 1 --qsa-topk 1 \
+  --router-top16 1 --shared-batch 1 --ple-conv 1 \
+  --trace deferred --natural-full
+```
+
+Ordinary/event/ordinary complete rounds are **21.421255 / 21.511603 /
+21.401212 ms**, ordinary mean **21.411234 ms**. Ordinary pure decode is
+71.347743 / 71.414562 tokens/s; TTFT is 0.434015 / 0.408487 seconds and
+prefill is 0.423256 / 0.396150 seconds. Observer perturbation is +0.468769%;
+ordinary control drift is -0.093565%. No timing is rescaled.
+
+All four fixed 513-token cases and three natural cases preserve every token,
+finish reason and acceptance statistic. Fixed requests retain 335 drafts,
+1,340 drafted tokens, 177 accepted tokens and positions `[125,36,10,6]`;
+natural requests retain 284 / 329 / 421 tokens with normal EOS. This is the
+same focused quality gate, not a claim of broad benchmark accuracy.
+
+The rank0 closed 335-cycle outer timeline sums to **21.515078 ms**:
+15.479071 target forward + 0.784805 sampling/state + 4.664252 draft +
+0.586950 preparation. Selecting the slowest complete interval at each
+aligned round ordinal gives 21.542033 ms; every phase in an interval comes
+from that same rank. Per-rank cycle/request closure error is at most
+0.016269%. These are replay/dependency envelopes, not kernel service sums;
+no new claim about absolute internal HC cost is made.
+
+The full run exits zero, and its workers and GPU leases are released. Logs
+confirm the actual batch GDN/HC/router/shared-expert, PLE, exact draft MoE,
+gated norm, mixed-QKV, grouped-MTP and QSA routes. The raw contract, quality
+audit, telemetry, deferred trace, Chrome timeline and closure report use
+prefix `pr703_merge_all_accel_20260927` in the artifact directory above.
+
+The audit fix and integration gates admit PR #703 for the explicitly
+requested merge into `onecat/main`. New opt-in defaults and numerical
+contracts remain unchanged. The <20-ms goal and calibrated internal kernel
+attribution remain follow-up work; neither blocks the user's authorized
+integration of this measured improvement. No wheel was produced.
