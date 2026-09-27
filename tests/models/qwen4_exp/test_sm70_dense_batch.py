@@ -87,7 +87,7 @@ def test_dense_runtime_route_and_fallback_bits(m, role, n, k, limit, monkeypatch
     x = torch.randn(m, k, device="cuda", dtype=torch.float16)
     w = torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.02
     role = "model.layers.0." + role
-    reference = gemv._qwen38_sm70_fp16_gemv(x, w, role, False)
+    reference = gemv._qwen38_sm70_fp16_gemv(x, w, role, dense_batch=False)
     original = torch.ops._C.qwen38_dense_batch_sm70_out
     calls = []
 
@@ -96,7 +96,7 @@ def test_dense_runtime_route_and_fallback_bits(m, role, n, k, limit, monkeypatch
         return original(*args)
 
     monkeypatch.setattr(torch.ops._C, "qwen38_dense_batch_sm70_out", tracked)
-    actual = torch.ops.vllm.qwen38_sm70_fp16_gemv(x, w, role, True)
+    actual = torch.ops.vllm.qwen38_sm70_fp16_gemv(x, w, role, dense_batch=True)
     assert len(calls) == int(2 <= m <= limit)
     assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
     envs.disable_envs_cache()

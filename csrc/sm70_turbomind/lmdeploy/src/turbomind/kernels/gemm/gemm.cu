@@ -784,14 +784,19 @@ struct Gemm::Impl {
                                size_t partials_size, int top_k,
                                bool include_prescaled,
                                bool include_batch_supply = false) {
-    std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
+    std::vector<Kernel*> admitted = registry_.kernels();
     // Untuned/cache-miss dispatch retains the existing numerical family.
     // Batch supply candidates are admitted only by the two-stage measurement.
     if (!include_batch_supply) {
-      feasible.erase(
-          std::remove_if(feasible.begin(), feasible.end(), IsSm70BatchSupply),
-          feasible.end());
+      // Filter the registry before Context trims tiles to the smallest CTA
+      // covering M. Otherwise adding an M48 candidate hides the ordinary
+      // M64 reference even when supply candidates are not admitted, changing
+      // the protected split-K partition during reference selection.
+      admitted.erase(
+          std::remove_if(admitted.begin(), admitted.end(), IsSm70BatchSupply),
+          admitted.end());
     }
+    std::vector<Kernel*> feasible = ctx.Filter(admitted);
     if (!include_prescaled) {
       feasible.erase(
           std::remove_if(feasible.begin(), feasible.end(),

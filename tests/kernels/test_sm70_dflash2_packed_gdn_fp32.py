@@ -17,7 +17,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 @pytest.mark.parametrize("tp_size", [2, 4])
 @pytest.mark.parametrize("strided_qkv", [False, True])
 @pytest.mark.parametrize("use_bv2", [False, True])
-@pytest.mark.parametrize("batch", [1, 4, 8])
+@pytest.mark.parametrize("batch", [1, 4, 5, 6, 7, 8, 12, 16, 32, 64])
 def test_packed_entry_preserves_fp32_beta_and_strided_state(
     tp_size: int,
     strided_qkv: bool,
@@ -174,6 +174,6 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
             assert torch.all(mixed_storage[:, width:] == -3.0)
     expected_bv = (2 if use_bv2 else 16) if tp_size == 2 else 8
     if batch > 1:
-        expected_bv = 32 if tp_size == 2 else 8
+        expected_bv = 32 if tp_size == 2 or batch > 32 else 8
     assert launches
     assert set(launches) == {((1, dim // expected_bv, batch * v_heads), expected_bv, 1)}

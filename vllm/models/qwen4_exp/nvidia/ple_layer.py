@@ -2091,6 +2091,43 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         """
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
+        if (
+            envs.VLLM_SM70_MTP_PLE_CONV
+            and num_reqs == 1
+            and spec_query_len == 5
+            and self.conv_state_len == 9
+            and self.short_conv_dilation == 3
+            and x_spec.shape in ((5, 10240), (10, 10240))
+            and x_spec.is_cuda
+            and x_spec.dtype == torch.float16
+            and x_spec.is_contiguous()
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_contiguous()
+            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.dtype in (torch.float16, torch.float32)
+            and all(
+                t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
+                for t in (
+                    spec_state_indices_tensor,
+                    spec_query_start_loc,
+                    num_accepted_tokens,
+                )
+            )
+            and current_platform.is_device_capability((7, 0))
+        ):
+            output = torch.empty_like(x_spec)
+            torch.ops._C.qwen38_ple_spec_sm70_out(
+                output,
+                conv_state,
+                x_spec,
+                conv_weights,
+                spec_state_indices_tensor,
+                spec_query_start_loc,
+                num_accepted_tokens,
+            )
+            logger.info_once("SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled.")
+            return output
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len
         # Full CUDA graphs can pad these buffers. Only the first num_reqs

@@ -108,8 +108,10 @@ def main():
     p.add_argument("--layout", choices=("packed", "row-major"), default="packed")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
-    if not envs.VLLM_SM70_QWEN38_BATCH_FASTPATH:
-        p.error("Set VLLM_SM70_QWEN38_BATCH_FASTPATH=1 before startup")
+    if not (
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH or envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
+    ):
+        p.error("Enable BATCH_FASTPATH or GDN_INPUT_BATCH before startup")
     if not hasattr(torch.ops._C, "qwen38_gdn_input_batch_sm70_out"):
         p.error("Build/install this worktree's ordinary SM70 extension first")
     torch.set_num_threads(1)

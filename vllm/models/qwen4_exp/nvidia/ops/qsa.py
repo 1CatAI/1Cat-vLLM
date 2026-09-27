@@ -46,6 +46,7 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 
 
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
+_SM70_QSA_MTP_TOPK = os.getenv("VLLM_SM70_QSA_MTP_TOPK", "0") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
 )
@@ -1504,12 +1505,15 @@ def qsa_select_paged_tokens(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            _sm70_qsa_lexicographic_topk_op()(
-                logits,
-                visible_blocks,
-                blocks,
-                block_topk,
-            )
+            if _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
+                torch.ops._C.qsa_lexicographic_topk(
+                    logits, visible_blocks, blocks, block_topk, True
+                )
+                logger.info_once("Using exact SM70 MTP batch QSA selector.")
+            else:
+                _sm70_qsa_lexicographic_topk_op()(
+                    logits, visible_blocks, blocks, block_topk
+                )
         else:
             topk_op = (
                 torch.ops._C.cooperative_topk

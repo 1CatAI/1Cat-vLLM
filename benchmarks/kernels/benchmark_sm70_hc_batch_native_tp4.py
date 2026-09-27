@@ -93,7 +93,15 @@ def candidate(
     ):
         if communicator is not None:
             communicator.sm70_qwen38_hc_batch(
-                x, d, u, scratch, lora, local, output, injection, fused_chain
+                x,
+                d,
+                u,
+                scratch,
+                lora,
+                local,
+                output,
+                injection,
+                fused_chain=fused_chain,
             )
             continue
         ext.run_down_shard(x, d, scratch)

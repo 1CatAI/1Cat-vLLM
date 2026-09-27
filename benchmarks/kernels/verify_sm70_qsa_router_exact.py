@@ -64,7 +64,7 @@ def paired_timing(control, candidate):
     }
 
 
-def router_screen():
+def router_screen(rows=1):
     def out(rows):
         return (
             torch.empty(rows, 10, dtype=torch.float32, device="cuda"),
@@ -106,12 +106,14 @@ def router_screen():
             assert torch.equal(ref.view(torch.int32), got.view(torch.int32))
         samples += x.shape[0]
 
-    x = torch.randn(48, 512, dtype=torch.float16, device="cuda")
-    a, b = out(48), out(48)
+    # Keep the runtime M specialization and rank-major source-row convention
+    # in the graph, including the five-row MTP4 verifier and ten-row batch.
+    x = torch.randn(48, rows, 512, dtype=torch.float16, device="cuda")
+    a, b = out(48 * rows), out(48 * rows)
 
     def run(dst, packed):
         for i in range(48):
-            launch(x[i : i + 1], tuple(t[i : i + 1] for t in dst), packed)
+            launch(x[i], tuple(t[i * rows : (i + 1) * rows] for t in dst), packed)
 
     ga, gb = capture(lambda: run(a, False)), capture(lambda: run(b, True))
     for _ in range(16):
@@ -125,6 +127,7 @@ def router_screen():
         )
     times = paired_timing(ga, gb)
     return {
+        "rows_per_call": rows,
         "bitwise_rows": samples,
         "changing_graph_replays": 16,
         "control": times["control"],
@@ -244,18 +247,24 @@ def qsa_dynamic_screen(base=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--qsa-library", required=True)
+    parser.add_argument("--qsa-library")
+    parser.add_argument("--router-only", action="store_true")
+    parser.add_argument("--router-rows", type=int, choices=range(1, 17), default=1)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     torch.accelerator.set_device_index(0)
     assert torch.cuda.get_device_capability() == (7, 0)
     torch.manual_seed(20260905)
-    torch.ops.load_library(args.qsa_library)
+    if not args.router_only:
+        if not args.qsa_library:
+            parser.error("--qsa-library is required unless --router-only is set")
+        torch.ops.load_library(args.qsa_library)
     result = {"scope": "model-free GPU operator/graph screen, not endpoint speed"}
-    result["router"] = router_screen()
+    result["router"] = router_screen(args.router_rows)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
-    result["qsa"] = qsa_screen()
-    result["qsa_dynamic"] = qsa_dynamic_screen()
+    if not args.router_only:
+        result["qsa"] = qsa_screen()
+        result["qsa_dynamic"] = qsa_dynamic_screen()
     result.update(
         torch=torch.__version__,
         cuda=torch.version.cuda,

@@ -135,20 +135,18 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
 constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
-// Batch down and output have independent counters and exact half+tag packets.
-// Keep them disjoint from M1 HC and the auxiliary-stream MoE collectives.
+// Separate channels preserve half bits and isolate batch HC from M1/MoE.
 constexpr size_t kSm70Qwen38HcBatchOutputOffset =
-    kSm70Qwen38HcBatchDownOffset + 128 +
+    kSm70Qwen38HcBatchDownOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 88 * sizeof(uint32_t);
-// Fused up/output uses one counter per hidden tile and M8 group. Keep a
-// separate channel: its tile-major packets must never alias the row-major
-// standalone gather when captured graphs alternate between the two paths.
+// Fused up/output has tile-major packets and an independent epoch per block.
 constexpr int kSm70Qwen38HcBatchFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcBatchFusedOffset =
-    kSm70Qwen38HcBatchOutputOffset + 128 +
+    kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
     kSm70Qwen38HcBatchFusedOffset +
@@ -1555,7 +1553,7 @@ static __global__ void __launch_bounds__(512, 1)
   if (tid == 0) self_sg->_flag[0] = pair_flag;
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool CanonicalOrder = false>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
                                T* __restrict__ result, int rank, int size) {
@@ -1572,7 +1570,10 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Medium SM70 messages previously used one-stage canonical rank order.
+    // Preserve that arithmetic when sharing their reduction across devices;
+    // temporary ownership and gather visibility retain the two-stage order.
+    ptrs[i] = (const P*)_dp->ptrs[CanonicalOrder ? i : target];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
@@ -1992,6 +1993,20 @@ class CustomAllreduce {
           sm70_tp8_hierarchical_allreduce_size(bytes)) {
         sm70_tp8_hierarchical_reduce<<<1, 512, 0, stream>>>(
             ptrs, sg_, self_sg_, output, rank_, size);
+        return;
+      }
+    }
+    if constexpr (std::is_same_v<T, half>) {
+      const char* blocks_override =
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+      if (world_size_ == 4 && fully_connected_ && bytes >= 384 * 1024 &&
+          bytes < 512 * 1024 && block_limit == defaultBlockLimit &&
+          (blocks_override == nullptr || blocks_override[0] == '\0') &&
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          std::getenv("VLLM_SM70_TP4_M5_AR_THREADS") == nullptr &&
+          custom_allreduce_current_device_is_sm70()) {
+        cross_device_reduce_2stage<T, 4, true>
+            <<<20, 256, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
         return;
       }
     }

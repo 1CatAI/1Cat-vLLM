@@ -49,7 +49,7 @@ def config():
             )
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=4, use_ubatching=False),
-        speculative_config=None,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4),
     )
 
 
@@ -93,61 +93,28 @@ def test_bad_packing_rejected(shape, dtype, role, rank):
         hc._pack_hc_batch_weight(torch.empty(shape, dtype=dtype), role, rank)
 
 
-def test_batch_contract_does_not_admit_mtp_or_ubatching(config, monkeypatch):
+def test_mtp_contract_rejects_other_modes(config, monkeypatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    assert gemv._batch_runtime_contract(config)
-    config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
-    assert gemv._exact_runtime_contract(config)  # Existing M1/MTP contract.
-    assert not gemv._batch_runtime_contract(config)
+    assert hc._mtp_batch_runtime_contract(config)
+    config.speculative_config.num_speculative_tokens = 3
+    assert not hc._mtp_batch_runtime_contract(config)
     config.speculative_config = None
+    assert not hc._mtp_batch_runtime_contract(config)
+    config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
     config.parallel_config.use_ubatching = True
-    assert not gemv._batch_runtime_contract(config)
+    assert not hc._mtp_batch_runtime_contract(config)
     config.parallel_config.use_ubatching = False
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
-    assert not gemv._batch_runtime_contract(config)
+    assert not hc._mtp_batch_runtime_contract(config)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     config.parallel_config.tensor_parallel_size = 2
-    assert not gemv._batch_runtime_contract(config)
-
-
-def test_full_precision_also_applies_to_control(config, monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "0")
-    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "0")
-    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
-    backend = torch.backends.cuda.matmul
-    backend.allow_fp16_reduced_precision_reduction = True
-    backend.allow_bf16_reduced_precision_reduction = True
-    backend.allow_fp16_accumulation = True
-    gemv.enable_qwen38_sm70_fp16_gemv(torch.nn.Module(), torch.float16, config)
-    assert not backend.allow_fp16_reduced_precision_reduction
-    assert not backend.allow_bf16_reduced_precision_reduction
-    assert not backend.allow_fp16_accumulation
-
-
-@pytest.mark.parametrize("enabled", (False, True))
-def test_nomtp_policy_does_not_overwrite_explicit_mtp_policy(
-    config, monkeypatch, enabled
-):
-    config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
-    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "0")
-    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
-    backend = torch.backends.cuda.matmul
-    for name in (
-        "allow_fp16_reduced_precision_reduction",
-        "allow_bf16_reduced_precision_reduction",
-        "allow_fp16_accumulation",
-    ):
-        monkeypatch.setattr(backend, name, enabled)
-    gemv.enable_qwen38_sm70_fp16_gemv(torch.nn.Module(), torch.float16, config)
-    assert backend.allow_fp16_reduced_precision_reduction == enabled
-    assert backend.allow_bf16_reduced_precision_reduction == enabled
-    assert backend.allow_fp16_accumulation == enabled
+    assert not hc._mtp_batch_runtime_contract(config)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_hc_loader_tags_only_when_admitted(config, monkeypatch, enabled):
     monkeypatch.setenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "1")
-    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", str(int(enabled)))
+    monkeypatch.setenv("VLLM_SM70_MTP_HC_BATCH", str(int(enabled)))
     monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     monkeypatch.setattr(hc.current_platform, "is_device_capability", lambda _: True)
@@ -169,9 +136,9 @@ def test_hc_loader_tags_only_when_admitted(config, monkeypatch, enabled):
             assert type(layer.quant_method) is UnquantizedLinearMethod
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 8, 16, 17])
+@pytest.mark.parametrize("rows", [1, 2, 5, 10, 16, 17])
 def test_cpu_rejected_and_fake_shapes(rows, monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_SM70_MTP_HC_BATCH", "1")
     x = torch.empty(rows, 10240, dtype=torch.float16)
     assert not hc._batch_runtime_ok(x, None, None)
     fake = hc._qwen38_sm70_fp16_fused_hc_fake(x, x, x, x, x)
@@ -202,70 +169,3 @@ def test_packed_hc_survives_fake_export():
         if node.target == torch.ops.vllm.qwen38_sm70_fp16_fused_hc.default
     ]
     assert len(calls) == 1 and len(calls[0].args) == 5
-
-
-def test_admitted_hc_selects_fused_native_output(monkeypatch):
-    from vllm.distributed import parallel_state
-
-    calls = []
-    communicator = SimpleNamespace(
-        can_sm70_qwen38_hc_batch=lambda x: True,
-        sm70_qwen38_hc_batch=lambda *args, **kwargs: calls.append((args, kwargs)),
-    )
-    monkeypatch.setattr(hc, "_batch_runtime_ok", lambda *args: True)
-    monkeypatch.setattr(
-        parallel_state,
-        "get_tp_group",
-        lambda: SimpleNamespace(
-            device_communicator=SimpleNamespace(ca_comm=communicator)
-        ),
-    )
-    x = torch.empty(2, 10240, dtype=torch.float16)
-    block, injection = hc._qwen38_sm70_fp16_fused_hc(
-        x, x, x, x, x, concurrent_batch=True
-    )
-    assert calls[0][1] == {
-        "round_down_partials": False,
-        "cooperative": False,
-        "full_unroll": False,
-        "fused_chain": True,
-    }
-    assert calls[0][0][6] is block and calls[0][0][7] is injection
-    assert block.shape == (2, 2560) and injection.shape == (2, 4)
-
-
-@pytest.mark.parametrize(
-    "role,shape",
-    [
-        ("mlp.gate", (512, 2560)),
-        ("linear_attn.out_proj", (2560, 1536)),
-    ],
-)
-@pytest.mark.parametrize("policy", ("normal", "disabled", "mtp", "ubatch", "invariant"))
-def test_dense_loader_permission_respects_batch_contract(
-    config, monkeypatch, role, shape, policy
-):
-    class Dense(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.empty(shape, device="meta"))
-            self.prefix = "model.layers.0." + role
-            self.quant_method = UnquantizedLinearMethod()
-
-    monkeypatch.setattr(gemv, "LinearBase", Dense)
-    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
-    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
-    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
-    monkeypatch.setenv(
-        "VLLM_SM70_QWEN38_BATCH_FASTPATH", str(int(policy != "disabled"))
-    )
-    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(policy == "invariant")))
-    if policy == "mtp":
-        config.speculative_config = SimpleNamespace(
-            method="mtp", num_speculative_tokens=4
-        )
-    if policy == "ubatch":
-        config.parallel_config.use_ubatching = True
-    layer = Dense()
-    gemv.enable_qwen38_sm70_fp16_gemv(layer, torch.float16, config)
-    assert layer._sm70_qwen38_dense_batch == (policy == "normal")

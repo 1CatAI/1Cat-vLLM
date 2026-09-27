@@ -256,6 +256,12 @@ class Qwen2MoeMLP(nn.Module):
                         "SM70 Qwen3.8 batch shared-expert sigmoid/multiply "
                         "fusion enabled (linear unchanged)."
                     )
+            if not used_batch_epilogue and (
+                getattr(self.gate_up_proj, "_sm70_mtp_prepare_shared_batch", False)
+                and use_sm70_decode_graph_semantics()
+            ):
+                out = torch.ops.vllm.qwen38_sm70_shared_gate_mul(expert_gate, out)
+                used_batch_epilogue = True
             if not used_batch_epilogue:
                 expert_gate = F.sigmoid(expert_gate)
                 expert_gate = _sm70_dump_qwen_mlp_tensor(

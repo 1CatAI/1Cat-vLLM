@@ -80,7 +80,7 @@ def test_dense_permission_survives_fake_export():
     class Project(torch.nn.Module):
         def forward(self, x, weight):
             return torch.ops.vllm.qwen38_sm70_fp16_gemv(
-                x, weight, "model.layers.0.linear_attn.out_proj", True
+                x, weight, "model.layers.0.linear_attn.out_proj", dense_batch=True
             )
 
     args = tuple(

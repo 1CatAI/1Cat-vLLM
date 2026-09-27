@@ -33,9 +33,12 @@ def full_precision_reductions():
     envs.disable_envs_cache()
 
 
-def test_default_off(monkeypatch):
-    monkeypatch.delenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", raising=False)
-    assert not envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+@pytest.mark.parametrize(
+    "name", ("VLLM_SM70_QWEN38_BATCH_FASTPATH", "VLLM_SM70_QWEN38_GDN_INPUT_BATCH")
+)
+def test_default_off(monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    assert not getattr(envs, name)
 
 
 @pytest.mark.parametrize("n", (24, 4096))
@@ -60,7 +63,7 @@ def test_cpu_and_missing_pack_rejected(monkeypatch):
     assert not _can_use_packed_gdn_input(torch.empty(8, 2560), None, None)
 
 
-@pytest.mark.parametrize("m", (1, 2, 16, 17, 8192))
+@pytest.mark.parametrize("m", (1, 2, 5, 10, 16, 17, 8192))
 def test_fake_shapes(m):
     x = torch.empty(m, 2560, device="meta", dtype=torch.float16)
     outputs = _qwen38_sm70_fp16_gdn_input_fake(x, x, x, x, x)
@@ -119,6 +122,22 @@ def test_unsupported_batch_falls_back(cuda_weights, monkeypatch, m):
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.parametrize("m", (5, 10))
+def test_fp16_accumulation_falls_back(cuda_weights, monkeypatch, m):
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", True)
+    envs.disable_envs_cache()
+    q, b, pq, pb = cuda_weights
+    x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
+    assert not _can_use_packed_gdn_input(x, pq, pb)
+    for actual, expected in zip(
+        _qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb),
+        _qwen38_sm70_fp16_gdn_input(x, q, b),
+    ):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("which", ("x", "q", "b"))
 def test_unaligned_storage_falls_back(cuda_weights, monkeypatch, which):
     monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
@@ -137,7 +156,7 @@ def test_unaligned_storage_falls_back(cuda_weights, monkeypatch, which):
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("m", (2, 7, 9, 16))
+@pytest.mark.parametrize("m", (2, 5, 7, 9, 10, 16))
 @pytest.mark.parametrize("row_major", (False, True))
 def test_native_output_canaries(cuda_weights, m, row_major):
     q, b, pq, pb = cuda_weights

@@ -495,6 +495,9 @@ class CustomAllreduce:
         local_output,
         output,
         injection,
+        round_down_partials: bool = False,
+        cooperative: bool = False,
+        full_unroll: bool = False,
         fused_chain: bool = False,
     ) -> None:
         ops.sm70_qwen38_hc_batch(
@@ -507,6 +510,9 @@ class CustomAllreduce:
             local_output,
             output,
             injection,
+            round_down_partials,
+            cooperative,
+            full_unroll,
             fused_chain,
         )
 

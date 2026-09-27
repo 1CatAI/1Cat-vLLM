@@ -48048,3 +48048,458 @@ has launched no full model. Details and artifacts are in
   items; merging does not mark them as passed. Capability-based defaults need
   no additional enable switches. Public API and gateway were stopped at the
   user's request; local benchmark services are shut down.
+
+## 2026-09-27 DFlash2 C4/C6/C8 target continuation (PR #708)
+
+The next targets remain **unmet**: C4 +10%, C6 +15%, C8 +20% over the
+conservative frozen PR #706/GDN-only baselines. The retained default
+candidate adds full and masked M48 compressed-weight tiles, an exact
+eight-lane attention softmax layout and canonical-order 384–512-KiB TP4
+reduction. Ordinary 32K/256 all-live pure decode is
+447.421/666.955/730.373 tok/s, or +2.46%/+13.31%/+1.69%; required rates are
+480.345/676.925/861.921. All 76 token arrays and speculative counters match,
+and long retrieval/natural stops remain 8/8. No new enable switch or weight
+copy is required. Source and expanded GPU checks are in PR #708.
+
+Do not repeat the rejected deeper prefetch, extra M64 tile, forced-register
+cap, paired-half scale or L2-prefetch candidates without new evidence.
+Relaxing split-K partitions improved the M64 GEMM estimate by only 4.1%
+and changed output bits; it was reverted, with no acceptance claim. Fresh
+M32/M64 NCU counters, failed correctness checks, exact build hashes and
+all endpoint qualifications are in the
+[M48 implementation and profiling report](sm70_dflash2_m48_scaling_20260927.md).
+M64 representative kernels do not saturate DRAM; low resident-warp counts,
+instruction/data dependencies and long-attention work remain relevant.
+The report distinguishes these diagnostic counters from endpoint speed.
+
+Main advanced to `db292f9a49` (PR #703) during this frozen comparison and
+was integrated in `bec7cb784c`. The integrated normal extensions build and
+269 GPU/graph regression checks pass. The figures above retain their
+frozen performance baselines; shared 35B-A3B AWQ/FP8 endpoint gates remain
+open. The owner requested merging this verified increment on 2026-09-27;
+the unmet C4/C6/C8 targets remain follow-up work. The integration audit
+and artifact hashes are recorded in the implementation report.
+
+Post-integration ordinary serving on idle GPUs 0–3 preserves all 19 token
+arrays and speculative counters across one C1/C4/C6/C8 wave, with 8/8
+long-retrieval answers and natural stops. This is correctness evidence,
+not a replacement speed baseline. Startup KV capacity is 11.00 GiB versus
+the prior 11.45 GiB; the existing capacity qualification remains open.
+The tested private service is stopped and public serving remains off.
+
+## 2026-09-27 DFlash2 M48 coverage and scaling audit
+
+- Main after PR #706 remeasured at 32K/256, TP4, E4M3 KV, prefix caching and
+  ordered admission. C1/C4/C6/C8 all-live decode medians are
+  162.364/436.677/578.872/704.171 tok/s. C6 is M48 with no graph padding to M64;
+  its GEMM already uses the SM70 batch path. See the
+  [M48 trace and coverage report](sm70_dflash2_m48_scaling_20260927.md).
+- Full-q8 whole GPU rounds are 20.825/33.274/47.913/50.695 ms. At 32K,
+  attention is the largest C1→C4 increment. GEMM is the largest C4→C6
+  increment; M48's GEMM cost is almost the same as M64's. The M64 full-tile
+  iterator must not be admitted at M48 without implementing safe tail loads.
+- Close the separate GDN omission: replace the C4/C8 whitelist by the measured
+  SM70 q8 operator range N4–N32, with identical recurrence and FP32 state
+  snapshots. No quantization/model-name gate, new runtime flag or native
+  artifact is added. Preserve BV32 above N32: the B64 BV8 screen regressed
+  1.06%. The expanded exact-state/replay suite passes 80 GPU tests.
+- C6's GDN screen saves 17.46% per layer; ordinary serving improves
+  578.872→588.630 tok/s (+1.69%). All 76 fixture requests have exact matching
+  token IDs and speculative counters; natural retrieval remains 8/8 correct
+  and 8/8 stops. Do not attribute the unchanged full-C8 route's endpoint
+  median fluctuation to this patch.
+- Retain the startup KV-budget difference (11.45 versus 11.00 GiB) separately:
+  both actual graph pools are 0.99 GiB, but total capacity equality is not
+  established. The baseline C6 480-KiB one-stage versus C8 640-KiB two-stage
+  reduction discontinuity is addressed by the later Draft #708 candidate
+  above; the capacity qualification remains separate.
+
+## 2026-09-27 MTP4 batch GDN input qualification
+
+- Keep the accepted 27.3963-ms complete-round reference. The target verifier
+  is M5/M10 batch decode; M1 GEMV remains the single-token/draft route.
+- Reuse PR #692's packed GDN input operator at `bcf0efa914`, on integration
+  base `b034648012`. This scope imports no other no-MTP candidates from that
+  PR. The existing shared split-copy fallback is already present on main.
+- `VLLM_SM70_QWEN38_GDN_INPUT_BATCH` remains opt-in while M5/M10 real-weight
+  bit parity, engine token/acceptance parity, memory and complete-round timing
+  are qualified. Do not infer MTP performance from the previous M2/4/8/16
+  component benchmark or repeat the rejected generic FP16 GEMM substitution.
+- Build and measurements use the owned source tree and CUDA 12.8, with no
+  wheel packaging. Record results and commands in the
+  [MTP4 batch GDN report](sm70_flash_next_mtp4_batch_gdn.md).
+- The batch candidate passes the component and full-model gates: 114 targeted
+  tests pass; all 36 real target GDN weight pairs across four TP slices are
+  FP16-bit exact; fixed and natural endpoint token IDs and MTP acceptance
+  statistics are identical. On the matched 8192/513 fixture, complete-round
+  median falls from 27.309572 ms (control) to 26.495768 ms (candidate), a
+  0.813804-ms (2.980%) saving. Natural EOS rounds also improve by
+  0.550--0.606 ms.
+- Keep the new environment variable default-off for now. Retaining packed
+  QKVZ/BA buffers adds 725.625 MiB per rank and reduces the engine's KV cache
+  from 153,910 to 122,631 tokens (maximum concurrency 4.70x to 3.74x). The
+  next optimization is to preserve the batch-decode speed without duplicating
+  the original weight storage; only then revisit a default-on change.
+- The trace confirms this is a batch Tensor Core path, not GEMV: the critical
+  target graph is 28.389041 to 26.740710 ms, dense service drops 9.735184 to
+  7.667470 ms, and 36 `gdn_input_batch_kernel` launches account for
+  1.306008 ms/round. Nsight Compute counters remain unavailable because the
+  driver returns `ERR_NVGPUCTRPERM`; do not claim measured occupancy or HBM
+  utilization.
+
+## 2026-09-27 MTP4 grouped experts and gated norm
+
+- The complete unprofiled MTP4 round must be below 20 ms, retaining the frozen
+  Flash-Next TP4/8K/513/MTP4 workload. Target-only verifier times do not qualify.
+- Extend existing grouped batch experts to M5, preserving W13 split4 and all
+  FP16 boundaries; reuse PR #692's grouped W2/ordered reduction at `2c5b584468`.
+  Add the common N128 native gated RMSNorm fusion, including sigmoid, with
+  ATen's exact vector4 mean and pointwise arithmetic. Both new flags are
+  opt-in: `VLLM_SM70_NVFP4_MOE_GROUPED_MTP5` and
+  `VLLM_SM70_RMSNORM_GATED_EXACT`.
+- Source-built component gates pass: four TP expert weight slices, changing
+  routes/inputs, 36 real norm weights, CUDA Graph poison/canary checks and all
+  FP16 gate payloads. See the [batch decode report](sm70_flash_next_mtp4_batch_gdn.md)
+  for commands, native hashes and the corrected test-fixture failure.
+- Same-build, same-GPUs0--3 full-model pair: with packed GDN enabled in both,
+  complete-round median **26.696061 -> 23.849974 ms**, saving **2.846087 ms
+  (10.6611%)**. Fixed repeats and all three natural EOS outputs retain every
+  token and acceptance count. KV capacity remains 122,631 tokens. The
+  less-than-20-ms target is still **3.849974 ms away**.
+- After ordinary timing, separate CUDA-event profiling gives critical-rank
+  target forward 18.208780 ms, verifier GPU 18.963904, drafts 5.038821 and total
+  wall 24.155889. The 18.96-ms verifier is not the complete-round result.
+- Do not repeat rejected screens: original-layout HC down regresses; packed
+  HC gives about 0.47 ms projected over 96 pairs but needs roughly 1.20 GiB/rank
+  and regresses M10 down; shared-gate vector8 dot changes FP16 logits. A fused
+  packed output projection is exact at M5 but costs 22--28 us versus 16--17 us;
+  its M10 arithmetic differs and is rejected without a model run.
+- Full reports and negative evidence remain in this task's `.artifacts/`.
+  No wheel is built; no private research extension is used in model runs.
+- Implementation is published as Draft PR #703 at `45248dc8d4`; main
+  `1e90d17f2c` is merged at `2e4369373a`. Normal source rebuild succeeds and
+  post-merge CPU regressions give 108 passes/8 GPU skips. These do not replace
+  the accepted endpoint pair's original source and extension identity.
+- Draft follow-up closes the old node-trace rank0 wall at 5.271298 ms, with
+  4.790127 ms kernel union and 0.481171 ms gaps. Full local vocabulary heads
+  use 1.883523 ms, MoE projection service 0.822872 ms; the M1 W13 grid has 30
+  CTAs and the compiled SM70 Triton path uses FP32 FMA rather than MMA.
+  Historical tuned tiles and local argmax are already on. Screen projection
+  geometry before another engine run; retain full-vocabulary sampling.
+- Reject `mtp_stack_trace` for kernel attribution: it contains no kernel
+  activity table. The follow-up explicitly flushes all TP workers before
+  shutdown. Do not substitute its profiled wall for the unprofiled baseline.
+- `mtp_stack_trace_flush` recovers four-rank kernel records and 84 closed
+  rounds. Capture shutdown exits 143 and prevents the later phase request;
+  retain the valid intervals plus this failure. Rank0 profiled cycle is
+  29.679408 ms, target graph 22.614401 and draft (excluding combine)
+  5.262167 ms. Target gaps include 3.661182 ms inside graph-launch API;
+  neither profiled time nor subtracted gaps are a new endpoint claim.
+- The draft screen preserves every FP16 bit and admits an original-layout
+  native projection schedule: M1 W13 105.395 -> 61.395 us, M1 W2
+  24.960 -> 13.024 us; captured first-draft M5 routes improve W13
+  170.989 -> 88.070 us and W2 95.258 -> 52.294 us. Native integration is
+  opt-in (`VLLM_SM70_MTP_MOE_FP16_EXACT`); normal-build GPU/model gates are
+  pending. Keep full vocabulary and target batch decode.
+- Reject original-layout GDN: exact M5 36-layer chain regresses from
+  1.104200 to 1.444454 ms even with read-only loads; M10 also regresses.
+  Do not spend another full-model run on this variant.
+- Normal-build draft tests pass 14 cases; the real-weight benchmark covers
+  all four TP slices and 16 M1/M5/W13/W2 cases at six scales with zero bit
+  differences. Native `_C` SHA256 is
+  `647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`.
+- The first engine candidate missed the native route because modular
+  `TritonExperts` bypassed the common dispatcher. Retain the stopped attempt
+  (exit -15), route both projections through the common entry, and require
+  the native route log in the corrected candidate. Two additional GPU tests
+  verify this modular entry, both operator hits and graph output bit parity.
+  The same-GPU control completes at **23.950179 ms**; its corrected candidate
+  remains pending. Do not relabel the older 23.849974-ms pair.
+- The refreshed Nsight report warns of unsupported driver CUDA 13.0 and
+  possibly incomplete CUDA/NVTX records on all four workers. Empty intervals
+  mean no recorded kernel; they do not prove removable GPU idle time.
+- Reject original-layout HC shared staging: exact M5 13.664 ->
+  18.052--21.776 us and M10 14.424 -> 20.924--23.592 us. Asking the identical
+  kernel to prefer L1 also gives no gain (M5 12.696 -> 12.716 us). Retain
+  `hc_up_original_shared` and `hc_up_cache`; skip full-model runs for both.
+- Draft-MoE full-model gate completes on GPU4--7 at source `6bcffbb796`,
+  same native extension and engine settings in both arms. Only the new draft
+  flag changes. Fixed 8192/513 round median is **23.874188 -> 23.657858 ms**,
+  saving **0.216330 ms (0.9061%)**. The <20-ms objective is still unmet by
+  3.657858 ms. Do not subtract this delta from a different historical pair.
+- Both fixed repeats and all three natural EOS cases preserve every token,
+  finish reason and acceptance count. Natural outputs stop at 284/329/421
+  tokens and pass the code/arithmetic/explanation health checks. Natural
+  round timings do not improve (24.957797/24.920565/24.962826 ->
+  25.067507/25.013588/24.962961 ms). Keep the new draft flag opt-in; no
+  universal throughput gain or default-on qualification is claimed.
+- Separate per-rank CUDA-event draft means fall from 5.011584--5.034362 to
+  4.879756--4.902546 ms. This is less than the isolated projection saving.
+  A new node trace is needed to inspect actual scheduling; event-profiled
+  or heavily traced request timing is not a replacement endpoint result.
+- Retain the pre-weight-load GPU4--7 resource-conflict failure. The
+  successful retry reused its completed same-GPU control and waited for
+  foreign jobs to exit, without changing the .95 memory contract. Normal
+  model memory remains 23.61 GiB, with 122,631 KV tokens.
+- The real-weight full-vocabulary head screen finds no exact cuBLASLt gain.
+  Reject other full-head algorithms for FP16-logit differences. Raw fused
+  top1 additionally rounds products to FP16 via `__hmul2`, violating this
+  arithmetic contract; six matching selected tokens do not admit it.
+- Reject the Nsight 2025.3.2.474 model capture: it completes generation and
+  profiler RPCs but emits no report. A tiny reproduction identifies CUPTI
+  13.1 `CUPTI_ERROR_INVALID_DEVICE` and zero CUDA events. The same smoke with
+  isolated 2025.3.1.90/CUPTI 12.9 captures exactly 40/40 graph kernels. A
+  driver-version warning remains, so preserve diagnostics and distinguish
+  unrecorded intervals from idle. This is the gate for one model recapture.
+  Model runtime/build remain unchanged; do not install Nsight 2025.4+ for
+  Volta, which those versions no longer support.
+
+### Current-build draft trace and long-tail screen, 2026-09-27
+
+- `mtp_draft_exact_trace2531` exits 0 and preserves the 129-token request and
+  85/43 draft/accepted counts. Four ranks and 84 closed intervals pass the
+  marker checks: 2,060 target and 298 draft kernels each; every round uses
+  exactly 1 M5 W13 + 3 M1 W13 + 4 W2 native projections. Keep compatibility
+  diagnostics. The 29.391136-ms profiled cycle is not the 23.657858-ms ordinary
+  endpoint. Target graph-launch overlap explains a large part of its extra
+  unrecorded span, without establishing all such spans as idle.
+- Current traced rank0 draft wall is 5.027947 ms: full heads 1.881527, MoE
+  0.613238, other dense 0.629245, sampling/state 0.544494, communication/waits
+  0.405687, attention 0.343567, HC 0.199544, overlap 0.067603, unrecorded
+  0.343043. Target dense service is 7.565656 ms, including 3.022150 ms HC
+  down/up; HC postops add 1.055227 ms service. Service is nonadditive.
+- Native M1 W13 has 62--73-us medians but 171/1,008 traced calls exceed
+  250 us. Do not equate isolated 59--64-us timing with all model calls.
+  Changed-route screens, 64-MiB cache flush, Nsight on/off and 24-GiB strided
+  address pressure do not reproduce those tails (direct64 maxima <=101 us).
+  Preserve `draft_moe_{context,tlb}_screen*`; do not re-run these hypotheses
+  or install a new schedule from a cold-only component win.
+- The discriminating next observation is CUDA-event timing within the
+  resident draft graph without CUPTI, actual routes and rank arrival times.
+  Root cause remains unresolved. Prioritize target batch dense/HC fusion
+  for the remaining several milliseconds; the <20-ms goal is still unmet.
+- The task-local graph-event observer passes a three-replay changed-route,
+  counter and bit-parity smoke. Its first resident attempt fails before
+  weight loading when a foreign service races startup (20.43 GiB free versus
+  the unchanged 30.15-GiB request). Preserve the failed log and pending
+  observer; there is no resident no-CUPTI result yet. Both GPU groups are
+  occupied at this checkpoint. No model/code change or quality regression
+  is inferred from this resource failure.
+- The bounded retry subsequently completes on idle GPU4--7; all tokens,
+  acceptance and cross-rank route IDs agree. The resident runner replays
+  **one captured M1 graph three times**. Its end-of-proposal event value
+  therefore covers only the last M1 step, not three independent kernels.
+  On 84 aligned rounds/rank, last-step event means are 75.447/65.938/66.280/
+  75.106 us; all maxima <=82.944 us. The node trace has 39/336 last-step
+  calls >250 us, versus zero in this instrumented no-CUPTI observation.
+  Record measurement sensitivity, not a proven ordinary scheduling bug.
+  An existing stream-synchronize API overlaps both fast and slow traced
+  calls and is not a causal explanation. Preserve the observer source/hash
+  and comparison artifacts. Any follow-up must collect after each graph
+  replay before overwrite; do not repeat the end-of-proposal-only observer.
+- Next exact component decisions: extend the existing FP16 router packed32
+  key to its admitted M<=16 batch route. Original FP32 normalization and all
+  three outputs remain bitwise; 48-call M5/M10 savings are approximately
+  0.05 ms. Reuse the existing mixed-QKV fused recurrence for pure small-M
+  MTP, behind `VLLM_SM70_FUSED_SIGMOID_MIXED_QKV`; 36-layer M5 copy-chain
+  1.097771 -> 0.615125 ms, M10 1.256832 -> 0.784512 ms, all output/FP32
+  state bits exact in ten changing graph checks. These are component gates,
+  not a new complete-round result. CPU guards: 18 pass, ten GPU integration
+  checks and full-model admission pending at this checkpoint.
+- Reject original-layout HC split-stage schedules: exact but M5
+  17.024 -> 18.702 us, M10 16.098 -> 20.422 us. Do not model-test those
+  variants. CuBLAS uses 480 single-warp CTAs versus this prototype's 220;
+  a masked-quad 420/840-CTA hypothesis and reuse of PR #704's up/mix kernel
+  under original MTP precision are separately pending component screens.
+  PR #504 sharding changes replicated GEMM association and is not an exact
+  shortcut. Preserve artifacts and follow-up decisions in
+  `docs/design/sm70_flash_next_mtp4_batch_gdn.md`. The qualified endpoint
+  remains 23.657858 ms; <20 ms is still unmet.
+- Loader source `8a99ccb4ea` passes changed-file pre-commit/mypy. The combined
+  15-minute GPU wait expires before CUDA starts; ten new integration tests
+  and the two HC follow-ups remain unrun, not failed numerical gates.
+  All eight cards have foreign owners. No owned waiter/worker remains;
+  resume the retained `run_mtp_pending_gates.py` without repeating successful
+  router/mixed-loader components or the rejected HC split-stage schedules.
+- CPU-only MTP recurrence follow-up: the existing trace has 48 CTAs for 80
+  SMs. BV16 with unchanged four warps/stages3 compiles to the same K/state
+  and Q/K-normalization layouts as BV32, doubles M5 CTAs to 96 and uses
+  80 versus 117 registers in the isolated pair (zero spills). The actual
+  trace's 119-register binary remains separately identified. No measured
+  occupancy, bitwise equivalence or speedup follows from compilation alone.
+  `gdn_mtp_value_tile.py` is the fourth pending component job; no runtime
+  schedule/default changed. Preserve this distinct hypothesis and do not
+  repeat the rejected global BV8/recurrent-schedule overrides.
+- The next 600-second lease wait also expires before CUDA starts
+  (`mtp_pending_gates_retry1.log`). Both foreign TP4 groups remain active;
+  the four prepared jobs and model admission are unrun. No owned worker or
+  pending wait process remains. Latest qualified complete round stays
+  23.657858 ms, with <20 ms still unmet.
+- Capture qualification correction: the 29.391136-ms node trace is not an
+  admitted absolute decomposition of the ordinary 23.657858-ms round. Its
+  request's own decode metrics give 29.350420 ms (0.139% closure difference),
+  but use 129 rather than 513 output tokens and lack matched capture-off
+  controls. The separate phase observer's enclosing request is 26.885772 ms,
+  +13.64%; its target/round event fences preclude calling it an unperturbed
+  breakdown. The phase observer was disabled in the node trace.
+- A correlation-ID audit finds target graph host launch 4.116641 ms for
+  2,060 nodes, versus draft 0.232171/0.163631 ms for 81/65 nodes. This is a
+  capture-overhead lead, not evidence that all unrecorded gaps are idle or
+  removable. Retain the existing Nsight-2025.3.2 invalid-device/no-events
+  failure. New clean/graph/node calibration scripts fix 8192/513, warm the
+  actual shape, compare identical resident-engine before/during/after
+  requests, avoid CUDA-event fences and require token/acceptance equality
+  plus a 3% perturbation/drift gate. The first launch was rejected before
+  CUDA by a foreign GPU4--7 lease; no new speed/trace result or owned waiter
+  exists. See the detailed capture audit in the MTP batch qualification doc.
+- Completed capture calibration on source `e7df523a3c`, normal native SHA256
+  `647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`,
+  physical GPUs4--7, same warmed 8192/513 MTP4 fixture, pinned host PLE,
+  four acceleration flags on and mixed-QKV off. Clean rounds are
+  23.686521/23.704239/23.700977 ms (mean 23.697246). Nsight whole-graph
+  off/on/off is 25.176410/25.350714/25.460508 ms: inactive injection is
+  already +6.841% against clean, so the arm is rejected and node collection
+  is skipped. Three ranks also each lack one target-graph record. Retain
+  the graph audit; do not repeat this failed arm as an absolute timing path.
+- Deferred CUDA-event observation preserves asynchronous execution and reads
+  timing only after the request. Same-engine off/on/off is
+  23.602294/23.799931/23.691980 ms, +0.646% capture perturbation and 0.380%
+  control drift; every output ID, finish reason and acceptance statistic
+  matches. There are 336 target starts / 6,720 unique events on each rank,
+  closing 335 intervals. Correct the parser's original start-count versus
+  request-draft-counter mistake without rerunning GPU work; its failure is
+  retained. Independent raw-event/identity/quality checks pass.
+- The calibrated rank0 cycle is **23.783247 ms**, within 0.071% of the
+  enclosing request: target forward 17.781912, sampling/state handoff
+  0.780647, four drafts 4.627054, next-round preparation 0.593635 ms.
+  Draft replay envelopes are 1.329739/1.081356/1.058597/1.051968 ms, with
+  0.105394 ms outside their graphs. All four rank-local cycle means agree
+  within 0.000171 ms. Per-ordinal slowest complete-rank intervals average
+  23.813001 ms; never sum independent category maxima. These are replay/
+  phase envelopes including waits, not per-kernel service or utilization.
+- Raw events, closed intervals, Chrome/Perfetto trace and reviewed PNG/SVG
+  are under `mtp_capture_calibration_deferred_20260927*` and
+  `calibrated_mtp_trace_view/` in the owned artifact directory. Target
+  forward is about 75% of the cycle; split HC/GDN/experts/attention within
+  it next under the same admission gate. The old kernel-level Nsight
+  breakdown and SM/HBM counters remain unqualified. <20 ms is still unmet.
+  No foreign service was stopped, no wheel was built, and all owned
+  measurement/waiter processes have exited.
+- User-requested forward planning estimate reclassifies the two retained
+  node traces using 97 HC boundaries and 2,060 kernels per rank/round.
+  Same-module overlap is unioned; HC includes its projections, while the
+  extra PLE GEMM is removed from HC up. Estimated budgets are HC 4.293,
+  MoE 4.307, GDN 3.774, QSA 2.908, PLE/preparation 0.607 and TP/waits
+  0.909 ms. These inherit old kernel timing and are not current internal
+  measurements. The 0.934-ms balancing residual is not measured idle.
+  Preserve `mtp_forward_module_estimate_20260927.{json,md}` and its parser.
+- HC audit confirms current M5 projections are replicated on TP4; the
+  admitted exact HC shard/gather path only accepts M1. Batch output-sharding
+  is a new candidate, subject to unchanged reduction/materialization and
+  communication-cost checks. Do not port PR #504 as an exact speedup.
+- On idle, leased GPU4, source `63ad3e255b` and the unchanged normal `_C`,
+  only the two previously pending HC components run. More-CTA original-layout
+  down remains exact but slower: M5 17.022->18.510 and 16.324->18.116 us;
+  M10 also regresses. Reject without a model run. PR #704's selected
+  register up/mix under original MTP precision is exact on eight checkpoint
+  pairs/seven scales and improves M5 14.516->10.738 us, M10
+  15.422->11.946 us. The 96-module extrapolation is 0.363 ms at M5, not a
+  measured endpoint saving. Packed-up duplication would cost 0.586 GiB/rank.
+  Resolve source integration, memory and model quality/speed before promotion.
+  Retain `hc_evidence_20260927_contract.json`, JIT hashes and raw reports in
+  the owned artifact directory. Both research processes exit 0; GPU4 is
+  released. No model reload, wheel, runtime/default change or foreign stop.
+  The GDN gates/current internal trace remain pending; <20 ms is still unmet.
+- MTP HC batch integration reuses pinned PR704's arithmetic with the original
+  MTP FP16 split-partial rounding and FP32 reduction order. Cooperative HC,
+  exact router projection and mixed-QKV integration qualify **22.094242 ms**
+  per ordinary complete round on GPU4--7, versus the independent 23.697246-ms
+  clean baseline. Fixed/natural token IDs, EOS and acceptance are unchanged.
+  Same-engine deferred trace overhead is +0.205%; its 22.127934-ms closed
+  cycle splits into target 16.183720, sampling/state 0.766432, four drafts
+  4.607666 and preparation 0.570115 ms. Source `3b7365925f` and full contracts
+  are in the detailed MTP batch report. <20 ms remains unmet; no wheel.
+- Do not repeat rejected BV16 GDN, grouped-W13 unroll40/N16, HC half-tile,
+  per-tile gather, N8 down, or M1 norm-reduction-at-M5 experiments. The new
+  Triton QSA scorer is removed: actual page204 causes register spilling and
+  a ~5x component regression despite exact outputs. `tl.dot` here lowers to
+  scalar FP32 FMA, not Tensor Core MMA. Native exact scorer screens are
+  neutral at M5. Keep original scoring.
+- Exact HC full unroll and QSA short-row compaction pass component/native
+  gates, but their combined source `732e184173` measures 22.325730-ms ordinary
+  rounds, failing to exceed the prior best. Its trace overhead is +0.476%;
+  all fixed/natural quality counters match and sampled GPU clocks do not
+  throttle. Both HC schedules now remain selectable for same-process A/B/A.
+  The partial router-key sort is bit-exact and saves about 0.06 ms per target
+  component chain; its model gate is pending. The resident harness avoids
+  reloading weights for each schedule and retains inspectable graph metadata.
+  Preserve all `mtp_hc_*candidate_20260927*` contracts/events and component
+  rejections; do not promote extrapolated savings or repeat completed gates.
+
+- Resident HC/QSA/router A/B/A now qualifies a modest 22.156515->22.005602-ms
+  combined improvement, preserving fixed/natural output IDs and acceptance.
+  The 194-event internal observer is rejected (+23.753% perturbation);
+  selecting the actual bucket32768 graph and checking unique invocation
+  counts are mandatory. Empty cloning itself stays close to the control.
+  Globaltimer kernel-node research passes a tiny graph gate; no current
+  internal absolute attribution is admitted yet.
+- New default-off shared-expert M5/M10 Tensor Core/SiLU and sigmoid/multiply
+  fusions pass 49 checkpoint modules x four TP slices x seven scales and
+  36 native/fallback tests, preserving FP16 boundaries and scalar projection.
+  Source build adds 76.5625 MiB/rank packing. Full-model admission is pending.
+  The one-warp GDN screen is exact but saves only about 0.056 ms per M5
+  component chain; avoid a new model load solely for it. Keep all rejection
+  and source identities in the detailed MTP report. The <20-ms goal is unmet.
+
+- Shared-expert fusion completes fixed and natural quality gates with exact
+  IDs/EOS/acceptance. Ordinary mean is 21.722330 ms (21.662596/21.782064),
+  outer events add 0.306%. A later research timestamp-template capture fails
+  outside inference mode; reject that diagnostic attempt and keep the earlier
+  completed performance/quality segment. Fresh ordinary confirmation and
+  admitted internal trace are still pending; <20 ms remains unmet.
+
+- Source-built single-request MTP4 PLE rollback/conv/SiLU/state fusion passes
+  ten native/public tests and all fixed/natural model token/EOS/acceptance
+  gates. With shared-expert fusion, ordinary complete rounds average
+  **21.507750 ms**; final same-engine ordinary confirmations average
+  **21.427792 ms**. Outer trace perturbation is only +0.1405% and closes at
+  21.542208 ms: target 15.534391, sampling/state 0.780901, four drafts
+  4.574895, preparation 0.652021. Full contract/hashes are in the MTP report.
+  The dense globaltimer observer still perturbs by +6.85%; the two-marker
+  attempt contains multi-second stalls. Both internal captures are rejected,
+  with no outlier deletion or rescaling. The resident engine exits normally.
+  New W2 expert-pair warp packing is under component screening; do not repeat
+  the rejected W13 N16 screen. The <20-ms complete-round goal remains unmet.
+
+- Post-PLE component screens reject W2 expert-pair N16, W13 shuffled
+  epilogue/quad-split, HC producer-ready flags and HC 2/4-warp CTAs: all
+  preserve bits but regress. Detailed magnitudes/artifact names are in the
+  MTP report; do not repeat these scheduling ideas. GDN BV16 divergence is
+  traced to LLVM's first-product/FMA contraction for the final four V rows;
+  explicitly pinning the original BV32 arithmetic restores all output/state
+  bits, but exact BV8/BV16 saves only ~0.05 ms per 36-layer component chain.
+  Keep it as research rather than rerunning a full model for that small gain.
+
+### 2026-09-27 PR #703 audit and authorized main integration
+
+- The user explicitly requested audit and merge. Merge latest `onecat/main`
+  `ef6909830cbb7b40a24413bfe74ab49a4f7e1b90` (#706) into the owned published
+  MTP branch without rebasing; integration commit is `b772a0e962`.
+- Fix one numerical-contract bug in `4d4cb68dac`: batch GDN must fall back
+  when the caller requests FP16 accumulation. M5/M10 GPU regressions and
+  the focused 185-test integration suite pass; changed-file pre-commit and
+  normal native rebuild pass. Optional Rust frontend remains unavailable.
+- Fresh source-built TP4 GPU4–7 all-acceleration gate preserves all fixed and
+  natural IDs/EOS/acceptance. Complete ordinary rounds are 21.421255 /
+  21.401212 ms, mean **21.411234 ms**; pure decode 71.347743 / 71.414562
+  tokens/s. Deferred observer adds +0.468769%; rank0 cycle is 21.515078 ms.
+- Native SHA256 is
+  `790ca7b49e83c2289c98b167ca070146d10643f63dab653ee6a54e95f56a175f`;
+  no preload/private kernel dependency. Raw artifacts use
+  `pr703_merge_all_accel_20260927*` in the existing owned MTP worktree.
+  Full commands, audit and dependency hashes are in the final section of
+  `sm70_flash_next_mtp4_batch_gdn.md`.
+- Admit PR #703 for the authorized main merge. Retain opt-in defaults,
+  original precision and batch decode. <20 ms and reliable internal HC
+  attribution remain unmet follow-ups. All owned GPU workers are stopped;
+  no foreign service was interrupted and no wheel was built.

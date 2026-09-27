@@ -363,6 +363,14 @@ def _use_qwen38_qpn_mtp5_decode(
     )
 
 
+def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+    """Keep MTP's admitted split4 arithmetic while sharing expert weights."""
+    return bool(
+        getattr(layer, "sm70_nvfp4_grouped_mtp5", False)
+        and _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+    )
+
+
 @triton.jit
 def _prepare_single_token_slots_kernel(
     input_ptr,
@@ -1180,19 +1188,31 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_glm53_qpn_w13_q8 = glm53_qpn_w13_q8
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
-        grouped_requested = bool(
-            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
-            and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
+        grouped_supported = bool(
+            (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
             == (512, 2560, 160, 10)
             and not raw_scale
             and layer.swiglu_limit is None
         )
-        if grouped_requested and not sm70_ops.has_nvfp4_grouped_decode_dispatch():
+        grouped_requested = bool(
+            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE and grouped_supported
+        )
+        grouped_mtp5 = bool(
+            envs.VLLM_SM70_NVFP4_MOE_GROUPED_MTP5
+            and envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+            and int(layer.moe_config.tp_size) == 4
+            and grouped_supported
+        )
+        if (grouped_requested or grouped_mtp5) and (
+            not sm70_ops.has_nvfp4_grouped_decode_dispatch()
+            or (grouped_mtp5 and not sm70_ops.has_nvfp4_grouped_batch_reduce_dispatch())
+        ):
             raise RuntimeError(
-                "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native build."
+                "SM70 grouped MoE decode requires a matching native build."
             )
         layer.sm70_nvfp4_grouped_decode = grouped_requested
-        if grouped_requested:
+        layer.sm70_nvfp4_grouped_mtp5 = grouped_mtp5
+        if grouped_requested or grouped_mtp5:
             # Layer-owned metadata; W2 reuses sorted_output. No process-global
             # cache or additional activation buffer inside graph capture.
             device = layer.w13_tm_weight.device
@@ -1509,7 +1529,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
-        if _use_grouped_decode(layer, x, topk_ids):
+        grouped_mtp5 = _use_grouped_mtp5(layer, x, topk_ids)
+        if grouped_mtp5 or _use_grouped_decode(layer, x, topk_ids):
             sm70_ops.nvfp4_grouped_w13_sm70_out(
                 buffers["intermediate"],
                 x,
@@ -1520,10 +1541,15 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer._nvfp4_grouped_experts,
                 layer._nvfp4_grouped_sizes,
                 layer._nvfp4_grouped_total,
-                4 if num_tokens == 8 else 8,
+                4 if grouped_mtp5 or num_tokens == 8 else 8,
                 interleaved_w13,
             )
-            sm70_ops.nvfp4_grouped_w2_sm70_out(
+            w2_op = (
+                sm70_ops.nvfp4_grouped_w2_batch_reduce_sm70_out
+                if grouped_mtp5
+                else sm70_ops.nvfp4_grouped_w2_sm70_out
+            )
+            w2_op(
                 output,
                 buffers["sorted_output"],
                 buffers["intermediate"],
@@ -1537,8 +1563,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             logger.info_once(
                 "Experimental SM70 grouped native-NVFP4 decode selected "
-                "(tokens=%d, W13/W2 share route groups).",
+                "(tokens=%d, W13/W2 share route groups, MTP split4/reduce=%s).",
                 num_tokens,
+                grouped_mtp5,
             )
             return output
         direct_single_token = num_tokens == 1
