@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
@@ -172,6 +173,14 @@ def clear_sm70_fp8_workspaces() -> None:
     """Release process-global SM70 FP8 prefill and QPN8 workspaces."""
     _sm70_fp8_prefill_dense_workspaces.clear()
     _sm70_fp8_qpn8_pp2_tp4_workspaces.clear()
+    sm70_layer_workspaces.clear_layer_workspaces()
+
+
+def _bind_sm70_fp8_prefill_workspace(
+    layer: torch.nn.Module, workspace: torch.Tensor
+) -> None:
+    sm70_layer_workspaces.register_layer_workspace(layer, workspace)
+    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = workspace.data_ptr()
 
 
 def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
@@ -981,9 +990,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.sm70_fp8_qpn8_split_k = split_k
                         layer.sm70_fp8_qpn8_nacc = nacc
                         layer.sm70_fp8_qpn8_prefetch = prefetch
-                        layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
-                            workspace.data_ptr()
-                        )
+                        _bind_sm70_fp8_prefill_workspace(layer, workspace)
                         logger.info_once(
                             "Default SM70 grouped QPN8 enabled for the validated "
                             "serialized PP2 x TP4 tensor contract."
@@ -1155,9 +1162,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.sm70_fp8_qpn8_split_k = split_k
                     layer.sm70_fp8_qpn8_nacc = nacc
                     layer.sm70_fp8_qpn8_prefetch = prefetch
-                    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
-                        workspace.data_ptr()
-                    )
+                    _bind_sm70_fp8_prefill_workspace(layer, workspace)
                     if use_gated_silu:
                         if pp2_tp4_qpn8_candidate:
                             assert pp2_tp4_gated_config is not None
@@ -1308,9 +1313,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 is_exact_8k_projection = _is_sm70_fp8_exact_8k_prefill_layer(layer)
                 workspace = _get_sm70_fp8_prefill_exact_dense_workspace(tm_weight)
                 if workspace is not None:
-                    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
-                        workspace.data_ptr()
-                    )
+                    _bind_sm70_fp8_prefill_workspace(layer, workspace)
                     layer.sm70_fp8_prefill_exact_dense_min_m = (
                         _SM70_FP8_EXACT_8K_PREFILL_M
                         if is_exact_8k_projection
@@ -1461,9 +1464,9 @@ class Fp8LinearMethod(LinearMethodBase):
                             *x.shape[:-2], group_count, output_size
                         )
                     for group_idx in range(group_count):
-                        sm70_ops.fp8_qpn8_dispatch_sm70_out(
+                        torch.ops.vllm.sm70_fp8_qpn8_dispatch(
                             out_by_group[group_idx],
-                            int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
+                            layer.prefix,
                             x_by_group[group_idx],
                             layer.weight[group_idx],
                             layer.weight_scale_inv[group_idx],
@@ -1490,9 +1493,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 if x_2d.shape[0] == 0:
                     return out_2d.reshape(out_shape)
-                sm70_ops.fp8_qpn8_dispatch_sm70_out(
+                torch.ops.vllm.sm70_fp8_qpn8_dispatch(
                     out_2d,
-                    int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
+                    layer.prefix,
                     x_2d,
                     layer.weight,
                     layer.weight_scale_inv,
@@ -1604,9 +1607,9 @@ class Fp8LinearMethod(LinearMethodBase):
             elif visible_dense_out is not None:
                 out_2d = visible_dense_out
             elif prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
-                sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+                torch.ops.vllm.sm70_fp8_prefill_dispatch(
                     out_2d,
-                    prefill_workspace_ptr,
+                    layer.prefix,
                     x_2d,
                     layer.weight,
                     layer.weight_scale_inv,
@@ -1721,9 +1724,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if x_2d.shape[0] == 0:
                 return out_2d.reshape(*x.shape[:-1], out_features)
-            sm70_ops.fp8_qpn8_dispatch_sm70_out(
+            torch.ops.vllm.sm70_fp8_qpn8_dispatch(
                 out_2d,
-                int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
+                layer.prefix,
                 x_2d,
                 layer.weight,
                 layer.weight_scale_inv,
@@ -1781,9 +1784,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 "sm70_fp8_prefill_exact_dense_min_m",
                 _SM70_FP8_PREFILL_DENSE_MIN_M,
             )
-            sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+            torch.ops.vllm.sm70_fp8_prefill_dispatch(
                 out_2d,
-                prefill_workspace_ptr,
+                layer.prefix,
                 x_2d,
                 weight,
                 scales,
