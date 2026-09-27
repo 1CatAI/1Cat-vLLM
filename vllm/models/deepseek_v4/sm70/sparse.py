@@ -14,6 +14,10 @@ from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    sparse_attn_decode_bmm,
+    sparse_attn_prefill_bmm,
+    sparse_decode_bmm_workspace_specs,
+    sparse_prefill_bmm_workspace_specs,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLASparseBackend,
@@ -114,6 +118,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ),
                 ((layer.max_num_batched_tokens, combined_topk), torch.int32),
                 ((layer.max_num_batched_tokens,), torch.int32),
+                *cls._prefill_bmm_workspace_specs(layer, q, combined_topk),
             )
             output.zero_()
             return
@@ -193,6 +198,41 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None and swa_lens is not None
+        if envs.VLLM_SM70_DSV4_SPARSE_MLA_BMM:
+            main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
+            extra_width = (
+                0
+                if topk_indices is None
+                else topk_indices.reshape(num_decode_tokens, -1).shape[1]
+            )
+            keys, scores, logits, probs = current_workspace_manager().get_simultaneous(
+                *sparse_decode_bmm_workspace_specs(
+                    num_decode_tokens,
+                    q.shape[1],
+                    q.shape[2],
+                    main_width,
+                    extra_width,
+                    q.dtype,
+                )
+            )
+            logger.info_once("DeepSeek V4 SM70 sparse MLA decode: batched matmul.")
+            sparse_attn_decode_bmm(
+                q,
+                layer.swa_cache_layer.kv_cache,
+                swa_indices,
+                swa_lens,
+                compressed_cache,
+                topk_indices,
+                topk_lens,
+                layer.scale,
+                layer.attn_sink[: q.shape[1]],
+                output,
+                keys,
+                scores,
+                logits,
+                probs,
+            )
+            return
         use_splitk = (
             (swa_only and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA)
             or (layer.compress_ratio == 4 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4)
@@ -283,6 +323,22 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 extra_lengths=topk_lens,
             )
 
+    @staticmethod
+    def _prefill_bmm_workspace_specs(
+        layer: "DeepseekV4MLAAttention", q: torch.Tensor, combined_topk: int
+    ) -> list[tuple[tuple[int, ...], torch.dtype]]:
+        """Batched-matmul prefill buffers; they share the workspace request
+        with the gathered KV so that the manager does not alias them."""
+        if not envs.VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL:
+            return []
+        return sparse_prefill_bmm_workspace_specs(
+            layer.max_num_batched_tokens,
+            q.shape[1],
+            q.shape[-1],
+            combined_topk,
+            torch.float16,
+        )
+
     @classmethod
     def _forward_prefill(
         cls,
@@ -338,8 +394,10 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ((current_chunk, chunk_M, q.shape[-1]), torch.float16),
                 ((layer.max_num_batched_tokens, combined_topk), torch.int32),
                 ((layer.max_num_batched_tokens,), torch.int32),
+                *cls._prefill_bmm_workspace_specs(layer, q, combined_topk),
             )
-            kv_workspace, combined_indices_out, combined_lens_out = workspace
+            kv_workspace, combined_indices_out, combined_lens_out = workspace[:3]
+            bmm_buffers = workspace[3:]
             if not swa_only:
                 assert sparse_metadata is not None and compressed_cache is not None
                 dequantize_and_gather_k_cache(
@@ -388,14 +446,26 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 chunk_N,
                 out=(combined_indices_out, combined_lens_out),
             )
-            sm70_sparse_attention_gathered(
-                q[query_start:query_end],
-                kv_workspace[:current_chunk],
-                combined_indices,
-                combined_lens,
-                layer.scale,
-                layer.attn_sink[: q.shape[1]],
-                output[query_start:query_end],
-            )
+            if bmm_buffers:
+                sparse_attn_prefill_bmm(
+                    q[query_start:query_end],
+                    kv_workspace[:current_chunk].reshape(-1, q.shape[-1]),
+                    combined_indices,
+                    combined_lens,
+                    layer.scale,
+                    layer.attn_sink[: q.shape[1]],
+                    output[query_start:query_end],
+                    *bmm_buffers,
+                )
+            else:
+                sm70_sparse_attention_gathered(
+                    q[query_start:query_end],
+                    kv_workspace[:current_chunk],
+                    combined_indices,
+                    combined_lens,
+                    layer.scale,
+                    layer.attn_sink[: q.shape[1]],
+                    output[query_start:query_end],
+                )
 
         logger.debug_once("DeepSeek V4 SM70 FP16 sparse attention route active.")
