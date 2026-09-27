@@ -7,6 +7,9 @@ from typing import Literal
 import torch
 
 from vllm import envs
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    register_layer_workspace,
+)
 from vllm.platforms import current_platform
 
 U4_GROUP_SIZES = (32, 64, 128)
@@ -32,14 +35,13 @@ class SM70TurboMindLinearState:
     output_size: int
     op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4"]
     gated_silu: bool = False
-    dense_weight_ptr: int = 0
     global_scale: float = 0.0
     use_scale_code: bool = False
     padded_output_size: int = 0
     prescaled_scales: bool = False
 
 
-# States retain only data_ptr(), so this cache owns the bounded allocation.
+# Owns the bounded allocations the registered layer workspaces refer to.
 _nvfp4_qpn4_dense_workspaces: dict[tuple, torch.Tensor] = {}
 
 
@@ -185,7 +187,6 @@ def _store_state(
     output_size: int,
     op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4"],
     gated_silu: bool = False,
-    dense_weight_ptr: int = 0,
     global_scale: float = 0.0,
     use_scale_code: bool = False,
     padded_output_size: int = 0,
@@ -200,7 +201,6 @@ def _store_state(
         output_size=output_size,
         op_kind=op_kind,
         gated_silu=gated_silu,
-        dense_weight_ptr=dense_weight_ptr,
         global_scale=global_scale,
         use_scale_code=use_scale_code,
         padded_output_size=padded_output_size,
@@ -437,6 +437,7 @@ def prepare_nvfp4_qpn4_linear(
         packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_sm70(
             qweight, fp16_scales
         )
+    register_layer_workspace(layer, workspace)
     _store_state(
         layer,
         packed_weight,
@@ -446,7 +447,6 @@ def prepare_nvfp4_qpn4_linear(
         qweight.size(1),
         "nvfp4_qpn4",
         gated_silu=gated_silu,
-        dense_weight_ptr=workspace.data_ptr(),
         global_scale=global_scale,
         use_scale_code=use_scale_code,
     )
@@ -520,9 +520,9 @@ def apply_prepared_linear(
             )
         if reshaped_x.stride(-1) != 1:
             reshaped_x = reshaped_x.contiguous()
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
+        torch.ops.vllm.sm70_nvfp4_qpn4_dispatch(
             out,
-            state.dense_weight_ptr,
+            layer.prefix,
             reshaped_x,
             state.weight,
             state.scales,
@@ -578,9 +578,9 @@ def apply_prepared_fused_silu_and_mul(
     from vllm import _sm70_ops as sm70_ops
 
     if state.op_kind == "nvfp4_qpn4":
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
+        torch.ops.vllm.sm70_nvfp4_qpn4_dispatch(
             out,
-            state.dense_weight_ptr,
+            layer.prefix,
             reshaped_x,
             state.weight,
             state.scales,
