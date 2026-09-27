@@ -43,6 +43,60 @@ def assert_bits(actual, expected):
     )
 
 
+@pytest.mark.parametrize("rows", [12, 60, 193])
+@pytest.mark.parametrize("activation", ["sigmoid", "silu"])
+def test_native_forward_fullgraph_compile(
+    rows, activation, monkeypatch, default_vllm_config
+):
+    require_native()
+    monkeypatch.setenv("VLLM_SM70_RMSNORM_GATED_EXACT", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    envs.disable_envs_cache()
+    norm = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=True,
+        activation=activation,
+        device="cuda",
+        dtype=torch.float16,
+    )
+
+    def unexpected_device_query(*args, **kwargs):
+        raise AssertionError("Device capability must be resolved before forward")
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", unexpected_device_query
+    )
+    graphs = []
+
+    def capture_backend(graph, example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(
+        norm.forward_native, backend=capture_backend, fullgraph=True, dynamic=True
+    )
+    for scale in (0.1, 3.0):
+        x = torch.randn(rows, 128, device="cuda", dtype=torch.float16) * scale
+        z = torch.randn_like(x)
+        expected = RMSNormGated.forward_static(
+            x,
+            z,
+            norm.weight,
+            1e-6,
+            x.dtype,
+            norm_before_gate=True,
+            activation=activation,
+        )
+        assert_bits(compiled(x, z), expected)
+    assert len(graphs) == 1
+    has_native = any(
+        node.target == torch.ops.vllm.sm70_rmsnorm_gated_exact
+        for node in graphs[0].graph.nodes
+    )
+    assert has_native == (rows <= 192)
+
+
 @pytest.mark.parametrize("rows", [1, 12, 60, 120, 192])
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 def test_changed_graph_inputs_and_canaries(

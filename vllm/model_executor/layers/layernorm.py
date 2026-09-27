@@ -711,6 +711,11 @@ class RMSNormGated(CustomOp):
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
+        # Device discovery may call C-backed cached functions that Dynamo cannot
+        # inline. Resolve this worker-constant property outside the forward graph.
+        self._is_sm70 = current_platform.is_cuda() and (
+            current_platform.is_device_capability(70)
+        )
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -774,16 +779,17 @@ class RMSNormGated(CustomOp):
             envs.VLLM_SM70_RMSNORM_GATED_EXACT
             and not envs.VLLM_BATCH_INVARIANT
             and x.is_cuda
-            and current_platform.is_device_capability(70)
+            and self._is_sm70
             and self.group_size is None
             and self.norm_before_gate
             and self.activation in ("sigmoid", "silu", "swish")
             and _sm70_gated_norm_shape_supported(x, z, self.weight)
         ):
-            logger.info_once(
-                "SM70 exact native gated RMSNorm fusion enabled "
-                "(N128, sigmoid/SiLU, M1 and batch)."
-            )
+            if not torch.compiler.is_compiling():
+                logger.info_once(
+                    "SM70 exact native gated RMSNorm fusion enabled "
+                    "(N128, sigmoid/SiLU, M1 and batch)."
+                )
             return torch.ops.vllm.sm70_rmsnorm_gated_exact(
                 x, z, self.weight, self.eps, self.activation != "sigmoid"
             )
