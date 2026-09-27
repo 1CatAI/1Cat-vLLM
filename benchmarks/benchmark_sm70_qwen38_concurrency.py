@@ -104,16 +104,24 @@ def compare_tokens(requests, reference):
 def finalize_measurements(report):
     """Collect every planned case, but never accept failed token parity."""
     report["measurements_complete"] = True
+    report["complete"] = False
     checks = [
         matched
         for case in report["cases"]
         for key in ("tokens_match_reference", "tokens_match_first_repeat")
         for matched in case.get(key, [])
     ]
+    checks.extend(run["matches_reference"] for run in report.get("baseline_runs", []))
+    if not checks:
+        report["token_parity_passed"] = None
+        raise RuntimeError(
+            "Token parity was not checked; collect repeats or provide a reference "
+            "before accepting a quality/speed result"
+        )
     if "reference_accepted" in report:
         checks.append(report["reference_accepted"])
-    report["token_parity_passed"] = all(checks) if checks else None
-    if checks and not all(checks):
+    report["token_parity_passed"] = all(checks)
+    if not report["token_parity_passed"]:
         raise RuntimeError(
             "Token parity failed; all planned measurements were collected, "
             "but this run is not an accepted quality/speed result"

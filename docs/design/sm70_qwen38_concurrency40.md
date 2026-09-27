@@ -1,5 +1,39 @@
 # Qwen3.8 concurrent decode: next-stage optimization
 
+## Output-quality investigation (2026-09-28, not yet qualified)
+
+Same-input deep observation on the retained high-precision source
+`581e69adb4751d3613ca1fdcc031b480b3dc2502` localizes the earliest C1
+cross-arm difference to layer0's gated RMSNorm, before its output projection.
+At decode step2, all four ranks have identical weights, projected inputs,
+convolution states/outputs, FP32 recurrent states and attention-core outputs.
+Only rank1's normalized coordinate117 differs: control
+`-0.003421783447265625`, candidate `-0.0034198760986328125`.
+The local projection then differs at11 elements, TP output at4, and HC
+normalization at4. Do not misidentify HC or TP reduction as the origin.
+
+An independent actual-tensor replay reproduces every input projection,
+convolution, recurrent output/state and local output projection bit.
+Native FP32 gated RMSNorm and its standalone compiled form reproduce the
+candidate's value. FP64 evaluation gives `-0.0034208292707999443`, whose
+nearest FP16 value is also the candidate's. Thus simply forcing the old
+control token sequence would not establish greater arithmetic accuracy.
+The full-model compiled normalization must get a stable, explicit numerical
+contract before another endpoint acceptance attempt.
+
+The diagnostic includes two40-step C1 repeats per arm, fixed KV bytes and
+intrusive intermediate copies. Control matches the preceding observer at
+all144 boundaries and logits for all40 steps; repeat state values also agree.
+Physical cache-slot indices differ normally between requests. This is
+localization evidence, **not** new throughput or broad quality qualification.
+Raw deep captures and comparison/replay reports use `quality_v4_*` and
+`replay_deep_control.rank1*` in the task artifacts.
+
+Benchmark acceptance now includes single-stream `baseline_runs` parity
+and refuses to accept a run with no actual parity observations. Thirteen
+focused CPU regressions pass. This closes a reporting bug separately from
+the normalization fix; it cannot qualify the optimization by itself.
+
 ## Acceptance target, not a performance claim
 
 Status update: the initial sections below record research-only screens.

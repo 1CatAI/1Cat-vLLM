@@ -6,7 +6,10 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from benchmarks.benchmark_sm70_qwen38_concurrency import generate_cohort
+from benchmarks.benchmark_sm70_qwen38_concurrency import (
+    finalize_measurements,
+    generate_cohort,
+)
 
 
 def make_llm():
@@ -56,3 +59,51 @@ def test_atomic_cohort_does_not_enqueue_after_pause_failure():
     with pytest.raises(RuntimeError, match="pause failed"):
         generate_cohort(llm, ["prompt"], "sampling", atomic=True)
     assert events.mock_calls == [call.rpc("pause_scheduler", "keep", False)]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"baseline_runs": [{"matches_reference": False}]},
+        {"reference_accepted": False},
+        {"cases": [{"tokens_match_reference": [True, False]}]},
+        {"cases": [{"tokens_match_first_repeat": [False]}]},
+    ],
+)
+def test_parity_failure_keeps_measurements_but_rejects_result(extra):
+    report = {
+        "cases": [{"tokens_match_first_repeat": [True]}],
+        "complete": True,
+        **extra,
+    }
+    with pytest.raises(RuntimeError, match="Token parity failed"):
+        finalize_measurements(report)
+    assert report["measurements_complete"] is True
+    assert report["token_parity_passed"] is False
+    assert report["complete"] is False
+
+
+@pytest.mark.parametrize("extra", [{}, {"reference_accepted": True}])
+def test_no_observed_parity_cannot_pass(extra):
+    report = {"cases": [{}], **extra}
+    with pytest.raises(RuntimeError, match="Token parity was not checked"):
+        finalize_measurements(report)
+    assert report["measurements_complete"] is True
+    assert report["token_parity_passed"] is None
+    assert report["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"cases": [{"tokens_match_first_repeat": [True, True]}]},
+        {"cases": [{"tokens_match_reference": [True]}], "reference_accepted": True},
+        {"baseline_runs": [{"matches_reference": True}]},
+    ],
+)
+def test_passing_observed_parity_accepts_result(extra):
+    report = {"cases": [{}], **extra}
+    finalize_measurements(report)
+    assert report["measurements_complete"] is True
+    assert report["token_parity_passed"] is True
+    assert report["complete"] is True
