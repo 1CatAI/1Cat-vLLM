@@ -305,3 +305,54 @@ rebuild has SHA256
 the FA2 hash is unchanged. This restoration is not an additional endpoint
 run. The last qualified endpoint remains the combined-candidate table
 above, and none of the new performance targets is claimed complete.
+
+### Main integration and incremental merge
+
+On 2026-09-27, the project owner requested merging this verified increment
+after disclosure that C4 +10%, C6 +15% and C8 +20% remain unmet. Merge
+authorization does not turn those targets, a renewed PRO comparison or the
+35B-A3B AWQ/FP8 endpoint speed gates into passes.
+
+Integration commit `bec7cb784c7fec909f37a344c98133461ac46888` incorporates
+main `db292f9a49318459f064075bfdbbed438b4e77a3` (PR #703). The only conflict
+was the appended migration histories; both are retained. The shared
+communicator keeps main's new HC buffer offsets and this PR's canonical
+medium-payload reduction. Main's optional mixed-QKV MTP verifier does not
+replace the DFlash2 packed verifier.
+
+Normal `_C` and `_C_stable_libtorch` were rebuilt from the integrated
+source; the same CMake build verified `_vllm_fa2_C`. Fresh-process imports,
+ELF dependencies and resolved mappings use only the shipped package and
+standard Torch/CUDA libraries, with no private DSO or preload. SHA256:
+
+| Extension | Integrated artifact SHA256 |
+|---|---|
+| `_C` | `921394e201f82b2ee07f051fe2d6b29a14a700d39456ae2179f35635d8f657a2` |
+| `_C_stable_libtorch` | `54632ce86c8077a6d6e30273b00234b46e3e62f05811067f5ddb7df3fdd653fb` |
+| `_vllm_fa2_C` | `ac99fbe8e879df746478d2bb872e910c94b776532c4a71c6f3f7db8a0a7b6859` |
+
+The merged regression suite passed **269 tests in 148.74 s** on an idle,
+exclusively leased V100 group 0–3: FP4/FP8 GEMM tails and prescaling,
+TP4 all-reduce boundaries, long attention through 262K, exact DFlash2
+GDN states, the newly integrated MTP GDN loader, and graph selection.
+The 44 graph-selection tests also passed with CUDA devices hidden.
+GitHub pre-commit CI passed. Build, imports, dependency inspection and
+test logs are retained under `batch-targets-20260927/results/merge-*`.
+
+The ordinary integrated service then passed one ordered 32K/256 wave at
+C1/C4/C6/C8 on GPUs 0–3. All **19 complete token arrays and speculative
+counters match** the previously qualified candidate's corresponding wave;
+acceptance is unchanged. Long retrieval remains **8/8 correct and 8/8
+natural stops**. Worker logs confirm the default GEMM/GDN routes and long
+q8 graph replay for C4/C6/C8. These one-wave checks on a different GPU group
+do not replace the frozen three-wave performance medians above.
+
+This startup reports 9.57 GiB model, 0.99 GiB graph pool, **11.00 GiB KV
+and 1,009,312 KV tokens**, versus the earlier measured service's 11.45 GiB
+and 1,050,885 tokens. The 262144 context limit remains configured; the
+capacity difference is not attributed to a specific cause or claimed
+resolved. No persistent weight copy or workspace was added by this PR.
+See `results/merge-service-summary.json`, `merge-service.log` and
+`merge-eval.log`; raw request results are `long-service-merge708/`.
+The owned private service is stopped, GPU leases released, and public
+serving remains off.

@@ -48049,7 +48049,7 @@ has launched no full model. Details and artifacts are in
   no additional enable switches. Public API and gateway were stopped at the
   user's request; local benchmark services are shut down.
 
-## 2026-09-27 DFlash2 C4/C6/C8 target continuation (Draft #708)
+## 2026-09-27 DFlash2 C4/C6/C8 target continuation (PR #708)
 
 The next targets remain **unmet**: C4 +10%, C6 +15%, C8 +20% over the
 conservative frozen PR #706/GDN-only baselines. The retained default
@@ -48059,7 +48059,7 @@ reduction. Ordinary 32K/256 all-live pure decode is
 447.421/666.955/730.373 tok/s, or +2.46%/+13.31%/+1.69%; required rates are
 480.345/676.925/861.921. All 76 token arrays and speculative counters match,
 and long retrieval/natural stops remain 8/8. No new enable switch or weight
-copy is required. Source and expanded GPU checks are in Draft #708.
+copy is required. Source and expanded GPU checks are in PR #708.
 
 Do not repeat the rejected deeper prefetch, extra M64 tile, forced-register
 cap, paired-half scale or L2-prefetch candidates without new evidence.
@@ -48072,9 +48072,20 @@ M64 representative kernels do not saturate DRAM; low resident-warp counts,
 instruction/data dependencies and long-attention work remain relevant.
 The report distinguishes these diagnostic counters from endpoint speed.
 
-Main advanced to `db292f9a49` (PR #703) during this frozen comparison.
-The figures above are not a new measurement against that main revision;
-integration and shared 35B-A3B AWQ/FP8 endpoint gates remain open.
+Main advanced to `db292f9a49` (PR #703) during this frozen comparison and
+was integrated in `bec7cb784c`. The integrated normal extensions build and
+269 GPU/graph regression checks pass. The figures above retain their
+frozen performance baselines; shared 35B-A3B AWQ/FP8 endpoint gates remain
+open. The owner requested merging this verified increment on 2026-09-27;
+the unmet C4/C6/C8 targets remain follow-up work. The integration audit
+and artifact hashes are recorded in the implementation report.
+
+Post-integration ordinary serving on idle GPUs 0–3 preserves all 19 token
+arrays and speculative counters across one C1/C4/C6/C8 wave, with 8/8
+long-retrieval answers and natural stops. This is correctness evidence,
+not a replacement speed baseline. Startup KV capacity is 11.00 GiB versus
+the prior 11.45 GiB; the existing capacity qualification remains open.
+The tested private service is stopped and public serving remains off.
 
 ## 2026-09-27 DFlash2 M48 coverage and scaling audit
 
