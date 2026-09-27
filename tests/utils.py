@@ -2149,3 +2149,21 @@ class TestFP8Layer(torch.nn.Module):
         self, y: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         return self.kernel.apply_weights(self, y, bias)
+
+
+def set_lazy_env(monkeypatch: pytest.MonkeyPatch, name: str, value: str | None) -> None:
+    """Set a variable that ``vllm.envs`` resolves lazily, without a shadow.
+
+    ``monkeypatch.setattr(envs, ...)`` restores the previous value as a real
+    module attribute, which from then on hides ``envs.__getattr__`` from every
+    later test in the process. Remove such a shadow for this test only and
+    steer the value through the environment, which leaves nothing behind.
+    Unsetting goes through ``setenv`` first: ``delenv`` alone records nothing
+    for an absent variable, so a value the code under test then writes to
+    ``os.environ`` would outlive the test.
+    """
+    if name in vars(envs):
+        monkeypatch.delattr(envs, name)
+    monkeypatch.setenv(name, "" if value is None else value)
+    if value is None:
+        monkeypatch.delenv(name)

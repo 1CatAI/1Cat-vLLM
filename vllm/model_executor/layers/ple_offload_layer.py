@@ -202,6 +202,7 @@ class PleOffloadLayer(nn.Module, ABC):
             if (
                 envs.VLLM_PLE_CPU_OFFLOAD
                 and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                and not self.offload_keeps_local_tables()
                 and not is_offload_process()
             ):
                 nn.Module.__init__(self)
@@ -211,10 +212,24 @@ class PleOffloadLayer(nn.Module, ABC):
         cls.__init__ = guarded_init  # type: ignore[method-assign, assignment]
 
     @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        """Whether GPU workers keep their own table next to the offload worker.
+
+        Under the default contract the GPU-side layer is a placeholder that
+        only waits for the worker's result. A tiered layer keeps its resident
+        rows and merges the worker's rows into its own gather, so its
+        constructor and its weight loading run in the GPU workers as well.
+        """
+        return False
+
+    @classmethod
     def get_target_device(cls) -> torch.device:
         """Return CPU for the offload process and the active GPU otherwise."""
+        keeps_gpu_tables = (
+            envs.VLLM_SM70_QWEN38_HYBRID_PLE or cls.offload_keeps_local_tables()
+        )
         if envs.VLLM_PLE_CPU_OFFLOAD and not (
-            envs.VLLM_SM70_QWEN38_HYBRID_PLE and not is_offload_process()
+            keeps_gpu_tables and not is_offload_process()
         ):
             return torch.device("cpu")
         return torch.device("cuda", torch.accelerator.current_device_index())
@@ -244,6 +259,32 @@ class PleOffloadLayer(nn.Module, ABC):
         self._gpu_output_buffer = gpu_output_buffer
         self._sem = semaphore
 
+    def remote_placement(self) -> object | None:
+        """Describe the rows the offload worker serves for this GPU layer.
+
+        Sent once with the registration and handed to the worker-side layer
+        through :meth:`bind_remote_placements`. ``None`` keeps the default
+        contract in which the worker owns the complete table.
+        """
+        return None
+
+    def bind_remote_placements(self, placements: list[object]) -> None:
+        """Receive one :meth:`remote_placement` per tensor-parallel rank."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not serve tiered PLE placements"
+        )
+
+    def wait_offloaded_output(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Wait for the worker's result and return its first ``num_tokens`` rows."""
+        torch.ops.vllm.ple_offload_wait(
+            self._sem.flag_tensor,
+            self._gpu_output_buffer,
+            hidden_states,
+        )
+        return self._gpu_output_buffer[:num_tokens]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -255,12 +296,11 @@ class PleOffloadLayer(nn.Module, ABC):
         if self._is_cpu_offloaded:
             if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_sm70_decode_graph_semantics():
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
-            torch.ops.vllm.ple_offload_wait(
-                self._sem.flag_tensor,
-                self._gpu_output_buffer,
-                hidden_states,
-            )
-            return self._gpu_output_buffer[: input_ids.shape[0]]
+            if self.offload_keeps_local_tables():
+                # The layer gathers its resident rows itself and merges the
+                # worker's rows through wait_offloaded_output.
+                return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
+            return self.wait_offloaded_output(hidden_states, input_ids.shape[0])
         return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
 
     def release_offloaded_output(
