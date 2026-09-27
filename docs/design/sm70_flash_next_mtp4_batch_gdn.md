@@ -1195,3 +1195,155 @@ service is stopped, no wheel is built, and no runtime/default changes.
 GDN integration/value-tile gates and current internal trace calibration
 remain pending. Prioritize preserving the admitted up/mix component while
 evaluating batch HC sharding; the complete-round <20-ms target is unmet.
+
+### Exact MTP batch HC, cooperative execution and router, 2026-09-27
+
+The normal source-built runtime now reuses PR #704's packed batch Tensor Core
+HC computation and communicator-owned half-plus-tag transport. The MTP
+numerical contract differs from that PR's concurrent-decode screen: keep
+`allow_fp16_reduced_precision_reduction=True`, round each of the twenty K512
+down partials to FP16, then add in the original FP32 order. Do not copy a
+global precision override or substitute M1 GEMV for M5/M10. The loader keeps
+original checkpoint weights for M1/prefill and adds TP4 packed shards only
+under the explicit MTP4 gate (about 330 MiB/rank).
+
+`VLLM_SM70_MTP_HC_BATCH=1` enables this M5/M10 route. Its optional
+`VLLM_SM70_MTP_HC_COOPERATIVE=1` execution combines down, gather/SiLU, up/mix
+and output gather in one cooperative launch. All arithmetic and transport
+are shared with the four-launch implementation. Dedicated batch channels,
+per-block epochs, and clearing consumed packets preserve FP16 bits and
+support changing graph widths without collision with M1 or auxiliary MoE.
+Both flags default off pending broader promotion.
+
+The separate `VLLM_SM70_MTP_ROUTER_BATCH=1` reuses the same packed batch-MMA
+implementation file for the replicated E512 router projection. Four Volta
+quad pairs compute the original four contiguous K640 partials; an ordered
+FP32 shuffle reduction replaces the separate workspace-reduction launch.
+This retains MTP's FP16 output and adds about 122.5 MiB/rank of packed weights.
+Its M5/M10 checkpoint component screen is 12.562->7.778 and 11.882->8.270 us.
+
+The HC normal-`_C` TP4 gates cover all 96 checkpoint pairs, all four ranks,
+M5/M10, seven activation scales and alternating graph widths. LoRA, mixed
+output and injection are bitwise exact. Full pair times, including both
+gathers, are:
+
+| Execution | M5, us/pair | M10, us/pair |
+| --- | ---: | ---: |
+| Replicated control | 33.568 | 34.573 |
+| Four-launch TP4 batch HC | 29.013 | 33.730 |
+| Cooperative TP4 batch HC | 24.082 | 26.674 |
+
+The mixed-QKV GDN integration and router gates pass 28 GPU tests. HC loader
+contracts pass 24 tests; router native/dispatcher graph checks plus the
+three existing GPU HC checks pass six tests. An earlier CPU-only invocation
+of those three existing tests fails because it hides CUDA; the subsequent
+GPU run resolves that invocation error. Changed-file pre-commit passes.
+
+Two resident-engine checks use the unchanged frozen Qwen3.8 Flash Next
+NVFP4 / V100-SXM2-32GB TP4 GPUs4--7 / FP16 KV / FP32 SSM / MTP4 /
+32K max length / 8192 batch tokens / one sequence / memory 0.95 / 12-GiB
+pinned host PLE contract. CUDA 12.8, Torch 2.10.0+cu128, Triton 3.6.0,
+driver 580.173.02, greedy 8192-token prompt and 513 output tokens are retained.
+No wheel, private preload or sidecar is used by either engine.
+
+| Candidate | Ordinary before | Deferred events | Ordinary after | Ordinary mean |
+| --- | ---: | ---: | ---: | ---: |
+| Four-launch HC + mixed QKV, `7b0b303a60` | 22.752404 | 22.915771 | 22.746107 | 22.749255 |
+| Cooperative HC + batch router + mixed QKV, `3b7365925f` | 22.077260 | 22.139499 | 22.111224 | **22.094242** |
+
+All values are complete-round milliseconds. The second candidate improves
+the independent clean 23.697246-ms baseline by 6.76%, and still misses the
+20-ms target by 2.094242 ms. Native SHA256 is
+`1cd56edf45492ec12a8feed3a087473abd926f11af8145e827c512a280391d8b`.
+All fixed token IDs, finish reasons and acceptance counters match the oracle:
+335 drafts, 1,340 draft tokens, 177 accepted, positions `[125,36,10,6]`.
+Three natural prompts also retain every token ID, normal EOS and acceptance
+record (284/329/421 output tokens, temperature 1, top-p 0.95, top-k 20,
+seed 20260828, maximum 2,048 tokens).
+
+The second candidate's same-engine event perturbation is **+0.205%** and
+ordinary-before/after drift **+0.154%**. Rank0's unscaled, 335 closed cycles
+average **22.127934 ms**, only -0.052% from the enclosing observed request:
+
+| Phase envelope | ms |
+| --- | ---: |
+| Target forward (replay 16.143267) | 16.183720 |
+| Sampling and state handoff | 0.766432 |
+| Four drafts | 4.607666 |
+| Next-round preparation | 0.570115 |
+
+Draft replay envelopes are 1.327611/1.065933/1.060104/1.049167 ms. These
+include dependency/submission waits and are not isolated kernel service.
+Do not rescale the previous Nsight category table into current measurements.
+The optimized ordinary time is intentionally different from the old clean
+baseline: remove the parser's inappropriate <=3% equality requirement
+against that older implementation. Same-engine perturbation, control drift,
+cycle closure and output equality remain required. An independent clean run
+of the final candidate is still pending; this trace's admission scope is
+the matched resident-engine off/on/off comparison.
+
+Retain `mtp_hc_mixed_candidate_20260927*`,
+`mtp_hc_coop_router_candidate_20260927*`, `hc_mtp_native_tp4_20260927*`,
+`hc_mtp_coop_tp4_20260927*`, the source/native contracts, and
+`analyze_mtp_candidate_trace.py`. The latter writes unscaled per-rank closed
+intervals and a Chrome/Perfetto timeline. Do not rerun these completed gates
+unless subsequent changes invalidate them.
+
+Further component decisions, without model admission:
+
+- GDN BV16 changes FP32 state and some FP16 output bits; reject it without
+  timing. Keep BV32 (`gdn_mtp_value_tile.json`).
+- Grouped MoE W13 full unroll-40 is exact but 3--5% slower on the real-route
+  screen. N16 tiles are exact but mixed: layer0 averages slightly slower,
+  layers24/42 improve by 2.629/1.138 us per complete expert chain. Neither
+  justifies another engine run (`moe_w13_unroll40*`, `moe_w13_n16*`).
+- Cooperative HC half tiles preserve all TP4 bits but M5 only improves
+  24.082->23.595 us; M10 is neutral. Publishing each up tile without the
+  final grid barrier is also neutral (23.941/26.825 us). Revert both, retaining
+  their source patches, native contracts and `hc_mtp_coop_*_tp4_20260927*`.
+- Reusing the M1 HC norm's 1024-wide reduction at M5/M10 changes output bits.
+  Retain the 512-wide batch reduction. Only extending weight prefetch is
+  exact across all 96 norm weights/seven scales, taking M5 0.352085->0.320811
+  and M10 0.352128->0.315904 ms per 96-component chain. This narrow change
+  is included in `82ac7f970d`; it is not a measured endpoint saving yet.
+- The optional QSA scorer in `82ac7f970d` is rejected and removed. Its
+  complete-round ordinary times are 23.308872/23.264122 ms (mean 23.286497),
+  despite all fixed/natural outputs and acceptance remaining exact. The
+  engine uses page204/8,364 score columns: twelve scorer calls regress
+  0.223392->1.186528 ms at M5 and 0.351824->1.477632 ms at M10. The earlier
+  page4 synthetic geometry is not representative. Compiler inspection also
+  corrects the earlier Tensor Core explanation: both Triton variants lower
+  `tl.dot` to scalar FP32 FMA, with zero MMA instructions. The rejected
+  variant has a 3,224-byte/thread stack (1,016 LDL and 570 STL instructions),
+  whereas the original has no stack. Preserve `qsa_batch_compiler_audit.json`,
+  `qsa_mqa_engine_page*`, and `mtp_qsa_batch_candidate_20260927*`.
+- A native shared-key scorer preserves the original sequential 128 FP32
+  FMAs and all screened scores, without spills, but does not improve M5.
+  Unroll8 measures 0.237264->0.244368 ms per twelve calls; full unroll128
+  measures 0.260672->0.261776 ms. Stop this experiment (`qsa_batch_exact*`).
+- Full cooperative HC down/up K-loop unrolling preserves all 96 real pairs,
+  four ranks, seven activation scales, and M5/M10 changing graph widths.
+  The TP4 component on GPU0--3 measures M5 33.552223->21.110666 us and M10
+  34.607112->23.565778 us against the ordinary reference. The previous
+  cooperative candidate was 24.082445/26.674223 us on GPU4--7. This is a
+  component result, not a measured complete-round saving. Retain
+  `hc_mtp_coop_full_unroll_tp4_20260927*` and `hc_up_full_unroll*`.
+- Reuse the existing single-row exact QSA selector's bucket compaction for
+  M5/M10 rows with at most 2,304 visible blocks. A union shares the compact
+  and normal workspaces; longer rows retain the original four-pass body.
+  Buffers over 9,216 columns retain the original kernel, since the combined
+  kernel regresses the 64K-context component. At M10, 2,176 blocks improve
+  24.586668->11.250667 us, 8,192 blocks are neutral
+  (33.708001->33.537333 us). Native schema adds optional `decode_batch=False`;
+  `VLLM_SM70_QSA_MTP_TOPK=1` opts in. Nine native GPU tests pass, including
+  M1/prefill regressions, changing captured M5/M10 inputs, threshold crossing,
+  ties/infinities, noncontiguous rows, and the long-buffer fallback. Preserve
+  `qsa_topk_adaptive*`, `qsa_topk_shared*` and
+  `qsa_mtp_topk_native_gate_20260927.log`. Whole-model admission is pending.
+
+The pinned PR704 GDN output projection uses FP32 split partials, whereas the
+current MTP M5 projection requires FP16 materialization. Do not port it by
+changing the global precision contract. The earlier packed output projection
+screen already preserves M5 bits but regresses latency, and changes M10 bits
+(`out_projection_batch*`); do not repeat it without a new numerical/scheduling
+hypothesis. No wheel was built.

@@ -116,7 +116,7 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
 }
 
 template <bool PairRows, int Warps, bool WarpM16, int N = 352,
-          bool RoundPartials = false>
+          bool RoundPartials = false, int Unroll = 4>
 __device__ __forceinline__ void hc_down_partials_body(
     const half* __restrict__ x, const half* __restrict__ packed,
     float* __restrict__ partials, int rows, int block_x, int block_y,
@@ -134,7 +134,7 @@ __device__ __forceinline__ void hc_down_partials_body(
   const int row_base = WarpM16 ? (quad / 2) * 8 : group * 8;
   const half* w = packed + static_cast<size_t>(tile) * 10240 * TileN;
   float accum[PairRows ? 2 : 1][8] = {};
-#pragma unroll 4
+#pragma unroll Unroll
   for (int g = 0; g < 32; ++g) {
     const int kg = split * 32 + g;
     const uint4 lo =
@@ -291,16 +291,16 @@ __global__ __launch_bounds__(32, 4) void hc_cooperative(
   const int block = blockIdx.x, groups = (rows + 7) / 8;
   auto grid = cooperative_groups::this_grid();
   if (block < 60 * groups)
-    hc_down_partials_body<false, 1, false, 96, true>(
+    hc_down_partials_body<false, 1, false, 96, true, 32>(
         input, packed_down, partials, rows, block % 3, (block / 3) % groups,
         block / (3 * groups));
   grid.sync();
   if (block < (rows * 11 + 31) / 32)
     gather_body<true>(buffers, partials, lora, injection, rank, rows, block);
   grid.sync();
-  hc_up_batch_body<false, 1, 4, true>(lora, packed_up, input, local_output,
-                                      rows, 640, rank * 640, block % 80,
-                                      block / 80);
+  hc_up_batch_body<false, 1, 20, true>(lora, packed_up, input, local_output,
+                                       rows, 640, rank * 640, block % 80,
+                                       block / 80);
   grid.sync();
   if (block < (rows * 80 + 31) / 32)
     gather_body<false>(buffers, local_output, output, injection, rank, rows,
