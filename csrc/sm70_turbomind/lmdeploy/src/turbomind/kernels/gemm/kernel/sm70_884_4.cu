@@ -75,10 +75,21 @@ void Registry::sm70_884_4() {
     using Rows32 = B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>;
     using Full64 =
         B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>;
-    Add(std::make_unique<
-        DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
-    Add(std::make_unique<
-        DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
+    using Full48K32 =
+        B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>;
+    using Full48K64 =
+        B::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>;
+    using Tail48K32 =
+        B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true, true>;
+    using Tail64 =
+        B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>;
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full48K32::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full48K64::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Tail48K32::Kernel, true, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Tail64::Kernel, true, true>>());
+
   }
 
   if constexpr (1) {
@@ -189,10 +200,12 @@ class PrescaledNvfp4KernelImpl final : public KernelImpl<Gemm> {
 };
 
 template <class Ordinary, class Prescaled>
-Kernel* MatchPrescaled(const Kernel& control, bool batch = false) {
+Kernel* MatchPrescaled(const Kernel& control, bool batch = false,
+                       bool mask_m = false) {
   static thread_local KernelImpl<typename Ordinary::Kernel> ordinary;
   const std::string name =
-      ordinary.name() + (batch ? "_sm70_batch_supply" : "");
+      ordinary.name() + (mask_m ? "_sm70_batch_supply_mtail"
+                               : (batch ? "_sm70_batch_supply" : ""));
   if (control.name() != name) {
     return nullptr;
   }
@@ -209,17 +222,18 @@ Kernel* Sm70Nvfp4PrescaledCounterpart(const Kernel& control) {
   using B = Config_QuantizedBatch<fp4_e2m1_t, kColMajor>;
   using BP = Config_QuantizedBatch<fp4_e2m1_t, kColMajor,
                                    Transform_HMMA_SIMT_B_PrescaledE2M1>;
-  // Dense decode and prefill have matching transforms. Keeping these out of
-  // Registry prevents ordinary/imported plans from selecting scaled weights.
-  if (auto* k = MatchPrescaled<
-          B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>,
-          BP::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>>(
-          control, true))
+  // Match the ordinary tile and split partition before changing its transform.
+  if (auto* k = MatchPrescaled<B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>, BP::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>>(control, true))
     return k;
-  if (auto* k = MatchPrescaled<
-          B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>,
-          BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1,
-                   true>>(control, true))
+  if (auto* k = MatchPrescaled<B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>, BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>>(control, true))
+    return k;
+  if (auto* k = MatchPrescaled<B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>, BP::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>>(control, true))
+    return k;
+  if (auto* k = MatchPrescaled<B::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>, BP::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>>(control, true))
+    return k;
+  if (auto* k = MatchPrescaled<B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true, true>, BP::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true, true>>(control, true, true))
+    return k;
+  if (auto* k = MatchPrescaled<B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>, BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>>(control, true, true))
     return k;
   if (auto* k = MatchPrescaled<
           C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>,

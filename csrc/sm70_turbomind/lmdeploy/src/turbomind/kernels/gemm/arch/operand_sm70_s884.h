@@ -53,6 +53,43 @@ struct Operand_A_Swizzle_8x64: Operand_A<T> {
 // shared-memory banks. Weight layout and arithmetic remain unchanged.
 template<class T>
 struct Operand_A_BatchPadded: Operand_A<T> {
+    template<int C, int S, int WARPS>
+    struct PartialWarpThreadMap:
+        ThreadMap_V2<C, S, 128 / bitsof<T>, Blocked, WARPS> {
+        using Base = ThreadMap_V2<C, S, 128 / bitsof<T>, Blocked, WARPS>;
+        // M48/K32 needs six loading warps, but the GEMM has eight. The
+        // base map considers its six-warp tile aligned and does not account
+        // for the two surplus warps. Keep their row predicates active even
+        // when the logical matrix exactly fills the CTA tile.
+        static constexpr bool kAlignedS =
+            Base::kAlignedS && WARPS == Base::kWarpC * Base::kWarpS;
+    };
+
+    struct GetGmemIter {
+        template<class Operand, class Iterator, class SmemLayout, int M, int K, int WARPS>
+        static constexpr auto apply(basic_type<Operand> operand,
+                                    basic_type<Iterator> iterator,
+                                    basic_type<SmemLayout> layout,
+                                    pair<M, K> shape, constant<WARPS> warps)
+        {
+            if constexpr (M % 32 == 0) {
+                return gemm::GetGmemIter::apply(operand, iterator, layout, shape, warps);
+            }
+            else {
+                // M48 with eight warps otherwise selects a six-half access,
+                // which has no aligned CUDA vector load. Keep 16-byte A
+                // transactions and let ThreadMap predicate its partial wave.
+                using Dtype = typename Operand::Dtype;
+                constexpr int2 cs = mk2cs<Operand::kOrder>(M, K);
+                constexpr int2 aligned = mk2cs<Operand::kOrder>(0, 1);
+                using Iter = typename Iterator::template Type<
+                    Dtype, PartialWarpThreadMap<cs.x, cs.y, WARPS>,
+                    SmemLayout, Operand::kPack, Operand::kOrder, aligned.x, aligned.y>;
+                return type_c<Iter>;
+            }
+        }
+    };
+
     template<int M, int K>
     struct Layout: SmemLayoutV2<M, K, 1, 1> {
         static constexpr int  kSize      = M * (K + 8);

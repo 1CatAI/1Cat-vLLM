@@ -72,16 +72,25 @@ void Registry::sm70_884_8() {
         B::Type<64, 256, 32, 1, 4, 1, D, S, 2, true, 1, 128, 64, 128>;
     using Full64 =
         B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true>;
+    using Full48K32 =
+        B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 128, 48, 128, 1, true>;
+    using Full48K64 =
+        B::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 128, 48, 128, 1, true>;
+    using Tail48K32 =
+        B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 128, 48, 128, 1, true, true>;
+    using Tail64 =
+        B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true, true>;
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full48K32::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full48K64::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Tail48K32::Kernel, true, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Tail64::Kernel, true, true>>());
     using Full64K16 =
         B::Type<64, 256, 16, 1, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true>;
-    Add(std::make_unique<
-        DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
-    Add(std::make_unique<
-        DenseBatchSupplyKernelImpl<typename Rows64::Kernel>>());
-    Add(std::make_unique<
-        DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
-    Add(std::make_unique<
-        DenseBatchSupplyKernelImpl<typename Full64K16::Kernel, true>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Rows64::Kernel>>());
+    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full64K16::Kernel, true>>());
+
   }
 
   if constexpr (1) {

@@ -48049,6 +48049,71 @@ has launched no full model. Details and artifacts are in
   no additional enable switches. Public API and gateway were stopped at the
   user's request; local benchmark services are shut down.
 
+## 2026-09-27 DFlash2 C4/C6/C8 target continuation (PR #708)
+
+The next targets remain **unmet**: C4 +10%, C6 +15%, C8 +20% over the
+conservative frozen PR #706/GDN-only baselines. The retained default
+candidate adds full and masked M48 compressed-weight tiles, an exact
+eight-lane attention softmax layout and canonical-order 384–512-KiB TP4
+reduction. Ordinary 32K/256 all-live pure decode is
+447.421/666.955/730.373 tok/s, or +2.46%/+13.31%/+1.69%; required rates are
+480.345/676.925/861.921. All 76 token arrays and speculative counters match,
+and long retrieval/natural stops remain 8/8. No new enable switch or weight
+copy is required. Source and expanded GPU checks are in PR #708.
+
+Do not repeat the rejected deeper prefetch, extra M64 tile, forced-register
+cap, paired-half scale or L2-prefetch candidates without new evidence.
+Relaxing split-K partitions improved the M64 GEMM estimate by only 4.1%
+and changed output bits; it was reverted, with no acceptance claim. Fresh
+M32/M64 NCU counters, failed correctness checks, exact build hashes and
+all endpoint qualifications are in the
+[M48 implementation and profiling report](sm70_dflash2_m48_scaling_20260927.md).
+M64 representative kernels do not saturate DRAM; low resident-warp counts,
+instruction/data dependencies and long-attention work remain relevant.
+The report distinguishes these diagnostic counters from endpoint speed.
+
+Main advanced to `db292f9a49` (PR #703) during this frozen comparison and
+was integrated in `bec7cb784c`. The integrated normal extensions build and
+269 GPU/graph regression checks pass. The figures above retain their
+frozen performance baselines; shared 35B-A3B AWQ/FP8 endpoint gates remain
+open. The owner requested merging this verified increment on 2026-09-27;
+the unmet C4/C6/C8 targets remain follow-up work. The integration audit
+and artifact hashes are recorded in the implementation report.
+
+Post-integration ordinary serving on idle GPUs 0–3 preserves all 19 token
+arrays and speculative counters across one C1/C4/C6/C8 wave, with 8/8
+long-retrieval answers and natural stops. This is correctness evidence,
+not a replacement speed baseline. Startup KV capacity is 11.00 GiB versus
+the prior 11.45 GiB; the existing capacity qualification remains open.
+The tested private service is stopped and public serving remains off.
+
+## 2026-09-27 DFlash2 M48 coverage and scaling audit
+
+- Main after PR #706 remeasured at 32K/256, TP4, E4M3 KV, prefix caching and
+  ordered admission. C1/C4/C6/C8 all-live decode medians are
+  162.364/436.677/578.872/704.171 tok/s. C6 is M48 with no graph padding to M64;
+  its GEMM already uses the SM70 batch path. See the
+  [M48 trace and coverage report](sm70_dflash2_m48_scaling_20260927.md).
+- Full-q8 whole GPU rounds are 20.825/33.274/47.913/50.695 ms. At 32K,
+  attention is the largest C1→C4 increment. GEMM is the largest C4→C6
+  increment; M48's GEMM cost is almost the same as M64's. The M64 full-tile
+  iterator must not be admitted at M48 without implementing safe tail loads.
+- Close the separate GDN omission: replace the C4/C8 whitelist by the measured
+  SM70 q8 operator range N4–N32, with identical recurrence and FP32 state
+  snapshots. No quantization/model-name gate, new runtime flag or native
+  artifact is added. Preserve BV32 above N32: the B64 BV8 screen regressed
+  1.06%. The expanded exact-state/replay suite passes 80 GPU tests.
+- C6's GDN screen saves 17.46% per layer; ordinary serving improves
+  578.872→588.630 tok/s (+1.69%). All 76 fixture requests have exact matching
+  token IDs and speculative counters; natural retrieval remains 8/8 correct
+  and 8/8 stops. Do not attribute the unchanged full-C8 route's endpoint
+  median fluctuation to this patch.
+- Retain the startup KV-budget difference (11.45 versus 11.00 GiB) separately:
+  both actual graph pools are 0.99 GiB, but total capacity equality is not
+  established. The baseline C6 480-KiB one-stage versus C8 640-KiB two-stage
+  reduction discontinuity is addressed by the later Draft #708 candidate
+  above; the capacity qualification remains separate.
+
 ## 2026-09-27 MTP4 batch GDN input qualification
 
 - Keep the accepted 27.3963-ms complete-round reference. The target verifier

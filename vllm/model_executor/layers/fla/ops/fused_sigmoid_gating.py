@@ -749,7 +749,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         # Split the independent V columns across more CTAs for this q8 case.
         BV = 2
     if (
-        N in (4, 8)
+        4 <= N <= 32
         and (T, H, HV, K, V) == (N * 8, 4, 12, 128, 128)
         and (BV, num_warps) == (32, 1)
         and match_recurrent_schedule
@@ -767,7 +767,10 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
 
         if not _SM70_FLA_HAS_LEGACY_OVERRIDE:
             # The q8 verifier writes eight FP32 state snapshots per request.
-            # BV32 overfills each one-warp tile as batch grows. BV8 keeps the
+            # BV32 overfills each one-warp tile as batch grows. Admit the
+            # operator family, including non-power-of-two batches such as N6,
+            # rather than selected service concurrency counts. Larger batches
+            # retain BV32, where the extra CTAs no longer help. BV8 keeps the
             # same K reduction and recurrence while exposing more independent
             # V tiles; output and every stored state remain bitwise identical.
             BV = 8

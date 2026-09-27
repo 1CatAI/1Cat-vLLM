@@ -1541,7 +1541,7 @@ static __global__ void __launch_bounds__(512, 1)
   if (tid == 0) self_sg->_flag[0] = pair_flag;
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool CanonicalOrder = false>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
                                T* __restrict__ result, int rank, int size) {
@@ -1558,7 +1558,10 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Medium SM70 messages previously used one-stage canonical rank order.
+    // Preserve that arithmetic when sharing their reduction across devices;
+    // temporary ownership and gather visibility retain the two-stage order.
+    ptrs[i] = (const P*)_dp->ptrs[CanonicalOrder ? i : target];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
@@ -1978,6 +1981,20 @@ class CustomAllreduce {
           sm70_tp8_hierarchical_allreduce_size(bytes)) {
         sm70_tp8_hierarchical_reduce<<<1, 512, 0, stream>>>(
             ptrs, sg_, self_sg_, output, rank_, size);
+        return;
+      }
+    }
+    if constexpr (std::is_same_v<T, half>) {
+      const char* blocks_override =
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+      if (world_size_ == 4 && fully_connected_ && bytes >= 384 * 1024 &&
+          bytes < 512 * 1024 && block_limit == defaultBlockLimit &&
+          (blocks_override == nullptr || blocks_override[0] == '\0') &&
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          std::getenv("VLLM_SM70_TP4_M5_AR_THREADS") == nullptr &&
+          custom_allreduce_current_device_is_sm70()) {
+        cross_device_reduce_2stage<T, 4, true>
+            <<<20, 256, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
         return;
       }
     }
