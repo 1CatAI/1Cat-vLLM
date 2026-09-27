@@ -1009,3 +1009,114 @@ No calibration inference, new trace, owned GPU worker or waiter exists at
 this checkpoint. Syntax checks pass for the prepared artifact scripts.
 Retain `mtp_capture_representativeness_audit.json` and the calibration
 scripts. Corrected plot titles explicitly mark the old trace uncalibrated.
+
+### Calibrated deferred-event trace, 2026-09-27
+
+The subsequent queue obtains GPUs4--7 after foreign jobs exit naturally.
+No foreign service is stopped. All arms use source
+`e7df523a3c68c6d1a586d34adb54f84fc1e63c1d`, normal `_C` SHA256
+`647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`,
+the same environment, physical GPUs4--7, and warmed 8192/513 fixture.
+The four qualified acceleration flags stay enabled; mixed-QKV stays disabled.
+The batch router source is newer than the paired `6bcffbb796` endpoint above.
+These controls qualify measurement and the fixed fixture; they are not a
+new paired optimization speedup or a new natural-EOS quality campaign.
+
+| Arm | Before ms/round | During ms/round | After ms/round |
+| --- | ---: | ---: | ---: |
+| Independent clean process | 23.686521 | 23.704239 | 23.700977 |
+| Nsight whole-graph process | 25.176410 | 25.350714 | 25.460508 |
+| Deferred CUDA events, no Nsight | 23.602294 | 23.799931 | 23.691980 |
+
+The clean mean is **23.697246 ms**. Whole-graph collection changes only
+0.127% against its adjacent controls, but its collection-disabled process
+already differs from clean by **+6.841%**. It fails admission; no node arm
+is launched. Its metadata markers close 335 cycles/rank at
+25.354080--25.354105 ms, agreeing with the captured request. One target-graph
+record is missing on ranks0/2/3 at cycle316/310/305. Do not drop these cycles
+silently or reuse this graph trace for normal absolute attribution.
+
+The deferred observer precreates event handles and reads them after the
+request. It overrides only the optional diagnostic profiler's event fence
+and reporting; real model, output, and collective synchronization is intact.
+Each graph invocation receives unique event handles, including all three
+replays of the same M1 draft graph. No per-round timing read or diagnostic
+synchronization occurs. The original phase profiler flag remains zero.
+The event request differs by **+0.646%** from its own off-control mean
+(23.647137 ms), and **+0.433%** from the independent clean mean. Off-control
+drift is 0.380%. All three requests preserve all 513 output IDs, finish
+reasons, and the complete acceptance statistics: 335 drafts, 177 accepted
+tokens, positions `[125, 36, 10, 6]`.
+
+Each rank records **336 target-forward starts and 6,720 unique events**.
+Those starts close **335 consecutive intervals**. The initial parser
+incorrectly required the number of starts to equal the request draft
+counter; its failed log and source are retained. The corrected parser
+distinguishes those quantities, validates all four ranks and five replay
+envelopes per invocation, and retains the final invocation as raw data and
+the final closing boundary. This is a CPU-only parser correction: no raw
+measurement changes and no GPU rerun.
+
+All components below come from the same 335 rank0 intervals. Event envelopes
+include GPU execution, host submission gaps, and dependency waits; they are
+not isolated kernel service times. No timing is rescaled to the endpoint.
+
+| Rank0 phase | Mean ms | p50 ms | p90 ms | p99 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Target forward | 17.781912 | 17.795044 | 17.914063 | 18.081792 |
+| Sampling and state handoff | 0.780647 | 0.781250 | 0.785156 | 0.791504 |
+| Four drafts | 4.627054 | 4.554688 | 4.800293 | 5.014648 |
+| Next-round preparation/scheduling | 0.593635 | 0.589844 | 0.607178 | 0.655273 |
+| Complete closed cycle | **23.783247** | 23.781738 | 24.015137 | 24.270752 |
+
+The four rank-local cycle means are 23.783247, 23.783418, 23.783387,
+and 23.783259 ms, within **0.071%** of the event request's 23.799931 ms.
+Selecting the longest whole interval at each aligned ordinal gives
+23.813001 ms. Its components, each taken from the same selected rank, are
+17.730917 / 0.773139 / 4.635154 / 0.673792 ms. This is kept separate from
+fixed-rank means; independently maximizing each category would not close.
+Different GPUs retain separate event-clock origins.
+
+Rank0's target replay envelope is 17.741128 ms; forward work around it is
+0.040784 ms. The four draft replay envelopes are **1.329739, 1.081356,
+1.058597, 1.051968 ms** (M5, then three M1), plus 0.105394 ms outside those
+replays. Within the 0.780647-ms sampling/handoff interval, direct event
+pairs measure 0.754719 ms sampling and 0.017420 ms state update. Remaining
+gaps stay explicit in the enclosing interval. Prefill/TTFT are excluded;
+the sampled request's pure decode is 7.972977 s for 512 steady emitted
+tokens (64.216917 tokens/s, 15.572221 ms/emitted token).
+
+Host replay observation supports a profiler-sensitive launch path: ordinary
+target replay host means are 0.074--0.101 ms/rank before event collection,
+versus 1.048--1.422 ms/rank in the inactive Nsight process. These are CPU
+API durations, not GPU graph costs. This does not assign every difference
+in the old node trace to one cause. Node-level kernel attribution and
+SM/HBM counters remain unqualified; do not carry old GEMM service sums into
+the calibrated wall table.
+
+The target forward accounts for about 74.8% of rank0's complete cycle and
+draft for 19.5%. The next measurement should split HC, GDN, experts, and
+attention inside the target while retaining this perturbation/closure gate.
+The <20-ms goal remains unmet. No new runtime optimization, default, wheel,
+or model numerical contract is introduced by this measurement.
+
+Retained artifacts in the owned worktree's `.artifacts/`:
+
+- `mtp_capture_calibration_{none,graph,deferred}_20260927` reports,
+  commands/contracts, logs, and exit codes;
+- `mtp_capture_calibration_graph_20260927_audit.json`, including the rejected
+  graph trace's missing records and diagnostic warnings;
+- `mtp_deferred_{worker,probe}.py`, `run_mtp_deferred_trace.py`, and the
+  CPU plumbing check;
+- `mtp_deferred_independent_audit.json`, verifying identities, all output
+  IDs, monotonic timestamps, and unique handles independently of plotting;
+- `mtp_capture_calibration_deferred_20260927_{wall,chrome}.json`, all raw
+  intervals and a Chrome/Perfetto event trace;
+- `calibrated_mtp_trace_view/trace_breakdown.{png,svg}` and its selection
+  manifest. The shown raw interval is round252, chosen by distance to the
+  median over all 335 rank0 intervals.
+
+The model processes and resource waiter exit after measurement. The first
+automatic postprocessor reports the strict parser failure described above;
+CPU analysis/plotting are then completed and reviewed without another
+model load. The current report/status supersede that historical failure.

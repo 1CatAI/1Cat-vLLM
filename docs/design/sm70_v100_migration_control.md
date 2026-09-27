@@ -48252,3 +48252,36 @@ has launched no full model. Details and artifacts are in
   plus a 3% perturbation/drift gate. The first launch was rejected before
   CUDA by a foreign GPU4--7 lease; no new speed/trace result or owned waiter
   exists. See the detailed capture audit in the MTP batch qualification doc.
+- Completed capture calibration on source `e7df523a3c`, normal native SHA256
+  `647649e8d5ee1ef6ab0952e8e29b8967967ca647a27bd86d55af62e58ca65179`,
+  physical GPUs4--7, same warmed 8192/513 MTP4 fixture, pinned host PLE,
+  four acceleration flags on and mixed-QKV off. Clean rounds are
+  23.686521/23.704239/23.700977 ms (mean 23.697246). Nsight whole-graph
+  off/on/off is 25.176410/25.350714/25.460508 ms: inactive injection is
+  already +6.841% against clean, so the arm is rejected and node collection
+  is skipped. Three ranks also each lack one target-graph record. Retain
+  the graph audit; do not repeat this failed arm as an absolute timing path.
+- Deferred CUDA-event observation preserves asynchronous execution and reads
+  timing only after the request. Same-engine off/on/off is
+  23.602294/23.799931/23.691980 ms, +0.646% capture perturbation and 0.380%
+  control drift; every output ID, finish reason and acceptance statistic
+  matches. There are 336 target starts / 6,720 unique events on each rank,
+  closing 335 intervals. Correct the parser's original start-count versus
+  request-draft-counter mistake without rerunning GPU work; its failure is
+  retained. Independent raw-event/identity/quality checks pass.
+- The calibrated rank0 cycle is **23.783247 ms**, within 0.071% of the
+  enclosing request: target forward 17.781912, sampling/state handoff
+  0.780647, four drafts 4.627054, next-round preparation 0.593635 ms.
+  Draft replay envelopes are 1.329739/1.081356/1.058597/1.051968 ms, with
+  0.105394 ms outside their graphs. All four rank-local cycle means agree
+  within 0.000171 ms. Per-ordinal slowest complete-rank intervals average
+  23.813001 ms; never sum independent category maxima. These are replay/
+  phase envelopes including waits, not per-kernel service or utilization.
+- Raw events, closed intervals, Chrome/Perfetto trace and reviewed PNG/SVG
+  are under `mtp_capture_calibration_deferred_20260927*` and
+  `calibrated_mtp_trace_view/` in the owned artifact directory. Target
+  forward is about 75% of the cycle; split HC/GDN/experts/attention within
+  it next under the same admission gate. The old kernel-level Nsight
+  breakdown and SM/HBM counters remain unqualified. <20 ms is still unmet.
+  No foreign service was stopped, no wheel was built, and all owned
+  measurement/waiter processes have exited.
