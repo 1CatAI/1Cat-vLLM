@@ -48415,6 +48415,66 @@ has launched no full model. Details and artifacts are in
   bits, but exact BV8/BV16 saves only ~0.05 ms per 36-layer component chain.
   Keep it as research rather than rerunning a full model for that small gain.
 
+### 2026-09-27–28 Flash-Next MTP4 fixed-sample evaluation at a 256K cap
+
+- Evaluate merged source `db292f9a49318459f064075bfdbbed438b4e77a3` on
+  TP4 GPU4–7 with all #703 accelerators, pinned-host PLE, FP16 main KV and
+  FP32 SSM state. Native kernels remain unchanged; no wheel was built. The owned branch
+  is `agent/v100-mtp4-256k-eval-20260927`.
+- Fixed seed-42 subsets of 64 GSM8K, 64 MATH-500, and 64 HumanEval tasks use
+  checkpoint sampling (T1/top-p .95/top-k 20), thinking/xhigh, and normal EOS.
+  Strict scores are **61/64, 61/64, 56/64**; pure decode is **127.262,
+  123.640, 113.903 tokens/s**, acceptance **49.13%, 46.40%, 40.84%**.
+  The sample contains 11 output-budget truncations (1/2/8 respectively).
+  Natural-sampling complete endpoint rounds remain about 23.1 ms, not <20 ms.
+- Do not repeat the failed automatic-KV configuration as a 256K qualification:
+  `max_num_batched_tokens=2048`, memory fraction .97 admits 5.18 GiB KV and
+  364130 nominal tokens, but the real request OOMs around 225K during draft
+  QSA cuBLAS score allocation (64 MiB requested, 40.12 MiB free). KV block
+  usage is only about 64%; reserve temporary workspace rather than adding KV.
+- Explicit `kv_cache_memory_bytes=4294967296` admits 281030 tokens and passes
+  the exact 261631-input + 513-output boundary. Both 131072- and 261888-token
+  natural-EOS retrieval probes recover all three codes. Keep this as a
+  single-request TP4 configuration; it is not a concurrency qualification.
+- The fixed 24-task replay at 4 GiB scores 8/8, 8/8, 6/8, with the HumanEval
+  failures truncated. It is not bitwise parity: 4/24 sampled outputs and
+  3/24 acceptance records match the initial run. Fixed greedy 8K outputs
+  match, but acceptance changes. Preserve both contracts and leave the cause
+  of capacity/history sensitivity open; do not merge their measurements.
+- One saved-prefix continuation for each primary truncation resolves three,
+  leaves seven truncated, and yields one failing code answer. Keep these
+  diagnostics separate from primary pass@1. GSM8K row 454 has a reference
+  inconsistency (question implies 240, reference says 150); retain the strict
+  mismatch and its audit instead of changing the benchmark answer.
+- Full results, definitions, and raw artifact names are in
+  `sm70_flash_next_mtp4_256k_eval_20260927.md`. Raw per-token outputs, frozen
+  fixtures, sandbox results, contracts, and telemetry remain under
+  `.artifacts/mtp256k_eval/` in the owned MTP worktree. The no-MTP comparison
+  uses the same 4-GiB budget and common accelerators; its finalized results
+  are recorded in the linked report.
+- Target-only startup with exact gated RMSNorm enabled exposed a Dynamo
+  device-query graph break. Fix `6337a96bee` resolves the worker capability
+  in the constructor and omits tracing-time logging; 25 GPU tests and the
+  six dynamic-compile regressions pass. Draft PR #709 contains this fix.
+  The no-MTP control therefore has a disclosed Python-only source delta;
+  native binaries and all common acceleration settings match. Do not
+  label this comparison identical-source.
+- Completed target-only control: 30 requests, clean exit. The same fixed
+  first-eight subsets run at 95.317/94.570/94.740 tokens/s without MTP versus
+  162.906/138.098/111.977 with MTP (1.709x/1.460x/1.182x); scores are 8/8,
+  8/8, 7/8 off versus 8/8, 8/8, 6/8 on. Generated lengths differ under normal
+  EOS, so these are throughput comparisons, not fixed-output latency ratios.
+- Fixed 8K+513 token sequences match and recover the historical no-MTP speed:
+  97.380 tokens/s off versus 72.250 on at only 13.98% draft acceptance. MTP
+  is slower here. The 128K/256K synthetic fixtures yield 196.362/100.357 on
+  versus 83.014/72.978 off, with matching repeated outputs and 100% acceptance;
+  do not use these artificial sequences as natural-task quality evidence.
+- All 264 persisted completed cases pass frozen-input and endpoint-metric
+  integrity checks. Publish the per-case CSV beside the report; retain full
+  token sequences locally. No new profile was collected in this evaluation.
+  Both final engines exit 0; all owned workers/watchers and telemetry are
+  stopped, and the GPU4–7 leases are released. No foreign service was stopped.
+
 ### 2026-09-27 PR #703 audit and authorized main integration
 
 - The user explicitly requested audit and merge. Merge latest `onecat/main`
