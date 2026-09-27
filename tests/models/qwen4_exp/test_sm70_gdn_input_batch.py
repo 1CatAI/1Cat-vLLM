@@ -96,6 +96,22 @@ def test_unsupported_batch_falls_back(cuda_weights, monkeypatch, m):
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.parametrize("m", (5, 10))
+def test_fp16_accumulation_falls_back(cuda_weights, monkeypatch, m):
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", True)
+    envs.disable_envs_cache()
+    q, b, pq, pb = cuda_weights
+    x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
+    assert not _can_use_packed_gdn_input(x, pq, pb)
+    for actual, expected in zip(
+        _qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb),
+        _qwen38_sm70_fp16_gdn_input(x, q, b),
+    ):
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("which", ("x", "q", "b"))
 def test_unaligned_storage_falls_back(cuda_weights, monkeypatch, which):
     monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")

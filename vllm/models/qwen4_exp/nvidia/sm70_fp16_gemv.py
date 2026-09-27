@@ -399,6 +399,9 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
     return bool(
         envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
         and not envs.VLLM_BATCH_INVARIANT
+        # The packed MMA preserves the original FP32 accumulation contract.
+        # Let cuBLAS honor an explicit request for FP16 accumulation.
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
         and 2 <= x.shape[0] <= 16
         and x.shape[1] == 2560
