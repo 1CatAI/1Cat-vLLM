@@ -101,6 +101,36 @@ def compare_tokens(requests, reference):
     return differences
 
 
+def long_quality_prompt_ids(tokenizer, length):
+    """Place one record in the middle of an exactly sized natural chat."""
+    marker = "ONECAT_LONG_ARCHIVE_MARKER"
+    rendered = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": marker
+                + "\nFind the archive code and finish with RESULT=<code>.",
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    before, after = rendered.split(marker)
+    lead = tokenizer.encode(before, add_special_tokens=False)
+    tail = tokenizer.encode(after, add_special_tokens=False)
+    filler = tokenizer.encode(
+        "A routine archive entry, without task instructions.\n",
+        add_special_tokens=False,
+    )
+    record = tokenizer.encode("\nArchive code: MAPLE-8261.\n", add_special_tokens=False)
+    count = length - len(lead) - len(tail) - len(record)
+    if count < 0 or not filler:
+        raise ValueError("Long quality prompt needs room for the chat and record")
+    padding = (filler * ((count + len(filler) - 1) // len(filler)))[:count]
+    return lead + padding[: count // 2] + record + padding[count // 2 :] + tail
+
+
 def finalize_measurements(report):
     """Collect every planned case, but never accept failed token parity."""
     report["measurements_complete"] = True
@@ -163,6 +193,11 @@ def main():
     )
     parser.add_argument("--measure-prefill", action="store_true")
     parser.add_argument("--health", action="store_true")
+    parser.add_argument(
+        "--long-context",
+        action="store_true",
+        help="Also check natural 128K/256K retrieval and the exact context boundary",
+    )
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
@@ -287,7 +322,7 @@ def main():
             use_tqdm=False,
         )[0]
         report["warmup_text"] = warm.outputs[0].text
-        if args.health:
+        if args.health or args.long_context:
             import regex as re
 
             official = json.loads((Path(model) / "generation_config.json").read_text())
@@ -300,6 +335,7 @@ def main():
                 ignore_eos=False,
                 skip_special_tokens=False,
             )
+        if args.health:
             report["health"] = []
             for prompt, pattern in (
                 (
@@ -583,6 +619,78 @@ def main():
             save()
             if not all(case["passed"] for case in report["batch_health"]):
                 raise RuntimeError("Concurrent natural output health check failed")
+        if args.long_context:
+            report["long_context_health"] = []
+            for length in (131072 - 513, config["max_model_len"] - 513):
+                ids = long_quality_prompt_ids(tokenizer, length)
+                first_ids = None
+                for repeat in range(2):
+                    output = llm.generate(
+                        {"prompt_token_ids": ids}, natural, use_tqdm=False
+                    )[0]
+                    completion = output.outputs[0]
+                    token_ids = list(completion.token_ids)
+                    metrics = _request_metrics_dict(output.metrics, len(token_ids))
+                    if first_ids is None:
+                        first_ids = token_ids
+                    passed = (
+                        completion.finish_reason == "stop"
+                        and bool(
+                            re.search(
+                                r"RESULT\s*=\s*MAPLE-8261\b",
+                                completion.text.rsplit("</think>", 1)[-1],
+                            )
+                        )
+                        and token_ids == first_ids
+                        and not metrics["raw"]["is_corrupted"]
+                    )
+                    row = {
+                        "input_tokens": length,
+                        "prompt_sha256": hashlib.sha256(str(ids).encode()).hexdigest(),
+                        "repeat": repeat,
+                        "passed": passed,
+                        "tokens_match_first_repeat": token_ids == first_ids,
+                        "token_ids": token_ids,
+                        "text": completion.text,
+                        "finish_reason": completion.finish_reason,
+                        "metrics": metrics,
+                    }
+                    report["long_context_health"].append(row)
+                    save()
+                    print(
+                        json.dumps(
+                            {
+                                "long_health": length,
+                                "repeat": repeat,
+                                "passed": passed,
+                                "output_tokens": len(token_ids),
+                            }
+                        ),
+                        flush=True,
+                    )
+            # Exercise the final valid input slot without inventing an answer
+            # quality score from a one-token completion.
+            length = config["max_model_len"] - 1
+            ids = long_quality_prompt_ids(tokenizer, length)
+            output = llm.generate(
+                {"prompt_token_ids": ids},
+                SamplingParams(max_tokens=1, temperature=0, seed=0, ignore_eos=True),
+                use_tqdm=False,
+            )[0]
+            token_ids = list(output.outputs[0].token_ids)
+            metrics = _request_metrics_dict(output.metrics, len(token_ids))
+            boundary_passed = len(token_ids) == 1 and not metrics["raw"]["is_corrupted"]
+            report["exact_context_boundary"] = {
+                "input_tokens": length,
+                "token_ids": token_ids,
+                "passed": boundary_passed,
+                "metrics": metrics,
+            }
+            save()
+            if not boundary_passed or not all(
+                case["passed"] for case in report["long_context_health"]
+            ):
+                raise RuntimeError("Long-context output quality/boundary check failed")
         finalize_measurements(report)
         save()
     except Exception as error:

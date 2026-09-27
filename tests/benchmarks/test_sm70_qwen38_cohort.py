@@ -9,6 +9,7 @@ import pytest
 from benchmarks.benchmark_sm70_qwen38_concurrency import (
     finalize_measurements,
     generate_cohort,
+    long_quality_prompt_ids,
 )
 
 
@@ -23,6 +24,38 @@ def make_llm():
         wait_for_completion=events.wait,
     )
     return llm, events
+
+
+class CharacterTokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs == {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            "enable_thinking": True,
+        }
+        return "<user>" + messages[0]["content"] + "</user><assistant><think>"
+
+    def encode(self, text, *, add_special_tokens):
+        assert not add_special_tokens
+        return list(map(ord, text))
+
+
+@pytest.mark.parametrize("length", [131072 - 513, 262144 - 513, 262144 - 1])
+def test_long_quality_prompt_preserves_exact_length_and_middle_record(length):
+    tokenizer = CharacterTokenizer()
+    ids = long_quality_prompt_ids(tokenizer, length)
+    assert len(ids) == length
+    text = "".join(map(chr, ids))
+    assert text.count("Archive code: MAPLE-8261.") == 1
+    assert abs(text.index("Archive code:") - length // 2) < 128
+    assert text.startswith("<user>")
+    assert text.endswith("</user><assistant><think>")
+    assert "finish with RESULT=<code>." in text
+
+
+def test_long_quality_prompt_rejects_insufficient_room():
+    with pytest.raises(ValueError, match="needs room"):
+        long_quality_prompt_ids(CharacterTokenizer(), 1)
 
 
 def test_streaming_cohort_preserves_generate():
