@@ -48048,3 +48048,29 @@ has launched no full model. Details and artifacts are in
   items; merging does not mark them as passed. Capability-based defaults need
   no additional enable switches. Public API and gateway were stopped at the
   user's request; local benchmark services are shut down.
+
+## 2026-09-27 DFlash2 M48 coverage and scaling audit
+
+- Main after PR #706 remeasured at 32K/256, TP4, E4M3 KV, prefix caching and
+  ordered admission. C1/C4/C6/C8 all-live decode medians are
+  162.364/436.677/578.872/704.171 tok/s. C6 is M48 with no graph padding to M64;
+  its GEMM already uses the SM70 batch path. See the
+  [M48 trace and coverage report](sm70_dflash2_m48_scaling_20260927.md).
+- Full-q8 whole GPU rounds are 20.825/33.274/47.913/50.695 ms. At 32K,
+  attention is the largest C1→C4 increment. GEMM is the largest C4→C6
+  increment; M48's GEMM cost is almost the same as M64's. The M64 full-tile
+  iterator must not be admitted at M48 without implementing safe tail loads.
+- Close the separate GDN omission: replace the C4/C8 whitelist by the measured
+  SM70 q8 operator range N4–N32, with identical recurrence and FP32 state
+  snapshots. No quantization/model-name gate, new runtime flag or native
+  artifact is added. Preserve BV32 above N32: the B64 BV8 screen regressed
+  1.06%. The expanded exact-state/replay suite passes 80 GPU tests.
+- C6's GDN screen saves 17.46% per layer; ordinary serving improves
+  578.872→588.630 tok/s (+1.69%). All 76 fixture requests have exact matching
+  token IDs and speculative counters; natural retrieval remains 8/8 correct
+  and 8/8 stops. Do not attribute the unchanged full-C8 route's endpoint
+  median fluctuation to this patch.
+- Retain the startup KV-budget difference (11.45 versus 11.00 GiB) separately:
+  both actual graph pools are 0.99 GiB, but total capacity equality is not
+  established. C6's 480-KiB one-stage TP reduction versus C8's 640-KiB tuned
+  two-stage reduction is another measured route discontinuity, not yet fixed.
