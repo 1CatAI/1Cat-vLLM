@@ -242,6 +242,8 @@ def main():
         probe = torch.empty((2, 10240), device="cuda", dtype=torch.float16)
         if not communicator.can_sm70_qwen38_hc_batch(probe):
             raise RuntimeError("Native TP4 batched HC was not admitted")
+        torch.cuda.synchronize()
+        dist.barrier()  # All local packet clears must finish before peer sends.
     result = {
         "contract": (
             "TP4 down/Silu/up/mix/both gathers; excludes combine/norm and model"
