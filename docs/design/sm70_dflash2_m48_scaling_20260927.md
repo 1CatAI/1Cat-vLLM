@@ -1,7 +1,7 @@
 # SM70 DFlash2 M48 scaling audit, 2026-09-27
 
 Main baseline: `ef6909830cbb7b40a24413bfe74ab49a4f7e1b90` (PR #706).
-The qualified pre-merge worktree has exactly the same source tree. No native kernel, quantization, sampling, or model change is used for this audit.
+The initial audit uses the qualified pre-merge source tree without native changes. The default native candidates and their separate endpoint validation are recorded below; model, quantization and sampling remain fixed.
 
 ## Contract
 
@@ -88,7 +88,7 @@ Eager initial comparisons are bitwise exact for output and state. C6 BV32→BV8:
 
 The change is Python-only and reuses the already qualified main native artifacts; native source trees are unchanged. Normal package extensions only, no LD_PRELOAD, private sidecar kernels or runtime overrides. Native core SHA256: `49b92da93e596ef8e3c2ec4b07907c5e2663c131413ce7f3dafdc8e4f68bb7b4`. Flash-V100 FA2 SHA256: `7962e11a7af0c0f88107459df7292c9f8c4a552c7be58efc7b1a0e32ae3ff2f8`.
 
-## Candidate ordinary endpoint validation
+## Earlier GDN-only endpoint validation
 
 The identical fixture, ordered admission, natural-output gate and three-repeat
 rule are used on a fresh ordinary service with the default route change.
@@ -123,17 +123,118 @@ and is not evidence of unchanged total memory capacity.
 
 `profiles/c1-c4-c6-c8.nsys-rep`, its SQLite export, `results/steps/{ledger,nodes}-c{1,4,6,8}/rank{0,1,2,3}.jsonl`, `results/{ledger,nodes}-step-summary.json`, `results/nsys-attribution.json`, `results/representative-kernels.json`, `results/baseline-summary.json`, `results/candidate-summary.json`, `results/gdn-warp-supply.json`, `results/gdn-large-coverage.json`, and `results/gdn-exactness-tests.log`. The private campaign worklog records absolute locations, exact launch scripts and active process ownership.
 
-The GDN admission fix does not claim to solve the remaining GEMM, long-attention or collective bottlenecks. Next candidates must preserve output and every state snapshot, prove a same-shape operator win, then confirm ordinary serving speed.
+## Default native optimization and acceptance targets
 
-Priorities from this trace are tail-safe M33–M64 GEMM tiles with more weight
-reuse across M, screening the collective strategy for the 480-KiB region, and
-reducing long-attention resource pressure. The grouped long-attention kernel
-uses 124 registers/thread and 72704 bytes of shared memory per CTA. These are
-launch-resource observations, not fresh Nsight Compute measurements of tensor
-core utilization or DRAM bandwidth. Attention KV work grows with requests even
-when prompt storage is prefix-shared; not all of that growth is avoidable.
+The next campaign freezes the preceding GDN-only service as its comparison.
+C4/C6/C8 must improve pure decode by 10%/15%/20%, respectively. Conservative
+thresholds use the higher median of main and GDN-only: **480.345 / 676.925 /
+861.921 tok/s**. C1 must not materially regress. Kernel timings and projections
+do not satisfy this endpoint requirement.
 
-For planning only, a further 15% pure-decode speedup with unchanged accepted
-tokens and all else equal would require about 4.34 ms off C4's 33.27-ms round,
-6.25 ms off C6's 47.91-ms round, or 6.61 ms off C8's 50.70-ms round. Those are
-whole-round savings targets, not predictions or measured candidate results.
+The retained implementation adds:
+
+- Full M48 and safely masked tail tiles to the shared FP4/FP8 TurboMind
+  registry. The policy is based on SM70, dense shapes, alignment and M/K/N,
+  with the established split-K numerical partition. C1 stays on its existing
+  fast route. Both formats share activation loading and dispatch; no model
+  name, concurrency whitelist, second weight copy or environment switch is
+  introduced.
+- A registry-order correction: exclude batch-only candidates before
+  Context::Filter chooses the covering CTA. Otherwise an excluded M48 tile
+  can still hide the ordinary M64 reference and change its split-K family.
+- A partial-warp activation-load guard. M48/K32 needs six loading warps in an
+  eight-warp CTA. The base thread map marked the six-warp tile aligned and
+  allowed two surplus warps to overwrite shared memory. Expanded generic
+  FP4/FP8 tests exposed this despite actual model cases passing. The local
+  map now keeps those row predicates active; all 127 quantized GEMM tests
+  pass after the fix.
+- Canonical-rank-order two-stage FP16 TP4 all-reduce for payloads from
+  384 KiB inclusive to 512 KiB exclusive on fully connected SM70 groups.
+  The existing small push and larger two-stage routes remain selected by
+  their existing guards. The new kernel keeps the ordinary rank sum order,
+  including adversarial cancellation cases.
+- Eight-lane subgroup softmax in the full-q8 long-attention kernel. Four rows
+  share a warp and preserve the original 32-column reduction tree,
+  probability residual compensation, N32 panels and 80-way split contract.
+  This changes execution layout, not attention coverage or KV precision.
+
+The all-reduce 480-KiB screening result is 34.771 -> 26.058 us, with graph
+replay, boundary sizes, stragglers, canaries and cancellation cases validated.
+The 16-layer, 32K attention microbenchmark changes C4/C6/C8 from
+7.129/10.460/13.878 ms to 6.316/9.256/12.264 ms. Output, partial numerator
+and max/sum workspace bits match across 64 random layers at C1/C4/C6/C8,
+mixed and empty rows, changed graph inputs, B16, unpaired KV strides, and
+262K context. These are operator measurements, not endpoint claims.
+
+### Ordinary service results for the combined default candidate
+
+Same GPUs 4–7, fixture, ordered admission, natural-output gate and three
+retained repeats. The custom streaming harness counts exact emitted tokens
+inside the common all-requests-alive window; this is not vLLM bench output
+throughput and does not include TTFT or new prefill.
+
+| C | Prior GDN-only tok/s | Combined candidate tok/s | Change |
+|---:|---:|---:|---:|
+| 1 | 162.857 | 165.175 | +1.42% |
+| 4 | 435.723 | 447.421 | +2.68% |
+| 6 | 588.630 | 666.955 | +13.31% |
+| 8 | 718.268 | 730.373 | +1.69% |
+
+**The new C4/C6/C8 targets are not met.** C6 is close; C4 and C8 require
+further work. Against the higher C4 main median, its gain is 2.46%.
+All 76 performance-request token arrays and speculative counters remain
+identical to the preceding baseline. Acceptance remains 33.395%, 37.093%,
+48.874%, and 51.029% at C1/C4/C6/C8. Long retrieval remains 8/8 correct with
+8/8 natural stops.
+
+The service uses normal source-built package extensions, with no task-local
+DSO dependency or new tuning switches. It reports 9.57 GiB model memory,
+0.99 GiB actual graph pool, 11.45 GiB available KV memory and 1,050,885 KV
+tokens. The 262144 maximum context remains configured. This is a startup
+capacity observation, not an end-to-end 262K performance claim.
+
+Test results: 127 quantized GEMM GPU tests, nine long-attention GPU cases
+(eight existing cases plus C6), one four-GPU all-reduce test, and the prior
+80 GDN GPU tests. Compute Sanitizer failed to attach before its first
+instrumented CUDA call; no sanitizer pass is claimed. The shared 35B-A3B
+AWQ/FP8 service performance gates have not been rerun for this candidate.
+
+Service extension SHA256:
+
+- core: `9e59de1e756537e5b6704054c179c3cf4114e429e075b6c92a0be254c179a5e5`
+- FA2: `ac99fbe8e879df746478d2bb872e910c94b776532c4a71c6f3f7db8a0a7b6859`
+
+A later ordinary rebuild after rejected experiments produces core hash
+`095fef73349812415840f53166aafb714328d43ef273c852a29a82f0ba4f18ce`.
+Its source diff is byte-identical to the recorded endpoint source patch;
+the different binary hash is recorded separately and not substituted for
+the hash used by the measured service.
+
+### Retained and rejected experiments
+
+Artifacts are under the campaign's `batch-targets-20260927/` directory:
+`results/service-m48-softmax-summary.json`, ordinary service/evaluation logs,
+`results/native-m48-softmax.{sha256,patch}`,
+`results/normal-m48-gemm-tests-fixed.log`,
+`results/normal-attention-softmax-tests.log`,
+`results/softmax-validation.json`, and the earlier medium-all-reduce logs.
+Original endpoint JSON, token IDs and retrieval results use
+`long-service-batch-targets-m48-softmaxfix/`.
+
+Request-interleaved attention CTAs, sequential PV panels, extra M64 warp
+arrangements, deeper QPN2 prefetch, FP8 scale folding, TurboMind lookahead
+tactics, smaller softmax subgroups and N64 attention panels did not provide
+a sufficient consistent win. They are absent from runtime source. Reduced
+attention split counts had a local win but changed arithmetic; the exact
+subgroup optimization was preferred. Raw failed experiments are retained
+in the campaign worklog to avoid repeating them.
+
+Remaining measured constraints are M64 GEMM cost and long-attention work
+that still scales with each request. A separate FP4 scale-supply probe was
+bit-exact but slower (down 45.712 -> 46.152/46.824 us, gate/up
+74.608 -> 78.432/77.160 us). It was rejected. Combining two QK MMA groups
+before compensated accumulation reduced the attention operator cost by
+about 4%, with similar error against an FP64 reference, but changed output
+bits. It has no acceptance or endpoint qualification and is not enabled or
+counted as an improvement. Draft review remains open; this report does not
+claim completion of the new targets or a renewed PRO 6000 comparison.

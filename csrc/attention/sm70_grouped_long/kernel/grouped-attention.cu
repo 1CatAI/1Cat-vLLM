@@ -3073,101 +3073,89 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       }
       __syncthreads();
     } else {
-      if (tile_start + kGroupedVerifyBlockN <=
-          minimum_visible_length) {
+
+      // Four independent softmax rows share a warp. Keep the original
+      // 32-column reduction tree: combine columns 16 and 8 apart locally,
+      // then use eight-lane shuffles for offsets 4, 2, and 1. This removes
+      // repeated warp reductions without changing probability compensation.
+      auto online_update = [&](auto full_visible) {
+        constexpr int Width = 8;
+        constexpr int Values = 32 / Width;
+        constexpr bool FullVisible = decltype(full_visible)::value;
+        const int subgroup_lane = lane_id % Width;
+        const int subgroup_base = (lane_id / Width) * Width;
+        for (int row = warp_id * Values + lane_id / Width;
+             row < kGroupedVerifyRows; row += kGroupedVerifyWarps * Values) {
+          float scores[Values];
+          bool visible[Values];
 #pragma unroll
-      for (int row = warp_id; row < kGroupedVerifyRows;
-           row += kGroupedVerifyWarps) {
-        if constexpr (COMPENSATE_P) {
-          if ((active_m_tiles & (1 << (row / 16))) == 0) {
-            continue;
+          for (int j = 0; j < Values; ++j) {
+            const int col = subgroup_lane + j * Width;
+            visible[j] = FullVisible || grouped_verify_key_visible<false, true>(
+                smem.sparse_token_masks, row / Traits::kHeadsPerCta, query_len,
+                head_start + row % Traits::kHeadsPerCta, tile_start + col,
+                valid_k_rows, col, prefix_kv_len, row_lengths);
+            scores[j] = visible[j]
+                ? shared_scores[row * kGroupedVerifyScoreStride + col]
+                : kXQANegInf;
           }
-        }
-        const int token_idx = row / Traits::kHeadsPerCta;
-        const int local_head = row % Traits::kHeadsPerCta;
-        const int head_idx = head_start + local_head;
-        const int kv_idx = tile_start + lane_id;
-        constexpr bool visible = true;
-        const float score =
-            visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
-                    : kXQANegInf;
-        const float tile_max_lane = warp_reduce_max(score);
-        const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
-        const float old_max = smem.row_max[row];
-        const float new_max = fmaxf(old_max, tile_max);
-        const float probability =
-            visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
-        shared_probs[grouped_a_offset(row, lane_id, 32)] =
-            __float2half_rn(probability);
-        if constexpr (COMPENSATE_P) {
-          const float rounded = __half2float(__float2half_rn(probability));
-          shared_prob_residual[grouped_a_offset(row, lane_id, 32)] =
-              __float2half_rn((probability - rounded) * 2048.0f);
-        }
-        const float tile_sum_lane = warp_reduce_sum(probability);
-        const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
-        const float exp_diff =
-            tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
-        // Finish every lane's shared-state reads before lane 0 overwrites the
-        // online maximum. Shuffle synchronization does not order memory.
-        __syncwarp();
-        if (lane_id == 0) {
-          if (tile_sum > 0.0f) {
-            smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
-            smem.row_max[row] = new_max;
-          }
-          smem.row_scale[row] = exp_diff;
-        }
-      }
-      } else {
+          float maxima[Values];
 #pragma unroll
-      for (int row = warp_id; row < kGroupedVerifyRows;
-           row += kGroupedVerifyWarps) {
-        if constexpr (COMPENSATE_P) {
-          if ((active_m_tiles & (1 << (row / 16))) == 0) {
-            continue;
+          for (int j = 0; j < Values; ++j) maxima[j] = scores[j];
+#pragma unroll
+          for (int stride = Values / 2; stride > 0; stride /= 2) {
+#pragma unroll
+            for (int j = 0; j < stride; ++j)
+              maxima[j] = fmaxf(maxima[j], maxima[j + stride]);
+          }
+          float maximum = maxima[0];
+#pragma unroll
+          for (int stride = Width / 2; stride > 0; stride /= 2)
+            maximum = fmaxf(maximum,
+                __shfl_down_sync(0xffffffffu, maximum, stride, Width));
+          const float tile_max =
+              __shfl_sync(0xffffffffu, maximum, subgroup_base);
+          const float old_max = smem.row_max[row];
+          const float new_max = fmaxf(old_max, tile_max);
+          float probabilities[Values];
+#pragma unroll
+          for (int j = 0; j < Values; ++j) {
+            const int col = subgroup_lane + j * Width;
+            const float probability = visible[j]
+                ? __expf(fmaxf(scores[j] - new_max, -80.f)) : 0.f;
+            probabilities[j] = probability;
+            const half rounded = __float2half_rn(probability);
+            shared_probs[grouped_a_offset(row, col, 32)] = rounded;
+            shared_prob_residual[grouped_a_offset(row, col, 32)] =
+                __float2half_rn((probability - __half2float(rounded)) * 2048.f);
+          }
+#pragma unroll
+          for (int stride = Values / 2; stride > 0; stride /= 2) {
+#pragma unroll
+            for (int j = 0; j < stride; ++j)
+              probabilities[j] = __fadd_rn(probabilities[j], probabilities[j + stride]);
+          }
+          float sum = probabilities[0];
+#pragma unroll
+          for (int stride = Width / 2; stride > 0; stride /= 2)
+            sum += __shfl_down_sync(0xffffffffu, sum, stride, Width);
+          const float tile_sum = __shfl_sync(0xffffffffu, sum, subgroup_base);
+          const float exp_diff = tile_sum > 0.f
+              ? __expf(fmaxf(old_max - new_max, -80.f)) : 1.f;
+          __syncwarp();
+          if (subgroup_lane == 0) {
+            if (tile_sum > 0.f) {
+              smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
+              smem.row_max[row] = new_max;
+            }
+            smem.row_scale[row] = exp_diff;
           }
         }
-        const int token_idx = row / Traits::kHeadsPerCta;
-        const int local_head = row % Traits::kHeadsPerCta;
-        const int head_idx = head_start + local_head;
-        const int kv_idx = tile_start + lane_id;
-        const bool visible =
-            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
-                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
-        const float score =
-            visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
-                    : kXQANegInf;
-        const float tile_max_lane = warp_reduce_max(score);
-        const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
-        const float old_max = smem.row_max[row];
-        const float new_max = fmaxf(old_max, tile_max);
-        const float probability =
-            visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
-        shared_probs[grouped_a_offset(row, lane_id, 32)] =
-            __float2half_rn(probability);
-        if constexpr (COMPENSATE_P) {
-          const float rounded = __half2float(__float2half_rn(probability));
-          shared_prob_residual[grouped_a_offset(row, lane_id, 32)] =
-              __float2half_rn((probability - rounded) * 2048.0f);
-        }
-        const float tile_sum_lane = warp_reduce_sum(probability);
-        const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
-        const float exp_diff =
-            tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
-        // Finish every lane's shared-state reads before lane 0 overwrites the
-        // online maximum. Shuffle synchronization does not order memory.
-        __syncwarp();
-        if (lane_id == 0) {
-          if (tile_sum > 0.0f) {
-            smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
-            smem.row_max[row] = new_max;
-          }
-          smem.row_scale[row] = exp_diff;
-        }
-      }
-      }
+      };
+      if (tile_start + kGroupedVerifyBlockN <= minimum_visible_length)
+        online_update(std::true_type{});
+      else
+        online_update(std::false_type{});
       __syncthreads();
       if constexpr (!COMPENSATE_P) {
 #pragma unroll

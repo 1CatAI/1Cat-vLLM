@@ -38,7 +38,8 @@ struct Sm70_s884 {
   template <int CTA_M, int CTA_N, int CTA_K, int TG_M, int TG_N, int TG_K,
             class PolicyA, class PolicyB, int Stages, bool SplitK,
             int GroupSizeU = 1, int GroupSizeV = 1, int TILE_C_M_ = -1,
-            int TILE_C_N_ = -1, int GmemLookahead = 1, bool FullTiles = false>
+            int TILE_C_N_ = -1, int GmemLookahead = 1, bool FullTiles = false,
+            bool MaskM = false>
   struct Type {
     // (TM, TN, TK) = R(MMA_Atom, SmemCopy_Atom)
     using MMA_Atom = SM70_MMA_884;
@@ -50,7 +51,8 @@ struct Sm70_s884 {
     using MMA = Tiled_MMA_v2<MMA_Atom, MMA_Map>;
 
     using IteratorA =
-        std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_A, PolicyA>,
+        std::conditional_t<FullTiles && !MaskM,
+                           IteratorSm70FullTile<MODE_A, PolicyA>,
                            IteratorSm70<MODE_A, PolicyA>>;
     using IteratorB =
         std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_B, PolicyB>,

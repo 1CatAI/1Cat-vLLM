@@ -29,7 +29,7 @@ def test_nvfp4_scale_folding_rejects_without_mutation(value):
     assert torch.equal(scales.view(torch.int16), original)
 
 
-@pytest.mark.parametrize("rows", [33, 64, 65, 128, 1024, 8192])
+@pytest.mark.parametrize("rows", [33, 40, 48, 49, 56, 64, 65, 128, 1024, 8192])
 @pytest.mark.parametrize("gated", [False, True])
 def test_nvfp4_prescaled_same_partition_graph(monkeypatch, rows, gated):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -118,7 +118,7 @@ def test_nvfp4_prescaled_opaque_dispatch_dynamic_rows(monkeypatch, gated):
         return out
 
     compiled = torch.compile(call, backend="aot_eager", fullgraph=True, dynamic=True)
-    for rows in (64, 8, 16, 32, 33, 65, 128, 1024):
+    for rows in (64, 8, 16, 32, 33, 40, 48, 49, 56, 65, 128, 1024):
         x = torch.randn(rows, k, device="cuda", dtype=torch.float16) * 0.03
         expected = call(x, scales, False)
         actual = compiled(x, shifted, True)
