@@ -48285,3 +48285,28 @@ has launched no full model. Details and artifacts are in
   breakdown and SM/HBM counters remain unqualified. <20 ms is still unmet.
   No foreign service was stopped, no wheel was built, and all owned
   measurement/waiter processes have exited.
+- User-requested forward planning estimate reclassifies the two retained
+  node traces using 97 HC boundaries and 2,060 kernels per rank/round.
+  Same-module overlap is unioned; HC includes its projections, while the
+  extra PLE GEMM is removed from HC up. Estimated budgets are HC 4.293,
+  MoE 4.307, GDN 3.774, QSA 2.908, PLE/preparation 0.607 and TP/waits
+  0.909 ms. These inherit old kernel timing and are not current internal
+  measurements. The 0.934-ms balancing residual is not measured idle.
+  Preserve `mtp_forward_module_estimate_20260927.{json,md}` and its parser.
+- HC audit confirms current M5 projections are replicated on TP4; the
+  admitted exact HC shard/gather path only accepts M1. Batch output-sharding
+  is a new candidate, subject to unchanged reduction/materialization and
+  communication-cost checks. Do not port PR #504 as an exact speedup.
+- On idle, leased GPU4, source `63ad3e255b` and the unchanged normal `_C`,
+  only the two previously pending HC components run. More-CTA original-layout
+  down remains exact but slower: M5 17.022->18.510 and 16.324->18.116 us;
+  M10 also regresses. Reject without a model run. PR #704's selected
+  register up/mix under original MTP precision is exact on eight checkpoint
+  pairs/seven scales and improves M5 14.516->10.738 us, M10
+  15.422->11.946 us. The 96-module extrapolation is 0.363 ms at M5, not a
+  measured endpoint saving. Packed-up duplication would cost 0.586 GiB/rank.
+  Resolve source integration, memory and model quality/speed before promotion.
+  Retain `hc_evidence_20260927_contract.json`, JIT hashes and raw reports in
+  the owned artifact directory. Both research processes exit 0; GPU4 is
+  released. No model reload, wheel, runtime/default change or foreign stop.
+  The GDN gates/current internal trace remain pending; <20 ms is still unmet.

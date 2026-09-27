@@ -1120,3 +1120,78 @@ The model processes and resource waiter exit after measurement. The first
 automatic postprocessor reports the strict parser failure described above;
 CPU analysis/plotting are then completed and reviewed without another
 model load. The current report/status supersede that historical failure.
+
+### HC planning audit and pending component screens, 2026-09-27
+
+At the user's request for an estimated current forward composition, a CPU
+analysis reconstructs module ownership in the two retained node traces
+`mtp_draft_exact_trace2531` and `mtp_stack_trace_flush`. Every rank/window
+has 97 HC norm-to-gate boundaries and 2,060 kernel records. Timestamp
+unions remove same-module concurrent work; TP collectives and cross-module
+overlap stay separate. This corrects two coarse classifications: HC includes
+its dense projections, and one of the 98 `(8,80,1)` GEMMs belongs to PLE.
+
+The planning budget inherits the newer old trace's rank0 busy intervals:
+HC 4.293, MoE 4.307, GDN 3.774, QSA 2.908, PLE with preparation 0.607,
+TP communication/dependency waits 0.909 ms. Current target replay minus
+those historical busy intervals leaves a 0.934-ms balancing residual.
+**This assumes transferable kernel times/overlap and is not a newly measured
+internal trace. The residual is not measured idle time.** The old 129-token
+and current 513-token windows differ; no uniform scaling or independent
+rank-category maxima are used. Both historical captures' four ranks support
+HC/MoE as the largest modules, followed by GDN and QSA. Retain
+`mtp_forward_module_estimate_20260927.{json,md}`, its CPU parser and plot.
+
+HC's ordinary M5 path uses replicated FP16 weights: down is
+`[5,10240] x [10240,336]`, up is `[5,320] x [320,10240]`, and the final
+mixer's down has 320 outputs. The 96 regular modules plus final mixer
+contain 1,302,855,680 nominal weight bytes per rank per round and about
+6.514 GFLOPs at M5, before postops. This is weight-volume accounting, not
+measured HBM traffic. The existing exact TP4 HC sharding implementation
+requires `x.shape == (1,10240)`; M5 uses the ordinary replicated fallback.
+Extending output-dimension sharding to batch shapes is a candidate to avoid
+duplicated work, but it must preserve each row's original reduction and
+materialization boundaries and account for the additional gathers. The
+previous PR #504 result does not establish that new route's parity or speed.
+
+GPU4 later becomes idle. The existing single-card lease runs only the two
+previously unexecuted HC screens, without a model load or profiler:
+
+```bash
+MTP_RESEARCH_GPU=4 MTP_WAIT_SECONDS=0 .venv/bin/python \
+  .artifacts/run_research.py .artifacts/run_hc_evidence_20260927.py
+```
+
+Source is `63ad3e255b` (runtime unchanged from `e7df523a3c`), Torch
+2.10.0+cu128, CUDA toolkit 12.8.93, driver 580.173.02. The normal native
+extension SHA remains the calibrated value above. Both arms use eight real
+checkpoint HC pairs, seven activation scales and alternating graph timing
+pairs; all tested raw/intermediate/final FP16 bits agree.
+
+| Component | M | Control us | Candidate us | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Down, 420 independent CTAs at M5 | 5 | 17.022 | 18.510 | Reject |
+| Down, 840 independent CTAs at M5 | 5 | 16.324 | 18.116 | Reject |
+| Same down schedules | 10 | 16.128 / 16.124 | 19.960 / 21.698 | Reject |
+| PR #704 register up/mix, original precision | 5 | 14.516 | 10.738 | Component passes, -26.0% |
+| Same up/mix | 10 | 15.422 | 11.946 | Component passes, -22.5% |
+
+Increasing independent CTA count alone does not rescue the original-layout
+down schedule. Do not repeat those variants or run an engine gate for them.
+PR #704's selected up/mix kernel at source
+`590d78e0b168d38703f94333d240606900821f85` passes the original MTP precision
+screen; its benchmark's global precision override is not copied. Extrapolating
+the M5 difference across 96 ordinary HC modules gives about **0.363 ms**,
+not an observed full-round gain. Keeping both original and packed up weights
+would add about 0.586 GiB/rank for those modules; loader memory and fallback
+layout need resolution before integration.
+
+Both kernels here are task-local research extensions, not runtime dispatch
+or a source-complete speed claim. `hc_evidence_20260927_contract.json` records
+source/JIT/native hashes, commands, environment and GPU state; raw results
+are `hc_down_cta_parallel.json`, `hc_up_register_pr704.json` and matching
+`*_20260927.{log,exit}`. Both processes exit 0 and release GPU4. No foreign
+service is stopped, no wheel is built, and no runtime/default changes.
+GDN integration/value-tile gates and current internal trace calibration
+remain pending. Prioritize preserving the admitted up/mix component while
+evaluating batch HC sharding; the complete-round <20-ms target is unmet.
