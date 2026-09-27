@@ -182,6 +182,8 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = False
     VLLM_SM70_MTP_HC_BATCH: bool = False
     VLLM_SM70_MTP_HC_COOPERATIVE: bool = False
+    VLLM_SM70_MTP_HC_FULL_UNROLL: bool = False
+    VLLM_SM70_MTP_ROUTER_TOP16: bool = False
     VLLM_SM70_MTP_ROUTER_BATCH: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -1880,6 +1882,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the same per-projection arithmetic and communicator-owned packets.
     "VLLM_SM70_MTP_HC_COOPERATIVE": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_HC_COOPERATIVE", "0"))
+    ),
+    # Exact cooperative HC schedule; opt in pending same-engine comparison.
+    "VLLM_SM70_MTP_HC_FULL_UNROLL": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_HC_FULL_UNROLL", "0"))
+    ),
+    # Select only the first 16 lossless keys before the unchanged top-10 norm.
+    "VLLM_SM70_MTP_ROUTER_TOP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "0"))
     ),
     # Fused four-partition FP32 reduction for the MTP4 FP16 router projection.
     "VLLM_SM70_MTP_ROUTER_BATCH": lambda: bool(

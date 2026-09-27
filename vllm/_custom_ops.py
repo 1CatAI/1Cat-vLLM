@@ -3108,6 +3108,7 @@ def sm70_qwen38_hc_batch(
     injection: torch.Tensor,
     round_down_partials: bool = False,
     cooperative: bool = False,
+    full_unroll: bool = False,
 ) -> None:
     _custom_ar_owner_namespace().sm70_qwen38_hc_batch(
         fa,
@@ -3121,6 +3122,7 @@ def sm70_qwen38_hc_batch(
         injection,
         round_down_partials,
         cooperative,
+        full_unroll,
     )
 
 

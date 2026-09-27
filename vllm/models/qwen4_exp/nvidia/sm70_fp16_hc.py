@@ -382,6 +382,7 @@ def _qwen38_sm70_fp16_fused_hc(
                 injection,
                 round_down_partials=True,
                 cooperative=envs.VLLM_SM70_MTP_HC_COOPERATIVE,
+                full_unroll=envs.VLLM_SM70_MTP_HC_FULL_UNROLL,
             )
             logger.info_once(
                 "SM70 MTP4 TP4 batched HC with FP16 split partials enabled."

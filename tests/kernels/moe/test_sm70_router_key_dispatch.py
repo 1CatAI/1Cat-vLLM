@@ -33,12 +33,14 @@ def test_packed_half_key_preserves_dtype_and_batch_guards(monkeypatch, dtype, ro
 
 
 @pytest.mark.parametrize("rows", [5, 10])
+@pytest.mark.parametrize("select_top16", [False, True])
 def test_mtp_public_route_preserves_graph_weights_ids_and_source_rows(
-    monkeypatch, rows
+    monkeypatch, rows, select_top16
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
     monkeypatch.setenv("VLLM_SM70_QWEN38_ROUTER_TOPK", "1")
+    monkeypatch.setattr(mod.envs, "VLLM_SM70_MTP_ROUTER_TOP16", select_top16)
     x = torch.zeros(rows, 512, device="cuda", dtype=torch.float16)
     hidden = torch.zeros(rows, 2560, device="cuda", dtype=torch.float16)
     ref = (

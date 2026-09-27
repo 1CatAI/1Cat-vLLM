@@ -284,6 +284,7 @@ __global__ void gather(RankData buffers, const void* input, half* output,
 
 // The same arithmetic and half+tag transport as the four-launch path.
 // All CTAs reside together; grid barriers close only local data dependencies.
+template <bool FullUnroll>
 __global__ __launch_bounds__(32, 4) void hc_cooperative(
     RankData buffers, int rank, const half* input, const half* packed_down,
     const half* packed_up, float* partials, half* lora, half* local_output,
@@ -291,16 +292,16 @@ __global__ __launch_bounds__(32, 4) void hc_cooperative(
   const int block = blockIdx.x, groups = (rows + 7) / 8;
   auto grid = cooperative_groups::this_grid();
   if (block < 60 * groups)
-    hc_down_partials_body<false, 1, false, 96, true, 32>(
+    hc_down_partials_body<false, 1, false, 96, true, FullUnroll ? 32 : 4>(
         input, packed_down, partials, rows, block % 3, (block / 3) % groups,
         block / (3 * groups));
   grid.sync();
   if (block < (rows * 11 + 31) / 32)
     gather_body<true>(buffers, partials, lora, injection, rank, rows, block);
   grid.sync();
-  hc_up_batch_body<false, 1, 20, true>(lora, packed_up, input, local_output,
-                                       rows, 640, rank * 640, block % 80,
-                                       block / 80);
+  hc_up_batch_body<false, 1, FullUnroll ? 20 : 4, true>(
+      lora, packed_up, input, local_output, rows, 640, rank * 640, block % 80,
+      block / 80);
   grid.sync();
   if (block < (rows * 80 + 31) / 32)
     gather_body<false>(buffers, local_output, output, injection, rank, rows,
@@ -311,7 +312,7 @@ inline void launch(RankData buffers, int rank, const half* input,
                    const half* packed_down, const half* packed_up,
                    float* partials, half* lora, half* local_output,
                    half* output, half* injection, int rows, bool round_partials,
-                   bool cooperative, cudaStream_t stream) {
+                   bool cooperative, bool full_unroll, cudaStream_t stream) {
   if (cooperative) {
     TORCH_CHECK(round_partials,
                 "Cooperative HC requires the MTP FP16 contract");
@@ -319,8 +320,9 @@ inline void launch(RankData buffers, int rank, const half* input,
                     &packed_up, &partials,  &lora,  &local_output,
                     &output,    &injection, &rows};
     CUDACHECK(cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(hc_cooperative), dim3(80 * ((rows + 7) / 8)),
-        dim3(32), args, 0, stream));
+        reinterpret_cast<void*>(full_unroll ? hc_cooperative<true>
+                                            : hc_cooperative<false>),
+        dim3(80 * ((rows + 7) / 8)), dim3(32), args, 0, stream));
     return;
   }
   if (round_partials) {

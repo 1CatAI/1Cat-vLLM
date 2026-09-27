@@ -1347,3 +1347,45 @@ changing the global precision contract. The earlier packed output projection
 screen already preserves M5 bits but regresses latency, and changes M10 bits
 (`out_projection_batch*`); do not repeat it without a new numerical/scheduling
 hypothesis. No wheel was built.
+
+### Combined HC unroll / selector result and resident comparison
+
+Source `732e184173` completes the frozen GPU4--7 gate. Ordinary before/after
+rounds are **22.359054/22.292406 ms**, mean **22.325730 ms**; observed is
+22.432099 ms (+0.476% perturbation, -0.298% control drift). All fixed and
+natural token IDs, finish reasons and acceptance counters match. Rank0's
+unscaled closed cycle is 22.439080 ms: target 16.322280, sampling/state
+0.783965, four drafts 4.684935, preparation 0.647900. The 500-ms telemetry
+samples during all fixed requests show 1,530-MHz SM clocks and no throttle
+flags. This candidate does **not** beat the earlier qualified 22.094242-ms
+process; neither component savings nor the different-process difference
+establish an isolated HC/selector gain. Keep both HC schedules selectable
+with `VLLM_SM70_MTP_HC_FULL_UNROLL=0/1` (default 0) for a resident A/B/A.
+Retain `mtp_hc_unroll_topk_candidate_20260927*`, including both native library
+hashes, raw events, full outputs and GPU telemetry. The <20-ms goal is unmet.
+
+Two more component decisions:
+
+- Splitting the current packed HC down tile from N32 to N8 keeps all partial
+  bits but regresses M5 5.406->5.848 us and M10 6.078->7.876 us. Reject it
+  (`hc_down_n8*`); its initial fixture omitted the separate injection rows,
+  which is corrected before arithmetic testing.
+- Full-width up (a possible way to omit the final gather) takes
+  10.704/10.776 us at M5 with unroll4/20, versus the sharded up's 5.388 us.
+  No complete-pair gain is established; do not add another packed full-weight
+  copy to the engine (`hc_up_full_width*`).
+- Selecting only the first 16 lossless router keys, instead of sorting all
+  512, preserves all 65,536 FP16 payloads and changed graph inputs at
+  M1/2/4/5/8/10/16. Keep the eight-warp FP32 normalization and original top10
+  outputs. The M5 48-call chain improves 0.241504->0.173168 ms, M10
+  0.205488->0.147520 ms. The opt-in `VLLM_SM70_MTP_ROUTER_TOP16=1` admits
+  FP16 M5/M10 only. Public router and HC integration tests pass 46 cases.
+  Whole-model admission remains pending (`router_top16*`,
+  `mtp_router_top16_hc_dispatch_gate_20260927.log`).
+
+The task-local resident harness retains ordinary CUDA graph definitions,
+clears inactive request/prefix state before variant recapture, and records
+command-by-command source/flag identity and graph metadata. It is intended
+to amortize model loading and compare schedules under one process. Graph
+recapture and timing readback remain outside measured requests. This harness
+is a measurement tool, not a serving default or a new latency claim.

@@ -48310,3 +48310,28 @@ has launched no full model. Details and artifacts are in
   the owned artifact directory. Both research processes exit 0; GPU4 is
   released. No model reload, wheel, runtime/default change or foreign stop.
   The GDN gates/current internal trace remain pending; <20 ms is still unmet.
+- MTP HC batch integration reuses pinned PR704's arithmetic with the original
+  MTP FP16 split-partial rounding and FP32 reduction order. Cooperative HC,
+  exact router projection and mixed-QKV integration qualify **22.094242 ms**
+  per ordinary complete round on GPU4--7, versus the independent 23.697246-ms
+  clean baseline. Fixed/natural token IDs, EOS and acceptance are unchanged.
+  Same-engine deferred trace overhead is +0.205%; its 22.127934-ms closed
+  cycle splits into target 16.183720, sampling/state 0.766432, four drafts
+  4.607666 and preparation 0.570115 ms. Source `3b7365925f` and full contracts
+  are in the detailed MTP batch report. <20 ms remains unmet; no wheel.
+- Do not repeat rejected BV16 GDN, grouped-W13 unroll40/N16, HC half-tile,
+  per-tile gather, N8 down, or M1 norm-reduction-at-M5 experiments. The new
+  Triton QSA scorer is removed: actual page204 causes register spilling and
+  a ~5x component regression despite exact outputs. `tl.dot` here lowers to
+  scalar FP32 FMA, not Tensor Core MMA. Native exact scorer screens are
+  neutral at M5. Keep original scoring.
+- Exact HC full unroll and QSA short-row compaction pass component/native
+  gates, but their combined source `732e184173` measures 22.325730-ms ordinary
+  rounds, failing to exceed the prior best. Its trace overhead is +0.476%;
+  all fixed/natural quality counters match and sampled GPU clocks do not
+  throttle. Both HC schedules now remain selectable for same-process A/B/A.
+  The partial router-key sort is bit-exact and saves about 0.06 ms per target
+  component chain; its model gate is pending. The resident harness avoids
+  reloading weights for each schedule and retains inspectable graph metadata.
+  Preserve all `mtp_hc_*candidate_20260927*` contracts/events and component
+  rejections; do not promote extrapolated savings or repeat completed gates.
