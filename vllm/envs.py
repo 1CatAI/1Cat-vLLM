@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_TOP16: bool = False
     VLLM_SM70_MTP_ROUTER_BATCH: bool = False
     VLLM_SM70_MTP_SHARED_BATCH: bool = False
+    VLLM_SM70_MTP_PLE_CONV: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
@@ -1899,6 +1900,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues.
     "VLLM_SM70_MTP_SHARED_BATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_SHARED_BATCH", "0"))
+    ),
+    # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
+    "VLLM_SM70_MTP_PLE_CONV": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "0"))
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.

@@ -1469,3 +1469,60 @@ after that failed capture. These diagnostic attempts are rejected. The
 harness now enters inference mode for diagnostic calls and stops on any
 reported diagnostic error before further generation. A fresh ordinary
 confirmation and admitted internal breakdown remain pending. <20 ms is unmet.
+
+### Exact PLE rollback/conv fusion, 2026-09-27
+
+`VLLM_SM70_MTP_PLE_CONV=1` combines the single-request MTP4 PLE rollback,
+four ordered dilated-convolution taps, FP16 convolution boundary, SiLU and
+state commit in a normal source-built kernel. It supports M5/M10 graph
+padding, H10240, dilation3 and a 13-position FP16/FP32 cache in both supported
+layouts. Null state IDs never write state. The existing generic path handles
+all other shapes. The flag remains default off. No precision or accumulation
+policy changes, sidecar runtime library, or wheel are involved.
+
+Ten native/public tests pass, including 30 successive rollback/commit rounds
+per dtype/layout/padding case, accepted lengths 0/1/3/5/8, query lengths
+0/1/3/5 and null/live states. Effective output bits and the entire state match;
+padded rows are zero (zero sign is not promised). The component chain falls
+from about 124--144 us to 4--7 us. Retain `ple_spec_conv*`,
+`mtp_ple_native_gate_20260927.log` and `mtp_ple_conv_build_20260927.log`.
+Changed-file pre-commit checks pass.
+
+The same complete model contract with shared-expert fusion and PLE enabled
+qualifies ordinary **21.371631/21.643868 ms**, mean **21.507750 ms**. Deferred
+outer events measure 21.537974 ms, only +0.1405% relative to controls, with
++1.2738% control drift. All fixed 513 token IDs, 335 drafts, 177 accepted
+tokens and three natural normal-EOS sequences (284/329/421 tokens) match the
+oracle. Two final ordinary requests after disabling the diagnostic observer
+measure **21.463874/21.391711 ms**, mean **21.427792 ms**, with the same exact
+quality. These are confirmations within this loaded engine, not independent
+fresh-process replicates. The resident process exits normally and releases
+GPU4--7. Retain `mtp_ple_shared_resident_20260927*` including quality audit.
+
+The admitted outer rank0 closed cycle is **21.542208 ms**:
+
+| Stage | ms |
+| --- | ---: |
+| Target forward | 15.534391 |
+| Sampling, state and handoff | 0.780901 |
+| Four drafts | 4.574895 |
+| Next-round preparation | 0.652021 |
+
+Target replay alone is 15.488772 ms; draft replay envelopes are
+1.307042/1.049184/1.058051/1.054877 ms. These are dependency-aware replay
+walls, not isolated kernel service times. Internal HC attribution is still
+unqualified. The 194-globaltimer-node diagnostic measures 22.884433 ms
+versus 21.383865/21.451629-ms controls (+6.85%), so its HC and branch sums
+must not be presented as ordinary execution costs. A two-marker capture
+measures 88.799896 ms with multi-second rank stalls, while surrounding
+controls remain 21.976152/21.617862 ms. Preserve the entire failed capture;
+do not drop outliers, assume their cause, align independent clock origins,
+or rescale either capture to the baseline.
+
+The run uses source `69eac6d8e806ad30e41639863aacddae827199ac` plus the saved
+PLE patch; `_C` SHA256 is
+`95f0af7adcb248d5227162c75e48c1e0e0df227ad2d8cc594be01aa28697987d` and
+stable-native SHA256 is
+`ea479867dce18c14b91c16045b62ef1ab20634a211069c3d89ace7d252ddda63`.
+The exact diff and untracked-source hashes are in the run contract.
+The complete-round **<20 ms goal remains unmet**.

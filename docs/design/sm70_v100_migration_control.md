@@ -48357,3 +48357,16 @@ has launched no full model. Details and artifacts are in
   outside inference mode; reject that diagnostic attempt and keep the earlier
   completed performance/quality segment. Fresh ordinary confirmation and
   admitted internal trace are still pending; <20 ms remains unmet.
+
+- Source-built single-request MTP4 PLE rollback/conv/SiLU/state fusion passes
+  ten native/public tests and all fixed/natural model token/EOS/acceptance
+  gates. With shared-expert fusion, ordinary complete rounds average
+  **21.507750 ms**; final same-engine ordinary confirmations average
+  **21.427792 ms**. Outer trace perturbation is only +0.1405% and closes at
+  21.542208 ms: target 15.534391, sampling/state 0.780901, four drafts
+  4.574895, preparation 0.652021. Full contract/hashes are in the MTP report.
+  The dense globaltimer observer still perturbs by +6.85%; the two-marker
+  attempt contains multi-second stalls. Both internal captures are rejected,
+  with no outlier deletion or rescaling. The resident engine exits normally.
+  New W2 expert-pair warp packing is under component screening; do not repeat
+  the rejected W13 N16 screen. The <20-ms complete-round goal remains unmet.
