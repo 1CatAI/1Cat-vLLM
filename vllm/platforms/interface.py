@@ -677,13 +677,15 @@ class Platform:
             )
         kernel_block_alignment_size = max(kernel_block_size, cache_config.block_size)
 
-        # A model that shards part of each block over DCP ranks can require the
-        # rank-local share to stay kernel aligned as well.
+        # A model that shards part of each block over DCP ranks needs the
+        # rank-local share to keep the alignment of a whole block. The backend
+        # found above may accept smaller kernel blocks than the one serving the
+        # sharded layers, so scale the full alignment, not its kernel minimum.
         block_multiple = getattr(model_cls, "get_kv_block_size_multiple", None)
         if block_multiple is not None:
             kernel_block_alignment_size = lcm(
                 kernel_block_alignment_size,
-                kernel_block_size * block_multiple(vllm_config),
+                kernel_block_alignment_size * block_multiple(vllm_config),
             )
 
         if cache_config.mamba_cache_mode == "all":
