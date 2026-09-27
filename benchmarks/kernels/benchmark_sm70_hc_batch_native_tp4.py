@@ -110,6 +110,49 @@ def check(state):
     return errors
 
 
+def save_first_failure(state, names, path):
+    for name, tensors in zip(names, state):
+        x, y, lora, gate, out, partials, actual_lora, local, actual, injection = tensors
+        if not any(check([tensors])):
+            continue
+        torch.save(
+            {
+                "weight_name": name,
+                "tensors": {
+                    key: value.detach().cpu()
+                    for key, value in zip(
+                        (
+                            "input",
+                            "down_ref",
+                            "lora_ref",
+                            "gate_ref",
+                            "output_ref",
+                            "partials",
+                            "lora_actual",
+                            "local",
+                            "output_actual",
+                            "injection_actual",
+                        ),
+                        (
+                            x,
+                            y,
+                            lora,
+                            gate,
+                            out,
+                            partials,
+                            actual_lora,
+                            local,
+                            actual,
+                            injection,
+                        ),
+                    )
+                },
+            },
+            path,
+        )
+        break
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path)
@@ -279,6 +322,12 @@ def main():
             cg.replay()
             errors = [None] * 4
             dist.all_gather_object(errors, check(state))
+            if any(errors[rank]):
+                save_first_failure(
+                    state,
+                    names,
+                    a.out.with_suffix(f".m{rows}.scale{scale}.rank{rank}.failure.pt"),
+                )
             checks.append(
                 {"scale": scale, "rank_lora_output_injection_mismatches": errors}
             )
@@ -342,14 +391,16 @@ def main():
     if communicator is not None:
         communicator.close()
     dist.destroy_process_group()
-    result["complete"] = True
-    if rank == 0:
-        a.out.write_text(json.dumps(result, indent=2) + "\n")
-    if any(any(e) for t in transitions for e in t["rank_mismatches"]) or any(
+    failed = any(any(e) for t in transitions for e in t["rank_mismatches"]) or any(
         any(any(e) for e in c["rank_lora_output_injection_mismatches"])
         for case in result["cases"]
         for c in case["checks"]
-    ):
+    )
+    result["measurements_complete"] = True
+    result["complete"] = result["bitwise_passed"] = not failed
+    if rank == 0:
+        a.out.write_text(json.dumps(result, indent=2) + "\n")
+    if failed:
         raise SystemExit("HC numerical gate failed; no runtime promotion")
 
 
