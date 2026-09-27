@@ -944,12 +944,14 @@ if TYPE_CHECKING:
     VLLM_PLE_DISK_OFFLOAD: bool = False
     VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
     VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
+    VLLM_PLE_DISK_RELEASE_PAGES: bool = False
     VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
     VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_DISK: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -14557,6 +14559,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    # Unmap the checkpoint pages the PLE offload worker read, after every
+    # disk gather (disk lane and cascade disk tier). The pages stay in the page
+    # cache, but no longer count as the worker's: on a host with little RAM the
+    # kernel otherwise keeps them and swaps other processes out. Off keeps them
+    # mapped, which saves the re-mapping on repeated reads.
+    "VLLM_PLE_DISK_RELEASE_PAGES": env_var(
+        lambda: (
+            os.getenv("VLLM_PLE_DISK_RELEASE_PAGES", "False").lower() in ("true", "1")
+        ),
+        description=(
+            "Unmap the checkpoint pages the PLE offload worker read after every "
+            "disk gather (disk lane and cascade disk tier), so they stay in the "
+            "page cache without counting as the worker's memory."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Keep the latency-critical PLE lookup process on the NUMA node local to
     # its first visible GPU. This changes CPU placement only; allocations use
     # a local-first policy with fallback so large tables are not forced into a
@@ -14674,6 +14696,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+    ),
+    # Qwen4Exp PLE overflow cascade: let the rows beyond the device and
+    # pinned-host tiers be read from the mapped checkpoint on disk. Setting it
+    # starts the PLE offload worker next to the resident tables; the compute
+    # ranks wait for its rows inside their CUDA graphs. Without it such a
+    # remainder fails the startup. The disk tier needs no budget: it reads the
+    # checkpoint in place, nothing is copied.
+    "VLLM_QWEN4EXP_PLE_DISK": env_var(
+        lambda: os.getenv("VLLM_QWEN4EXP_PLE_DISK", "False").lower() in ("true", "1"),
+        description=(
+            "Qwen4Exp PLE overflow cascade: read the rows beyond the device and "
+            "pinned-host tiers from the mapped checkpoint through the PLE "
+            "offload worker instead of failing the startup."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

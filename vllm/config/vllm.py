@@ -318,6 +318,39 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
     parallel_config.ensure_ple_offload_ipc_path()
 
 
+def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
+    """Whether the PLE overflow cascade is configured, checking its contract.
+
+    ``VLLM_QWEN4EXP_PLE_DISK`` lets the rows beyond the device and pinned-host
+    tiers be read from the mapped checkpoint and starts the cascade. The PLE
+    offload worker then serves those rows next to the resident tables, which
+    is a different contract from the whole-table offload and from the hybrid
+    lane.
+
+    Only a config that carries a model is checked: helper configs without one,
+    such as the PLE offload worker's isolated single-rank world, inherit the
+    variable but have no table to place.
+    """
+    if not envs.VLLM_QWEN4EXP_PLE_DISK:
+        return False
+    if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
+        raise ValueError(
+            "The Qwen4Exp PLE cascade is configured, but the model has no PLE layers"
+        )
+    if envs.VLLM_SM70_QWEN38_HYBRID_PLE or envs.VLLM_PLE_DISK_OFFLOAD:
+        raise ValueError(
+            "The Qwen4Exp PLE cascade cannot be combined with "
+            "VLLM_SM70_QWEN38_HYBRID_PLE or VLLM_PLE_DISK_OFFLOAD"
+        )
+    return True
+
+
+def _apply_qwen4exp_ple_cascade_defaults(parallel_config: ParallelConfig) -> None:
+    """Start the PLE offload worker that serves the cascade's outer tiers."""
+    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    parallel_config.ensure_ple_offload_ipc_path()
+
+
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     # B32 is the largest concurrency with end-to-end SM70 graph validation.
     # Keep larger scheduler capacities usable through the regular piecewise
@@ -1871,6 +1904,15 @@ class VllmConfig:
         sm70_no_compile_decode_graph_requested = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
         )
+
+        if self.model_config is not None and _qwen4exp_ple_cascade_requested(
+            self.model_config
+        ):
+            _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
+            logger.info_once(
+                "Qwen4Exp PLE overflow cascade: the PLE offload worker reads the "
+                "rows beyond the resident tiers from the mapped checkpoint."
+            )
 
         attention_backend = self.attention_config.backend
         attention_backend_name = getattr(attention_backend, "name", attention_backend)
