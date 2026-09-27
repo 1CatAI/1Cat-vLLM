@@ -85,6 +85,16 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _block_table_rows_per_request(decode_metadata) -> int:
+    """Consecutive decode block-table rows that belong to one request: the
+    verifier length when a uniform speculative decode was flattened to one row
+    per token, 1 otherwise."""
+    per_request = decode_metadata.per_req_decode_lens
+    if per_request is None or not decode_metadata.decode_is_uniform:
+        return 1
+    return max(1, decode_metadata.block_table.shape[0] // per_request.shape[0])
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -359,6 +369,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 attn_metadata_narrowed.compressed_max_seq_len,
+                _block_table_rows_per_request(decode_metadata),
             )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:

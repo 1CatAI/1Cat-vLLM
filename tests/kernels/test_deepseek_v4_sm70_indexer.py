@@ -193,8 +193,17 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
         )
 
 
+# The serving cache pads its blocks (stride(0) exceeds a block's bytes), so it
+# is not contiguous; the route has to take it, and read the right rows.
+@pytest.mark.parametrize("padded_blocks", [False, True])
+# native: one block-table row and [1, rows] lengths. flattened: what a uniform
+# speculative decode with more than two verifier tokens arrives as, one
+# block-table row and one length per token. two_requests: the same, twice.
+@pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
 @requires_sm70
-def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch):
+def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
+    monkeypatch, padded_blocks, layout
+):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
     num_rows, num_heads = 8, 64
@@ -206,6 +215,14 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
     value_bits = bits.reshape(blocks, _BLOCK_SIZE, _HEAD_DIM)
     scales = torch.rand((blocks, _BLOCK_SIZE), generator=generator).cuda() + 0.5
     cache = _build_paged_index_cache(value_bits, scales)
+    if padded_blocks:
+        block_bytes = cache.shape[1] * cache.shape[2]
+        storage = torch.zeros(
+            (blocks, block_bytes + 40), dtype=torch.uint8, device="cuda"
+        )
+        storage[:, :block_bytes] = cache.reshape(blocks, block_bytes)
+        cache = storage[:, :block_bytes].view(cache.shape)
+        assert not cache.is_contiguous()
     block_table = torch.full(
         (1, graph_width // _BLOCK_SIZE),
         -1,
@@ -221,11 +238,24 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
         dtype=torch.int32,
         device="cuda",
     ).view(1, num_rows)
-    q, weights = _make_queries(num_rows, num_heads)
+    table_rows_per_request = 1
+    num_requests = 2 if layout == "two_requests" else 1
+    if layout != "native":
+        table_rows_per_request = num_rows
+        second_table = block_table.clone()
+        second_table[0, :blocks] = block_table[0, :blocks].flip(0)
+        tables = [block_table, second_table][:num_requests]
+        block_table = torch.cat(
+            [table.repeat(num_rows, 1) for table in tables]
+        ).contiguous()
+        seq_lens = torch.cat(
+            [seq_lens.view(num_rows, 1) - 300 * i for i in range(num_requests)]
+        ).contiguous()
+    q, weights = _make_queries(num_rows * num_requests, num_heads)
 
     monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
     baseline = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, graph_width
+        q, cache, weights, seq_lens, block_table, graph_width, table_rows_per_request
     )
 
     static_workspace = (
@@ -238,10 +268,13 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
         ),
     )
 
+    workspace_requests = []
+
     class StaticWorkspace:
         @staticmethod
         def get_simultaneous(*specs):
             assert len(specs) == len(static_workspace)
+            workspace_requests.append(specs)
             return static_workspace
 
     monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", True)
@@ -252,7 +285,13 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
 
     def candidate_call():
         return sm70_indexer_decode_logits(
-            q, cache, weights, seq_lens, block_table, graph_width
+            q,
+            cache,
+            weights,
+            seq_lens,
+            block_table,
+            graph_width,
+            table_rows_per_request,
         )
 
     capture_stream = torch.cuda.Stream()
@@ -269,6 +308,8 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
         candidate = candidate_call()
     graph.replay()
     torch.accelerator.synchronize()
+    # Only the cuBLAS route asks for a workspace: this card took it.
+    assert workspace_requests
 
     for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
         expected_topk = torch.topk(baseline[row, :row_len], 512).indices.sort().values
@@ -284,7 +325,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
     seq_lens.sub_(127)
     monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
     replay_baseline = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, graph_width
+        q, cache, weights, seq_lens, block_table, graph_width, table_rows_per_request
     )
     graph.replay()
     torch.accelerator.synchronize()
