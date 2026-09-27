@@ -1,15 +1,18 @@
 # Flash-Next MTP4 batch decode qualification
 
-The latest qualified fixed-fixture result is **23.657858 ms per complete
-MTP4 round**, versus a matched 23.874188-ms control before the exact draft
-MoE schedule. Natural EOS timings do not improve in that pair; keep the new
-draft route opt-in. The requested **less-than-20-ms** threshold is unmet.
+The latest qualified complete MTP4 round averages **21.507750 ms** with
+shared-expert and PLE fusions; final ordinary confirmations in the same
+engine average **21.427792 ms**. All fixed and natural token IDs, acceptance
+statistics and normal EOS match the retained oracle. The requested
+**less-than-20-ms** threshold remains unmet. New flags remain opt-in.
 
-The retained 29.391136-ms node trace has **not passed perturbation
-calibration** and cannot provide an absolute breakdown of the 23.657858-ms
-endpoint. The separate CUDA-event phase observer also changes request
-latency. See the capture representativeness audit below before using their
-category timings to estimate an optimization's available endpoint gain.
+The calibrated outer trace closes at **21.542208 ms** with only +0.1405%
+request perturbation: target forward 15.534391, sampling/state 0.780901,
+four drafts 4.574895 and preparation 0.652021 ms. Current internal timestamp
+observers still fail perturbation calibration. Neither the retained
+29.391136-ms Nsight capture nor new internal marker sums are an absolute
+breakdown of ordinary execution. See the final PLE section for the source,
+native hashes, quality gates and raw reports.
 
 The original accepted reference is **27.3963 ms per complete MTP4 round**.
 The target verifier uses M5/M10 matrix batches; draft step0 uses M5 and its
@@ -1526,3 +1529,52 @@ stable-native SHA256 is
 `ea479867dce18c14b91c16045b62ef1ab20634a211069c3d89ace7d252ddda63`.
 The exact diff and untracked-source hashes are in the run contract.
 The complete-round **<20 ms goal remains unmet**.
+
+### Follow-up screens after PLE
+
+- Pairing two expert groups in each W2 warp (N16 tiles) preserves all output
+  bits on three real layers, five captured routing sets and four activation
+  scales, but regresses every component case. The 16-warp variant is about
+  3--10% slower; 32 warps regress by up to 19.6%. Do not integrate this screen
+  or repeat it. Its first compile missed an output argument and produced no
+  benchmark evidence; the corrected gate is `moe_w2_n16_gate_20260927.log`.
+- The rejected GDN BV16 state's first divergence is now localized to value
+  coordinates 12--15 modulo32. Both shapes have the same K reduction tree;
+  LLVM/PTX contraction rounds a different first product in the final four V
+  rows of each tile. Pinning the BV32 product/FMA sequence explicitly restores
+  every FP16 output and FP32 state bit for M5/M10 across changing inputs,
+  accepted positions and six scales. This is a new diagnosis, not permission
+  to accept the original non-exact BV16 schedule. `gdn_fma_probe*` and
+  `gdn_fma_order*` retain the evidence.
+- Exact pinned BV8/BV16 recurrence components save only about 0.04--0.06 ms
+  per 36-layer chain. A warp-local Q/K norm also preserves the original
+  reduction/FMA sequence but does not improve the chain; BV4 regresses M10.
+  Keep these as research; no full-model reload or claimed endpoint saving.
+  Retain `gdn_warp_norm*` and `gdn_fma_parallel*`.
+
+- Replacing the first two cooperative HC grid barriers with per-producer
+  ready flags and coherent LoRA loads is exact on eight real pairs, four
+  ranks, M5/M10, seven scales and alternating widths. It is slower:
+  23.216->24.576 us at M5 and 25.467->29.157 us at M10. Both variants use
+  254 registers without spills. Do not integrate this scheduling change;
+  fewer whole-grid barriers alone does not establish lower latency. Retain
+  `hc_ready_flags_gate_20260927*`, `hc_flags*` and their separate IPC channels.
+
+- Cooperative HC with 2/4 warps per CTA (40/20 CTAs at M5) retains exact
+  outputs but loses to the 80-CTA, one-warp schedule: M5 23.237 us versus
+  25.088/28.597 us; M10 24.021 versus 25.339/30.597 us. All use 254 registers
+  without spills. More warps per CTA is not an admitted utilization fix.
+  Keep `hc_warp_geometry_gate_20260927*` and `hc_warps*`.
+- Grouped W13's warp-shuffle activation epilogue is exact but 2.4--4.8%
+  slower across the real-route chain. Moving the four K partitions into
+  the four quad pairs also preserves exact bits but regresses 25--51%.
+  Both skip unnecessary full-model runs; retain `moe_w13_epilogue*` and
+  `moe_w13_quad_split*`. The original packed MTP5 expert path stays selected.
+
+- HC reciprocal-only sigmoid is bitwise identical on all 65,536 FP16
+  payloads and their quarter-scaled forms, including NaN payload results.
+  However its complete TP4 pair is nearly neutral at M5 (23.221->23.045 us)
+  and slower at M10 (25.920->26.357 us). Do not integrate or extrapolate a
+  meaningful endpoint gain. Preserve `hc_sigmoid_rcp*` and
+  `hc_fast_rcp_gate_20260927*`. All follow-up research workers exited; owned
+  GPU leases are released. Runtime source remains PLE commit `763189d9a8`.

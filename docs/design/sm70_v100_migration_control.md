@@ -48370,3 +48370,12 @@ has launched no full model. Details and artifacts are in
   with no outlier deletion or rescaling. The resident engine exits normally.
   New W2 expert-pair warp packing is under component screening; do not repeat
   the rejected W13 N16 screen. The <20-ms complete-round goal remains unmet.
+
+- Post-PLE component screens reject W2 expert-pair N16, W13 shuffled
+  epilogue/quad-split, HC producer-ready flags and HC 2/4-warp CTAs: all
+  preserve bits but regress. Detailed magnitudes/artifact names are in the
+  MTP report; do not repeat these scheduling ideas. GDN BV16 divergence is
+  traced to LLVM's first-product/FMA contraction for the final four V rows;
+  explicitly pinning the original BV32 arithmetic restores all output/state
+  bits, but exact BV8/BV16 saves only ~0.05 ms per 36-layer component chain.
+  Keep it as research rather than rerunning a full model for that small gain.
