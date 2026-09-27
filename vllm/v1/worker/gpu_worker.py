@@ -213,8 +213,10 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+        # Pipeline parallelism is fine: the PLE table sits on the first
+        # stage only (check_ple_layers_on_first_pp_rank refuses a layout that
+        # puts PLE layers anywhere else), and ranks without a PleOffloadLayer
+        # do not create a connector.
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
