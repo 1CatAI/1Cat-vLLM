@@ -48215,3 +48215,9 @@ has launched no full model. Details and artifacts are in
   shortcut. Preserve artifacts and follow-up decisions in
   `docs/design/sm70_flash_next_mtp4_batch_gdn.md`. The qualified endpoint
   remains 23.657858 ms; <20 ms is still unmet.
+- Loader source `8a99ccb4ea` passes changed-file pre-commit/mypy. The combined
+  15-minute GPU wait expires before CUDA starts; ten new integration tests
+  and the two HC follow-ups remain unrun, not failed numerical gates.
+  All eight cards have foreign owners. No owned waiter/worker remains;
+  resume the retained `run_mtp_pending_gates.py` without repeating successful
+  router/mixed-loader components or the rejected HC split-stage schedules.

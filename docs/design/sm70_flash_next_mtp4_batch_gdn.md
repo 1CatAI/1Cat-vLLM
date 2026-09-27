@@ -897,3 +897,14 @@ bounded retry before GPU work. The second retry acquired idle GPU4 and
 completed; other services were left untouched. Subsequent integration/HC
 gates share a finite queued lease. Preserve resource failures as such rather
 than counting them as correctness failures or speed samples.
+
+Source `8a99ccb4ea37e820840e9b7c3d1d45b335dfc94f` passes all changed-file
+pre-commit hooks, including mypy. The combined 15-minute GPU wait then expires
+because all eight cards remain under foreign leases/compute owners; none of
+the ten new GPU integration cases or the two pending HC screens starts.
+Retain `mtp_pending_gates.log`, `mtp_loader_cpu_gate.log` and
+`mtp_loader_precommit.log`. No owned GPU worker or waiting process remains.
+Resume the prepared `run_mtp_pending_gates.py` under an idle-card lease, inspect
+all three exit/result files, and only then qualify admitted runtime changes
+with the frozen full-model contract. Do not rerun the successful component
+screens or report a new endpoint/trace from this resource failure.
