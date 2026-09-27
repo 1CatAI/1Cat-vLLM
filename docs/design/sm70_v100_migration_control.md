@@ -48049,6 +48049,33 @@ has launched no full model. Details and artifacts are in
   no additional enable switches. Public API and gateway were stopped at the
   user's request; local benchmark services are shut down.
 
+## 2026-09-27 DFlash2 C4/C6/C8 target continuation (Draft #708)
+
+The next targets remain **unmet**: C4 +10%, C6 +15%, C8 +20% over the
+conservative frozen PR #706/GDN-only baselines. The retained default
+candidate adds full and masked M48 compressed-weight tiles, an exact
+eight-lane attention softmax layout and canonical-order 384–512-KiB TP4
+reduction. Ordinary 32K/256 all-live pure decode is
+447.421/666.955/730.373 tok/s, or +2.46%/+13.31%/+1.69%; required rates are
+480.345/676.925/861.921. All 76 token arrays and speculative counters match,
+and long retrieval/natural stops remain 8/8. No new enable switch or weight
+copy is required. Source and expanded GPU checks are in Draft #708.
+
+Do not repeat the rejected deeper prefetch, extra M64 tile, forced-register
+cap, paired-half scale or L2-prefetch candidates without new evidence.
+Relaxing split-K partitions improved the M64 GEMM estimate by only 4.1%
+and changed output bits; it was reverted, with no acceptance claim. Fresh
+M32/M64 NCU counters, failed correctness checks, exact build hashes and
+all endpoint qualifications are in the
+[M48 implementation and profiling report](sm70_dflash2_m48_scaling_20260927.md).
+M64 representative kernels do not saturate DRAM; low resident-warp counts,
+instruction/data dependencies and long-attention work remain relevant.
+The report distinguishes these diagnostic counters from endpoint speed.
+
+Main advanced to `db292f9a49` (PR #703) during this frozen comparison.
+The figures above are not a new measurement against that main revision;
+integration and shared 35B-A3B AWQ/FP8 endpoint gates remain open.
+
 ## 2026-09-27 DFlash2 M48 coverage and scaling audit
 
 - Main after PR #706 remeasured at 32K/256, TP4, E4M3 KV, prefix caching and
@@ -48072,5 +48099,6 @@ has launched no full model. Details and artifacts are in
   median fluctuation to this patch.
 - Retain the startup KV-budget difference (11.45 versus 11.00 GiB) separately:
   both actual graph pools are 0.99 GiB, but total capacity equality is not
-  established. C6's 480-KiB one-stage TP reduction versus C8's 640-KiB tuned
-  two-stage reduction is another measured route discontinuity, not yet fixed.
+  established. The baseline C6 480-KiB one-stage versus C8 640-KiB two-stage
+  reduction discontinuity is addressed by the later Draft #708 candidate
+  above; the capacity qualification remains separate.
