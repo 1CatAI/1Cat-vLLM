@@ -143,3 +143,135 @@ Build, CPU tests (11) and repository pre-commit gates passed. All-96-pair,
 all-shard validation and full-engine integration remain pending. No default
 changed and no new endpoint throughput is claimed. **The 40% target is not
 achieved by this PR.**
+
+## Next screen: preserve the high-precision down partition
+
+A four-weight diagnostic trace with FP16/BF16 reduced-precision reduction
+and FP16 accumulation disabled identifies the replicated HC down route as
+`cutlass_70_wmma_tensorop_s161616gemm_f16_16x16_64x2_tn_align8`, grid
+`(8, 3, 20)`, followed by a separate `splitKreduce_kernel` with FP32 partial
+inputs. This is a projection-only trace, not another model startup or an
+unprofiled throughput measurement.
+
+The next research candidate preserves twenty K=512 partitions. Its second
+kernel performs the ordered FP32 reduction, materializes the same FP16 GEMM
+boundary, and fuses HC SiLU plus injection extraction. It does not change
+the checkpoint, precision flags, expert selection or production dispatch.
+
+Besides M8xN32 and its paired-M8 version, the screen includes M16xN16 within
+a single warp: two quad pairs own each eight-token half. This shares weights
+across both halves without doubling the per-lane accumulator array, while
+exposing twice as many output tiles as the paired-M8xN32 schedule. It is a
+layout/resource hypothesis to test, not an asserted speedup.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/path/to/cuda-12.8 \
+TORCH_CUDA_ARCH_LIST=7.0 \
+TORCH_EXTENSIONS_DIR="$PWD/.cache/torch_extensions" \
+TRITON_CACHE_DIR="$PWD/.cache/triton" \
+.venv/bin/python benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --pairs 4 \
+  --projection down --rows 2,4,8,16 --out .artifacts/hc_down_screen.json
+```
+
+Admission checks projection, SiLU and injection bits separately across all
+six scales, as well as replaying the actual timed graph with poisoned
+outputs. Only exact candidates receive alternating A/B timing. CPU layout
+tests and compilation are not GPU numerical/performance acceptance.
+
+Packing also has a memory gate. Keeping all original tensors *and* every
+replicated packed tensor would add 660 MiB/rank for down and 600 MiB/rank for
+up. This microbenchmark is not permission to add those copies to production.
+A whole-chain candidate must account for sharding/replacing packed weights,
+fallback ownership and available KV capacity, not hide the allocation cost.
+
+### Down screen result: exact, still a small component gain
+
+Four real weights, 14 configurations and six input scales passed bit equality
+for projection, SiLU and injection, including the timed graph's outputs.
+Unprofiled alternating graph timings on an exclusively locked V100:
+
+| Tokens | Replicated down + SiLU baseline (us) | Native (us) |
+| ---: | ---: | ---: |
+| 2 | 15.53 | 12.31 |
+| 4 | 15.84 | 12.87 |
+| 8 | 16.39 | 13.63 |
+| 16 | 17.81 | 15.41 |
+
+The winner is non-paired M8xN32, one warp. Neither paired-M8 (C16 15.71 us)
+nor M16xN16 (17.09 us) wins. Fewer repeated weight loads alone again do not
+establish a faster schedule. The extrapolated 96-pair saving is only
+0.23–0.31 ms, **not endpoint acceptance**. Do not spend a model startup on
+this isolated component.
+
+Artifact: `.artifacts/hc_down_v1.json`; measured kernel SHA256
+`c7214e9185088cb78eebd2e82ef71f1121533c13e496c51f0c2afc62d29d591c`,
+extension SHA256
+`f20a9fede35e192a57c34072291eee9dbd0c641807bc92960fd0d284b6f079f3`.
+The subsequent TP4 extension below has a different hash and needs its own
+validation; the earlier result is not silently relabeled as that extension.
+
+### TP4 down/up/mix and communication screen
+
+`benchmark_sm70_hc_batch_native_tp4.py` connects the winning local schedules to
+quarter-output down/up weights, fusing the ordered down reduction and SiLU
+inside the first gather. The second gather collects already mixed hidden
+shards. Down and output transfers have independent, research-owned IPC
+channels using the source tree's push-packet helpers. No opaque communicator
+from a foreign extension or auxiliary runtime stream is reused.
+
+```bash
+CUDA_HOME=/path/to/cuda-12.8 TORCH_CUDA_ARCH_LIST=7.0 \
+TORCH_EXTENSIONS_DIR="$PWD/.cache/torch_extensions" \
+.venv/bin/python benchmarks/kernels/benchmark_sm70_hc_batch_native_tp4.py \
+  --build-only --out .artifacts/hc_tp4_build.json
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_HOME=/path/to/cuda-12.8 \
+TORCH_CUDA_ARCH_LIST=7.0 \
+TORCH_EXTENSIONS_DIR="$PWD/.cache/torch_extensions" \
+TRITON_CACHE_DIR="$PWD/.cache/triton" \
+.venv/bin/torchrun --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_batch_native_tp4.py \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --pairs 8 \
+  --rows 2,4,8,16,2 --out .artifacts/hc_tp4_screen.json
+```
+
+The reported rank-maximum pair time **includes both gathers**, but excludes
+combine/norm, the final mixer and the rest of the model. Check LoRA, injection
+and mixed block outputs separately on every rank. Repeated C2 after C16
+exercises payload-size transitions without resetting communication state.
+The packed quarter weights would add 330 MiB/rank if originals are retained;
+runtime integration and the memory/performance/quality gates remain pending.
+
+### First TP4 result (8 distinct HC pairs)
+
+On exclusively locked GPUs4–7, every rank passed bit equality for LoRA,
+injection and mixed block outputs at all six scales and every tested batch
+width, including the final C16→C2 transition. Each row below is the median
+of six alternating A/B trials, using the slowest rank's time per trial.
+
+| Tokens | Replicated chain (us/pair) | Native sharded chain including gathers (us/pair) | Median paired saving (us/pair) |
+| ---: | ---: | ---: | ---: |
+| 2 | 31.53 | 23.72 | 7.83 |
+| 4 | 31.18 | 24.08 | 7.12 |
+| 8 | 31.36 | 24.69 | 6.87 |
+| 16 | 33.19 | 26.15 | 7.04 |
+| 2, repeated after C16 | 29.35 | 21.07 | 8.28 |
+
+The repeated C2 exposes some absolute-latency drift; use the paired samples,
+not unmatched row-to-row timing. C16's paired savings range from 6.99 to
+7.16 us across the six trials. **These are HC subchain measurements, not
+engine decode or prefill throughput.** Their approximately 0.64–0.80 ms
+96-pair extrapolation is still not enough to claim the +40% endpoint goal.
+An all-96-pair follow-up waited for a TP4 lease and exited before creating
+any CUDA context; do not describe it as completed validation.
+
+Artifact: `.artifacts/hc_tp4_v1.json`. Kernel SHA256 values:
+
+- Projection: `2961c36dcb770f62146cb75aee11152b8875d8aa7afa3378b083b65ea74b9456`.
+- Gather: `089a769efcacd7c03c4c550b779d77a480d3af7d409875ca16185f39f1d3d19f`.
+
+Both source-built research modules exited normally and released all four
+cards. CPU contract tests: 21 passed. The original cuBLAS/all-reduce benchmark
+`benchmark_sm70_hc_batch_tp4.py` remains unchanged; the new native screen has
+its own filename. No production path/default, KV format or DCP work changed.

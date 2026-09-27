@@ -73,3 +73,61 @@ def test_invalid_packing_rejected():
         BENCH.pack_weight(torch.empty(2560, 320))
     with pytest.raises(ValueError, match="hidden"):
         BENCH.pack_weight(torch.empty(4, 1280, 320))
+
+
+@pytest.mark.parametrize("tile_n", [16, 32])
+@pytest.mark.parametrize("columns", [88, 336])
+def test_down_weight_packing_preserves_every_element(tile_n, columns):
+    weight = torch.arange(columns * 10240, dtype=torch.int32).reshape(columns, 10240)
+    padded_n = 96 if columns == 88 else 352
+    packed = BENCH.pack_down_weight(weight, tile_n)
+    assert packed.is_contiguous()
+    assert packed.dtype == weight.dtype
+    restored = packed.permute(0, 3, 1, 2, 4).reshape(padded_n, 10240)
+    assert torch.equal(restored[:columns], weight)
+    assert torch.count_nonzero(restored[columns:]) == 0
+    for tile in (0, padded_n // tile_n - 2, padded_n // tile_n - 1):
+        for split in (0, 9, 19):
+            for lane in range(32):
+                r = (lane & 3) + (4 if lane & 16 else 0)
+                quad = ((lane >> 2) & 3) % (tile_n // 8)
+                for khalf in (0, 1):
+                    group = split * 32
+                    start = group * 16 + khalf * 8
+                    assert torch.equal(
+                        packed[tile, group, khalf, quad * 8 + r],
+                        restored[tile * tile_n + quad * 8 + r, start : start + 8],
+                    )
+
+
+def test_down_weight_packing_rejects_wrong_shape():
+    with pytest.raises(ValueError, match="shape"):
+        BENCH.pack_down_weight(torch.empty(320, 10240))
+    with pytest.raises(ValueError, match="columns"):
+        BENCH.pack_down_weight(torch.empty(336, 10240), 8)
+
+
+@pytest.mark.parametrize("rows", [2, 4, 8, 16])
+def test_down_m16_fragment_mapping_has_one_writer_per_output(rows):
+    coordinates = []
+    for lane in range(32):
+        quad = (lane >> 2) & 3
+        for i in range(8):
+            row = (quad // 2) * 8 + ((i & 2) | (4 if lane & 16 else 0) | (lane & 1))
+            col = (quad % 2) * 8 + (
+                (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2)
+            )
+            if row < rows:
+                coordinates.append((row, col))
+    assert len(coordinates) == rows * 16
+    assert set(coordinates) == {(r, c) for r in range(rows) for c in range(16)}
+
+
+def test_tp4_down_shards_preserve_lora_and_rank3_injection_ownership():
+    weight = torch.arange(336 * 10240, dtype=torch.int32).reshape(336, 10240)
+    shards = []
+    for rank in range(4):
+        packed = BENCH.pack_down_weight(weight[rank * 80 : rank * 80 + 88])
+        shards.append(packed.permute(0, 3, 1, 2, 4).reshape(96, 10240))
+    assert torch.equal(torch.cat([s[:80] for s in shards]), weight[:320])
+    assert torch.equal(shards[3][80:84], weight[320:324])
