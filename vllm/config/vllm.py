@@ -305,6 +305,11 @@ def _apply_sm70_qwen38_decode_defaults(
         # Keep M=1 draft graphs when target graph sizes are multiples of five.
         # Otherwise the prepared single-token operators never reach capture.
         defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
+    else:
+        # Pin the native FP32 gated-norm arithmetic across independently
+        # compiled C1/batch graphs. Tiny fusion-dependent rounding differences
+        # can change an MoE route and ultimately flip an EOS token.
+        defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:

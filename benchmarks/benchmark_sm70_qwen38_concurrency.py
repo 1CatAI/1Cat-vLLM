@@ -140,6 +140,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        help="Fix the per-rank KV budget for matched control/candidate runs",
+    )
+    parser.add_argument(
         "--atomic-cohort",
         action="store_true",
         help="Queue timed cohorts while the scheduler is paused; then resume",
@@ -169,12 +174,16 @@ def main():
         raise ValueError("input/repeats must be positive and output-len >= 40")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise ValueError("gpu-memory-utilization must be in (0, 1]")
+    if args.kv_cache_memory_bytes is not None and args.kv_cache_memory_bytes <= 0:
+        raise ValueError("kv-cache-memory-bytes must be positive")
     model = str(args.model)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     config = engine_args(model, use_defaults=True)
     config.pop("worker_extension_cls")
     config["max_num_seqs"] = max(widths)
     config["gpu_memory_utilization"] = args.gpu_memory_utilization
+    if args.kv_cache_memory_bytes is not None:
+        config["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     if args.mode == "mtp":
         config["speculative_config"] = {
             "method": "mtp",
