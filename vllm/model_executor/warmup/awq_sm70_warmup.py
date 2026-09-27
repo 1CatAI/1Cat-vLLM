@@ -325,16 +325,30 @@ def _iter_unique_fp8_dense_layers(
     model: torch.nn.Module,
 ) -> Iterable[tuple[torch.nn.Module, bool]]:
     seen: set[tuple[int, int, bool]] = set()
+    # Batch-only layouts cannot suppress an ordinary layer's small-M warmup.
+    seen_batch: set[tuple[int, int, bool, bool]] = set()
     for layer in model.modules():
         if not (
             getattr(layer, "sm70_fp8_turbomind", False)
             or getattr(layer, "sm70_modelopt_fp8_turbomind", False)
         ):
             continue
-        # QPN8 has a static source-selected dispatch and does not populate the
-        # TurboMind LUT warmed below. CUDA graph capture exercises its admitted
-        # M<=8 kernels separately.
         if getattr(layer, "sm70_fp8_qpn8", False):
+            # The small-M QPN8 path is static, but its prepared batch layout
+            # switches to TurboMind above M32. Include that layout in the
+            # coordinated LUT before importing freezes tuning on every rank.
+            if getattr(layer, "sm70_fp8_batch_tm", False):
+                k_dim, n_dim = layer.sm70_fp8_batch_tm_weight.shape
+                gated = bool(getattr(layer, "sm70_fp8_gated_silu", False))
+                batch_key = (
+                    int(k_dim),
+                    int(n_dim),
+                    gated,
+                    bool(layer.sm70_fp8_batch_tm_prescaled),
+                )
+                if batch_key not in seen_batch:
+                    seen_batch.add(batch_key)
+                    yield layer, gated
             continue
 
         if getattr(layer, "sm70_fp8_bmm", False):
@@ -544,7 +558,16 @@ def _warmup_fp8_dense_layers(
     calls = 0
     for layer, gated_silu in dense_layers:
         is_modelopt = getattr(layer, "sm70_modelopt_fp8_turbomind", False)
-        if getattr(layer, "sm70_fp8_bmm", False):
+        batch_qpn8 = getattr(layer, "sm70_fp8_qpn8", False) and getattr(
+            layer, "sm70_fp8_batch_tm", False
+        )
+        if batch_qpn8:
+            weight = layer.sm70_fp8_batch_tm_weight
+            scales = layer.sm70_fp8_batch_tm_scales
+            k_ld = int(layer.sm70_fp8_batch_tm_k_ld)
+            q_ld = int(layer.sm70_fp8_batch_tm_q_ld)
+            n_dim = int(weight.shape[1]) // (2 if gated_silu else 1)
+        elif getattr(layer, "sm70_fp8_bmm", False):
             assert not gated_silu
             weight = layer.weight[0]
             scales = layer.weight_scale_inv[0]
@@ -578,11 +601,19 @@ def _warmup_fp8_dense_layers(
         device = weight.device
         k_dim = int(weight.shape[0])
         for m_dim in m_values:
+            if batch_qpn8 and not 32 < m_dim <= 64:
+                continue
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
-            sm70_ops.fp8_gemm_sm70_out(
-                out, x, weight, scales, 128, k_ld, q_ld, gated_silu
-            )
+            if batch_qpn8 and layer.sm70_fp8_batch_tm_prescaled:
+                sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
+                    out, x, weight, scales, 128, k_ld, q_ld
+                )
+            else:
+                kwargs = {"preserve_default_partition": True} if batch_qpn8 else {}
+                sm70_ops.fp8_gemm_sm70_out(
+                    out, x, weight, scales, 128, k_ld, q_ld, gated_silu, **kwargs
+                )
             calls += 1
         if getattr(layer, "sm70_fp8_bmm_grouped_decode", False):
             group_count = int(layer.sm70_fp8_bmm_groups)

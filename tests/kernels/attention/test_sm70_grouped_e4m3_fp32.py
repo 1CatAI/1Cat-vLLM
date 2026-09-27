@@ -283,11 +283,12 @@ def test_precision_workspace_is_separate_from_request_major_batch():
 
 
 @pytest.mark.parametrize("padding", ["token", "block", "both"])
-def test_eight_byte_kv_strides_match_contiguous_graph(padding):
-    """The explicit-row route must not inherit q8's 16-byte paired loader."""
+@pytest.mark.parametrize("rows", [5, 8])
+def test_eight_byte_kv_strides_match_contiguous_graph(padding, rows):
+    """Eight-byte strides must retain the unpaired loader, including full q8."""
     op = _native()
     torch.manual_seed(20260907)
-    rows, pages, page = 5, 3, 848
+    pages, page = 3, 848
     token_stride = 264 if padding in ("token", "both") else 256
     block_stride = page * token_stride + (8 if padding in ("block", "both") else 0)
     shape = (pages, page, 1, 256)

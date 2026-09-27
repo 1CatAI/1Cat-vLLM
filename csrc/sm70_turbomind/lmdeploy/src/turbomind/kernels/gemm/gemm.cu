@@ -156,6 +156,15 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70DflashContextFcFastTarget(
   if (desc.arch == 700 && desc.type_a == kHalf && desc.type_b == kHalf &&
       desc.type_c == kHalf && !desc.quant_a && !desc.quant_b && desc.num == 1 &&
       UseSm70DflashContextFcStableReduction(desc.m, desc.n, desc.k)) {
+    if (desc.m > 8) {
+      // Preserve the qualified concurrent projection's reduction tree. The
+      // M8 tree is not numerically interchangeable here: its half rounding can
+      // change a draft proposal and the subsequent probabilistic sample path.
+      return Sm70AwqTp2FastTarget{
+          desc.n, desc.k, 16,
+          128,    32,     12,
+          0,      true,   "16x128x32_2_1x1_s884_1x4x1_mgroup"};
+    }
     return Sm70AwqTp2FastTarget{
         desc.n, desc.k, 8,
         256,    64,     10,
@@ -456,15 +465,20 @@ const char* ToString(DispatchPolicy policy) {
       (policy & DispatchPolicy::kPreserveDefaultSplitCount) ||
       (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) ||
       (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) ||
-      (policy & DispatchPolicy::kSm70Nvfp4Prescaled)) {
+      (policy & DispatchPolicy::kSm70Nvfp4Prescaled) ||
+      (policy & DispatchPolicy::kPreserveDefaultPartition)) {
     static thread_local std::string text;
     auto base = static_cast<DispatchPolicy>(
         (int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits &
         ~(int)DispatchPolicy::kPreserveDefaultSplitCount &
         ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast &
         ~(int)DispatchPolicy::kSm70Fp8PrefillPrescaled &
-        ~(int)DispatchPolicy::kSm70Nvfp4Prescaled);
+        ~(int)DispatchPolicy::kSm70Nvfp4Prescaled &
+        ~(int)DispatchPolicy::kPreserveDefaultPartition);
     text = std::string(ToString(base));
+    if (policy & DispatchPolicy::kPreserveDefaultPartition) {
+      text += "|preserve_default_partition";
+    }
     if (policy & DispatchPolicy::kPreserveDefaultSplits) {
       text += "|preserve_default_splits";
     }
@@ -873,7 +887,8 @@ struct Gemm::Impl {
 
   template <class LaunchFunc>
   int Measure(Context& ctx, size_t barriers_size, size_t partials_size,
-              int top_k, LaunchFunc launch_func, cudaStream_t st) {
+              int top_k, LaunchFunc launch_func, cudaStream_t st,
+              bool preserve_default_partition) {
     // Early exit on exact match
     if (cache_.Find(ctx.desc())) {
       return 0;
@@ -903,13 +918,13 @@ struct Gemm::Impl {
                          }),
           batch_candidates.end());
       if (!batch_candidates.empty()) {
-        // Keep the ordinary FP8 candidate set unchanged. Filtering its K16
-        // plans here also changes the LM-head and MLP reduction reference;
-        // supply tuning must preserve the reference, not redefine it.
-        if (ctx.desc().type_b == kFloat4_e2m1) {
-          // Timer noise must not redefine the FP4 reduction partition before
-          // supply tuning. The established deterministic selector supplies the
-          // reference; timing can change M/N tiles only within that partition.
+        if (ctx.desc().type_b == kFloat4_e2m1 ||
+            preserve_default_partition) {
+          // Timer noise must not redefine the compressed-weight reduction
+          // partition before supply tuning. This also keeps newly warmed FP8
+          // batch layouts on their previous graph-capture fallback's arithmetic.
+          // Already tuned ordinary FP8 layers retain their existing reference.
+          // Timing can change M/N tiles only within that partition.
           auto reference = Find(ctx, barriers_size, partials_size, 1, false);
           if (!reference.empty()) {
             specs = {reference.front()};
@@ -986,7 +1001,8 @@ struct Gemm::Impl {
   DispatchCache cache_;
 
   DispatchCache sm70_fp8_prefill_cache_;
-  std::array<std::optional<LaunchSpec>, 8> sm70_dflash_context_specs_{};
+  std::array<std::optional<LaunchSpec>, kSm70DflashContextStableMaxM>
+      sm70_dflash_context_specs_{};
 
   std::mutex dispatch_mutex_;
 };
@@ -1073,7 +1089,9 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
     std::lock_guard<std::mutex> lock(impl_->dispatch_mutex_);
     if (measured) {
       impl_->Measure(*dispatch_context, workspace.barriers_size,
-                     workspace.partials_size, 1, launch, stream);
+                     workspace.partials_size, 1, launch, stream,
+                     operation.dispatch &
+                         DispatchPolicy::kPreserveDefaultPartition);
     }
 
     spec = impl_->Dispatch(*dispatch_context, operation.dispatch,

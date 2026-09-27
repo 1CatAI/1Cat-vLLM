@@ -2,6 +2,41 @@
 
 Date: 2026-05-30
 
+## DFlash2 concurrent long decode follow-up, 2026-09-27
+
+Against main `1e90d17f` (PR #697), the new default candidate reaches the
+requested C4/C8 32K/256 pure-decode target: 377.689 -> 436.004 tok/s (+15.44%)
+and 612.982 -> 709.714 (+15.78%). C1/C2 are 161.621/252.465 (+1.56%/+6.90%).
+These are three retained ordinary-service wave medians with one warm wave
+excluded, TP4 V100, FP16 execution, E4M3 KV, DFlash2 q7, matching seeds and
+prefix-cache admission. The metric counts actual returned tokens in the
+all-C-alive window with no new prefills; it is not rolling output throughput.
+Every 256-token array and accepted/drafted/prefix counter matches the frozen
+baseline. Long retrieval and natural stops both pass 8/8.
+
+The changes repair coordinated warmup of secondary compressed FP8 layouts,
+prefetch full-M32 FP4/FP8 weights and long-attention K panels, share merge
+weights, reduce sampling fallback/synchronization and tune medium TP4
+reductions. No new persistent weight copy, model-name/target-quantization
+admission or user acceleration switch is added.
+
+A startup-dependent C2 acceptance loss is causally isolated to the draft
+context projection's M16 FP16 GEMM: changing just its reduction plan toggles
+31.305%/22.104% acceptance and the exact previously observed token paths.
+An A/B/A restore reproduces the baseline. The stable selector now covers its
+default M1–16 tuning range, preserves the original single-request tree and
+pins the qualified concurrent tree before any imported/autotuned cache.
+Do not repeat the disproven M8/M16 vocabulary-projection or sampling-guard
+root-cause hypotheses. A literal extension of the M8 tree is also rejected.
+
+Normal source-built artifacts, all raw waves, causal controls, rejected
+candidates and checks are retained under `sm70-long-decode15-20260927`.
+The final core SHA256 is
+`49b92da93e596ef8e3c2ec4b07907c5e2663c131413ce7f3dafdc8e4f68bb7b4`.
+No fresh PRO or 35B-A3B AWQ/FP8 speed qualification is claimed; C2's 15%
+speed target and the separate older rolling-workload gates are not closed.
+See [implementation, contract and results](sm70_dflash2_long_decode_followup_20260927.md).
+
 ## Shared batch defaults and incremental integration, 2026-09-26
 
 The requested integration scope is the current measured C2/C4/C8 improvement,

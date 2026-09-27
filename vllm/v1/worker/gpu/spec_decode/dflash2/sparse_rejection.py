@@ -13,6 +13,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _TARGET_TOP_K = 20
+_TARGET_PROBE_K = 64
 _SELECTOR_ALIGNMENT_DUMP_COUNT = 0
 _SELECTOR_ALIGNMENT_STEP = 0
 
@@ -40,10 +43,82 @@ class DFlash2LogitsFallback:
     logits: torch.Tensor | None
 
 
+@triton.jit
+def _compact_target_reference_rows_kernel(
+    probe,
+    temperatures,
+    top_ps,
+    row_to_request,
+    reference_rows,
+    row_stride: tl.constexpr,
+    width: tl.constexpr,
+    top_k: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, block)
+    request = tl.load(row_to_request + row)
+    temperature = tl.load(temperatures + request)
+    top_p = tl.load(top_ps + request)
+    values = tl.load(probe + row * row_stride + col, col < width, -float("inf"))
+    first = tl.load(probe + row * row_stride) / temperature
+    cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
+    last = tl.load(probe + row * row_stride + width - 1) / temperature
+    logits = values / temperature
+    keep = (col < width) & (logits >= cutoff)
+    logits = tl.where(keep, logits, -float("inf"))
+    probabilities = tl.exp(logits - tl.max(logits, 0))
+    probabilities /= tl.sum(probabilities, 0)
+    before = tl.cumsum(probabilities, 0) - probabilities
+    # Double the CPU reference guard's margin: different FP32 reductions
+    # can add a conservative fallback near the guard, never justify relaxing it.
+    margin: tl.constexpr = 16 * width * 1.1920928955078125e-7
+    near_cutoff = (
+        tl.sum(((tl.abs(before - top_p) <= margin) & (col < width)).to(tl.int32), 0) > 0
+    )
+    underflow = tl.sum(((probabilities == 0) & keep).to(tl.int32), 0) > 0
+    has_nan = tl.sum(((values != values) & (col < width)).to(tl.int32), 0) > 0
+    bad_first = (first != first) | (tl.abs(first) == float("inf"))
+    reference = (
+        (last >= cutoff)
+        | bad_first
+        | has_nan
+        | underflow
+        | (near_cutoff & (top_p < 1.0))
+    )
+    tl.store(reference_rows + row, reference)
+
+
+def _compact_target_reference_rows_gpu(
+    probe: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+) -> np.ndarray:
+    """Copy only fallback decisions, preserving the request-slot parameter map."""
+    rows, width = probe.shape
+    result = torch.empty(rows, device=probe.device, dtype=torch.bool)
+    _compact_target_reference_rows_kernel[(rows,)](
+        probe,
+        temperatures,
+        top_ps,
+        row_to_request,
+        result,
+        probe.stride(0),
+        width,
+        _TARGET_TOP_K,
+        triton.next_power_of_2(width),
+        num_warps=1,
+    )
+    return result.cpu().numpy()
+
+
 def _compact_target_reference_rows(
     probe_logits: torch.Tensor,
     temperature: float | np.ndarray,
     top_p: float | np.ndarray,
+    *,
+    vocab_ordered: bool = False,
 ) -> np.ndarray:
     """Keep ambiguous cutoffs on the full-vocabulary sampling contract.
 
@@ -58,6 +133,28 @@ def _compact_target_reference_rows(
     probe = probe_logits.detach().cpu().float().numpy()
     temperature = np.asarray(temperature, dtype=np.float32).reshape(-1, 1)
     top_p = np.asarray(top_p, dtype=np.float32).reshape(-1, 1)
+    if vocab_ordered:
+        # The wider probe contains all cutoff ties unless its last value
+        # reaches the top-k boundary. Descending vocabulary order also
+        # reproduces a split top-p tie in the reference's retained suffix.
+        logits = probe / temperature
+        truncated = probe[:, -1] >= probe[:, _TARGET_TOP_K - 1]
+        keep_k = logits >= logits[:, _TARGET_TOP_K - 1 : _TARGET_TOP_K]
+        logits = np.where(keep_k, logits, -np.inf)
+        with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+            probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs /= probs.sum(axis=-1, keepdims=True)
+        before = probs.cumsum(axis=-1) - probs
+        margin = 8 * probe.shape[1] * np.finfo(np.float32).eps
+        near_cutoff = (np.abs(before - top_p) <= margin).any(axis=-1)
+        underflow = ((probs == 0) & keep_k).any(axis=-1)
+        return (
+            truncated
+            | ~np.isfinite(logits[:, 0])
+            | np.isnan(probe).any(axis=-1)
+            | underflow
+            | (near_cutoff & (top_p[:, 0] < 1.0))
+        )
     logits = probe[:, :_TARGET_TOP_K] / temperature
     exp_logits = np.exp(logits - logits.max(axis=-1, keepdims=True))
     probs = exp_logits / exp_logits.sum(axis=-1, keepdims=True)
@@ -324,27 +421,46 @@ def try_dflash2_sparse_target_rejection(
     if sparse_draft_logits is None:
         return None
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
+    idx = input_batch.idx_mapping_np
+    states = rejection_sampler.sampler.sampling_states
+    # Preserve the small single-request path. The large-vocabulary reference
+    # uses stable radix order; retain the existing fallback for other sorts.
+    retain_ties = idx.size > 1 and getattr(states, "vocab_size", 0) >= 32768
+    probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
     if hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
         target_topk_ids, target_topk_logits, fallback = (
             model.get_topk_tokens_and_logits_with_fallback(
-                sample_hidden_states, _TARGET_TOP_K + 1
+                sample_hidden_states, probe_k
             )
         )
     else:
         target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
-            sample_hidden_states, _TARGET_TOP_K + 1
+            sample_hidden_states, probe_k
         )
-    idx = input_batch.idx_mapping_np
-    states = rejection_sampler.sampler.sampling_states
+    if retain_ties:
+        target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
+            target_topk_logits,
+            target_topk_ids,
+            vocab_size=states.vocab_size,
+            descending=True,
+        )
     # Packed verifier rows need their own request's sampling parameters.
     # Reusing the first request misses ambiguous nuclei in heterogeneous batches.
-    num_logits = np.diff(input_batch.cu_num_logits_np)
-    reference_rows = _compact_target_reference_rows(
-        target_topk_logits,
-        np.repeat(states.temperature.np[idx], num_logits),
-        np.repeat(states.top_p.np[idx], num_logits),
-    )
+    if retain_ties:
+        reference_rows = _compact_target_reference_rows_gpu(
+            target_topk_logits,
+            states.temperature.gpu,
+            states.top_p.gpu,
+            input_batch.expanded_idx_mapping,
+        )
+    else:
+        num_logits = np.diff(input_batch.cu_num_logits_np)
+        reference_rows = _compact_target_reference_rows(
+            target_topk_logits,
+            np.repeat(states.temperature.np[idx], num_logits),
+            np.repeat(states.top_p.np[idx], num_logits),
+        )
     reference_reqs = np.flatnonzero(
         np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
     )
@@ -358,8 +474,9 @@ def try_dflash2_sparse_target_rejection(
         reference_logits = fallback()
         if reference_reqs.size == idx.size or reference_logits is None:
             return DFlash2LogitsFallback(reference_logits)
-    target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
-    target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
+    if not retain_ties:
+        target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]
+        target_topk_logits = target_topk_logits[:, :_TARGET_TOP_K]
     num_rows = target_topk_ids.shape[0]
     if input_batch.num_tokens == num_rows:
         # Uniform decode logits_indices spans the entire real query.
@@ -383,6 +500,7 @@ def try_dflash2_sparse_target_rejection(
         rejection_sampler.sampler.sampling_states.seeds.gpu,
         rejection_sampler.num_speculative_steps,
         use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
+        target_top_k=_TARGET_TOP_K,
     )
     if reference_logits is not None:
         reqs, dense_sampled, dense_num_sampled = _sample_reference_requests(
