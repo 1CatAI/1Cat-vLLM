@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from compressed_tensors.quantization import (
     QuantizationArgs,
@@ -14,6 +15,9 @@ import vllm.envs as envs
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsLinearMethod,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    compressed_tensors_w8a16_fp8 as ct_fp8_module,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
     CompressedTensorsW8A16Fp8,
     _sm70_channel_fp8_qpn8_config,
@@ -24,6 +28,7 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _SM70_FP8_PREFILL_DENSE_MIN_M,
     _SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES,
     Fp8LinearMethod,
+    _bind_sm70_fp8_prefill_workspace,
     _get_sm70_fp8_prefill_exact_dense_workspace,
     _is_sm70_fp8_exact_8k_prefill_layer,
     _is_sm70_fp8_prefill_exact_dense_layer,
@@ -33,7 +38,34 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _sm70_fp8_prefill_dense_workspaces,
     _sm70_fp8_prefill_visible_dense_mm,
     _try_sm70_fp8_prescaled_decode_scales,
+    clear_sm70_fp8_workspaces,
 )
+from vllm.model_executor.layers.quantization.utils import (
+    sm70_layer_workspaces as ws_module,
+)
+
+
+@pytest.fixture(autouse=True)
+def _sm70_fp8_workspace_ops_on_cpu():
+    """The tests dispatch on CPU tensors; the opaque workspace ops register CUDA
+    kernels only. Every test starts with empty workspace caches."""
+    libraries = []
+    for op_name, impl in (
+        ("sm70_fp8_qpn8_dispatch", ws_module._sm70_fp8_qpn8_dispatch),
+        ("sm70_fp8_prefill_dispatch", ws_module._sm70_fp8_prefill_dispatch),
+        ("sm70_ct_fp8_qpn8_dispatch", ct_fp8_module._sm70_ct_fp8_qpn8_dispatch),
+    ):
+        if not torch._C._dispatch_has_kernel_for_dispatch_key(
+            f"vllm::{op_name}", "CPU"
+        ):
+            library = torch.library.Library("vllm", "IMPL", "CPU")
+            library.impl(op_name, impl)
+            libraries.append(library)
+    clear_sm70_fp8_workspaces()
+    yield
+    clear_sm70_fp8_workspaces()
+    for library in libraries:
+        library._destroy()
 
 
 def _make_channel_fp8_scheme(
@@ -553,7 +585,7 @@ def test_fp8_prefill_visible_dense_mm_is_long_prefill_only(monkeypatch):
 
 
 def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypatch):
-    calls = []
+    calls: list[tuple[int, int, bool]] = []
 
     def fake_dispatch(
         out,
@@ -567,7 +599,7 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
         gated_silu,
         min_prefill_m,
     ):
-        assert dense_weight_ptr == 42
+        assert dense_weight_ptr == workspace.data_ptr()
         calls.append((input.shape[0], min_prefill_m, gated_silu))
         out.zero_()
 
@@ -584,8 +616,10 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
         weight_scale_inv=torch.empty((1, 6), dtype=torch.float16),
         sm70_fp8_k_ld=4,
         sm70_fp8_q_ld=6,
-        sm70_fp8_prefill_exact_dense_workspace_ptr=42,
+        prefix="model.layers.0.mlp.down_proj",
     )
+    workspace = torch.empty(1, dtype=torch.float16)
+    _bind_sm70_fp8_prefill_workspace(layer, workspace)
     method = SimpleNamespace()
 
     for m in (1, _SM70_FP8_PREFILL_DENSE_MIN_M):
@@ -815,8 +849,10 @@ def test_fp8_qpn8_dispatches_small_m_and_workspace_fallback(monkeypatch):
         sm70_fp8_qpn8_split_k=16,
         sm70_fp8_qpn8_nacc=1,
         sm70_fp8_qpn8_prefetch=False,
-        sm70_fp8_prefill_exact_dense_workspace_ptr=42,
+        prefix="model.layers.0.mlp.down_proj",
     )
+    workspace = torch.empty(1, dtype=torch.float16)
+    _bind_sm70_fp8_prefill_workspace(layer, workspace)
     method = SimpleNamespace()
 
     for m in (1, 9):
@@ -826,8 +862,8 @@ def test_fp8_qpn8_dispatches_small_m_and_workspace_fallback(monkeypatch):
         assert output.shape == (m, 6)
 
     assert calls == [
-        ("dispatch", 1, 42, 16, 1, False, False),
-        ("dispatch", 9, 42, 16, 1, False, False),
+        ("dispatch", 1, workspace.data_ptr(), 16, 1, False, False),
+        ("dispatch", 9, workspace.data_ptr(), 16, 1, False, False),
     ]
 
 
@@ -856,8 +892,10 @@ def test_fp8_qpn8_fused_gate_dispatches_without_intermediate(monkeypatch):
         sm70_fp8_qpn8_gated_split_k=8,
         sm70_fp8_qpn8_gated_nacc=2,
         sm70_fp8_qpn8_gated_prefetch=True,
-        sm70_fp8_prefill_exact_dense_workspace_ptr=42,
+        prefix="model.layers.0.mlp.down_proj",
     )
+    workspace = torch.empty(1, dtype=torch.float16)
+    _bind_sm70_fp8_prefill_workspace(layer, workspace)
     method = SimpleNamespace()
 
     for m in (8, 16):
@@ -868,6 +906,6 @@ def test_fp8_qpn8_fused_gate_dispatches_without_intermediate(monkeypatch):
         assert output.shape == (m, 6)
 
     assert calls == [
-        ("dispatch", 8, 42, 8, 2, True, True),
-        ("dispatch", 16, 42, 8, 2, True, True),
+        ("dispatch", 8, workspace.data_ptr(), 8, 2, True, True),
+        ("dispatch", 16, workspace.data_ptr(), 8, 2, True, True),
     ]
