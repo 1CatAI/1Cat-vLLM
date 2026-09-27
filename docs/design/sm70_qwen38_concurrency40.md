@@ -324,8 +324,34 @@ and candidate**, even if the GEMV switch is off. An older result collected
 with different Torch precision flags is not a matched control.
 
 Current integration validation: 63 CPU layout/admission/fake-export tests
-passed; 28 GPU tests were deliberately skipped with CUDA hidden. This is
+passed, plus 71 shared-gate/integration tests; 39 GPU tests were deliberately
+skipped with CUDA hidden. This is
 not CUDA arithmetic or performance evidence. Native source build, actual
 TP4 runtime graphs, all-layer quality and matched endpoint measurements
 remain acceptance gates. There is no new decode-speed claim or default-on
 decision in this update.
+
+Native-runtime reproduction after the normal source build (exclusive TP4
+lease required):
+
+```bash
+VLLM_SM70_TP4_PUSH_ALLREDUCE=1 VLLM_SM70_QWEN38_BATCH_FASTPATH=1 \
+  .venv/bin/torchrun --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_batch_native_tp4.py --runtime \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --pairs 96 \
+  --rows 2,3,4,8,16,2 --out .artifacts/hc_runtime_tp4.json
+```
+
+`--runtime` does not compile/load the research modules. It checks the loaded
+`_C` belongs to this source tree, hashes it, and uses the native communicator
+and loader packs. It also reuses existing CUDA graphs in an odd-replay
+shrinking/growing sequence instead of relying on fresh captures to reset
+state. Any numerical mismatch makes the benchmark fail and prevents timing
+of the failing case. The native `_C` and Flash-V100 package must be rebuilt
+from source; no private extension override is part of reproduction.
+
+The reused `benchmark_sm70_qwen38_concurrency.py` keeps per-step decode,
+prefill union-wall throughput and natural-EOS text health separate, records
+token IDs and checks repeated cohorts against a matched reference. Both
+arms record an explicit FP32 accumulation/reduction contract. A failed or
+nonrepeatable control cannot serve as an accepted speed/quality reference.

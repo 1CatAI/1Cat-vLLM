@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Research TP4 HC down/up/mix + both gathers; NOT model throughput.
+"""TP4 HC down/up/mix + both gathers; NOT model throughput.
 
 Run with torchrun --standalone --nproc-per-node=4 on exclusively owned cards.
-Each process builds/loads only this tree's research extensions. IPC channels
-are dedicated to this screen and are not shared with any runtime communicator.
+By default build this tree's research extensions with dedicated IPC channels.
+With --runtime, use only the ordinary source-built _C extension, runtime
+communicator and loader packing; no research extension is built or loaded.
 """
 
 import argparse
@@ -84,10 +85,15 @@ def reference(state, weight, rows):
         mix_reference[(rows, 5)](x, gate, out, 2560, 0, num_warps=4)
 
 
-def candidate(ext, gather, peers, state, weight, rank):
+def candidate(ext, gather, peers, state, weight, rank, communicator=None):
     for (x, _, _, _, _, scratch, lora, local, output, injection), (_, _, d, u) in zip(
         state, weight
     ):
+        if communicator is not None:
+            communicator.sm70_qwen38_hc_batch(
+                x, d, u, scratch, lora, local, output, injection
+            )
+            continue
         ext.run_down_shard(x, d, scratch)
         gather.run(peers[0], rank, scratch, lora, injection, True)
         ext.run(lora, u, x, local, rank * 640, False, 1, 4, True)
@@ -111,6 +117,7 @@ def main():
     p.add_argument("--pairs", type=int, default=8)
     p.add_argument("--rows", default="2,4,8,16")
     p.add_argument("--build-only", action="store_true")
+    p.add_argument("--runtime", action="store_true")
     a = p.parse_args()
     if not 1 <= a.pairs <= 96 or (not a.build_only and a.model is None):
         p.error("Use 1..96 HC pairs and specify --model")
@@ -118,7 +125,9 @@ def main():
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
-    ext, gather = build(), build_gather()
+    if a.runtime and a.build_only:
+        p.error("Build --runtime with the ordinary source build, not this JIT helper")
+    ext, gather = (None, None) if a.runtime else (build(), build_gather())
     if a.build_only:
         assert not torch.cuda.is_initialized()
         print("Built both research extensions without a CUDA context", flush=True)
@@ -151,9 +160,10 @@ def main():
     if status[0]:
         raise RuntimeError(f"Cards not exclusive: {status[0]}")
     peers = []
+    communicator = None
     # Separate down/output channels also isolate epoch state across payload
     # sizes. There is no alias with an engine's auxiliary-stream collectives.
-    for _ in range(2):
+    for _ in range(0 if a.runtime else 2):
         pointer, handle = gather.allocate()
         handles = [None] * 4
         dist.all_gather_object(handles, handle)
@@ -161,6 +171,34 @@ def main():
             [pointer if i == rank else gather.open(h) for i, h in enumerate(handles)]
         )
     names, weight = weights(a.model, a.pairs, rank)
+    native_files = []
+    if a.runtime:
+        import vllm._C
+
+        from vllm import _custom_ops as ops
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+        from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import _pack_hc_batch_weight
+
+        if not ops.supports_sm70_qwen38_hc_batch():
+            raise RuntimeError("Rebuild this worktree's native batched HC extension")
+        native_files = [Path(vllm._C.__file__)]
+        if not native_files[0].resolve().is_relative_to(ROOT.resolve()):
+            raise RuntimeError("Runtime benchmark must use this worktree's _C")
+        weight = [
+            (
+                d,
+                u,
+                _pack_hc_batch_weight(d, "down", rank),
+                _pack_hc_batch_weight(u, "up", rank),
+            )
+            for d, u, _, _ in weight
+        ]
+        communicator = CustomAllreduce(dist.group.WORLD, device=rank)
+        probe = torch.empty((2, 10240), device="cuda", dtype=torch.float16)
+        if not communicator.can_sm70_qwen38_hc_batch(probe):
+            raise RuntimeError("Native TP4 batched HC was not admitted")
     result = {
         "contract": (
             "TP4 down/Silu/up/mix/both gathers; excludes combine/norm and model"
@@ -168,17 +206,31 @@ def main():
         "source": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
+        "runtime": a.runtime,
         "sha256": {
             str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (
-                ROOT / "benchmarks/csrc/benchmark_sm70_hc_batch_reuse.cu",
-                ROOT / "benchmarks/csrc/benchmark_sm70_hc_batch_gather.cu",
+                [
+                    ROOT / "csrc/sm70_qwen38_hc_batch.cuh",
+                    ROOT / "csrc/custom_all_reduce.cuh",
+                    ROOT / "csrc/custom_all_reduce.cu",
+                ]
+                if a.runtime
+                else [
+                    ROOT / "benchmarks/csrc/benchmark_sm70_hc_batch_reuse.cu",
+                    ROOT / "benchmarks/csrc/benchmark_sm70_hc_batch_gather.cu",
+                ]
             )
         },
         "extensions_sha256": [
             hashlib.sha256(Path(e.__file__).read_bytes()).hexdigest()
             for e in (ext, gather)
+            if e is not None
         ],
+        "native_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in native_files
+        },
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -190,7 +242,10 @@ def main():
         "cases": [],
     }
     a.out.parent.mkdir(parents=True, exist_ok=True)
+    graphs = {}
     for rows in map(int, a.rows.split(",")):
+        if not 2 <= rows <= 16:
+            p.error("HC batch supports M2..16")
         torch.manual_seed(20260927 + rows)
         state = []
         for _ in weight:
@@ -210,7 +265,10 @@ def main():
                 )
             )
         bg = capture(partial(reference, state, weight, rows))
-        cg = capture(partial(candidate, ext, gather, peers, state, weight, rank))
+        cg = capture(
+            partial(candidate, ext, gather, peers, state, weight, rank, communicator)
+        )
+        graphs[rows] = (bg, cg, state)
         checks = []
         for scale in (0.0, 0.001, 0.03, 0.1, 1.0, 3.0):
             for tensors in state:
@@ -255,6 +313,23 @@ def main():
                 json.dumps({k: v for k, v in record.items() if k != "samples_us"}),
                 flush=True,
             )
+    # Reuse the SAME captured graphs across shrinking/growing payloads, with
+    # odd replay counts. Fresh captures or only-even epochs can mask stale tags.
+    transitions = []
+    for rows in (2, 16, 3, 2, 8, 2, 16, 4, 2):
+        if rows not in graphs:
+            continue
+        bg, cg, state = graphs[rows]
+        for tensors in state:
+            tensors[0].normal_(0, 0.1)
+            for output in tensors[5:]:
+                output.fill_(float("nan"))
+        bg.replay()
+        cg.replay()
+        errors = [None] * 4
+        dist.all_gather_object(errors, check(state))
+        transitions.append({"rows": rows, "rank_mismatches": errors})
+    result["graph_transitions"] = transitions
     torch.cuda.synchronize()
     dist.barrier()
     for channel in peers:
@@ -264,10 +339,18 @@ def main():
     dist.barrier()
     for channel in peers:
         gather.free(channel[rank])
+    if communicator is not None:
+        communicator.close()
     dist.destroy_process_group()
     result["complete"] = True
     if rank == 0:
         a.out.write_text(json.dumps(result, indent=2) + "\n")
+    if any(any(e) for t in transitions for e in t["rank_mismatches"]) or any(
+        any(any(e) for e in c["rank_lora_output_injection_mismatches"])
+        for case in result["cases"]
+        for c in case["checks"]
+    ):
+        raise SystemExit("HC numerical gate failed; no runtime promotion")
 
 
 if __name__ == "__main__":
