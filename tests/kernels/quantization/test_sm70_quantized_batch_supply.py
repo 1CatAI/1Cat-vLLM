@@ -133,6 +133,7 @@ def test_batch_captured_tail_keeps_partition(monkeypatch, kind):
             int(meta[0]),
             int(meta[1]),
             False,
+            *([True] if kind == "fp8" else []),
         )
 
     # Only M64 is tuned. Smaller shapes first appear during graph capture,

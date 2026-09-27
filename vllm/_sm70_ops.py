@@ -686,7 +686,13 @@ def fp8_gemm_sm70_out(
     k_ld: int,
     q_ld: int,
     gated_silu: bool = False,
+    preserve_default_partition: bool = False,
 ) -> None:
+    if preserve_default_partition:
+        _op("fp8_gemm_sm70_out")(
+            out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu, True
+        )
+        return
     _op("fp8_gemm_sm70_out")(
         out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
     )
@@ -704,6 +710,7 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         k_ld: int,
         q_ld: int,
         gated_silu: bool,
+        preserve_default_partition: bool = False,
     ) -> None:
         return None
 

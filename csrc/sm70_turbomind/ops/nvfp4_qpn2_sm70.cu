@@ -194,11 +194,15 @@ struct Nvfp4PairReader {
 
 // Four row tiles reuse each decoded weight. Two physical phases retain
 // the established split order while keeping shared scratch at 40/36 KiB.
-template <int Split, bool Gated>
-__global__ void nvfp4_qpn2_m32_twophase_sm70_kernel(
+template <int Split, bool Gated, bool FullRows = false>
+__global__
+__launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
     const half* __restrict__ input, half* __restrict__ output, int width, int k,
     int m, float global_scale) {
+  // A full row tile needs no input/output masking. Bound register usage so
+  // prefetching does not remove the second resident CTA on SM70.
+  if constexpr (FullRows) m = 32;
   constexpr int RowTiles = 4;
   constexpr int Phases = 2;
   constexpr int Warps = Split / Phases;
@@ -223,11 +227,25 @@ __global__ void nvfp4_qpn2_m32_twophase_sm70_kernel(
   for (int phase = 0; phase < Phases; ++phase) {
     float accum[RowTiles][2][8] = {};
     const int begin = (warp + phase * Warps) * groups_per_warp;
+    uint2 next_codes = make_uint2(0, 0);
+    uint8_t next_scale = 0;
+    if constexpr (FullRows) {
+      next_codes = reader.load(begin);
+      next_scale = __ldg(scale_ptr + static_cast<size_t>(begin) * 32);
+    }
 #pragma unroll 1
     for (int group = begin; group < begin + groups_per_warp; ++group) {
-      const uint2 code = reader.load(group);
+      const uint2 code = FullRows ? next_codes : reader.load(group);
       const half2 scale = nvfp4_effective_scale(
-          __ldg(scale_ptr + static_cast<size_t>(group) * 32), global_scale);
+          FullRows ? next_scale
+                   : __ldg(scale_ptr + static_cast<size_t>(group) * 32),
+          global_scale);
+      if constexpr (FullRows) {
+        if (group + 1 < begin + groups_per_warp) {
+          next_codes = reader.load(group + 1);
+          next_scale = __ldg(scale_ptr + static_cast<size_t>(group + 1) * 32);
+        }
+      }
       half2 weights[8];
       dequant_e2m1x8(code.x, scale, weights);
       dequant_e2m1x8(code.y, scale, weights + 4);
@@ -722,10 +740,12 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
       vllm::sm70::pack_k16_input<<<
           (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
           input_ptr, packed_ptr, m, k);
-      nvfp4_qpn2_m32_twophase_sm70_kernel<16, false>
-          <<<dim3(1, n / 32), 256, 0, stream>>>(
-              code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m,
-              static_cast<float>(global_scale));
+      auto kernel = m == 32
+                        ? nvfp4_qpn2_m32_twophase_sm70_kernel<16, false, true>
+                        : nvfp4_qpn2_m32_twophase_sm70_kernel<16, false>;
+      kernel<<<dim3(1, n / 32), 256, 0, stream>>>(
+          code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m,
+          static_cast<float>(global_scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
@@ -804,10 +824,11 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
       vllm::sm70::pack_k16_input<<<
           (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
           input_ptr, packed_ptr, m, k);
-      nvfp4_qpn2_m32_twophase_sm70_kernel<8, true>
-          <<<dim3(1, hidden / 32), 256, 0, stream>>>(
-              code_ptr, scale_ptr, packed_ptr, output_ptr, hidden, k, m,
-              static_cast<float>(global_scale));
+      auto kernel = m == 32 ? nvfp4_qpn2_m32_twophase_sm70_kernel<8, true, true>
+                            : nvfp4_qpn2_m32_twophase_sm70_kernel<8, true>;
+      kernel<<<dim3(1, hidden / 32), 256, 0, stream>>>(
+          code_ptr, scale_ptr, packed_ptr, output_ptr, hidden, k, m,
+          static_cast<float>(global_scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }

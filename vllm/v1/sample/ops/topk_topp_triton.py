@@ -1016,6 +1016,135 @@ def _topk_topp_kernel(
                 tl.store(LOGITS_ROW + offs_n, logits_blk, mask=mask_n)
 
 
+@triton.jit
+def _sort_topk_with_vocab_ties_kernel(
+    values,
+    indices,
+    out_values,
+    out_indices,
+    value_stride: tl.constexpr,
+    index_stride: tl.constexpr,
+    width: tl.constexpr,
+    block: tl.constexpr,
+    descending: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, block)
+    valid = col < width
+    value = tl.load(values + row * value_stride + col, valid, other=0)
+    token = tl.load(indices + row * index_stride + col, valid, other=0).to(tl.uint32)
+    bits = value.to(tl.uint32, bitcast=True)
+    # Match the reference radix sort: signed zeros compare equal; NaN
+    # encodings retain their radix ordering. Gather the original value so
+    # even its signed-zero/NaN bits survive the reordering.
+    bits = tl.where(value == 0, 0, bits)
+    numeric = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    key = (numeric.to(tl.uint64) << 32) | (token.to(tl.uint64) << 8) | col.to(tl.uint64)
+    pad: tl.constexpr = 0 if descending else 0xFFFFFFFFFFFFFFFF
+    key = tl.where(valid, key, pad)
+    ordered = tl.sort(key, descending=descending)
+    source_col = tl.minimum((ordered & 255).to(tl.int32), block - 1)
+    ordered_value = tl.gather(value, source_col, axis=0)
+    tl.store(out_values + row * width + col, ordered_value, valid)
+    tl.store(
+        out_indices + row * width + col,
+        ((ordered >> 8) & 0xFFFFFF).to(tl.int64),
+        valid,
+    )
+
+
+def sort_topk_with_vocab_ties(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    vocab_size: int,
+    descending: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Order a shortlist by score, then vocabulary ID, retaining value bits."""
+    if (
+        not values.is_cuda
+        or values.dtype != torch.float32
+        or not 0 < values.shape[1] <= 128
+        or vocab_size >= 1 << 24
+        or values.stride(-1) != 1
+        or indices.stride(-1) != 1
+    ):
+        indices, permutation = indices.sort(dim=-1, descending=descending)
+        values = values.gather(1, permutation)
+        values, permutation = values.sort(dim=-1, descending=descending, stable=True)
+        return values, indices.gather(1, permutation)
+    out_values = values.new_empty(values.shape)
+    out_indices = indices.new_empty(indices.shape)
+    _sort_topk_with_vocab_ties_kernel[(values.shape[0],)](
+        values,
+        indices,
+        out_values,
+        out_indices,
+        values.stride(0),
+        indices.stride(0),
+        values.shape[1],
+        triton.next_power_of_2(values.shape[1]),
+        descending,
+        num_warps=1,
+    )
+    return out_values, out_indices
+
+
+def _apply_top_k_top_p_compact(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor,
+    mask_value: float,
+) -> torch.Tensor | None:
+    """Filter a bounded shortlist; retain reference handling at boundaries.
+
+    A top-k cutoff keeps *all* equal logits, so a fixed-size shortlist is not
+    sufficient if the lowest selected value reaches the cutoff. CUDA's large
+    vocabulary reference uses stable radix sorting: equal values retain their
+    vocabulary order. Restore that order before sorting the shortlist so that
+    top-p also splits ties at the same token. Numerically close cumulative
+    probabilities still use the full reference reduction.
+    """
+    capacity = 128
+    if not ((k > 0) & (k < capacity)).all():
+        return None
+
+    values, indices = logits.topk(capacity, dim=-1, sorted=False)
+    values, indices = sort_topk_with_vocab_ties(
+        values, indices, vocab_size=logits.shape[1]
+    )
+    cutoff = values.gather(1, (capacity - k.long()).unsqueeze(1))
+    reference_rows = (values[:, 0] >= cutoff[:, 0]) | ~torch.isfinite(values[:, -1])
+    reference_rows |= torch.isnan(values[:, 0])
+    values.masked_fill_(values < cutoff, -float("inf"))
+    probabilities = values.softmax(dim=-1)
+    cumulative = probabilities.cumsum(dim=-1)
+    boundary = 1 - p.unsqueeze(1)
+    # Conservative margin for the different FP32 softmax/cumsum reduction.
+    # There are fewer than capacity nonzero probabilities in admitted rows.
+    margin = 8 * capacity * torch.finfo(torch.float32).eps
+    reference_rows |= ((cumulative - boundary).abs() <= margin).any(dim=-1)
+    remove = cumulative <= boundary
+    remove[:, -1] = False
+    values.masked_fill_(remove, -float("inf"))
+    result = torch.full_like(logits, -float("inf"))
+    result.scatter_(1, indices, values)
+
+    if reference_rows.any():
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        rows = reference_rows.nonzero(as_tuple=True)[0]
+        reference = apply_top_k_top_p_pytorch(
+            logits.index_select(0, rows),
+            k.index_select(0, rows),
+            p.index_select(0, rows),
+        )
+        result.index_copy_(0, rows, reference)
+    if mask_value != float("-inf"):
+        result.masked_fill_(torch.isneginf(result), mask_value)
+    return result
+
+
 def apply_top_k_top_p_triton(
     logits: torch.Tensor,
     k: torch.Tensor | None,
@@ -1075,6 +1204,19 @@ def apply_top_k_top_p_triton(
         p_ptr = p.to(torch.float32)
     else:
         p_ptr = logits  # Dummy pointer (won't be read)
+
+    if (
+        topk_enabled
+        and topp_enabled
+        and batch_size >= 2
+        and vocab_size >= 32768
+        and logits.is_cuda
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
+    ):
+        compact = _apply_top_k_top_p_compact(logits, k_ptr, p_ptr, mask_value)
+        if compact is not None:
+            return compact
 
     num_sm = num_compute_units(logits.device.index)
     NUM_PROGRAMS = min(num_sm, batch_size)
@@ -1144,14 +1286,18 @@ def apply_top_k_top_p_triton(
     if reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
+        # Boolean indexing performs a host-synchronizing nonzero for each
+        # operand. Reuse one ordered row index for logits, parameters and the
+        # final scatter without changing the reference's vocabulary tie order.
+        reference_indices = reference_rows.nonzero(as_tuple=True)[0]
         reference_logits = apply_top_k_top_p_pytorch(
-            original_logits[reference_rows],
-            k[reference_rows] if k is not None else None,
-            p[reference_rows] if p is not None else None,
+            original_logits.index_select(0, reference_indices),
+            k.index_select(0, reference_indices) if k is not None else None,
+            p.index_select(0, reference_indices) if p is not None else None,
         )
         if mask_value != float("-inf"):
             reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
-        logits[reference_rows] = reference_logits
+        logits.index_copy_(0, reference_indices, reference_logits)
     return logits
 
 

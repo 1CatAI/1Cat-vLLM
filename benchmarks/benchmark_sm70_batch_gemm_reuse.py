@@ -221,7 +221,15 @@ def prepare(args, kind):
             )
         else:
             torch.ops._C.fp8_gemm_sm70_out(
-                y, x, w, s, 128, int(meta[0]), int(meta[1]), gated
+                y,
+                x,
+                w,
+                s,
+                128,
+                int(meta[0]),
+                int(meta[1]),
+                gated,
+                *([True] if args.preserve_default_partition else []),
             )
 
     return k, n, gated, call
@@ -236,6 +244,7 @@ def main():
     p.add_argument("--oracles", type=Path, required=True)
     p.add_argument("--write-oracles", action="store_true")
     p.add_argument("--require-bitwise", action="store_true")
+    p.add_argument("--preserve-default-partition", action="store_true")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--rows", type=int, nargs="+", default=[8, 16, 17, 24, 32, 64])
     p.add_argument("--kinds", nargs="+", default=list(COUNTS))
