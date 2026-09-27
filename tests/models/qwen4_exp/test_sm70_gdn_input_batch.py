@@ -80,7 +80,8 @@ def cuda_weights():
 
 
 @pytest.mark.parametrize("m", range(2, 17))
-def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m):
+@pytest.mark.parametrize("row_major", (False, True))
+def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m, row_major):
     monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     q, b, pq, pb = cuda_weights
@@ -90,7 +91,11 @@ def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m):
     torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb)
+        if row_major:
+            actual = tuple(x.new_empty((m, n)) for n in (2560, 1536, 12, 12))
+            torch.ops._C.qwen38_gdn_input_batch_sm70_out(*actual, x, q, b)
+        else:
+            actual = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb)
     for scale in (0.0, 0.001, 0.1, 1.0, 3.0):
         x.normal_(0, scale)
         for output in actual:
@@ -133,12 +138,14 @@ def test_unaligned_storage_falls_back(cuda_weights, monkeypatch, which):
 
 
 @pytest.mark.parametrize("m", (2, 7, 9, 16))
-def test_native_output_canaries(cuda_weights, m):
+@pytest.mark.parametrize("row_major", (False, True))
+def test_native_output_canaries(cuda_weights, m, row_major):
     q, b, pq, pb = cuda_weights
     x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
     storage = [x.new_full((m * n + 16,), 17) for n in (2560, 1536, 12, 12)]
     outputs = [s[8:-8].view(m, n) for s, n in zip(storage, (2560, 1536, 12, 12))]
-    torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, pq, pb)
+    qw, bw = (q, b) if row_major else (pq, pb)
+    torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, qw, bw)
     for s in storage:
         assert torch.all(s[:8] == 17) and torch.all(s[-8:] == 17)
     for actual, expected in zip(outputs, _qwen38_sm70_fp16_gdn_input(x, q, b)):
@@ -151,6 +158,14 @@ def test_native_rejects_wrong_output_geometry(cuda_weights):
     outputs = [x.new_empty((2, n)) for n in (2560, 1536, 12, 13)]
     with pytest.raises(RuntimeError, match="output geometry"):
         torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, pq, pb)
+
+
+def test_native_rejects_mixed_weight_layouts(cuda_weights):
+    q, _, _, pb = cuda_weights
+    x = torch.zeros(2, 2560, device="cuda", dtype=torch.float16)
+    outputs = [x.new_empty((2, n)) for n in (2560, 1536, 12, 12)]
+    with pytest.raises(RuntimeError, match="weight geometry"):
+        torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, q, pb)
 
 
 def test_loader_prepares_nonpersistent_and_reloadable_bits(cuda_weights):

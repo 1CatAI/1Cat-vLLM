@@ -65,13 +65,18 @@ def checkpoint_weights(model: Path, layers: list[int], rank: int):
     return result
 
 
-def capture(xs, weights, packed):
+def capture(xs, weights, packed, row_major=False):
     outputs = []
 
     def run():
         outputs.clear()
         for x, (q, b), (pq, pb) in zip(xs, weights, packed):
-            outputs.append(_qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb))
+            if row_major:
+                out = tuple(x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
+                torch.ops._C.qwen38_gdn_input_batch_sm70_out(*out, x, q, b)
+                outputs.append(out)
+            else:
+                outputs.append(_qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb))
 
     for _ in range(3):
         run()
@@ -100,6 +105,7 @@ def main():
     p.add_argument("--layers", default="all")
     p.add_argument("--rank", type=int, choices=range(4), default=0)
     p.add_argument("--rows", default="2,4,8,16")
+    p.add_argument("--layout", choices=("packed", "row-major"), default="packed")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     if not envs.VLLM_SM70_QWEN38_BATCH_FASTPATH:
@@ -117,7 +123,11 @@ def main():
         else list(map(int, args.layers.split(",")))
     )
     weights = checkpoint_weights(args.model, layers, args.rank)
-    packed = [tuple(_pack_gdn_input_weight(w) for w in pair) for pair in weights]
+    packed = (
+        [tuple(_pack_gdn_input_weight(w) for w in pair) for pair in weights]
+        if args.layout == "packed"
+        else [(None, None)] * len(weights)
+    )
     rows = []
     report = dict(
         model=str(args.model),
@@ -128,7 +138,13 @@ def main():
         cuda=torch.version.cuda,
         synthetic_activations=True,
         fp32_accumulation_and_reduction=True,
-        packed_bytes=sum(w.numel() * w.element_size() for pair in packed for w in pair),
+        weight_layout=args.layout,
+        packed_bytes=sum(
+            w.numel() * w.element_size()
+            for pair in packed
+            for w in pair
+            if w is not None
+        ),
         config_sha256=hashlib.sha256(
             (args.model / "config.json").read_bytes()
         ).hexdigest(),
@@ -142,7 +158,7 @@ def main():
             for _ in weights
         ]
         base, expected = capture(xs, weights, [(None, None)] * len(weights))
-        candidate, actual = capture(xs, weights, packed)
+        candidate, actual = capture(xs, weights, packed, args.layout == "row-major")
         checks = []
         for scale in (0.0, 0.001, 0.03, 0.1, 1.0, 3.0):
             for x in xs:

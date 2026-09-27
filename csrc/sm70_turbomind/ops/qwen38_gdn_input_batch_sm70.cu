@@ -18,10 +18,12 @@ namespace {
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
+template <bool Packed, bool PairRows = false>
 __global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
     const half* x, const half* qw, const half* bw, half* qkv, half* z,
     half* b_out, half* a_out, int m) {
-  __shared__ float partial[4][8][32];
+  constexpr int groups = PairRows ? 2 : 1;
+  __shared__ float partial[4][groups * 8][32];
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const bool is_ba = blockIdx.x == 128;
   const int row_group = blockIdx.y;
@@ -30,46 +32,60 @@ __global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
   if (!is_ba && warp != 0) return;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3;
-  const int col = quad * 8 + r, row = row_group * 8 + r;
-  const half* input = x + static_cast<size_t>(row) * 2560;
+  const int col = quad * 8 + r;
   const half* w = is_ba ? bw : qw + static_cast<size_t>(blockIdx.x) * 2560 * 32;
   const int start = is_ba ? warp * 40 : 0;
   const int end = is_ba ? (warp + 1) * 40 : 160;
-  float acc[8] = {};
+  float acc[groups][8] = {};
 #pragma unroll 32
   for (int g = start; g < end; ++g) {
-    const uint4 lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
-    const uint4 hi =
-        *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
-    uint4 a = make_uint4(0, 0, 0, 0), b = a;
-    if (row < m) {
-      a = *reinterpret_cast<const uint4*>(input + g * 16);
-      b = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
+    uint4 lo = make_uint4(0, 0, 0, 0), hi = lo;
+    if constexpr (Packed) {
+      lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
+      hi = *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
+    } else if (!is_ba || col < 24) {
+      // Same fragments and K order, but read the original checkpoint layout.
+      // This variant needs no second model-sized weight allocation.
+      lo = *reinterpret_cast<const uint4*>(w + col * 2560 + g * 16);
+      hi = *reinterpret_cast<const uint4*>(w + col * 2560 + g * 16 + 8);
     }
-    GDN_MMA(acc, a.x, a.y, lo.x, lo.y);
-    GDN_MMA(acc, a.z, a.w, lo.z, lo.w);
-    GDN_MMA(acc, b.x, b.y, hi.x, hi.y);
-    GDN_MMA(acc, b.z, b.w, hi.z, hi.w);
+#pragma unroll
+    for (int p = 0; p < groups; ++p) {
+      const int row = (row_group + p) * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < m) {
+        const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+        a = *reinterpret_cast<const uint4*>(input);
+        b = *reinterpret_cast<const uint4*>(input + 8);
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+    }
   }
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int rr = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-    const int cc =
-        quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
-    if (is_ba) {
-      partial[warp][rr][cc] = acc[i];
-    } else if (row_group * 8 + rr < m) {
-      const int outcol = blockIdx.x * 32 + cc;
-      const half value = __float2half_rn(acc[i]);
-      if (outcol < 2560)
-        qkv[(row_group * 8 + rr) * 2560 + outcol] = value;
-      else
-        z[(row_group * 8 + rr) * 1536 + outcol - 2560] = value;
+  for (int p = 0; p < groups; ++p) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rr = p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int cc =
+          quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      if (is_ba) {
+        partial[warp][rr][cc] = acc[p][i];
+      } else if (row_group * 8 + rr < m) {
+        const int outcol = blockIdx.x * 32 + cc;
+        const half value = __float2half_rn(acc[p][i]);
+        if (outcol < 2560)
+          qkv[(row_group * 8 + rr) * 2560 + outcol] = value;
+        else
+          z[(row_group * 8 + rr) * 1536 + outcol - 2560] = value;
+      }
     }
   }
   if (is_ba) {
     __syncthreads();
-    for (int i = threadIdx.x; i < 8 * 24; i += 128) {
+    for (int i = threadIdx.x; i < groups * 8 * 24; i += 128) {
       const int rr = i / 24, cc = i % 24;
       // cuBLASLt FP32 workspace reduction: preserve left-to-right order.
       // Balanced alternatives produce measurable FP16 bit differences.
@@ -85,7 +101,94 @@ __global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
     }
   }
 }
+
+// The router and attention output projections have fixed FP32 split-K
+// contracts on the high-precision small-batch cuBLAS path. Fuse only the
+// existing partition reduction; retain the checkpoint row-major weights.
+template <int K, int Splits>
+__global__ __launch_bounds__(32 * Splits, 4) void dense_batch_kernel(
+    const half* x, const half* weight, half* output, int m, int n) {
+  __shared__ float partials[Splits][8][32];
+  const int split = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int quad = (lane >> 2) & 3;
+  const int col = blockIdx.x * 32 + quad * 8 + r;
+  const int row = blockIdx.y * 8 + r;
+  float acc[8] = {};
+#pragma unroll 4
+  for (int g = split * (K / Splits / 16); g < (split + 1) * (K / Splits / 16);
+       ++g) {
+    const half* w = weight + static_cast<size_t>(col) * K + g * 16;
+    const uint4 lo = *reinterpret_cast<const uint4*>(w);
+    const uint4 hi = *reinterpret_cast<const uint4*>(w + 8);
+    uint4 a = make_uint4(0, 0, 0, 0), b = a;
+    if (row < m) {
+      const half* input = x + static_cast<size_t>(row) * K + g * 16;
+      a = *reinterpret_cast<const uint4*>(input);
+      b = *reinterpret_cast<const uint4*>(input + 8);
+    }
+    GDN_MMA(acc, a.x, a.y, lo.x, lo.y);
+    GDN_MMA(acc, a.z, a.w, lo.z, lo.w);
+    GDN_MMA(acc, b.x, b.y, hi.x, hi.y);
+    GDN_MMA(acc, b.z, b.w, hi.z, hi.w);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int rr = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+    const int cc =
+        quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+    partials[split][rr][cc] = acc[i];
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < 8 * 32; i += 32 * Splits) {
+    const int rr = i / 32, cc = i % 32;
+    float value = partials[0][rr][cc];
+#pragma unroll
+    for (int s = 1; s < Splits; ++s)
+      value = __fadd_rn(value, partials[s][rr][cc]);
+    if (blockIdx.y * 8 + rr < m) {
+      output[(blockIdx.y * 8 + rr) * n + blockIdx.x * 32 + cc] =
+          __float2half_rn(value);
+    }
+  }
+}
 #undef GDN_MMA
+
+void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 && x.size(0) <= 16,
+              "Qwen3.8 dense batch requires CUDA M2..16");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* props = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(props->major == 7 && props->minor == 0, "SM70 required");
+  for (const auto& t : {output, x, weight}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
+                    t.scalar_type() == at::kHalf &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "Qwen3.8 dense batch requires aligned contiguous FP16");
+  }
+  TORCH_CHECK(weight.dim() == 2 && output.dim() == 2 &&
+                  weight.size(1) == x.size(1) && output.size(0) == x.size(0) &&
+                  output.size(1) == weight.size(0),
+              "Qwen3.8 dense batch shape mismatch");
+  const int m = x.size(0), n = weight.size(0), k = x.size(1);
+  const bool router = n == 512 && k == 2560;
+  const bool attention_output = n == 2560 && k == 1536;
+  TORCH_CHECK(router || attention_output,
+              "Qwen3.8 dense batch supports only router/output projections");
+  const auto* input = reinterpret_cast<const half*>(x.data_ptr());
+  const auto* w = reinterpret_cast<const half*>(weight.data_ptr());
+  auto* out = reinterpret_cast<half*>(output.data_ptr());
+  const dim3 grid(n / 32, (m + 7) / 8);
+  if (router)
+    dense_batch_kernel<2560, 4>
+        <<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m,
+                                                             n);
+  else
+    dense_batch_kernel<1536, 2>
+        <<<grid, 64, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m,
+                                                            n);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
                      torch::Tensor a, torch::Tensor x, torch::Tensor qw,
@@ -104,17 +207,23 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
     TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
                 "Qwen3.8 batched GDN requires 16-byte aligned storage");
   }
-  TORCH_CHECK(qw.sizes() == at::IntArrayRef({128, 160, 2, 32, 8}) &&
-                  bw.sizes() == at::IntArrayRef({1, 160, 2, 32, 8}),
-              "Invalid packed Qwen3.8 GDN weight geometry");
+  const bool packed = qw.sizes() == at::IntArrayRef({128, 160, 2, 32, 8}) &&
+                      bw.sizes() == at::IntArrayRef({1, 160, 2, 32, 8});
+  const bool row_major = qw.sizes() == at::IntArrayRef({4096, 2560}) &&
+                         bw.sizes() == at::IntArrayRef({24, 2560});
+  TORCH_CHECK(packed || row_major, "Invalid Qwen3.8 GDN weight geometry");
   const int m = x.size(0);
   TORCH_CHECK(qkv.sizes() == at::IntArrayRef({m, 2560}) &&
                   z.sizes() == at::IntArrayRef({m, 1536}) &&
                   b.sizes() == at::IntArrayRef({m, 12}) &&
                   a.sizes() == at::IntArrayRef({m, 12}),
               "Invalid Qwen3.8 GDN output geometry");
-  gdn_input_batch_kernel<<<dim3(129, (m + 7) / 8), 128, 0,
-                           at::cuda::getCurrentCUDAStream()>>>(
+  const bool paired = row_major && m > 8;
+  const auto kernel = packed ? gdn_input_batch_kernel<true>
+                             : (paired ? gdn_input_batch_kernel<false, true>
+                                       : gdn_input_batch_kernel<false>);
+  kernel<<<dim3(129, paired ? 1 : (m + 7) / 8), 128, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(x.data_ptr()),
       reinterpret_cast<const half*>(qw.data_ptr()),
       reinterpret_cast<const half*>(bw.data_ptr()),
@@ -128,9 +237,13 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
 
 TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
+      "qwen38_dense_batch_sm70_out(Tensor(a!) out, Tensor x, Tensor weight) -> "
+      "()");
+  m.def(
       "qwen38_gdn_input_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) z, "
       "Tensor(c!) b, Tensor(d!) a, Tensor x, Tensor qw, Tensor bw) -> ()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("qwen38_dense_batch_sm70_out", &dense_batch);
   m.impl("qwen38_gdn_input_batch_sm70_out", &gdn_input_batch);
 }

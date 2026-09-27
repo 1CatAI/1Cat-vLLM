@@ -220,7 +220,7 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
   }
 }
 
-// Single-token QSA decode has only about two thousand live block scores at the
+// Each QSA decode row has only about two thousand live block scores at the
 // common 8K context length. After the first radix byte, scanning all scores for
 // the other three bytes wastes most of the work. Compact the selected coarse
 // bucket into shared memory and refine that much smaller set instead. Integer
@@ -229,9 +229,12 @@ template <int TopK>
 __global__
 __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
     const float* __restrict__ logits, const int32_t* __restrict__ lengths,
-    int32_t* __restrict__ output, uint32_t columns) {
+    int32_t* __restrict__ output, uint32_t columns, uint32_t stride) {
+  const uint32_t row = blockIdx.x;
   const uint32_t tx = threadIdx.x;
-  const int32_t raw_length = lengths[0];
+  logits += static_cast<uint64_t>(row) * stride;
+  output += static_cast<uint64_t>(row) * TopK;
+  const int32_t raw_length = lengths[row];
   const uint32_t length =
       raw_length > 0 ? min(static_cast<uint32_t>(raw_length), columns) : 0;
 
@@ -400,11 +403,12 @@ template <int TopK>
 void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
                                    int32_t* output, uint32_t num_rows,
                                    uint32_t columns, uint32_t stride,
-                                   cudaStream_t stream) {
-  if (num_rows == 1) {
+                                   cudaStream_t stream,
+                                   bool decode_batch = false) {
+  if (num_rows == 1 || (decode_batch && num_rows <= 16)) {
     qsa_lexicographic_decode_topk_kernel<TopK>
-        <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
-                                                      columns);
+        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+            logits, lengths, output, columns, stride);
   } else {
     qsa_lexicographic_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(

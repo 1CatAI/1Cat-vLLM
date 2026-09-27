@@ -12,6 +12,13 @@ Scope: Qwen3.8 Flash-Next NVFP4, V100-SXM2-32GB, TP4, no MTP. Improve
 C2/C4 and obtain at least **40% more aggregate decode throughput at both
 C8 and C16**, without reducing arithmetic precision or regressing quality.
 
+Priority update (2026-09-27): **C2 minus C1 must be at most 3 ms/step**,
+with no C1 regression. The matched historical unprofiled trace campaign
+measured C1 10.335855 ms and C2 17.545152 ms: a 7.209297 ms gap. If C1 holds,
+C2 must reach 13.335855 ms or less (about 150 aggregate tok/s). This needs
+4.209297 ms of recovery; a small component win does not satisfy the target.
+The C8/C16 target remains open, not superseded or claimed achieved.
+
 The retained source-built control from [PR #692](https://github.com/1CatAI/1Cat-vLLM/pull/692)
 provides planning values, not a newly measured latest-main baseline:
 
@@ -334,11 +341,10 @@ Its dynamic dependencies contain only standard Torch/CUDA/C++/libc libraries,
 with no private DSO or task-cache RPATH. A fresh process confirmed native
 HC/GDN/gate registration without initializing a CUDA context.
 
-The native TP4 gate's 300-second queue expired while both four-card groups
-were occupied; it did not start CUDA work or a model. These CPU/build results
-are not CUDA arithmetic or performance evidence. Actual TP4 runtime graphs,
-all-layer quality and matched endpoint measurements remain acceptance gates.
-There is no new decode-speed claim or default-on decision in this update.
+The first native TP4 queue expired without creating a CUDA context. A later
+finite exclusive GPU slot completed the native component gates below.
+Full-model quality and matched endpoint measurements remain acceptance gates;
+there is no new model decode-speed claim or default-on decision.
 
 The retained control at `gpu_memory_utilization=0.90` loaded 21.31 GiB/rank,
 left 3.59 GiB for KV and reported 290671-token capacity. Its headroom above
@@ -372,3 +378,77 @@ prefill union-wall throughput and natural-EOS text health separate, records
 token IDs and checks repeated cohorts against a matched reference. Both
 arms record an explicit FP32 accumulation/reduction contract. A failed or
 nonrepeatable control cannot serve as an accepted speed/quality reference.
+
+## Native component results, 2026-09-27
+
+These measurements use the normal source-built extension, not the earlier
+research gather. All three low-precision Torch matmul options were disabled.
+Native HC covers all 96 real weight pairs, all four ranks, six input scales
+and odd-count shrinking/growing graph replays. Every LoRA, mixed-output and
+injection FP16 bit comparison passed. Timing is the median slowest-rank
+micro-chain of 96 pairs, including both gathers but excluding combine/norm:
+
+| Width | Control ms | Native candidate ms | Saving ms |
+| ---: | ---: | ---: | ---: |
+| C2 | 3.169493 | 2.521579 | 0.647915 |
+| C4 | 3.221781 | 2.723115 | 0.498667 |
+| C8 | 3.319211 | 3.017963 | 0.301248 |
+| C16 | 3.559467 | 3.574272 | -0.014805 |
+
+C16 has **no measured HC improvement** here. Do not replace these numbers
+with the earlier, faster eight-pair research transport result.
+
+Packed GDN passes all 36 layer weights, all four logical TP slices and six
+scales. Rank0's 36-layer C2 chain is 1.924992 -> 1.118208 ms; C16 is
+1.995520 -> 1.192256 ms. The separate 48-layer shared-gate micro is
+0.449459 -> 0.281093 ms at C2, with the original linear unchanged; all finite
+half sigmoid inputs were also checked. The TP4 C2 ordinary/sum2 collective
+micro (96 operations) is 0.733773 -> 0.327721 ms, with all-rank equality.
+These separate timings are **not an additive endpoint result**.
+
+Native artifact for that suite:
+`d67ea552106eec5b7d6e11a6c182527b6ffd57156c4db59db13a68da23cc47a6`.
+Raw files in the owned worktree's `.artifacts/` are
+`hc_runtime_tp4_native_20260927.json`,
+`gdn_native_packed_rank{0,1,2,3}.json`, `gate_native.json`,
+`c2_push_native.json`, and `native_gdn_gate_gpu_tests.log` (68 passed).
+
+### C2 selector and memory screens
+
+The native QSA selector now has an explicit, default-false `decode_batch`
+argument. It extends the existing exact C1 algorithm with per-row offsets
+and retains default dispatch and M1 behavior. It is **not admitted by the
+model runtime yet**. The 72-test follow-up suite includes graph-replayed
+Top-K, strided rows, mixed lengths, signed-zero ties, infinities, output
+canaries, independent stable-sort checks and the 256K compressed boundary,
+plus GDN tests. All passed after fixing a boolean-mask bug in the new test.
+
+In a same-buffer 12-call graph screen, C2 Top-K at 8K improves
+0.209736 -> 0.116879 ms. However, at 64K it regresses
+0.693166 -> 0.733348 ms; at 256K it is approximately unchanged. This is not
+an unconditional runtime winner. Raw: `qsa_batch_decode_v{1,2}.json`.
+Stable native extension hash:
+`bfcd2a344cd2c7e006a02273b74effc71e0334cef5cafec0b4d1e40bc646f3b2`.
+
+Rejected experiments, not production policy:
+
+- Simply extending the C1 32-column score tile changes FP32 score bits.
+  Fixing the original four-head left-to-right sum restores exact scores,
+  but slows C2 8K scoring from 0.109670 to 0.130867 ms/12 calls and also
+  regresses long contexts. Lower register count alone is not a speedup.
+- No-copy row-major GDN removes the 725.625 MiB/rank packed allocation but
+  is slower than packed GDN and regresses C16 versus the original path.
+  Pairing two M8 groups preserves bits but worsens C16 to 2.366272 ms,
+  versus 1.988416 ms control. Do not enable that memory-saving path blindly.
+
+Neither experiment changes the runtime default. The optional score-sum
+argument and direct row-major native entry are retained only to reproduce
+the rejected screens; the model continues to use its existing score tile
+and the opt-in packed GDN route.
+
+The next distinct native screen targets router (N512/K2560, four K640
+partitions) and attention output (N2560/K1536, two K768 partitions): retain
+the original FP32 K order, fuse partition reduction, and use original
+row-major weights. Its build and direct benchmark entry do **not** establish
+numerical or speed qualification. No runtime admission or model throughput
+claim is made for this unfinished screen.
