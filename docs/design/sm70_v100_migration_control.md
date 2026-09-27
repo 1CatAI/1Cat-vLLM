@@ -48221,3 +48221,17 @@ has launched no full model. Details and artifacts are in
   All eight cards have foreign owners. No owned waiter/worker remains;
   resume the retained `run_mtp_pending_gates.py` without repeating successful
   router/mixed-loader components or the rejected HC split-stage schedules.
+- CPU-only MTP recurrence follow-up: the existing trace has 48 CTAs for 80
+  SMs. BV16 with unchanged four warps/stages3 compiles to the same K/state
+  and Q/K-normalization layouts as BV32, doubles M5 CTAs to 96 and uses
+  80 versus 117 registers in the isolated pair (zero spills). The actual
+  trace's 119-register binary remains separately identified. No measured
+  occupancy, bitwise equivalence or speedup follows from compilation alone.
+  `gdn_mtp_value_tile.py` is the fourth pending component job; no runtime
+  schedule/default changed. Preserve this distinct hypothesis and do not
+  repeat the rejected global BV8/recurrent-schedule overrides.
+- The next 600-second lease wait also expires before CUDA starts
+  (`mtp_pending_gates_retry1.log`). Both foreign TP4 groups remain active;
+  the four prepared jobs and model admission are unrun. No owned worker or
+  pending wait process remains. Latest qualified complete round stays
+  23.657858 ms, with <20 ms still unmet.

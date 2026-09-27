@@ -908,3 +908,35 @@ Resume the prepared `run_mtp_pending_gates.py` under an idle-card lease, inspect
 all three exit/result files, and only then qualify admitted runtime changes
 with the frozen full-model contract. Do not rerun the successful component
 screens or report a new endpoint/trace from this resource failure.
+
+#### CPU-only recurrence layout audit
+
+The retained target trace launches the fused sigmoid recurrence as
+`grid=(1,4,12)`, 128 threads/CTA, 119 registers/thread and 256 shared bytes:
+only 48 CTAs for 80 V100 SMs. This establishes a limit on independent
+parallel work, not achieved utilization or the size of an available gain.
+
+A CPU-only Triton compilation isolates **BV32 -> BV16 while retaining four
+warps and three stages**. Both TTGIR programs use the same K reduction
+layout: state tile `sizePerThread=[1,4]`, `threadsPerWarp=[1,32]`,
+`warpsPerCTA=[4,1]`; Q/K normalization keeps its original four-warp 1-D
+layout. All four FP32 reduction regions retain the same axes/layouts.
+The isolated compiled pair uses 117 -> 80 registers, one barrier, 256
+shared bytes and zero spill/stack bytes. Its M5 grid grows from 48 to 96
+CTAs. The isolated 117-register build is not relabeled as the traced
+119-register binary, and neither compile result is a timing or bit-parity
+result.
+
+This differs from the previously rejected BV8/recurrent-schedule overrides;
+no global runtime schedule has changed. Retain
+`gdn_value_tile_compile.{py,json,log}`, both emitted IR/PTX/cubins and the
+prepared `gdn_mtp_value_tile.py` GPU screen. That screen compares every
+FP16 output and FP32 state bit over changing inputs, accepted selectors and
+live slot zero, then times only an exact candidate. The pending gate runner
+now has four independent jobs, including this screen. Admission still
+requires GPU evidence before any runtime integration.
+
+The subsequent 600-second lease wait (`mtp_pending_gates_retry1.log`) also
+expires before any CUDA work. Both foreign TP4 groups remain occupied;
+all four prepared jobs and whole-model qualification are pending. The wait
+process has exited. The accepted 23.657858-ms endpoint is unchanged.
