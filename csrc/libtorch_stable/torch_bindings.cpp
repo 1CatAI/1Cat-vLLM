@@ -362,7 +362,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 
   ops.def(
       "qsa_lexicographic_topk(Tensor logits, Tensor lengths, Tensor! output, "
-      "int k) -> ()");
+      "int k, bool decode_batch=False) -> ()");
 
   // Activation ops
   // Activation function used in SwiGLU.

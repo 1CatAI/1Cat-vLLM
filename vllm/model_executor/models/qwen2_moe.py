@@ -36,6 +36,7 @@ from transformers import Qwen2MoeConfig
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -233,11 +234,17 @@ class Qwen2MoeMLP(nn.Module):
             expert_gate = _sm70_dump_qwen_mlp_tensor(
                 "mlp_expert_gate", self.layer_idx, expert_gate
             )
-            expert_gate = F.sigmoid(expert_gate)
-            expert_gate = _sm70_dump_qwen_mlp_tensor(
-                "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
-            )
-            out = expert_gate * out
+            if (
+                getattr(self.gate_up_proj, "_sm70_mtp_prepare_shared_batch", False)
+                and use_sm70_decode_graph_semantics()
+            ):
+                out = torch.ops.vllm.qwen38_sm70_shared_gate_mul(expert_gate, out)
+            else:
+                expert_gate = F.sigmoid(expert_gate)
+                expert_gate = _sm70_dump_qwen_mlp_tensor(
+                    "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
+                )
+                out = expert_gate * out
             out = _sm70_dump_qwen_mlp_tensor(
                 "mlp_after_expert_gate", self.layer_idx, out
             )
