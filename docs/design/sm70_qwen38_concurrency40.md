@@ -532,3 +532,117 @@ user tuning switches. CPU admission/export/wiring tests: 79 passed.
 No full-model startup or new endpoint speed/quality claim in this round.
 The packed-weight 256K-capacity gate and matched C1/C2 model validation
 remain open; C2 minus C1 <=3 ms and C8/C16 +40% are **not yet demonstrated**.
+
+### Source-built endpoint control (2026-09-27)
+
+The first complete measurement on this branch uses the same ordinary model
+defaults with the batch switch off. Contract: V100-SXM2-32GB GPU0..3, TP4,
+CUDA12.8, Torch2.10.0+cu128, FP16 activations/KV, FP32 GDN state and GEMM
+accumulation/reductions, no MTP or prefix cache, 262144 maximum context,
+8192 input tokens per request, 256 greedy output tokens, two repeats,
+max16 sequences and 8192 batched tokens. Both A/B arms use explicit
+`--gpu-memory-utilization 0.94`, preserving capacity despite the candidate's
+1055.625 MiB/rank packed copies. This is not a reduced-context comparison.
+
+PLE is the existing **hybrid** path: file-backed prefill and pinned-UVA
+decode, with `VLLM_QWEN4EXP_PLE_HOST_GIB=12`. Actual placement is zero GPU
+table rows, 11.92 GiB pinned host table per rank, and a separate 47.684 GiB
+file mapping for prefill. Do not describe this contract as disk-only/zero-RAM.
+The control loads 21.31 GiB/rank and has 393216-token KV capacity.
+
+| Width | Control step ms | Aggregate decode tok/s | Per-stream tok/s |
+| ---: | ---: | ---: | ---: |
+| C1 | 10.400342 | 96.151 | 96.151 |
+| C2 | 17.590719 | 113.696 | 56.848 |
+| C4 | 18.114192 | 220.821 | 55.205 |
+| C8 | 21.668120 | 369.206 | 46.151 |
+| C16 | 29.044725 | 550.875 | 34.430 |
+
+These are pooled, unprofiled, fixed-width engine intervals; they exclude
+prefill and changing-width steps. C2 minus C1 is 7.190378 ms. Separately,
+one-output-token prefill cohorts give aggregate6817.653/6816.154/6816.623/
+6812.797/6824.260 tok/s at C1/2/4/8/16. These repeated synthetic 8K inputs
+do not establish natural-chat, dataset or long-context throughput.
+
+**Quality gate remains open:** C1/C2/C4/C16 repeated greedy tokens match,
+but C8 streams0/1 first differ at zero-based token52/49. Both single-request
+health cases and all16 concurrent natural-EOS health cases pass. Natural
+text health is not a substitute for token parity; this control is a fully
+measured diagnostic reference, not an accepted all-width quality baseline.
+The candidate must not be promoted against this failed reference.
+
+Environment bootstrap was completed before this measured run: numba0.67.0,
+tilelang0.1.10, apache-tvm-ffi0.1.10 and xgrammar0.2.0. Newer unconstrained
+TVM-FFI0.1.14.post1 aborts TileLang import; XGrammar0.2.8 uses a newer FFI
+API despite metadata admitting the pinned FFI. The compatible imports and
+a128-token original FlashQLA indexed-state execution pass before loading
+the model. No precision flag, Torch version or model weight was changed.
+In-place source builds now place Flash-V100/FlashQLA companion kernels next
+to the source packages; wheel staging remains unchanged. Use a short owned
+IPC/TMP directory because UNIX socket paths cannot exceed107bytes.
+
+GPU source is the published1ae3403 kernel revision, rebuilt normally after
+formatting; native `_C` SHA256:
+`e4572643d7f61f5b968323c859ee3be456472bc6438dfc77407626009bc990b7`.
+Raw: `endpoint_control_v4.json` and `.log`. Earlier v1/v2 failures occurred
+before weight loading (long IPC path, missing numba); v3 failed graph capture
+on the dependency mismatch and has no speed result. Preserve those records,
+but do not repeat their resolved startup diagnostics.
+
+### Diagnostic candidate endpoint, not a promoted baseline
+
+The same-contract batch-on arm completed all cases on the same GPU0..3.
+Actual worker logs confirm native batched HC, packed GDN input, guarded
+small-batch dense and shared-gate epilogue dispatch. Model allocation is
+22.35 GiB/rank; available KV3.97 GiB gives320740 tokens. Thus256K capacity
+survives the packed copies, although KV capacity is not identical between
+arms. Both use memory utilization0.94, not equal KV byte budgets.
+
+| Width | Control ms | Candidate ms | Candidate aggregate tok/s | Per-stream tok/s | Throughput gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 | 10.400342 | 10.356449 | 96.558 | 96.558 | +0.42% |
+| C2 | 17.590719 | 13.590531 | 147.161 | 73.581 | +29.43% |
+| C4 | 18.114192 | 15.304173 | 261.367 | 65.342 | +18.36% |
+| C8 | 21.668120 | 19.161013 | 417.514 | 52.189 | +13.08% |
+| C16 | 29.044725 | 26.777536 | 597.516 | 37.345 | +8.47% |
+
+C2 minus C1 falls7.190378 ->3.234083 ms, still0.234083 ms above the target.
+C8/C16 are nowhere near+40%. Candidate prefill aggregate at C1/2/4/8/16 is
+6827.845/6825.408/6818.820/6817.946/6826.257 tok/s, effectively unchanged
+for these synthetic inputs. This is actual unprofiled engine measurement,
+not a sum of separate microbenchmark savings. The+0.42%C1 difference is
+small variation, not evidence of a new single-request optimization.
+
+**The candidate is not quality-qualified.** All two single-request and16
+concurrent natural-EOS health checks pass in each arm, but cross-arm token
+parity fails at every width. In particular, candidate C1 first differs at
+zero-based token36 in both repeats despite C1's intended unchanged decode
+route. Candidate C2 repeat stream0 differs at25; C4 streams0/1 at12/64.
+C1/C8/C16 repeat within the candidate is exact. Text health cannot override
+these failures, and no precision reduction is enabled to obtain the speed.
+Both reports finish with measurements_complete=true and complete=false;
+the candidate explicitly used --diagnostic-reference against the failed
+control. No default promotion or main merge is justified by these numbers.
+
+Raw engine records expose an additional comparison confound: control C8
+repeat0 begins before the entire cohort is queued and has an extra early
+decode step versus repeat1. This is a scheduling difference, not proof of
+a kernel arithmetic defect. It also does not explain the cross-arm C1
+difference. The new optional --atomic-cohort mode pauses the scheduler
+without clearing caches, enqueues the full cohort, resumes in finally and
+then drains outputs. Its admission mode must match the reference; legacy
+reports mean streaming admission. The new helper has four CPU ordering and
+failure-cleanup tests (16tests pass with the baseline suite). It has not yet
+been full-engine qualified and was **not** used retroactively in these v4
+measurements. Production scheduling is unchanged.
+
+Next gate: preserve these failures, fix cohort admission for repeated-token
+tests, and localize the C1 difference with fixed inputs/teacher-forced
+logits at the prefill-to-decode boundary. Consider equal KV capacity as an
+isolation control; do not assert scheduling alone is the root cause. Only
+after numerical qualification should the remaining C2 gap and C8/C16
+scaling be accepted or further tuned using a new whole-model trace.
+
+Raw: `endpoint_candidate_v4.json`, `endpoint_comparison_v4.json`, both arm
+logs and complete token sequences. All benchmark processes exited and
+GPU0..3 were released. No persistent API was started.

@@ -27,6 +27,24 @@ from benchmarks.sm70_qwen38_baseline import FIXED_PROMPT, engine_args
 from vllm import LLM, SamplingParams
 
 
+def generate_cohort(llm, prompts, sampling_params, *, atomic=False):
+    """Optionally queue the entire cohort before the scheduler can run it.
+
+    The multiprocess engine can start executing during LLM.enqueue(), even
+    before the caller starts draining its outputs. Pause without clearing
+    caches so host submission timing cannot add an early decode-only step.
+    """
+    if not atomic:
+        return llm.generate(prompts, sampling_params, use_tqdm=False)
+    core = llm.llm_engine.engine_core
+    core.call_utility("pause_scheduler", "keep", False)
+    try:
+        llm.enqueue(prompts, sampling_params, use_tqdm=False)
+    finally:
+        core.call_utility("resume_scheduler")
+    return llm.wait_for_completion(use_tqdm=False)
+
+
 def summarize(records, width):
     eligible = [
         i
@@ -112,6 +130,12 @@ def main():
     parser.add_argument("--input-len", type=int, default=8192)
     parser.add_argument("--output-len", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument(
+        "--atomic-cohort",
+        action="store_true",
+        help="Queue timed cohorts while the scheduler is paused; then resume",
+    )
     parser.add_argument("--baseline-reference", type=Path)
     parser.add_argument(
         "--reference", type=Path, help="Same-contract token parity gate"
@@ -135,11 +159,14 @@ def main():
         raise ValueError("widths must be distinct positive integers")
     if args.input_len <= 0 or args.output_len < 40 or args.repeats <= 0:
         raise ValueError("input/repeats must be positive and output-len >= 40")
+    if not 0 < args.gpu_memory_utilization <= 1:
+        raise ValueError("gpu-memory-utilization must be in (0, 1]")
     model = str(args.model)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     config = engine_args(model, use_defaults=True)
     config.pop("worker_extension_cls")
     config["max_num_seqs"] = max(widths)
+    config["gpu_memory_utilization"] = args.gpu_memory_utilization
     if args.mode == "mtp":
         config["speculative_config"] = {
             "method": "mtp",
@@ -162,6 +189,7 @@ def main():
         "input_len": args.input_len,
         "output_len": args.output_len,
         "sampling": {"temperature": 0, "top_p": 1, "top_k": -1, "ignore_eos": True},
+        "cohort_admission": "atomic" if args.atomic_cohort else "streaming",
         "measurement": (
             "Tokens divided by consecutive engine timestamp intervals at fixed "
             "live width; trim 8 head/tail steps; exclude prefill/finished requests"
@@ -181,6 +209,8 @@ def main():
     reference_cases = {}
     if args.reference:
         reference = json.loads(args.reference.read_text())
+        if reference.get("cohort_admission", "streaming") != report["cohort_admission"]:
+            raise ValueError("Reference contract differs at cohort_admission")
         for key in (
             "engine",
             "input_len",
@@ -362,7 +392,8 @@ def main():
                 core.get_output = observed
                 start = time.perf_counter()
                 try:
-                    outputs = llm.generate(
+                    outputs = generate_cohort(
+                        llm,
                         prompts[:width],
                         SamplingParams(
                             max_tokens=args.output_len,
@@ -372,7 +403,7 @@ def main():
                             seed=0,
                             ignore_eos=True,
                         ),
-                        use_tqdm=False,
+                        atomic=args.atomic_cohort,
                     )
                 finally:
                     core.get_output = original
@@ -439,12 +470,13 @@ def main():
                 # phase. Use a union wall interval, never sum overlapping TTFTs.
                 for repeat in range(args.repeats):
                     start = time.perf_counter()
-                    outputs = llm.generate(
+                    outputs = generate_cohort(
+                        llm,
                         prompts[:width],
                         SamplingParams(
                             max_tokens=1, temperature=0, seed=0, ignore_eos=True
                         ),
-                        use_tqdm=False,
+                        atomic=args.atomic_cohort,
                     )
                     elapsed = time.perf_counter() - start
                     metrics = [
