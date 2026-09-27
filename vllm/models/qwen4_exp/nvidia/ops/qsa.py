@@ -46,6 +46,7 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 
 
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
+_SM70_QSA_MTP_BATCH = os.getenv("VLLM_SM70_QSA_MTP_BATCH", "0") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
 )
@@ -239,6 +240,91 @@ def _qsa_mqa_paged_kernel(
             tl.where(page_valid, score, -float("inf")),
             mask=live & (columns < num_columns),
         )
+
+
+@triton.jit
+def _qsa_mqa_mtp_batch_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    logits_ptr,
+    visible_blocks_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_cache_block,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_page,
+    stride_logits_row,
+    score_divisor,
+    NUM_ROWS: tl.constexpr,
+    NUM_COLUMNS: tl.constexpr,
+    NUM_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    # One physical request: four queries share each paged-key load. The four
+    # heads of each query occupy a tensor-core N4 slice of the combined N16.
+    rows = tl.program_id(0) * 4 + tl.arange(0, 4)
+    request = tl.load(token_to_req_ptr + rows, rows < NUM_ROWS, -1)
+    position = tl.load(query_positions_ptr + rows, rows < NUM_ROWS, -1)
+    length = tl.load(sequence_lengths_ptr)
+    visible = tl.minimum((position + 1) // 4, tl.where(request == 0, length // 4, 0))
+    if tl.program_id(1) == 0:
+        tl.store(visible_blocks_ptr + rows, visible, rows < NUM_ROWS)
+    max_visible = tl.max(visible, 0)
+    start = tl.program_id(1) * BLOCK_N
+    if start >= max_visible:
+        return
+
+    columns = start + tl.arange(0, BLOCK_N)
+    dims = tl.arange(0, 128)
+    heads = tl.arange(0, 16)
+    query_rows = tl.program_id(0) * 4 + heads // 4
+    query = tl.load(
+        q_ptr
+        + query_rows[None, :] * stride_q_row
+        + (heads[None, :] % 4) * stride_q_head
+        + dims[:, None] * stride_q_dim,
+        query_rows[None, :] < NUM_ROWS,
+        0.0,
+    )
+    logical_page = tl.minimum(columns // PAGE_SIZE, PAGE_TABLE_WIDTH - 1)
+    physical_page = tl.load(
+        page_table_ptr + logical_page * stride_table_page,
+        columns < max_visible,
+        -1,
+    )
+    valid = (columns < max_visible) & (physical_page >= 0) & (physical_page < NUM_PAGES)
+    keys = tl.load(
+        k_cache_ptr
+        + tl.maximum(physical_page, 0)[:, None].to(tl.int64) * stride_cache_block
+        + (columns[:, None] % PAGE_SIZE) * stride_cache_token
+        + dims[None, :] * stride_cache_dim,
+        valid[:, None],
+        0.0,
+        eviction_policy="evict_first",
+    )
+    scores = tl.maximum(tl.dot(keys, query, out_dtype=tl.float32), 0.0)
+    # Preserve the existing SM70 four-head reduction, including association.
+    # tl.sum over a new packed axis would use (h0+h1)+(h2+h3), changing scores.
+    even, odd = tl.split(scores.reshape(BLOCK_N, 4, 2, 2))
+    h0, h2 = tl.split(even)
+    h1, h3 = tl.split(odd)
+    scores = (((h0 + h1) + h2) + h3) / score_divisor
+    scores = tl.where(valid[:, None], scores, -float("inf"))
+    tl.store(
+        logits_ptr + rows[None, :] * stride_logits_row + columns[:, None],
+        scores,
+        (rows[None, :] < NUM_ROWS)
+        & (columns[:, None] < visible[None, :])
+        & (columns[:, None] < NUM_COLUMNS),
+    )
 
 
 @triton.jit
@@ -1123,6 +1209,41 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
+    if _use_sm70_qsa_mtp_batch(q, k_cache, page_table, compress_ratio):
+        logger.info_once(
+            "SM70 MTP batch QSA indexer with shared key loads enabled "
+            "(rows=%d, page_size=%d, columns=%d).",
+            q.shape[0],
+            k_cache.shape[1],
+            columns,
+        )
+        _qsa_mqa_mtp_batch_kernel[
+            (triton.cdiv(q.shape[0], 4), triton.cdiv(columns, 32))
+        ](
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            logits,
+            visible_blocks,
+            *q.stride(),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(3),
+            page_table.stride(1),
+            logits.stride(0),
+            float(score_divisor),
+            NUM_ROWS=q.shape[0],
+            NUM_COLUMNS=columns,
+            NUM_PAGES=k_cache.shape[0],
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            BLOCK_N=32,
+            num_warps=2,
+        )
+        return logits, visible_blocks
     sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
     # On V100 the GB300 decode tile leaves the 128-d scorer badly
     # under-occupied. A 32-column, two-warp tile preserves the selected QSA
@@ -1170,6 +1291,16 @@ def qsa_mqa_paged(
         num_warps=2,
     )
     return logits, visible_blocks
+
+
+def _use_sm70_qsa_mtp_batch(q, k_cache, page_table, compress_ratio) -> bool:
+    return (
+        _SM70_QSA_MTP_BATCH
+        and current_platform.is_device_capability(70)
+        and q.shape[0] in (5, 10)
+        and compress_ratio == 4
+        and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
+    )
 
 
 def _qsa_indexer_cublas_shape_supported(
