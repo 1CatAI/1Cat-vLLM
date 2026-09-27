@@ -341,3 +341,50 @@ improvement at every concurrency, a new 2K rolling result, a fresh PRO 6000
 comparison, or new 35B-A3B AWQ/FP8 service-speed acceptance. The reported
 8-case retrieval gate is also distinct from the older 2K rolling campaign's
 quality/acceptance limitations.
+
+## Public-data merge review
+
+The merge review adds 25 warmup checks and 226 GPU/operator/sampler/graph
+checks on the final package artifacts. All pass. The non-16-byte-aligned KV
+stride regression now covers full q8 as well as a five-row tail. No new
+native binary is required for this test expansion.
+
+Fresh ordinary main and candidate services use the same 56 public-data
+examples, prompts, seeds and sampling: temperature 0.7, top-p 0.8, top-k 20,
+presence penalty 0, repetition penalty 1, thinking disabled, natural EOS.
+GSM8K and HumanEval each exercise C1/C2/C4/C8; the three long suites use C8.
+Untruncated long inputs span 4,133 to 31,930 tokens. These are fixed review
+subsets, not full benchmark leaderboard scores.
+
+| Dataset | Examples | Main score | Candidate score |
+| --- | ---: | ---: | ---: |
+| GSM8K numeric answer | 16 | 15/16 | 16/16 |
+| HumanEval test assertions | 16 | 16/16 | 16/16 |
+| HotpotQA answer F1 | 8 | 53.750% | 53.750% |
+| MultiFieldQA Chinese answer F1 | 8 | 65.530% | 65.530% |
+| NarrativeQA answer F1 | 8 | 24.643% | 24.643% |
+
+All requests stop naturally; 54/56 complete token arrays match exactly.
+Every code and long-context output matches. However, the GSM8K C2 cohort
+fails the two-percentage-point acceptance guard: 70.417% to 53.940%.
+One request first differs at output index 155, after 34 identical emitted
+chunks. Its 400-token wrong answer becomes a 1,626-token correct answer.
+Its paired request remains token- and chunk-identical. The aggregate
+accepted/drafted ratio changes from 5,628/7,308 to 6,537/9,233. This is an
+unresolved trajectory/acceptance finding, not a demonstrated accuracy loss;
+the better answer does not by itself clear the merge gate.
+
+A supplemental 16-example check uses the model card's non-thinking
+presence penalty 1.5, exercising the dense sampling fallback. GSM8K and
+HumanEval are both 4/4 on both services, and eight NarrativeQA F1 scores
+match. All requests stop naturally, 15/16 token arrays match, and acceptance
+changes from 1,439/1,862 to 1,445/1,855 (+0.615 percentage points). This
+supplement passes but does not replace the failed primary C2 gate.
+
+Raw results and exact fixture hashes are recorded under artifact key
+`sm70-long-decode15-20260927`, in `quality-706-comparison.json` and
+`quality-706-comparison-official.json`. The primary fixture SHA256 is
+`21b4cfa0de925a55cbb739d42b1344d20fe6370ed45154f387d34f21e9f4ca54`;
+the supplemental fixture SHA256 is
+`0e4dd476651529988cada66e45526239c0fbe2f47b4c2ffde6e1e6a48ff05e16`.
+PR #706 remains draft pending diagnosis of the primary acceptance finding.
