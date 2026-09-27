@@ -23,6 +23,14 @@ from vllm.utils.import_utils import has_cutedsl
 from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
 
 
+def needs_software_fp8() -> bool:
+    """Whether Triton has to decode FP8 in software: native FP8 exists from
+    Ada (sm89) on."""
+    return current_platform.is_cuda() and not current_platform.has_device_capability(
+        (8, 9)
+    )
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors

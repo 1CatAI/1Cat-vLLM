@@ -16,6 +16,11 @@ from .save_partial_states import (
     save_partial_states_to_ring,
     stage_partial_states_from_ring,
 )
+from .sparse_decode_bmm import sparse_attn_decode_bmm, sparse_decode_bmm_workspace_specs
+from .sparse_prefill_bmm import (
+    sparse_attn_prefill_bmm,
+    sparse_prefill_bmm_workspace_specs,
+)
 
 __all__ = [
     "MXFP4_BLOCK_SIZE",
@@ -30,5 +35,9 @@ __all__ = [
     "quantize_and_insert_k_cache",
     "save_partial_states",
     "save_partial_states_to_ring",
+    "sparse_attn_decode_bmm",
+    "sparse_attn_prefill_bmm",
+    "sparse_decode_bmm_workspace_specs",
+    "sparse_prefill_bmm_workspace_specs",
     "stage_partial_states_from_ring",
 ]
