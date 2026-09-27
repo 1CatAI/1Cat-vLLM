@@ -323,13 +323,30 @@ reduced-precision GEMM reduction and FP16 accumulation for **both control
 and candidate**, even if the GEMV switch is off. An older result collected
 with different Torch precision flags is not a matched control.
 
-Current integration validation: 63 CPU layout/admission/fake-export tests
-passed, plus 71 shared-gate/integration tests; 39 GPU tests were deliberately
-skipped with CUDA hidden. This is
-not CUDA arithmetic or performance evidence. Native source build, actual
-TP4 runtime graphs, all-layer quality and matched endpoint measurements
-remain acceptance gates. There is no new decode-speed claim or default-on
-decision in this update.
+Current integration validation: the combined CPU layout/admission/fake-export,
+shared-gate and integration suite passed all 134 tests with the actual native
+registrations loaded; 39 GPU tests were deliberately skipped with CUDA hidden.
+The normal CUDA 12.8/Torch 2.10.0+cu128 source build completed, including `_C`,
+Flash-V100 and bundled FlashQLA. The optional Rust frontend was not built
+(no Rust compiler); no complete-wheel claim is made. The loaded `_C` SHA256 is
+`3a3ae3ba1d6baf6a92c8c4854068c53d5c2a16c9f543ea14fda1497c9a799c6f`.
+Its dynamic dependencies contain only standard Torch/CUDA/C++/libc libraries,
+with no private DSO or task-cache RPATH. A fresh process confirmed native
+HC/GDN/gate registration without initializing a CUDA context.
+
+The native TP4 gate's 300-second queue expired while both four-card groups
+were occupied; it did not start CUDA work or a model. These CPU/build results
+are not CUDA arithmetic or performance evidence. Actual TP4 runtime graphs,
+all-layer quality and matched endpoint measurements remain acceptance gates.
+There is no new decode-speed claim or default-on decision in this update.
+
+The retained control at `gpu_memory_utilization=0.90` loaded 21.31 GiB/rank,
+left 3.59 GiB for KV and reported 290671-token capacity. Its headroom above
+262144 tokens is smaller than the new 1055.625 MiB/rank packed copies. This
+is a capacity risk inferred from the old control, not a new model measurement.
+Do not attempt endpoint qualification by silently reducing context length or
+KV precision. Reduce retained storage or explicitly qualify both control and
+candidate at a matched memory budget before treating this as a drop-in path.
 
 Native-runtime reproduction after the normal source build (exclusive TP4
 lease required):
