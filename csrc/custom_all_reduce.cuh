@@ -98,6 +98,7 @@ constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
     5 * 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen38M2Bytes = 2 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38M4Bytes = 4 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38M8Bytes = 8 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
@@ -142,8 +143,14 @@ constexpr size_t kSm70Qwen38HcBatchDownOffset =
 constexpr size_t kSm70Qwen38HcBatchOutputOffset =
     kSm70Qwen38HcBatchDownOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 88 * sizeof(uint32_t);
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+// Fused up/output has tile-major packets and an independent epoch per block.
+constexpr int kSm70Qwen38HcBatchFusedBlocks = 160;
+constexpr size_t kSm70Qwen38HcBatchFusedOffset =
     kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
+    kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcBatchFusedOffset +
+    kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t) +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
@@ -176,8 +183,13 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
   }
   const char* batch = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
   const bool batch_enabled = batch == nullptr || std::strcmp(batch, "1") == 0;
-  if (batch_enabled && (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
-                        bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
+  const char* fastpath = std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
+  const bool m2_enabled =
+      fastpath != nullptr && std::strcmp(fastpath, "1") == 0;
+  if (batch_enabled &&
+      ((m2_enabled && bytes == kSm70Tp4PushAllreduceQwen38M2Bytes) ||
+       bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
+       bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
     const char* blocks =
         std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS");
     if (blocks != nullptr) {
@@ -190,7 +202,7 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
         return parsed;
       }
     }
-    return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
+    return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
@@ -2240,6 +2252,12 @@ class CustomAllreduce {
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
            bytes == kSm70Tp4PushAllreduceBytes);
+      const char* batch_fastpath =
+          std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
+      const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&
+                             batch_fastpath != nullptr &&
+                             std::strcmp(batch_fastpath, "1") == 0 &&
+                             (batch == nullptr || std::strcmp(batch, "1") == 0);
       const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
       const bool qwen38_mtp5 =
           (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0) &&
@@ -2265,7 +2283,7 @@ class CustomAllreduce {
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          (qwen38_batch || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
+          (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
         if (push_blocks > 0) {

@@ -218,7 +218,7 @@ __device__ __forceinline__ void qsa_lexicographic_topk_body(
   }
 }
 
-// Single-token QSA decode has only about two thousand live block scores at the
+// Each QSA decode row has only about two thousand live block scores at the
 // common 8K context length. After the first radix byte, scanning all scores for
 // the other three bytes wastes most of the work. Compact the selected coarse
 // bucket into shared memory and refine that much smaller set instead. Integer
@@ -407,10 +407,12 @@ template <int TopK>
 __global__
 __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
     const float* logits, const int32_t* lengths, int32_t* output,
-    uint32_t columns) {
+    uint32_t columns, uint32_t stride) {
   __shared__ LexicographicDecodeTopKShared<TopK> shared;
-  qsa_lexicographic_decode_topk_body<TopK>(logits, lengths, output, columns,
-                                           shared);
+  const uint32_t row = blockIdx.x;
+  qsa_lexicographic_decode_topk_body<TopK>(
+      logits + static_cast<uint64_t>(row) * stride, lengths + row,
+      output + static_cast<uint64_t>(row) * TopK, columns, shared);
 }
 
 template <int TopK>
@@ -444,7 +446,7 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
   if (num_rows == 1) {
     qsa_lexicographic_decode_topk_kernel<TopK>
         <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
-                                                      columns);
+                                                      columns, stride);
   } else if (decode_batch && (num_rows == 5 || num_rows == 10) &&
              columns <= 9216) {
     // Qualified through 32K context, allowing physical page padding. Longer
@@ -452,6 +454,11 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
     qsa_lexicographic_mtp_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
             logits, lengths, output, num_rows, columns, stride);
+  } else if (decode_batch && num_rows <= 16 && num_rows != 5 &&
+             num_rows != 10) {
+    qsa_lexicographic_decode_topk_kernel<TopK>
+        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+            logits, lengths, output, columns, stride);
   } else {
     qsa_lexicographic_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(

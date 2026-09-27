@@ -15,9 +15,30 @@ from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
 )
 
 
-def test_default_off(monkeypatch):
-    monkeypatch.delenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", raising=False)
-    assert not envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
+@pytest.fixture(autouse=True)
+def full_precision_reductions():
+    backend = torch.backends.cuda.matmul
+    names = (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+        "allow_fp16_accumulation",
+    )
+    previous = [getattr(backend, name) for name in names]
+    for name in names:
+        setattr(backend, name, False)
+    envs.disable_envs_cache()
+    yield
+    for name, value in zip(names, previous):
+        setattr(backend, name, value)
+    envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "name", ("VLLM_SM70_QWEN38_BATCH_FASTPATH", "VLLM_SM70_QWEN38_GDN_INPUT_BATCH")
+)
+def test_default_off(monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    assert not getattr(envs, name)
 
 
 @pytest.mark.parametrize("n", (24, 4096))
@@ -38,7 +59,7 @@ def test_bad_pack_shape_rejected():
 
 
 def test_cpu_and_missing_pack_rejected(monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     assert not _can_use_packed_gdn_input(torch.empty(8, 2560), None, None)
 
 
@@ -62,8 +83,9 @@ def cuda_weights():
 
 
 @pytest.mark.parametrize("m", range(2, 17))
-def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m):
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")
+@pytest.mark.parametrize("row_major", (False, True))
+def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m, row_major):
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     q, b, pq, pb = cuda_weights
     x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
@@ -72,7 +94,11 @@ def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m):
     torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb)
+        if row_major:
+            actual = tuple(x.new_empty((m, n)) for n in (2560, 1536, 12, 12))
+            torch.ops._C.qwen38_gdn_input_batch_sm70_out(*actual, x, q, b)
+        else:
+            actual = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb)
     for scale in (0.0, 0.001, 0.1, 1.0, 3.0):
         x.normal_(0, scale)
         for output in actual:
@@ -85,7 +111,7 @@ def test_dynamic_graph_bitwise(cuda_weights, monkeypatch, m):
 
 @pytest.mark.parametrize("m", (1, 17))
 def test_unsupported_batch_falls_back(cuda_weights, monkeypatch, m):
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     q, b, pq, pb = cuda_weights
     x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
     assert not _can_use_packed_gdn_input(x, pq, pb)
@@ -114,7 +140,7 @@ def test_fp16_accumulation_falls_back(cuda_weights, monkeypatch, m):
 
 @pytest.mark.parametrize("which", ("x", "q", "b"))
 def test_unaligned_storage_falls_back(cuda_weights, monkeypatch, which):
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     q, b, pq, pb = cuda_weights
     x = torch.randn(2, 2560, device="cuda", dtype=torch.float16)
     tensors = dict(x=x, q=pq, b=pb)
@@ -131,12 +157,14 @@ def test_unaligned_storage_falls_back(cuda_weights, monkeypatch, which):
 
 
 @pytest.mark.parametrize("m", (2, 5, 7, 9, 10, 16))
-def test_native_output_canaries(cuda_weights, m):
+@pytest.mark.parametrize("row_major", (False, True))
+def test_native_output_canaries(cuda_weights, m, row_major):
     q, b, pq, pb = cuda_weights
     x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
     storage = [x.new_full((m * n + 16,), 17) for n in (2560, 1536, 12, 12)]
     outputs = [s[8:-8].view(m, n) for s, n in zip(storage, (2560, 1536, 12, 12))]
-    torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, pq, pb)
+    qw, bw = (q, b) if row_major else (pq, pb)
+    torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, qw, bw)
     for s in storage:
         assert torch.all(s[:8] == 17) and torch.all(s[-8:] == 17)
     for actual, expected in zip(outputs, _qwen38_sm70_fp16_gdn_input(x, q, b)):
@@ -149,6 +177,14 @@ def test_native_rejects_wrong_output_geometry(cuda_weights):
     outputs = [x.new_empty((2, n)) for n in (2560, 1536, 12, 13)]
     with pytest.raises(RuntimeError, match="output geometry"):
         torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, pq, pb)
+
+
+def test_native_rejects_mixed_weight_layouts(cuda_weights):
+    q, _, _, pb = cuda_weights
+    x = torch.zeros(2, 2560, device="cuda", dtype=torch.float16)
+    outputs = [x.new_empty((2, n)) for n in (2560, 1536, 12, 12)]
+    with pytest.raises(RuntimeError, match="weight geometry"):
+        torch.ops._C.qwen38_gdn_input_batch_sm70_out(*outputs, x, q, pb)
 
 
 def test_loader_prepares_nonpersistent_and_reloadable_bits(cuda_weights):
@@ -174,7 +210,7 @@ def test_disabled_and_batch_invariant_fall_back(cuda_weights, monkeypatch):
     q, b, pq, pb = cuda_weights
     x = torch.randn(2, 2560, device="cuda", dtype=torch.float16)
     for enabled, invariant in (("0", "0"), ("1", "1")):
-        monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", enabled)
+        monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", enabled)
         monkeypatch.setenv("VLLM_BATCH_INVARIANT", invariant)
         assert not _can_use_packed_gdn_input(x, pq, pb)
         for actual, expected in zip(

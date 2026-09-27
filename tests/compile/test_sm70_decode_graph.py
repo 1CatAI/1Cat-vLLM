@@ -141,11 +141,19 @@ def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
     os.environ[disabled] = "0"
     applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
     assert disabled not in applied and os.environ[disabled] == "0"
-    assert len(applied) == 4
+    assert len(applied) == 5
     assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
+    assert os.environ["VLLM_SM70_RMSNORM_GATED_EXACT"] == "1"
     assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True) == ()
     assert "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8" not in os.environ
     assert "VLLM_SM70_NVFP4_QPN2" not in os.environ
+
+
+def test_qwen38_exact_gated_norm_preserves_explicit_override(monkeypatch):
+    monkeypatch.setattr(os, "environ", {"VLLM_SM70_RMSNORM_GATED_EXACT": "0"})
+    applied = _apply_sm70_qwen38_decode_defaults(_nomtp_default_config(), is_sm70=True)
+    assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in applied
+    assert os.environ["VLLM_SM70_RMSNORM_GATED_EXACT"] == "0"
 
 
 @pytest.mark.parametrize(

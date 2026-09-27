@@ -3109,6 +3109,7 @@ def sm70_qwen38_hc_batch(
     round_down_partials: bool = False,
     cooperative: bool = False,
     full_unroll: bool = False,
+    fused_chain: bool = False,
 ) -> None:
     _custom_ar_owner_namespace().sm70_qwen38_hc_batch(
         fa,
@@ -3123,6 +3124,7 @@ def sm70_qwen38_hc_batch(
         round_down_partials,
         cooperative,
         full_unroll,
+        fused_chain,
     )
 
 

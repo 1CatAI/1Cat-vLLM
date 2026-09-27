@@ -439,6 +439,9 @@ void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
 void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor weight);
 
+void qwen38_shared_gate_sigmoid_mul_out(torch::Tensor out,
+                                        torch::Tensor logits);
+
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
 
@@ -773,7 +776,7 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor partials, torch::Tensor lora,
                           torch::Tensor local_output, torch::Tensor output,
                           torch::Tensor injection, bool round_down_partials,
-                          bool cooperative, bool full_unroll);
+                          bool cooperative, bool full_unroll, bool fused_chain);
 void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
                              torch::Tensor& branches, torch::Tensor& output);
 void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,

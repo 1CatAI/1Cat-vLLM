@@ -21,6 +21,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+@torch.compiler.assume_constant_result
+def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
+    # Capability is static for the device guarded by the compiled tensor input.
+    # Do not trace the platform's cached NVML/PyTorch capability query.
+    return current_platform.is_device_capability(70, device_id=device_id)
+
+
 def _sm70_gated_norm_shape_supported(
     x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
 ) -> bool:
@@ -42,6 +49,10 @@ def _sm70_gated_norm_shape_supported(
 def _sm70_rmsnorm_gated_exact_impl(
     x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
 ) -> torch.Tensor:
+    logger.info_once(
+        "SM70 exact native gated RMSNorm fusion enabled "
+        "(N128, sigmoid/SiLU, M1 and batch)."
+    )
     out = torch.empty_like(x)
     torch.ops._C.sm70_rmsnorm_gated_exact_out(out, x, z, weight, eps, silu)
     return out
@@ -774,16 +785,12 @@ class RMSNormGated(CustomOp):
             envs.VLLM_SM70_RMSNORM_GATED_EXACT
             and not envs.VLLM_BATCH_INVARIANT
             and x.is_cuda
-            and current_platform.is_device_capability(70)
+            and _sm70_gated_norm_device_supported(x.device.index)
             and self.group_size is None
             and self.norm_before_gate
             and self.activation in ("sigmoid", "silu", "swish")
             and _sm70_gated_norm_shape_supported(x, z, self.weight)
         ):
-            logger.info_once(
-                "SM70 exact native gated RMSNorm fusion enabled "
-                "(N128, sigmoid/SiLU, M1 and batch)."
-            )
             return torch.ops.vllm.sm70_rmsnorm_gated_exact(
                 x, z, self.weight, self.eps, self.activation != "sigmoid"
             )

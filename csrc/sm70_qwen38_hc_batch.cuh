@@ -308,11 +308,225 @@ __global__ __launch_bounds__(32, 4) void hc_cooperative(
                        block);
 }
 
+template <bool PairRows, int Warps, int Unroll, bool FuseMix,
+          bool FuseGather = false>
+__global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch_fused_gather(
+    const half* __restrict__ lora, const half* __restrict__ packed,
+    const half* __restrict__ branches, half* __restrict__ out, int rows,
+    int hidden, int hidden_offset, RankData buffers, int rank, half* gathered) {
+  static_assert(!FuseGather || (!PairRows && Warps == 1 && FuseMix));
+  __shared__ __align__(16) uint32_t packets[64];
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+  const int tile = blockIdx.x * Warps + warp;
+  if (tile >= hidden / 8) return;
+  const int group = PairRows ? 0 : blockIdx.y;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int branch = (lane >> 2) & 3;
+  const int col = branch * 8 + r;
+  const half* w = packed + static_cast<size_t>(tile) * 320 * 32;
+  float accum[PairRows ? 2 : 1][8] = {};
+#pragma unroll Unroll
+  for (int g = 0; g < 20; ++g) {
+    const uint4 lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
+    const uint4 hi =
+        *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
+#pragma unroll
+    for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
+      const int row = (group + p) * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < rows) {
+        const half* x = lora + row * 320 + g * 16;
+        a = *reinterpret_cast<const uint4*>(x);
+        b = *reinterpret_cast<const uint4*>(x + 8);
+      }
+      mma(accum[p], a.x, a.y, lo.x, lo.y);
+      mma(accum[p], a.z, a.w, lo.z, lo.w);
+      mma(accum[p], b.x, b.y, hi.x, hi.y);
+      mma(accum[p], b.z, b.w, hi.z, hi.w);
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int row =
+          (group + p) * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int h =
+          tile * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      const half gate = __float2half_rn(accum[p][i]);
+      if constexpr (FuseMix) {
+        const float gate_f = __half2float(gate);
+        float v = 0.0f;
+        if (row < rows) {
+          v = __half2float(
+              branches[row * 10240 + branch * 2560 + hidden_offset + h]);
+        }
+        const float s = sigmoid(gate_f);
+        float mixed = 0.0f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int src = (lane & ~12) | (b << 2);
+          const float gs = __shfl_sync(0xffffffff, s, src);
+          const float x = __shfl_sync(0xffffffff, v, src);
+          mixed = fmaf(gs, x, mixed);
+        }
+        if (branch == 0 && row < rows) {
+          const half value = __float2half_rn(div_full(mixed, 4.0f));
+          out[row * hidden + h] = value;
+          if constexpr (FuseGather)
+            packets[(row - group * 8) * 8 + (h - tile * 8)] =
+                __half_as_ushort(value);
+        }
+      } else if (row < rows) {
+        out[row * 4 * hidden + branch * hidden + h] = gate;
+      }
+    }
+  }
+  if constexpr (FuseGather) {
+    constexpr int stride = 16 * 640;
+    constexpr int header = kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t);
+    constexpr size_t channel = kSm70Qwen38HcBatchFusedOffset;
+    const int block = group * 80 + tile;
+    auto* local =
+        const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
+        channel;
+    auto* counters = reinterpret_cast<uint32_t*>(local);
+    const uint32_t epoch = counters[block], tag = epoch + 1u;
+    const int slot = epoch * 4 * stride;
+    // Retile the MMA fragments into contiguous, lossless half+tag packets.
+    // Only valid rows publish/read/clear. Every active block owns its own
+    // epoch across odd-count shrinking/growing graph replays.
+    __syncthreads();
+    const int row = group * 8 + lane / 2;
+    if (lane < 16 && row < rows) {
+      const int pack = block * 16 + lane;
+      const auto payload = reinterpret_cast<const uint4*>(packets)[lane];
+      const uint32_t tags = tag << 16;
+      const uint4 words = make_uint4(payload.x | tags, payload.y | tags,
+                                     payload.z | tags, payload.w | tags);
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        auto* dest = const_cast<char*>(
+                         reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+                     channel + header +
+                     (slot + rank * stride) * sizeof(uint32_t);
+        sm70_push_store_volatile_16b(words, dest, pack);
+      }
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        void* source =
+            local + header + (slot + peer * stride) * sizeof(uint32_t);
+        uint4 received;
+        do {
+          sm70_push_load_volatile_16b(received, source, pack);
+        } while ((received.x >> 16) != tag || (received.y >> 16) != tag ||
+                 (received.z >> 16) != tag || (received.w >> 16) != tag);
+        half* dest =
+            gathered + row * 2560 + peer * 640 + tile * 8 + (lane % 2) * 4;
+        dest[0] = __ushort_as_half(received.x & 0xffffu);
+        dest[1] = __ushort_as_half(received.y & 0xffffu);
+        dest[2] = __ushort_as_half(received.z & 0xffffu);
+        dest[3] = __ushort_as_half(received.w & 0xffffu);
+        sm70_push_store_volatile_16b(make_uint4(0, 0, 0, 0), source, pack);
+      }
+    }
+    __syncthreads();
+    if (lane == 0) counters[block] = (epoch + 1u) & 1u;
+  }
+}
+
+// Assign adjacent columns to adjacent lanes for the twenty FP32 partial
+// reads. The old pack-per-thread assignment reads eight interleaved columns
+// serially, and leaves few active lanes at M2. Arithmetic/order is unchanged;
+// shared memory only retile words for the existing half+tag transport.
+__global__ void down_gather_coalesced(RankData buffers, const float* partials,
+                                      half* lora, half* injection, int rank,
+                                      int rows) {
+  constexpr int cols = 88, stride = 16 * cols;
+  constexpr size_t channel = kSm70Qwen38HcBatchDownOffset;
+  __shared__ __align__(16) uint32_t packets[128];
+  auto* local =
+      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
+      channel;
+  auto* counters = reinterpret_cast<uint32_t*>(local);
+  const uint32_t epoch = counters[blockIdx.x], tag = epoch + 1u;
+  const int slot = epoch * 4 * stride;
+  const int index = blockIdx.x * 128 + threadIdx.x;
+  const int row = index / cols, col = index % cols;
+  if (index < rows * cols) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int split = 0; split < 20; ++split)
+      acc = __fadd_rn(acc, partials[(split * rows + row) * 96 + col]);
+    half value = __float2half_rn(acc);
+    if (col < 80) {
+      const float x = div_full(__half2float(value), 4.0f);
+      value = __float2half_rn(__fmul_rn(x, sigmoid(x)));
+    }
+    packets[threadIdx.x] = (tag << 16) | __half_as_ushort(value);
+  }
+  __syncthreads();
+  // 88 columns and the 128-thread block are both multiples of four, so
+  // no transport vector spans a row or a partially valid final packet.
+  if (threadIdx.x % 4 == 0 && index < rows * cols) {
+    const int pack = index / 4;
+    const uint4 words =
+        reinterpret_cast<const uint4*>(packets)[threadIdx.x / 4];
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      auto* dest =
+          const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+          channel + kSm70Qwen38HcBatchCounterBytes +
+          (slot + rank * stride) * sizeof(uint32_t);
+      sm70_push_store_volatile_16b(words, dest, pack);
+    }
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      void* source = local + kSm70Qwen38HcBatchCounterBytes +
+                     (slot + peer * stride) * sizeof(uint32_t);
+      uint4 received;
+      do {
+        sm70_push_load_volatile_16b(received, source, pack);
+      } while ((received.x >> 16) != tag || (received.y >> 16) != tag ||
+               (received.z >> 16) != tag || (received.w >> 16) != tag);
+      const uint32_t values[4] = {received.x, received.y, received.z,
+                                  received.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const half value = __ushort_as_half(values[i] & 0xffffu);
+        if (col < 80)
+          lora[row * 320 + peer * 80 + col + i] = value;
+        else if (col == 80 && peer == 3)
+          injection[row * 4 + i] = value;
+      }
+      sm70_push_store_volatile_16b(make_uint4(0, 0, 0, 0), source, pack);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counters[blockIdx.x] = (epoch + 1u) & 1u;
+}
+
 inline void launch(RankData buffers, int rank, const half* input,
                    const half* packed_down, const half* packed_up,
                    float* partials, half* lora, half* local_output,
                    half* output, half* injection, int rows, bool round_partials,
-                   bool cooperative, bool full_unroll, cudaStream_t stream) {
+                   bool cooperative, bool full_unroll, cudaStream_t stream,
+                   bool fused_chain) {
+  TORCH_CHECK(!fused_chain || (!round_partials && !cooperative),
+              "Fused concurrent HC requires FP32 partials");
+  if (fused_chain) {
+    hc_down_partials<false, 1, false, 96>
+        <<<dim3(3, (rows + 7) / 8, 20), 32, 0, stream>>>(input, packed_down,
+                                                         partials, rows);
+    down_gather_coalesced<<<(rows * 88 + 127) / 128, 128, 0, stream>>>(
+        buffers, partials, lora, injection, rank, rows);
+    hc_up_batch_fused_gather<false, 1, 4, true, true>
+        <<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
+            lora, packed_up, input, local_output, rows, 640, rank * 640,
+            buffers, rank, output);
+    return;
+  }
   if (cooperative) {
     TORCH_CHECK(round_partials,
                 "Cooperative HC requires the MTP FP16 contract");

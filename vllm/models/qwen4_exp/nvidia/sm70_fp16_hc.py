@@ -17,6 +17,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .sm70_fp16_gemv import (
     Qwen38SM70FP16LinearMethod,
+    _batch_runtime_contract,
     _exact_runtime_contract,
 )
 
@@ -78,14 +79,19 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
     )
 
 
-def _batch_runtime_ok(x, packed_down, packed_up) -> bool:
+def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool:
+    if x.ndim != 2:
+        return False
+    reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    admitted = (
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and not reduced and 2 <= x.shape[0] <= 16
+        if concurrent_batch
+        else envs.VLLM_SM70_MTP_HC_BATCH and reduced and x.shape[0] in (5, 10)
+    )
     return bool(
-        envs.VLLM_SM70_MTP_HC_BATCH
+        admitted
         and not envs.VLLM_BATCH_INVARIANT
-        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
-        and x.ndim == 2
-        and x.shape[0] in (5, 10)
         and x.shape[1] == _HC_HIDDEN
         and x.is_cuda
         and x.dtype == torch.float16
@@ -360,8 +366,9 @@ def _qwen38_sm70_fp16_fused_hc(
     up_weight: torch.Tensor,
     packed_down: torch.Tensor | None = None,
     packed_up: torch.Tensor | None = None,
+    concurrent_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _batch_runtime_ok(x, packed_down, packed_up):
+    if _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch):
         from vllm.distributed.parallel_state import get_tp_group
 
         custom_ar = getattr(get_tp_group().device_communicator, "ca_comm", None)
@@ -380,12 +387,14 @@ def _qwen38_sm70_fp16_fused_hc(
                 local_block,
                 block,
                 injection,
-                round_down_partials=True,
-                cooperative=envs.VLLM_SM70_MTP_HC_COOPERATIVE,
-                full_unroll=envs.VLLM_SM70_MTP_HC_FULL_UNROLL,
+                round_down_partials=not concurrent_batch,
+                cooperative=not concurrent_batch and envs.VLLM_SM70_MTP_HC_COOPERATIVE,
+                full_unroll=not concurrent_batch and envs.VLLM_SM70_MTP_HC_FULL_UNROLL,
+                fused_chain=concurrent_batch,
             )
             logger.info_once(
-                "SM70 MTP4 TP4 batched HC with FP16 split partials enabled."
+                "SM70 TP4 batched HC enabled (FP32 concurrent partials=%s).",
+                concurrent_batch,
             )
             return block, injection
     if not _runtime_ok(x, down_weight, up_weight):
@@ -499,6 +508,7 @@ def _qwen38_sm70_fp16_fused_hc_fake(
     up_weight: torch.Tensor,
     packed_down: torch.Tensor | None = None,
     packed_up: torch.Tensor | None = None,
+    concurrent_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del down_weight, up_weight, packed_down, packed_up
     return (
@@ -537,6 +547,7 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         up_weight,
         getattr(down_layer, "_sm70_qwen38_hc_batch_packed", None),
         getattr(up_layer, "_sm70_qwen38_hc_batch_packed", None),
+        getattr(down_layer, "_sm70_qwen38_hc_batch_concurrent", False),
     )
 
 
@@ -565,7 +576,13 @@ def enable_qwen38_sm70_fp16_fused_hc(
         ):
             continue
         child._sm70_qwen38_fp16_fused_hc = True
-        if envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config):
+        concurrent_batch = bool(
+            envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+            and _batch_runtime_contract(vllm_config)
+        )
+        if concurrent_batch or (
+            envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
+        ):
             from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
             for role, layer in (
@@ -577,6 +594,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
                 if not isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod):
                     raise RuntimeError("Batched HC requires checkpoint-FP16 linears")
                 layer._sm70_qwen38_hc_batch_role = role
+                layer._sm70_qwen38_hc_batch_concurrent = concurrent_batch
         enabled_count += 1
 
     if enabled_count:

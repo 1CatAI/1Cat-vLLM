@@ -344,7 +344,13 @@ def _qwen38_sm70_fp16_gemv(
     weight: torch.Tensor,
     role: str = "",
     packed_router: torch.Tensor | None = None,
+    dense_batch: bool = False,
 ) -> torch.Tensor:
+    if dense_batch and _can_use_dense_batch(x, weight, role):
+        out = x.new_empty((x.shape[0], weight.shape[0]))
+        torch.ops._C.qwen38_dense_batch_sm70_out(out, x, weight)
+        logger.info_once("SM70 Qwen3.8 exact small-batch dense projections enabled.")
+        return out
     if role.endswith(_ROUTER_SUFFIX) and _router_batch_runtime_ok(x, packed_router):
         out = x.new_empty((x.shape[0], 512))
         torch.ops._C.qwen38_router_batch_sm70_out(out, x, packed_router)
@@ -374,6 +380,7 @@ def _qwen38_sm70_fp16_gemv_fake(
     weight: torch.Tensor,
     role: str = "",
     packed_router: torch.Tensor | None = None,
+    dense_batch: bool = False,
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
@@ -383,6 +390,34 @@ direct_register_custom_op(
     op_func=_qwen38_sm70_fp16_gemv,
     fake_impl=_qwen38_sm70_fp16_gemv_fake,
 )
+
+
+def _dense_batch_limit(role: str, shape: tuple[int, ...]) -> int:
+    # Reject measured regressions: router M8/M16 and output M16. The C1
+    # reduction is a different tree and must keep its existing route.
+    if role.endswith(_ROUTER_SUFFIX) and shape == (512, 2560):
+        return 4
+    if role.endswith((_GDN_OUT_SUFFIX, _QSA_OUT_SUFFIX)) and shape == (2560, 1536):
+        return 8
+    return 0
+
+
+def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bool:
+    return bool(
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        and not envs.VLLM_BATCH_INVARIANT
+        and _is_packed_row_major(x)
+        and _is_packed_row_major(weight)
+        and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))
+        and x.shape[1] == weight.shape[1]
+        and x.is_cuda
+        and weight.is_cuda
+        and x.dtype == weight.dtype == torch.float16
+        and x.device == weight.device
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+        and current_platform.is_device_capability(70)
+    )
 
 
 def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -397,7 +432,7 @@ def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
     return bool(
-        envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
+        (envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or envs.VLLM_SM70_QWEN38_BATCH_FASTPATH)
         and not envs.VLLM_BATCH_INVARIANT
         # The packed MMA preserves the original FP32 accumulation contract.
         # Let cuBLAS honor an explicit request for FP16 accumulation.
@@ -505,6 +540,14 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        if (
+            getattr(layer, "_sm70_qwen38_dense_batch", False)
+            and layer.weight.is_cuda
+            and not hasattr(torch.ops._C, "qwen38_dense_batch_sm70_out")
+        ):
+            raise RuntimeError(
+                "Rebuild the SM70 extension for batched dense projections"
+            )
         if getattr(layer, "_sm70_mtp_prepare_shared_batch", False):
             weight = layer.weight
             if weight.is_cuda and weight.dtype == torch.float16:
@@ -558,6 +601,7 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 layer.weight,
                 getattr(layer, "prefix", ""),
                 getattr(layer, "_sm70_mtp_router_packed", None),
+                getattr(layer, "_sm70_qwen38_dense_batch", False),
             )
         return super().apply(layer, x, bias)
 
@@ -602,14 +646,37 @@ def _exact_runtime_contract(vllm_config=None) -> bool:
     )
 
 
+def _batch_runtime_contract(vllm_config=None) -> bool:
+    if not _exact_runtime_contract(vllm_config) or envs.VLLM_BATCH_INVARIANT:
+        return False
+    config = vllm_config or get_current_vllm_config()
+    return bool(
+        config.speculative_config is None
+        and not getattr(config.parallel_config, "use_ubatching", False)
+    )
+
+
 def enable_qwen38_sm70_fp16_gemv(
     module: nn.Module, dtype: torch.dtype, vllm_config=None
 ) -> None:
     """Replace admitted unquantized methods before checkpoint loading."""
-    if not envs.VLLM_SM70_QWEN38_FP16_GEMV:
-        return
     capability_ok = current_platform.is_device_capability((7, 0))
     contract_ok = _exact_runtime_contract(vllm_config)
+    if (
+        capability_ok
+        and contract_ok
+        and dtype == torch.float16
+        and (vllm_config or get_current_vllm_config()).speculative_config is None
+    ):
+        # The no-MTP control and candidate both use FP32 accumulation/reduction.
+        # Never recover throughput by truncating intermediate GEMM sums.
+        # MTP has separate explicit numerical-policy admission; preserve it.
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_fp16_accumulation = False
+        logger.info_once("SM70 Qwen3.8 FP32 GEMM accumulation/reductions required.")
+    if not envs.VLLM_SM70_QWEN38_FP16_GEMV:
+        return
     if (
         envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
         or dtype != torch.float16
@@ -627,6 +694,9 @@ def enable_qwen38_sm70_fp16_gemv(
         return
 
     replaced = 0
+    batch_allowed = bool(
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and _batch_runtime_contract(vllm_config)
+    )
     for child in module.modules():
         if not (
             isinstance(child, LinearBase)
@@ -650,6 +720,9 @@ def enable_qwen38_sm70_fp16_gemv(
         if _plan_for(prefix, shape) is None and not shared_batch:
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
+        child._sm70_qwen38_dense_batch = bool(
+            batch_allowed and _dense_batch_limit(prefix, shape)
+        )
         if shared_batch:
             child._sm70_mtp_prepare_shared_batch = True
             child.forward_fused_silu_and_mul = MethodType(
@@ -689,7 +762,10 @@ def enable_qwen38_sm70_fp16_gemv(
             ):
                 continue
             child.sm70_qwen38_fp16_fused_input = True
-            if envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH:
+            if envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or (
+                envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+                and _batch_runtime_contract(vllm_config)
+            ):
                 assert qkvz is not None and ba is not None
                 qkvz._sm70_qwen38_prepare_gdn_batch = True
                 ba._sm70_qwen38_prepare_gdn_batch = True
