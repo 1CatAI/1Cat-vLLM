@@ -185,6 +185,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_HC_FULL_UNROLL: bool = False
     VLLM_SM70_MTP_ROUTER_TOP16: bool = False
     VLLM_SM70_MTP_ROUTER_BATCH: bool = False
+    VLLM_SM70_MTP_SHARED_BATCH: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
@@ -1894,6 +1895,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused four-partition FP32 reduction for the MTP4 FP16 router projection.
     "VLLM_SM70_MTP_ROUTER_BATCH": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_ROUTER_BATCH", "0"))
+    ),
+    # Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues.
+    "VLLM_SM70_MTP_SHARED_BATCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_SHARED_BATCH", "0"))
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.

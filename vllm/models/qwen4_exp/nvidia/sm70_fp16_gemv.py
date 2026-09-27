@@ -11,6 +11,7 @@ linear path.
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import NamedTuple
 
 import torch
@@ -42,6 +43,7 @@ _QSA_QKV_SUFFIX = ".self_attn.qkv_proj"
 _QSA_OUT_SUFFIX = ".self_attn.o_proj"
 _QSA_INDEX_SUFFIX = ".self_attn.indexer.index_qk_proj"
 _ROUTER_SUFFIX = ".mlp.gate"
+_SHARED_UP_SUFFIX = ".mlp.shared_expert.gate_up_proj"
 
 # Plans are cold-cache CUDA Graph winners on real checkpoint weights. Keep the
 # role in the key: GDN and QSA can share a physical shape while remaining
@@ -240,6 +242,81 @@ def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
+    return bool(
+        envs.VLLM_SM70_MTP_SHARED_BATCH
+        and not envs.VLLM_BATCH_INVARIANT
+        and x.ndim == 2
+        and x.shape[0] in (5, 10)
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+    )
+
+
+def _qwen38_sm70_shared_up(
+    x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
+) -> torch.Tensor:
+    if _shared_batch_runtime_ok(x) and packed is not None:
+        out = x.new_empty((x.shape[0], 160))
+        partial = x.new_empty((8, x.shape[0], 320))
+        torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
+        logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
+        return out
+    gate_up = torch.nn.functional.linear(x, weight)
+    out = gate_up.new_empty((*gate_up.shape[:-1], 160))
+    torch.ops._C.silu_and_mul(out, gate_up)
+    return out
+
+
+def _qwen38_sm70_shared_up_fake(
+    x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], 160))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_shared_up",
+    op_func=_qwen38_sm70_shared_up,
+    fake_impl=_qwen38_sm70_shared_up_fake,
+)
+
+
+def _qwen38_sm70_shared_gate_mul(
+    logits: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    if _shared_batch_runtime_ok(source):
+        out = torch.empty_like(source)
+        torch.ops._C.qwen38_shared_gate_mul_sm70_out(out, logits, source)
+        return out
+    return torch.sigmoid(logits) * source
+
+
+def _qwen38_sm70_shared_gate_mul_fake(
+    logits: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty_like(source)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_shared_gate_mul",
+    op_func=_qwen38_sm70_shared_gate_mul,
+    fake_impl=_qwen38_sm70_shared_gate_mul_fake,
+)
+
+
+def _forward_shared_batch_silu(layer, x):
+    if not use_sm70_decode_graph_semantics():
+        return None
+    return torch.ops.vllm.qwen38_sm70_shared_up(
+        x, layer.weight, getattr(layer, "_sm70_mtp_shared_packed", None)
+    )
+
+
 def _router_batch_runtime_ok(x, packed) -> bool:
     return bool(
         envs.VLLM_SM70_MTP_ROUTER_BATCH
@@ -425,6 +502,19 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        if getattr(layer, "_sm70_mtp_prepare_shared_batch", False):
+            weight = layer.weight
+            if weight.is_cuda and weight.dtype == torch.float16:
+                if not hasattr(torch.ops._C, "qwen38_shared_up_batch_sm70_out"):
+                    raise RuntimeError("Rebuild the SM70 extension for shared expert")
+                layer.register_buffer(
+                    "_sm70_mtp_shared_packed",
+                    weight.detach()
+                    .reshape(10, 32, 160, 2, 8)
+                    .permute(0, 2, 3, 1, 4)
+                    .contiguous(),
+                    persistent=False,
+                )
         if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
             from .sm70_fp16_hc import _prepare_hc_batch_weight
 
@@ -544,9 +634,24 @@ def enable_qwen38_sm70_fp16_gemv(
         if weight is None or weight.ndim != 2:
             continue
         shape = (int(weight.shape[0]), int(weight.shape[1]))
-        if _plan_for(str(getattr(child, "prefix", "")), shape) is None:
+        prefix = str(getattr(child, "prefix", ""))
+        shared_batch = False
+        if envs.VLLM_SM70_MTP_SHARED_BATCH:
+            from .sm70_fp16_hc import _mtp_batch_runtime_contract
+
+            shared_batch = (
+                prefix.endswith(_SHARED_UP_SUFFIX)
+                and shape == (320, 2560)
+                and _mtp_batch_runtime_contract(vllm_config)
+            )
+        if _plan_for(prefix, shape) is None and not shared_batch:
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
+        if shared_batch:
+            child._sm70_mtp_prepare_shared_batch = True
+            child.forward_fused_silu_and_mul = MethodType(
+                _forward_shared_batch_silu, child
+            )
         if envs.VLLM_SM70_MTP_ROUTER_BATCH and str(
             getattr(child, "prefix", "")
         ).endswith(_ROUTER_SUFFIX):

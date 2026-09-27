@@ -48335,3 +48335,25 @@ has launched no full model. Details and artifacts are in
   reloading weights for each schedule and retains inspectable graph metadata.
   Preserve all `mtp_hc_*candidate_20260927*` contracts/events and component
   rejections; do not promote extrapolated savings or repeat completed gates.
+
+- Resident HC/QSA/router A/B/A now qualifies a modest 22.156515->22.005602-ms
+  combined improvement, preserving fixed/natural output IDs and acceptance.
+  The 194-event internal observer is rejected (+23.753% perturbation);
+  selecting the actual bucket32768 graph and checking unique invocation
+  counts are mandatory. Empty cloning itself stays close to the control.
+  Globaltimer kernel-node research passes a tiny graph gate; no current
+  internal absolute attribution is admitted yet.
+- New default-off shared-expert M5/M10 Tensor Core/SiLU and sigmoid/multiply
+  fusions pass 49 checkpoint modules x four TP slices x seven scales and
+  36 native/fallback tests, preserving FP16 boundaries and scalar projection.
+  Source build adds 76.5625 MiB/rank packing. Full-model admission is pending.
+  The one-warp GDN screen is exact but saves only about 0.056 ms per M5
+  component chain; avoid a new model load solely for it. Keep all rejection
+  and source identities in the detailed MTP report. The <20-ms goal is unmet.
+
+- Shared-expert fusion completes fixed and natural quality gates with exact
+  IDs/EOS/acceptance. Ordinary mean is 21.722330 ms (21.662596/21.782064),
+  outer events add 0.306%. A later research timestamp-template capture fails
+  outside inference mode; reject that diagnostic attempt and keep the earlier
+  completed performance/quality segment. Fresh ordinary confirmation and
+  admitted internal trace are still pending; <20 ms remains unmet.

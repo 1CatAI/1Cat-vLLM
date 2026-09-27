@@ -1389,3 +1389,83 @@ command-by-command source/flag identity and graph metadata. It is intended
 to amortize model loading and compare schedules under one process. Graph
 recapture and timing readback remain outside measured requests. This harness
 is a measurement tool, not a serving default or a new latency claim.
+
+### Resident controls and exact shared-expert batch fusion, 2026-09-27
+
+The same-process A/B/A at source `1ef9f45a58` qualifies a small combined
+improvement: A (HC unroll4, original QSA selector and full router sort)
+averages **22.156515 ms**, B (HC full unroll, adaptive QSA top-k and partial
+router sort) **22.005602 ms**. Common HC norm prefetch stays enabled in both.
+B ordinary before/after are 21.865026/22.146178 ms; observed is 22.146999 ms
+(+0.643% perturbation, +1.286% control drift). Its 335 closed rank0 cycles
+average 22.130003 ms: target 16.114291, sampling/state 0.780309, four drafts
+4.548976 and preparation 0.686427. Fixed and all three natural-EOS token IDs,
+finish reasons and acceptance records remain exact. Do not promote the
+single 21.865-ms observation as the endpoint. The <20-ms goal is unmet.
+
+Retain `mtp_resident_ab_20260927*`. A later diagnostic callable-RPC attempt
+terminates that resident run after the valid A/B and quality data have been
+saved. The replacement uses a named, restricted diagnostic RPC; insecure
+serialization is not enabled. Subsequent raw-graph timing attempts establish:
+
+- The first observer selected M5 with no context bucket, while the request
+  uses M5/bucket32768. Its zero internal event count invalidates attribution;
+  only outer events were collected (`mtp_resident_modules_20260927*`).
+- After selecting the actual graph and requiring 336 unique invocations,
+  194 event nodes inflate ordinary **21.915471 ms** to **27.121042 ms**
+  (+23.753%). All token/acceptance records remain exact, but the internal
+  breakdown is rejected for ordinary absolute timing. An empty cloned graph
+  stays near the ordinary control (22.123230 versus 21.970648 ms).
+- The next sparse event probe fails before generation on an unnamed graph
+  tail node; this is a harness error, not model behavior. Diagnostic errors
+  now return data instead of escaping the worker RPC. The normal model
+  kernels are unchanged. Preserve `mtp_resident_modules_hit_20260927*`;
+  do not rescale the rejected internal times.
+- A research-only globaltimer kernel-node observer passes 16 changed-input
+  tiny-graph replays with unique GPU-counter slots. Model perturbation and
+  output gates are pending. It is not an admitted trace or serving kernel.
+
+`VLLM_SM70_MTP_SHARED_BATCH=1` adds a source-built M5/M10 shared-expert
+path, using the existing fused-activation hook. Its Tensor Core gate/up
+projection preserves eight K320 partitions, the FP16 split partials,
+left-to-right FP32 reduction, FP16 projection and FP16 SiLU before multiply.
+A second fusion leaves the scalar projection untouched and combines only
+its FP16 sigmoid and output multiply. The original M1/prefill paths remain
+available. Packing adds **76.5625 MiB/rank** for all 49 target/draft modules.
+The flag defaults off pending complete-model admission.
+
+The normal native build passes all 49 real weights, four TP slices, M5/M10,
+seven input scales and changing graph inputs bit-for-bit. The 49-call
+projection/activation chains save 0.270--0.325 ms at M5 and 0.267--0.277 ms
+at M10. Separate sigmoid/multiply research covers every FP16 payload and
+changing graphs: the 48-call chain changes 0.270432->0.110112 ms at M5 and
+0.191424->0.082944 ms at M10. These component savings are not summed into
+an endpoint claim. Native/public fallback tests pass 36 cases; source build
+and applicable pre-commit checks pass. Retain `shared_up_batch*`,
+`shared_sigmoid_mul*`, `shared_batch_native_gate*` and
+`shared_batch_dispatch_gate_20260927.log`. The full model gate is running
+under the original GPU4--7 contract. No wheel or foreign service stop.
+
+A separate one-warp GDN input screen retains exact QKVZ and four-partition
+b/a outputs for all 36 real rank0 layers and six scales. It removes the
+three inactive QKVZ warps and shared-memory b/a reduction, but improves only
+1.102438->1.045955 ms for the complete M5 component chain (M10
+1.124393->1.095516 ms). Keep it as research pending a larger structural
+benefit; do not infer large end-to-end savings from thread occupancy alone.
+The nominal checkpoint-weight byte/time quotient is about 689 GB/s for the
+original M5 chain, not a measured HBM utilization counter. NCU counters
+remain unavailable. Retain `gdn_input_warp*`; unroll16 regresses M10.
+
+The shared-expert candidate completes ordinary/event/ordinary and natural
+quality before a later profiling harness failure. Ordinary rounds are
+**21.662596/21.782064 ms**, mean **21.722330 ms**; outer deferred timing is
+21.788783 ms (+0.306% perturbation, +0.551% control drift). All 513 fixed
+IDs, 335 drafts, 177 accepted tokens and the three natural EOS sequences
+(284/329/421 tokens) match the retained oracle exactly. Retain
+`mtp_shared_batch_resident_20260927*` and its normalized completed-segment
+audit. The internal timestamp-template capture then fails because it ran
+outside inference mode; the following request encounters an illegal address
+after that failed capture. These diagnostic attempts are rejected. The
+harness now enters inference mode for diagnostic calls and stops on any
+reported diagnostic error before further generation. A fresh ordinary
+confirmation and admitted internal breakdown remain pending. <20 ms is unmet.
