@@ -140,6 +140,7 @@ enum class DispatchPolicy : int {
   kMxfp4MoeGroupedM8Fast = 16,
   kSm70Fp8PrefillPrescaled = 32,
   kSm70Nvfp4Prescaled = 64,
+  kPreserveDefaultPartition = 128,
 };
 
 constexpr bool operator&(const DispatchPolicy& a, const DispatchPolicy& b) {

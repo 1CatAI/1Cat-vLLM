@@ -159,7 +159,8 @@ void awq_gemm_sm70_out_tile_reduce(
 void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, torch::Tensor _scaling_factors,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
-                       bool gated_silu);
+                       bool gated_silu,
+                       bool preserve_default_partition = false);
 
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales);

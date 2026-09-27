@@ -54,6 +54,82 @@ def test_fp8_warmup_skips_static_qpn8_dispatch():
     assert list(warmup._iter_unique_fp8_dense_layers(model)) == []
 
 
+def _batch_qpn8_layer(*, gated=False, prescaled=False) -> nn.Module:
+    layer = nn.Module()
+    layer.sm70_fp8_turbomind = True
+    layer.sm70_fp8_qpn8 = True
+    layer.sm70_fp8_batch_tm = True
+    layer.sm70_fp8_batch_tm_prescaled = prescaled
+    layer.sm70_fp8_gated_silu = gated
+    # QPN8's primary layout has a different shape from the TurboMind buffer.
+    layer.weight = nn.Parameter(
+        torch.empty((2, 4, 32, 16), dtype=torch.uint8), requires_grad=False
+    )
+    layer.sm70_fp8_batch_tm_weight = torch.empty((128, 64), dtype=torch.uint8)
+    layer.sm70_fp8_batch_tm_scales = torch.empty((1, 64), dtype=torch.float16)
+    layer.sm70_fp8_batch_tm_k_ld = 128
+    layer.sm70_fp8_batch_tm_q_ld = 64
+    return layer
+
+
+def test_fp8_warmup_discovers_secondary_batch_layouts():
+    batch = _batch_qpn8_layer()
+    duplicate = _batch_qpn8_layer()
+    gated = _batch_qpn8_layer(gated=True)
+    prescaled = _batch_qpn8_layer(prescaled=True)
+    ordinary = _grouped_fp8_layer()
+    model = nn.Sequential(batch, duplicate, gated, prescaled, ordinary)
+
+    assert list(warmup._iter_unique_fp8_dense_layers(model)) == [
+        (batch, False),
+        (gated, True),
+        (prescaled, False),
+        (ordinary, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    "gated,prescaled", [(False, False), (True, False), (False, True)]
+)
+def test_fp8_warmup_matches_secondary_batch_dispatch(monkeypatch, gated, prescaled):
+    layer = _batch_qpn8_layer(gated=gated, prescaled=prescaled)
+    calls = []
+    prescaled_calls = []
+    policies = []
+
+    def record_call(*args, **kwargs):
+        calls.append(args)
+        policies.append(kwargs)
+
+    monkeypatch.setattr(torch.ops._C, "fp8_gemm_sm70_out_meta", object(), raising=False)
+    monkeypatch.setattr(warmup.sm70_ops, "fp8_gemm_sm70_out", record_call)
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_gemm_sm70_prefill_prescaled_out",
+        lambda *args: prescaled_calls.append(args),
+    )
+    rows = [1, 8, 16, 32, 33, 48, 64, 65]
+
+    count = warmup._warmup_fp8_dense_layers([(layer, gated)], rows)
+
+    assert count == 3
+    if prescaled:
+        assert not calls
+        assert not policies
+        calls = prescaled_calls
+    else:
+        assert not prescaled_calls
+        assert policies == [{"preserve_default_partition": True}] * 3
+    assert [tuple(call[0].shape) for call in calls] == [
+        (m, 32 if gated else 64) for m in (33, 48, 64)
+    ]
+    assert [tuple(call[1].shape) for call in calls] == [(m, 128) for m in (33, 48, 64)]
+    assert all(call[2] is layer.sm70_fp8_batch_tm_weight for call in calls)
+    assert all(call[3] is layer.sm70_fp8_batch_tm_scales for call in calls)
+    expected_meta = (128, 128, 64) if prescaled else (128, 128, 64, gated)
+    assert all(call[4:] == expected_meta for call in calls)
+
+
 def test_fp8_warmup_matches_grouped_bmm_runtime_slice(monkeypatch):
     layer = _grouped_fp8_layer()
     calls = []

@@ -506,6 +506,7 @@ def _dflash2_compact_target_row(
     top_p,
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LIMIT_K: tl.constexpr,
 ):
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < TOP_K
@@ -521,6 +522,17 @@ def _dflash2_compact_target_row(
     ).to(tl.float32)
     if temperature != 1.0:
         logits = logits / temperature
+
+    if LIMIT_K < TOP_K:
+        cutoff = tl.load(target_logits_ptr + row * target_stride + LIMIT_K - 1).to(
+            tl.float32
+        )
+        if temperature != 1.0:
+            cutoff = cutoff / temperature
+        # Keep every member of a tied top-k boundary within the admitted
+        # shortlist. The host guard rejects truncated boundary ties.
+        mask &= logits >= cutoff
+        logits = tl.where(mask, logits, float("-inf"))
 
     # get_topk_tokens_and_logits returns scores in descending order. Apply
     # nucleus filtering only within that exact top-k support, matching the
@@ -570,6 +582,7 @@ def _dflash2_sparse_topk_rejection_kernel(
     num_speculative_steps: tl.constexpr,
     TARGET_TOP_K: tl.constexpr,
     TARGET_BLOCK_K: tl.constexpr,
+    TARGET_LIMIT_K: tl.constexpr,
     DRAFT_TOP_K: tl.constexpr,
     DRAFT_BLOCK_K: tl.constexpr,
     USE_FP64: tl.constexpr,
@@ -610,6 +623,7 @@ def _dflash2_sparse_topk_rejection_kernel(
                     top_p,
                     TOP_K=TARGET_TOP_K,
                     BLOCK_K=TARGET_BLOCK_K,
+                    LIMIT_K=TARGET_LIMIT_K,
                 )
             )
             proposed = tl.load(draft_sampled_ptr + row + 1).to(tl.int64)
@@ -673,6 +687,7 @@ def _dflash2_sparse_topk_rejection_kernel(
         top_p,
         TOP_K=TARGET_TOP_K,
         BLOCK_K=TARGET_BLOCK_K,
+        LIMIT_K=TARGET_LIMIT_K,
     )
     is_bonus = resample_row == end_idx - 1
     residual_logits = target_logits
@@ -754,12 +769,15 @@ def dflash2_sparse_topk_rejection_sample(
     seed: torch.Tensor,
     num_speculative_steps: int,
     use_fp64: bool = False,
+    target_top_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run exact DFlash2 rejection on compact top-k distributions.
 
     Callers must enforce the no-penalty/no-logit-bias contract and provide
     target candidates after a global top-k merge. Draft scores must be the
     temperature-applied scores used to draw the corresponding proposal.
+    With target_top_k smaller than the shortlist, callers must retain all
+    cutoff ties and order equal target scores by descending vocabulary ID.
     """
     if target_topk_ids.ndim != 2 or target_topk_logits.ndim != 2:
         raise ValueError("target top-k tensors must be two-dimensional")
@@ -775,6 +793,10 @@ def dflash2_sparse_topk_rejection_sample(
         raise ValueError("target rows and sampled-token rows must match")
     if not 0 < target_topk_ids.shape[1] <= 64:
         raise ValueError("target top-k width must be in [1, 64]")
+    if target_top_k is None:
+        target_top_k = target_topk_ids.shape[1]
+    if not 0 < target_top_k <= target_topk_ids.shape[1]:
+        raise ValueError("target cutoff must be within the candidate width")
     if not 0 < draft_topk_ids.shape[2] <= 64:
         raise ValueError("draft top-k width must be in [1, 64]")
 
@@ -817,6 +839,7 @@ def dflash2_sparse_topk_rejection_sample(
         num_speculative_steps=num_speculative_steps,
         TARGET_TOP_K=target_topk_ids.shape[1],
         TARGET_BLOCK_K=triton.next_power_of_2(target_topk_ids.shape[1]),
+        TARGET_LIMIT_K=target_top_k,
         DRAFT_TOP_K=draft_topk_ids.shape[2],
         DRAFT_BLOCK_K=triton.next_power_of_2(draft_topk_ids.shape[2]),
         USE_FP64=use_fp64,

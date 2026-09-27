@@ -245,7 +245,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "fp8_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
-      "bool gated_silu) -> ()");
+      "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");

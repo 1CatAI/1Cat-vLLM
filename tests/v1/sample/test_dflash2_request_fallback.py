@@ -27,9 +27,10 @@ def test_reference_mask_keeps_safe_rows():
 @pytest.mark.parametrize("ragged", [False, True])
 @pytest.mark.parametrize("use_fp64", [False, True])
 @pytest.mark.parametrize("vocab", [32768, 248320])
+@pytest.mark.parametrize("wide_probe", [False, True])
 @torch.inference_mode()
 def test_partial_fallback_matches_dense_with_request_slot_permutation(
-    monkeypatch, batch_size, ragged, use_fp64, vocab
+    monkeypatch, batch_size, ragged, use_fp64, vocab, wide_probe
 ):
     torch.manual_seed(260926)
     device = "cuda"
@@ -52,8 +53,12 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
     target[:, :21] = torch.arange(21, 0, -1, device=device).float() / 8
     ambiguous = np.array([1] if batch_size < 8 else [1, 5])
     for request in ambiguous:
-        target[int(cu_np[request]), :24] = 2.0
-    values, ids = target.topk(21, dim=-1)
+        target[int(cu_np[request]), : (80 if wide_probe else 24)] = 2.0
+    if wide_probe:
+        # A complete top-k tie in a safe request now remains compact; the
+        # wider tie above still exercises dense request packing.
+        target[0, :24] = 2.0
+    values, ids = target.topk(64 if wide_probe else 21, dim=-1)
     draft_ids = torch.arange(16, device=device).expand(slots, steps, 16).contiguous()
     draft_scores = torch.randn(slots, steps, 16, device=device) * 0.5
     draft_dense = torch.full((slots, steps, vocab), -float("inf"), device=device)
@@ -83,6 +88,7 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
         )
 
     states = SimpleNamespace(
+        vocab_size=vocab if wide_probe else 0,
         temperature=SimpleNamespace(np=temp_np, gpu=temperatures),
         top_p=SimpleNamespace(np=p_np, gpu=top_ps),
         seeds=SimpleNamespace(gpu=seeds),
@@ -157,3 +163,49 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
         valid = torch.arange(8, device=device)[None] < num_expected[:, None]
         assert torch.equal(actual.sampled_token_ids[valid], expected[valid])
     assert fallback.call_count == 8
+
+
+def test_wide_reference_guard_retains_truncation_and_rounding_fallbacks():
+    probe = torch.full((5, 64), -20.0)
+    probe[:, :24] = 1.0
+    probe[:, :2] = 2.0
+    probe[1].fill_(1.0)  # The shortlist truncates the top-k boundary.
+    probe[2, -1] = -float("nan")
+    probe[3, 0] = float("inf")
+    probe[4, 0] = 200.0  # Avoid changing underflow behavior at p=1.
+    mask = sparse_rejection._compact_target_reference_rows(
+        probe, 0.7, 1.0, vocab_ordered=True
+    )
+    np.testing.assert_array_equal(mask, [False, True, True, True, True])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("amplitude", [0.01, 1.0, 20.0, 400.0])
+def test_gpu_reference_guard_preserves_cpu_boundary_fallbacks(amplitude):
+    torch.manual_seed(270927)
+    rows = 256
+    probe = (torch.randn(rows, 64, device="cuda") * amplitude).half().float()
+    probe = probe.sort(descending=True).values
+    probe[0].fill_(1.0)  # Truncated top-k tie.
+    probe[1, -1] = -float("nan")
+    probe[2, 0] = float("inf")
+    probe[3, 0] = 20000.0  # Retained probability underflows.
+    probe[4].fill_(-float("inf"))
+    temperature = torch.linspace(0.4, 1.5, rows, device="cuda")
+    top_p = torch.linspace(0.6, 1.0, rows, device="cuda")
+    mapping = torch.randperm(rows, device="cuda").int()
+    # Explicitly hit a top-p boundary, with nonidentity request-slot mapping.
+    support = probe[5, :20] / temperature[mapping[5]]
+    top_p[mapping[5]] = support.softmax(0)[:4].sum()
+    cpu = sparse_rejection._compact_target_reference_rows(
+        probe,
+        temperature[mapping].cpu().numpy(),
+        top_p[mapping].cpu().numpy(),
+        vocab_ordered=True,
+    )
+    gpu = sparse_rejection._compact_target_reference_rows_gpu(
+        probe, temperature, top_p, mapping
+    )
+    assert gpu[:6].all()
+    # The GPU's wider rounding margin may add conservative reference rows.
+    assert not (cpu & ~gpu).any()

@@ -8,7 +8,10 @@ import pytest
 import torch
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
-from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+from vllm.v1.sample.ops.topk_topp_triton import (
+    apply_top_k_top_p_triton,
+    sort_topk_with_vocab_ties,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     _compact_target_requires_reference,
@@ -51,6 +54,22 @@ def test_standalone_topp_ties_and_graph_capture():
         captured = apply_top_k_top_p_triton(x.clone(), None, p)
     graph.replay()
     assert torch.equal(captured, expected)
+
+
+@pytest.mark.parametrize("use_top_k", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mixed_cutoffs_keep_row_parameters(use_top_k):
+    x = torch.full((8, 32768), -20.0, device="cuda")
+    x[:, :32] = torch.arange(32, 0, -1, device="cuda") / 8
+    x[1::2, :24] = 1.0
+    x[1::2, :2] = 2.0
+    k = torch.tensor([8, 12, 16, 20] * 2, dtype=torch.int32, device="cuda")
+    p = torch.tensor([0.8, 0.95, 0.6, 1.0] * 2, device="cuda")
+    if not use_top_k:
+        k = None
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
 
 
 def test_compact_guard_only_rejects_ambiguous_cutoffs():
@@ -128,3 +147,123 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
         None,
     )
     assert result is None
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
+@pytest.mark.parametrize("vocab", [32768, 248320])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_large_batch_matches_reference(rows, vocab):
+    # Mix cutoff ties, more ties than the shortlist can hold, grammar masks,
+    # distinct cutoffs, and heterogeneous request parameters in one batch.
+    torch.manual_seed(1527)
+    x = (torch.randn(rows, vocab, device="cuda") * 1.5).half().float()
+    x[0].fill_(1.0)
+    x[1].fill_(-float("inf"))
+    x[1, :24] = 1.0
+    x[1, :2] = 2.0
+    x[2].fill_(-20.0)
+    x[2, -160:] = 3.0
+    x[3].fill_(-float("inf"))
+    x[3, 7] = 1.0
+    k = torch.tensor([1, 20, 64, 127] * (rows // 4), device="cuda")
+    p = torch.tensor([0.6, 0.8, 0.95, 1.0] * (rows // 4), device="cuda")
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("direction", [-1, 0, 1])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_top_p_rounding_boundary(direction):
+    torch.manual_seed(1528)
+    x = torch.randn(16, 32768, device="cuda")
+    k = torch.full((16,), 20, dtype=torch.int32, device="cuda")
+    ordered = x.sort(dim=-1).values
+    cutoff = ordered[:, -20:-19]
+    ordered.masked_fill_(ordered < cutoff, -float("inf"))
+    probabilities = ordered.softmax(-1).cumsum(-1)
+    p = 1 - probabilities[:, -9]
+    if direction:
+        p = torch.nextafter(p, torch.full_like(p, float("inf") * direction))
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("rows", [2, 8, 32])
+@pytest.mark.parametrize("vocab", [32768, 248320])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_ties_preserve_vocabulary_order(rows, vocab):
+    torch.manual_seed(1530)
+    x = torch.full((rows, vocab), -20.0, device="cuda")
+    # Scatter a split nucleus tie across radix-sort tiles and the shortlist's
+    # arbitrary topk order. It must keep the reference's exact token support.
+    for row in range(rows):
+        ids = torch.randperm(vocab, device="cuda")[:24]
+        x[row, ids] = 1.0
+        x[row, ids[:2]] = 2.0
+    k = torch.full((rows,), 20, dtype=torch.int32, device="cuda")
+    p = torch.full((rows,), 0.95, device="cuda")
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("mask_value", [float("-inf"), -1e9])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_changed_inputs_strides_and_large_k(mask_value):
+    torch.manual_seed(1529)
+    storage = torch.randn(16, 65536, device="cuda")
+    x = storage[:, ::2]
+    k = torch.full((16,), 20, dtype=torch.int32, device="cuda")
+    p = torch.full((16,), 0.8, device="cuda")
+    for amplitude in (0.1, 1.0, 3.0):
+        x.normal_(0, amplitude)
+        expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+        if mask_value != float("-inf"):
+            expected.masked_fill_(torch.isneginf(expected), mask_value)
+        actual = apply_top_k_top_p_triton(x, k, p, mask_value)
+        assert torch.equal(actual, expected)
+    # Large k must keep the existing general implementation.
+    k[::2] = 512
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("width", [21, 64, 128])
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
+    torch.manual_seed(1540)
+    ids = torch.stack(
+        [torch.randperm(248320, device="cuda")[: width + 3] for _ in range(8)]
+    )[:, :width]
+    storage = torch.randn(8, width + 3, device="cuda")
+    values = storage[:, :width]
+    output = sort_topk_with_vocab_ties(
+        values, ids, vocab_size=248320, descending=descending
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = sort_topk_with_vocab_ties(
+            values, ids, vocab_size=248320, descending=descending
+        )
+    for amplitude in (0.1, 2.0):
+        values.normal_(0, amplitude)
+        values[:, :12] = 1.0
+        values[:, 12:18] = torch.tensor(
+            [-0.0, 0.0, -float("inf"), float("inf"), float("nan"), -float("nan")],
+            device="cuda",
+        )
+        ordered_ids, permutation = ids.sort(dim=-1, descending=descending)
+        ordered_values = values.gather(1, permutation)
+        ordered_values, permutation = ordered_values.sort(
+            dim=-1, descending=descending, stable=True
+        )
+        ordered_ids = ordered_ids.gather(1, permutation)
+        graph.replay()
+        assert torch.equal(output[1], ordered_ids)
+        assert torch.equal(
+            output[0].view(torch.int32), ordered_values.view(torch.int32)
+        )
