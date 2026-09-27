@@ -387,4 +387,8 @@ Raw results and exact fixture hashes are recorded under artifact key
 `21b4cfa0de925a55cbb739d42b1344d20fe6370ed45154f387d34f21e9f4ca54`;
 the supplemental fixture SHA256 is
 `0e4dd476651529988cada66e45526239c0fbe2f47b4c2ffde6e1e6a48ff05e16`.
-PR #706 remains draft pending diagnosis of the primary acceptance finding.
+The initial review kept PR #706 in draft while this finding was investigated.
+After reviewing these results on 2026-09-27, the project owner explicitly
+approved integration with the C2 acceptance finding retained as follow-up.
+This approval does not reclassify the failed acceptance check as a pass or
+claim that its cause has been resolved.
