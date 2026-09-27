@@ -29,6 +29,7 @@ _HIDDEN_SIZE = 2560
 _LAYERS = 48
 _MTP5_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5"
 _BATCH_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH"
+_FASTPATH_ENV = "VLLM_SM70_QWEN38_BATCH_FASTPATH"
 
 
 def _make_inputs(rank: int, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,7 +56,8 @@ def _capture_round(
     tokens: int,
 ) -> tuple[torch.cuda.CUDAGraph, list[torch.Tensor]]:
     os.environ[_MTP5_ENV] = "1" if push and tokens == 5 else "0"
-    os.environ[_BATCH_ENV] = "1" if push and tokens in (4, 8, 16) else "0"
+    os.environ[_BATCH_ENV] = "1" if push and tokens in (2, 4, 8, 16) else "0"
+    os.environ[_FASTPATH_ENV] = "1" if push and tokens == 2 else "0"
     torch.accelerator.synchronize()
     dist.barrier()
     regular_outputs = [torch.empty_like(input_a) for _ in range(_LAYERS)]
@@ -116,7 +118,7 @@ def _compare_outputs(
     max_abs_diff = 0.0
     first_mismatch: dict[str, Any] | None = None
     for index, (control, push) in enumerate(zip(baseline, candidate, strict=True)):
-        mismatch = control != push
+        mismatch = control.view(torch.int16) != push.view(torch.int16)
         count = int(mismatch.sum().item())
         mismatch_count += count
         diff = (control.float() - push.float()).abs()
@@ -192,7 +194,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--timing-repeats", type=int, default=4)
-    parser.add_argument("--tokens", type=int, choices=(4, 5, 8, 16), default=5)
+    parser.add_argument("--tokens", type=int, choices=(2, 4, 5, 8, 16), default=5)
     parser.add_argument("--json-out")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0 or args.timing_repeats <= 0:
@@ -307,6 +309,7 @@ def main() -> None:
     finally:
         os.environ[_MTP5_ENV] = "0"
         os.environ[_BATCH_ENV] = "0"
+        os.environ[_FASTPATH_ENV] = "0"
         communicator.close()
         dist.destroy_process_group(gloo_group)
         dist.destroy_process_group()

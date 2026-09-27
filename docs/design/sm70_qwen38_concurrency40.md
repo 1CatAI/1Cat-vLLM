@@ -2,6 +2,11 @@
 
 ## Acceptance target, not a performance claim
 
+Status update: the initial sections below record research-only screens.
+An opt-in native runtime candidate is now being integrated; see
+"C1-to-batch runtime candidate" below. It is **not yet an accepted endpoint
+speed or quality result** and remains disabled by default.
+
 Integration base: `1e90d17f2c75e443b2a85a576ed68fa04c5f9dd6` (`onecat/main`).
 Scope: Qwen3.8 Flash-Next NVFP4, V100-SXM2-32GB, TP4, no MTP. Improve
 C2/C4 and obtain at least **40% more aggregate decode throughput at both
@@ -275,3 +280,52 @@ Both source-built research modules exited normally and released all four
 cards. CPU contract tests: 21 passed. The original cuBLAS/all-reduce benchmark
 `benchmark_sm70_hc_batch_tp4.py` remains unchanged; the new native screen has
 its own filename. No production path/default, KV format or DCP work changed.
+
+## C1-to-batch runtime candidate
+
+One default-off admission switch, `VLLM_SM70_QWEN38_BATCH_FASTPATH=1`, now
+groups the following source-built candidates. The existing checkpoint-FP16
+GEMV, fused HC/GDN and TP4 push routes must also be admitted by the normal
+Qwen3.8 runtime profile. The candidate targets SM70, TP4, FP16, M2–16, no
+speculation and no microbatch overlap; batch-invariant execution is excluded.
+C1 retains its existing kernels. Dynamic prefill retains the original
+weights and path. Unsupported layouts fall back to the ordinary operators.
+
+| Component | Batch implementation | Numerical contract |
+| --- | --- | --- |
+| HC down/up | Quarter-output TP4 projections, two dedicated gathers, fused SiLU and gate/mix | Twenty ordered K512 FP32 partials for down; original up K order; original FP16 boundaries |
+| GDN input | Packed QKVZ and b/a projection with output splitting in the epilogue | Ordered FP32 QKVZ; four original b/a partitions and left-to-right FP32 reduction |
+| Shared gate | Keep the original linear; fuse only sigmoid and multiply | FP16 sigmoid materialization before FP16 multiply |
+| C2 communication | Admit 10-KiB ordinary and sum2 push collectives | Unchanged rank-ordered FP32 sum and FP16 result |
+
+HC is new native integration of this PR's arithmetic screen. GDN and gate
+reuse the exact candidates from PR #692, not its unqualified grouped-MoE
+or altered gate-dot candidates. The code ships in the normal `_C` extension
+and its owning `_custom_ar` namespace, with no private DSO dependency.
+
+The HC transport differs from the research sentinel screen: each FP16
+payload travels with an epoch tag in the same 32-bit word. Down/output
+channels are disjoint from M1 HC and auxiliary-stream MoE collectives.
+Consumed packets are cleared, so inactive lanes cannot retain a valid tag
+when a graph changes batch size. The transport preserves every half bit
+without reserving a floating-point value. Consequently, the old research
+timings and correctness tests do **not** qualify the new native transport.
+Native TP4 changed-input/changed-batch graph validation is mandatory.
+
+Keeping the original fallback weights adds 330 MiB HC plus 725.625 MiB GDN
+packed storage per rank (1055.625 MiB total), plus 364.25 KiB/rank of HC
+communication buffers. This must be included in the model/KV memory budget.
+Per-call workspaces are small FP32 partials and FP16 outputs, not another
+model-sized allocation. Do not promote based on isolated hot-cache timing.
+
+The admitted Qwen3.8/SM70 FP16 runtime now explicitly disables FP16 and BF16
+reduced-precision GEMM reduction and FP16 accumulation for **both control
+and candidate**, even if the GEMV switch is off. An older result collected
+with different Torch precision flags is not a matched control.
+
+Current integration validation: 63 CPU layout/admission/fake-export tests
+passed; 28 GPU tests were deliberately skipped with CUDA hidden. This is
+not CUDA arithmetic or performance evidence. Native source build, actual
+TP4 runtime graphs, all-layer quality and matched endpoint measurements
+remain acceptance gates. There is no new decode-speed claim or default-on
+decision in this update.

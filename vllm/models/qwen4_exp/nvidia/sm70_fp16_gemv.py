@@ -261,11 +261,56 @@ direct_register_custom_op(
 )
 
 
+def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Copy FP16 bits into N32/K16 tiles; retain originals for M1/prefill."""
+    if weight.dtype != torch.float16 or weight.shape not in ((4096, 2560), (24, 2560)):
+        raise ValueError("Unsupported packed GDN input weight")
+    weight = weight.detach()
+    if weight.shape[0] == 24:
+        weight = torch.cat((weight, weight.new_zeros((8, 2560))))
+    return weight.reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+
+
+def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
+    return bool(
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        and not envs.VLLM_BATCH_INVARIANT
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 16
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and packed_qkvz is not None
+        and packed_ba is not None
+        and packed_qkvz.shape == (128, 160, 2, 32, 8)
+        and packed_ba.shape == (1, 160, 2, 32, 8)
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (packed_qkvz, packed_ba)
+        )
+        and current_platform.is_device_capability(70)
+    )
+
+
 def _qwen38_sm70_fp16_gdn_input(
     x: torch.Tensor,
     qkvz_weight: torch.Tensor,
     ba_weight: torch.Tensor,
+    packed_qkvz: torch.Tensor | None = None,
+    packed_ba: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
+        qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
+        torch.ops._C.qwen38_gdn_input_batch_sm70_out(
+            qkv, z, b, a, x, packed_qkvz, packed_ba
+        )
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled.")
+        return qkv, z, b, a
     if not (
         qkvz_weight.shape == (4096, 2560)
         and ba_weight.shape == (24, 2560)
@@ -308,8 +353,10 @@ def _qwen38_sm70_fp16_gdn_input_fake(
     x: torch.Tensor,
     qkvz_weight: torch.Tensor,
     ba_weight: torch.Tensor,
+    packed_qkvz: torch.Tensor | None = None,
+    packed_ba: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del qkvz_weight, ba_weight
+    del qkvz_weight, ba_weight, packed_qkvz, packed_ba
     batch_shape = x.shape[:-1]
     return (
         x.new_empty((*batch_shape, 2560)),
@@ -327,7 +374,24 @@ direct_register_custom_op(
 
 
 class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
-    """Use the row-GEMV custom op for admitted single-token projections."""
+    """Prepare admitted FP16 projections; use row GEMV for single tokens."""
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
+            from .sm70_fp16_hc import _prepare_hc_batch_weight
+
+            _prepare_hc_batch_weight(layer)
+        if not getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):
+            return
+        weight = layer.weight
+        if not weight.is_cuda or weight.dtype != torch.float16:
+            return  # The PLE-only/meta loader does not execute GPU projections.
+        if not hasattr(torch.ops._C, "qwen38_gdn_input_batch_sm70_out"):
+            raise RuntimeError("Rebuild the SM70 extension for batched GDN input")
+        layer.register_buffer(
+            "_sm70_qwen38_gdn_packed", _pack_gdn_input_weight(weight), persistent=False
+        )
 
     def apply(
         self,
@@ -385,14 +449,31 @@ def _exact_runtime_contract(vllm_config=None) -> bool:
     )
 
 
+def _batch_runtime_contract(vllm_config=None) -> bool:
+    if not _exact_runtime_contract(vllm_config) or envs.VLLM_BATCH_INVARIANT:
+        return False
+    config = vllm_config or get_current_vllm_config()
+    return bool(
+        config.speculative_config is None
+        and not getattr(config.parallel_config, "use_ubatching", False)
+    )
+
+
 def enable_qwen38_sm70_fp16_gemv(
     module: nn.Module, dtype: torch.dtype, vllm_config=None
 ) -> None:
     """Replace admitted unquantized methods before checkpoint loading."""
-    if not envs.VLLM_SM70_QWEN38_FP16_GEMV:
-        return
     capability_ok = current_platform.is_device_capability((7, 0))
     contract_ok = _exact_runtime_contract(vllm_config)
+    if capability_ok and contract_ok and dtype == torch.float16:
+        # The control and candidate both use FP32 accumulation/reduction.
+        # Never recover throughput by truncating intermediate GEMM sums.
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_fp16_accumulation = False
+        logger.info_once("SM70 Qwen3.8 FP32 GEMM accumulation/reductions required.")
+    if not envs.VLLM_SM70_QWEN38_FP16_GEMV:
+        return
     if (
         envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
         or dtype != torch.float16
@@ -450,6 +531,12 @@ def enable_qwen38_sm70_fp16_gemv(
             ):
                 continue
             child.sm70_qwen38_fp16_fused_input = True
+            if envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and _batch_runtime_contract(
+                vllm_config
+            ):
+                assert qkvz is not None and ba is not None
+                qkvz._sm70_qwen38_prepare_gdn_batch = True
+                ba._sm70_qwen38_prepare_gdn_batch = True
             fused_gdn_inputs += 1
 
     if replaced:
