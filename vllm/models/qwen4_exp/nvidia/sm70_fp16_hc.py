@@ -85,7 +85,7 @@ def _batch_runtime_ok(x, packed_down, packed_up) -> bool:
         and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 16
+        and x.shape[0] in (5, 10)
         and x.shape[1] == _HC_HIDDEN
         and x.is_cuda
         and x.dtype == torch.float16
@@ -381,6 +381,7 @@ def _qwen38_sm70_fp16_fused_hc(
                 block,
                 injection,
                 round_down_partials=True,
+                cooperative=envs.VLLM_SM70_MTP_HC_COOPERATIVE,
             )
             logger.info_once(
                 "SM70 MTP4 TP4 batched HC with FP16 split partials enabled."

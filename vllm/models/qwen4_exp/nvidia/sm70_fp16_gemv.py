@@ -228,9 +228,51 @@ def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Keep four K640 partitions contiguous for each N8 output tile."""
+    if weight.dtype != torch.float16 or weight.shape != (512, 2560):
+        raise ValueError("Batch router packing requires FP16 [512, 2560]")
+    return (
+        weight.detach()
+        .reshape(64, 8, 4, 40, 2, 8)
+        .permute(0, 3, 4, 2, 1, 5)
+        .contiguous()
+    )
+
+
+def _router_batch_runtime_ok(x, packed) -> bool:
+    return bool(
+        envs.VLLM_SM70_MTP_ROUTER_BATCH
+        and not envs.VLLM_BATCH_INVARIANT
+        and x.ndim == 2
+        and x.shape[0] in (5, 10)
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and packed is not None
+        and packed.shape == (64, 40, 2, 4, 8, 8)
+        and packed.device == x.device
+        and packed.dtype == x.dtype
+        and packed.is_contiguous()
+        and packed.data_ptr() % 16 == 0
+        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+    )
+
+
 def _qwen38_sm70_fp16_gemv(
-    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    role: str = "",
+    packed_router: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if role.endswith(_ROUTER_SUFFIX) and _router_batch_runtime_ok(x, packed_router):
+        out = x.new_empty((x.shape[0], 512))
+        torch.ops._C.qwen38_router_batch_sm70_out(out, x, packed_router)
+        logger.info_once("SM70 MTP4 batch router with ordered FP32 splits enabled.")
+        return out
     shape = (weight.shape[0], weight.shape[1])
     plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
     if plan is None or not _runtime_ok(x, weight):
@@ -251,7 +293,10 @@ def _qwen38_sm70_fp16_gemv(
 
 
 def _qwen38_sm70_fp16_gemv_fake(
-    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    role: str = "",
+    packed_router: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
@@ -384,6 +429,16 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
             from .sm70_fp16_hc import _prepare_hc_batch_weight
 
             _prepare_hc_batch_weight(layer)
+        if getattr(layer, "_sm70_mtp_prepare_router_batch", False):
+            weight = layer.weight
+            if weight.is_cuda and weight.dtype == torch.float16:
+                if not hasattr(torch.ops._C, "qwen38_router_batch_sm70_out"):
+                    raise RuntimeError("Rebuild the SM70 extension for batch router")
+                layer.register_buffer(
+                    "_sm70_mtp_router_packed",
+                    _pack_router_batch_weight(weight),
+                    persistent=False,
+                )
         if not getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):
             return
         weight = layer.weight
@@ -406,7 +461,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         # prefill branch.
         if bias is None and use_sm70_decode_graph_semantics():
             return torch.ops.vllm.qwen38_sm70_fp16_gemv(
-                x, layer.weight, getattr(layer, "prefix", "")
+                x,
+                layer.weight,
+                getattr(layer, "prefix", ""),
+                getattr(layer, "_sm70_mtp_router_packed", None),
             )
         return super().apply(layer, x, bias)
 
@@ -489,6 +547,13 @@ def enable_qwen38_sm70_fp16_gemv(
         if _plan_for(str(getattr(child, "prefix", "")), shape) is None:
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
+        if envs.VLLM_SM70_MTP_ROUTER_BATCH and str(
+            getattr(child, "prefix", "")
+        ).endswith(_ROUTER_SUFFIX):
+            from .sm70_fp16_hc import _mtp_batch_runtime_contract
+
+            if _mtp_batch_runtime_contract(vllm_config):
+                child._sm70_mtp_prepare_router_batch = True
         replaced += 1
 
     fused_gdn_inputs = 0

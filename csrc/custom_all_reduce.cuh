@@ -134,15 +134,16 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
 constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
 // Separate channels preserve half bits and isolate batch HC from M1/MoE.
 constexpr size_t kSm70Qwen38HcBatchOutputOffset =
-    kSm70Qwen38HcBatchDownOffset + 128 +
+    kSm70Qwen38HcBatchDownOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 88 * sizeof(uint32_t);
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
-    kSm70Qwen38HcBatchOutputOffset + 128 +
+    kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));

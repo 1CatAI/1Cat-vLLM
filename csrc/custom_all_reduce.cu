@@ -815,7 +815,8 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor packed_down, torch::Tensor packed_up,
                           torch::Tensor partials, torch::Tensor lora,
                           torch::Tensor local_output, torch::Tensor output,
-                          torch::Tensor injection, bool round_down_partials) {
+                          torch::Tensor injection, bool round_down_partials,
+                          bool cooperative) {
 #if defined(USE_ROCM)
   TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
 #else
@@ -861,7 +862,7 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
       reinterpret_cast<half*>(local_output.data_ptr()),
       reinterpret_cast<half*>(output.data_ptr()),
       reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
-      c10::cuda::getCurrentCUDAStream().stream());
+      cooperative, c10::cuda::getCurrentCUDAStream().stream());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 }

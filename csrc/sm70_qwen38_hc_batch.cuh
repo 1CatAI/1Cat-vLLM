@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #pragma once
+#include <cooperative_groups.h>
 
 // Selected arithmetic from the exact HC batch screen. Included after
 // custom_all_reduce.cuh; runtime ownership stays with that communicator.
@@ -36,15 +37,15 @@ __device__ __forceinline__ float sigmoid(float x) {
 // PairRows shares the same 16-byte weight load across two independent M8
 // accumulators. The K sequence in each accumulator is unchanged.
 template <bool PairRows, int Warps, int Unroll, bool FuseMix>
-__global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
+__device__ __forceinline__ void hc_up_batch_body(
     const half* __restrict__ lora, const half* __restrict__ packed,
     const half* __restrict__ branches, half* __restrict__ out, int rows,
-    int hidden, int hidden_offset) {
+    int hidden, int hidden_offset, int block_x, int block_y) {
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
-  const int tile = blockIdx.x * Warps + warp;
+  const int tile = block_x * Warps + warp;
   if (tile >= hidden / 8) return;
-  const int group = PairRows ? 0 : blockIdx.y;
+  const int group = PairRows ? 0 : block_y;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int branch = (lane >> 2) & 3;
   const int col = branch * 8 + r;
@@ -105,17 +106,27 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
   }
 }
 
+template <bool PairRows, int Warps, int Unroll, bool FuseMix>
+__global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
+    const half* lora, const half* packed, const half* branches, half* out,
+    int rows, int hidden, int hidden_offset) {
+  hc_up_batch_body<PairRows, Warps, Unroll, FuseMix>(
+      lora, packed, branches, out, rows, hidden, hidden_offset, blockIdx.x,
+      blockIdx.y);
+}
+
 template <bool PairRows, int Warps, bool WarpM16, int N = 352,
           bool RoundPartials = false>
-__global__ __launch_bounds__(32 * Warps, 4) void hc_down_partials(
+__device__ __forceinline__ void hc_down_partials_body(
     const half* __restrict__ x, const half* __restrict__ packed,
-    float* __restrict__ partials, int rows) {
+    float* __restrict__ partials, int rows, int block_x, int block_y,
+    int block_z) {
   constexpr int TileN = WarpM16 ? 16 : 32;
   const int lane = threadIdx.x % 32;
-  const int tile = blockIdx.x * Warps + threadIdx.x / 32;
+  const int tile = block_x * Warps + threadIdx.x / 32;
   if (tile >= N / TileN) return;
-  const int group = (PairRows || WarpM16) ? 0 : blockIdx.y;
-  const int split = blockIdx.z;
+  const int group = (PairRows || WarpM16) ? 0 : block_y;
+  const int split = block_z;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3;
   const int output_quad = WarpM16 ? quad % 2 : quad;
@@ -166,9 +177,18 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_down_partials(
   }
 }
 
+template <bool PairRows, int Warps, bool WarpM16, int N = 352,
+          bool RoundPartials = false>
+__global__ __launch_bounds__(32 * Warps, 4) void hc_down_partials(
+    const half* x, const half* packed, float* partials, int rows) {
+  hc_down_partials_body<PairRows, Warps, WarpM16, N, RoundPartials>(
+      x, packed, partials, rows, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
 template <bool Down>
-__global__ void gather(RankData buffers, const void* input, half* output,
-                       half* injection, int rank, int rows) {
+__device__ __forceinline__ void gather_body(RankData buffers, const void* input,
+                                            half* output, half* injection,
+                                            int rank, int rows, int block) {
   constexpr int cols = Down ? 88 : 640;
   constexpr int packs_per_row = cols / 8;
   constexpr int stride = 16 * cols;
@@ -178,10 +198,10 @@ __global__ void gather(RankData buffers, const void* input, half* output,
       const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
       channel;
   auto* counters = reinterpret_cast<uint32_t*>(local);
-  const uint32_t epoch = counters[blockIdx.x];
+  const uint32_t epoch = counters[block];
   const uint32_t tag = epoch + 1u;  // Zero is always an empty packet.
   const int slot = epoch * 4 * stride;
-  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+  const int offset = block * blockDim.x + threadIdx.x;
   if (offset < rows * packs_per_row) {
     const int row = offset / packs_per_row;
     const int col = (offset % packs_per_row) * 8;
@@ -213,15 +233,15 @@ __global__ void gather(RankData buffers, const void* input, half* output,
     for (int peer = 0; peer < 4; ++peer) {
       auto* dest =
           const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
-          channel + 128;
+          channel + kSm70Qwen38HcBatchCounterBytes;
       dest += (slot + rank * stride) * sizeof(uint32_t);
       sm70_push_store_volatile_16b(lo, dest, offset * 2);
       sm70_push_store_volatile_16b(hi, dest, offset * 2 + 1);
     }
 #pragma unroll
     for (int peer = 0; peer < 4; ++peer) {
-      const void* source =
-          local + 128 + (slot + peer * stride) * sizeof(uint32_t);
+      const void* source = local + kSm70Qwen38HcBatchCounterBytes +
+                           (slot + peer * stride) * sizeof(uint32_t);
       uint4 a, b;
       do {
         sm70_push_load_volatile_16b(a, source, offset * 2);
@@ -253,14 +273,56 @@ __global__ void gather(RankData buffers, const void* input, half* output,
     }
   }
   __syncthreads();
-  if (threadIdx.x == 0) counters[blockIdx.x] = (epoch + 1u) & 1u;
+  if (threadIdx.x == 0) counters[block] = (epoch + 1u) & 1u;
+}
+
+template <bool Down>
+__global__ void gather(RankData buffers, const void* input, half* output,
+                       half* injection, int rank, int rows) {
+  gather_body<Down>(buffers, input, output, injection, rank, rows, blockIdx.x);
+}
+
+// The same arithmetic and half+tag transport as the four-launch path.
+// All CTAs reside together; grid barriers close only local data dependencies.
+__global__ __launch_bounds__(32, 4) void hc_cooperative(
+    RankData buffers, int rank, const half* input, const half* packed_down,
+    const half* packed_up, float* partials, half* lora, half* local_output,
+    half* output, half* injection, int rows) {
+  const int block = blockIdx.x, groups = (rows + 7) / 8;
+  auto grid = cooperative_groups::this_grid();
+  if (block < 60 * groups)
+    hc_down_partials_body<false, 1, false, 96, true>(
+        input, packed_down, partials, rows, block % 3, (block / 3) % groups,
+        block / (3 * groups));
+  grid.sync();
+  if (block < (rows * 11 + 31) / 32)
+    gather_body<true>(buffers, partials, lora, injection, rank, rows, block);
+  grid.sync();
+  hc_up_batch_body<false, 1, 4, true>(lora, packed_up, input, local_output,
+                                      rows, 640, rank * 640, block % 80,
+                                      block / 80);
+  grid.sync();
+  if (block < (rows * 80 + 31) / 32)
+    gather_body<false>(buffers, local_output, output, injection, rank, rows,
+                       block);
 }
 
 inline void launch(RankData buffers, int rank, const half* input,
                    const half* packed_down, const half* packed_up,
                    float* partials, half* lora, half* local_output,
                    half* output, half* injection, int rows, bool round_partials,
-                   cudaStream_t stream) {
+                   bool cooperative, cudaStream_t stream) {
+  if (cooperative) {
+    TORCH_CHECK(round_partials,
+                "Cooperative HC requires the MTP FP16 contract");
+    void* args[] = {&buffers,   &rank,      &input, &packed_down,
+                    &packed_up, &partials,  &lora,  &local_output,
+                    &output,    &injection, &rows};
+    CUDACHECK(cudaLaunchCooperativeKernel(
+        reinterpret_cast<void*>(hc_cooperative), dim3(80 * ((rows + 7) / 8)),
+        dim3(32), args, 0, stream));
+    return;
+  }
   if (round_partials) {
     hc_down_partials<false, 1, false, 96, true>
         <<<dim3(3, (rows + 7) / 8, 20), 32, 0, stream>>>(input, packed_down,
