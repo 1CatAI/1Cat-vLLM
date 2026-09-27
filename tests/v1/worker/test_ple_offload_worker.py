@@ -617,6 +617,7 @@ def test_ple_offload_requires_ple_layers(
     assert worker._has_ple_layers() is expected
 
 
+@pytest.mark.parametrize("pipeline_parallel_size", [1, 4])
 @pytest.mark.parametrize(
     ("architecture", "enable_expert_parallel"),
     [
@@ -629,6 +630,7 @@ def test_ple_offload_uses_capability_not_model_identity(
     monkeypatch: pytest.MonkeyPatch,
     architecture: str,
     enable_expert_parallel: bool,
+    pipeline_parallel_size: int,
 ) -> None:
     worker = Worker.__new__(Worker)
     worker.use_v2_model_runner = True
@@ -638,7 +640,7 @@ def test_ple_offload_uses_capability_not_model_identity(
         data_parallel_backend="mp",
         data_parallel_size_local=1,
         data_parallel_size=1,
-        pipeline_parallel_size=1,
+        pipeline_parallel_size=pipeline_parallel_size,
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
         enable_expert_parallel=enable_expert_parallel,
