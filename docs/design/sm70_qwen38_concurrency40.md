@@ -320,7 +320,7 @@ timings and correctness tests do **not** qualify the new native transport.
 Native TP4 changed-input/changed-batch graph validation is mandatory.
 
 Keeping the original fallback weights adds 330 MiB HC plus 725.625 MiB GDN
-packed storage per rank (1055.625 MiB total), plus 364.25 KiB/rank of HC
+packed storage per rank (1055.625 MiB total), plus 684.875 KiB/rank of HC
 communication buffers. This must be included in the model/KV memory budget.
 Per-call workspaces are small FP32 partials and FP16 outputs, not another
 model-sized allocation. Do not promote based on isolated hot-cache timing.
@@ -446,9 +446,89 @@ argument and direct row-major native entry are retained only to reproduce
 the rejected screens; the model continues to use its existing score tile
 and the opt-in packed GDN route.
 
-The next distinct native screen targets router (N512/K2560, four K640
-partitions) and attention output (N2560/K1536, two K768 partitions): retain
-the original FP32 K order, fuse partition reduction, and use original
-row-major weights. Its build and direct benchmark entry do **not** establish
-numerical or speed qualification. No runtime admission or model throughput
-claim is made for this unfinished screen.
+### Dense contract correction and guarded integration
+
+The first native dense screen was rejected: router was exact but slower;
+output had small bit differences. A fresh CUDA-graph-node trace with all
+three low-precision Torch options disabled shows **four** output K384
+partitions, not the older two K768 assumption. Do not recover the obsolete
+tree by enabling FP16 reduction. The corrected native kernel gives each
+independent m8n8k4 quad pair one original FP32 partition and reduces the
+four values left-to-right. N8 tiles spread work across more CTAs, without
+packing/duplicating weights or changing the reduction tree.
+
+Twenty direct native GPU tests pass. All 48 router and 48 output weights,
+all four logical TP slices and six scales pass exact FP16-bit comparisons.
+Rank0 C2 48-layer graphs: router 0.556636 -> 0.503532 ms, output
+0.802499 -> 0.610724 ms. Router M8/M16 and output M16 have no win; runtime
+admission under the existing default-off switch is restricted to router
+M2..4 and output M2..8. Loader permission excludes speculation/microbatching;
+C1, unsupported roles, layouts and widths keep their existing dispatch.
+Fifteen additional GPU route/fallback tests pass through the registered
+opaque Python op, including unchanged C1 and rejected larger widths.
+
+Raw: `dense_contract.{qdstrm,nsys-rep,sqlite}`,
+`dense_batch_v1_rank0.json` (rejected), `dense_batch_quad_v2_rank0.json`,
+`dense_batch_quad_rank{1,2,3}.json`, `dense_runtime_gpu_tests.log` (35 passed).
+Rank0 measurements used GPU4; the remaining logical slices used idle GPU0.
+These are component results, not four-rank model endpoint measurements.
+
+### Native HC fusion continuation
+
+The eight-pair native trace `hc_native_chain_v1.sqlite` identifies the two
+gathers as a large remaining cost. Excluding the first pair of each graph
+replay avoids attributing host rank-start skew to normal gather work.
+Stable rank0 median per-pair C2 kernel durations are approximately down
+7.92 us, reduce/down-gather 7.22 us, up/mix 6.50 us and output-gather
+6.69 us. These are instrumented primitive durations, not token latency.
+
+The admitted candidate now has three kernels: down partials, coalesced
+ordered down reduction/gather, and fused up/mix/output gather. The down
+stage assigns contiguous FP32 columns to adjacent lanes instead of eight
+interleaved columns per thread. Up retains its ordered K320 MMA, FP16 gate
+boundary and branch-ordered mix. Its MMA fragments are retiled in shared
+memory into exact half+tag packets; a dedicated tile-major channel keeps
+it independent of the old row-major gather and auxiliary-stream collectives.
+The new channel adds 320.625 KiB/rank (included in the total above).
+
+Same-process TP4 GPU0..3 A/B, 96 actual weight pairs, median slowest rank,
+CUDA12.8/Torch2.10.0+cu128, V100-SXM2-32GB, no low-precision reductions:
+
+| Width | Previous native four-kernel ms | New three-kernel ms | Saving ms |
+| ---: | ---: | ---: | ---: |
+| C2 | 2.506987 | 1.940011 | 0.566976 |
+| C4 | 2.694144 | 2.001600 | 0.692544 |
+| C8 | 3.013163 | 2.143125 | 0.870037 |
+| C16 | 3.547691 | 2.342251 | 1.205440 |
+
+This is the communication-inclusive 96-pair HC micro-chain, **excluding
+combine/norm and the rest of the model**. It is not a model-level +40%
+result. Repeated C2 at the end is 2.506133 -> 1.936875 ms.
+Every rank passes LoRA/output/injection bit comparisons at all six scales.
+Twenty-seven mixed-width/old-new-path transitions also pass. The benchmark
+now executes one extra pair per transition: replaying a 96-pair graph once
+still increments epochs an even number of times, so the prior "odd graph
+replay" check alone did not test odd communication epochs.
+
+Native `_C` SHA256:
+`a971b81f891496d6742e29ae840b643815f167895904994755ca53222b4c0b1d`.
+Dynamic dependencies remain standard Torch/CUDA/C++/libc; no private DSO/RPATH.
+Raw: `hc_fused_chain_paired_v3.json`, with earlier staged results retained
+in `hc_fused_up_native_v1.json` and `hc_fused_up_coalesced_v2.json`.
+The v2 timing control already contained coalesced down; use **v3** to
+compare the complete old/new native paths in the same process.
+
+```bash
+VLLM_SM70_TP4_PUSH_ALLREDUCE=1 VLLM_SM70_QWEN38_BATCH_FASTPATH=1 \
+  .venv/bin/torchrun --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_batch_native_tp4.py --runtime \
+  --fused-chain --model /path/to/Qwen3.8-Flash-Next-NVFP4 --pairs 96 \
+  --rows 2,3,4,8,16,2 --out .artifacts/hc_fused_chain.json
+```
+
+The runtime selects the qualified three-kernel HC implementation and the
+guarded dense winners behind the **same default-off batch flag**, not new
+user tuning switches. CPU admission/export/wiring tests: 79 passed.
+No full-model startup or new endpoint speed/quality claim in this round.
+The packed-weight 256K-capacity gate and matched C1/C2 model validation
+remain open; C2 minus C1 <=3 ms and C8/C16 +40% are **not yet demonstrated**.

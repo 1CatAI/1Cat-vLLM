@@ -85,13 +85,15 @@ def reference(state, weight, rows):
         mix_reference[(rows, 5)](x, gate, out, 2560, 0, num_warps=4)
 
 
-def candidate(ext, gather, peers, state, weight, rank, communicator=None):
+def candidate(
+    ext, gather, peers, state, weight, rank, communicator=None, fused_chain=False
+):
     for (x, _, _, _, _, scratch, lora, local, output, injection), (_, _, d, u) in zip(
         state, weight
     ):
         if communicator is not None:
             communicator.sm70_qwen38_hc_batch(
-                x, d, u, scratch, lora, local, output, injection
+                x, d, u, scratch, lora, local, output, injection, fused_chain
             )
             continue
         ext.run_down_shard(x, d, scratch)
@@ -161,6 +163,10 @@ def main():
     p.add_argument("--rows", default="2,4,8,16")
     p.add_argument("--build-only", action="store_true")
     p.add_argument("--runtime", action="store_true")
+    p.add_argument("--fused-chain", action="store_true")
+    p.add_argument(
+        "--trace", action="store_true", help="Capture four graph replays per arm/width"
+    )
     a = p.parse_args()
     if not 1 <= a.pairs <= 96 or (not a.build_only and a.model is None):
         p.error("Use 1..96 HC pairs and specify --model")
@@ -170,6 +176,8 @@ def main():
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     if a.runtime and a.build_only:
         p.error("Build --runtime with the ordinary source build, not this JIT helper")
+    if a.fused_chain and not a.runtime:
+        p.error("--fused-chain requires the ordinary native --runtime")
     ext, gather = (None, None) if a.runtime else (build(), build_gather())
     if a.build_only:
         assert not torch.cuda.is_initialized()
@@ -252,6 +260,12 @@ def main():
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
         "runtime": a.runtime,
+        "fused_chain": a.fused_chain,
+        "timing_arms": (
+            ["native-four-kernel", "native-coalesced-fused-three-kernel"]
+            if a.fused_chain
+            else ["torch-reference", "candidate"]
+        ),
         "sha256": {
             str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (
@@ -288,6 +302,7 @@ def main():
     }
     a.out.parent.mkdir(parents=True, exist_ok=True)
     graphs = {}
+    split_graphs = {}
     for rows in map(int, a.rows.split(",")):
         if not 2 <= rows <= 16:
             p.error("HC batch supports M2..16")
@@ -311,9 +326,33 @@ def main():
             )
         bg = capture(partial(reference, state, weight, rows))
         cg = capture(
-            partial(candidate, ext, gather, peers, state, weight, rank, communicator)
+            partial(
+                candidate,
+                ext,
+                gather,
+                peers,
+                state,
+                weight,
+                rank,
+                communicator,
+                a.fused_chain,
+            )
         )
         graphs[rows] = (bg, cg, state)
+        if a.fused_chain:
+            split_graphs[rows] = capture(
+                partial(
+                    candidate,
+                    ext,
+                    gather,
+                    peers,
+                    state,
+                    weight,
+                    rank,
+                    communicator,
+                    False,
+                )
+            )
         checks = []
         for scale in (0.0, 0.001, 0.03, 0.1, 1.0, 3.0):
             for tensors in state:
@@ -344,7 +383,9 @@ def main():
                 pair = [None, None]
                 for arm in (0, 1) if trial % 2 == 0 else (1, 0):
                     dist.barrier()
-                    latency = time_graph((bg, cg)[arm], len(weight))
+                    latency = time_graph(
+                        (split_graphs.get(rows, bg), cg)[arm], len(weight)
+                    )
                     times = [None] * 4
                     dist.all_gather_object(times, latency)
                     pair[arm] = times
@@ -376,11 +417,58 @@ def main():
             for output in tensors[5:]:
                 output.fill_(float("nan"))
         bg.replay()
-        cg.replay()
-        errors = [None] * 4
-        dist.all_gather_object(errors, check(state))
-        transitions.append({"rows": rows, "rank_mismatches": errors})
+        paths = [("candidate", cg)]
+        if rows in split_graphs:
+            paths += [("native-split", split_graphs[rows]), ("candidate", cg)]
+        for label, graph in paths:
+            for output in state:
+                for tensor in output[5:]:
+                    tensor.fill_(float("nan"))
+            graph.replay()
+            # A graph containing 96 HC pairs advances each epoch an EVEN
+            # number of times even when replayed once. Execute one extra
+            # pair to really flip active counters before the next width/path.
+            candidate(
+                ext,
+                gather,
+                peers,
+                state[:1],
+                weight[:1],
+                rank,
+                communicator,
+                a.fused_chain and label == "candidate",
+            )
+            errors = [None] * 4
+            dist.all_gather_object(errors, check(state))
+            transitions.append(
+                {
+                    "rows": rows,
+                    "path": label,
+                    "extra_pair": True,
+                    "rank_mismatches": errors,
+                }
+            )
     result["graph_transitions"] = transitions
+    if a.trace:
+        # Capture only warmed graphs. Timings above exclude these captured
+        # replays; neither is an extrapolated model-token measurement.
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 0:
+            torch.cuda.cudart().cudaProfilerStart()
+        for rows, (bg, cg, _) in graphs.items():
+            for label, graph in (
+                ("control", split_graphs.get(rows, bg)),
+                ("candidate", cg),
+            ):
+                dist.barrier()
+                with torch.cuda.nvtx.range(f"hc-m{rows}-{label}-rank{rank}"):
+                    for _ in range(4):
+                        graph.replay()
+                torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 0:
+            torch.cuda.cudart().cudaProfilerStop()
     torch.cuda.synchronize()
     dist.barrier()
     for channel in peers:

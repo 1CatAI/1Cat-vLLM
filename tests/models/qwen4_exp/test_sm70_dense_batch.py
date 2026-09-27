@@ -65,3 +65,38 @@ def test_dense_batch_unaligned_input_rejected():
     out = torch.empty(2, 512, dtype=torch.float16, device="cuda")
     with pytest.raises(RuntimeError, match="aligned contiguous FP16"):
         torch.ops._C.qwen38_dense_batch_sm70_out(out, x, w)
+
+
+@pytest.mark.parametrize("m", (1, 2, 4, 8, 16))
+@pytest.mark.parametrize(
+    "role,n,k,limit",
+    (
+        ("mlp.gate", 512, 2560, 4),
+        ("linear_attn.out_proj", 2560, 1536, 8),
+        ("self_attn.o_proj", 2560, 1536, 8),
+    ),
+)
+def test_dense_runtime_route_and_fallback_bits(m, role, n, k, limit, monkeypatch):
+    import vllm.envs as envs
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    torch.manual_seed(20928)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.02
+    role = "model.layers.0." + role
+    reference = gemv._qwen38_sm70_fp16_gemv(x, w, role, False)
+    original = torch.ops._C.qwen38_dense_batch_sm70_out
+    calls = []
+
+    def tracked(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(torch.ops._C, "qwen38_dense_batch_sm70_out", tracked)
+    actual = torch.ops.vllm.qwen38_sm70_fp16_gemv(x, w, role, True)
+    assert len(calls) == int(2 <= m <= limit)
+    assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
+    envs.disable_envs_cache()

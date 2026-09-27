@@ -5,6 +5,8 @@
 The route is deliberately narrow: exact Qwen3.8 Flash Next topology, TP4,
 no speculation or MTP4, FP16 checkpoint weights, and one decode token. All
 prefill and unsupported shapes retain the ordinary unquantized linear path.
+The separate default-off batch switch admits only measured router/output
+winners without speculation; it does not change the M1 arithmetic.
 """
 
 from __future__ import annotations
@@ -227,8 +229,13 @@ def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 def _qwen38_sm70_fp16_gemv(
-    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+    x: torch.Tensor, weight: torch.Tensor, role: str = "", dense_batch: bool = False
 ) -> torch.Tensor:
+    if dense_batch and _can_use_dense_batch(x, weight, role):
+        out = x.new_empty((x.shape[0], weight.shape[0]))
+        torch.ops._C.qwen38_dense_batch_sm70_out(out, x, weight)
+        logger.info_once("SM70 Qwen3.8 exact small-batch dense projections enabled.")
+        return out
     shape = (weight.shape[0], weight.shape[1])
     plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
     if plan is None or not _runtime_ok(x, weight):
@@ -249,7 +256,7 @@ def _qwen38_sm70_fp16_gemv(
 
 
 def _qwen38_sm70_fp16_gemv_fake(
-    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+    x: torch.Tensor, weight: torch.Tensor, role: str = "", dense_batch: bool = False
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
@@ -259,6 +266,34 @@ direct_register_custom_op(
     op_func=_qwen38_sm70_fp16_gemv,
     fake_impl=_qwen38_sm70_fp16_gemv_fake,
 )
+
+
+def _dense_batch_limit(role: str, shape: tuple[int, ...]) -> int:
+    # Reject measured regressions: router M8/M16 and output M16. The C1
+    # reduction is a different tree and must keep its existing route.
+    if role.endswith(_ROUTER_SUFFIX) and shape == (512, 2560):
+        return 4
+    if role.endswith((_GDN_OUT_SUFFIX, _QSA_OUT_SUFFIX)) and shape == (2560, 1536):
+        return 8
+    return 0
+
+
+def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bool:
+    return bool(
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        and not envs.VLLM_BATCH_INVARIANT
+        and _is_packed_row_major(x)
+        and _is_packed_row_major(weight)
+        and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))
+        and x.shape[1] == weight.shape[1]
+        and x.is_cuda
+        and weight.is_cuda
+        and x.dtype == weight.dtype == torch.float16
+        and x.device == weight.device
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+        and current_platform.is_device_capability(70)
+    )
 
 
 def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -378,6 +413,14 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        if (
+            getattr(layer, "_sm70_qwen38_dense_batch", False)
+            and layer.weight.is_cuda
+            and not hasattr(torch.ops._C, "qwen38_dense_batch_sm70_out")
+        ):
+            raise RuntimeError(
+                "Rebuild the SM70 extension for batched dense projections"
+            )
         if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
             from .sm70_fp16_hc import _prepare_hc_batch_weight
 
@@ -404,7 +447,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         # prefill branch.
         if bias is None and use_sm70_decode_graph_semantics():
             return torch.ops.vllm.qwen38_sm70_fp16_gemv(
-                x, layer.weight, getattr(layer, "prefix", "")
+                x,
+                layer.weight,
+                getattr(layer, "prefix", ""),
+                getattr(layer, "_sm70_qwen38_dense_batch", False),
             )
         return super().apply(layer, x, bias)
 
@@ -491,6 +537,9 @@ def enable_qwen38_sm70_fp16_gemv(
         return
 
     replaced = 0
+    batch_allowed = bool(
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and _batch_runtime_contract(vllm_config)
+    )
     for child in module.modules():
         if not (
             isinstance(child, LinearBase)
@@ -504,6 +553,10 @@ def enable_qwen38_sm70_fp16_gemv(
         if _plan_for(str(getattr(child, "prefix", "")), shape) is None:
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
+        child._sm70_qwen38_dense_batch = bool(
+            batch_allowed
+            and _dense_batch_limit(str(getattr(child, "prefix", "")), shape)
+        )
         replaced += 1
 
     fused_gdn_inputs = 0

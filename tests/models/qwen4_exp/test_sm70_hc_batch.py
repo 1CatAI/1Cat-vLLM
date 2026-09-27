@@ -182,3 +182,63 @@ def test_packed_hc_survives_fake_export():
         if node.target == torch.ops.vllm.qwen38_sm70_fp16_fused_hc.default
     ]
     assert len(calls) == 1 and len(calls[0].args) == 5
+
+
+def test_admitted_hc_selects_fused_native_output(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    calls = []
+    communicator = SimpleNamespace(
+        can_sm70_qwen38_hc_batch=lambda x: True,
+        sm70_qwen38_hc_batch=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(hc, "_batch_runtime_ok", lambda *args: True)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(
+            device_communicator=SimpleNamespace(ca_comm=communicator)
+        ),
+    )
+    x = torch.empty(2, 10240, dtype=torch.float16)
+    block, injection = hc._qwen38_sm70_fp16_fused_hc(x, x, x, x, x)
+    assert calls[0][1] == {"fused_chain": True}
+    assert calls[0][0][6] is block and calls[0][0][7] is injection
+    assert block.shape == (2, 2560) and injection.shape == (2, 4)
+
+
+@pytest.mark.parametrize(
+    "role,shape",
+    [
+        ("mlp.gate", (512, 2560)),
+        ("linear_attn.out_proj", (2560, 1536)),
+    ],
+)
+@pytest.mark.parametrize("policy", ("normal", "disabled", "mtp", "ubatch", "invariant"))
+def test_dense_loader_permission_respects_batch_contract(
+    config, monkeypatch, role, shape, policy
+):
+    class Dense(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(shape, device="meta"))
+            self.prefix = "model.layers.0." + role
+            self.quant_method = UnquantizedLinearMethod()
+
+    monkeypatch.setattr(gemv, "LinearBase", Dense)
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
+    monkeypatch.setenv(
+        "VLLM_SM70_QWEN38_BATCH_FASTPATH", str(int(policy != "disabled"))
+    )
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(policy == "invariant")))
+    if policy == "mtp":
+        config.speculative_config = SimpleNamespace(
+            method="mtp", num_speculative_tokens=4
+        )
+    if policy == "ubatch":
+        config.parallel_config.use_ubatching = True
+    layer = Dense()
+    gemv.enable_qwen38_sm70_fp16_gemv(layer, torch.float16, config)
+    assert layer._sm70_qwen38_dense_batch == (policy == "normal")

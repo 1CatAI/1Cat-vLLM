@@ -143,8 +143,16 @@ constexpr size_t kSm70Qwen38HcBatchDownOffset =
 constexpr size_t kSm70Qwen38HcBatchOutputOffset =
     kSm70Qwen38HcBatchDownOffset + 128 +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 88 * sizeof(uint32_t);
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+// Fused up/output uses one counter per hidden tile and M8 group. Keep a
+// separate channel: its tile-major packets must never alias the row-major
+// standalone gather when captured graphs alternate between the two paths.
+constexpr int kSm70Qwen38HcBatchFusedBlocks = 160;
+constexpr size_t kSm70Qwen38HcBatchFusedOffset =
     kSm70Qwen38HcBatchOutputOffset + 128 +
+    kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcBatchFusedOffset +
+    kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t) +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));

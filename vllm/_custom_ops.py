@@ -3106,9 +3106,19 @@ def sm70_qwen38_hc_batch(
     local_output: torch.Tensor,
     output: torch.Tensor,
     injection: torch.Tensor,
+    fused_chain: bool = False,
 ) -> None:
     _custom_ar_owner_namespace().sm70_qwen38_hc_batch(
-        fa, inp, packed_down, packed_up, partials, lora, local_output, output, injection
+        fa,
+        inp,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_output,
+        output,
+        injection,
+        fused_chain,
     )
 
 

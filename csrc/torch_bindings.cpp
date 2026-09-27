@@ -1074,7 +1074,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def(
       "sm70_qwen38_hc_batch(int fa, Tensor input, Tensor packed_down, "
       "Tensor packed_up, Tensor(a!) partials, Tensor(b!) lora, "
-      "Tensor(c!) local_output, Tensor(d!) output, Tensor(e!) injection) -> "
+      "Tensor(c!) local_output, Tensor(d!) output, Tensor(e!) injection, "
+      "bool fused_chain=False) -> "
       "()");
   custom_ar.impl("sm70_qwen38_hc_batch", torch::kCUDA, &sm70_qwen38_hc_batch);
   custom_ar.def(

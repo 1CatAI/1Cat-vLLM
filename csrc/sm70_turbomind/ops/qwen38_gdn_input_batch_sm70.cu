@@ -102,22 +102,24 @@ __global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
   }
 }
 
-// The router and attention output projections have fixed FP32 split-K
-// contracts on the high-precision small-batch cuBLAS path. Fuse only the
-// existing partition reduction; retain the checkpoint row-major weights.
-template <int K, int Splits>
-__global__ __launch_bounds__(32 * Splits, 4) void dense_batch_kernel(
-    const half* x, const half* weight, half* output, int m, int n) {
-  __shared__ float partials[Splits][8][32];
-  const int split = threadIdx.x / 32, lane = threadIdx.x % 32;
+// Both high-precision small-batch cuBLAS projections use four contiguous
+// FP32 K partitions (router: K640, output: K384). Each independent m8n8k4
+// quad pair owns one partition, with an ordered warp-shuffle reduction.
+// N8 tiles distribute work over more SMs without adding weight copies or
+// changing the dot-product tree. This direct entry remains screening-only.
+template <int K>
+__global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
+                                                            const half* weight,
+                                                            half* output, int m,
+                                                            int n) {
+  const int lane = threadIdx.x;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int quad = (lane >> 2) & 3;
-  const int col = blockIdx.x * 32 + quad * 8 + r;
+  const int split = (lane >> 2) & 3;
+  const int col = blockIdx.x * 8 + r;
   const int row = blockIdx.y * 8 + r;
   float acc[8] = {};
 #pragma unroll 4
-  for (int g = split * (K / Splits / 16); g < (split + 1) * (K / Splits / 16);
-       ++g) {
+  for (int g = split * (K / 4 / 16); g < (split + 1) * (K / 4 / 16); ++g) {
     const half* w = weight + static_cast<size_t>(col) * K + g * 16;
     const uint4 lo = *reinterpret_cast<const uint4*>(w);
     const uint4 hi = *reinterpret_cast<const uint4*>(w + 8);
@@ -135,19 +137,15 @@ __global__ __launch_bounds__(32 * Splits, 4) void dense_batch_kernel(
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
     const int rr = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-    const int cc =
-        quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
-    partials[split][rr][cc] = acc[i];
-  }
-  __syncthreads();
-  for (int i = threadIdx.x; i < 8 * 32; i += 32 * Splits) {
-    const int rr = i / 32, cc = i % 32;
-    float value = partials[0][rr][cc];
+    const int cc = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+    const int base = lane & ~12;
+    float value = __shfl_sync(0xffffffff, acc[i], base);
 #pragma unroll
-    for (int s = 1; s < Splits; ++s)
-      value = __fadd_rn(value, partials[s][rr][cc]);
-    if (blockIdx.y * 8 + rr < m) {
-      output[(blockIdx.y * 8 + rr) * n + blockIdx.x * 32 + cc] =
+    for (int s = 1; s < 4; ++s)
+      value =
+          __fadd_rn(value, __shfl_sync(0xffffffff, acc[i], base | (s << 2)));
+    if (split == 0 && blockIdx.y * 8 + rr < m) {
+      output[(blockIdx.y * 8 + rr) * n + blockIdx.x * 8 + cc] =
           __float2half_rn(value);
     }
   }
@@ -178,15 +176,13 @@ void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
   const auto* input = reinterpret_cast<const half*>(x.data_ptr());
   const auto* w = reinterpret_cast<const half*>(weight.data_ptr());
   auto* out = reinterpret_cast<half*>(output.data_ptr());
-  const dim3 grid(n / 32, (m + 7) / 8);
+  const dim3 grid(n / 8, (m + 7) / 8);
   if (router)
-    dense_batch_kernel<2560, 4>
-        <<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m,
-                                                             n);
+    dense_batch_kernel<2560><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+        input, w, out, m, n);
   else
-    dense_batch_kernel<1536, 2>
-        <<<grid, 64, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m,
-                                                            n);
+    dense_batch_kernel<1536><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+        input, w, out, m, n);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

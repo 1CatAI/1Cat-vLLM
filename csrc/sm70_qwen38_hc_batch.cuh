@@ -35,11 +35,14 @@ __device__ __forceinline__ float sigmoid(float x) {
 // for a hidden column live at identical lane offsets in the four quad pairs.
 // PairRows shares the same 16-byte weight load across two independent M8
 // accumulators. The K sequence in each accumulator is unchanged.
-template <bool PairRows, int Warps, int Unroll, bool FuseMix>
+template <bool PairRows, int Warps, int Unroll, bool FuseMix,
+          bool FuseGather = false>
 __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
     const half* __restrict__ lora, const half* __restrict__ packed,
     const half* __restrict__ branches, half* __restrict__ out, int rows,
-    int hidden, int hidden_offset) {
+    int hidden, int hidden_offset, RankData buffers, int rank, half* gathered) {
+  static_assert(!FuseGather || (!PairRows && Warps == 1 && FuseMix));
+  __shared__ __align__(16) uint32_t packets[64];
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
   const int tile = blockIdx.x * Warps + warp;
@@ -96,12 +99,67 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
           mixed = fmaf(gs, x, mixed);
         }
         if (branch == 0 && row < rows) {
-          out[row * hidden + h] = __float2half_rn(div_full(mixed, 4.0f));
+          const half value = __float2half_rn(div_full(mixed, 4.0f));
+          out[row * hidden + h] = value;
+          if constexpr (FuseGather)
+            packets[(row - group * 8) * 8 + (h - tile * 8)] =
+                __half_as_ushort(value);
         }
       } else if (row < rows) {
         out[row * 4 * hidden + branch * hidden + h] = gate;
       }
     }
+  }
+  if constexpr (FuseGather) {
+    constexpr int stride = 16 * 640;
+    constexpr int header = kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t);
+    constexpr size_t channel = kSm70Qwen38HcBatchFusedOffset;
+    const int block = group * 80 + tile;
+    auto* local =
+        const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
+        channel;
+    auto* counters = reinterpret_cast<uint32_t*>(local);
+    const uint32_t epoch = counters[block], tag = epoch + 1u;
+    const int slot = epoch * 4 * stride;
+    // Retile the MMA fragments into contiguous, lossless half+tag packets.
+    // Only valid rows publish/read/clear. Every active block owns its own
+    // epoch across odd-count shrinking/growing graph replays.
+    __syncthreads();
+    const int row = group * 8 + lane / 2;
+    if (lane < 16 && row < rows) {
+      const int pack = block * 16 + lane;
+      const auto payload = reinterpret_cast<const uint4*>(packets)[lane];
+      const uint32_t tags = tag << 16;
+      const uint4 words = make_uint4(payload.x | tags, payload.y | tags,
+                                     payload.z | tags, payload.w | tags);
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        auto* dest = const_cast<char*>(
+                         reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+                     channel + header +
+                     (slot + rank * stride) * sizeof(uint32_t);
+        sm70_push_store_volatile_16b(words, dest, pack);
+      }
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        void* source =
+            local + header + (slot + peer * stride) * sizeof(uint32_t);
+        uint4 received;
+        do {
+          sm70_push_load_volatile_16b(received, source, pack);
+        } while ((received.x >> 16) != tag || (received.y >> 16) != tag ||
+                 (received.z >> 16) != tag || (received.w >> 16) != tag);
+        half* dest =
+            gathered + row * 2560 + peer * 640 + tile * 8 + (lane % 2) * 4;
+        dest[0] = __ushort_as_half(received.x & 0xffffu);
+        dest[1] = __ushort_as_half(received.y & 0xffffu);
+        dest[2] = __ushort_as_half(received.z & 0xffffu);
+        dest[3] = __ushort_as_half(received.w & 0xffffu);
+        sm70_push_store_volatile_16b(make_uint4(0, 0, 0, 0), source, pack);
+      }
+    }
+    __syncthreads();
+    if (lane == 0) counters[block] = (epoch + 1u) & 1u;
   }
 }
 
@@ -249,19 +307,98 @@ __global__ void gather(RankData buffers, const void* input, half* output,
   if (threadIdx.x == 0) counters[blockIdx.x] = (epoch + 1u) & 1u;
 }
 
+// Assign adjacent columns to adjacent lanes for the twenty FP32 partial
+// reads. The old pack-per-thread assignment reads eight interleaved columns
+// serially, and leaves few active lanes at M2. Arithmetic/order is unchanged;
+// shared memory only retile words for the existing half+tag transport.
+__global__ void down_gather_coalesced(RankData buffers, const float* partials,
+                                      half* lora, half* injection, int rank,
+                                      int rows) {
+  constexpr int cols = 88, stride = 16 * cols;
+  constexpr size_t channel = kSm70Qwen38HcBatchDownOffset;
+  __shared__ __align__(16) uint32_t packets[128];
+  auto* local =
+      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
+      channel;
+  auto* counters = reinterpret_cast<uint32_t*>(local);
+  const uint32_t epoch = counters[blockIdx.x], tag = epoch + 1u;
+  const int slot = epoch * 4 * stride;
+  const int index = blockIdx.x * 128 + threadIdx.x;
+  const int row = index / cols, col = index % cols;
+  if (index < rows * cols) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int split = 0; split < 20; ++split)
+      acc = __fadd_rn(acc, partials[(split * rows + row) * 96 + col]);
+    half value = __float2half_rn(acc);
+    if (col < 80) {
+      const float x = div_full(__half2float(value), 4.0f);
+      value = __float2half_rn(__fmul_rn(x, sigmoid(x)));
+    }
+    packets[threadIdx.x] = (tag << 16) | __half_as_ushort(value);
+  }
+  __syncthreads();
+  // 88 columns and the 128-thread block are both multiples of four, so
+  // no transport vector spans a row or a partially valid final packet.
+  if (threadIdx.x % 4 == 0 && index < rows * cols) {
+    const int pack = index / 4;
+    const uint4 words =
+        reinterpret_cast<const uint4*>(packets)[threadIdx.x / 4];
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      auto* dest =
+          const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+          channel + 128 + (slot + rank * stride) * sizeof(uint32_t);
+      sm70_push_store_volatile_16b(words, dest, pack);
+    }
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      void* source = local + 128 + (slot + peer * stride) * sizeof(uint32_t);
+      uint4 received;
+      do {
+        sm70_push_load_volatile_16b(received, source, pack);
+      } while ((received.x >> 16) != tag || (received.y >> 16) != tag ||
+               (received.z >> 16) != tag || (received.w >> 16) != tag);
+      const uint32_t values[4] = {received.x, received.y, received.z,
+                                  received.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const half value = __ushort_as_half(values[i] & 0xffffu);
+        if (col < 80)
+          lora[row * 320 + peer * 80 + col + i] = value;
+        else if (col == 80 && peer == 3)
+          injection[row * 4 + i] = value;
+      }
+      sm70_push_store_volatile_16b(make_uint4(0, 0, 0, 0), source, pack);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counters[blockIdx.x] = (epoch + 1u) & 1u;
+}
+
 inline void launch(RankData buffers, int rank, const half* input,
                    const half* packed_down, const half* packed_up,
                    float* partials, half* lora, half* local_output,
-                   half* output, half* injection, int rows,
-                   cudaStream_t stream) {
+                   half* output, half* injection, int rows, cudaStream_t stream,
+                   bool fused_chain) {
   hc_down_partials<false, 1, false, 96>
       <<<dim3(3, (rows + 7) / 8, 20), 32, 0, stream>>>(input, packed_down,
                                                        partials, rows);
-  gather<true><<<(rows * 11 + 127) / 128, 128, 0, stream>>>(
-      buffers, partials, lora, injection, rank, rows);
-  hc_up_batch<false, 1, 4, true><<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
-      lora, packed_up, input, local_output, rows, 640, rank * 640);
-  gather<false><<<(rows * 80 + 127) / 128, 128, 0, stream>>>(
-      buffers, local_output, output, injection, rank, rows);
+  if (fused_chain) {
+    down_gather_coalesced<<<(rows * 88 + 127) / 128, 128, 0, stream>>>(
+        buffers, partials, lora, injection, rank, rows);
+    hc_up_batch<false, 1, 4, true, true>
+        <<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
+            lora, packed_up, input, local_output, rows, 640, rank * 640,
+            buffers, rank, output);
+  } else {
+    gather<true><<<(rows * 11 + 127) / 128, 128, 0, stream>>>(
+        buffers, partials, lora, injection, rank, rows);
+    hc_up_batch<false, 1, 4, true><<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
+        lora, packed_up, input, local_output, rows, 640, rank * 640, buffers,
+        rank, output);
+    gather<false><<<(rows * 80 + 127) / 128, 128, 0, stream>>>(
+        buffers, local_output, output, injection, rank, rows);
+  }
 }
 }  // namespace vllm::qwen38_hc_batch

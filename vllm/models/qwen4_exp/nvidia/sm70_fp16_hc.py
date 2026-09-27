@@ -357,10 +357,19 @@ def _qwen38_sm70_fp16_fused_hc(
                 x.new_empty((m, n)) for n in (320, 640, 2560, 4)
             )
             custom_ar.sm70_qwen38_hc_batch(
-                x, packed_down, packed_up, partials, lora, local_block, block, injection
+                x,
+                packed_down,
+                packed_up,
+                partials,
+                lora,
+                local_block,
+                block,
+                injection,
+                fused_chain=True,
             )
             logger.info_once(
-                "SM70 Qwen3.8 exact TP4 batched HC projections/gathers enabled."
+                "SM70 Qwen3.8 exact TP4 batched HC: coalesced down reduction "
+                "and fused up/mix/output gather enabled."
             )
             return block, injection
     if not _runtime_ok(x, down_weight, up_weight):

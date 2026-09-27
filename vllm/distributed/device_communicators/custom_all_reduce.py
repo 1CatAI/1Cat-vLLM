@@ -495,6 +495,7 @@ class CustomAllreduce:
         local_output,
         output,
         injection,
+        fused_chain: bool = False,
     ) -> None:
         ops.sm70_qwen38_hc_batch(
             self._ptr,
@@ -506,6 +507,7 @@ class CustomAllreduce:
             local_output,
             output,
             injection,
+            fused_chain,
         )
 
     def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
