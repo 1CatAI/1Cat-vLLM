@@ -1,6 +1,99 @@
 # Qwen3.8 concurrent decode: next-stage optimization
 
-## Output-quality investigation (2026-09-28, not yet qualified)
+## Quality-qualified endpoint result (2026-09-28)
+
+The repaired ordinary engine pair passes the previously failing token gate.
+Control source: `7f27016c12465c9ac45d33914b6670c11fbcf45c`; candidate:
+`4b2404f99588f8b1588f8a5e0f4bf35915852c8e`. Their production Python/CUDA
+sources and native binaries are identical; the intervening commit adds only
+optional benchmark long-context checks. Integration base is
+`14abfc27ee4e13cd2a9d1a8a882f36a629e5889a`, including main's MTP and M48
+changes. Both arms use the repaired native FP32 gated norm; the batch
+fast-path switch is the A/B difference.
+
+Contract: GPU0..3, V100-SXM2-32GB, TP4, driver580.173.02,
+Torch2.10.0+cu128/CUDA12.8, the RadixArk Qwen3.8 Flash-Next NVFP4 checkpoint,
+FP16 activations/KV, FP32 GDN state and GEMM accumulation/reductions,
+no MTP or prefix caching, max context262144, chunk8192, max16 sequences,
+FULL decode graphs. Both arms reserve exactly4160749568 KV bytes/rank;
+this explicit budget overrides memory utilization and gives313030 tokens
+of reported capacity in each arm. PLE remains mmap prefill plus11.92 GiB
+pinned-host UVA decode per rank, **not a disk-only/no-RAM configuration**.
+
+Pooled unprofiled fixed-width engine intervals, 8192 input/256 greedy forced
+output tokens per request, two atomic-admission cohorts per width:
+
+| Width | Control ms/step | Batch-on ms/step | Batch-on aggregate tok/s | Batch-on per-stream tok/s | Throughput change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 | 10.198848 | 10.272228 | 97.350 | 97.350 | -0.71% |
+| C2 | 17.316287 | 13.401774 | 149.234 | 74.617 | +29.21% |
+| C4 | 17.715166 | 15.040512 | 265.948 | 66.487 | +17.78% |
+| C8 | 21.398201 | 18.847988 | 424.448 | 53.056 | +13.53% |
+| C16 | 28.662908 | 26.464495 | 604.584 | 37.786 | +8.31% |
+
+The repaired batch-off C1 is98.050 tok/s. Batch-on's observed C1 cost is
+0.073380 ms/step; do not claim an exactly zero regression or infer its cause
+from two repetitions. C2 minus C1 falls7.117440 ->3.129546 ms, still above
+the3 ms target. C8/C16 +40% remains unmet. Separate one-output-token prefill
+cohorts remain about6.83K tok/s for these repeated synthetic8K inputs; this
+is not a natural-chat/dataset prefill baseline or a sum of overlapping TTFTs.
+
+Quality checks:
+
+- All62 cross-arm sequences, totaling15872 compared greedy output tokens,
+  match exactly. All31 within-arm repeat comparisons pass in each arm.
+- Each arm passes two single-request and16 concurrent natural-EOS answer
+  checks with checkpoint sampling: temperature1.0, top_p0.95, top_k20,
+  seed0. Concurrent natural traffic intentionally uses streaming admission;
+  its text differs across arms and is **not token-parity evidence**. The
+  fixed-cohort greedy comparisons above supply that separate evidence.
+- Candidate natural middle-record retrieval passes twice at130559 and
+  261631 input tokens, allowing513 output tokens within128K/256K contexts.
+  Outputs stop naturally after163 and123 tokens respectively and repeat
+  exactly at each length. The expected archive code is recovered.
+- The exact262143-input-plus-one-output boundary passes with valid request
+  metrics. This is a boundary check, not a one-token answer-quality score.
+
+These are bounded regression/health checks, not a claim of universal output
+identity or dataset accuracy. The earlier diagnostic failures remain below
+as history; they are not the repaired acceptance result. Both reports now
+have `complete=true` and `token_parity_passed=true`. Raw records:
+`endpoint_{control,candidate}_canonical_v1.json` and logs;
+`quality_canonical_summary.json` records the pooled comparison. All owned
+workers shut down and released GPU0..3; no API was started.
+
+The numerical repair defaults on for its admitted no-MTP contract. The
+batch optimizations remain opt-in via `VLLM_SM70_QWEN38_BATCH_FASTPATH=1`:
+their packed copies still cost1055.625 MiB/rank, so this result is not a
+blanket default-promotion claim for other memory budgets or model routes.
+The final merge audit also removed a duplicate GDN translation-unit entry;
+the generated native build already compiled and linked it only once.
+
+After a normal source build, reproduce in a clean, exclusively leased TP4
+environment with owned compiler caches and no private DSO/preload overrides:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID
+export PYTHONPATH="$PWD" VLLM_WORKER_MULTIPROC_METHOD=spawn
+export VLLM_QWEN4EXP_PLE_HOST_GIB=12 OMP_NUM_THREADS=1
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+for arm in control candidate; do
+  export VLLM_SM70_QWEN38_BATCH_FASTPATH=0
+  extra=()
+  if [[ "$arm" == candidate ]]; then
+    export VLLM_SM70_QWEN38_BATCH_FASTPATH=1
+    extra=(--reference control.json --long-context)
+  fi
+  .venv/bin/python benchmarks/benchmark_sm70_qwen38_concurrency.py \
+    --model "$MODEL" --mode nomtp --widths 1,2,4,8,16 \
+    --input-len 8192 --output-len 256 --repeats 2 \
+    --gpu-memory-utilization 0.94 --kv-cache-memory-bytes 4160749568 \
+    --atomic-cohort --health --measure-prefill --out "$arm.json" \
+    "${extra[@]}" || exit 1
+done
+```
+
+## Output-quality investigation and repair
 
 Same-input deep observation on the retained high-precision source
 `581e69adb4751d3613ca1fdcc031b480b3dc2502` localizes the earliest C1
@@ -18,8 +111,8 @@ Native FP32 gated RMSNorm and its standalone compiled form reproduce the
 candidate's value. FP64 evaluation gives `-0.0034208292707999443`, whose
 nearest FP16 value is also the candidate's. Thus simply forcing the old
 control token sequence would not establish greater arithmetic accuracy.
-The full-model compiled normalization must get a stable, explicit numerical
-contract before another endpoint acceptance attempt.
+The full-model compiled normalization therefore required a stable, explicit
+numerical contract before another endpoint acceptance attempt.
 
 The diagnostic includes two40-step C1 repeats per arm, fixed KV bytes and
 intrusive intermediate copies. Control matches the preceding observer at
@@ -34,12 +127,54 @@ and refuses to accept a run with no actual parity observations. Thirteen
 focused CPU regressions pass. This closes a reporting bug separately from
 the normalization fix; it cannot qualify the optimization by itself.
 
+### Native FP32 normalization repair
+
+Source `7f27016c12465c9ac45d33914b6670c11fbcf45c` integrates
+`onecat/main` at `14abfc27ee4e13cd2a9d1a8a882f36a629e5889a` and reuses its
+native exact gated RMSNorm. The narrowly admitted SM70/TP4/Qwen3.8 NVFP4
+no-MTP configuration now defaults `VLLM_SM70_RMSNORM_GATED_EXACT=1`, while
+respecting an explicit override and leaving MTP defaults unchanged. The
+operator preserves native FP32 reduction and activation arithmetic and the
+FP16 output boundary; it does not lower precision or copy model weights.
+
+The device-capability guard is a compile-time constant for the input device,
+and route logging is inside the opaque operator rather than the traced
+forward. A small full-graph test caught the old capability-query tracing
+failure before a model launch. Its corrected version checks changing batch
+shapes and neighboring reductions against native FP32 bits. The issue is
+different arithmetic in different compilation contexts, **not random output
+within one compiled graph**. The diagnostic has not identified one specific
+PTX instruction as the cause.
+
+Focused validation before endpoint acceptance:
+
+- All four TP ranks and three retained decode steps replay exactly through
+  the input projections, convolution, recurrent state/output and local
+  output projection. The new gated norm matches native FP32 eager bits.
+- 39 native gated-norm/router/shared-expert GPU checks and 116 GDN/dense/QSA
+  GPU checks pass, including dynamic graph inputs and long selector shapes.
+- Four-card HC checks on eight actual weight pairs and six activation scales
+  have zero LoRA/output/injection bit mismatches. The existing fused HC
+  microbenchmark gain survives the integration; it is not endpoint evidence.
+- 39 configuration/default CPU checks and the explicit no-MTP versus MTP
+  precision-policy checks pass. The MTP API argument order and its qualified
+  routes are preserved by the integration.
+
+The source-built `_C` SHA256 is
+`2757c48735b4a6ee65889f93b45082be9b8a67b1572d3dd7edf19e157184e484`.
+The ordinary paired engine result above passes token repetition, cross-arm
+parity and natural-EOS text health. It uses identical KV bytes
+(`4160749568` per rank) and atomic cohort admission;
+neither the old unequal KV capacities nor host request-submission timing may
+serve as a hidden A/B difference. Microtests at long selector shapes do not
+substitute for a 256K full-model quality check.
+
 ## Acceptance target, not a performance claim
 
-Status update: the initial sections below record research-only screens.
-An opt-in native runtime candidate is now being integrated; see
-"C1-to-batch runtime candidate" below. It is **not yet an accepted endpoint
-speed or quality result** and remains disabled by default.
+Historical chronology: the sections below preserve the research-only screens
+and rejected endpoint attempts preceding the repaired result above. The
+batch route remains disabled by default; its measured improvement still
+does not meet the full performance targets.
 
 Integration base: `1e90d17f2c75e443b2a85a576ed68fa04c5f9dd6` (`onecat/main`).
 Scope: Qwen3.8 Flash-Next NVFP4, V100-SXM2-32GB, TP4, no MTP. Improve
@@ -647,7 +782,7 @@ for these synthetic inputs. This is actual unprofiled engine measurement,
 not a sum of separate microbenchmark savings. The+0.42%C1 difference is
 small variation, not evidence of a new single-request optimization.
 
-**The candidate is not quality-qualified.** All two single-request and16
+**This pre-repair v4 candidate was not quality-qualified.** All two single-request and16
 concurrent natural-EOS health checks pass in each arm, but cross-arm token
 parity fails at every width. In particular, candidate C1 first differs at
 zero-based token36 in both repeats despite C1's intended unchanged decode
