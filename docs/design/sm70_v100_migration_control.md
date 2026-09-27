@@ -48197,3 +48197,21 @@ has launched no full model. Details and artifacts are in
   calls and is not a causal explanation. Preserve the observer source/hash
   and comparison artifacts. Any follow-up must collect after each graph
   replay before overwrite; do not repeat the end-of-proposal-only observer.
+- Next exact component decisions: extend the existing FP16 router packed32
+  key to its admitted M<=16 batch route. Original FP32 normalization and all
+  three outputs remain bitwise; 48-call M5/M10 savings are approximately
+  0.05 ms. Reuse the existing mixed-QKV fused recurrence for pure small-M
+  MTP, behind `VLLM_SM70_FUSED_SIGMOID_MIXED_QKV`; 36-layer M5 copy-chain
+  1.097771 -> 0.615125 ms, M10 1.256832 -> 0.784512 ms, all output/FP32
+  state bits exact in ten changing graph checks. These are component gates,
+  not a new complete-round result. CPU guards: 18 pass, ten GPU integration
+  checks and full-model admission pending at this checkpoint.
+- Reject original-layout HC split-stage schedules: exact but M5
+  17.024 -> 18.702 us, M10 16.098 -> 20.422 us. Do not model-test those
+  variants. CuBLAS uses 480 single-warp CTAs versus this prototype's 220;
+  a masked-quad 420/840-CTA hypothesis and reuse of PR #704's up/mix kernel
+  under original MTP precision are separately pending component screens.
+  PR #504 sharding changes replicated GEMM association and is not an exact
+  shortcut. Preserve artifacts and follow-up decisions in
+  `docs/design/sm70_flash_next_mtp4_batch_gdn.md`. The qualified endpoint
+  remains 23.657858 ms; <20 ms is still unmet.

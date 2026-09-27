@@ -121,7 +121,9 @@ def _sm70_qwen38_router_topk(
         K=10,
         M=num_tokens,
         BLOCK_E=512,
-        PACKED_HALF_KEY=(gating_output.dtype == torch.float16 and num_tokens == 1),
+        PACKED_HALF_KEY=(
+            gating_output.dtype == torch.float16 and 1 <= num_tokens <= 16
+        ),
         num_warps=8,
     )
 

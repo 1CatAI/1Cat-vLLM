@@ -3703,9 +3703,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASHQLA_DECODE_WARMUP": lambda: bool(
         int(os.getenv("VLLM_SM70_FLASHQLA_DECODE_WARMUP", "1"))
     ),
-    # Experimental packed-qkv GDN decode route from 0.0.3. The low-level
-    # function exists for strict op validation, but model-level routing remains
-    # default-off until token/quality/throughput gates pass.
+    # Experimental packed-QKV GDN decode loader, also reused by the small
+    # SM70 fused MTP verifier. Model routing remains default-off until its
+    # token/quality/throughput gates pass.
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV": lambda: bool(
         int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "0"))
     ),

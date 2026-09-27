@@ -825,3 +825,75 @@ an identical end-of-proposal observer expecting three independent timings.
 All owned workers shut down; subsequent GPU4--7 owners belong to another task.
 The qualified 23.657858-ms endpoint and the <20-ms remaining objective are
 unchanged by this diagnostic run.
+
+### Reuse the batch router key and remove MTP QKV copies
+
+The next screens preserve the 23.657858-ms endpoint contract. They do not
+rerun no-MTP, change draft length, enable reduced precision, or substitute
+component sums for a new complete-round measurement.
+
+- The existing M1 router's lossless 32-bit key is also exact at M1/2/4/5/8/10/16.
+  Tests cover all 65,536 FP16 payloads at the actual M specialization and
+  24 changing-input graph replays per width. FP32 weights, expert IDs and
+  rank-major source indices match the original 64-bit sort exactly. Keeping
+  eight warps preserves the normalization reduction. Forty-eight distinct
+  M5 calls improve 0.254016 -> 0.204256 ms; M10 improves
+  0.254496 -> 0.204800 ms. Extend only the existing admitted FP16 M<=16
+  dispatcher; this approximately 0.05-ms component saving is not a measured
+  endpoint gain. Retain `router_batch_packed.{py,json,log}`.
+- Ordinary MTP currently copies three flattened Q/K/V splits and concatenates
+  them before invoking the already fused sigmoid recurrence. Reuse the
+  existing mixed-QKV loader with the same BV32/four-warp math, FP32 state,
+  accepted-state selection and FP16 output. In 36 distinct layer buffers,
+  ten changing-input/state graph checks per width preserve every output and
+  stored-state bit, including untouched slots. The current copy path, one
+  fused packing copy and direct mixed loader measure respectively
+  **1.097771 / 0.642859 / 0.615125 ms at M5**, and
+  **1.256832 / 0.797653 / 0.784512 ms at M10**. These are five alternating
+  component timing pairs, not new engine speed. Retain
+  `gdn_mtp_mixed_loader.{py,json}` and `gdn_mtp_mixed_loader_retry2.log`.
+
+The existing opt-in `VLLM_SM70_FUSED_SIGMOID_MIXED_QKV` now admits this small
+SM70 pure-spec verifier geometry (four QK heads, twelve V heads, D128,
+FP16 input, FP32 state and 2..16 rows). DFlash2's separate numerical bridge,
+tree verification, mixed prefill/decode and unsupported shapes keep their
+previous dispatch. Core output allocation/merge and padding remain as before.
+No new native library or persistent weight storage is required.
+The CPU route gate passes 18 cases; ten GPU integration cases are pending at
+this checkpoint. They exercise the public router and real GDN convolution,
+accepted-state selectors, both conv-cache layouts and output canaries.
+Whole-model token/acceptance and complete-round gates remain pending.
+
+#### Further HC evidence before another model run
+
+The original-layout split-stage down hypothesis retains twenty K512
+FP16-rounded partials and ordered FP32 reduction, with reduction/SiLU fused.
+Eight real checkpoint pairs and seven input scales are bitwise exact. It is
+nevertheless slower: the best M5 case is 17.024 -> 18.702 us and M10 is
+16.098 -> 20.422 us. Two/four-warp variants are slower still. Reject these
+schedules without an engine run; retain `hc_down_split_stage.{cu,py,json,log}`.
+
+Existing trace launch metadata identifies the cuBLAS HC down kernel as
+`16x16_64x2_tn_align8`, 480 CTAs, one warp/CTA, 114 registers/thread and
+8,704 shared bytes/CTA. The new one-warp screen had 220 CTAs, whereas its
+slower two-warp version had 120. A follow-up screens 420/840 independent
+CTAs by masking unused Volta MMA quads while preserving every K512 partial;
+compiled variants use 62 registers and no shared memory or spills. This is
+a parallelism hypothesis, not measured occupancy or bandwidth. Its GPU
+screen remains pending.
+
+[PR #504](https://github.com/1CatAI/1Cat-vLLM/pull/504)'s existing batch HC
+sharding changes the original replicated GEMM association and previously
+saved only 0.174--0.277 ms in a different no-MTP endpoint. It cannot be
+blindly ported as an exact MTP improvement. A separate component screen
+reuses [PR #704](https://github.com/1CatAI/1Cat-vLLM/pull/704)'s unchanged
+register-level up/mix kernel at fixed source
+`590d78e0b168d38703f94333d240606900821f85`, with this task's original M5/M10
+precision settings. Its result is pending; the research extension is not
+loaded by model workers.
+
+GPU ownership checks rejected the first mixed-loader attempt and its first
+bounded retry before GPU work. The second retry acquired idle GPU4 and
+completed; other services were left untouched. Subsequent integration/HC
+gates share a finite queued lease. Preserve resource failures as such rather
+than counting them as correctness failures or speed samples.
