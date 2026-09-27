@@ -238,3 +238,70 @@ about 4%, with similar error against an FP64 reference, but changed output
 bits. It has no acceptance or endpoint qualification and is not enabled or
 counted as an improvement. Draft review remains open; this report does not
 claim completion of the new targets or a renewed PRO 6000 comparison.
+
+### M64 hardware counters and occupancy screening
+
+Nsight Compute 2022.4.1 profiled four real TP-local weight shapes after
+ordinary tuning on V100 GPU 7, using the committed candidate's normal core.
+The retained report is `results/ncu-current-m64-direct.ncu-rep`; text and raw
+CSV exports are alongside it. These isolated kernel replays are diagnostic,
+not service timing or useful model FLOPs as a fraction of hardware peak.
+
+| M64 projection | Registers/thread | Achieved occupancy | DRAM throughput | Tensor pipeline active |
+|---|---:|---:|---:|---:|
+| FP4 gate/up | 121 | 23.12% | 27.65% | 44.88% |
+| FP4 down | 131 | 12.47% | 27.49% | 47.00% |
+| FP8 input | 178 | 11.67% | 34.50% | 36.53% |
+| FP8 output | 146 | 12.36% | 25.74% | 27.25% |
+
+The DRAM and tensor figures use NCU's elapsed-cycle denominator. The FP8
+input sample selected the 128-thread M32xN256 kernel; FP4 down and FP8
+output selected 256-thread M64xN128 kernels. The latter two permit only one
+resident CTA with their present register requirements. Global memory
+bandwidth is not saturated. L1/TEX, instruction dependencies, barriers and
+insufficient ready warps must be considered along with register occupancy.
+
+A separate launch-bounds screen preserved the numerical partition and
+passed real-weight output oracles, but failed the performance screen.
+Reducing the ordinary FP4 down candidate from 133 to 128 registers allowed
+two resident CTAs but increased cold tuning time from 60.93 to 66.25 us.
+FP8 input's M64 candidate at 128 registers was also slightly slower than its
+146-register control; its local allocation increased from 64 to 96 bytes.
+Aggressive M32 caps were substantially slower. The whole-model M64 estimate
+was 16.634 -> 16.745 ms, so none of the launch-bounds candidates are kept.
+Raw candidate costs, source patch and matched graph samples are retained as
+`regcap-tactic-costs.log`, `rejected-regcap.patch`, and `gemm-*regcap-gpu3.*`.
+
+The analogous M32/QPN2-QPN8 capture on GPU 3 shows tensor-pipeline activity
+of 33.59/30.21/28.93/23.45% and DRAM throughput of
+35.02/31.61/53.46/42.88% for FP4 gate, FP4 down, FP8 input, and FP8 output.
+FP8 input/output spend their largest measured stall contribution on the
+long scoreboard. This motivates supply scheduling experiments rather than
+treating C4 as compute-saturated. The raw M32 report is
+`results/ncu-current-m32-direct.ncu-rep`.
+
+Explicit paired-half scale multiplication was exact but yielded no
+whole-model gain (M64 16.634 -> 16.683 ms), so it was reverted. A separate
+research build removed the batch split-K partition restriction: M48
+14.304 -> 13.776 ms and M64 16.634 -> 15.953 ms. This changed output bits
+(maximum tested difference 0.00048828125), despite passing the microbenchmark
+tolerance checks. Its approximately 4.1% M64 GEMM gain is not an endpoint or
+acceptance result. The change was reverted; the source-built runtime retains
+the protected numerical partition. Raw data and the rejected patch are in
+`gemm-partition-ceiling-gpu3.*` and `partition-ceiling.patch`.
+
+The M32 FP8 L2-prefetch probe also failed screening: lookahead distances
+four/eight slowed the three completed projection cases by approximately
+2–9%. These cases were bit-exact, but the gate/up case subsequently failed
+the exactness check (maximum difference 3.814697265625e-6). No further
+performance claim is made for that incomplete probe. It exists only as
+task-local research code, never as a service dependency. See
+`results/fp8-m32-l2-micro.{json,log}`.
+
+After these experiments, all production kernel sources are restored to
+commit `a42e887cf65b537ede6f0b3db380706cbd9c5145`. The final ordinary core
+rebuild has SHA256
+`e06b8d46eda509c2cdd9bece49427c9ea0d8a8c908c8a8fe6600b0de22c45e1c`;
+the FA2 hash is unchanged. This restoration is not an additional endpoint
+run. The last qualified endpoint remains the combined-candidate table
+above, and none of the new performance targets is claimed complete.
