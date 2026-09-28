@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
@@ -466,6 +467,45 @@ def test_cudagraph_sizes_post_init(
             vllm_config.compilation_config.max_cudagraph_capture_size
             == expected_max_size
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((7, 0)),
+    reason="SM70 Flash-V100 compile graph policy",
+)
+@pytest.mark.parametrize(
+    "compilation_config,expected_mode,expected_cudagraph_mode",
+    [
+        (
+            {"cudagraph_mode": CUDAGraphMode.NONE},
+            CompilationMode.VLLM_COMPILE,
+            CUDAGraphMode.NONE,
+        ),
+        (
+            {
+                "mode": CompilationMode.NONE,
+                "cudagraph_mode": CUDAGraphMode.FULL,
+                "cudagraph_capture_sizes": [1],
+            },
+            CompilationMode.NONE,
+            CUDAGraphMode.FULL,
+        ),
+        # Nothing set: the SM70 policy still applies.
+        ({}, CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL_AND_PIECEWISE),
+    ],
+)
+def test_sm70_compile_graph_policy_respects_explicit_none(
+    compilation_config, expected_mode, expected_cudagraph_mode
+):
+    # The policy exports its switches into os.environ; keep them local.
+    with patch.dict(os.environ):
+        os.environ.pop("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", None)
+        config = EngineArgs(
+            model="facebook/opt-125m", compilation_config=compilation_config
+        ).create_engine_config()
+
+    assert config.compilation_config.mode == expected_mode
+    assert config.compilation_config.cudagraph_mode == expected_cudagraph_mode
 
 
 def test_sm70_full_and_piecewise_compile_range_includes_decode_token(monkeypatch):

@@ -1913,10 +1913,15 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
+        # mode and cudagraph_mode stay None until resolved further down, and
+        # the only paths above that set them to NONE are the three switches
+        # listed here, so an explicit NONE at this point came from the user.
         sm70_compile_disabled_by_user = (
             (self.model_config is not None and self.model_config.enforce_eager)
             or os.environ.get("TORCH_COMPILE_DISABLE") == "1"
             or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            or self.compilation_config.mode == CompilationMode.NONE
+            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
         )
         sm70_no_compile_decode_graph_requested = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
@@ -2153,9 +2158,9 @@ class VllmConfig:
             if sm70_compile_disabled_by_user:
                 logger.warning_once(
                     "Ignoring VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 "
-                    "because enforce_eager, TORCH_COMPILE_DISABLE, or "
-                    "VLLM_USE_BREAKABLE_CUDAGRAPH explicitly disables the "
-                    "compile path."
+                    "because enforce_eager, TORCH_COMPILE_DISABLE, "
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH, or an explicit mode=NONE "
+                    "or cudagraph_mode=NONE disables the compile path."
                 )
             elif (
                 current_platform.is_cuda()
