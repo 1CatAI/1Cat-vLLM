@@ -330,6 +330,7 @@ def test_qsa_canonical_block_table_accepts_partial_virtual_page() -> None:
     builder.kv_cache_spec = SimpleNamespace(block_size=32, dcp_sharded=False)
     builder.kernel_block_size = 16
     builder.has_sharded_main_owner = False
+    builder.reads_sharded_group = False
     builder.dcp_world_size = 1
     table = torch.tensor([[14, 15, 16]], dtype=torch.int32)
     canonical = builder._canonical_block_table(table)
@@ -342,6 +343,7 @@ def test_qsa_canonical_block_table_keeps_physical_pages() -> None:
     builder.kv_cache_spec = SimpleNamespace(block_size=32, dcp_sharded=False)
     builder.kernel_block_size = 16
     builder.has_sharded_main_owner = False
+    builder.reads_sharded_group = False
     builder.dcp_world_size = 1
     table = torch.tensor([[5, 6, 7]], dtype=torch.int32)
     assert builder._canonical_block_table(table) is table
@@ -362,6 +364,7 @@ def _dcp2_selector_builder(buffer_width: int) -> qsa_cache.QSAMetadataBuilder:
     builder.kv_cache_spec = SimpleNamespace(block_size=3136, dcp_sharded=False)
     builder.kernel_block_size = 32
     builder.has_sharded_main_owner = True
+    builder.reads_sharded_group = True
     builder.dcp_world_size = 2
     return builder
 
@@ -379,6 +382,109 @@ def test_qsa_replicated_side_table_uses_local_kernel_block_units() -> None:
     builder = _dcp2_selector_builder(buffer_width=2)
     table = torch.arange(49, 49 + 98, dtype=torch.int32).unsqueeze(0)
     assert builder._canonical_block_table(table).tolist() == [[1, 2]]
+
+
+def _dcp2_real_selector_builder(
+    monkeypatch: pytest.MonkeyPatch, layer_names: list[str], dcp: int = 2
+) -> qsa_cache.QSAMetadataBuilder:
+    """A QSA compressed-cache builder built by its real constructor."""
+
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    spec = MLAAttentionSpec(
+        block_size=3136,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=False,
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=1),
+    )
+    builder = qsa_cache.QSAMetadataBuilder(
+        spec, layer_names, config, torch.device("cpu"), block_table_width=2
+    )
+    builder.kernel_block_size = 32
+    return builder
+
+
+def test_qsa_dcp2_draft_selector_table_matches_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eager MTP draft steps build QSA metadata from draft-only builders.
+
+    Under DCP2 the replicated draft shares the target's KV group, so its
+    compressed-cache builder reads the same rank-local table. Treating it as
+    global doubled the virtual expansion: pages were divided by twice the
+    right factor, compressed K rows went to arbitrary pages of the shared
+    compressed/ring tensor, and a clobbered ring position later sent the fused
+    pre-indexer's RoPE load out of bounds on DCP rank 1.
+    """
+
+    target = _dcp2_real_selector_builder(
+        monkeypatch, ["model.layers.3.self_attn.indexer.compressed_key_cache"]
+    )
+    draft = _dcp2_real_selector_builder(
+        monkeypatch, ["mtp.layers.48.self_attn.indexer.compressed_key_cache"]
+    )
+    table = torch.arange(49, 49 + 98, dtype=torch.int32).unsqueeze(0)
+    assert target._canonical_block_table(table).tolist() == [[1, 2]]
+    assert draft._canonical_block_table(table).tolist() == [[1, 2]]
+
+
+@pytest.mark.parametrize(
+    ("names", "dcp", "ignore_mask"),
+    [
+        (["mtp.layers.48.self_attn.indexer.compressed_key_cache"], 2, True),
+        (["mtp.layers.48.self_attn.indexer.compressed_key_cache"], 1, False),
+        (["model.layers.3.self_attn.indexer.compressed_key_cache"], 2, True),
+        (["model.layers.3.self_attn.indexer.compressed_key_cache"], 1, False),
+    ],
+)
+def test_qsa_draft_builder_ignores_dcp_ownership_mask(
+    monkeypatch: pytest.MonkeyPatch, names: list[str], dcp: int, ignore_mask: bool
+) -> None:
+    """Replicated selectors, the draft's included, write every group boundary
+    on both DCP ranks instead of following the sharded main K/V ownership."""
+
+    monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    seen: dict[str, bool] = {}
+
+    def fake_build(*args, **kwargs):
+        seen["ignore"] = kwargs["ignore_common_slot_mask"]
+        return qsa_cache._build_qsa_metadata_torch(*args, **kwargs)
+
+    monkeypatch.setattr(qsa_cache, "build_qsa_metadata", fake_build)
+    spec = MLAAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=2,
+        dcp_sharded=False,
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
+    )
+    builder = qsa_cache.QSAMetadataBuilder(
+        spec, names, config, torch.device("cpu"), block_table_width=2
+    )
+    starts = torch.tensor([0, 4], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_actual_tokens=4,
+        num_reqs=1,
+        max_query_len=4,
+        max_seq_len=11,
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([11], dtype=torch.int32),
+        slot_mapping=torch.full((4,), -1, dtype=torch.int64),
+        block_table_tensor=torch.tensor([[5, 6]], dtype=torch.int32),
+    )
+    builder.build(0, common)
+    assert seen["ignore"] is ignore_mask
 
 
 def test_qsa_dcp2_selector_table_addresses_full_long_context() -> None:
@@ -416,6 +522,7 @@ def test_qsa_replicated_draft_side_table_keeps_global_page_geometry() -> None:
 
     builder = _dcp2_selector_builder(buffer_width=2)
     builder.has_sharded_main_owner = False
+    builder.reads_sharded_group = False
     table = torch.arange(98, 98 + 196, dtype=torch.int32).unsqueeze(0)
     assert builder._canonical_block_table(table).tolist() == [[1, 2]]
 
