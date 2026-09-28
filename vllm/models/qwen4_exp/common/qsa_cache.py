@@ -629,6 +629,16 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         self.has_sharded_main_owner = any(
             "mtp" not in name.split(".") for name in layer_names
         )
+        # Under DCP the replicated MTP draft shares the target's KV cache
+        # group, so a draft-only builder (the eager draft steps build one) gets
+        # the same rank-local block table and ownership-masked slot map as the
+        # target. It must convert pages and ignore the ownership mask exactly
+        # like a selector with a sharded main owner.
+        self.reads_sharded_group = self.has_sharded_main_owner or (
+            self.dcp_world_size > 1
+            and bool(layer_names)
+            and all("mtp" in name.split(".") for name in layer_names)
+        )
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = kv_cache_spec.compress_ratio
         else:
@@ -697,11 +707,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         # (see qsa_dcp_block_geometry). Convert that span back to local tokens
         # before deriving the virtual expansion. This applies to a replicated
         # selector sharing a sharded main owner's table just as much as to a
-        # sharded page: both read the same local table. A standalone draft
-        # keeps every QSA cache replicated, so its table is already global and
-        # must not be divided.
+        # sharded page: both read the same local table. The replicated MTP
+        # draft keeps its QSA caches replicated but reads that same table.
         table_counts_local_tokens = (
-            self.kv_cache_spec.dcp_sharded or self.has_sharded_main_owner
+            self.kv_cache_spec.dcp_sharded or self.reads_sharded_group
         )
         if table_counts_local_tokens and self.dcp_world_size > 1:
             if group_block_size % self.dcp_world_size:
@@ -769,9 +778,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             k_work_metadata_buffer=k_work_metadata if build_k_work else None,
             request_capacity=request_capacity,
             # The common slot map follows sharded main K/V ownership. A
-            # replicated selector still writes every selected group boundary.
+            # replicated selector, including the draft's, still writes every
+            # selected group boundary.
             ignore_common_slot_mask=(
-                build_k_work and self.has_sharded_main_owner and self.dcp_world_size > 1
+                build_k_work and self.reads_sharded_group and self.dcp_world_size > 1
             ),
         )
         if common_attn_metadata.is_dummy_batch and (
