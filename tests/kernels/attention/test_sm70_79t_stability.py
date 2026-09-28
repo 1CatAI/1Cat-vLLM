@@ -18,7 +18,10 @@ import torch
 def test_large_scores_and_biased_values(kv_len, query_len, op_name):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA test")
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     if not hasattr(torch.ops._vllm_fa2_C, op_name):
         pytest.skip("SM70 architecture operator was not built")
@@ -50,7 +53,10 @@ def test_large_scores_and_biased_values(kv_len, query_len, op_name):
 def test_periodic_score_spikes_do_not_overflow(query_len, op_name):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA test")
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     if not hasattr(torch.ops._vllm_fa2_C, op_name):
         pytest.skip("SM70 architecture operator was not built")
@@ -87,7 +93,10 @@ def test_periodic_score_spikes_do_not_overflow(query_len, op_name):
 def test_rejects_partial_prefix_pv_tile(query_len, op_name):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA test")
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     if not hasattr(torch.ops._vllm_fa2_C, op_name):
         pytest.skip("SM70 architecture operator was not built")
@@ -106,7 +115,10 @@ def test_q8000_q8192_share_scores_and_preserve_graph_replay():
         0,
     ):
         pytest.skip("requires SM70")
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     torch.manual_seed(732)
     cases = []
