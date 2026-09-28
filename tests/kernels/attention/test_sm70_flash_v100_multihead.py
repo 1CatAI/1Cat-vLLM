@@ -9,6 +9,13 @@ import torch
 
 fa = pytest.importorskip("flash_attn_v100.flash_attn_interface")
 
+# The built-in long and grouped E4M3 paths are built for SM70 only; the XQA
+# decode above them also runs on Turing.
+requires_sm70 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="SM70-only E4M3 kernels",
+)
+
 
 def _inputs(heads, batch, length, page, cache_dtype=torch.float8_e4m3fn):
     torch.manual_seed(4619)
@@ -169,6 +176,7 @@ def test_other_dtypes_long_multihead_graph(heads, cache_dtype):
     )
 
 
+@requires_sm70
 @pytest.mark.parametrize("heads", [2, 4])
 @pytest.mark.parametrize("rows", [1, 3, 8])
 @pytest.mark.parametrize("page", [1024, 2048, 3296, 4096, 8192])
@@ -238,6 +246,7 @@ def test_builtin_long_multihead_graph(monkeypatch, heads, rows, page):
     )
 
 
+@requires_sm70
 @pytest.mark.parametrize("heads", [1, 2, 4])
 @pytest.mark.parametrize("page,length", [(256, 2049), (848, 32768), (800, 262144)])
 def test_e4m3_grouped_multihead_graph(heads, page, length):
