@@ -203,6 +203,9 @@ def test_compressed_tensors_channel_fp8_qpn8_prepares_and_dispatches(monkeypatch
         f"{module}._get_sm70_fp8_prefill_exact_dense_workspace",
         lambda weight: workspace,
     )
+    # An SM70 VllmConfig built earlier in the process exports
+    # VLLM_SM70_BATCH_GEMM_LAYOUTS=1; this test covers the QPN8 prepare only.
+    monkeypatch.setattr(f"{module}.sm70_tm.use_batched_gemm_layouts", lambda: False)
 
     def fake_prepare(weight, scales):
         prepare_calls.append((tuple(weight.shape), tuple(scales.shape)))
