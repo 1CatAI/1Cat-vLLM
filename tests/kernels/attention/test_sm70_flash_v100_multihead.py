@@ -186,7 +186,10 @@ def test_other_dtypes_long_multihead_graph(heads, cache_dtype):
 def test_builtin_long_multihead_graph(monkeypatch, heads, rows, page):
     from vllm.v1.attention.ops import sm70_e4m3_long as long
     from vllm.v1.attention.ops import sm70_e4m3_scalar as scalar
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     for module in (long, scalar):
         monkeypatch.setattr(module, "is_forward_context_available", lambda: True)
