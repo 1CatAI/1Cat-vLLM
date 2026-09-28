@@ -28,6 +28,9 @@ def _fake_scheduler(request: _FakeRequest):
     return SimpleNamespace(
         requests={"r0": request},
         structured_output_manager=_FakeStructuredOutputManager(),
+        # Drafters that carry a decode tree stash their payload per request;
+        # both entry points drop it alongside the draft tokens.
+        ddtree_payloads_by_req_id={},
     )
 
 
@@ -50,6 +53,7 @@ def test_update_draft_token_ids_in_output_does_not_mutate_worker_rows():
     scheduler = _fake_scheduler(request)
     scheduler_output = SimpleNamespace(
         scheduled_spec_decode_tokens={"r0": [-1, -1]},
+        scheduled_ddtree_payloads={},
         num_invalid_spec_tokens={},
     )
     worker_row = [21, 22, 23, 24]

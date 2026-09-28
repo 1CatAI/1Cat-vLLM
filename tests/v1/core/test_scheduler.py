@@ -2597,6 +2597,11 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.connector = None
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
+    # The scheduler strips reasoning tokens before handing them to the grammar;
+    # pass them through so this test still checks what reaches accept_tokens.
+    scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (
+        lambda _request, token_ids: token_ids
+    )
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request]
     scheduler.waiting = Mock()
