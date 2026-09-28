@@ -523,8 +523,10 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        # DSpark's non-causal rows are noncausal_index_width wide, which is
+        # wider than the window.
         self.decode_swa_ragged_indices_buffer = torch.empty(
-            max_tokens * self.window_size,
+            max_tokens * max(self.window_size, self.noncausal_index_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -553,8 +555,9 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
+            dense_swa = base.decode_swa_indices.reshape(base.num_decode_tokens, -1)
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
+                dense_swa,
                 base.decode_swa_lens,
             )
             ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
@@ -563,7 +566,9 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
                 self.decode_swa_ragged_indices_buffer,
                 self.decode_swa_ragged_indptr_buffer,
                 base.num_decode_tokens,
-                self.window_size,
+                # The dense rows are window_size wide, or noncausal_index_width
+                # for DSpark's non-causal rows.
+                dense_swa.shape[1],
             )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
