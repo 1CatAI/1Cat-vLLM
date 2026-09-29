@@ -3,6 +3,7 @@
 """Omni wire requests use native jobs with bounded, request-owned media."""
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -232,6 +233,63 @@ def test_uploaded_reference_is_removed_after_validation_error(media, tmp_path):
         )
         assert response.status_code == 422
         assert not list((tmp_path / ".inputs").glob("*"))
+
+
+def test_cancelling_queued_job_removes_only_its_uploaded_inputs(media, tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingEngine(RecordingEngine):
+        def generate(self, request, output, *, on_progress=None):
+            entered.set()
+            assert release.wait(10), "test did not release the running job"
+            return super().generate(request, output, on_progress=on_progress)
+
+    engine = BlockingEngine(H3Config())
+    app = create_app(H3Config(), tmp_path, engine_factory=lambda _: engine)
+    source = Path(media["image"])
+    files = {"input_reference": ("image.png", source.read_bytes(), "image/png")}
+    with TestClient(app) as client:
+        try:
+            running = client.post("/v1/videos", files=files)
+            assert running.status_code == 202, running.text
+            running_id = running.json()["id"]
+            assert entered.wait(5)
+            running_inputs = tmp_path / ".inputs" / running_id
+            assert list(running_inputs.iterdir())
+
+            queued = client.post("/v1/videos", files=files)
+            assert queued.status_code == 202, queued.text
+            queued_id = queued.json()["id"]
+            assert queued.json()["status"] == "queued"
+            queued_inputs = tmp_path / ".inputs" / queued_id
+            assert list(queued_inputs.iterdir())
+
+            assert client.post(f"/v1/videos/{running_id}/cancel").status_code == 409
+            cancelled = client.post(f"/v1/videos/{queued_id}/cancel")
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancelled"
+            # Cleanup must finish while the worker is still busy with another job.
+            assert not queued_inputs.exists()
+            assert list(running_inputs.iterdir())
+            assert source.is_file()
+            assert client.get(f"/v1/videos/{queued_id}").json() == cancelled.json()
+            assert (
+                client.post(f"/v1/videos/{queued_id}/cancel").json() == cancelled.json()
+            )
+        finally:
+            release.set()
+
+        assert wait_job(client, running_id)["status"] == "completed"
+        late_cancel = client.post(f"/v1/videos/{running_id}/cancel")
+        assert late_cancel.json()["status"] == "completed"
+        assert client.get(f"/v1/videos/{running_id}/content").content == b"42"
+        # A later job also proves that the cancelled queue entry was skipped.
+        following = client.post("/v1/videos", json={"seed": 99})
+        assert following.status_code == 202, following.text
+        assert wait_job(client, following.json()["id"])["status"] == "completed"
+        assert [request.sampling.seed for request in engine.requests] == [42, 99]
+        assert client.delete(f"/v1/videos/{queued_id}").json()["deleted"]
 
 
 def test_lora_request_and_explicit_base_request(tmp_path):
