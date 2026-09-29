@@ -38,7 +38,8 @@ struct Sm70_s884 {
   template <int CTA_M, int CTA_N, int CTA_K, int TG_M, int TG_N, int TG_K,
             class PolicyA, class PolicyB, int Stages, bool SplitK,
             int GroupSizeU = 1, int GroupSizeV = 1, int TILE_C_M_ = -1,
-            int TILE_C_N_ = -1, int GmemLookahead = 1, bool FullTiles = false>
+            int TILE_C_N_ = -1, int GmemLookahead = 1, bool FullTiles = false,
+            bool MaskM = false>
   struct Type {
     // (TM, TN, TK) = R(MMA_Atom, SmemCopy_Atom)
     using MMA_Atom = SM70_MMA_884;
@@ -50,7 +51,8 @@ struct Sm70_s884 {
     using MMA = Tiled_MMA_v2<MMA_Atom, MMA_Map>;
 
     using IteratorA =
-        std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_A, PolicyA>,
+        std::conditional_t<FullTiles && !MaskM,
+                           IteratorSm70FullTile<MODE_A, PolicyA>,
                            IteratorSm70<MODE_A, PolicyA>>;
     using IteratorB =
         std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_B, PolicyB>,
@@ -140,6 +142,21 @@ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               kRowMajor,                   // order_C
                               half,                        // Tc
                               raster_order, group_axis>;
+
+// Dense batch FP4/FP8 share the activation supply and warp tiling policy.
+// Their packed weights and numerical transforms are the existing ones.
+template <class Weight, Order raster_order,
+          class Transform = Transform_HMMA_SIMT_B>
+using Config_QuantizedBatch =
+    Sm70_s884<Operand_A_BatchPadded<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<Weight>, Transform, Operand_V_Pack<uint16_t>,
+              kRowMajor, half, raster_order, -1>;
+
+template <Order raster_order>
+using Config_NVF4_Prescaled =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<fp4_e2m1_t>, Transform_HMMA_SIMT_B_PrescaledE2M1,
+              Operand_V_Pack<uint16_t>, kRowMajor, half, raster_order, 0>;
 
 template <Order raster_order, int group_axis = -1>
 using Config_E4M3_Prescaled =

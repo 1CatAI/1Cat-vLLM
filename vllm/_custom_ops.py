@@ -3092,6 +3092,42 @@ def all_reduce_sum2(
     _custom_ar_op("all_reduce_sum2")(fa, inp_a, inp_b, out)
 
 
+def supports_sm70_qwen38_hc_batch() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_batch")
+
+
+def sm70_qwen38_hc_batch(
+    fa: int,
+    inp: torch.Tensor,
+    packed_down: torch.Tensor,
+    packed_up: torch.Tensor,
+    partials: torch.Tensor,
+    lora: torch.Tensor,
+    local_output: torch.Tensor,
+    output: torch.Tensor,
+    injection: torch.Tensor,
+    round_down_partials: bool = False,
+    cooperative: bool = False,
+    full_unroll: bool = False,
+    fused_chain: bool = False,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_batch(
+        fa,
+        inp,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_output,
+        output,
+        injection,
+        round_down_partials,
+        cooperative,
+        full_unroll,
+        fused_chain,
+    )
+
+
 def sm70_qwen38_hc_down_allgather(
     fa: int,
     inp: torch.Tensor,

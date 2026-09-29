@@ -27,8 +27,21 @@ def grouped_e4m3_fp32_allowed(
 ):
     parent_table = getattr(metadata, "block_table", None)
     parent_seq = getattr(metadata, "seq_lens", None)
+    batch_size = (
+        parent_table.shape[0]
+        if parent_table is not None and parent_table.ndim == 2
+        else 0
+    )
+    query_rows = query.shape[0] if query.ndim == 3 else 0
+    if batch_size > 1:
+        from flash_attn_v100 import flash_attn_grouped_e4m3_fp32_available
+
+        batch_supported = flash_attn_grouped_e4m3_fp32_available(6)
+    else:
+        batch_supported = True
     if not (
         getattr(instance, "flash_attn_grouped_e4m3_fp32_paged", None) is not None
+        and batch_supported
         and instance.kv_cache_dtype == "fp8_e4m3"
         and instance.use_smallq_decode_xqa
         and partition_size_hint is None
@@ -36,7 +49,10 @@ def grouped_e4m3_fp32_allowed(
         and getattr(metadata, "causal", True)
         and instance._flash_v100_window_size(causal=True) == (-1, -1)
         and query.ndim == 3
-        and 2 <= query.shape[0] <= 8
+        and (
+            (batch_size == 1 and 2 <= query_rows <= 8)
+            or (2 <= batch_size <= 16 and query_rows == batch_size * 8)
+        )
         and query.shape[1] > 0
         and query.shape[2] == 256
         and query.dtype == torch.float16
@@ -54,17 +70,17 @@ def grouped_e4m3_fp32_allowed(
         and k.dtype == torch.uint8
         and v.dtype == torch.uint8
         and parent_seq is not None
-        and parent_seq.shape == (1,)
+        and parent_seq.shape == (batch_size,)
         and parent_table is not None
         and parent_table.ndim == 2
-        and parent_table.shape[0] == 1
+        and parent_table.shape[0] == batch_size
         and 0 < parent_table.shape[1] * k.shape[1] <= 266240
-        and lengths.shape == (query.shape[0],)
-        and table.shape == (query.shape[0], parent_table.shape[1])
+        and lengths.shape == (query_rows,)
+        and table.shape == (query_rows, parent_table.shape[1])
     ):
         return False
-    # The parent metadata proves that every real query belongs to one request.
-    # Device row lengths, including graph padding, define the visible KV prefix.
+    # Parent metadata maps each eight-row group to one request. Device row
+    # lengths, including graph padding, define each query's visible KV prefix.
     return all(
         t.device == query.device and t.dtype == torch.int32 and t.is_contiguous()
         for t in (table, lengths, parent_table, parent_seq)

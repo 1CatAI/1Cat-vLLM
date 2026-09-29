@@ -93,6 +93,7 @@ def support_torch_compile(
 def support_torch_compile(
     *,
     dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]] | None,
+    enable_if: Callable[[VllmConfig], bool] | None = None,
 ) -> Callable[[type[_T]], type[_T]]: ...
 
 

@@ -16,7 +16,10 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    CpuGpuOffloadingHandlers,
+    SingleDirectionOffloadingHandler,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -29,6 +32,52 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA stream ordering")
+@pytest.mark.parametrize("strided", [False, True])
+@torch.inference_mode()
+def test_load_waits_for_destination_zeroing(default_vllm_config, strided):
+    page_size = 8192
+    gpu_slots = 13 if strided else 1
+    cpu_workers = 4 if strided else 1
+    gpu_storage = torch.full(
+        (32, gpu_slots, page_size), 19, dtype=torch.int8, device="cuda"
+    )
+    cpu_storage = torch.full(
+        (8, cpu_workers, page_size), 37, dtype=torch.int8, pin_memory=True
+    )
+    gpu = gpu_storage[:, 0, :]
+    cpu = cpu_storage[:, 0, :]
+    handler = SingleDirectionOffloadingHandler(
+        [gpu], [cpu], 1, [[CanonicalKVCacheRef(0, page_size)]], False
+    )
+    compute = torch.cuda.Stream()
+    torch.accelerator.synchronize()
+    try:
+        # Repeat to exercise transfer stream/event reuse as well as first use.
+        for job in range(3):
+            with torch.cuda.stream(compute):
+                torch.cuda._sleep(300_000_000)
+                gpu[job].zero_()
+                zero_done = compute.record_event()
+                assert not zero_done.query(), "Destination preparation must be pending"
+                assert handler.transfer_async(
+                    job,
+                    (
+                        CPULoadStoreSpec([job]),
+                        GPULoadStoreSpec([job], group_sizes=(1,), block_indices=(0,)),
+                    ),
+                )
+            handler.wait({job})
+            finished = handler.get_finished()
+            assert len(finished) == 1 and finished[0].success
+            torch.accelerator.synchronize()
+            assert torch.equal(gpu[job].cpu(), cpu[job])
+        if strided:
+            assert (gpu_storage[:, 1:, :] == 19).all().item()
+    finally:
+        handler.shutdown()
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])

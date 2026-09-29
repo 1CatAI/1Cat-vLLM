@@ -253,8 +253,9 @@ def _make_small_layer() -> torch.nn.Module:
         (True, True, True),
     ],
 )
+@pytest.mark.parametrize("batch_layouts", [False, True])
 def test_nvfp4_qpn2_prepare_and_dispatch_contract(
-    monkeypatch, shared_requested, shared_available, compact
+    monkeypatch, shared_requested, shared_available, compact, batch_layouts
 ):
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "1")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", str(int(shared_requested)))
@@ -264,6 +265,9 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
     layer = _make_small_layer()
     calls = []
     monkeypatch.setattr(nvfp4_scheme, "_compact_qpn2_scales_enabled", lambda: compact)
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_tm, "use_batched_gemm_layouts", lambda: batch_layouts
+    )
 
     monkeypatch.setattr(nvfp4_scheme.sm70_tm, "use_turbomind", lambda enabled: True)
     scheme = CompressedTensorsW4A4Fp4()
@@ -299,8 +303,11 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
         nvfp4_scheme.sm70_ops, "nvfp4_qpn2_prepare_scales_sm70", fake_prepare_scales
     )
 
-    def fake_prepare(prepared_layer, *, interleave_gated_silu=False):
+    def fake_prepare(
+        prepared_layer, *, interleave_gated_silu=False, prescale_for_batch=False
+    ):
         assert not interleave_gated_silu
+        assert prescale_for_batch == (shared and batch_layouts and not compact)
         state = sm70_tm.SM70TurboMindLinearState(
             weight=torch.empty((1,), dtype=torch.int32),
             scales=torch.empty((1,), dtype=torch.float16),
@@ -309,6 +316,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
             q_ld=64,
             output_size=64,
             op_kind="nvfp4",
+            prescaled_scales=prescale_for_batch,
         )
         setattr(prepared_layer, sm70_tm.STATE_ATTR, state)
 
@@ -335,8 +343,10 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 
     def fake_shared_dispatch(*args):
         assert shared
-        assert args[2] is getattr(layer, sm70_tm.STATE_ATTR).weight
-        fake_combined_dispatch(*args)
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        assert args[2] is state.weight
+        assert args[-1] == state.prescaled_scales
+        fake_combined_dispatch(*args[:-1])
 
     monkeypatch.setattr(
         nvfp4_scheme.sm70_ops,

@@ -6050,8 +6050,9 @@ struct Sm70GqaHalf2Workspace {
         completion(runtime.completion),
         query_transposed(at::empty({kHeadDim, kRows}, q.options())),
         key_transposed(at::empty({kHeadDim, kMaxTotalKV}, q.options())),
-        scores(shared_scores->scores.narrow(0, 0, int64_t(kBlockN) * kRows)
-                   .view({kBlockN, kRows})),
+        scores(
+            shared_scores->scores.narrow(0, 0, shared_scores->block_n * kRows)
+                .view({shared_scores->block_n, kRows})),
         prefix_numerator(at::empty({kRows, kHeadDim},
     #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
                                    q.options().dtype(at::ScalarType::Float))),
@@ -6172,6 +6173,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   const int total_kv = static_cast<int>(k.size(1));
   const int prefix = total_kv - Workspace::kQuery;
   auto workspace = get_sm70_gqa_half2_workspace(q);
+  const int block_n = static_cast<int>(workspace->shared_scores->block_n);
   std::unique_lock<std::mutex> launch_lock(workspace->launch_mutex);
   cudaStream_t caller_stream = at::cuda::getCurrentCUDAStream();
   cudaStream_t prefix_stream = workspace->prefix_stream;
@@ -6320,13 +6322,12 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
     #else
   std::vector<std::unique_ptr<PVLauncher>> prefix_pv;
     #endif
-  const int kPrefixBlocks =
-      (prefix + Workspace::kBlockN - 1) / Workspace::kBlockN;
+  const int kPrefixBlocks = (prefix + block_n - 1) / block_n;
   prefix_qk.reserve(kPrefixBlocks);
   prefix_pv.reserve(kPrefixBlocks);
   for (int block = 0; block < kPrefixBlocks; ++block) {
-    int begin = block * Workspace::kBlockN;
-    int width = std::min(Workspace::kBlockN, prefix - begin);
+    int begin = block * block_n;
+    int width = std::min(block_n, prefix - begin);
     prefix_qk.push_back(std::make_unique<CublasQKLauncher>(CublasQKLauncher{
         workspace->prefix_cublas, query_transposed, key_transposed + begin,
         scores, Workspace::kRows, width, Workspace::kRows, total_kv}));
@@ -6494,8 +6495,7 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
           cudaEventRecord(workspace->prefix_pv_ready, prefix_stream));
     }
     #if defined(PREFIX_TORCH_STABLE_ROWS)
-    int width =
-        std::min(Workspace::kBlockN, prefix - block * Workspace::kBlockN);
+    int width = std::min(block_n, prefix - block * block_n);
     int tiles = (width + 8191) / 8192;
     dim3 max_grid((Workspace::kRows + 255) / 256, tiles);
     stable_row_max_partials<false><<<max_grid, 128, 0, prefix_stream>>>(

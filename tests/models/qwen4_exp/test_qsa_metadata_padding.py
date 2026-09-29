@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""QSA metadata bounds when query offsets include graph-padding requests."""
+
+import pytest
+import torch
+
+from vllm.models.qwen4_exp.common import qsa_cache
+from vllm.triton_utils import HAS_TRITON
+from vllm.utils import torch_utils
+from vllm.v1.attention.backend import CommonAttentionMetadata
+
+pytestmark = pytest.mark.skip_global_cleanup
+
+
+@pytest.mark.parametrize("backend", ["torch", "triton"])
+@pytest.mark.parametrize("num_actual_tokens", [1, 4], ids=["decode", "verify"])
+@pytest.mark.parametrize("padding", [0, 3], ids=["unpadded", "graph-padded"])
+@pytest.mark.parametrize("cache_kind", ["plain", "compressed", "circular"])
+def test_qsa_metadata_query_offset_bounds(
+    backend: str,
+    num_actual_tokens: int,
+    padding: int,
+    cache_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if backend == "triton" and (not HAS_TRITON or not torch.cuda.is_available()):
+        pytest.skip("Triton metadata requires CUDA")
+    device = torch.device("cuda" if backend == "triton" else "cpu")
+    if backend == "torch":
+        # Keep the real mapping helper, but avoid CUDA-pinned allocation in
+        # this CPU-only reference path.
+        monkeypatch.setattr(torch_utils, "PIN_MEMORY", False)
+    # One real request, followed by graph-padding requests of one token each.
+    query_start_loc_cpu = torch.tensor(
+        [0, *range(num_actual_tokens, num_actual_tokens + padding + 1)],
+        dtype=torch.int32,
+    )
+    common = CommonAttentionMetadata(
+        num_actual_tokens=num_actual_tokens,
+        num_reqs=1 + padding,
+        max_query_len=num_actual_tokens,
+        max_seq_len=7 + num_actual_tokens,
+        query_start_loc=query_start_loc_cpu.to(device),
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens=torch.tensor(
+            [7 + num_actual_tokens] + [0] * padding,
+            dtype=torch.int32,
+            device=device,
+        ),
+        # Deliberately allocate only real slots, including for the Triton read.
+        slot_mapping=torch.arange(
+            100, 100 + num_actual_tokens, dtype=torch.int64, device=device
+        ),
+        block_table_tensor=torch.tensor(
+            [[5, 6]] + [[0, 0]] * padding, dtype=torch.int32, device=device
+        ),
+    )
+    sentinel = -12345
+    # The real CommonAttentionMetadata mapping helper needs backing capacity
+    # for every query offset, as in the scheduler's preallocated mapping buffer.
+    mapping_capacity = num_actual_tokens + padding
+    token_buffer = torch.full(
+        (mapping_capacity + 1,), sentinel, dtype=torch.int32, device=device
+    )
+    position_buffer = torch.full(
+        (num_actual_tokens + 1,), sentinel, dtype=torch.int64, device=device
+    )
+    slot_buffer = torch.full_like(position_buffer, sentinel)
+    builder = (
+        qsa_cache._build_qsa_metadata_torch
+        if backend == "torch"
+        else qsa_cache.build_qsa_metadata_triton
+    )
+
+    def build_metadata():
+        return builder(
+            common,
+            token_buffer[:mapping_capacity],
+            position_buffer[:num_actual_tokens],
+            slot_buffer[:num_actual_tokens],
+            storage_block_size=4,
+            compress_ratio=2 if cache_kind == "compressed" else 1,
+            circular_buffer_size=4 if cache_kind == "circular" else 0,
+        )
+
+    token_to_req, positions, slots = build_metadata()
+
+    assert token_to_req.tolist() == [0] * num_actual_tokens
+    assert positions.tolist() == list(range(7, 7 + num_actual_tokens))
+    expected_slots = {
+        "plain": [100, 101, 102, 103],
+        "compressed": [23, -1, 24, -1],
+        "circular": [23, 20, 21, 22],
+    }
+    assert slots.tolist() == expected_slots[cache_kind][:num_actual_tokens]
+    assert token_buffer[-1].item() == sentinel
+    assert position_buffer[-1].item() == sentinel
+    assert slot_buffer[-1].item() == sentinel
+
+    if backend == "triton":
+        eager = tuple(tensor.clone() for tensor in (token_to_req, positions, slots))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = build_metadata()
+        for _ in range(3):
+            graph.replay()
+            for actual, expected in zip(replayed, eager):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        # Replay must consume updated request data, not capture-time positions.
+        common.seq_lens[0].add_(4)
+        graph.replay()
+        assert replayed[0].tolist() == [0] * num_actual_tokens
+        assert replayed[1].tolist() == list(range(11, 11 + num_actual_tokens))
+        updated_slots = (
+            [25, -1, 26, -1]
+            if cache_kind == "compressed"
+            else expected_slots[cache_kind]
+        )
+        assert replayed[2].tolist() == updated_slots[:num_actual_tokens]
+        assert token_buffer[-1].item() == sentinel
+        assert position_buffer[-1].item() == sentinel
+        assert slot_buffer[-1].item() == sentinel

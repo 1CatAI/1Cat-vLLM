@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 from openai.types.chat import (
     ChatCompletionAssistantMessageParam,
@@ -27,6 +27,17 @@ from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+_RESPONSE_MESSAGE_TRANSPORT_FIELDS = frozenset(
+    {
+        "type",
+        "id",
+        "status",
+        "phase",
+        "internal_chat_message_metadata_passthrough",
+    }
+)
 
 
 def should_continue_final_message(
@@ -232,6 +243,19 @@ def _construct_message_from_response_item(
             role="tool",
             content=item.get("output"),
             tool_call_id=item.get("call_id"),
+        )
+    elif isinstance(item, dict) and item.get("type", "message") == "message":
+        # Responses message envelopes can carry per-item IDs and lifecycle
+        # metadata. Chat rendering does not consume these fields, and keeping
+        # them would make pre-parse developer-to-system consolidation treat
+        # different message IDs as conflicting system-message metadata.
+        return cast(
+            ChatCompletionMessageParam,
+            {
+                key: value
+                for key, value in item.items()
+                if key not in _RESPONSE_MESSAGE_TRANSPORT_FIELDS
+            },
         )
     return item  # type: ignore[arg-type]
 

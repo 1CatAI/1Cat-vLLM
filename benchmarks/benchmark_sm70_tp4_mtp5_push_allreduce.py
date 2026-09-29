@@ -23,12 +23,14 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
 _HIDDEN_SIZE = 2560
 _LAYERS = 48
 _MTP5_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5"
 _BATCH_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH"
+_FASTPATH_ENV = "VLLM_SM70_QWEN38_BATCH_FASTPATH"
 
 
 def _make_inputs(rank: int, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -55,7 +57,9 @@ def _capture_round(
     tokens: int,
 ) -> tuple[torch.cuda.CUDAGraph, list[torch.Tensor]]:
     os.environ[_MTP5_ENV] = "1" if push and tokens == 5 else "0"
-    os.environ[_BATCH_ENV] = "1" if push and tokens in (4, 8, 16) else "0"
+    os.environ[_BATCH_ENV] = "1" if push and tokens in (2, 4, 8, 16) else "0"
+    os.environ[_FASTPATH_ENV] = "1" if push and tokens == 2 else "0"
+    envs.disable_envs_cache()
     torch.accelerator.synchronize()
     dist.barrier()
     regular_outputs = [torch.empty_like(input_a) for _ in range(_LAYERS)]
@@ -116,7 +120,7 @@ def _compare_outputs(
     max_abs_diff = 0.0
     first_mismatch: dict[str, Any] | None = None
     for index, (control, push) in enumerate(zip(baseline, candidate, strict=True)):
-        mismatch = control != push
+        mismatch = control.view(torch.int16) != push.view(torch.int16)
         count = int(mismatch.sum().item())
         mismatch_count += count
         diff = (control.float() - push.float()).abs()
@@ -192,9 +196,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--timing-repeats", type=int, default=4)
-    parser.add_argument("--tokens", type=int, choices=(4, 5, 8, 16), default=5)
+    parser.add_argument("--tokens", type=int, choices=(2, 4, 5, 8, 16), default=5)
     parser.add_argument("--json-out")
     args = parser.parse_args()
+    original_env = {
+        name: os.environ.get(name) for name in (_MTP5_ENV, _BATCH_ENV, _FASTPATH_ENV)
+    }
     if args.warmup < 0 or args.iterations <= 0 or args.timing_repeats <= 0:
         raise ValueError("warmup must be >= 0; iterations/repeats must be > 0")
 
@@ -305,8 +312,12 @@ def main() -> None:
         if not result["all_ranks_equal"]:
             raise SystemExit(1)
     finally:
-        os.environ[_MTP5_ENV] = "0"
-        os.environ[_BATCH_ENV] = "0"
+        for name, value in original_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        envs.disable_envs_cache()
         communicator.close()
         dist.destroy_process_group(gloo_group)
         dist.destroy_process_group()

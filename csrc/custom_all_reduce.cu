@@ -8,6 +8,9 @@
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
+#if !defined(USE_ROCM)
+  #include "sm70_qwen38_hc_batch.cuh"
+#endif
 
 // Fake pointer type, must match fptr_t type in ops.h.
 // We use this type alias to indicate when pointers are passed in as int64_t.
@@ -806,6 +809,64 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
       throw std::runtime_error(
           "custom allreduce sum2 only supports float32, float16 and bfloat16");
   }
+}
+
+void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
+                          torch::Tensor packed_down, torch::Tensor packed_up,
+                          torch::Tensor partials, torch::Tensor lora,
+                          torch::Tensor local_output, torch::Tensor output,
+                          torch::Tensor injection, bool round_down_partials,
+                          bool cooperative, bool full_unroll,
+                          bool fused_chain) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(_fa != 0 && input.is_cuda(),
+              "Invalid batch HC communicator/input");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(fa->world_size_ == 4 && fa->fully_connected_ &&
+                  fa->sm70_tp4_push_buffers_registered_ &&
+                  vllm::custom_allreduce_current_device_is_sm70(),
+              "Batch HC requires a registered fully-connected SM70 TP4 group");
+  TORCH_CHECK(input.dim() == 2 && input.size(0) >= 2 && input.size(0) <= 16 &&
+                  input.size(1) == 10240,
+              "Batch HC requires [2..16, 10240] input");
+  const int m = input.size(0);
+  for (const auto& t :
+       {input, packed_down, packed_up, lora, local_output, output, injection}) {
+    TORCH_CHECK(
+        t.is_cuda() && t.device() == input.device() &&
+            t.scalar_type() == at::kHalf && t.is_contiguous() &&
+            reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+        "Batch HC requires same-device aligned contiguous FP16 storage");
+  }
+  TORCH_CHECK(packed_down.sizes() == at::IntArrayRef({3, 640, 2, 32, 8}) &&
+                  packed_up.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}),
+              "Invalid batch HC packed weights");
+  TORCH_CHECK(partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 96}),
+              "Invalid batch HC FP32 partial workspace");
+  TORCH_CHECK(lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  local_output.sizes() == at::IntArrayRef({m, 640}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}) &&
+                  injection.sizes() == at::IntArrayRef({m, 4}),
+              "Invalid batch HC output geometry");
+  vllm::qwen38_hc_batch::launch(
+      fa->sm70_tp4_push_buffers_, fa->rank_,
+      reinterpret_cast<const half*>(input.data_ptr()),
+      reinterpret_cast<const half*>(packed_down.data_ptr()),
+      reinterpret_cast<const half*>(packed_up.data_ptr()),
+      partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
+      reinterpret_cast<half*>(local_output.data_ptr()),
+      reinterpret_cast<half*>(output.data_ptr()),
+      reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
+      cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
+      fused_chain);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,

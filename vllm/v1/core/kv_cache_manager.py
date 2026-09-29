@@ -125,6 +125,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        prefix_cache_retention_interval: int | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -153,6 +154,9 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+        )
+        self.coordinator.configure_prefix_cache_retention(
+            prefix_cache_retention_interval
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -211,6 +215,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
+        request.shared_prefix_boundary = 0
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -226,6 +231,10 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        # Keep the existing two-value lookup API used by 1Cat connectors. The
+        # synchronous coordinator exposes the junction from this lookup only.
+        request.shared_prefix_boundary = self.coordinator.shared_prefix_boundary
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None

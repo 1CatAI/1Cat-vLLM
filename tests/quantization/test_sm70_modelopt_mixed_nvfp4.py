@@ -397,7 +397,7 @@ def test_qwen38_qpn_batch_fused_w2_defaults_on_and_is_shape_gated(monkeypatch, t
     assert not _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids)
 
 
-def test_qwen38_qpn_mtp5_decode_is_opt_in_and_exact_shape_only(monkeypatch):
+def test_qwen38_qpn_mtp5_decode_defaults_on_and_exact_shape_only(monkeypatch):
     layer = SimpleNamespace(
         moe_config=_qwen4_moe_contract(),
         sm70_nvfp4_num_experts=512,
@@ -409,6 +409,9 @@ def test_qwen38_qpn_mtp5_decode_is_opt_in_and_exact_shape_only(monkeypatch):
     topk_ids = torch.empty(5, 10, dtype=torch.int32)
 
     monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", raising=False)
+    assert _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0")
     assert not _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
 
     monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1")

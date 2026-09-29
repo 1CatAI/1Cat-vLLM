@@ -44,6 +44,8 @@ class _DecodeWorkspace:
     exp_sums: torch.Tensor
     active_num_partitions: torch.Tensor
     max_num_partitions: int
+    captured: bool = False
+    previous: "_DecodeWorkspace | None" = None
 
 
 @dataclass
@@ -331,41 +333,62 @@ def _get_decode_workspace_for_plan(
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
+    share_rows = os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0"
+    partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
     key = (
         device_index,
         stream_id,
-        batch_capacity,
+        None if share_rows else batch_capacity,
         num_heads,
         head_dim,
         plan.partition_size,
         partial_dtype,
+        partition_capacity if share_rows else None,
     )
 
     workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
     if (
         workspace is None
+        or workspace.tmp_out.size(0) < batch_capacity
         or workspace.max_num_partitions < plan.workspace_num_partitions
     ):
+        # Capture sizes normally descend, so smaller shapes can use a prefix
+        # of the first allocation. Partition capacities remain separate: a
+        # long single-row request followed by a short batched request must not
+        # multiply the largest row count by the largest context capacity.
+        # A later growth must keep any old addresses
+        # already embedded in graphs alive, including warmup allocations that
+        # were subsequently reused during capture.
+        previous = workspace
         workspace = _allocate_decode_workspace(
             q,
-            batch_capacity=batch_capacity,
+            batch_capacity=max(
+                batch_capacity, previous.tmp_out.size(0) if previous else 0
+            ),
             num_heads=num_heads,
             head_dim=head_dim,
             max_num_partitions=_round_decode_partition_capacity(
-                plan.workspace_num_partitions
+                max(
+                    plan.workspace_num_partitions,
+                    previous.max_num_partitions if previous else 0,
+                )
             ),
             partial_dtype=partial_dtype,
         )
+        if previous is not None:
+            workspace.previous = previous if previous.captured else previous.previous
         if _can_cache_workspace(q):
             _decode_workspace_cache[key] = workspace
 
+    if _cuda_graph_capture_active():
+        workspace.captured = True
     if active_num_partitions is None:
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
     return (
-        workspace.tmp_out[:, :, : workspace.max_num_partitions, :],
-        workspace.max_logits[:, :, : workspace.max_num_partitions],
-        workspace.exp_sums[:, :, : workspace.max_num_partitions],
+        workspace.tmp_out[:batch_capacity],
+        workspace.max_logits[:batch_capacity],
+        workspace.exp_sums[:batch_capacity],
         active_num_partitions,
     )
 
@@ -1112,12 +1135,12 @@ def flash_attn_grouped_verify_request_major_abi_version() -> int:
     return 0 if get_abi_version is None else int(get_abi_version())
 
 
-def flash_attn_grouped_e4m3_fp32_available() -> bool:
+def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
     version = getattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_precision_version", None)
     return (
         hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
         and callable(version)
-        and int(version()) >= 4
+        and int(version()) >= min_version
     )
 
 
@@ -1133,12 +1156,13 @@ def flash_attn_grouped_e4m3_fp32_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """E4M3 q2..8/GQA6/D256 attention over one KV sequence.
+    """E4M3 q2..8/B1 or request-major q8/B2..16 GQA6/D256 attention.
 
     Row lengths are authoritative GPU metadata, not inferred from padded Q.
     Zero lengths produce zero outputs. All positive lengths must fit the
     block table, whose entries must address valid physical pages. This is
-    not an independent-request batch API. QK/PV and partial storage are FP32;
+    q8 batches use one block-table row per independent request. QK/PV and
+    partial storage are FP32;
     Tensor Core operands and final output remain FP16. KV must encode E4M3.
     Precision revision 3 retains FP32 numerators and separate max/sum until
     the final normalization, as well as compensated QK/P and tile-local PV.
@@ -1153,7 +1177,12 @@ def flash_attn_grouped_e4m3_fp32_paged(
         or k_cache.shape[1] not in (800, 848, 1616, 1648, 1728, 3296, 3456)
     ) and int(flash_attn_v100_cuda.grouped_e4m3_fp32_precision_version()) < 5:
         raise RuntimeError("Rebuild Flash-V100 for multi-head E4M3 revision 5")
-    workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
+    batch_size = block_table.shape[0]
+    if batch_size > 1 and not flash_attn_grouped_e4m3_fp32_available(6):
+        raise RuntimeError("Rebuild Flash-V100 for request-major E4M3 revision 6")
+    workspace = _get_grouped_verify_workspace(
+        q, batch_size=batch_size, partial_dtype=torch.float32
+    )
     return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
         q,
         k_cache,

@@ -43,8 +43,14 @@ class DmaCopyBackend:
         self._load_stream = load_stream
         self._store_stream = store_stream
 
-        self._store_params = build_params(gpu_caches, cpu_caches, store_stream)
-        self._load_params = build_params(cpu_caches, gpu_caches, load_stream)
+        # Stores read the live GPU KV cache and must stay stream-ordered;
+        # loads read host pinned memory and can use the relaxed order.
+        self._store_params = build_params(
+            gpu_caches, cpu_caches, store_stream, src_access_order_any=False
+        )
+        self._load_params = build_params(
+            cpu_caches, gpu_caches, load_stream, src_access_order_any=True
+        )
 
         self._queue = queue.SimpleQueue()
         self._thread = threading.Thread(

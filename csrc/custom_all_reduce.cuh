@@ -98,6 +98,7 @@ constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
     5 * 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen38M2Bytes = 2 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38M4Bytes = 4 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen38M8Bytes = 8 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
@@ -134,9 +135,23 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
+constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
+// Separate channels preserve half bits and isolate batch HC from M1/MoE.
+constexpr size_t kSm70Qwen38HcBatchOutputOffset =
+    kSm70Qwen38HcBatchDownOffset + kSm70Qwen38HcBatchCounterBytes +
+    kSm70Tp4PushAllreduceEpochs * 4 * 16 * 88 * sizeof(uint32_t);
+// Fused up/output has tile-major packets and an independent epoch per block.
+constexpr int kSm70Qwen38HcBatchFusedBlocks = 160;
+constexpr size_t kSm70Qwen38HcBatchFusedOffset =
+    kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
+    kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcBatchFusedOffset +
+    kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t) +
+    kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
@@ -168,8 +183,13 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
   }
   const char* batch = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
   const bool batch_enabled = batch == nullptr || std::strcmp(batch, "1") == 0;
-  if (batch_enabled && (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
-                        bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
+  const char* fastpath = std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
+  const bool m2_enabled =
+      fastpath != nullptr && std::strcmp(fastpath, "1") == 0;
+  if (batch_enabled &&
+      ((m2_enabled && bytes == kSm70Tp4PushAllreduceQwen38M2Bytes) ||
+       bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
+       bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
     const char* blocks =
         std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS");
     if (blocks != nullptr) {
@@ -182,11 +202,11 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
         return parsed;
       }
     }
-    return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
+    return static_cast<int>(bytes / (kSm70Tp4PushAllreduceThreads * 16));
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
-  return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&
-                 std::strcmp(mtp5, "1") == 0
+  return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
+                 (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0)
              ? 13
              : 0;
 }
@@ -1533,7 +1553,7 @@ static __global__ void __launch_bounds__(512, 1)
   if (tid == 0) self_sg->_flag[0] = pair_flag;
 }
 
-template <typename T, int ngpus>
+template <typename T, int ngpus, bool CanonicalOrder = false>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
                                T* __restrict__ result, int rank, int size) {
@@ -1550,7 +1570,10 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Medium SM70 messages previously used one-stage canonical rank order.
+    // Preserve that arithmetic when sharing their reduction across devices;
+    // temporary ownership and gather visibility retain the two-stage order.
+    ptrs[i] = (const P*)_dp->ptrs[CanonicalOrder ? i : target];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
@@ -1973,8 +1996,37 @@ class CustomAllreduce {
         return;
       }
     }
+    if constexpr (std::is_same_v<T, half>) {
+      const char* blocks_override =
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+      if (world_size_ == 4 && fully_connected_ && bytes >= 384 * 1024 &&
+          bytes < 512 * 1024 && block_limit == defaultBlockLimit &&
+          (blocks_override == nullptr || blocks_override[0] == '\0') &&
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          std::getenv("VLLM_SM70_TP4_M5_AR_THREADS") == nullptr &&
+          custom_allreduce_current_device_is_sm70()) {
+        cross_device_reduce_2stage<T, 4, true>
+            <<<20, 256, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+        return;
+      }
+    }
     threads =
         sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_, bytes);
+    if constexpr (std::is_same_v<T, half>) {
+      // Medium TP4 messages benefit from fewer participating warps/CTAs.
+      // Keep the two-stage partition, rank order and visibility protocol;
+      // explicit diagnostic dispatch overrides retain their existing launch.
+      const char* blocks_override =
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+      if (world_size_ == 4 && fully_connected_ && bytes >= 512 * 1024 &&
+          bytes <= 768 * 1024 && block_limit == defaultBlockLimit &&
+          (blocks_override == nullptr || blocks_override[0] == '\0') &&
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          custom_allreduce_current_device_is_sm70()) {
+        threads = 256;
+        block_limit = 20;
+      }
+    }
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
     if constexpr (std::is_same_v<T, half>) {
@@ -2200,9 +2252,16 @@ class CustomAllreduce {
           (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
            bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
            bytes == kSm70Tp4PushAllreduceBytes);
+      const char* batch_fastpath =
+          std::getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH");
+      const bool qwen38_m2 = bytes == kSm70Tp4PushAllreduceQwen38M2Bytes &&
+                             batch_fastpath != nullptr &&
+                             std::strcmp(batch_fastpath, "1") == 0 &&
+                             (batch == nullptr || std::strcmp(batch, "1") == 0);
       const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
-      const bool qwen38_mtp5 = mtp5 != nullptr && std::strcmp(mtp5, "1") == 0 &&
-                               bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
+      const bool qwen38_mtp5 =
+          (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0) &&
+          bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
       const char* qwen4_exp_m1 =
           std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1");
       const bool qwen4_exp_m1_enabled =
@@ -2224,7 +2283,7 @@ class CustomAllreduce {
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          (qwen38_batch || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
+          (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
         if (push_blocks > 0) {

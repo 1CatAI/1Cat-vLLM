@@ -9,6 +9,7 @@
 
 namespace onecat_sm70_prefill {
 struct ScoreWorkspace {
+  const int64_t block_n;
   at::Tensor scores;
   std::mutex mutex;
   cudaEvent_t completion = nullptr;

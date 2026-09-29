@@ -4211,6 +4211,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 hidden_states,
                 self.in_proj_qkvz.weight,
                 self.in_proj_ba.weight,
+                getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_packed", None),
+                getattr(self.in_proj_ba, "_sm70_qwen38_gdn_packed", None),
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
@@ -5655,7 +5657,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state=ssm_state,
             attn_metadata=attn_metadata,
         )
-        if use_dflash2_packed_gdn_verify:
+        use_sm70_mixed_qkv_verify = (
+            mixed_qkv_decode_requested
+            and not use_dflash2_packed_gdn_verify
+            and spec_sequence_masks is not None
+            and ddtree_parent_ids is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes > 0
+            and current_platform.is_device_capability(70)
+            and self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+            and ssm_state.dtype == torch.float32
+            and mixed_qkv_spec is not None
+            and mixed_qkv_spec.is_contiguous()
+            and 1 < mixed_qkv_spec.shape[0] <= 16
+        )
+        if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
@@ -5825,6 +5844,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                 )
                 last_recurrent_state = ssm_state
+            elif use_sm70_mixed_qkv_verify:
+                assert mixed_qkv_spec is not None
+                assert spec_query_start_loc is not None
+                # Reuse the decode loader with the original fused verifier's
+                # gating, BV32 reduction and FP32 state. Avoid materializing
+                # three contiguous splits and concatenating them again.
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                        A_log=self.A_log,
+                        a=a_spec,
+                        b=b_spec,
+                        dt_bias=self.dt_bias,
+                        mixed_qkv=mixed_qkv_spec,
+                        num_q_heads=self.num_k_heads // self.tp_size,
+                        num_v_heads=self.num_v_heads // self.tp_size,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : attn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=spec_state_slot_selectors,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+                _log_runtime_route_once(
+                    "SM70 mixed-QKV fused GDN target-verification route hit."
+                )
             else:
                 assert query_spec is not None
                 assert key_spec is not None

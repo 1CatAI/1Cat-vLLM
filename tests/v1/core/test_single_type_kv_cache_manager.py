@@ -93,7 +93,7 @@ def test_chunked_local_attention_possible_cached_prefix():
             kv_cache_group_ids=[0],
             block_pool=block_pool,
             kv_cache_spec=chunked_local_attention_spec,
-            use_eagle=False,
+            drop_eagle_block=False,
             alignment_tokens=block_size,
         )[0]
         assert len(computed_blocks) == expect_length
@@ -164,7 +164,7 @@ def test_sliding_window_possible_cached_prefix():
             kv_cache_group_ids=[0],
             block_pool=block_pool,
             kv_cache_spec=sliding_window_spec,
-            use_eagle=False,
+            drop_eagle_block=False,
             alignment_tokens=block_size,
         )[0]
         assert len(computed_blocks) == expect_length
@@ -631,7 +631,7 @@ def test_mamba_honors_eagle_cache_drop() -> None:
                 kv_cache_group_ids=[group_id],
                 block_pool=block_pool,
                 kv_cache_spec=spec,
-                use_eagle=use_eagle,
+                drop_eagle_block=use_eagle,
                 alignment_tokens=block_size,
             )[0]
         )

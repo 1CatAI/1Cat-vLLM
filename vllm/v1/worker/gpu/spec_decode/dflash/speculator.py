@@ -519,6 +519,12 @@ class DFlashSpeculator(DraftModelSpeculator):
     def _apply_ngram_assist(self, num_reqs: int) -> None:
         """Override model proposals for ngram-hit rows, if configured."""
 
+    def _combine_aux_hidden_states(self, aux_hidden_states: list[torch.Tensor]):
+        combine_aux = getattr(self.model, "combine_aux_hidden_states", None)
+        if combine_aux is not None:
+            return combine_aux(aux_hidden_states)
+        return self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
+
     @torch.inference_mode()
     def propose(
         self,
@@ -594,10 +600,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     input_batch.input_ids[:num_target_tokens].tolist(),
                     aux_stats,
                 )
-            with record_function_or_nullcontext("dflash: concatenate target hidden"):
-                combined_target_hidden = torch.cat(aux_hidden_states, dim=-1)
             with record_function_or_nullcontext("dflash: project target hidden"):
-                hidden_states = self.model.combine_hidden_states(combined_target_hidden)
+                hidden_states = self._combine_aux_hidden_states(aux_hidden_states)
         else:
             hidden_states = last_hidden_states
         with record_function_or_nullcontext("dflash: stage target hidden"):

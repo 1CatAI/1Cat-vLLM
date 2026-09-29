@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
     _is_sm70_fp8_qpn8_runtime_contract,
     _missing_sm70_fp8_qpn8_ops,
+    _try_sm70_fp8_prescaled_decode_scales,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
@@ -95,6 +96,77 @@ direct_register_custom_op(
     _sm70_ct_fp8_qpn8_dispatch,
     mutates_args=["out"],
     fake_impl=_sm70_ct_fp8_qpn8_dispatch_fake,
+)
+
+
+def _sm70_ct_fp8_qpn8_batch_dispatch(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    tm_weight: torch.Tensor,
+    tm_scales: torch.Tensor,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+    tm_prescaled: bool,
+) -> None:
+    # AOTInductor shares a dynamic M range. Dispatch inside this opaque op so
+    # a graph captured at M=1 can later select the measured M64 path.
+    m = x.shape[0]
+    # M32 TurboMind saves less than one millisecond across a full verifier
+    # step but changes the acceptance trajectory enough to lose pure decode.
+    # Preserve the exact QPN8 route through M32, including the C1 fast path.
+    if 32 < m <= 64:
+        if tm_prescaled:
+            if gated_silu:
+                raise ValueError("Pre-scaled FP8 batch GEMM cannot fuse gated-SiLU")
+            sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
+                out, x, tm_weight, tm_scales, 128, tm_k_ld, tm_q_ld
+            )
+        else:
+            sm70_ops.fp8_gemm_sm70_out(
+                out, x, tm_weight, tm_scales, 128, tm_k_ld, tm_q_ld, gated_silu
+            )
+        return
+    _sm70_ct_fp8_qpn8_dispatch(
+        out,
+        x,
+        codes,
+        scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )
+
+
+def _sm70_ct_fp8_qpn8_batch_dispatch_fake(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    tm_weight: torch.Tensor,
+    tm_scales: torch.Tensor,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+    tm_prescaled: bool,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "sm70_ct_fp8_qpn8_batch_dispatch",
+    _sm70_ct_fp8_qpn8_batch_dispatch,
+    mutates_args=["out"],
+    fake_impl=_sm70_ct_fp8_qpn8_batch_dispatch_fake,
 )
 
 _SM70_CHANNEL_FP8_QPN8_SHAPES = {
@@ -324,6 +396,42 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     qpn8_codes, qpn8_scales = sm70_ops.fp8_qpn8_prepare_sm70(
                         layer.weight, weight_scale
                     )
+                    batch_tm = sm70_tm.use_batched_gemm_layouts()
+                    if batch_tm:
+                        gated = (
+                            getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+                            == "gate_up_proj"
+                        )
+                        tm_weight, tm_scales, tm_meta = sm70_ops.fp8_sm70_prepare(
+                            layer.weight, weight_scale, 128, gated
+                        )
+                        n, k = layer.weight.shape
+                        prescaled_batch = None
+                        if (
+                            not gated
+                            and os.getenv("VLLM_SM70_FP8_BATCH_PRESCALED", "0") == "1"
+                            and (k, n) in {(1536, 5120), (5120, 4096), (5120, 3584)}
+                            and hasattr(sm70_ops, "fp8_gemm_sm70_prefill_prescaled_out")
+                        ):
+                            prescaled_batch = _try_sm70_fp8_prescaled_decode_scales(
+                                tm_scales
+                            )
+                        if prescaled_batch is not None:
+                            tm_scales = prescaled_batch
+                            logger.info_once(
+                                "SM70 channel-FP8 batch GEMM uses reversible "
+                                "load-time pre-scaled FP16 scales for M=33..64."
+                            )
+                        layer.sm70_fp8_batch_tm_prescaled = prescaled_batch is not None
+                        layer.register_buffer(
+                            "sm70_fp8_batch_tm_weight", tm_weight, persistent=False
+                        )
+                        layer.register_buffer(
+                            "sm70_fp8_batch_tm_scales", tm_scales, persistent=False
+                        )
+                        layer.sm70_fp8_batch_tm_k_ld = int(tm_meta[0].item())
+                        layer.sm70_fp8_batch_tm_q_ld = int(tm_meta[1].item())
+                        layer.sm70_fp8_batch_tm = True
                     replace_parameter(layer, "weight", qpn8_codes)
                     del layer._parameters["weight_scale"]
                     replace_parameter(layer, "weight_scale_inv", qpn8_scales)
@@ -345,10 +453,16 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         layer.sm70_fp8_qpn8_gated_split_k = gated_split_k
                         layer.sm70_fp8_qpn8_gated_nacc = gated_nacc
                         layer.sm70_fp8_qpn8_gated_prefetch = gated_prefetch
-                    logger.info_once(
-                        "Memory-neutral SM70 channel-FP8 QPN8 path enabled "
-                        "for aligned local projection shapes."
-                    )
+                    if batch_tm:
+                        logger.info_once(
+                            "SM70 channel-FP8 batch GEMM retains a second "
+                            "load-time compressed TurboMind layout for M64."
+                        )
+                    else:
+                        logger.info_once(
+                            "Memory-neutral SM70 channel-FP8 QPN8 path enabled "
+                            "for aligned local projection shapes."
+                        )
                     return
                 if missing_ops:
                     logger.warning_once(
@@ -438,16 +552,33 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             if x_2d.shape[0] == 0:
                 return out_2d.reshape(out_shape)
             if getattr(layer, "sm70_fp8_qpn8", False):
-                torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
-                    out_2d,
-                    x_2d,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    int(layer.sm70_fp8_qpn8_split_k),
-                    int(layer.sm70_fp8_qpn8_nacc),
-                    bool(layer.sm70_fp8_qpn8_prefetch),
-                    False,
-                )
+                if getattr(layer, "sm70_fp8_batch_tm", False):
+                    torch.ops.vllm.sm70_ct_fp8_qpn8_batch_dispatch(
+                        out_2d,
+                        x_2d,
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        layer.sm70_fp8_batch_tm_weight,
+                        layer.sm70_fp8_batch_tm_scales,
+                        int(layer.sm70_fp8_batch_tm_k_ld),
+                        int(layer.sm70_fp8_batch_tm_q_ld),
+                        int(layer.sm70_fp8_qpn8_split_k),
+                        int(layer.sm70_fp8_qpn8_nacc),
+                        bool(layer.sm70_fp8_qpn8_prefetch),
+                        False,
+                        bool(layer.sm70_fp8_batch_tm_prescaled),
+                    )
+                else:
+                    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+                        out_2d,
+                        x_2d,
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        int(layer.sm70_fp8_qpn8_split_k),
+                        int(layer.sm70_fp8_qpn8_nacc),
+                        bool(layer.sm70_fp8_qpn8_prefetch),
+                        False,
+                    )
             else:
                 sm70_ops.fp8_gemm_sm70_out(
                     out_2d,
@@ -487,14 +618,31 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         )
         if x_2d.shape[0] == 0:
             return out_2d.reshape(*x.shape[:-1], out_features)
-        torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
-            out_2d,
-            x_2d,
-            layer.weight,
-            layer.weight_scale_inv,
-            int(layer.sm70_fp8_qpn8_gated_split_k),
-            int(layer.sm70_fp8_qpn8_gated_nacc),
-            bool(layer.sm70_fp8_qpn8_gated_prefetch),
-            True,
-        )
+        if getattr(layer, "sm70_fp8_batch_tm", False):
+            torch.ops.vllm.sm70_ct_fp8_qpn8_batch_dispatch(
+                out_2d,
+                x_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                layer.sm70_fp8_batch_tm_weight,
+                layer.sm70_fp8_batch_tm_scales,
+                int(layer.sm70_fp8_batch_tm_k_ld),
+                int(layer.sm70_fp8_batch_tm_q_ld),
+                int(layer.sm70_fp8_qpn8_gated_split_k),
+                int(layer.sm70_fp8_qpn8_gated_nacc),
+                bool(layer.sm70_fp8_qpn8_gated_prefetch),
+                True,
+                bool(layer.sm70_fp8_batch_tm_prescaled),
+            )
+        else:
+            torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+                out_2d,
+                x_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                int(layer.sm70_fp8_qpn8_gated_split_k),
+                int(layer.sm70_fp8_qpn8_gated_nacc),
+                bool(layer.sm70_fp8_qpn8_gated_prefetch),
+                True,
+            )
         return out_2d.reshape(*x.shape[:-1], out_features)

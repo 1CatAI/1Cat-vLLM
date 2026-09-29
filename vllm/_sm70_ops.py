@@ -186,6 +186,10 @@ def has_qwen38_shared_gate_exact() -> bool:
     )
 
 
+def has_qwen38_shared_gate_sigmoid_mul() -> bool:
+    return hasattr(torch.ops._C, "qwen38_shared_gate_sigmoid_mul_out")
+
+
 def has_nvfp4_qpn_mtp5_dispatch() -> bool:
     """Reject extensions that only implement the legacy ten-route kernel."""
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
@@ -205,6 +209,10 @@ def has_nvfp4_grouped_decode_dispatch() -> bool:
         hasattr(torch.ops._C, name)
         for name in ("nvfp4_grouped_w13_sm70_out", "nvfp4_grouped_w2_sm70_out")
     )
+
+
+def has_nvfp4_grouped_batch_reduce_dispatch() -> bool:
+    return hasattr(torch.ops._C, "nvfp4_grouped_w2_batch_reduce_sm70_out")
 
 
 def nvfp4_grouped_w13_sm70_out(
@@ -242,6 +250,23 @@ def nvfp4_grouped_w2_sm70_out(
     )
 
 
+def nvfp4_grouped_w2_batch_reduce_sm70_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_batch_reduce_sm70_out(
+        out, routed, x, w, s, topk, rows, experts, sizes, total
+    )
+
+
 if has_nvfp4_grouped_decode_dispatch():
 
     @register_fake("_C::nvfp4_grouped_w13_sm70_out")
@@ -252,6 +277,13 @@ if has_nvfp4_grouped_decode_dispatch():
 
     @register_fake("_C::nvfp4_grouped_w2_sm70_out")
     def _grouped_w2_fake(out, routed, x, w, s, topk, rows, experts, sizes, total):
+        return None
+
+
+if has_nvfp4_grouped_batch_reduce_dispatch():
+
+    @register_fake("_C::nvfp4_grouped_w2_batch_reduce_sm70_out")
+    def _grouped_w2_batch_fake(out, routed, x, w, s, topk, rows, experts, sizes, total):
         return None
 
 
@@ -686,7 +718,13 @@ def fp8_gemm_sm70_out(
     k_ld: int,
     q_ld: int,
     gated_silu: bool = False,
+    preserve_default_partition: bool = False,
 ) -> None:
+    if preserve_default_partition:
+        _op("fp8_gemm_sm70_out")(
+            out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu, True
+        )
+        return
     _op("fp8_gemm_sm70_out")(
         out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
     )
@@ -704,6 +742,7 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         k_ld: int,
         q_ld: int,
         gated_silu: bool,
+        preserve_default_partition: bool = False,
     ) -> None:
         return None
 
@@ -1377,6 +1416,7 @@ def nvfp4_qpn2_tm_dispatch_sm70_out(
     tm_q_ld: int,
     gated_silu: bool,
     min_prefill_m: int,
+    prescaled_scales: bool = False,
 ) -> None:
     """Use shared TurboMind codes for QPN2, TurboMind and dense prefill."""
     _op("nvfp4_qpn2_tm_dispatch_sm70_out")(
@@ -1393,6 +1433,7 @@ def nvfp4_qpn2_tm_dispatch_sm70_out(
         tm_q_ld,
         gated_silu,
         min_prefill_m,
+        *([True] if prescaled_scales else []),
     )
 
 
@@ -1413,6 +1454,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_tm_dispatch_sm70_out"):
         tm_q_ld: int,
         gated_silu: bool,
         min_prefill_m: int,
+        prescaled_scales: bool = False,
     ) -> None:
         return None
 
@@ -2144,6 +2186,19 @@ if hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out"):
         return None
 
 
+def qwen38_shared_gate_sigmoid_mul_out(out: torch.Tensor, logits: torch.Tensor) -> None:
+    torch.ops._C.qwen38_shared_gate_sigmoid_mul_out(out, logits)
+
+
+if hasattr(torch.ops._C, "qwen38_shared_gate_sigmoid_mul_out"):
+
+    @register_fake("_C::qwen38_shared_gate_sigmoid_mul_out")
+    def _qwen38_shared_gate_sigmoid_mul_out_fake(
+        out: torch.Tensor, logits: torch.Tensor
+    ) -> None:
+        return None
+
+
 def nvfp4_glm53_moe_q8_qpn_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -2433,6 +2488,37 @@ if hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
 
     @register_fake("_C::nvfp4_gemm_sm70_out")
     def _nvfp4_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_gemm_sm70_prescaled_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    _op("nvfp4_gemm_sm70_prescaled_out")(
+        out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out"):
+
+    @register_fake("_C::nvfp4_gemm_sm70_prescaled_out")
+    def _nvfp4_gemm_sm70_prescaled_out_fake(
         out: torch.Tensor,
         input: torch.Tensor,
         qweight: torch.Tensor,

@@ -4,12 +4,14 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
 #include <ATen/cuda/Exceptions.h>
+#include <cstdlib>
 #include <map>
 #include "shared_workspace.h"
 
 namespace onecat_sm70_prefill {
 ScoreWorkspace::ScoreWorkspace(const at::Tensor& query, int64_t block_n)
-    : scores(at::empty({block_n * 8192 * 6}, query.options())) {
+    : block_n(block_n),
+      scores(at::empty({block_n * 8192 * 6}, query.options())) {
   C10_CUDA_CHECK(cudaEventCreateWithFlags(&completion, cudaEventDisableTiming));
 }
 ScoreWorkspace::~ScoreWorkspace() {
@@ -17,6 +19,15 @@ ScoreWorkspace::~ScoreWorkspace() {
 }
 std::shared_ptr<ScoreWorkspace> get_score_workspace(const at::Tensor& query,
                                                     int64_t block_n) {
+  if (const char* value =
+          std::getenv("VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS")) {
+    char* end = nullptr;
+    block_n = std::strtol(value, &end, 10);
+    TORCH_CHECK(end != value && *end == '\0' && block_n >= 8192 &&
+                    block_n <= 16 * 8192 && block_n % 8192 == 0,
+                "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS must be a "
+                "multiple of 8192 between 8192 and 131072");
+  }
   static std::mutex mutex;
   static std::map<std::pair<int, int64_t>, std::shared_ptr<ScoreWorkspace>>
       cache;

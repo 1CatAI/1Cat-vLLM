@@ -52,6 +52,10 @@ class CacheConfig:
     """Whether block_size was explicitly provided. Derived automatically."""
     user_specified_mamba_block_size: bool = field(default=False, init=False)
     """Whether mamba_block_size was explicitly provided. Derived automatically."""
+    cache_dtype_from_checkpoint: bool = field(default=False, init=False)
+    """Whether cache_dtype was resolved from the checkpoint's KV-cache
+    quantization metadata rather than requested by the user. Derived
+    automatically; a request other than "auto" never sets it."""
     hash_block_size: int | None = Field(default=None, gt=0)
     """Block size (in tokens) used for computing Request's block_hashes.
 
@@ -73,7 +77,10 @@ class CacheConfig:
     example, if you have two vLLM instances running on the same GPU, you can
     set the GPU memory utilization to 0.5 for each instance."""
     cache_dtype: CacheDType = "auto"
-    """Data type for kv cache storage. If "auto", will use model data type.
+    """Data type for kv cache storage. If "auto", will use model data type,
+    unless the checkpoint declares a KV-cache quantization algorithm; that
+    declaration is honored on Ampere and newer and ignored on Volta and
+    Turing, which have no FP8 hardware (pass the dtype explicitly to force it).
     CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
     On SM70 with the 1Cat Flash-V100 backend enabled, the user-facing ``fp8``
@@ -94,6 +101,13 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    prefix_cache_retention_interval: int | None = Field(default=0, ge=0)
+    """Token interval between retained Mamba prefix-cache checkpoints.
+    ``None`` keeps dense admission; ``0`` keeps replay and detected shared-prefix
+    boundaries; positive values additionally keep periodic checkpoints and must
+    be a multiple of the resolved cache-hit alignment. This backport applies to
+    aligned Mamba groups; other cache types keep their existing admission policy.
+    """
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
@@ -198,6 +212,7 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.sm70_e4m3_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.worker.gpu import cudagraph_utils as cg
 from vllm.v1.worker.gpu.cudagraph_utils import (
@@ -39,6 +40,36 @@ def test_context_boundary_and_switch_back(graph_pair):
         assert (
             manager.select_attention_graph(ordinary, torch.tensor([upper])) == expected
         )
+
+
+@pytest.mark.parametrize("num_reqs", [2, 4, 8, 16])
+def test_request_major_q8_context_boundary(num_reqs):
+    manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
+    ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_reqs * 8, num_reqs, 8)
+    bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
+    manager._long_attention_graphs = {ordinary: bounded}
+    manager.graphs = {ordinary: object(), bounded: object()}
+
+    assert (
+        manager.select_attention_graph(
+            ordinary, torch.full((num_reqs,), BUILTIN_MAX_CONTEXT)
+        )
+        == bounded
+    )
+    bounds = torch.full((num_reqs,), 32768)
+    bounds[-1] = BUILTIN_MAX_CONTEXT + 1
+    assert manager.select_attention_graph(ordinary, bounds) == ordinary
+    # A B3 batch may replay a B4 graph with one padded request.
+    assert (
+        manager.select_attention_graph(ordinary, torch.full((num_reqs - 1,), 32768))
+        == bounded
+    )
+    assert (
+        manager.select_attention_graph(
+            ordinary, torch.tensor([BUILTIN_MAX_CONTEXT + 1])
+        )
+        == ordinary
+    )
 
 
 def test_device_hint_never_copied_to_host(graph_pair):
@@ -94,24 +125,32 @@ def test_disabled_operator_preserves_original_binding(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "enabled,method,sm70,target,sequence_parallel,expect_tail",
+    "enabled,method,capability,target,sequence_parallel,expect_tail",
     [
-        (True, "dflash", True, True, False, True),
-        (False, "dflash", True, True, False, False),
-        (True, "mtp", True, True, False, False),
-        (True, "dflash", False, True, False, False),
-        (True, "dflash", True, False, False, False),
-        (True, "dflash", True, True, True, False),
+        (True, "dflash", (7, 0), True, False, True),
+        # Turing takes the same tail graphs as Volta.
+        (True, "dflash", (7, 5), True, False, True),
+        (False, "dflash", (7, 0), True, False, False),
+        (True, "mtp", (7, 0), True, False, False),
+        (True, "dflash", (8, 0), True, False, False),
+        (True, "dflash", (7, 0), False, False, False),
+        (True, "dflash", (7, 0), True, True, False),
     ],
 )
 def test_tail_capture_and_dispatch_from_real_initialization(
-    monkeypatch, enabled, method, sm70, target, sequence_parallel, expect_tail
+    monkeypatch, enabled, method, capability, target, sequence_parallel, expect_tail
 ):
     monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", str(int(enabled)))
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
     monkeypatch.delenv("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", raising=False)
     monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(cg.current_platform, "is_device_capability", lambda cap: sm70)
+    # The gate asks the worker's own device; answer for it only.
+    monkeypatch.setattr(
+        cg.current_platform,
+        "get_device_capability",
+        lambda device_id=0: DeviceCapability(*capability),
+    )
+    monkeypatch.setattr(cg.torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
     monkeypatch.setattr(
         cg,
@@ -144,9 +183,95 @@ def test_tail_capture_and_dispatch_from_real_initialization(
         if expect_tail:
             assert desc in manager._capture_descs[CUDAGraphMode.FULL]
             assert desc.num_tokens == desc.uniform_token_count == q
-        # Admission is B1 only.
+        # Short target tails remain B1; q8 batches are admitted by the long
+        # verifier graph independently of these q1..q7 tail descriptors.
         assert manager.dispatch(2, 2 * q, q).cg_mode == CUDAGraphMode.NONE
     assert manager.dispatch(1, 8, 8).cg_mode == CUDAGraphMode.FULL
+
+
+@pytest.mark.parametrize("native_capacity", [1, 16])
+@pytest.mark.parametrize(
+    "query_heads,kv_heads,head_dim,kv_dtype,admit_batch",
+    [
+        (6, 1, 256, "fp8_e4m3", True),
+        (12, 2, 256, "fp8", True),
+        # Qwen 35B-A3B TP4 has four local query heads, one replicated KV head.
+        (4, 1, 256, "fp8_e4m3", False),
+        (6, 1, 256, "auto", False),
+        (6, 1, 256, "fp8_e5m2", False),
+        (6, 1, 128, "fp8_e4m3", False),
+    ],
+)
+def test_batch_long_graph_capture_requires_native_capability(
+    monkeypatch, native_capacity, query_heads, kv_heads, head_dim, kv_dtype, admit_batch
+):
+    from vllm.v1.attention.ops import sm70_e4m3_long as long
+
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "0")
+    monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
+    monkeypatch.setattr(long, "long_attention_enabled", lambda: True)
+    monkeypatch.setattr(
+        long,
+        "long_attention_graph_contract",
+        lambda capacity: (capacity, tuple(range(2, 9))),
+    )
+    monkeypatch.setattr(long, "long_attention_max_batch_size", lambda: native_capacity)
+    monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(cg.current_platform, "is_device_capability", lambda cap: True)
+    monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
+    monkeypatch.setattr(
+        cg,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=32),
+        model_config=SimpleNamespace(
+            max_model_len=131072,
+            dtype=torch.float16,
+            get_head_size=lambda: head_dim,
+            get_num_attention_heads=lambda parallel: query_heads,
+            get_num_kv_heads=lambda parallel: kv_heads,
+        ),
+        cache_config=SimpleNamespace(cache_dtype=kv_dtype),
+        compilation_config=CompilationConfig(
+            cudagraph_capture_sizes=[8, 16, 32, 64, 128, 256],
+            max_cudagraph_capture_size=256,
+        ),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, tensor_parallel_size=4, pipeline_parallel_size=1
+        ),
+        speculative_config=SimpleNamespace(
+            method="dflash", num_speculative_tokens=7, ngram_assist=False
+        ),
+    )
+    manager = ModelCudaGraphManager(
+        config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, 8
+    )
+    manager._graphs_captured = True
+    for batch in (1, 2, 4, 8, 16, 32):
+        desc = manager.dispatch(batch, batch * 8, 8)
+        variant = manager._long_attention_graphs.get(desc)
+        assert (variant is not None) == (
+            batch <= native_capacity and (batch == 1 or admit_batch)
+        )
+        if variant is not None:
+            assert variant.attention_context_bucket == 131072
+            assert variant in manager._capture_descs[CUDAGraphMode.FULL]
+
+
+@pytest.mark.parametrize("native_capacity", [None, 16])
+def test_long_batch_capability_rejects_stale_binary(monkeypatch, native_capacity):
+    from vllm.v1.attention.ops import sm70_e4m3_long as long
+
+    namespace = SimpleNamespace()
+    if native_capacity is not None:
+        namespace.sm70_grouped_long_max_batch_size = lambda: native_capacity
+    monkeypatch.setattr(torch.ops, "_vllm_fa2_C", namespace)
+    assert long.long_attention_max_batch_size(long.BUILTIN_MANIFEST) == (
+        native_capacity or 1
+    )
+    assert long.long_attention_max_batch_size({"module_name": "experiment"}) == 1
 
 
 @pytest.mark.parametrize(

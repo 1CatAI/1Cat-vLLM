@@ -31,6 +31,7 @@ def _sm70_qwen38_router_topk_kernel(
     M: tl.constexpr,
     BLOCK_E: tl.constexpr,
     PACKED_HALF_KEY: tl.constexpr = False,
+    SELECT_TOP16: tl.constexpr = False,
 ) -> None:
     """Sort one exact Qwen3.8 decode or MTP verifier row per program."""
 
@@ -65,7 +66,12 @@ def _sm70_qwen38_router_topk_kernel(
         # Original int64 sort is signed: flip the key sign bit when moving
         # to a positive 25-bit key so positive logits still precede negatives.
         packed = ((key ^ 0x8000) << 9) | offsets
-        sorted_packed = tl.sort(packed, descending=False)
+        if SELECT_TOP16:
+            # Keys include the expert ID, so partial selection keeps the same
+            # total order. Only the first ten values enter normalization.
+            sorted_packed = -tl.topk(-packed, 16)
+        else:
+            sorted_packed = tl.sort(packed, descending=False)
         sorted_keys = (sorted_packed >> 9) ^ 0x8000
         sorted_ids = sorted_packed & 0x1FF
         sorted_bits = tl.where(
@@ -89,6 +95,9 @@ def _sm70_qwen38_router_topk_kernel(
         sorted_bits = tl.where(sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32)
         sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
 
+    if SELECT_TOP16:
+        tl.static_assert(PACKED_HALF_KEY and K == 10)
+        offsets = tl.arange(0, 16)
     raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
     raw_weights = tl.where(invalid_row, 0.0, raw_weights)
     top_mask = offsets < K
@@ -121,7 +130,14 @@ def _sm70_qwen38_router_topk(
         K=10,
         M=num_tokens,
         BLOCK_E=512,
-        PACKED_HALF_KEY=(gating_output.dtype == torch.float16 and num_tokens == 1),
+        PACKED_HALF_KEY=(
+            gating_output.dtype == torch.float16 and 1 <= num_tokens <= 16
+        ),
+        SELECT_TOP16=(
+            envs.VLLM_SM70_MTP_ROUTER_TOP16
+            and gating_output.dtype == torch.float16
+            and num_tokens in (5, 10)
+        ),
         num_warps=8,
     )
 

@@ -283,7 +283,7 @@ def test_disk_backed_gpu_roundtrip_keeps_storage_aliases(tmp_path):
 
 
 @pytest.mark.parametrize("extensions", [True, False])
-def test_source_wheel_reuse_keeps_h3_native_operators(
+def test_source_wheel_reuse_keeps_sm70_native_operators(
     tmp_path, monkeypatch, extensions
 ):
     # Execute only the extraction method, avoiding setup() and build/network work.
@@ -305,6 +305,10 @@ def test_source_wheel_reuse_keeps_h3_native_operators(
     names = [
         f"_h3_{kind}_C.cpython-312-x86_64-linux-gnu.so"
         for kind in ("w8a16", "flashinfer", "flashattn")
+    ] + [
+        "_sm70_sampler_C.abi3.so",
+        "_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so",
+        "_sm70_sparse_attention_C.cpython-312-x86_64-linux-gnu.so",
     ]
     with zipfile.ZipFile(wheel, "w") as archive:
         for name in names:

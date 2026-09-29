@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -68,6 +68,10 @@ class DefaultModelLoader(BaseModelLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
+
+        skip_weight: Callable[[str], bool] | None = None
+        """If defined, tensors whose checkpoint name (before *prefix*) it
+        accepts are skipped before they are read from disk."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -293,6 +297,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
                         indexed_weights_by_file=indexed_weights_by_file,
+                        skip_weight=source.skip_weight,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -333,6 +338,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            skip_weight=getattr(model, "skip_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 

@@ -275,13 +275,12 @@ def test_prefill(hash_fn):
     # All blocks should be available.
     assert free_block_queue.num_free_blocks == 10
     # The order should be
+    # [uncached unique_req1 (5), unique_req0 (4)]
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Cache hit in the common prefix when the original block is already free.
     # Incomplete 1 block (6 tokens)
@@ -295,7 +294,7 @@ def test_prefill(hash_fn):
     blocks = manager.allocate_slots(
         req2, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([6],)
+    assert blocks is not None and blocks.get_block_ids() == ([5],)
 
     # Although we only have 6 free blocks, we have 8 blocks in
     # the free block queue due to lazy removal.
@@ -315,7 +314,7 @@ def test_prefill(hash_fn):
     )
     # This block ID order also checks the eviction order.
     assert blocks is not None and blocks.get_block_ids() == (
-        [7, 8, 9, 10, 4, 5, 6, 3, 2, 1],
+        [5, 4, 6, 7, 8, 9, 10, 3, 2, 1],
     )
 
     assert free_block_queue.num_free_blocks == 0
@@ -1180,13 +1179,12 @@ def test_prefill_plp():
     # All blocks should be available.
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     # The order should be
+    # [uncached unique_req1 (5), unique_req0 (4)]
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Request #2 is a prompt-logprobs request:
     # NO cache hit in the common prefix; duplicates request #0 cached blocks
@@ -1319,7 +1317,7 @@ def test_evict():
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [10, 6, 5, 4, 3, 2, 1, 9, 8, 7]
+    ] == [6, 10, 5, 4, 3, 2, 1, 9, 8, 7]
 
     # Touch the first 2 blocks.
     req2 = make_request("2", list(range(2 * 16 + 3)), block_size, sha256)
@@ -1329,7 +1327,7 @@ def test_evict():
     blocks = manager.allocate_slots(
         req2, 3, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([10],)
+    assert blocks is not None and blocks.get_block_ids() == ([6],)
     assert manager.block_pool.free_block_queue.num_free_blocks == 7
 
 
@@ -2545,6 +2543,201 @@ def test_eagle_with_sliding_window():
     assert num_tokens == 0
 
 
+def test_eagle_swa_alignment_caches_extra_block():
+    """Regression: SWA + EAGLE with `sliding_window <= alignment_tokens`.
+
+    When the cache-hit alignment (lcm of per-group block sizes) is larger than
+    the SWA window, the SWA mask only kept the last block of each aligned
+    segment. EAGLE/MTP lookup needs ``tail + 1`` contiguous cached blocks and
+    that +1 block lives at the next segment's first position, which was left
+    uncached. The fix caches that extra block when ``use_eagle=True``.
+    """
+    block_size = 8
+    # Full group uses 4 * block_size, so lcm/alignment is 4 * block_size.
+    # SWA group has sliding_window = block_size (i.e., tail = 1 block).
+    # Without the fix, the second cached block needed for the EAGLE 2-block
+    # match never exists -> EAGLE cache hit fails entirely.
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mtp"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+
+    # Prime the cache with a long prompt (16 swa blocks = 4 aligned segments).
+    token_ids = [i for i in range(16) for _ in range(block_size)]
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, _ = manager.get_computed_blocks(req0)
+    blocks = manager.allocate_slots(
+        req0,
+        len(token_ids),
+        len(computed_blocks.blocks[0]) * block_size,
+        computed_blocks,
+    )
+    assert blocks is not None
+    manager.free(req0)
+
+    # Second request with identical prompt should find an EAGLE cache hit.
+    # Without the fix, ``num_computed_tokens`` is 0; with the fix, it lands at
+    # an alignment boundary (multiple of 32 tokens, minus the EAGLE drop).
+    req1 = make_request("1", token_ids, block_size, sha256)
+    _, num_computed_tokens = manager.get_computed_blocks(req1)
+    assert num_computed_tokens > 0, (
+        "EAGLE + SWA with sliding_window <= alignment failed to find any "
+        "cache hit; the +1 block past each segment boundary must be cached."
+    )
+    # Each aligned segment contributes 4 * block_size = 32 tokens; EAGLE drops
+    # the last block (block_size tokens) from the hit.
+    assert num_computed_tokens % (4 * block_size) == 0
+
+
+def test_eagle_swa_boundary_caches_post_boundary_block():
+    """EAGLE + SWA must cache the first block after an alignment boundary.
+
+    A 40-token computed prefix with 8-token SWA blocks and 32-token hybrid
+    alignment needs SWA blocks 3 and 4 cached to reuse a 32-token prefix:
+    block 3 is the segment tail, and block 4 is the EAGLE lookahead block
+    that gets dropped after lookup.
+    """
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_mtp"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(5) for _ in range(block_size)]
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, _ = manager.get_computed_blocks(req0)
+    blocks = manager.allocate_slots(
+        req0,
+        len(token_ids),
+        len(computed_blocks.blocks[0]) * block_size,
+        computed_blocks,
+    )
+    assert blocks is not None
+
+    pool = manager.block_pool
+    assert pool.get_cached_block(req0.block_hashes[3], kv_cache_group_ids=[1])
+    assert pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1])
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids + [999], block_size, sha256)
+    _, num_computed_tokens = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 4 * block_size
+
+
+def test_eagle_grouped_swa_siblings_use_same_cache_mask():
+    """Grouped SWA siblings must cache the EAGLE lookahead block together."""
+    block_size = 8
+    swa_spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=block_size,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(["swa_main"], swa_spec),
+            KVCacheGroupSpec(["swa_mtp"], swa_spec, is_eagle_group=True),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(9) for _ in range(block_size)]
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, _ = manager.get_computed_blocks(req0)
+    blocks = manager.allocate_slots(
+        req0,
+        len(token_ids),
+        len(computed_blocks.blocks[0]) * block_size,
+        computed_blocks,
+    )
+    assert blocks is not None
+
+    pool = manager.block_pool
+    assert pool.get_cached_block(req0.block_hashes[4], kv_cache_group_ids=[1, 2])
+    assert pool.get_cached_block(req0.block_hashes[8], kv_cache_group_ids=[1, 2])
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids + [999], block_size, sha256)
+    _, num_computed_tokens = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 8 * block_size
+
+
 def test_different_block_size():
     block_size = 16
     # full attention and sliding window attention layers have the same page size:
@@ -2693,7 +2886,7 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
 
 
 def test_hybrid_cache_blocks_clamped_to_lcm():
-    """HybridKVCacheCoordinator.cache_blocks() clamps to lcm_block_size.
+    """HybridKVCacheCoordinator.cache_blocks() clamps to scheduler_block_size.
     Chunks past the last lcm-aligned boundary can never participate in a
     cache hit (find_longest_cache_hit always returns lcm-aligned hits), so
     caching them only pollutes the prefix-cache hash map and keeps blocks
@@ -2944,3 +3137,83 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     req = make_request("oversized", list(range(prompt_len)), block_size, sha256)
 
     assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
+
+
+@pytest.mark.parametrize("hash_size", [4, 8])
+@pytest.mark.parametrize("start", [0, 2])
+@pytest.mark.parametrize("null_indices", [set(), {1, 3}])
+@pytest.mark.parametrize(
+    "mask", [None, [False] * 6, [True, False, True, True, False, True]]
+)
+def test_sparse_store_events_preserve_logical_ranges(
+    hash_size, start, null_indices, mask
+):
+    block_size = 8
+    pool = BlockPool(20, True, hash_size, enable_kv_cache_events=True)
+    lora = LoRARequest("adapter", 7, "/unused")
+    req = make_request(
+        "sparse_events",
+        list(range(48)),
+        hash_size,
+        sha256,
+        mm_positions=[
+            PlaceholderRange(offset=9, length=4),
+            PlaceholderRange(offset=23, length=12),
+        ],
+        mm_hashes=["first-image", "second-image"],
+        cache_salt="event-salt",
+        lora_request=lora,
+    )
+    blocks = [
+        pool.null_block if i in null_indices else pool.get_new_blocks(1)[0]
+        for i in range(6)
+    ]
+    pool.cache_full_blocks(
+        req,
+        blocks,
+        start,
+        6,
+        block_size,
+        3,
+        block_mask=None if mask is None else mask[start:],
+    )
+    events = pool.take_events()
+    expected_indices = [
+        i
+        for i in range(start, 6)
+        if i not in null_indices and (mask is None or mask[i])
+    ]
+    logical_hashes = kv_cache_utils.BlockHashListWithBlockSize(
+        req.block_hashes, hash_size, block_size
+    )
+    actual_indices = []
+    for event in events:
+        assert isinstance(event, BlockStored)
+        assert event.block_hashes
+        assert len(event.token_ids) == block_size * len(event.block_hashes)
+        first = event.token_ids[0] // block_size
+        indices = list(range(first, first + len(event.block_hashes)))
+        actual_indices.extend(indices)
+        assert (
+            event.token_ids
+            == req.all_token_ids[first * block_size : (indices[-1] + 1) * block_size]
+        )
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(logical_hashes[i]) for i in indices
+        ]
+        assert event.parent_block_hash == (
+            kv_cache_utils.maybe_convert_block_hash(logical_hashes[first - 1])
+            if first
+            else None
+        )
+        assert event.extra_keys == [
+            kv_cache_utils.generate_block_hash_extra_keys(
+                req, i * block_size, (i + 1) * block_size, 0
+            )[0]
+            for i in indices
+        ]
+        assert event.group_idx == 3
+        assert event.lora_id == 7 and event.lora_name == "adapter"
+    assert actual_indices == expected_indices
+    # Dense runs remain batched; only logical gaps create new events.
+    assert len(events) == sum(i - 1 not in expected_indices for i in expected_indices)

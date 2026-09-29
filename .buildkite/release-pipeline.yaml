@@ -7,6 +7,9 @@ env:
   CUDA_ARCH_AARCH64: "8.0 8.7 8.9 9.0 10.0 11.0 12.0+PTX"
   CUDA_ARCH_X86_CU129: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
   CUDA_ARCH_AARCH64_CU129: "8.0 8.7 8.9 9.0 10.0 12.0"
+  # Volta is released as a separate CUDA 12.8 wheel. CUDA 13 removed SM70
+  # offline compilation, so it must not share the general CUDA 13 matrix.
+  CUDA_ARCH_SM70: "7.0"
   MOONCAKE_WHEEL_AARCH64_2_35: "https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_35_aarch64.whl"
   MOONCAKE_WHEEL_AARCH64_2_39: "https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_39_aarch64.whl"
   MOONCAKE_WHEEL_X86_64: "https://vllm-wheels.s3.amazonaws.com/mooncake/mooncake_transfer_engine-0.3.10.post2-0da9dfea3-cp312-cp312-manylinux_2_35_x86_64.whl"
@@ -74,6 +77,20 @@ steps:
           - "docker run --rm -v $(pwd)/artifacts:/artifacts_host vllm-ci:build-image bash -c 'cp -r dist /artifacts_host && chmod -R a+rw /artifacts_host'"
           - "bash .buildkite/scripts/upload-nightly-wheels.sh"
           - 'bash .buildkite/scripts/annotate-build-artifact.sh "$$BUILDKITE_LABEL" "s3://vllm-wheels/$$BUILDKITE_COMMIT/$(cd artifacts/dist && echo *.whl)"'
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - label: "Build wheel - x86_64 - CUDA 12.8 - SM70"
+        depends_on: ~
+        id: build-wheel-x86-cuda-12-8-sm70
+        agents:
+          queue: cpu_queue_release
+        commands:
+          - "DOCKER_BUILDKIT=1 docker build --build-arg max_jobs=16 --build-arg USE_SCCACHE=1 --build-arg GIT_REPO_CHECK=1 --build-arg CUDA_VERSION=12.8.1 --build-arg torch_cuda_arch_list=\"${CUDA_ARCH_SM70}\" --build-arg BUILD_OS=manylinux --build-arg BUILD_BASE_IMAGE=pytorch/manylinux2_28-builder:cuda12.8 --tag vllm-ci:build-image-sm70 --target build --progress plain -f docker/Dockerfile ."
+          - "mkdir artifacts"
+          - "docker run --rm -v $(pwd)/artifacts:/artifacts_host vllm-ci:build-image-sm70 bash -c 'python3 tools/check_sm70_release_artifact.py dist/*.whl && cp -r dist /artifacts_host && chmod -R a+rw /artifacts_host'"
+          - 'buildkite-agent artifact upload "artifacts/dist/*.whl"'
+          - 'bash .buildkite/scripts/annotate-build-artifact.sh "$$BUILDKITE_LABEL" "Buildkite artifact: artifacts/dist/*.whl"'
         env:
           DOCKER_BUILDKIT: "1"
 

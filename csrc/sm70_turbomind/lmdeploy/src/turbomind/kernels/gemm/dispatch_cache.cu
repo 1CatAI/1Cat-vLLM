@@ -274,9 +274,24 @@ struct DispatchCache::Impl {
                 it = cache_.emplace_hint(it, desc, Flat{});
             }
             auto& [idxs, specs] = it->second;
-            // Order is not maintained at this point
-            idxs.emplace_back(batch_size, (int)specs.size());
-            specs.push_back(spec);
+            // Import is authoritative for a shape.  A compile warmup can
+            // populate a local heuristic entry before the coordinated TP
+            // warmup reaches this rank; appending and deduplicating would
+            // keep that stale entry because it was inserted first.  Replace
+            // the existing batch record so every rank replays rank 0's
+            // measured split-K/swizzle plan.
+            auto existing = std::find_if(
+                idxs.begin(), idxs.end(),
+                [batch_size](const auto& item) {
+                    return item.first == batch_size;
+                });
+            if (existing != idxs.end()) {
+                specs[existing->second] = spec;
+            } else {
+                // Order is not maintained at this point.
+                idxs.emplace_back(batch_size, (int)specs.size());
+                specs.push_back(spec);
+            }
         }
         // Sort indices and deduplicate
         for (auto& [desc, flat] : cache_) {

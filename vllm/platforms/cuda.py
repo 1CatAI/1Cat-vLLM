@@ -218,7 +218,22 @@ class CudaPlatformBase(Platform):
         torch.cuda.manual_seed_all(seed)
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+    def resolve_device_id(cls, device_id: int | None) -> int:
+        if device_id is not None:
+            return device_id
+        # A worker that has already selected its device (torch.cuda.set_device
+        # in init_device) answers for that device. A process without a CUDA
+        # context -- the engine core, the API server, a worker before device
+        # selection -- keeps index 0 of the visibility list, as before.
+        # is_initialized() only reports; it never creates a context.
+        if torch.cuda.is_initialized():
+            return torch.cuda.current_device()
+        return 0
+
+    @classmethod
+    def get_device_capability(
+        cls, device_id: int | None = None
+    ) -> DeviceCapability | None:
         raise NotImplementedError
 
     @classmethod
@@ -650,9 +665,37 @@ class NvmlCudaPlatform(CudaPlatformBase):
         return super().device_id_to_physical_device_id(device_id)
 
     @classmethod
+    def get_device_capability(
+        cls, device_id: int | None = None
+    ) -> DeviceCapability | None:
+        # Resolve before the caches: they are keyed by the concrete index, so
+        # an unspecified device never freezes one process-wide answer.
+        device_id = cls.resolve_device_id(device_id)
+        # Once this process holds a CUDA context, torch is authoritative for
+        # the ordinal. NVML enumerates in PCI bus order while the CUDA runtime
+        # defaults to FASTEST_FIRST; on a node that mixes card generations the
+        # two orders differ unless CUDA_DEVICE_ORDER=PCI_BUS_ID is set. Reading
+        # torch after initialization cannot trigger the initialization that
+        # NvmlCudaPlatform exists to avoid, so NVML stays the pre-init path.
+        if torch.cuda.is_initialized():
+            return cls._torch_device_capability(device_id)
+        return cls._nvml_device_capability(device_id)
+
+    @classmethod
+    @cache
+    def _torch_device_capability(cls, device_id: int) -> DeviceCapability | None:
+        # Same contract as the NVML path: an unusable index answers None.
+        # torch raises AssertionError for an out-of-range ordinal.
+        try:
+            major, minor = torch.cuda.get_device_capability(device_id)
+        except (RuntimeError, AssertionError):
+            return None
+        return DeviceCapability(major=major, minor=minor)
+
+    @classmethod
     @cache
     @with_nvml_context
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+    def _nvml_device_capability(cls, device_id: int) -> DeviceCapability | None:
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
@@ -666,7 +709,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def has_device_capability(
         cls,
         capability: tuple[int, int] | int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         try:
             return super().has_device_capability(capability, device_id)
@@ -887,8 +930,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
     @classmethod
+    def get_device_capability(cls, device_id: int | None = None) -> DeviceCapability:
+        return cls._device_capability(cls.resolve_device_id(device_id))
+
+    @classmethod
     @cache
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
+    def _device_capability(cls, device_id: int) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)
         return DeviceCapability(major=major, minor=minor)
 

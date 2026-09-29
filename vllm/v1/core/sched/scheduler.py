@@ -267,6 +267,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -463,7 +464,13 @@ class Scheduler(SchedulerInterface):
         end = min(
             (
                 stop
-                for stop in (next_block_boundary, last_cache_position)
+                for stop in (
+                    next_block_boundary,
+                    last_cache_position,
+                    getattr(request, "shared_prefix_boundary", 0)
+                    // block_size
+                    * block_size,
+                )
                 if start < stop < end
             ),
             default=end,

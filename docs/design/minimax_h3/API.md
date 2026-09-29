@@ -68,6 +68,7 @@ quality, file-size tradeoffs, and the remaining host-memory transfer cost.
 | GET | `/v1/videos/{id}` | Status, output metadata and download URLs |
 | GET | `/v1/videos` | Job list; `limit`, `after`, `order` pagination |
 | GET | `/v1/videos/{id}/content` | First MP4, or `?output_index=N` for another output |
+| POST | `/v1/videos/{id}/cancel` | Cancel a queued job and release its owned inputs |
 | DELETE | `/v1/videos/{id}` | Delete queued or finished job and its owned files |
 | POST | `/v1/videos/sync` | Block and return the first MP4 directly |
 | GET | `/health` | Engine readiness |
@@ -79,11 +80,17 @@ completed outputs, not denoising steps. Deleting a running job returns HTTP 409;
 it does not terminate a distributed worker group. Downloading an unfinished
 job also returns 409. Unknown IDs or output indices return 404.
 
+Cancelling a queued job sets its status to `cancelled` and removes its uploaded
+or downloaded reference files before returning, even while another job is
+running. The cancelled job record remains available until deleted. Cancelling
+a running job returns 409; repeating a cancellation or cancelling a completed
+job leaves its status and any completed outputs intact.
+
 Job records live in memory for the process lifetime. Asynchronous outputs stay
 on disk until deleted. The synchronous endpoint does not publish a job in the
 list and removes its temporary results after sending the MP4. Uploaded and
 downloaded reference files are request-owned and removed after success, failure,
-or rejection. Original local reference files are never deleted.
+rejection, or queued cancellation. Original local reference files are never deleted.
 
 ## JSON requests from the frontend
 

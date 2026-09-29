@@ -966,23 +966,20 @@ PY
 
 ## Example TP4 + E5M2 serving command
 
+The release wheel installs the validated V100 launcher. It carries the
+Flash-V100 and FlashQLA extensions and enables the model-aware SM70 defaults;
+the user only supplies the checkpoint path:
+
 ```bash
-vllm serve /path/to/Qwen3.8-27B-NVFP4 \
-  --served-model-name qwen3.8-27b-dflash2 \
-  --trust-remote-code \
-  --tensor-parallel-size 4 \
-  --attention-backend FLASH_ATTN_V100 \
-  --kv-cache-dtype fp8_e5m2 \
-  --max-model-len 262144 \
-  --gpu-memory-utilization 0.80 \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking":true}' \
-  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","kv_cache_dtype":"auto"}' \
-  --host 0.0.0.0 \
-  --port 8000
+serve_qwen38_27b_nvfp4_v100.sh /path/to/Qwen3.8-27B-NVFP4
 ```
+
+The profile pins TP4, FP16 activations, FP8 E5M2 KV, 256K context,
+`--max-num-batched-tokens 8192`, `--max-num-seqs 4`, and the 2048/8192 KV and
+Mamba block sizes. Append normal `vllm serve` options to override a release
+default. This profile is validated for four peer-connected V100-SXM2 32GB
+GPUs; other hardware and concurrency levels need a separate memory and speed
+check.
 
 For the validated Qwen3.8 DFlash2 contract, runtime policy resolves the checkpoint-native draft geometry and the SM70 draft Attention backend.
 
@@ -1027,6 +1024,26 @@ verifier out of its fast path.
 
 ---
 
+# 📦 Install the SM70 release wheel
+
+For the Qwen3.8-27B NVFP4 + DFlash2 V100 profile, install the release wheel
+into a clean Python 3.12 environment. The wheel carries the SM70 extensions,
+Flash-V100, FlashQLA, and the versioned launcher; its metadata selects the
+CUDA 12.8 PyTorch wheels for this profile.
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install ./1cat_vllm-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
+serve_qwen38_27b_nvfp4_v100 /models/Qwen3.8-27B-NVFP4
+```
+
+The launcher uses the installed `vllm` command and packaged extensions. It
+does not require a checkout path, a copied `.so`, or `VLLM_*`/`FLASH_*`
+environment overrides. Four peer-connected V100-SXM2 32GB GPUs are required
+for this profile; pass normal `vllm serve` options after the model path when
+changing the service port or resource limits.
+
 # 🔨 Build From Source
 
 Clone:
@@ -1044,6 +1061,10 @@ export CMAKE_CUDA_ARCHITECTURES=70
 ```
 
 Then build/install the project using the repository's current build instructions for your CUDA/PyTorch environment.
+
+The two variables above are build-time inputs for a source build only. They
+are already fixed in the SM70 release-wheel build and are not needed after
+installing that wheel.
 
 Because this project contains custom CUDA extensions, make sure the active compiler/toolkit matches the PyTorch CUDA ABI used by your environment.
 

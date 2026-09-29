@@ -104,3 +104,33 @@ def test_drafter_does_not_hand_off_to_a_next_stage(monkeypatch) -> None:
 
     assert isinstance(result, tuple), "the drafter must not return IntermediateTensors"
     assert len(result) == 2
+
+
+def test_mtp_decode_view_shares_predictor_and_selects_only_during_capture(monkeypatch):
+    from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+    from vllm.models.qwen4_exp.nvidia.mtp import (
+        Qwen4ExpMTP,
+        _Qwen4ExpMTPDecodeGraphModel,
+    )
+
+    monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
+    model = object.__new__(Qwen4ExpMTP)
+    nn.Module.__init__(model)
+    calls = []
+    model.model = lambda *args, **kwargs: calls.append("prefill")
+    view = object.__new__(_Qwen4ExpMTPDecodeGraphModel)
+    nn.Module.__init__(view)
+    object.__setattr__(view, "_target_model", _predictor())
+    object.__setattr__(model, "_sm70_decode_graph_model", view.forward)
+    args = dict(
+        input_ids=torch.zeros(TOKENS, dtype=torch.long),
+        positions=torch.arange(TOKENS),
+        hidden_states=torch.zeros(TOKENS, HC_COUNT * HIDDEN),
+    )
+    model.forward(**args)
+    with sm70_decode_graph_compilation():
+        sample, multi = model.forward(**args)
+    assert calls == ["prefill"]
+    assert sample.shape == (TOKENS, HIDDEN)
+    assert multi.shape == (TOKENS, HC_COUNT * HIDDEN)
+    assert view.state_dict() == {}

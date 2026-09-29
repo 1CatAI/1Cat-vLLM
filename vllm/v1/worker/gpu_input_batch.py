@@ -1074,8 +1074,21 @@ class InputBatch:
             sampled_ids: list[int] = sampled_token_ids[prev_index]
             if not sampled_ids:
                 continue
-            num_sampled_ids = (
-                len(sampled_ids) if sampled_ids[-1] != -1 else sampled_ids.index(-1)
+            # A sampled id is only a real token when it is a valid token id. The
+            # speculative rejection path also emits `vocab_size` for rejected
+            # slots, not only the documented -1 placeholder; counting such an id
+            # as sampled copies it into token_ids_cpu and from there into
+            # input_ids, where the embedding lookup trips a CUDA device-side
+            # assert (Indexing.cu, indexSelectSmallIndex: `srcIndex <
+            # srcSelectDimSize`). Stop at the first id outside [0, vocab_size),
+            # the same rule _valid_async_draft_prefix() applies to draft ids.
+            num_sampled_ids = next(
+                (
+                    i
+                    for i, token_id in enumerate(sampled_ids)
+                    if token_id < 0 or token_id >= self.vocab_size
+                ),
+                len(sampled_ids),
             )
             if envs.VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR:
                 first_placeholder = req_output_token_ids.index(-1)

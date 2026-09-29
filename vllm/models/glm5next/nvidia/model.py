@@ -1307,13 +1307,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
-        if self._replicate_dflash_embedding:
-            if "embed_tokens.weight" not in loaded_params:
-                raise RuntimeError(
-                    "The final pipeline stage created a DFlash target embedding "
-                    "replica, but embed_tokens.weight was not loaded from the "
-                    "target checkpoint."
-                )
+        if self._replicate_dflash_embedding and "embed_tokens.weight" in loaded_params:
+            # AutoWeightsLoader groups consecutive tensors by top-level prefix,
+            # so a checkpoint whose shard order interleaves language-model
+            # tensors with lm_head/visual tensors (e.g. the 33-shard NVIDIA
+            # GLM-5.3-Flash-NVFP4 layout) reaches this method more than once.
+            # Record the replica as loaded when any call delivers it; the
+            # DFlash draft still refuses to borrow an unloaded replica
+            # (spec_decode/dflash/utils.py), so the guarantee is preserved.
             self.embed_tokens._dflash_pp_replica_loaded = True
             logger.info_once(
                 "Loaded the replicated DFlash target embedding on the final "

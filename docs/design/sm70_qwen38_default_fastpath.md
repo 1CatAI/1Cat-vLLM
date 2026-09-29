@@ -5,9 +5,10 @@ with FP16 activations/KV, native FP32 SSM state, NVFP4 expert weights,
 TP4/PP1, 262144 context capacity, an 8192-token prefill chunk and no MTP or
 prefix cache. It used explicit optimization switches.
 
-This change lets ordinary model/capacity arguments select the missing parts
-of that route. End-to-end validation remains pending; this document does not
-claim a new speed result or that configuration tests reproduce throughput.
+Ordinary model/capacity arguments select the missing parts of that route.
+The configuration tests below do not reproduce the historical throughput.
+The MTP4 extension and its accepted 27.3963-ms complete-round baseline are
+recorded in the [shared-path profile](sm70_flash_next_mtp4_default_profile.md).
 
 The initial audit found checkpoint-FP16 GEMV, fused GDN input and fused HC
 disabled by default. This also prevents the dependent auto dual-compile and
@@ -19,7 +20,8 @@ enabled. Shared-expert overlap and MoE add/reduce also required opt-in.
 The following five switches now default to 1 only for the matching
 Qwen3.8 Flash-Next architecture and dimensions, checkpoint NVFP4
 (`modelopt_fp4`), FP16 activations/KV, native FP32 SSM, all-SM70 local TP4/PP1,
-DP1, no MTP, no LoRA, no expert parallelism and no dual-batch overlap:
+DP1, no speculation or exactly four MTP drafts, no LoRA, no expert parallelism
+and no dual-batch overlap:
 
 - `VLLM_SM70_QWEN38_FP16_GEMV`
 - `VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16`
@@ -28,9 +30,17 @@ DP1, no MTP, no LoRA, no expert parallelism and no dual-batch overlap:
 - `VLLM_SM70_MOE_ADD_ALLREDUCE`
 
 Existing explicit values are preserved, including 0. Other models, hardware,
-quantizations and speculative configurations do not receive these new
+quantizations and other speculative configurations do not receive these new
 defaults. Enforce-eager/no-compile-decode-graph requests also skip this
 auto-selection. No kernel arithmetic or precision is changed by this PR.
+
+The admitted MTP4 configuration also defaults
+`VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS=1`, reusing the existing separate verifier
+and draft graph managers. For one request, verifier graphs retain M=5 and M=10
+while draft decode captures M=1. The drafter shares the target's existing FP16
+GEMV/HC operators and decode-compilation policy; M=1 operator guards still
+reject M=5 inputs. This avoids losing single-token acceleration when the
+shared graph-size list is normalized for speculative verification.
 
 The existing dependent selectors can then enable dual compilation and hybrid
 PLE automatically. Prefill uses asynchronous disk-mmap lookup; decode uses

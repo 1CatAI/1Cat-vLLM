@@ -118,7 +118,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reasoning-effort",
-        choices=("low", "high", "max"),
+        choices=("low", "medium", "high", "max", "xhigh"),
         default="max",
     )
     parser.add_argument("--seed", type=int, default=0)

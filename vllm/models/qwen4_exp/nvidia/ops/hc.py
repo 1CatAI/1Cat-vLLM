@@ -380,7 +380,8 @@ def _hc_combine_norm(
         BLOCK_SIZE=BLOCK_SIZE,
         launch_pdl=current_platform.is_arch_support_pdl(),
         PREFETCH_WEIGHT=(
-            sm70_decode
+            current_platform.is_device_capability(70)
+            and N in (1, 5, 10)
             and hc_dim == 2560
             and hc_count == 4
             and residual.dtype == torch.float16

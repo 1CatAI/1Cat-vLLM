@@ -84,7 +84,24 @@ _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
+_SM70_BATCH_GEMM_DEFAULTS = {
+    # Common dense-operator policy, independent of model name, checkpoint
+    # quantization, speculative method/width and service concurrency. Local
+    # operators retain their dtype/layout/shape checks and small-M routes.
+    "VLLM_SM70_BATCH_GEMM_LAYOUTS": "1",
+    "VLLM_SM70_AWQ_WARMUP_MAX_M": "64",
+    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": "64",
+    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
+}
+
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # Match the measured packed verifier and draft context pipeline without
+    # requiring launch-script flags. Operators retain their shape guards.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": "1",
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": "1",
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "1",
+    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": "1",
     # Preserve candidate and dense logits in FP32 through sampling.
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
     # This is the target projection's memory-neutral FP8 layout, not the
@@ -182,16 +199,17 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
-def _is_sm70_qwen38_nomtp_dual_compile_contract(
+def _is_sm70_qwen38_decode_compile_contract(
     model_config: Any,
     speculative_config: Any,
     parallel_config: Any,
 ) -> bool:
-    """Admit only the exact Qwen3.8 TP4 no-MTP dual-compile topology."""
-    if (
-        model_config is None
-        or parallel_config is None
-        or speculative_config is not None
+    """Admit the shared Qwen3.8 TP4 decode topology, including MTP4."""
+    if model_config is None or parallel_config is None:
+        return False
+    if speculative_config is not None and not (
+        getattr(speculative_config, "method", None) == "mtp"
+        and getattr(speculative_config, "num_speculative_tokens", None) == 4
     ):
         return False
 
@@ -255,11 +273,11 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     return tuple(range(start, start + parallel.local_world_size))
 
 
-def _apply_sm70_qwen38_nomtp_defaults(
+def _apply_sm70_qwen38_decode_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
     """Complete the admitted NVFP4 baseline without global experimental defaults."""
-    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+    if not is_sm70 or not _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     ):
         return ()
@@ -283,6 +301,15 @@ def _apply_sm70_qwen38_nomtp_defaults(
         "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
         "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
     }
+    if cfg.speculative_config is not None:
+        # Keep M=1 draft graphs when target graph sizes are multiples of five.
+        # Otherwise the prepared single-token operators never reach capture.
+        defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
+    else:
+        # Pin the native FP32 gated-norm arithmetic across independently
+        # compiled C1/batch graphs. Tiny fusion-dependent rounding differences
+        # can change an MoE route and ultimately flip an EOS token.
+        defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
@@ -313,6 +340,35 @@ def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
     return _any_participating_device_is_capability(
         cfg, (7, 0)
     ) or _any_participating_device_is_capability(cfg, (7, 5))
+
+
+def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool) -> tuple[str, ...]:
+    """Enable shared SM70 batch operators without overriding explicit settings."""
+    if not is_sm70:
+        return ()
+    applied = []
+    for env_name, env_value in _SM70_BATCH_GEMM_DEFAULTS.items():
+        if env_name not in os.environ:
+            os.environ[env_name] = env_value
+            applied.append(env_name)
+    return tuple(applied)
+
+
+def checkpoint_kv_quant_allowed(cfg: "VllmConfig") -> bool:
+    """May the checkpoint's own metadata select a quantized KV cache here?
+
+    A checkpoint that declares ``kv_cache_quant_algo`` or ``kv_cache_scheme``
+    describes how its weights were produced. With ``--kv-cache-dtype auto``
+    vLLM reads that as permission to also store the KV cache in FP8. On
+    Volta and Turing there is no FP8 hardware: the cache is unpacked in
+    software and decode attention loses its tensor-core route (measured on
+    4x V100 with Qwen3.8-27B: +4.82 ms per decode round, 4.5x the cost of
+    the FP8 weights the checkpoint ships with), and on Turing the FP8 cast
+    is not compiled at all. So the directive is honored only when every
+    participating device is Ampere or newer. An explicit ``--kv-cache-dtype``
+    never reaches this policy.
+    """
+    return not _any_participating_device_is_pre_ampere(cfg)
 
 
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
@@ -1490,6 +1546,20 @@ class VllmConfig:
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
+        if (
+            self.cache_config.cache_dtype_from_checkpoint
+            and not checkpoint_kv_quant_allowed(self)
+        ):
+            logger.info_once(
+                "Ignoring the checkpoint's KV-cache quantization directive (%s): "
+                "a participating device is Volta or Turing, which has no FP8 "
+                "hardware, so the KV cache keeps the model dtype. Pass "
+                "--kv-cache-dtype explicitly to override.",
+                self.cache_config.cache_dtype,
+            )
+            self.cache_config.cache_dtype = "auto"
+            self.cache_config.cache_dtype_from_checkpoint = False
+
         self.try_verify_and_update_config()
 
         if self.model_config is not None:
@@ -1723,6 +1793,20 @@ class VllmConfig:
             )
 
         from vllm.platforms import current_platform
+
+        for env_name in _apply_sm70_batch_gemm_defaults(
+            is_sm70=(
+                current_platform.is_cuda()
+                and _any_participating_device_is_capability(self, (7, 0))
+            ),
+        ):
+            logger.info_once(
+                "Auto-setting %s=%s for SM70 batch GEMM. "
+                "Local operators select compatible layouts and shapes. "
+                "Set it explicitly to override.",
+                env_name,
+                os.environ[env_name],
+            )
 
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
             self.model_config,
@@ -1991,7 +2075,7 @@ class VllmConfig:
                 and not sm70_no_compile_decode_graph_requested
                 and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             ):
-                for env_name in _apply_sm70_qwen38_nomtp_defaults(
+                for env_name in _apply_sm70_qwen38_decode_defaults(
                     self,
                     is_sm70=all(
                         current_platform.is_device_capability((7, 0), device_id=i)
@@ -2000,11 +2084,11 @@ class VllmConfig:
                 ):
                     logger.info_once(
                         "Auto-setting %s=1 for the quality-qualified SM70 "
-                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
+                        "Qwen3.8 NVFP4 TP4 decode path. Set it explicitly to override.",
                         env_name,
                     )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,
@@ -2023,7 +2107,7 @@ class VllmConfig:
                     "large prefill and FULL decode graphs share one model."
                 )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,

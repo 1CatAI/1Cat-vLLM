@@ -36,6 +36,7 @@ class SM70TurboMindLinearState:
     global_scale: float = 0.0
     use_scale_code: bool = False
     padded_output_size: int = 0
+    prescaled_scales: bool = False
 
 
 # States retain only data_ptr(), so this cache owns the bounded allocation.
@@ -55,6 +56,17 @@ def use_turbomind(default_enabled: bool) -> bool:
     return envs.use_sm70_turbomind(default_enabled)
 
 
+def use_batched_gemm_layouts() -> bool:
+    """Prepare compatible batch GEMM layouts once on SM70.
+
+    Format-specific callers validate their own local weights and operators.
+    Model name, quantization label, speculative method/width and max_num_seqs
+    do not restrict this shared policy. Small-M kernels retain their existing
+    packed layouts; larger batches consume prepared TurboMind weights/scales.
+    """
+    return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
+
+
 def forces_marlin() -> bool:
     return envs.force_sm70_marlin()
 
@@ -71,8 +83,17 @@ def is_exact_sm70_cuda_platform() -> bool:
     Quant-method selection runs before a layer owns a CUDA tensor, so it
     cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
     from the tensor-based helpers used by linear weight preparation.
+
+    The capability is read from the device this worker builds its layers on.
+    Probing device 0 of the visibility list answers for a different card on a
+    heterogeneous node: with a Turing card first the Volta workers lose their
+    SM70 routes, and with a Volta first the Turing workers take them.
     """
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability(
+        (7, 0), device_id=torch.accelerator.current_device_index()
+    )
 
 
 def should_use_mxfp4_moe_turbomind() -> bool:
@@ -168,6 +189,7 @@ def _store_state(
     global_scale: float = 0.0,
     use_scale_code: bool = False,
     padded_output_size: int = 0,
+    prescaled_scales: bool = False,
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
@@ -182,6 +204,7 @@ def _store_state(
         global_scale=global_scale,
         use_scale_code=use_scale_code,
         padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
     )
     setattr(layer, STATE_ATTR, state)
 
@@ -288,9 +311,18 @@ def prepare_mxfp4_linear(
     )
 
 
+def _prescale_nvfp4_batch_scales(scales: torch.Tensor) -> bool:
+    """Fold the exact FP4 conversion factor into the existing scale allocation."""
+    if not float(scales.abs().amax()) <= 65504.0 / 16384.0:
+        return False
+    scales.mul_(16384.0)
+    return True
+
+
 def prepare_nvfp4_linear(
     layer: torch.nn.Module,
     interleave_gated_silu: bool = False,
+    prescale_for_batch: bool = False,
 ) -> None:
     if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
         raise RuntimeError(
@@ -334,6 +366,13 @@ def prepare_nvfp4_linear(
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
     )
+    # QPN2 retains its independent compressed scales for M<=32. Larger decode
+    # and prefill use the same scaled TM buffer, without a second allocation.
+    prescaled_scales = bool(
+        prescale_for_batch
+        and hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out")
+        and _prescale_nvfp4_batch_scales(tm_scales)
+    )
     _store_state(
         layer,
         tm_weight,
@@ -344,6 +383,7 @@ def prepare_nvfp4_linear(
         "nvfp4",
         interleave_gated_silu,
         padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
     )
 
 
@@ -459,7 +499,12 @@ def apply_prepared_linear(
             state.q_ld,
         )
     elif state.op_kind == "nvfp4":
-        sm70_ops.nvfp4_gemm_sm70_out(
+        op = (
+            sm70_ops.nvfp4_gemm_sm70_prescaled_out
+            if state.prescaled_scales
+            else sm70_ops.nvfp4_gemm_sm70_out
+        )
+        op(
             out,
             reshaped_x,
             state.weight,
@@ -544,7 +589,12 @@ def apply_prepared_fused_silu_and_mul(
             True,
         )
     else:
-        sm70_ops.nvfp4_gemm_sm70_out(
+        op = (
+            sm70_ops.nvfp4_gemm_sm70_prescaled_out
+            if state.prescaled_scales
+            else sm70_ops.nvfp4_gemm_sm70_out
+        )
+        op(
             out,
             reshaped_x,
             state.weight,

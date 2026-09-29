@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in compensated attention with explicit native build manifests."""
+"""Compensated SM70 attention with explicit native capability contracts."""
 
 import hashlib
 import importlib.util
@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 BUILTIN_MAX_CONTEXT = 262144
 MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
 DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
-_WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_WORKSPACES: dict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = {}
 
 
 # The grouped long-context route is compiled into the shipped FA2 extension, so
@@ -35,7 +35,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "eb7a85511f581fcd22cf13619c85ed2f42a8cbc8b216bb3e632bf448f6b820e1"
+    "e98db3a38dfae231ec164c3e14c9e755f362af9c089dcc36331b32b7b8d8e55f"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.
@@ -180,6 +180,21 @@ def long_attention_graph_contract(capacity: int | None = None):
     return long_attention_contract(manifest, capacity)
 
 
+def long_attention_max_batch_size(manifest=None) -> int:
+    """Batch capacity of the loaded operator; old libraries remain B1-only."""
+    if manifest is None:
+        _, manifest = resolve_long_attention()
+    if manifest is None:
+        return 1
+    if manifest["module_name"] == "_vllm_fa2_C":
+        query = getattr(torch.ops._vllm_fa2_C, "sm70_grouped_long_max_batch_size", None)
+        return int(query()) if query is not None else 1
+    batch_size = manifest.get("max_batch_size", 1)
+    if type(batch_size) is not int or not 1 <= batch_size <= 16:
+        raise ValueError("Unsupported long-attention batch contract")
+    return batch_size
+
+
 # Keep the qualified fixed pages for older native libraries. Rebuilt libraries
 # also expose the existing runtime-page kernel for positive 16-aligned pages.
 ADMITTED_PAGE_SIZES = (1648, 3296)
@@ -214,6 +229,7 @@ def wrap_long_attention(fallback):
         return fallback
     capability = long_attention_capability(manifest)
     query_rows = long_attention_query_rows(manifest)
+    max_batch_size = long_attention_max_batch_size(manifest)
 
     def run(
         q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
@@ -224,6 +240,14 @@ def wrap_long_attention(fallback):
             else None
         )
         bucket = getattr(descriptor, "attention_context_bucket", None)
+        batch_size = int(table.shape[0]) if table.ndim == 2 else 0
+        num_rows = q.shape[0] if q.ndim == 3 else 0
+        request_major_q8 = (
+            2 <= batch_size <= max_batch_size
+            and 8 in query_rows
+            and num_rows == batch_size * 8
+        )
+        single_request_tail = batch_size == 1 and num_rows in query_rows
         # The graph builder owns the served window: it stamps the bound it
         # captured the variant at onto the descriptor. The wrapper only has to
         # refuse a bound the operator was not qualified for.
@@ -231,10 +255,13 @@ def wrap_long_attention(fallback):
             bucket is not None
             and bucket <= capability
             and q.ndim == 3
-            and q.shape[0] in query_rows
+            and (single_request_tail or request_major_q8)
             and q.shape[1] > 0
             and q.shape[2] == 256
             and k.ndim == 4
+            and table.is_contiguous()
+            and row_lengths.ndim == 1
+            and row_lengths.shape[0] == q.shape[0]
             and long_attention_page_supported(k.shape[1], manifest)
             and k.shape[2] * 6 == q.shape[1]
             and k.shape[3] == 256
@@ -256,14 +283,36 @@ def wrap_long_attention(fallback):
         # Allocate a fixed workspace once for each warmup/capture stream. Graph
         # replay never allocates. Layers reuse it in stream order; different
         # streams and versions never share the legacy 80-split buffers.
+        if request_major_q8:
+            logger.info_once(
+                "SM70 E4M3 long q8 request-major route selected: batch=%d "
+                "page=%d bound=%d; shared full-q8 kernel, FP32 state.",
+                batch_size,
+                k.shape[1],
+                bucket,
+                scope="process",
+            )
         stream = torch.cuda.current_stream(q.device).cuda_stream
         key = (manifest["source_sha256"], bucket, 80, q.device, stream)
-        if key not in _WORKSPACES:
-            _WORKSPACES[key] = (
-                torch.empty((80, 8, 6, 256), dtype=torch.float32, device=q.device),
-                torch.empty((80, 8, 6, 2), dtype=torch.float32, device=q.device),
+        bank = _WORKSPACES.setdefault(key, [])
+        # Full graphs replay in stream order, just like successive layers.
+        # Reuse a larger request panel for smaller captures. Keep older panels
+        # alive when growing: an earlier graph may still reference them.
+        for partial, lse in bank:
+            if partial.shape[0] >= batch_size:
+                break
+        else:
+            partial = torch.empty(
+                (batch_size, 80, 8, 6, 256), dtype=torch.float32, device=q.device
             )
-        partial, lse = _WORKSPACES[key]
+            lse = torch.empty(
+                (batch_size, 80, 8, 6, 2), dtype=torch.float32, device=q.device
+            )
+            bank.append((partial, lse))
+        if batch_size == 1:
+            partial, lse = partial[0], lse[0]
+        else:
+            partial, lse = partial[:batch_size], lse[:batch_size]
         return run_six_head_groups(
             operator,
             q,

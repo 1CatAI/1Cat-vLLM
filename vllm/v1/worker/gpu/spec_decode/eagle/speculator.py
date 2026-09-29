@@ -26,7 +26,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CapturedAttentionState,
-    get_uniform_token_count,
+    get_uniform_decode_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -563,6 +563,9 @@ class EagleSpeculator:
         attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
     ) -> None:
         logger.info("Capturing model for Eagle speculator...")
+        prepare_decode = getattr(self.model, "prepare_sm70_decode_graph_model", None)
+        if prepare_decode is not None:
+            prepare_decode()
         # Reset indices to zeros to prevent stale values from prior
         # dummy runs to cause out-of-bounds indexing during capture.
         self.last_token_indices.zero_()
@@ -678,12 +681,13 @@ class EagleSpeculator:
 
         # When all requests are decoding (no true prefills), each has
         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
-        uniform_token_count = get_uniform_token_count(
+        uniform_token_count = get_uniform_decode_token_count(
             num_reqs,
             # Use the actual number of tokens without padding added by
             # the target model during FULL cudagraph.
             input_batch.num_tokens,
             max_query_len,
+            has_prefill=bool(input_batch.is_prefilling_np.any()),
         )
         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,

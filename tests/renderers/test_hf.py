@@ -1117,6 +1117,43 @@ class TestConsolidateSystemMessages:
         with pytest.raises(ValueError, match="conflicting metadata"):
             _consolidate_system_messages(conversation)
 
+    def test_responses_transport_metadata_does_not_conflict(self):
+        from vllm.entrypoints.openai.responses.utils import construct_input_messages
+
+        input_items = [
+            {
+                "type": "message",
+                "id": "msg_developer_1",
+                "phase": "commentary",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn_1"},
+                "role": "developer",
+                "content": "Follow policy.",
+            },
+            {
+                "type": "message",
+                "id": "msg_developer_2",
+                "phase": "commentary",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn_2"},
+                "role": "developer",
+                "content": "Follow repository rules.",
+            },
+        ]
+        messages = construct_input_messages(
+            request_instructions="Base instructions.",
+            request_input=input_items,
+        )
+
+        result = _consolidate_system_messages(_convert_developer_to_system(messages))
+
+        assert result == [
+            {
+                "role": "system",
+                "content": (
+                    "Base instructions.\n\nFollow policy.\n\nFollow repository rules."
+                ),
+            }
+        ]
+
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_developer_normalization_precedes_multimodal_tracking(

@@ -105,11 +105,10 @@ __device__ __forceinline__ void decode_choose_threshold(
 }
 
 template <int TopK>
-__global__
-__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
+__device__ __forceinline__ void qsa_lexicographic_topk_body(
     const float* __restrict__ logits, const int32_t* __restrict__ lengths,
     int32_t* __restrict__ output, uint32_t num_rows, uint32_t columns,
-    uint32_t stride) {
+    uint32_t stride, LexicographicTopKShared<TopK>& shared) {
   const uint32_t row = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   if (row >= num_rows) return;
@@ -128,7 +127,6 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
     return;
   }
 
-  __shared__ LexicographicTopKShared<TopK> shared;
   if (tx == 0) {
     shared.prefix = 0;
     shared.remaining = TopK;
@@ -220,16 +218,16 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
   }
 }
 
-// Single-token QSA decode has only about two thousand live block scores at the
+// Each QSA decode row has only about two thousand live block scores at the
 // common 8K context length. After the first radix byte, scanning all scores for
 // the other three bytes wastes most of the work. Compact the selected coarse
 // bucket into shared memory and refine that much smaller set instead. Integer
 // counters and the final increasing-index pass retain exact tie-breaking.
 template <int TopK>
-__global__
-__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
+__device__ __forceinline__ void qsa_lexicographic_decode_topk_body(
     const float* __restrict__ logits, const int32_t* __restrict__ lengths,
-    int32_t* __restrict__ output, uint32_t columns) {
+    int32_t* __restrict__ output, uint32_t columns,
+    LexicographicDecodeTopKShared<TopK>& shared) {
   const uint32_t tx = threadIdx.x;
   const int32_t raw_length = lengths[0];
   const uint32_t length =
@@ -243,7 +241,6 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_
     return;
   }
 
-  __shared__ LexicographicDecodeTopKShared<TopK> shared;
   if (tx == 0) {
     shared.prefix = 0;
     shared.remaining = TopK;
@@ -397,14 +394,71 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_
 }
 
 template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
+    const float* logits, const int32_t* lengths, int32_t* output, uint32_t rows,
+    uint32_t columns, uint32_t stride) {
+  __shared__ LexicographicTopKShared<TopK> shared;
+  qsa_lexicographic_topk_body<TopK>(logits, lengths, output, rows, columns,
+                                    stride, shared);
+}
+
+template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
+    const float* logits, const int32_t* lengths, int32_t* output,
+    uint32_t columns, uint32_t stride) {
+  __shared__ LexicographicDecodeTopKShared<TopK> shared;
+  const uint32_t row = blockIdx.x;
+  qsa_lexicographic_decode_topk_body<TopK>(
+      logits + static_cast<uint64_t>(row) * stride, lengths + row,
+      output + static_cast<uint64_t>(row) * TopK, columns, shared);
+}
+
+template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_mtp_topk_kernel(
+    const float* logits, const int32_t* lengths, int32_t* output, uint32_t rows,
+    uint32_t columns, uint32_t stride) {
+  // Only one path runs in a CTA. Sharing its storage avoids reserving both
+  // workspaces and unnecessarily reducing the available L1 cache capacity.
+  __shared__ union {
+    LexicographicTopKShared<TopK> normal;
+    LexicographicDecodeTopKShared<TopK> compact;
+  } shared;
+  const uint32_t row = blockIdx.x;
+  if (lengths[row] <= kLexicographicTopKDecodeCandidateCapacity) {
+    qsa_lexicographic_decode_topk_body<TopK>(
+        logits + static_cast<uint64_t>(row) * stride, lengths + row,
+        output + static_cast<uint64_t>(row) * TopK, columns, shared.compact);
+  } else {
+    qsa_lexicographic_topk_body<TopK>(logits, lengths, output, rows, columns,
+                                      stride, shared.normal);
+  }
+}
+
+template <int TopK>
 void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
                                    int32_t* output, uint32_t num_rows,
                                    uint32_t columns, uint32_t stride,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream,
+                                   bool decode_batch = false) {
   if (num_rows == 1) {
     qsa_lexicographic_decode_topk_kernel<TopK>
         <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
-                                                      columns);
+                                                      columns, stride);
+  } else if (decode_batch && (num_rows == 5 || num_rows == 10) &&
+             columns <= 9216) {
+    // Qualified through 32K context, allowing physical page padding. Longer
+    // score buffers retain the original kernel and its resource allocation.
+    qsa_lexicographic_mtp_topk_kernel<TopK>
+        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+            logits, lengths, output, num_rows, columns, stride);
+  } else if (decode_batch && num_rows <= 16 && num_rows != 5 &&
+             num_rows != 10) {
+    qsa_lexicographic_decode_topk_kernel<TopK>
+        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+            logits, lengths, output, columns, stride);
   } else {
     qsa_lexicographic_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(

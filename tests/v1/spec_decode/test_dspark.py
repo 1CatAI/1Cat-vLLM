@@ -99,6 +99,10 @@ def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
     remap = DSparkDeepseekV4ForCausalLM._remap_dspark_name
 
     assert remap("model.layers.0.attn.wq_a.weight") is None
+    # The target's embedding also fills the drafter's own table: under
+    # pipeline parallelism the drafter (last stage) cannot share the target
+    # embedding (first stage).
+    assert remap("embed.weight") == "model.embed_tokens.weight"
     assert remap("mtp.0.main_proj.weight") == "model.main_proj.weight"
     assert remap("mtp.0.main_norm.weight") == "model.main_norm.weight"
     assert remap("mtp.1.ffn.experts.7.w2.weight") == (
@@ -110,6 +114,15 @@ def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
     assert remap("mtp.2.confidence_head.proj.weight") == (
         "model.confidence_head.proj.weight"
     )
+
+
+def test_dspark_skips_every_checkpoint_weight_it_does_not_load() -> None:
+    drafter = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
+
+    assert drafter.skip_checkpoint_weight("layers.3.attn.wq_a.weight")
+    assert drafter.skip_checkpoint_weight("head.weight")
+    assert not drafter.skip_checkpoint_weight("mtp.0.main_proj.weight")
+    assert not drafter.skip_checkpoint_weight("mtp.1.ffn.experts.7.w2.weight")
 
 
 class _FakeDSparkModel:

@@ -212,6 +212,11 @@ def _missing_qpn2_prefill_ops() -> list[str]:
 
 
 def _compact_qpn2_scales_enabled() -> bool:
+    # At C8/M64 the TurboMind fallback consumes FP16 scales. Preserve its
+    # load-time-prepared scales for concurrent decode; otherwise every step
+    # expands all E4M3 scale tensors again before the GEMM.
+    if sm70_tm.use_batched_gemm_layouts():
+        return False
     if not envs.VLLM_SM70_NVFP4_QPN2_SHARED_SCALES:
         return False
     version = getattr(torch.ops._C, "nvfp4_qpn2_compact_scales_version_sm70", None)
@@ -461,6 +466,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             sm70_tm.prepare_nvfp4_linear(
                 layer,
                 interleave_gated_silu=use_gated_silu,
+                prescale_for_batch=(
+                    use_qpn2
+                    and qpn2_shared
+                    and sm70_tm.use_batched_gemm_layouts()
+                    and not (qpn2_shared and _compact_qpn2_scales_enabled())
+                ),
             )
             if use_qpn2:
                 suffix = layer.prefix.rsplit(".", 1)[-1]
@@ -490,6 +501,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     logger.info_once(
                         "SM70 QPN2 retains E4M3 scales only; TurboMind restores "
                         "shared FP16 scratch for fallback shapes."
+                    )
+                elif qpn2_shared and sm70_tm.use_batched_gemm_layouts():
+                    logger.info_once(
+                        "SM70 batched NVFP4 keeps load-time FP16 TurboMind "
+                        "scales for M>32 while QPN2 retains compact E4M3 "
+                        "scales for small M."
                     )
                 logger.info_once(
                     "SM70 NVFP4 QPN2 M<=32 route enabled for a compatible "
@@ -607,6 +624,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 state.q_ld,
                 gated_silu,
                 min_prefill_m,
+                state.prescaled_scales,
             )
         elif getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
             sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(

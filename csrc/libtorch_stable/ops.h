@@ -263,7 +263,8 @@ void persistent_topk(const torch::stable::Tensor& logits,
 
 void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
                             const torch::stable::Tensor& lengths,
-                            torch::stable::Tensor& output, int64_t k);
+                            torch::stable::Tensor& output, int64_t k,
+                            bool decode_batch);
 
 void selective_scan_fwd(
     const torch::stable::Tensor& u, const torch::stable::Tensor& delta,

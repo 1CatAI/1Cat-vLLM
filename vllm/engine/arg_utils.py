@@ -535,6 +535,9 @@ class EngineArgs:
     )
     block_size: int | None = None
     enable_prefix_caching: bool | None = None
+    prefix_cache_retention_interval: int | None = (
+        CacheConfig.prefix_cache_retention_interval
+    )
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1173,6 +1176,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
+        )
+        cache_group.add_argument(
+            "--prefix-cache-retention-interval",
+            **cache_kwargs["prefix_cache_retention_interval"],
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -1995,6 +2002,7 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
+            prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
@@ -2004,6 +2012,10 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+        )
+
+        cache_config.cache_dtype_from_checkpoint = (
+            self.kv_cache_dtype == "auto" and resolved_cache_dtype != "auto"
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):

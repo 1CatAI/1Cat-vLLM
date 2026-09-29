@@ -21,6 +21,56 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+@torch.compiler.assume_constant_result
+def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
+    # Capability is static for the device guarded by the compiled tensor input.
+    # Do not trace the platform's cached NVML/PyTorch capability query.
+    return current_platform.is_device_capability(70, device_id=device_id)
+
+
+def _sm70_gated_norm_shape_supported(
+    x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
+) -> bool:
+    return bool(
+        z is not None
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= 192
+        and x.shape[1] == 128
+        and z.shape == x.shape
+        and weight.shape == (128,)
+        and x.dtype == z.dtype == weight.dtype == torch.float16
+        and x.device == z.device == weight.device
+        and x.is_contiguous()
+        and z.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+def _sm70_rmsnorm_gated_exact_impl(
+    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
+) -> torch.Tensor:
+    logger.info_once(
+        "SM70 exact native gated RMSNorm fusion enabled "
+        "(N128, sigmoid/SiLU, M1 and batch)."
+    )
+    out = torch.empty_like(x)
+    torch.ops._C.sm70_rmsnorm_gated_exact_out(out, x, z, weight, eps, silu)
+    return out
+
+
+def _sm70_rmsnorm_gated_exact_fake(
+    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="sm70_rmsnorm_gated_exact",
+    op_func=_sm70_rmsnorm_gated_exact_impl,
+    fake_impl=_sm70_rmsnorm_gated_exact_fake,
+)
+
+
 @triton.jit
 def _sm70_dflash2_fixed_gemma_rms_kernel(
     x,
@@ -731,6 +781,19 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
+        if (
+            envs.VLLM_SM70_RMSNORM_GATED_EXACT
+            and not envs.VLLM_BATCH_INVARIANT
+            and x.is_cuda
+            and _sm70_gated_norm_device_supported(x.device.index)
+            and self.group_size is None
+            and self.norm_before_gate
+            and self.activation in ("sigmoid", "silu", "swish")
+            and _sm70_gated_norm_shape_supported(x, z, self.weight)
+        ):
+            return torch.ops.vllm.sm70_rmsnorm_gated_exact(
+                x, z, self.weight, self.eps, self.activation != "sigmoid"
+            )
         return self.forward_static(
             x,
             z,

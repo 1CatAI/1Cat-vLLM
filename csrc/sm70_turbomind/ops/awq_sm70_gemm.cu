@@ -35,6 +35,7 @@
 #include "src/turbomind/kernels/gemm/gemm.h"
 #include "src/turbomind/kernels/gemm/gemm_universal.h"
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
+#include "src/turbomind/kernels/gemm/sm70_dflash_context.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
 #include "custom_all_reduce.cuh"
@@ -1155,7 +1156,18 @@ bool fp8_grouped_bmm_decode_enabled() {
 
 bool awq_reuse_imported_cache_enabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE");
-  return raw != nullptr && std::atoi(raw) != 0;
+  // An imported plan is produced by the coordinated warmup on rank 0.  Keep
+  // it as the default source of truth on the other TP ranks; an explicit 0
+  // remains available for cache-debugging and old standalone warmups.
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
+bool fp8_reuse_imported_cache_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE");
+  // See awq_reuse_imported_cache_enabled().  The Python warmup only marks an
+  // imported cache after rank 0 has finished measuring the shape, so this
+  // does not change the no-cache path.
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool awq_preserve_default_splits_enabled() {
@@ -1321,6 +1333,10 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
 
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
+  if (group_size == 0 &&
+      turbomind::gemm::UseSm70DflashContextFcStableReduction(m, n, k)) {
+    return turbomind::gemm::DispatchPolicy::kDefault;
+  }
   const char* dflash2_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
   const char* dflash2_shadow =
       std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
@@ -1352,11 +1368,13 @@ turbomind::gemm::DispatchPolicy select_fp8_dense_dispatch_policy(
   if (fp8_0dot3_dense_selector_enabled()) {
     return select_dense_dispatch_policy_impl(
         device, m, n, k, group_size, stream, TuneKeyKind::kGenericDense,
-        tune_small_shapes_enabled(), false, generic_dense_tune_max_m());
+        tune_small_shapes_enabled(), fp8_reuse_imported_cache_enabled(),
+        generic_dense_tune_max_m());
   }
   auto policy = select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kFp8Dense,
-      fp8_tune_small_shapes_enabled(), false, fp8_dense_tune_max_m());
+      fp8_tune_small_shapes_enabled(), fp8_reuse_imported_cache_enabled(),
+      fp8_dense_tune_max_m());
   if (!fp8_safe_fast_selector_enabled()) {
     return policy;
   }
@@ -1367,7 +1385,7 @@ turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kMxfp4Dense,
-      mxfp4_tune_small_shapes_enabled(), false, mxfp4_dense_tune_max_m());
+      mxfp4_tune_small_shapes_enabled(), true, mxfp4_dense_tune_max_m());
 }
 
 turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
@@ -1379,7 +1397,7 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
   }
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kNvfp4Dense,
-      nvfp4_tune_small_shapes_enabled(), false, nvfp4_dense_tune_max_m());
+      nvfp4_tune_small_shapes_enabled(), true, nvfp4_dense_tune_max_m());
 }
 
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
@@ -4143,8 +4161,8 @@ void awq_gemm_sm70_out_tile_reduce(
 void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                        torch::Tensor tm_weight, torch::Tensor tm_scales,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
-                       bool gated_silu,
-                       bool exact_8k_prefill_prescaled = false) {
+                       bool gated_silu, bool exact_8k_prefill_prescaled = false,
+                       bool preserve_default_partition = false) {
   TORCH_CHECK(in_feats.is_cuda(), "fp8_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "fp8_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "fp8_gemm_sm70: scales must be CUDA.");
@@ -4182,9 +4200,12 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
         m == 1 && ((n == 1536 && k == 4096) || (n == 8192 && k == 1024) ||
                    (n == 4096 && k == 2048) || (n == 1024 && k == 4096) ||
                    (n == 4096 && k == 512));
-    TORCH_CHECK(qwen38_prefill || prescaled_m1,
+    const bool prescaled_batch =
+        m > 32 && m <= 64 &&
+        ((n == 5120 && k == 1536) || ((n == 4096 || n == 3584) && k == 5120));
+    TORCH_CHECK(qwen38_prefill || prescaled_m1 || prescaled_batch,
                 "fp8_gemm_sm70: pre-scaled block-FP8 requires an accepted "
-                "8K prefill or M=1 tensor shape.");
+                "8K prefill, M=1, or M=33..64 tensor shape.");
     TORCH_CHECK(!gated_silu,
                 "fp8_gemm_sm70: pre-scaled path does not fuse gated SILU.");
   }
@@ -4271,6 +4292,10 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   if (exact_8k_prefill_prescaled) {
     op.dispatch =
         op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Fp8PrefillPrescaled;
+  }
+  if (preserve_default_partition) {
+    op.dispatch = op.dispatch |
+                  turbomind::gemm::DispatchPolicy::kPreserveDefaultPartition;
   }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
@@ -4469,7 +4494,7 @@ void mxfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                          torch::Tensor tm_weight, torch::Tensor tm_scales,
                          int64_t group_size, int64_t k_ld, int64_t q_ld,
-                         bool gated_silu) {
+                         bool gated_silu, bool prescaled = false) {
   TORCH_CHECK(in_feats.is_cuda(), "nvfp4_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "nvfp4_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "nvfp4_gemm_sm70: scales must be CUDA.");
@@ -4585,6 +4610,11 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   op.dispatch = select_nvfp4_dense_dispatch_policy(
       device, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
       static_cast<int>(group_size), stream);
+  if (prescaled) {
+    TORCH_CHECK(m > 32, "nvfp4_gemm_sm70: prescaled input requires M>32.");
+    op.dispatch =
+        op.dispatch | turbomind::gemm::DispatchPolicy::kSm70Nvfp4Prescaled;
+  }
   op.epilogue = gated_silu ? turbomind::gemm::Epilogue::kGatedSilu
                            : turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
@@ -6237,9 +6267,10 @@ void awq_gemm_sm70_out_tile_reduce(
 void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, torch::Tensor _scaling_factors,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
-                       bool gated_silu) {
+                       bool gated_silu, bool preserve_default_partition) {
   vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
-                                    group_size, k_ld, q_ld, gated_silu);
+                                    group_size, k_ld, q_ld, gated_silu, false,
+                                    preserve_default_partition);
 }
 
 void fp8_gemm_sm70_prefill_prescaled_out(torch::Tensor out,
@@ -6286,6 +6317,14 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                          bool gated_silu) {
   vllm::awq_sm70::nvfp4_gemm_sm70_out(out, _in_feats, _kernel, _scaling_factors,
                                       group_size, k_ld, q_ld, gated_silu);
+}
+
+void nvfp4_gemm_sm70_prescaled_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, torch::Tensor scales,
+                                   int64_t group_size, int64_t k_ld,
+                                   int64_t q_ld, bool gated_silu) {
+  vllm::awq_sm70::nvfp4_gemm_sm70_out(out, input, weight, scales, group_size,
+                                      k_ld, q_ld, gated_silu, true);
 }
 
 void nvfp4_gemv_sm70_raw_out(torch::Tensor out, torch::Tensor _in_feats,
