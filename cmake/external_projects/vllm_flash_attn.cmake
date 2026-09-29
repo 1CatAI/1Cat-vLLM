@@ -99,6 +99,8 @@ message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 # legacy FA2 headers or operators, which remain available for rollback.
 if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
   set(SM70_V37_DIR "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_v37")
+  target_include_directories(_vllm_fa2_C PRIVATE
+    "${vllm-flash-attn_SOURCE_DIR}/csrc/cutlass/examples/35_gemm_softmax")
   set(SM70_V37_CUDA_SRCS
     "${SM70_V37_DIR}/prefill.cu"
     "${SM70_V37_DIR}/tail.cu"
