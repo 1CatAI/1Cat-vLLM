@@ -1207,9 +1207,18 @@ def get_requirements() -> list[str]:
     elif _is_cuda():
         requirements = _read_requirements("cuda.txt")
         cuda_major, cuda_minor = torch.version.cuda.split(".")
+        # An SM70 wheel is a CUDA 12.8 release artifact.  Keep its runtime
+        # dependency on the matching PyTorch wheel in the wheel metadata so a
+        # user installing the wheel does not need to know about this build
+        # detail or export a local-environment override.  The explicit env
+        # switch remains for reproducible packaging jobs that pin the same
+        # dependency while using a non-SM70 target.
+        pin_torch_cu128 = bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))) or (
+            _cuda_arch_contains(7, 0) and torch.version.cuda == "12.8"
+        )
         modified_requirements = []
         for req in requirements:
-            if bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))):
+            if pin_torch_cu128:
                 req = ONECAT_TORCH_CU128_URLS.get(req.split("#", 1)[0].strip(), req)
             if "vllm-flash-attn" in req and cuda_major != "12":
                 # vllm-flash-attn is built only for CUDA 12.x.

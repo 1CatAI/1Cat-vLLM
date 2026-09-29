@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -31,6 +33,12 @@ def write_wheel(path: Path, members: list[str]) -> None:
     with zipfile.ZipFile(path, "w") as wheel:
         for member in members:
             wheel.writestr(member, b"fixture; dynamic inspection is disabled")
+        wheel.writestr(
+            "1cat_vllm-0.0.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\n"
+            "Generator: test\n"
+            "Tag: cp312-cp312-manylinux_2_28_x86_64\n",
+        )
 
 
 def test_complete_sm70_wheel_manifest_passes(tmp_path: Path) -> None:
@@ -64,6 +72,77 @@ def test_launcher_is_required(tmp_path: Path) -> None:
 
     with pytest.raises(ArtifactError, match="launcher"):
         check_wheel(wheel, inspect_dynamic=False)
+
+
+def test_release_wheel_requires_cp312_tag(tmp_path: Path) -> None:
+    wheel = tmp_path / "wrong-tag.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for member in REQUIRED_MEMBERS:
+            archive.writestr(member, b"fixture")
+        archive.writestr(
+            "1cat_vllm-0.0.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\n"
+            "Generator: test\n"
+            "Tag: cp311-cp311-manylinux_2_28_x86_64\n",
+        )
+
+    with pytest.raises(ArtifactError, match="Python 3.12"):
+        check_wheel(wheel, inspect_dynamic=False)
+
+
+def test_unsafe_zip_member_is_rejected_before_dynamic_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = tmp_path / "unsafe.whl"
+    write_wheel(wheel, [*REQUIRED_MEMBERS, "../outside.so"])
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("dynamic inspection must not extract unsafe members")
+
+    monkeypatch.setattr(
+        "tools.check_sm70_release_artifact._check_dynamic_dependencies",
+        fail_if_called,
+    )
+    with pytest.raises(ArtifactError, match="unsafe wheel member"):
+        check_wheel(wheel)
+
+
+def test_dynamic_inspection_rejects_private_rpath(tmp_path: Path) -> None:
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("cc is required for the native artifact fixture")
+    assert compiler is not None
+
+    source = tmp_path / "fixture.c"
+    source.write_text("int fixture(void) { return 1; }\n", encoding="utf-8")
+    native = tmp_path / "fixture.so"
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            str(source),
+            "-Wl,-rpath,/home/private-build/lib",
+            "-o",
+            str(native),
+        ],
+        check=True,
+    )
+
+    wheel = tmp_path / "private-rpath.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        payload = native.read_bytes()
+        for member in REQUIRED_MEMBERS:
+            archive.writestr(member, payload)
+        archive.writestr(
+            "1cat_vllm-0.0.0.dist-info/WHEEL",
+            "Wheel-Version: 1.0\n"
+            "Generator: test\n"
+            "Tag: cp312-cp312-manylinux_2_28_x86_64\n",
+        )
+
+    with pytest.raises(ArtifactError, match="private build path|RPATH"):
+        check_wheel(wheel)
 
 
 def test_release_launcher_has_no_developer_runtime_overlays() -> None:

@@ -1024,6 +1024,26 @@ verifier out of its fast path.
 
 ---
 
+# 📦 Install the SM70 release wheel
+
+For the Qwen3.8-27B NVFP4 + DFlash2 V100 profile, install the release wheel
+into a clean Python 3.12 environment. The wheel carries the SM70 extensions,
+Flash-V100, FlashQLA, and the versioned launcher; its metadata selects the
+CUDA 12.8 PyTorch wheels for this profile.
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install ./1cat_vllm-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
+serve_qwen38_27b_nvfp4_v100 /models/Qwen3.8-27B-NVFP4
+```
+
+The launcher uses the installed `vllm` command and packaged extensions. It
+does not require a checkout path, a copied `.so`, or `VLLM_*`/`FLASH_*`
+environment overrides. Four peer-connected V100-SXM2 32GB GPUs are required
+for this profile; pass normal `vllm serve` options after the model path when
+changing the service port or resource limits.
+
 # 🔨 Build From Source
 
 Clone:
@@ -1041,6 +1061,10 @@ export CMAKE_CUDA_ARCHITECTURES=70
 ```
 
 Then build/install the project using the repository's current build instructions for your CUDA/PyTorch environment.
+
+The two variables above are build-time inputs for a source build only. They
+are already fixed in the SM70 release-wheel build and are not needed after
+installing that wheel.
 
 Because this project contains custom CUDA extensions, make sure the active compiler/toolkit matches the PyTorch CUDA ABI used by your environment.
 

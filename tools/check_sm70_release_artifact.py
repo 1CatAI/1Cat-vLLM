@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import regex as re
 
@@ -69,6 +69,8 @@ REQUIRED_MEMBERS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 LAUNCHER_SUFFIX = ".data/scripts/serve_qwen38_27b_nvfp4_v100.sh"
+WHEEL_METADATA_PATTERN = re.compile(r"^[^/]+\.dist-info/WHEEL$")
+RELEASE_PYTHON_TAG = "cp312"
 PRIVATE_PATH_MARKERS = (
     "/home/",
     "/data/",
@@ -85,6 +87,37 @@ class ArtifactError(ValueError):
 def _dynamic_section_uses_private_path(output: str) -> bool:
     lowered = output.lower()
     return any(marker in lowered for marker in PRIVATE_PATH_MARKERS)
+
+
+def _dynamic_section_errors(member: str, output: str) -> list[str]:
+    """Reject loader paths that escape the wheel or name an absolute DSO."""
+
+    errors: list[str] = []
+    if _dynamic_section_uses_private_path(output):
+        errors.append(f"{member}: private build path in dynamic section")
+
+    for line in output.splitlines():
+        if "(RPATH)" not in line and "(RUNPATH)" not in line:
+            continue
+        match = re.search(r"\[(.*?)\]", line)
+        if match is None:
+            continue
+        for path in match.group(1).split(":"):
+            path = path.strip()
+            if not path:
+                continue
+            if path.startswith("$ORIGIN") or path.startswith("${ORIGIN}"):
+                continue
+            errors.append(f"{member}: non-portable RPATH/RUNPATH entry {path!r}")
+
+    # A DT_NEEDED entry with a slash is an absolute or caller-relative loader
+    # path.  A wheel may rely on system CUDA/driver libraries by soname, but it
+    # must not reach back into the build host for a private .so.
+    for match in re.finditer(r"Shared library: \[(.*?)\]", output):
+        needed = match.group(1)
+        if "/" in needed or "\\" in needed:
+            errors.append(f"{member}: non-portable DT_NEEDED entry {needed!r}")
+    return errors
 
 
 def _check_dynamic_dependencies(
@@ -111,8 +144,7 @@ def _check_dynamic_dependencies(
             if result.returncode != 0:
                 errors.append(f"{member}: readelf failed: {result.stderr.strip()}")
                 continue
-            if _dynamic_section_uses_private_path(result.stdout):
-                errors.append(f"{member}: private build path in RPATH/RUNPATH")
+            errors.extend(_dynamic_section_errors(member, result.stdout))
     return errors
 
 
@@ -123,12 +155,19 @@ def check_wheel(path: Path, *, inspect_dynamic: bool = True) -> None:
         raise ArtifactError(f"wheel does not exist: {path}")
 
     with zipfile.ZipFile(path) as wheel:
-        members = set(wheel.namelist())
+        member_list = wheel.namelist()
+        members = set(member_list)
         errors: list[str] = []
 
-        for member in members:
-            pure = member.replace("\\", "/")
-            if pure.startswith("/") or "../" in pure:
+        if len(members) != len(member_list):
+            errors.append("wheel contains duplicate member names")
+
+        for member in member_list:
+            if "\\" in member or "\x00" in member:
+                errors.append(f"unsafe wheel member: {member}")
+                continue
+            pure = PurePosixPath(member)
+            if pure.is_absolute() or ".." in pure.parts:
                 errors.append(f"unsafe wheel member: {member}")
 
         for description, pattern in REQUIRED_MEMBERS:
@@ -138,7 +177,36 @@ def check_wheel(path: Path, *, inspect_dynamic: bool = True) -> None:
         if not any(member.endswith(LAUNCHER_SUFFIX) for member in members):
             errors.append("missing packaged V100 release launcher")
 
-        native_members = sorted(member for member in members if member.endswith(".so"))
+        wheel_metadata = [
+            member for member in members if WHEEL_METADATA_PATTERN.fullmatch(member)
+        ]
+        if not wheel_metadata:
+            errors.append("missing wheel WHEEL metadata")
+        else:
+            tags = []
+            for member in wheel_metadata:
+                metadata = wheel.read(member).decode("utf-8", errors="replace")
+                tags.extend(
+                    line.partition(":")[2].strip()
+                    for line in metadata.splitlines()
+                    if line.startswith("Tag:")
+                )
+            if not tags:
+                errors.append("wheel WHEEL metadata has no Tag entry")
+            elif not any(tag.startswith(f"{RELEASE_PYTHON_TAG}-") for tag in tags):
+                errors.append(
+                    "SM70 release wheel must publish a Python 3.12-compatible Tag"
+                )
+
+        # Do not inspect or extract native members until all member names have
+        # passed validation.  This keeps a malformed ZIP from writing outside
+        # the temporary directory used by the dynamic dependency check.
+        if errors:
+            raise ArtifactError("; ".join(errors))
+
+        native_members = sorted(
+            member for member in members if re.search(r"\.so(?:\..*)?$", member)
+        )
         if inspect_dynamic:
             errors.extend(_check_dynamic_dependencies(wheel, native_members))
 
