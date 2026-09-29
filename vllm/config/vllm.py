@@ -2162,10 +2162,13 @@ class VllmConfig:
                 and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
-                self.compilation_config.mode = CompilationMode.VLLM_COMPILE
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.FULL_AND_PIECEWISE
-                )
+                # None means unspecified; explicit modes take precedence.
+                if self.compilation_config.mode is None:
+                    self.compilation_config.mode = CompilationMode.VLLM_COMPILE
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_AND_PIECEWISE
+                    )
                 if self.compilation_config.cudagraph_capture_sizes is None:
                     cudagraph_capture_sizes = _sm70_nomtp_cudagraph_capture_sizes(
                         self.scheduler_config.max_num_seqs
@@ -2321,8 +2324,10 @@ class VllmConfig:
                 )
                 logger.info_once(
                     "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
-                    "mode=VLLM_COMPILE, cudagraph_mode=FULL_AND_PIECEWISE, "
+                    "mode=%s, cudagraph_mode=%s, "
                     "capture_sizes=%s.",
+                    self.compilation_config.mode.name,
+                    self.compilation_config.cudagraph_mode.name,
                     tuple(self.compilation_config.cudagraph_capture_sizes),
                 )
             else:
@@ -2346,8 +2351,12 @@ class VllmConfig:
                     1,
                     envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE,
                 )
-                self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+                if self.compilation_config.mode is None:
+                    self.compilation_config.mode = CompilationMode.NONE
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_DECODE_ONLY
+                    )
                 if self.compilation_config.max_cudagraph_capture_size is None:
                     self.compilation_config.max_cudagraph_capture_size = capture_size
                 if self.compilation_config.cudagraph_capture_sizes is None:
@@ -2356,8 +2365,10 @@ class VllmConfig:
                     )
                 logger.info_once(
                     "Using SM70 Flash-V100 no-compile decode CUDA graph "
-                    "policy: mode=NONE, cudagraph_mode=FULL_DECODE_ONLY, "
+                    "policy: mode=%s, cudagraph_mode=%s, "
                     "capture_size=%d.",
+                    self.compilation_config.mode.name,
+                    self.compilation_config.cudagraph_mode.name,
                     capture_size,
                 )
             else:
