@@ -1408,6 +1408,7 @@ setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
     packages=(find_packages(include=["vllm*", "flash_qla*"]) + ["flash_attn_v100"]),
+    scripts=["scripts/serve_qwen38_27b_nvfp4_v100.sh"],
     package_dir={
         "flash_attn_v100": str(FLASH_ATTN_V100_PACKAGE),
     },

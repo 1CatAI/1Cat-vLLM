@@ -966,23 +966,20 @@ PY
 
 ## Example TP4 + E5M2 serving command
 
+The release wheel installs the validated V100 launcher. It carries the
+Flash-V100 and FlashQLA extensions and enables the model-aware SM70 defaults;
+the user only supplies the checkpoint path:
+
 ```bash
-vllm serve /path/to/Qwen3.8-27B-NVFP4 \
-  --served-model-name qwen3.8-27b-dflash2 \
-  --trust-remote-code \
-  --tensor-parallel-size 4 \
-  --attention-backend FLASH_ATTN_V100 \
-  --kv-cache-dtype fp8_e5m2 \
-  --max-model-len 262144 \
-  --gpu-memory-utilization 0.80 \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking":true}' \
-  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","kv_cache_dtype":"auto"}' \
-  --host 0.0.0.0 \
-  --port 8000
+serve_qwen38_27b_nvfp4_v100.sh /path/to/Qwen3.8-27B-NVFP4
 ```
+
+The profile pins TP4, FP16 activations, FP8 E5M2 KV, 256K context,
+`--max-num-batched-tokens 8192`, `--max-num-seqs 4`, and the 2048/8192 KV and
+Mamba block sizes. Append normal `vllm serve` options to override a release
+default. This profile is validated for four peer-connected V100-SXM2 32GB
+GPUs; other hardware and concurrency levels need a separate memory and speed
+check.
 
 For the validated Qwen3.8 DFlash2 contract, runtime policy resolves the checkpoint-native draft geometry and the SM70 draft Attention backend.
 

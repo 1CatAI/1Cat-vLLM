@@ -129,7 +129,7 @@ cold outputs in every case, so the decoupled grid does not corrupt results.
 
 ## Adopted default
 
-`scripts/serve_qwen38_27b_nvfp4_v100.sh` pins
+The packaged `serve_qwen38_27b_nvfp4_v100.sh` launcher pins
 `--block-size 2048 --mamba-block-size 8192`. Re-derive if the prefill budget
 changes: the grid wants to be a multiple of the block size that stays inside
 [8000, 8192] so the 75T route keeps dispatching.
