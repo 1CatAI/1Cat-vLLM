@@ -350,6 +350,8 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
         if job.metadata["status"] == "queued":
             update_metadata(job.metadata, {"stage": "cancelled"}, time.time())
             job.metadata.update(status="cancelled", completed_at=time.time())
+            # The worker skips cancelled jobs, so release their uploads here.
+            await asyncio.to_thread(shutil.rmtree, job.input_dir, True)
             job.done.set()
         # A late cancellation never deletes a completed result.
         return job.metadata

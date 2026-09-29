@@ -2,6 +2,25 @@
 
 Date: 2026-05-30
 
+## Pre-release packaging and video cancellation fixes, 2026-09-29
+
+The release audit against main `357d07bcb0ee` reproduced three P2 issues:
+precompiled reuse omitted the SM70 sparse-attention extension, full-CPython-ABI
+extensions could be labelled `cp38-abi3`, and cancelling queued video jobs
+retained uploaded references. Reuse now includes the sparse-attention library;
+wheel tags account for both extension declarations and precompiled package
+data; queued cancellation cleans request-owned inputs before returning.
+
+The focused packaging, Docker metadata, H3 host-memory and API suites pass
+67 tests, with two GPU tests skipped. All applicable pre-commit hooks pass.
+A tiny C-extension fixture also passes source wheel build, extraction,
+repackaging, installation and import in a fresh process: both wheels use
+`cp312-cp312`, retain the native file and reject CPython 3.11 compatibility.
+This is packaging evidence, not a full CUDA wheel or model qualification.
+Raw before/after logs and fixture hashes are retained in the
+`release-audit-20260928` evidence directory as `p2-*` artifacts. No inference
+kernel, benchmark threshold or performance claim changes in this patch.
+
 ## DFlash2 concurrent long decode follow-up, 2026-09-27
 
 Against main `1e90d17f` (PR #697), the new default candidate reaches the
