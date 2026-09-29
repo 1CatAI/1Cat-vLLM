@@ -56,6 +56,24 @@ from .passes.pass_manager import PostGradPassManager
 logger = init_logger(__name__)
 
 
+def _compute_backend_code_hash(forward_code_files: Sequence[str]) -> str:
+    hash_content = []
+    for filepath in sorted(forward_code_files):
+        if filepath == "<string>" or filepath.startswith("<frozen "):
+            # Dynamo can trace frozen Python modules such as os.getenv, but
+            # SourceInfo does not restore them after AOT loading. They have no
+            # source file to hash; including their name makes the first reload
+            # miss the Inductor artifacts saved by the cold compile.
+            continue
+        hash_content.append(filepath)
+        try:
+            with open(filepath) as f:
+                hash_content.append(f.read())
+        except (OSError, UnicodeDecodeError):
+            logger.warning("Failed to read file %s", filepath)
+    return hashlib.sha256("\n".join(hash_content).encode()).hexdigest()
+
+
 def make_copy_and_call(
     sym_tensor_indices: list[int],
     input_buffers: list[torch.Tensor | None],
@@ -1034,20 +1052,7 @@ class VllmBackend:
             "Traced files (to be considered for compilation cache):\n%s",
             lazy(lambda: "\n".join(forward_code_files)),
         )
-        hash_content = []
-        for filepath in forward_code_files:
-            if filepath == "<string>":
-                # This means the function was dynamically generated, with
-                # e.g. exec(). We can't actually check these.
-                continue
-            hash_content.append(filepath)
-            try:
-                with open(filepath) as f:
-                    hash_content.append(f.read())
-            except (OSError, UnicodeDecodeError):
-                logger.warning("Failed to read file %s", filepath)
-                continue
-        code_hash = hashlib.sha256("\n".join(hash_content).encode()).hexdigest()
+        code_hash = _compute_backend_code_hash(forward_code_files)
         # Clear after consumption
         self.compilation_config.traced_files.clear()
         if not self.compilation_config.cache_dir:
