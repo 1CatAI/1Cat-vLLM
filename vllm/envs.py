@@ -324,6 +324,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
+    VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS: int = 512
+    VLLM_SM70_NVFP4_MOE_QPN_CFG: str = "16,1,8,1"
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS: bool = False
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
@@ -2630,6 +2632,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # non-TurboMind route for diagnostics.
     "VLLM_SM70_NVFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "1"))
+    ),
+    # moe_backend="sm70_skinny": largest batch the grouped skinny MoE kernel
+    # serves; larger batches take the per-expert loop. The bound is memory:
+    # the grouped path holds slot-major intermediates the loop never builds.
+    "VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS", "512")
+    ),
+    # moe_backend="sm70_skinny": grouped-kernel launch configs as
+    # "splitk_w13,nacc_w13,splitk_w2,nacc_w2".
+    "VLLM_SM70_NVFP4_MOE_QPN_CFG": lambda: os.getenv(
+        "VLLM_SM70_NVFP4_MOE_QPN_CFG", "16,1,8,1"
     ),
     # Dispatch all 256 routed experts in one grouped TurboMind call for the
     # exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 decode keeps

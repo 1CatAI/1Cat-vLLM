@@ -57,7 +57,9 @@ def is_breakable_cudagraph_enabled() -> bool:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def eager_break_during_capture(fn: F) -> F:
+def eager_break_during_capture(
+    fn: F | None = None, *, ignore_full_mode: bool = False
+) -> Any:
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -88,6 +90,15 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
+    # ``ignore_full_mode=True`` breaks under a FULL runtime mode as well.
+    # Attention ops are capture-safe and only break in PIECEWISE mode; an op
+    # driven from the host (the skinny MoE's per-expert loop routes on
+    # ``topk_ids.cpu()``) has to leave the capture in every mode, or the
+    # capture fails with "operation not permitted when stream is capturing".
+    if fn is None:
+        return functools.partial(
+            eager_break_during_capture, ignore_full_mode=ignore_full_mode
+        )
     if not is_breakable_cudagraph_enabled():
         return fn
 
@@ -98,7 +109,7 @@ def eager_break_during_capture(fn: F) -> F:
             return fn(*args, **kwargs)
         if not capture._capturing:
             return fn(*args, **kwargs)
-        if is_forward_context_available():
+        if not ignore_full_mode and is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
             if mode == CUDAGraphMode.FULL:
                 return fn(*args, **kwargs)

@@ -705,6 +705,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._expert_routing_tables(),
                 layer=layer,
             )
+            if self.mxfp4_backend == Mxfp4MoeBackend.SM70_SKINNY:
+                # The skinny experts re-permute weights and scales in place.
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight
@@ -806,14 +809,17 @@ def make_deepseek_v4_mxfp4_moe_method(
 ) -> FusedMoEMethodBase:
     """Construct the DeepSeek-V4 MXFP4 MoE implementation for this device.
 
-    Volta cannot use the upstream CUDA MXFP4 implementations.  It must take
-    the native TurboMind path or fail explicitly: silently falling through to
-    Marlin or an emulation backend would change the deployment contract and
-    duplicate full expert weights.
+    Volta cannot use the upstream CUDA MXFP4 implementations.  It takes the
+    native TurboMind path, or the skinny QPN kernels when
+    ``--moe-backend sm70_skinny`` asks for them, or fails explicitly:
+    silently falling through to Marlin or an emulation backend would change
+    the deployment contract and duplicate full expert weights.
     """
     from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 
-    if sm70_tm.is_exact_sm70_cuda_platform():
+    # An explicit --moe-backend sm70_skinny serves every SM70/SM75 stage with
+    # the skinny QPN kernels through the backend oracle.
+    if moe.moe_backend != "sm70_skinny" and sm70_tm.is_exact_sm70_cuda_platform():
         if not sm70_tm.should_use_mxfp4_moe_turbomind():
             raise NotImplementedError(
                 "DeepSeek-V4 MXFP4 MoE on SM70 requires the native TurboMind "
