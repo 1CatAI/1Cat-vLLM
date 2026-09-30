@@ -28,6 +28,12 @@ class LRUCachePolicy(CachePolicy):
             if key in self.blocks:
                 self.blocks.move_to_end(key)
 
+    def demote(self, keys: Iterable[OffloadKey]) -> None:
+        # ``evict`` scans from the front and skips referenced blocks.
+        for key in reversed(list(keys)):
+            if key in self.blocks:
+                self.blocks.move_to_end(key, last=False)
+
     def clear(self) -> None:
         self.blocks.clear()
 
