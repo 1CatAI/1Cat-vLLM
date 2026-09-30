@@ -23,6 +23,12 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4.common.ops import fused_inv_rope_fp8_quant
+from vllm.platforms import current_platform
+
+pytestmark = pytest.mark.skipif(
+    not current_platform.has_device_capability(89),
+    reason="Triton limitation: fp8e4nv data type is not supported on CUDA arch < 89",
+)
 
 # -- Default dimensions matching DeepSeek V3/V4 --------------------------
 HEAD_DIM = 512
