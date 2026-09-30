@@ -339,6 +339,36 @@ def validate_mxfp4_sm70_moe_weight_layout(
             )
 
 
+def _prepare_mxfp4_sm70_experts(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> list[torch.Tensor]:
+    """Repack one projection's experts into stacked TurboMind tensors.
+
+    Each prepared expert is copied straight into its slot, so the repack holds
+    the checkpoint projection and one stacked copy instead of a per-expert
+    list next to its stack. The converter only repacks nibbles and scales; it
+    does not dequantize or materialize a full-precision expert weight.
+    """
+    num_experts = weight.shape[0]
+    stacks: list[torch.Tensor] = []
+    for expert_id in range(num_experts):
+        prepared = sm70_ops.mxfp4_sm70_prepare(
+            unpack_mxfp4_weight(weight[expert_id].data),
+            weight_scale[expert_id].data.t().contiguous(),
+            MXFP4_GROUP_SIZE,
+        )
+        if not stacks:
+            stacks = [
+                torch.empty(
+                    (num_experts, *part.shape), dtype=part.dtype, device=part.device
+                )
+                for part in prepared
+            ]
+        for stack, part in zip(stacks, prepared):
+            stack[expert_id].copy_(part)
+    return stacks
+
+
 class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
     """Exact-SM70 V4-Flash MXFP4 MoE using TurboMind packed GEMMs.
 
@@ -449,60 +479,35 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             w2_weight_scale=layer.w2_weight_scale,
         )
 
-        w13_tm_weights: list[torch.Tensor] = []
-        w13_tm_scales: list[torch.Tensor] = []
-        w13_meta: list[torch.Tensor] = []
-        w2_tm_weights: list[torch.Tensor] = []
-        w2_tm_scales: list[torch.Tensor] = []
-        w2_meta: list[torch.Tensor] = []
-        for expert_id in range(num_experts):
-            # The converter only repacks nibbles/scales for TurboMind; it does
-            # not dequantize or materialize a full-precision expert weight.
-            w13_packed = unpack_mxfp4_weight(layer.w13_weight[expert_id].data)
-            w13_scales = layer.w13_weight_scale[expert_id].data.t().contiguous()
-            prepared_w13 = sm70_ops.mxfp4_sm70_prepare(
-                w13_packed, w13_scales, MXFP4_GROUP_SIZE
-            )
-            w13_tm_weights.append(prepared_w13[0])
-            w13_tm_scales.append(prepared_w13[1])
-            w13_meta.append(prepared_w13[2])
-
-            w2_packed = unpack_mxfp4_weight(layer.w2_weight[expert_id].data)
-            w2_scales = layer.w2_weight_scale[expert_id].data.t().contiguous()
-            prepared_w2 = sm70_ops.mxfp4_sm70_prepare(
-                w2_packed, w2_scales, MXFP4_GROUP_SIZE
-            )
-            w2_tm_weights.append(prepared_w2[0])
-            w2_tm_scales.append(prepared_w2[1])
-            w2_meta.append(prepared_w2[2])
-
-        layer.w13_tm_weight = Parameter(
-            torch.stack(w13_tm_weights), requires_grad=False
+        # post-load processing runs after every layer of the stage is
+        # resident, so each projection's checkpoint copy is released as soon
+        # as its TurboMind stack exists.
+        w13_tm_weight, w13_tm_scales, w13_meta = _prepare_mxfp4_sm70_experts(
+            layer.w13_weight, layer.w13_weight_scale
         )
-        layer.w13_tm_scales = Parameter(torch.stack(w13_tm_scales), requires_grad=False)
-        layer.w13_tm_meta = Parameter(torch.stack(w13_meta), requires_grad=False)
-        layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
-        layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
-        layer.w2_tm_meta = Parameter(torch.stack(w2_meta), requires_grad=False)
+        del layer.w13_weight
+        del layer.w13_weight_scale
+        w2_tm_weight, w2_tm_scales, w2_meta = _prepare_mxfp4_sm70_experts(
+            layer.w2_weight, layer.w2_weight_scale
+        )
+        del layer.w2_weight
+        del layer.w2_weight_scale
+        # Return the released checkpoint blocks before the pointer tables
+        # allocate, so V100 does not exhaust driver memory while the CUDA
+        # caching allocator retains them.
+        torch.accelerator.empty_cache()
+
+        layer.w13_tm_weight = Parameter(w13_tm_weight, requires_grad=False)
+        layer.w13_tm_scales = Parameter(w13_tm_scales, requires_grad=False)
+        layer.w13_tm_meta = Parameter(w13_meta, requires_grad=False)
+        layer.w2_tm_weight = Parameter(w2_tm_weight, requires_grad=False)
+        layer.w2_tm_scales = Parameter(w2_tm_scales, requires_grad=False)
+        layer.w2_tm_meta = Parameter(w2_meta, requires_grad=False)
 
         w13_k_ld = int(w13_meta[0][0].item())
         w13_q_ld = int(w13_meta[0][1].item())
         w2_k_ld = int(w2_meta[0][0].item())
         w2_q_ld = int(w2_meta[0][1].item())
-
-        # Stacking 256 experts temporarily holds both the per-expert tensors
-        # and their contiguous replacements. Release those load-only tensors
-        # before the pointer tables allocate so V100 does not exhaust driver
-        # memory while the CUDA caching allocator retains the stack workspace.
-        del w13_tm_weights, w13_tm_scales, w13_meta
-        del w2_tm_weights, w2_tm_scales, w2_meta
-        del w13_packed, w13_scales, prepared_w13
-        del w2_packed, w2_scales, prepared_w2
-        del layer.w13_weight
-        del layer.w13_weight_scale
-        del layer.w2_weight
-        del layer.w2_weight_scale
-        torch.accelerator.empty_cache()
 
         w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
