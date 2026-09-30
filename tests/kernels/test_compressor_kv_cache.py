@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
 )
+from vllm.models.deepseek_v4.common.ops.cache_utils import needs_software_fp8
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -641,9 +642,7 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         SCALE_DIM=SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         # Same value compress_norm_rope_store_triton passes.
-        USE_SOFTWARE_FP8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-        ),
+        USE_SOFTWARE_FP8=needs_software_fp8(),
         USE_PRIVATE_STATE=False,
         USE_DENSE_PRIVATE_STATE=False,
         RING_SIZE=1,
