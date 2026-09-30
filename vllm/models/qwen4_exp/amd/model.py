@@ -75,6 +75,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from ..common.ple import is_ple_checkpoint_shard
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
@@ -833,6 +834,11 @@ class Qwen4ExpForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    def map_checkpoint_weight(self, name: str) -> bool:
+        # Under direct I/O the PLE table would be read whole into anonymous
+        # memory, though it is loaded shard by shard; keep it mapped.
+        return is_ple_checkpoint_shard(name)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1026,6 +1032,11 @@ class Qwen4ExpForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
+
+    def map_checkpoint_weight(self, name: str) -> bool:
+        # Under direct I/O the PLE table would be read whole into anonymous
+        # memory, though it is loaded shard by shard; keep it mapped.
+        return is_ple_checkpoint_shard(name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

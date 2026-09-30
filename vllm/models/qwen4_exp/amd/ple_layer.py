@@ -33,7 +33,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import PLE_SHARD_PREFIX, copy_ple_embedding_shard_
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -333,7 +333,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         }
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
-        shard_prefix = "ngram_embedding.shard_"
+        shard_prefix = PLE_SHARD_PREFIX
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
