@@ -5,6 +5,7 @@
 import asyncio
 import concurrent.futures
 import fnmatch
+import functools
 import glob
 import hashlib
 import json
@@ -35,10 +36,17 @@ from vllm.config.load import (
     LoadConfig,
 )
 from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
+)
+from vllm.model_executor.model_loader.direct_io import (
+    RunSharing,
+    direct_io_weights,
+    is_decoder_layer_weight,
+    released_mapped_weights,
 )
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
@@ -952,6 +960,39 @@ def _keep_weight(
     return skip_weight is None or not skip_weight(name)
 
 
+def _direct_io_sharing(local_expert_ids: set[int] | None) -> RunSharing | None:
+    """The tensor-parallel group reads the same decoder tensors, so its first
+    rank reads them for all; not under expert parallelism, where each rank
+    keeps other experts."""
+    if local_expert_ids is not None or not model_parallel_is_initialized():
+        return None
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return None
+    return RunSharing(tp_group.cpu_group, tp_group.first_rank, tp_group.is_first_rank)
+
+
+def _keep_direct_weight(
+    name: str,
+    *,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+    map_weight: Callable[[str], bool] | None,
+    read_directly: bool,
+) -> bool:
+    """Whether a kept tensor goes through O_DIRECT (*read_directly*) or the
+    memory map: decoder-layer tensors are read directly unless the model
+    wants them mapped; everything else is mapped, so that a pipeline stage
+    reads only the embeddings, heads or MTP layers it actually uses."""
+    if not _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
+        return False
+    direct = is_decoder_layer_weight(name) and not (
+        map_weight is not None and map_weight(name)
+    )
+    return direct == read_directly
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -960,6 +1001,7 @@ def safetensors_weights_iterator(
     *,
     indexed_weights_by_file: Mapping[str, set[str]] | None = None,
     skip_weight: Callable[[str], bool] | None = None,
+    map_weight: Callable[[str], bool] | None = None,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -973,6 +1015,10 @@ def safetensors_weights_iterator(
     skipped the same way. It lets a model that loads only part of a shared
     checkpoint (e.g. a drafter shipped inside its target's checkpoint) avoid
     reading the rest.
+
+    With the "direct" strategy only decoder-layer tensors are read with
+    O_DIRECT; the rest and those *map_weight* accepts are yielded
+    memory-mapped after them, and their pages are released once consumed.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -1072,6 +1118,22 @@ def safetensors_weights_iterator(
             for name, param in state_dict.items():
                 if _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
                     yield name, param
+        elif safetensors_load_strategy == "direct":
+            keep = functools.partial(
+                _keep_direct_weight,
+                indexed_weights=indexed_weights,
+                local_expert_ids=local_expert_ids,
+                skip_weight=skip_weight,
+                map_weight=map_weight,
+            )
+            yield from direct_io_weights(
+                st_file,
+                functools.partial(keep, read_directly=True),
+                _direct_io_sharing(local_expert_ids),
+            )
+            yield from released_mapped_weights(
+                st_file, functools.partial(keep, read_directly=False)
+            )
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning

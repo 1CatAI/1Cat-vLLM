@@ -594,17 +594,29 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     ) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
+    @staticmethod
+    def _draft_weight_name(name: str) -> str | None:
+        """The drafter's name for a checkpoint tensor, None for the target's."""
+        if name.startswith("mtp."):
+            return name.replace("mtp.", "model.")
+        if "embed_tokens" in name:
+            return name.replace("language_model.", "")
+        if "lm_head" in name:
+            return name
+        return None
+
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target again only for load_weights to drop
+        # everything but mtp.* (47 s for the 27B under direct I/O).
+        return self._draft_weight_name(name) is None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):
             for name, weight in weights:
-                if name.startswith("mtp."):
-                    name = name.replace("mtp.", "model.")
-                elif any(key in name for key in ["embed_tokens", "lm_head"]):
-                    if "embed_tokens" in name:
-                        name = name.replace("language_model.", "")
-                else:
-                    continue
-                yield name, weight
+                draft_name = self._draft_weight_name(name)
+                if draft_name is not None:
+                    yield draft_name, weight
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(remap_weight_names(weights))
