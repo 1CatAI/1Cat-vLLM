@@ -984,6 +984,7 @@ def _log_route_summary() -> None:
             "FLASH_ATTN_V100 route summary: %s",
             json.dumps(_route_counts, sort_keys=True),
         )
+        _route_counts.clear()
 
 
 def _record_route(route: str) -> None:

@@ -13,7 +13,7 @@ MODEL is a local checkpoint directory or a Hugging Face model ID.
 Uses the installed vllm, bundled kernels and automatic SM70 operator defaults.
 The pinned DFlash2 checkpoint is downloaded normally; no offline mode is forced.
 
-Profile: FP16, TP4, E5M2 KV, 256K context, 8192-token prefill, up to 4 sequences.
+Profile: FP16, TP4, E4M3 KV, 256K context, 8192-token prefill, up to 4 sequences.
 Requires four peer-connected V100-SXM2 32GB GPUs. Other hardware/capacities
 need their own memory and performance validation. Additional CLI options
 override the profile, for example:

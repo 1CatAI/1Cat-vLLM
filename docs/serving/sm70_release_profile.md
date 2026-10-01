@@ -17,10 +17,11 @@ context, an 8192-token prefill budget, four sequences, 0.80 memory utilization,
 separately; pip installs the declared Python and CUDA runtime dependencies.
 No source overlay or private native extension is required.
 
-The initial profile keeps E5M2 KV. It therefore reports `kv_dtype` for the
-E4M3 grouped, long-context and scalar-tail paths. The final release KV default
-must be selected after the E4M3/E5M2 quality and performance comparison.
-To test the E4M3 candidate, append `--kv-cache-dtype fp8_e4m3`.
+The release owner selected E4M3 KV for the profile and the main qualification
+path. It admits the grouped, long-context and scalar-tail capabilities.
+Performance and output-quality qualification remain release gates.
+An explicit `--kv-cache-dtype fp8_e5m2` override reports `kv_dtype` for these
+E4M3 paths and is not the profile's accelerated long-context baseline.
 
 The draft uses a fixed Hugging Face revision. The profile also records the
 corresponding ModelScope commit and configuration/weight SHA256 values: commit
@@ -32,6 +33,9 @@ warnings with a reason. `GET /v1/sm70/acceleration` returns the same report and
 uses the server's existing API-key authentication. A configured capability is
 not proof that a particular request executed a kernel; retain worker route
 logs and the graceful-shutdown route summary for performance qualification.
+Worker shutdown explicitly flushes route counters, because multiprocessing
+workers can exit without invoking Python's `atexit` hooks. Counters cover Python
+dispatch and graph capture; CUDA graph replay does not increment them.
 
 For a selected, qualified profile, set
 `VLLM_SM70_REQUIRE_PROFILE_ACCELERATION=1` to refuse startup when an expected

@@ -1395,6 +1395,9 @@ class Worker(WorkerBase):
         self._is_checkpoint_format = True
 
     def shutdown(self) -> None:
+        from vllm.v1.worker.gpu.shutdown import log_loaded_attention_route_summaries
+
+        log_loaded_attention_route_summaries()
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

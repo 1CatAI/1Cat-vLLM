@@ -49,6 +49,30 @@ def test_compile_wrapper_cleanup_is_idempotent():
     assert wrapper._bytecode_hook_handle is None
 
 
+def test_worker_shutdown_flushes_route_summary_once(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100
+    from vllm.v1.worker import gpu_worker
+
+    logger = MagicMock()
+    counts = {"decode_e4m3_grouped_fp32": 3}
+    monkeypatch.setattr(flash_attn_v100, "logger", logger)
+    monkeypatch.setattr(flash_attn_v100, "_route_counts", counts)
+    monkeypatch.setattr(gpu_worker, "ensure_kv_transfer_shutdown", lambda: None)
+    monkeypatch.setattr(gpu_worker, "ensure_ec_transfer_shutdown", lambda: None)
+    worker = object.__new__(gpu_worker.Worker)
+    worker.profiler = None
+    worker._ple_offload_worker_handle = None
+
+    worker.shutdown()
+    flash_attn_v100._log_route_summary()  # The later atexit hook is harmless.
+
+    logger.info.assert_called_once_with(
+        "FLASH_ATTN_V100 route summary: %s",
+        '{"decode_e4m3_grouped_fp32": 3}',
+    )
+    assert not counts
+
+
 def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     from vllm.model_executor.layers.quantization import (
         fp8,
