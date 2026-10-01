@@ -46,6 +46,29 @@ Compile-cache status is reported separately. The existing SM70 quality policy
 can disable AOT cache reload; this change does not alter that policy or any
 acceleration default.
 
+The report's `expected_acceleration` lists the paths required by this recipe.
+Use that list when computing enabled/total counts. Flash-Next FP16 MoE decode
+is a different model contract and is `not_applicable` to this dense 27B recipe.
+`compile_cache_disabled` describes cache state; it does not mean the user
+disabled decode acceleration. The SM70 quality policy can select that state
+automatically, so repeated startup may still spend time compiling.
+
+| Override | Expected capability affected |
+| --- | --- |
+| `--kv-cache-dtype fp8_e5m2` | E4M3 grouped FP32, long-context and scalar tail: `kv_dtype` |
+| `--max-num-batched-tokens 4096` | Q8000 prefill: `budget<8000` |
+| `--block-size 16` | Compact scalar tail: `page_size` |
+| DFlash2 with five speculative tokens | Qualified verifier defaults: `num_speculative_tokens=5≠7` |
+| No speculative config | DFlash2 verifier: `method=None≠dflash` |
+| `--enforce-eager` | Compile/graph capability: `user_override` |
+
+Some operators select their default inside the quantization layer rather than
+in the global environment table. In particular, NVFP4 QPN2 decode and bounded
+prefill are automatic for the compatible DFlash2 contract even when no
+`VLLM_SM70_NVFP4_QPN2*` variables were exported. Larger live shapes retain
+TurboMind. QPN4's target-only/single-sequence contract is a separate route;
+enabling every experimental switch is not a supported serving recipe.
+
 `benchmarks/benchmark_sm70_openai_stream.py` counts returned token IDs when
 reporting TPOT. DFlash2 can emit multiple tokens in one response chunk, so chunk
 intervals are reported separately. Token latency describes availability at the

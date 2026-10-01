@@ -48598,3 +48598,31 @@ The tested private service is stopped and public serving remains off.
   original precision and batch decode. <20 ms and reliable internal HC
   attribution remain unmet follow-ups. All owned GPU workers are stopped;
   no foreign service was interrupted and no wheel was built.
+
+## 2026-10-02 release acceleration admission audit
+
+Release baseline remains `d30469863287471a7082842500ae73299a697e0d`.
+Using its installed 1.5.1 wheel, Torch2.10.0+cu128, four V100-SXM2-32GB devices,
+and the proposed Draft #748 E4M3/TP4/8192-budget/2048-block/seven-draft recipe, ordinary
+`EngineArgs.create_engine_config()` selected all eight required configured
+capabilities with no launch-time performance environment variables. Native
+QPN2/shared-layout/prefill operator checks had no missing operators; QPN2 decode
+and bounded prefill defaults resolved inside the quantization layer even though
+their global env getters default to false. No weights were loaded, no worker
+started, and no new output-quality or throughput result is claimed.
+
+Nine configuration cases cover the release recipe, E5M2, a 4096-token budget,
+TP2, eight sequences, 16-token blocks, target-only, five drafts and eager mode.
+These identify E4M3, prefill-budget, scalar-page, speculative-width and graph
+fallback reasons. TP and service capacity do not globally disable compatible
+batch GEMM or verifier operators. Flash-Next MoE decode belongs to another model
+contract; the 27B release status must not count it as a missing required path.
+
+Draft #748 publishes the recipe's expected path list for status consumers.
+Studio Draft #6 pairs already verified release drafts with new presets and
+offers explicit updates for existing presets. A revision label alone does not
+admit modified draft files, and inherited external FlashQLA DSO paths are
+filtered. No acceleration defaults or native arithmetic changed. Preserve the
+compile-cache quality guard: #675 demonstrated first-reload mechanics but its
+recorded complete output parity failed. Final rebuilt-wheel GPU qualification,
+three-start quality/speed gates and 35B-A3B AWQ/FP8 speed gates remain open.

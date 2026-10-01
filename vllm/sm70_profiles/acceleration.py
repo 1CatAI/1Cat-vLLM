@@ -117,17 +117,18 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         _is_sm70_qwen38_decode_compile_contract,
     )
 
+    from .profile import load_profile
+
     sm70 = _is_sm70(cfg)
     paths: dict[str, dict[str, Any]] = {}
     report = {
         "profile": "qwen38_27b_nvfp4_dflash2",
         "sm70": sm70,
         "scope": "configured_capabilities",
+        "expected_acceleration": load_profile()["expected_acceleration"],
         "paths": paths,
     }
     if not sm70:
-        from .profile import load_profile
-
         names = set(load_profile()["expected_acceleration"]) | {
             "qwen38_decode",
             "e4m3_grouped_fp32",
@@ -166,7 +167,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     )
     paths["qwen38_decode"] = _row(
-        "contract_mismatch:qwen38_decode=False≠True"
+        "not_applicable"
         if not decode_contract
         else (
             "kv_dtype"
@@ -281,7 +282,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         cudagraph_mode=getattr(compilation.cudagraph_mode, "name", None),
     )
     paths["compile_cache"] = _row(
-        "user_override" if envs.VLLM_DISABLE_COMPILE_CACHE else None,
+        "compile_cache_disabled" if envs.VLLM_DISABLE_COMPILE_CACHE else None,
         switches={"VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE},
     )
     return report

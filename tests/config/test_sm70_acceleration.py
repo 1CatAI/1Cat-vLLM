@@ -200,3 +200,15 @@ def test_malformed_draft_contract_has_reason(config):
     assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
         "contract_mismatch:selector_top_k=None≠16"
     )
+
+
+def test_release_status_counts_only_expected_paths(config, monkeypatch):
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    report = acc.build_report(config)
+    assert report["paths"]["qwen38_decode"]["reason"] == "not_applicable"
+    assert report["paths"]["compile_cache"]["reason"] == "compile_cache_disabled"
+    assert "qwen38_decode" not in report["expected_acceleration"]
+    assert "compile_cache" not in report["expected_acceleration"]
+    assert all(
+        report["paths"][name]["enabled"] for name in report["expected_acceleration"]
+    )
