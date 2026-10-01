@@ -3,6 +3,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm.platforms.interface import DeviceCapability
@@ -19,7 +20,7 @@ def test_sm70_sparse_backend_contract():
     assert DeepseekV4SM70SparseBackend.supports_compute_capability(
         DeviceCapability(7, 0)
     )
-    assert not DeepseekV4SM70SparseBackend.supports_compute_capability(
+    assert DeepseekV4SM70SparseBackend.supports_compute_capability(
         DeviceCapability(7, 5)
     )
     assert not DeepseekV4SM70SparseBackend.supports_compute_capability(
@@ -40,16 +41,17 @@ def test_sm70_sparse_backend_uses_v4_packed_kv_layout():
     ) == (3, 256, 584)
 
 
-def test_sm70_selects_triton_sparse_impl():
+@pytest.mark.parametrize("minor", [0, 5])
+def test_volta_and_turing_select_triton_sparse_impl(minor):
     from vllm.models.deepseek_v4 import attention
     from vllm.models.deepseek_v4.sm70.sparse import DeepseekV4SM70SparseImpl
 
+    capability = DeviceCapability(7, minor)
     platform = MagicMock()
     platform.is_rocm.return_value = False
     platform.is_cuda.return_value = True
-    platform.is_device_capability.side_effect = lambda capability: capability == (
-        7,
-        0,
+    platform.is_device_capability_family.side_effect = (
+        lambda family: capability.to_int() // 10 == family // 10
     )
     with patch.object(attention, "current_platform", platform):
         assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
@@ -111,7 +113,7 @@ def test_sm70_sparse_qk_dsplit_uses_one_tp4_head_group():
     assert _qk_dsplit_block_h(8) == 8
 
 
-def test_sm75_does_not_select_sm70_impl():
+def test_hopper_does_not_select_sm70_impl():
     from vllm.models.deepseek_v4 import attention
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
@@ -120,7 +122,7 @@ def test_sm75_does_not_select_sm70_impl():
     platform = MagicMock()
     platform.is_rocm.return_value = False
     platform.is_cuda.return_value = True
-    platform.is_device_capability.return_value = False
+    platform.is_device_capability_family.return_value = False
     with patch.object(attention, "current_platform", platform):
         assert attention._select_v4_sparse_impl() is DeepseekV4FlashMLASparseImpl
 

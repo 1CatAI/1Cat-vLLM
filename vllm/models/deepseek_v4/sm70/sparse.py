@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""DeepSeek V4 sparse MLA implementation for exact SM70 CUDA devices."""
+"""DeepSeek V4 sparse MLA implementation for SM70 and SM75 CUDA devices."""
 
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -58,7 +58,8 @@ class DeepseekV4SM70SparseBackend(DeepseekV4FlashMLASparseBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 7 and capability.minor == 0
+        # Volta and Turing: the kernels are FP16 Triton with software FP8.
+        return capability.major == 7
 
 
 class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):

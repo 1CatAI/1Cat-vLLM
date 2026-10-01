@@ -1343,12 +1343,12 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
         if (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and current_platform.is_device_capability_family(70)
             and vllm_config.model_config.dtype != torch.float16
         ):
             raise ValueError(
-                "DeepSeek V4 on SM70 requires --dtype half; V100 has no "
-                "native BF16 tensor-core path."
+                "DeepSeek V4 on SM70/SM75 requires --dtype half; Volta and "
+                "Turing have no native BF16 tensor-core path."
             )
 
         config = vllm_config.model_config.hf_config

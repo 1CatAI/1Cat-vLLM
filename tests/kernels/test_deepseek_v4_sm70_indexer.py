@@ -9,10 +9,11 @@ from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_decode_logits,
     sm70_indexer_prefill_logits,
 )
+from vllm.utils.torch_utils import current_stream
 
 requires_sm70 = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
-    reason="requires NVIDIA V100/SM70",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7,
+    reason="requires a Volta or Turing GPU (SM70/SM75)",
 )
 
 _HEAD_DIM = 128
@@ -255,7 +256,10 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
         )
 
     capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
+    # vLLM's stream, so that leaving the capture contexts restores it instead
+    # of recording torch's default stream as vLLM's current stream, which
+    # breaks later graph captures in the same process.
+    capture_stream.wait_stream(current_stream())
     with torch.cuda.stream(capture_stream):
         for _ in range(3):
             candidate_call()

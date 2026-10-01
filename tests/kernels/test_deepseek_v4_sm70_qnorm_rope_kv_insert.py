@@ -17,8 +17,8 @@ HEAD_BYTES = NOPE_DIM + ROPE_DIM * 2 + 8
 TOKEN_DATA_BYTES = NOPE_DIM + ROPE_DIM * 2
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
-    reason="requires an exact SM70 CUDA device",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7,
+    reason="requires a Volta or Turing GPU (SM70/SM75)",
 )
 
 
