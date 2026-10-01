@@ -95,8 +95,13 @@ def _fill_short_context_topk_indices(
     )
 
 
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+def _is_volta_or_turing_cuda() -> bool:
+    # Both lack BF16, FP8 and FlashMLA, so Turing takes the SM70 route too. Its
+    # kernels are Triton with software FP8; the TurboMind-backed pieces it calls
+    # keep their own exact-SM70 checks.
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        70
+    )
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
@@ -107,7 +112,7 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
-    if _is_exact_sm70_cuda():
+    if _is_volta_or_turing_cuda():
         from vllm.models.deepseek_v4.sm70.sparse import (
             DeepseekV4SM70SparseImpl,
         )
@@ -184,7 +189,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self._use_sm70_path = _is_exact_sm70_cuda()
+        self._use_sm70_path = _is_volta_or_turing_cuda()
         self.n_local_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale

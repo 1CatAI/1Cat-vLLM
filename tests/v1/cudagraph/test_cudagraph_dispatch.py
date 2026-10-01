@@ -388,6 +388,9 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
+            patch.object(
+                current_platform, "is_device_capability_family", return_value=True
+            ),
         ):
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(

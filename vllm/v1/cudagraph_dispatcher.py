@@ -55,7 +55,7 @@ def _get_sm70_dsv4_decode_context_buckets(
 
     model_config = vllm_config.model_config
     if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+        current_platform.is_cuda() and current_platform.is_device_capability_family(70)
     ):
         return ()
 

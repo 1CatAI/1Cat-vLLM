@@ -788,7 +788,7 @@ def sm70_indexer_decode_logits(
         _RELU_LOGITS
         and _DECODE_CUBLAS
         and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
+        and current_platform.is_device_capability_family(70)
         and max_seq_len >= _DECODE_CUBLAS_MIN_KEYS
         and single_request
         and (native_rows or total_rows == 1)

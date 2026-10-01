@@ -37,8 +37,11 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+def _is_volta_or_turing_cuda() -> bool:
+    # Neither has DeepGEMM or native FP8, so Turing takes the FP16 indexer too.
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        70
+    )
 
 
 def _gather_workspace_shapes(
@@ -149,7 +152,7 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    sm70_fp16_indexer = _is_exact_sm70_cuda()
+    sm70_fp16_indexer = _is_volta_or_turing_cuda()
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -494,7 +497,7 @@ class SparseAttnIndexer(CustomOp):
         self.use_fp4_cache = use_fp4_cache
         if (
             current_platform.is_cuda()
-            and not _is_exact_sm70_cuda()
+            and not _is_volta_or_turing_cuda()
             and not has_deep_gemm()
         ):
             raise RuntimeError(

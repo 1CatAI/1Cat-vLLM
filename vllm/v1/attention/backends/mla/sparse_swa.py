@@ -500,7 +500,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_xpu()
             or (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and current_platform.is_device_capability_family(70)
             )
         ):
             return out
