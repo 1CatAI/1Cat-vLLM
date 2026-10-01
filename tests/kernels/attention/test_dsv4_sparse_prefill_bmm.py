@@ -35,9 +35,10 @@ def _reference(q, kv, indices, lengths, scale, attn_sink) -> torch.Tensor:
 @pytest.mark.parametrize("num_tokens", [7, 300])
 @pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("width", [128, 640])
+@pytest.mark.parametrize("stale_tail", [False, True])
 @torch.inference_mode()
 def test_sparse_attn_prefill_bmm_matches_reference(
-    num_tokens: int, num_heads: int, width: int
+    num_tokens: int, num_heads: int, width: int, stale_tail: bool
 ):
     torch.manual_seed(0)
     num_kv = 900
@@ -53,7 +54,14 @@ def test_sparse_attn_prefill_bmm_matches_reference(
         [width, 0, 1, width // 2, width - 1, 5, width], dtype=torch.int32
     ).cuda()
     lengths = lengths.repeat(-(-num_tokens // lengths.numel()))[:num_tokens]
-    indices[torch.arange(width, device="cuda")[None, :] >= lengths[:, None]] = -1
+    past_length = torch.arange(width, device="cuda")[None, :] >= lengths[:, None]
+    if stale_tail:
+        # combine_topk_swa_indices fills a reused workspace and writes only the
+        # valid slots, so past the length lies whatever was there before.
+        stale = torch.randint_like(indices, num_kv, 2**30)
+        indices = torch.where(past_length, stale, indices)
+    else:
+        indices[past_length] = -1
     indices[3, 2] = -1  # an unused slot inside the valid length
     attn_sink = torch.randn(num_heads, dtype=torch.float32, device="cuda")
     scale = HEAD_DIM**-0.5
