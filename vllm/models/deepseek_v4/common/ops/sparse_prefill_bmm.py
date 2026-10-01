@@ -58,16 +58,19 @@ def sparse_attn_prefill_bmm(
     logits: torch.Tensor,
     probs: torch.Tensor,
 ) -> None:
-    """q [T, H, D], kv [S, D], indices [T, W] into kv (-1 = unused), lengths
-    [T], attn_sink [H]. The four buffers come from the workspace specs and may
-    be larger than this call needs; they hold `MAX_TOKENS_PER_PASS` tokens, so
-    a longer chunk takes several passes. The softmax runs in float32 over the
-    keys plus one sink column that only feeds the denominator."""
+    """q [T, H, D], kv [S, D], indices [T, W] into kv, lengths [T], attn_sink
+    [H]. A slot is unused when it holds -1 or lies at or past its token's
+    length; past the length it may hold anything, since callers fill the
+    indices into a reused workspace. The four buffers come from the workspace
+    specs and may be larger than this call needs; they hold
+    `MAX_TOKENS_PER_PASS` tokens, so a longer chunk takes several passes. The
+    softmax runs in float32 over the keys plus one sink column that only feeds
+    the denominator."""
     total_tokens, width = indices.shape
     num_heads = q.shape[1]
     unused = indices < 0
     unused |= torch.arange(width, device=indices.device)[None, :] >= lengths[:, None]
-    safe_indices = indices.clamp(min=0)
+    safe_indices = indices.masked_fill(unused, 0)
 
     for start in range(0, total_tokens, MAX_TOKENS_PER_PASS):
         stop = min(start + MAX_TOKENS_PER_PASS, total_tokens)

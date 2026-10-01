@@ -14,6 +14,7 @@ from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_paged_fp8,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import current_stream
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda() or not current_platform.is_device_capability(70),
@@ -124,10 +125,13 @@ def test_bmm_decode_matches_the_paged_fp8_kernel(extra, num_heads, num_tokens):
 
     # All shapes are static: the call captures into a CUDA graph.
     stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
+    # vLLM's stream, so that leaving the contexts below restores it instead of
+    # recording torch's default stream as vLLM's current stream, which breaks
+    # later graph captures in the same process.
+    stream.wait_stream(current_stream())
     with torch.cuda.stream(stream):
         run()
-    torch.cuda.current_stream().wait_stream(stream)
+    current_stream().wait_stream(stream)
     output.zero_()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
