@@ -24,7 +24,13 @@ def _post_json(url: str, payload: dict[str, object]):
 
 def _tokenize(base_url: str, model: str, prompt: str) -> list[int]:
     with _post_json(
-        f"{base_url}/tokenize", {"model": model, "prompt": prompt}
+        f"{base_url}/tokenize",
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "add_generation_prompt": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     ) as response:
         return json.loads(response.read())["tokens"]
 
@@ -50,9 +56,21 @@ def _build_prompt_ids(base_url: str, model: str, input_len: int) -> list[int]:
         "\n问题：请基于以上材料总结三个最重要的瓶颈，解释判断依据，并提出"
         "不会牺牲输出质量的优化顺序。"
     )
-    prefix_ids = _tokenize(base_url, model, prefix)
-    context_ids = _tokenize(base_url, model, paragraph * 80)
-    suffix_ids = _tokenize(base_url, model, suffix)
+    # Keep the model's user/assistant delimiters while filling the exact-length
+    # context. A bare completion prompt can terminate immediately at long input.
+    skeleton = _tokenize(base_url, model, prefix + suffix)
+    full = _tokenize(base_url, model, prefix + paragraph * 80 + suffix)
+    left = 0
+    while left < len(skeleton) and skeleton[left] == full[left]:
+        left += 1
+    right = 0
+    while right < len(skeleton) - left and skeleton[-1 - right] == full[-1 - right]:
+        right += 1
+    if not right:
+        raise ValueError("Chat template has no stable generation suffix")
+    prefix_ids = full[:left]
+    suffix_ids = full[-right:]
+    context_ids = full[left:-right]
     context_len = input_len - len(prefix_ids) - len(suffix_ids)
     if context_len < 0 or not context_ids:
         raise ValueError("Unable to construct the requested input length")
@@ -159,6 +177,7 @@ def main() -> int:
             "top_k": args.top_k,
             "seed": args.seed,
             "ignore_eos": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
         "usage": usage,
         "stream_chunks": len(token_events),

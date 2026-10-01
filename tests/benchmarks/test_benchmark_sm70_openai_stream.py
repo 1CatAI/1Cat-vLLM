@@ -22,12 +22,27 @@ def test_speculative_chunks_are_counted_by_tokens():
 
 
 def test_prompt_can_fill_32k(monkeypatch):
-    responses = iter([[1, 2], [3, 4, 5], [6, 7]])
+    responses = iter([[1, 2, 6, 7], [1, 2, 3, 4, 5, 6, 7]])
     monkeypatch.setattr(stream, "_tokenize", lambda *args: next(responses))
     prompt = stream._build_prompt_ids("http://unused", "model", 32768)
     assert len(prompt) == 32768
     assert prompt[:5] == [1, 2, 3, 4, 5]
     assert prompt[-2:] == [6, 7]
+
+
+def test_tokenization_preserves_chat_generation_prompt(monkeypatch):
+    import io
+    from contextlib import contextmanager
+
+    @contextmanager
+    def post(url, payload):
+        assert payload["messages"] == [{"role": "user", "content": "hello"}]
+        assert payload["add_generation_prompt"] is True
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        yield io.StringIO('{"tokens": [1, 2]}')
+
+    monkeypatch.setattr(stream, "_post_json", post)
+    assert stream._tokenize("http://unused", "model", "hello") == [1, 2]
 
 
 def test_one_token_has_no_decode_interval():
