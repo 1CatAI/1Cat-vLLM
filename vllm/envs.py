@@ -311,6 +311,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_BLOCK_QPN8: bool = False
     VLLM_SM70_FP8_QPN8_M16: bool = True
     VLLM_SM70_FP8_QPN8_M32_CHUNKED: bool = True
     VLLM_SM70_FP8_QPN8_M32_NATIVE: bool = True
@@ -3529,6 +3530,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "only when the environment override is absent."
             ),
         ),
+        acceleration_paths=("FP8 QPN8",),
+    ),
+    "VLLM_SM70_FP8_BLOCK_QPN8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_BLOCK_QPN8", "0"))),
+        description=(
+            "Serve every [128, 128] block-FP8 linear on Volta and Turing with "
+            "the native QPN8 operators (QPN8Fp8BlockScaledMMLinearKernel) "
+            "instead of TurboMind (Volta) or Marlin (Turing), independent of "
+            "layer names and parallel layout. Opt-in."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
     ),
     # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in

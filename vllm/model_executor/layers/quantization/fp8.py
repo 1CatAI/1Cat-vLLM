@@ -21,6 +21,9 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
@@ -564,6 +567,7 @@ class Fp8Config(QuantizationConfig):
                 envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
                 or sm70_tm.forces_marlin()
                 or sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+                or envs.VLLM_SM70_FP8_BLOCK_QPN8
             )
         ):
             return 70
@@ -736,6 +740,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # kernel for fast weight-only FP8 quantization
         self.marlin_input_dtype = None
         self.use_marlin = False
+        self.use_qpn8 = False
 
         if self.quant_config.use_deep_gemm is not None:
             self.use_deep_gemm = self.quant_config.use_deep_gemm
@@ -750,14 +755,24 @@ class Fp8LinearMethod(LinearMethodBase):
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
         )
+        # Opt-in: [128, 128] block-FP8 linears go to the native QPN8 kernel
+        # (QPN8Fp8BlockScaledMMLinearKernel) instead of TurboMind on Volta.
+        self.use_sm70_fp8_block_qpn8 = (
+            envs.VLLM_SM70_FP8_BLOCK_QPN8
+            and self._sm70_without_fp8_hw
+            and self.block_quant
+            and self.weight_block_size == [128, 128]
+        )
         self.use_sm70_dequant_fallback = (
             self._sm70_without_fp8_hw
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+            and not self.use_sm70_fp8_block_qpn8
             and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and not sm70_tm.forces_marlin()
         )
         self.use_sm70_fp8_turbomind = (
             self._sm70_without_fp8_hw
+            and not self.use_sm70_fp8_block_qpn8
             and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and self.block_quant
             and self.weight_block_size == [128, 128]
@@ -864,14 +879,15 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
+        self.use_qpn8 = isinstance(self.fp8_linear, QPN8Fp8BlockScaledMMLinearKernel)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if getattr(layer, "sm70_fp8_turbomind", False):
             return
 
-        if self.use_marlin and getattr(layer, "is_bmm", False):
-            # Marlin packs one [N, K] matrix and cannot serve the grouped
-            # matmul of an is_bmm layer (DeepSeek-V4 wo_a on Turing), so the
+        if (self.use_marlin or self.use_qpn8) and getattr(layer, "is_bmm", False):
+            # Marlin and QPN8 pack one [N, K] matrix and cannot serve the
+            # grouped matmul of an is_bmm layer (DeepSeek-V4 wo_a), so the
             # weight is dequantized once here and applied per group in apply().
             assert self.block_quant, "is_bmm layers are block-quantized"
             weight, weight_scale_inv = process_fp8_weight_block_strategy(

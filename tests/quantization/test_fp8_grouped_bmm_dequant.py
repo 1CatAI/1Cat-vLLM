@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Grouped (is_bmm) block-FP8 weights on a Marlin-backed Fp8LinearMethod.
+"""Grouped (is_bmm) block-FP8 weights on a Marlin- or QPN8-backed Fp8LinearMethod.
 
-Marlin cannot serve DeepSeek-V4's grouped wo_a, so on cards that take Marlin
-for block FP8 (Turing) the weight is dequantized at load and applied per group.
+Neither kernel serves DeepSeek-V4's grouped wo_a, so on cards that take one of
+them for block FP8 the weight is dequantized at load and applied per group.
 """
 
 import pytest
@@ -34,29 +34,32 @@ def _grouped_layer() -> tuple[torch.nn.Module, torch.Tensor]:
     return layer, weight.float() * full_scales
 
 
-def _marlin_method() -> fp8.Fp8LinearMethod:
+def _method(kernel: str) -> fp8.Fp8LinearMethod:
     method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
-    method.use_marlin = True
+    method.use_marlin = kernel == "marlin"
+    method.use_qpn8 = kernel == "qpn8"
     method.block_quant = True
     method.weight_block_size = [BLOCK, BLOCK]
     method.use_sm70_dequant_fallback = False
     return method
 
 
-def test_marlin_bmm_weight_is_dequantized_at_load() -> None:
+@pytest.mark.parametrize("kernel", ["marlin", "qpn8"])
+def test_bmm_weight_is_dequantized_at_load(kernel) -> None:
     layer, reference = _grouped_layer()
 
-    _marlin_method().process_weights_after_loading(layer)
+    _method(kernel).process_weights_after_loading(layer)
 
     assert layer.dequantized_bmm
     assert layer.weight.dtype == torch.float16
     assert torch.equal(layer.weight, reference.half())
 
 
+@pytest.mark.parametrize("kernel", ["marlin", "qpn8"])
 @pytest.mark.parametrize("num_tokens", [1, 7])
-def test_marlin_bmm_apply_multiplies_each_group_by_its_rows(num_tokens) -> None:
+def test_bmm_apply_multiplies_each_group_by_its_rows(kernel, num_tokens) -> None:
     layer, reference = _grouped_layer()
-    method = _marlin_method()
+    method = _method(kernel)
     method.process_weights_after_loading(layer)
     x = torch.randn(num_tokens, GROUPS, K).half()
 
