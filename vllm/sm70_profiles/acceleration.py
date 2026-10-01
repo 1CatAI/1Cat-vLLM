@@ -281,6 +281,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         mode=getattr(compilation.mode, "name", None),
         cudagraph_mode=getattr(compilation.cudagraph_mode, "name", None),
     )
+    from torch._inductor import config as inductor_config
+
     from vllm.compilation.compiler_interface import is_compile_cache_enabled
 
     cache_config = compilation.inductor_compile_config
@@ -301,6 +303,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             "VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE,
             "VLLM_USE_AOT_COMPILE": envs.VLLM_USE_AOT_COMPILE,
             "force_disable_caches": cache_config.get("force_disable_caches", False),
+            "torch_force_disable_caches": inductor_config.force_disable_caches,
         },
     )
     return report

@@ -230,6 +230,7 @@ def test_compile_cache_reports_effective_disable(config, monkeypatch, disabled_b
         monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
     row = acc.build_report(config)["paths"]["compile_cache"]
     assert not row["enabled"]
+    assert row["switches"]["torch_force_disable_caches"] == (disabled_by == "torch")
     assert row["reason"] == (
         "compilation_disabled"
         if disabled_by in ("eager", "mode")
