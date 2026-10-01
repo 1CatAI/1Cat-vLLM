@@ -15,6 +15,7 @@ from pathlib import Path
 from shutil import which
 
 import torch
+from packaging.tags import sys_tags
 from packaging.version import Version, parse
 from setuptools import Extension, find_packages, setup
 from setuptools.command.bdist_wheel import bdist_wheel
@@ -43,19 +44,28 @@ FLASH_QLA_SM70_ROOT = (
     ROOT_DIR / "flash_qla" / "ops" / "gated_delta_rule" / "chunk" / "sm70"
 )
 ONECAT_TORCH_CU128_URLS = {
-    "torch==2.10.0": (
-        "torch @ https://download.pytorch.org/whl/cu128/"
-        "torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
-    ),
-    "torchaudio==2.10.0": (
-        "torchaudio @ https://download.pytorch.org/whl/cu128/"
-        "torchaudio-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
-    ),
-    "torchvision==0.25.0": (
-        "torchvision @ https://download.pytorch.org/whl/cu128/"
-        "torchvision-0.25.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
-    ),
+    "torch==2.10.0": ("torch", "2.10.0"),
+    "torchaudio==2.10.0": ("torchaudio", "2.10.0"),
+    "torchvision==0.25.0": ("torchvision", "0.25.0"),
 }
+
+
+def _onecat_torch_cu128_urls() -> dict[str, str]:
+    platform = sysconfig.get_platform()
+    if platform not in {"linux-x86_64", "linux-aarch64"}:
+        raise RuntimeError(
+            f"No pinned CUDA 12.8 PyTorch wheels for platform {platform}"
+        )
+    tag = next(sys_tags())
+    wheel_platform = "manylinux_2_28_" + platform.removeprefix("linux-")
+    return {
+        requirement: (
+            f"{name} @ https://download.pytorch.org/whl/cu128/"
+            f"{name}-{version}%2Bcu128-{tag.interpreter}-{tag.abi}-{wheel_platform}.whl"
+        )
+        for requirement, (name, version) in ONECAT_TORCH_CU128_URLS.items()
+    }
+
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
@@ -1245,10 +1255,11 @@ def get_requirements() -> list[str]:
         pin_torch_cu128 = bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))) or (
             _cuda_arch_contains(7, 0) and torch.version.cuda == "12.8"
         )
+        torch_cu128_urls = _onecat_torch_cu128_urls() if pin_torch_cu128 else {}
         modified_requirements = []
         for req in requirements:
             if pin_torch_cu128:
-                req = ONECAT_TORCH_CU128_URLS.get(req.split("#", 1)[0].strip(), req)
+                req = torch_cu128_urls.get(req.split("#", 1)[0].strip(), req)
             if "vllm-flash-attn" in req and cuda_major != "12":
                 # vllm-flash-attn is built only for CUDA 12.x.
                 # Skip for other versions.
