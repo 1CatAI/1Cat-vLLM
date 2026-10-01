@@ -199,6 +199,31 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+def _configure_sm70_dflash2_graph_cache(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+    cache_config: Any,
+) -> bool:
+    """Reuse compiled subgraphs without the unqualified AOT FX-graph reload."""
+    if (
+        envs.VLLM_DISABLE_COMPILE_CACHE
+        or not _is_sm70_dflash2_verifier_contract(
+            model_config, speculative_config, parallel_config
+        )
+        or model_config.quantization != "compressed-tensors"
+        or not model_config.is_nvfp4_quantized()
+        or parallel_config.tensor_parallel_size != 4
+        or cache_config.cache_dtype != "fp8_e4m3"
+    ):
+        return False
+    # The E4M3 release contract passes cold/warm quality with this cache path.
+    # Explicit AOT selection remains an override; other model routes keep their
+    # existing defaults until their own cache/quality qualification passes.
+    os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    return True
+
+
 def _is_sm70_qwen38_decode_compile_contract(
     model_config: Any,
     speculative_config: Any,
@@ -2270,6 +2295,12 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity; "
                         "greedy decode keeps the local-logits top1 shortcut."
                     )
+                sm70_dflash2_graph_cache = _configure_sm70_dflash2_graph_cache(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                    self.cache_config,
+                )
                 if "VLLM_USE_AOT_COMPILE" not in os.environ:
                     os.environ["VLLM_USE_AOT_COMPILE"] = "1"
                     logger.info_once(
@@ -2277,7 +2308,12 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity."
                     )
                 elif os.environ.get("VLLM_USE_AOT_COMPILE") == "0":
-                    if sm70_glm5_dflash_tp8_pp1_verifier:
+                    if sm70_dflash2_graph_cache:
+                        logger.info_once(
+                            "Using SM70 E4M3 DFlash2 compiled graph caches "
+                            "without AOT FX-graph reload; CUDA graphs remain enabled."
+                        )
+                    elif sm70_glm5_dflash_tp8_pp1_verifier:
                         logger.info_once(
                             "Using the quality-qualified regular torch.compile "
                             "path for SM70 GLM-5.3 DFlash2 TP8/PP1."
@@ -2289,6 +2325,13 @@ class VllmConfig:
                             "configuration: regular torch.compile reproduced "
                             "deterministic greedy token drift."
                         )
+                elif sm70_dflash2_graph_cache and envs.VLLM_USE_AOT_COMPILE:
+                    logger.warning_once(
+                        "Explicit VLLM_USE_AOT_COMPILE=1 selects AOT cache reload, "
+                        "which failed complete-output parity for the SM70 E4M3 "
+                        "DFlash2 release contract. Remove this override to reuse "
+                        "compiled graph caches without AOT FX-graph reload."
+                    )
                 self.compilation_config.inductor_compile_config["combo_kernels"] = True
                 self.compilation_config.inductor_compile_config[
                     "benchmark_combo_kernel"
