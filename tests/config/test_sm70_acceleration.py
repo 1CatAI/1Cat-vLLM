@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace as NS
+
+import pytest
+import torch
+
+from vllm import envs
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.vllm import _SM70_BATCH_GEMM_DEFAULTS, _SM70_DFLASH2_VERIFIER_DEFAULTS
+from vllm.sm70_profiles import acceleration as acc
+
+
+@pytest.fixture
+def config(monkeypatch):
+    envs.disable_envs_cache()
+    for name, value in {
+        **_SM70_BATCH_GEMM_DEFAULTS,
+        **_SM70_DFLASH2_VERIFIER_DEFAULTS,
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "0")
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "1")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    monkeypatch.setattr(acc, "_is_sm70", lambda cfg: True)
+    monkeypatch.setattr(
+        acc,
+        "_native_capabilities",
+        lambda page: dict.fromkeys(
+            (
+                "grouped_fp32",
+                "long_operator",
+                "long_enabled",
+                "page_supported",
+                "scalar",
+                "q8000",
+            ),
+            True,
+        ),
+    )
+    return NS(
+        model_config=NS(
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            dtype=torch.float16,
+            enforce_eager=False,
+            hf_text_config=NS(
+                hidden_size=5120,
+                num_attention_heads=24,
+                num_key_value_heads=4,
+                head_dim=256,
+            ),
+        ),
+        speculative_config=NS(
+            method="dflash",
+            num_speculative_tokens=7,
+            draft_model_config=NS(hf_config=NS(dflash_config={"selector_top_k": 16})),
+        ),
+        parallel_config=NS(
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
+            ubatch_size=1,
+        ),
+        cache_config=NS(cache_dtype="fp8_e4m3", block_size=2048),
+        scheduler_config=NS(max_num_batched_tokens=8192),
+        compilation_config=NS(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+
+
+def test_e5m2_reason(config):
+    config.cache_config.cache_dtype = "fp8_e5m2"
+    paths = acc.build_report(config)["paths"]
+    for name in ("e4m3_grouped_fp32", "long_context", "scalar_tail"):
+        assert paths[name]["reason"] == "kv_dtype"
+    assert paths["dflash2_verifier"]["enabled"]
+
+
+def test_tp2_reason(config):
+    config.parallel_config.tensor_parallel_size = 2
+    assert acc.build_report(config)["paths"]["profile_hardware"]["reason"] == (
+        "contract_mismatch:tensor_parallel_size=2≠4"
+    )
+
+
+def test_five_speculative_tokens_reason(config):
+    config.speculative_config.num_speculative_tokens = 5
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "contract_mismatch:num_speculative_tokens=5≠7"
+    )
+
+
+def test_budget_reason(config):
+    config.scheduler_config.max_num_batched_tokens = 4096
+    assert acc.build_report(config)["paths"]["q8000_prefill"]["reason"] == "budget<8000"
+
+
+def test_missing_operator_reason(config, monkeypatch):
+    monkeypatch.setattr(
+        acc,
+        "_native_capabilities",
+        lambda page: dict.fromkeys(
+            (
+                "grouped_fp32",
+                "long_operator",
+                "long_enabled",
+                "page_supported",
+                "scalar",
+                "q8000",
+            ),
+            False,
+        ),
+    )
+    paths = acc.build_report(config)["paths"]
+    assert paths["e4m3_grouped_fp32"]["reason"].startswith("operator_missing:")
+    assert paths["q8000_prefill"]["reason"].startswith("operator_missing:")
+
+
+def test_user_override_and_strict_failure(config, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0")
+    assert (
+        acc.build_report(config)["paths"]["dflash2_verifier"]["reason"]
+        == "user_override"
+    )
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    with pytest.raises(ValueError, match="dflash2_verifier: user_override"):
+        acc.log_and_validate(config)
+
+
+def test_non_sm70_is_not_applicable(config, monkeypatch):
+    monkeypatch.setattr(acc, "_is_sm70", lambda cfg: False)
+    report = acc.log_and_validate(config)
+    assert not report["expected_failures"]
+    assert all(row["reason"] == "not_applicable" for row in report["paths"].values())
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    with pytest.raises(ValueError, match="not_applicable"):
+        acc.log_and_validate(config)
+
+
+def test_success_does_not_mutate_compile_hash_input(config):
+    config.additional_config = {"customer_setting": "preserved"}
+    report = acc.log_and_validate(config)
+    assert not report["expected_failures"]
+    assert config.additional_config == {"customer_setting": "preserved"}
+    assert config.sm70_acceleration_report == report
+
+
+def test_real_config_diagnostic_field_does_not_affect_hash(monkeypatch):
+    from vllm import platforms
+    from vllm.config import DeviceConfig, VllmConfig
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    monkeypatch.setattr(platforms, "current_platform", UnspecifiedPlatform())
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    report = acc.log_and_validate(cfg)
+    assert report["sm70"] is False
+    before = cfg.compute_hash()
+    cfg.sm70_acceleration_report["diagnostic_test"] = True
+    assert cfg.compute_hash() == before
+
+
+def test_read_only_endpoint_uses_api_key_authentication(config):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from vllm.entrypoints.openai.server_utils import AuthenticationMiddleware
+    from vllm.entrypoints.serve.sm70.api_router import attach_router
+
+    report = acc.log_and_validate(config)
+    app = FastAPI()
+    app.state.vllm_config = config
+    attach_router(app)
+    app.add_middleware(AuthenticationMiddleware, tokens=["test-key"])
+    with TestClient(app) as client:
+        assert client.get("/v1/sm70/acceleration").status_code == 401
+        assert (
+            client.get(
+                "/v1/sm70/acceleration", headers={"Authorization": "Bearer wrong"}
+            ).status_code
+            == 401
+        )
+        response = client.get(
+            "/v1/sm70/acceleration", headers={"Authorization": "Bearer test-key"}
+        )
+        assert response.status_code == 200
+        assert response.json() == report
+
+
+def test_larger_batch_tuning_budget_is_enabled(config, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "128")
+    assert acc.build_report(config)["paths"]["batch_gemm"]["enabled"]
+
+
+def test_malformed_draft_contract_has_reason(config):
+    config.speculative_config.draft_model_config.hf_config.dflash_config = ["invalid"]
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "contract_mismatch:selector_top_k=None≠16"
+    )

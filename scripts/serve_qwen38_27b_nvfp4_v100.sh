@@ -36,6 +36,7 @@ if [[ $# -eq 0 || $1 == -* ]]; then
 fi
 model=$1
 shift
+PROFILE_NAME=qwen38_27b_nvfp4_dflash2
 
 # Prefer the CLI installed alongside this script, including when the caller
 # invokes it by absolute path without activating that Python environment.
@@ -45,23 +46,8 @@ if [[ -x "$script_dir/vllm" ]]; then
   vllm_cli="$script_dir/vllm"
 fi
 
-# Keep the prefill budget and recurrent-state grid at 8192 together: the
-# long-prefill specialization admits Q=8000..8192, and the grid must be a
-# multiple of the KV block size. Smaller prompts use the normal fallback.
-exec "$vllm_cli" serve "$model" \
-  --host 127.0.0.1 --port 8000 \
-  --served-model-name qwen3.8-27b-dflash2 \
-  --trust-remote-code \
-  --dtype half --tensor-parallel-size 4 --attention-backend FLASH_ATTN_V100 \
-  --kv-cache-dtype fp8_e5m2 --max-model-len 262144 \
-  --gpu-memory-utilization 0.80 \
-  --max-num-batched-tokens 8192 --max-num-seqs 4 \
-  --enable-prefix-caching --mamba-cache-mode align \
-  --block-size 2048 --mamba-block-size 8192 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking":false}' \
-  --seed 0 \
-  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","num_speculative_tokens":7,"kv_cache_dtype":"auto","attention_backend":"FLASH_ATTN_V100","draft_sample_method":"probabilistic","enforce_eager":false}' \
-  "$@"
+vllm_cli=$(command -v "$vllm_cli")
+python_bin="$(dirname "$vllm_cli")/python"
+profile_output=$("$python_bin" -m vllm.sm70_profiles argv "$PROFILE_NAME" --argv-lines)
+mapfile -t profile_args <<< "$profile_output"
+exec "$vllm_cli" serve "$model" "${profile_args[@]}" "$@"

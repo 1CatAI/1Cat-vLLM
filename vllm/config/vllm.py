@@ -991,6 +991,10 @@ class VllmConfig:
     """Additional config for specified platform. Different platforms may
     support different configs. Make sure the configs are valid for the platform
     you are using. Contents must be hashable."""
+    sm70_acceleration_report: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False, exclude=True
+    )
+    """Diagnostic route capabilities, excluded from the computation graph hash."""
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -3122,6 +3126,9 @@ class VllmConfig:
 
         # complete the remaining process.
         self.compilation_config.post_init_cudagraph_sizes()
+        from vllm.sm70_profiles.acceleration import log_and_validate
+
+        log_and_validate(self)
 
     def _set_compile_ranges(self):
         """

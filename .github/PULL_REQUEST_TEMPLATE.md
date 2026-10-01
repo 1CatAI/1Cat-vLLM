@@ -5,6 +5,15 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 
 ## Test Plan
 
+## Acceleration and benchmark contract (required for performance changes)
+
+- Default enabled or opt-in:
+- Required CLI options and environment switches:
+- KV cache dtype used for the benchmark:
+- Wheel SHA or source commit:
+- PYTHONPATH, source overlays, or external native libraries used (write "none" if absent):
+- User-entry route-hit, speed, and output-quality evidence:
+
 ## Test Result
 
 ---
