@@ -24,7 +24,15 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
+
+# Volta and Turing take the SM70 branch (fp16 q, software FP8), which this test
+# does not cover; the Triton path it does cover compiles fp8e4nv.
+pytestmark = pytest.mark.skipif(
+    not current_platform.has_device_capability(89),
+    reason="Triton limitation: fp8e4nv data type is not supported on CUDA arch < 89",
+)
 
 HEAD_DIM = 128
 ROPE_DIM = 64
