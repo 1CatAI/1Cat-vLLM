@@ -42,16 +42,29 @@ For a selected, qualified profile, set
 path is disabled. It remains off by default. On other platforms paths are
 reported as `not_applicable`.
 
-Compile-cache status is reported separately. The existing SM70 quality policy
-can disable AOT cache reload; this change does not alter that policy or any
-acceleration default.
+The 1.5.1 release requires compilation caching to be enabled by default, without
+user environment variables. Removing the two existing SM70 cache opt-outs is
+tracked in [#621](https://github.com/1CatAI/1Cat-vLLM/pull/621), separately from
+this profile and status implementation. The final wheel must pass cold/warm
+output-quality checks before that default is qualified for release.
+
+The standard cache location is `~/.cache/vllm`, or `$XDG_CACHE_HOME/vllm` when
+configured. Compilation artifacts are reused for matching configuration,
+compiler, environment and source hashes. Each process still loads model weights
+and captures its CUDA graphs; enabling the cache does not eliminate all startup
+work. An explicit `VLLM_DISABLE_COMPILE_CACHE=1` remains a troubleshooting opt-out.
+Compilation caching and AOT FX-graph serialization are separate controls. The
+tested E4M3 release contract reuses compiled subgraphs while rebuilding its FX
+graph, preserving CUDA graphs and avoiding the failed AOT-reload output gate.
+The corresponding default-policy fix and #621 must be included in the final
+wheel; the profile/status change alone does not implement those defaults.
 
 The report's `expected_acceleration` lists the paths required by this recipe.
 Use that list when computing enabled/total counts. Flash-Next FP16 MoE decode
 is a different model contract and is `not_applicable` to this dense 27B recipe.
 `compile_cache_disabled` describes cache state; it does not mean the user
-disabled decode acceleration. The SM70 quality policy can select that state
-automatically, so repeated startup may still spend time compiling.
+disabled decode acceleration. The unmodified main baseline automatically
+selects that state. It does not satisfy the release's default-cache requirement.
 
 | Override | Expected capability affected |
 | --- | --- |

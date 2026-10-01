@@ -68,6 +68,7 @@ def config(monkeypatch):
         compilation_config=NS(
             mode=CompilationMode.VLLM_COMPILE,
             cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            inductor_compile_config={},
         ),
     )
 
@@ -211,4 +212,26 @@ def test_release_status_counts_only_expected_paths(config, monkeypatch):
     assert "compile_cache" not in report["expected_acceleration"]
     assert all(
         report["paths"][name]["enabled"] for name in report["expected_acceleration"]
+    )
+
+
+@pytest.mark.parametrize("disabled_by", ["eager", "mode", "config", "torch"])
+def test_compile_cache_reports_effective_disable(config, monkeypatch, disabled_by):
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", False)
+    assert acc.build_report(config)["paths"]["compile_cache"]["enabled"]
+    if disabled_by == "eager":
+        config.model_config.enforce_eager = True
+    elif disabled_by == "mode":
+        config.compilation_config.mode = CompilationMode.NONE
+    elif disabled_by == "config":
+        config.compilation_config.inductor_compile_config["force_disable_caches"] = True
+    else:
+        monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
+    row = acc.build_report(config)["paths"]["compile_cache"]
+    assert not row["enabled"]
+    assert row["reason"] == (
+        "compilation_disabled"
+        if disabled_by in ("eager", "mode")
+        else "inductor_cache_disabled"
     )

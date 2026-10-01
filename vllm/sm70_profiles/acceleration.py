@@ -281,9 +281,27 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         mode=getattr(compilation.mode, "name", None),
         cudagraph_mode=getattr(compilation.cudagraph_mode, "name", None),
     )
+    from vllm.compilation.compiler_interface import is_compile_cache_enabled
+
+    cache_config = compilation.inductor_compile_config
+    cache_reason = None
+    if envs.VLLM_DISABLE_COMPILE_CACHE:
+        cache_reason = "compile_cache_disabled"
+    elif cfg.model_config.enforce_eager or compilation.mode in (
+        None,
+        CompilationMode.NONE,
+    ):
+        cache_reason = "compilation_disabled"
+    elif not is_compile_cache_enabled(cache_config):
+        cache_reason = "inductor_cache_disabled"
     paths["compile_cache"] = _row(
-        "compile_cache_disabled" if envs.VLLM_DISABLE_COMPILE_CACHE else None,
-        switches={"VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE},
+        cache_reason,
+        mode=getattr(compilation.mode, "name", None),
+        switches={
+            "VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE,
+            "VLLM_USE_AOT_COMPILE": envs.VLLM_USE_AOT_COMPILE,
+            "force_disable_caches": cache_config.get("force_disable_caches", False),
+        },
     )
     return report
 
