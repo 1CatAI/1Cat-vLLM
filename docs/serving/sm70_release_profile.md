@@ -45,3 +45,10 @@ reported as `not_applicable`.
 Compile-cache status is reported separately. The existing SM70 quality policy
 can disable AOT cache reload; this change does not alter that policy or any
 acceleration default.
+
+`benchmarks/benchmark_sm70_openai_stream.py` counts returned token IDs when
+reporting TPOT. DFlash2 can emit multiple tokens in one response chunk, so chunk
+intervals are reported separately. Token latency describes availability at the
+HTTP client: co-emitted tokens share an arrival time, and its percentiles do not
+measure individual GPU rounds. The client also supports 32K and longer input
+construction and an explicit `--top-k` sampling option.
