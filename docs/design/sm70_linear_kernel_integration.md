@@ -16,6 +16,34 @@ DFlash2 pipelines and collectives remain separate migration scopes.
 
 ## Configuration and qualification
 
+### Turing ModelOpt linears
+
+On SM75, the common selectors can choose `TuringQpn2NvFp4LinearKernel`
+for checkpoint-native NVFP4 and `TuringQpn8Fp8LinearKernel` for static
+per-tensor E4M3 weights. Both keep activations and output in FP16 and require
+the corresponding native QPN operators. NVFP4 accepts positive output widths
+with zero padding to a 32-column tile and K divisible by 128; FP8 requires
+positive N divisible by 32 and K divisible by 128. These contracts do not
+depend on model names, tensor parallel size or speculative width.
+
+The paths are selected by default when supported. `sm70_nvfp4.dense_qpn2`
+and `sm70_fp8.enabled` can disable their respective routes through
+`--kernel-config`; `VLLM_DISABLED_KERNELS` can disable an individual class.
+The `turbomind` provider includes these registry-independent QPN kernels.
+Legacy backend disable overrides remain compatible. The new NVFP4 policy
+participates in compilation identity, invalidating older cached graphs.
+
+NVFP4 retains one QPN2 layout: rows up to 32 use native decode, and larger
+batches dequantize into invocation-owned FP16 storage for dense GEMM. FP8
+uses the native QPN8 dispatcher with invocation-owned dense scratch. Runtime
+dispatch happens inside opaque operations, and cached graphs retain no
+serialized workspace address. Volta retains its existing implementations.
+
+This support concerns linear weights. It does not establish FP8 KV-cache or
+attention-backend support on Turing. A conservative serving configuration
+uses `--dtype float16 --kv-cache-dtype float16` with an attention backend
+supported by the installed build, such as `TRITON_ATTN`.
+
 `KernelConfig.sm70_nvfp4` resolves once before layers load. Runtime QPN2
 execution consumes those resolved values; it does not re-read environment
 variables. This state participates in `KernelConfig.compute_hash` and is

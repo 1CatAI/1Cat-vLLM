@@ -164,6 +164,8 @@ class Sm70NvFp4Config:
     remain with the linear kernels. Explicit fields override deprecated envs.
     """
 
+    dense_qpn2: bool = True
+    """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
     """Enable QPN2 small-M kernels; auto follows the qualified draft workload."""
     prefill: bool | None = None
