@@ -36,6 +36,10 @@ from vllm.platforms import current_platform
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Cache kernel tests require CUDA or ROCm"
+)
+
 # indexer_k_quant_and_cache converts through quant_utils.cuh, whose bf16 -> fp8
 # conversion is assert(false) below sm_80; release builds drop the assert and
 # the op writes no codes. Pre-Ampere deployments run fp16.
