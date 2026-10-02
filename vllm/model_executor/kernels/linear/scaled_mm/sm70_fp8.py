@@ -418,6 +418,7 @@ class Sm70Fp8LinearLayerConfig(FP8ScaledMMLinearLayerConfig):
     """Serialized block-FP8 loader contract, separate from activation-FP8 layouts."""
 
     is_scale_e8m0: bool = False
+    is_bmm: bool = False
     policy: Sm70Fp8Config = field(default_factory=Sm70Fp8Config)
 
 
