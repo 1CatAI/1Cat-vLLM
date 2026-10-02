@@ -408,6 +408,14 @@ def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bo
         envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        # With reduced-precision reductions allowed, cuBLAS uses FP16 partials
+        # for the small output projections. Retain that baseline schedule;
+        # the native FP32 kernel differs at M2/M4/M5 in the operator oracle.
+        and not (
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+            and tuple(weight.shape) == (2560, 1536)
+            and x.shape[0] < 8
+        )
         and _is_packed_row_major(x)
         and _is_packed_row_major(weight)
         and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))
