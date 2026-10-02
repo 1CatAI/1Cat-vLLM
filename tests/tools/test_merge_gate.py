@@ -5,6 +5,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,7 @@ def test_check_failure_stops_the_gate(tmp_path, failure_call):
     calls = tmp_path / "calls.jsonl"
     python = tmp_path / "python"
     python.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{sys.executable}\n"
         "import json, os, pathlib, sys\n"
         f"path = pathlib.Path({str(calls)!r})\n"
         "prior = path.read_text().splitlines() if path.exists() else []\n"
@@ -35,7 +36,23 @@ def test_check_failure_stops_the_gate(tmp_path, failure_call):
         f"sys.exit(19 if len(prior) + 1 == {failure_call} else 0)\n"
     )
     python.chmod(0o755)
-    # HEAD~1 ensures the final pre-commit step has changed files to inspect.
+    # Keep the scope diff independent of the source checkout's merge history.
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    git = ["git", "-C", str(repository), "-c", "core.hooksPath=/dev/null"]
+    subprocess.run(git + ["config", "user.name", "Merge gate fixture"], check=True)
+    subprocess.run(
+        git + ["config", "user.email", "merge-gate@example.invalid"], check=True
+    )
+    scope = repository / "tests/tools/test_merge_gate.py"
+    scope.parent.mkdir(parents=True)
+    for content in ["# Initial scope\n", "# Changed scope\n"]:
+        scope.write_text(content)
+        subprocess.run(git + ["add", "."], check=True)
+        subprocess.run(
+            git + ["-c", "commit.gpgsign=false", "commit", "-q", "-s", "-m", "Scope"],
+            check=True,
+        )
     result = subprocess.run(
         [
             str(GATE),
@@ -45,7 +62,7 @@ def test_check_failure_stops_the_gate(tmp_path, failure_call):
             str(python),
             "tests/tools/test_merge_gate.py",
         ],
-        cwd=ROOT,
+        cwd=repository,
         env={**os.environ, "CUDA_VISIBLE_DEVICES": "4,5,6,7"},
         capture_output=True,
         text=True,
