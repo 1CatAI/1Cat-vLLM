@@ -48,7 +48,9 @@ def test_captured_continuation_reads_live_sequence_lengths(monkeypatch, rows):
         query = kwargs["query"]
         return kwargs["seq_lens"].to(query.dtype).view(-1, 1, 1).expand_as(query)
 
-    monkeypatch.setattr(attention, "triton_turboquant_decode_attention", observe_lengths)
+    monkeypatch.setattr(
+        attention, "triton_turboquant_decode_attention", observe_lengths
+    )
     implementation = attention.TurboQuantAttentionImpl.__new__(
         attention.TurboQuantAttentionImpl
     )
