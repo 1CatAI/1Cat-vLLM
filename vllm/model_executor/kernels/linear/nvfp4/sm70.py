@@ -139,7 +139,7 @@ class TurboMindNvFp4LinearKernel(NvFp4LinearKernel):
             capability = current_platform.get_device_capability()
             compute_capability = capability.to_int() if capability is not None else None
         if compute_capability not in (70, 72):
-            return False, "requires Volta SM70 or SM72"
+            return False, "requires SM70 or SM72 (Volta)"
         return True, None
 
     @classmethod

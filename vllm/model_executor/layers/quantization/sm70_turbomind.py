@@ -56,7 +56,6 @@ def clear_sm70_turbomind_workspaces() -> None:
     )
 
     clear_nvfp4_qpn2_dense_workspaces()
-    _fp8_qpn8_dense_workspaces.clear()
 
 
 def quant_backend() -> SM70QuantBackend:
@@ -152,9 +151,7 @@ def is_pre_ampere_cuda_platform() -> bool:
     """
     if not current_platform.is_cuda():
         return False
-    device_id = (
-        torch.accelerator.current_device_index() if torch.cuda.is_initialized() else 0
-    )
+    device_id = torch.accelerator.current_device_index()
     return current_platform.has_device_capability(70, device_id=device_id) and (
         not current_platform.has_device_capability(80, device_id=device_id)
     )
@@ -164,9 +161,7 @@ def is_turing_cuda_platform() -> bool:
     """Return true for Turing workers, judged on the worker's device."""
     if not current_platform.is_cuda():
         return False
-    device_id = (
-        torch.accelerator.current_device_index() if torch.cuda.is_initialized() else 0
-    )
+    device_id = torch.accelerator.current_device_index()
     return current_platform.is_device_capability((7, 5), device_id=device_id)
 
 
@@ -543,7 +538,6 @@ def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
 # FP8 weights on Turing: QPN8 decode kernels plus the QPN8 dense prefill
 # (dequantization into a transient fp16 [K, N] workspace and cuBLAS), both
 # provided by fp8_qpn8_sm70.cu without the TurboMind registry.
-_fp8_qpn8_dense_workspaces: dict[tuple[int, int, torch.device], torch.Tensor] = {}
 FP8_QPN8_STATE_ATTR = "_sm70_fp8_qpn8_state"
 
 
@@ -578,15 +572,6 @@ def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
 
 
-def get_fp8_qpn8_dense_workspace(k: int, n: int, device: torch.device) -> torch.Tensor:
-    key = (k, n, device)
-    workspace = _fp8_qpn8_dense_workspaces.get(key)
-    if workspace is None:
-        workspace = torch.empty(k, n, dtype=torch.float16, device=device)
-        _fp8_qpn8_dense_workspaces[key] = workspace
-    return workspace
-
-
 def prepare_fp8_qpn8_dense_linear(
     layer: torch.nn.Module, weight: torch.Tensor, weight_scale: torch.Tensor
 ) -> None:
@@ -614,7 +599,6 @@ def prepare_fp8_qpn8_dense_linear(
         weight.contiguous(), channel_scales
     )
     split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(k)
-    register_layer_workspace(layer, get_fp8_qpn8_dense_workspace(k, n, weight.device))
     setattr(
         layer,
         FP8_QPN8_STATE_ATTR,
@@ -646,19 +630,14 @@ def apply_prepared_fp8_qpn8_linear(
     reshaped_x = x.reshape(-1, x.shape[-1])
     if reshaped_x.stride(-1) != 1:
         reshaped_x = reshaped_x.contiguous()
-    out = torch.empty(
-        (reshaped_x.shape[0], state.output_size), dtype=x.dtype, device=x.device
-    )
-    torch.ops.vllm.sm70_fp8_qpn8_dispatch(
-        out,
-        layer.prefix,
+    out = torch.ops.vllm.turing_fp8_qpn8_linear(
         reshaped_x,
         state.codes,
         state.group_scales,
+        state.output_size,
         state.split_k,
         state.accumulator_chains,
         state.prefetch_codes,
-        False,
     )
     if bias is not None:
         out.add_(bias)

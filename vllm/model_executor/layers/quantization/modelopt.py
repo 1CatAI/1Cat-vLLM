@@ -18,6 +18,11 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
+    TuringNvFp4LinearLayerConfig,
+    TuringQpn2NvFp4LinearKernel,
+    TuringQpn8Fp8LinearKernel,
+)
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -478,10 +483,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         )
         # Turing takes the QPN8 kernels with the QPN8 dense prefill; the
         # TurboMind GEMMs are registered for exact SM70 only.
-        self.use_sm75_fp8_qpn8 = (
-            sm70_tm.is_turing_cuda_platform()
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-        )
+        self.use_sm75_fp8_qpn8 = False
 
     def create_weights(
         self,
@@ -542,6 +544,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
         )
+        self.use_sm75_fp8_qpn8 = isinstance(self.fp8_linear, TuringQpn8Fp8LinearKernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
@@ -585,18 +588,9 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             return
 
         if self.use_sm75_fp8_qpn8:
-            if self.input_dtype != torch.float16:
-                raise RuntimeError(
-                    "ModelOpt FP8 QPN8 on Turing requires FP16 activations, "
-                    f"got {self.input_dtype}."
-                )
-            sm70_tm.prepare_fp8_qpn8_dense_linear(layer, weight, max_w_scale)
-            replace_parameter(
-                layer,
-                "weight",
-                torch.empty(0, dtype=weight.dtype, device=weight.device),
-            )
+            replace_parameter(layer, "weight", weight)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            self.fp8_linear.process_weights_after_loading(layer)
             layer.input_scale = None
             logger.info_once(
                 "SM75 ModelOpt FP8 QPN8 W8A16 dense path enabled "
@@ -1148,14 +1142,20 @@ def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
             "(weight-only; activations remain half)."
         )
         sm70_tm.prepare_nvfp4_linear(layer)
-    elif sm70_tm.should_prepare_turing_qpn2(
-        layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-    ):
-        logger.info_once(
-            "SM75 ModelOpt NVFP4 QPN2 path enabled (QPN2 decode kernels, dense "
-            "fp16 prefill; weight-only, activations remain half)."
+    elif sm70_tm.is_turing_cuda_platform():
+        config = TuringNvFp4LinearLayerConfig(
+            input_dtype=get_current_vllm_config().model_config.dtype,
+            weight_shape=tuple(layer.weight.shape),
+            scale_shape=tuple(layer.weight_scale.shape),
+            weight_dtype=layer.weight.dtype,
+            scale_dtype=layer.weight_scale.dtype,
         )
-        sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer)
+        kernel = init_nvfp4_linear_kernel(config)
+        if not isinstance(kernel, TuringQpn2NvFp4LinearKernel):
+            return False
+        kernel.process_weights_after_loading(layer)
+        layer.sm75_nvfp4_kernel = kernel
+        return True
     else:
         return False
     layer.weight = Parameter(
@@ -1316,7 +1316,9 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptNvFp4Config) -> None:
         self.quant_config = quant_config
         self.marlin_input_dtype = None
-        self.kernel = init_nvfp4_linear_kernel()
+        self.kernel = (
+            None if sm70_tm.is_turing_cuda_platform() else init_nvfp4_linear_kernel()
+        )
 
     def create_weights(
         self,
@@ -1391,6 +1393,16 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         layer.register_parameter("weight_scale", weight_scale)
+        if self.kernel is None:
+            self.kernel = init_nvfp4_linear_kernel(
+                TuringNvFp4LinearLayerConfig(
+                    input_dtype=get_current_vllm_config().model_config.dtype,
+                    weight_shape=tuple(layer.weight.shape),
+                    scale_shape=tuple(layer.weight_scale.shape),
+                    weight_dtype=layer.weight.dtype,
+                    scale_dtype=layer.weight_scale.dtype,
+                )
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if (
@@ -1423,9 +1435,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         if _try_prepare_sm70_modelopt_nvfp4(layer):
+            if hasattr(layer, "sm75_nvfp4_kernel"):
+                self.kernel = layer.sm75_nvfp4_kernel
             return
 
         # Convert layer to NVFP4 linear kernel format
+        assert self.kernel is not None
         self.kernel.process_weights_after_loading(layer)
 
     def apply(
@@ -1436,6 +1451,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if sm70_tm.has_prepared_linear(layer):
             return sm70_tm.apply_prepared_linear(layer, x, bias)
+        assert self.kernel is not None
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 

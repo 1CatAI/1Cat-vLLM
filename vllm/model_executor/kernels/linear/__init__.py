@@ -122,6 +122,10 @@ from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
     Sm70NvFp4LinearLayerConfig,
     TurboMindNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
+    TuringQpn2NvFp4LinearKernel,
+    TuringQpn8Fp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -196,6 +200,8 @@ def _get_linear_backend() -> str:
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
+        TuringQpn2NvFp4LinearKernel,
+        TuringQpn8Fp8LinearKernel,
         TurboMindAwqLinearKernel,
         TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
@@ -289,6 +295,7 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TuringQpn8Fp8LinearKernel,
         MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -398,6 +405,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TuringQpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
         Qpn2NvFp4LinearKernel,
         TurboMindNvFp4LinearKernel,

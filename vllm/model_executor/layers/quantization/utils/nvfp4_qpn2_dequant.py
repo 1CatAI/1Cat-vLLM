@@ -31,13 +31,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _KORDER = (0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15)
 
-# Bounded transient workspace: one fp16 [N, K] buffer per distinct shape and
-# device, reused by every layer of that shape.
-_dense_workspaces: dict[tuple[int, int, torch.device], torch.Tensor] = {}
-
 
 def clear_nvfp4_qpn2_dense_workspaces() -> None:
-    _dense_workspaces.clear()
+    """Compatibility cleanup hook; this route retains no persistent scratch."""
 
 
 def _lane_to_col() -> torch.Tensor:
@@ -180,11 +176,8 @@ def _nvfp4_qpn2_dense_linear(
     n: int,
     k: int,
 ) -> torch.Tensor:
-    key = (n, k, x.device)
-    workspace = _dense_workspaces.get(key)
-    if workspace is None:
-        workspace = torch.empty(n, k, dtype=torch.float16, device=x.device)
-        _dense_workspaces[key] = workspace
+    # Per-invocation storage is safe across streams and CUDA graph captures.
+    workspace = torch.empty(n, k, dtype=torch.float16, device=x.device)
     weight = nvfp4_qpn2_dequant(codes, scales, global_scale, n, k, out=workspace)
     return torch.nn.functional.linear(x, weight)
 
@@ -237,6 +230,8 @@ def _nvfp4_qpn2_dispatch_linear(
     # The split on M happens here at run time, inside one opaque op: a Python
     # branch in the model's forward would be traced once by torch.compile at
     # the warm-up M and keep the dense path in the decode graph.
+    if x.shape[0] == 0:
+        return x.new_empty((0, n))
     if x.shape[0] <= QPN2_DISPATCH_MAX_ROWS:
         from vllm import _sm70_ops as sm70_ops
 
