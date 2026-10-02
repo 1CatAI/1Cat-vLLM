@@ -249,6 +249,8 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
 
 
 def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> None:
+    # The converter is mocked below; advertise the corresponding native symbol.
+    monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
     envs.disable_envs_cache()
@@ -306,6 +308,8 @@ def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> No
 
 
 def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> None:
+    # The converter is mocked below; advertise the corresponding native symbol.
+    monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
@@ -374,6 +378,7 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
 def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0")
     monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", raising=False)
