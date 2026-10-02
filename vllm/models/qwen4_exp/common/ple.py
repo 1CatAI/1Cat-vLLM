@@ -186,22 +186,25 @@ def copy_ple_embedding_shard_split_(
 def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
     """Bytes this rank's KV cache needs to serve ``max_model_len``.
 
-    Sums what every KV-owning layer of this pipeline stage declares. The specs
-    are the engine's own source of truth for that number -- the same ones the
-    allocator consults later. This is a per-layer estimate: hybrid cache
-    grouping and allocator padding can require additional capacity.
+    Use the allocator's grouped layout so hybrid padding and shared pools are
+    included before deciding how much of the PLE table can stay on device.
     """
 
     from vllm.config import get_layers_from_vllm_config
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.v1.core.kv_cache_utils import (
+        _max_memory_usage_bytes_from_groups,
+        get_kv_cache_groups,
+    )
 
     layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)  # type: ignore[type-abstract]
-    total = 0
-    for layer in layers.values():
+    specs = {}
+    for name, layer in layers.items():
         spec = layer.get_kv_cache_spec(vllm_config)
         if spec is not None:
-            total += spec.max_memory_usage_bytes(vllm_config)
-    return total
+            specs[name] = spec
+    groups = get_kv_cache_groups(vllm_config, specs)
+    return _max_memory_usage_bytes_from_groups(vllm_config, groups)
 
 
 def auto_ple_host_budget_bytes(

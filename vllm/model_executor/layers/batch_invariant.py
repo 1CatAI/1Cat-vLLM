@@ -946,7 +946,7 @@ def enable_batch_invariant_mode():
     )
     torch.bmm = bmm_batch_invariant
 
-    set_high_precision_cuda_matmul_defaults()
+    set_high_precision_cuda_matmul_defaults(allow_split_k=False)
     torch.backends.cuda.preferred_blas_library(backend="cublaslt")
 
 
