@@ -1066,6 +1066,11 @@ The two variables above are build-time inputs for a source build only. They
 are already fixed in the SM70 release-wheel build and are not needed after
 installing that wheel.
 
+When building with CUDA 12.8 for SM70, dependency metadata selects the CUDA
+12.8 PyTorch wheels matching the build interpreter and Linux architecture.
+The published SM70 release wheel still requires Python 3.12 on x86_64;
+building for another interpreter does not make that release wheel compatible.
+
 Because this project contains custom CUDA extensions, make sure the active compiler/toolkit matches the PyTorch CUDA ABI used by your environment.
 
 ---
