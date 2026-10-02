@@ -46,7 +46,8 @@ git diff --check "$base" HEAD
 "$python" tools/run_cpu_tests.py --noconftest -q \
     tests/config/test_sm70_release_profile.py \
     tests/config/test_sm70_acceleration.py \
-    tests/config/test_sm70_dflash2_graph_cache.py
+    tests/config/test_sm70_dflash2_graph_cache.py \
+    tests/config/test_flash_next_release_launcher.py
 "$python" tools/run_cpu_tests.py --noconftest -q "$@"
 mapfile -t changed_files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD)
 if [[ ${#changed_files[@]} -gt 0 ]]; then
