@@ -84,6 +84,8 @@ class AiterSharedRoutedFusedMoERouter(BaseRouter):
         )
 
         if rocm_aiter_ops.fuse_sigmoid_in_kernel(aiter_topK_meta_data):
+            total_topk_weights: torch.Tensor
+            total_topk_ids: torch.Tensor
             total_topk_weights, total_topk_ids = aiter_topK_meta_data  # type: ignore[misc]
             total_topk_weights_slice = total_topk_weights[:M]
             topk_ids_slice = total_topk_ids[:M, :topk]
