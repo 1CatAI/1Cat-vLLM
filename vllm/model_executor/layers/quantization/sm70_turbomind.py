@@ -76,11 +76,11 @@ def forces_marlin() -> bool:
 def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
     if not enabled or not tensor.is_cuda:
         return False
-    return torch.cuda.get_device_capability(tensor.device) == (7, 0)
+    return torch.cuda.get_device_capability(tensor.device) in ((7, 0), (7, 2))
 
 
 def is_exact_sm70_cuda_platform() -> bool:
-    """Return true only for Volta SM70 CUDA workers.
+    """Return true for supported Volta SM70/SM72 CUDA workers.
 
     Quant-method selection runs before a layer owns a CUDA tensor, so it
     cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
@@ -93,8 +93,9 @@ def is_exact_sm70_cuda_platform() -> bool:
     """
     if not current_platform.is_cuda():
         return False
-    return current_platform.is_device_capability(
-        (7, 0), device_id=torch.accelerator.current_device_index()
+    device_id = torch.accelerator.current_device_index()
+    return current_platform.is_device_capability((7, 0), device_id=device_id) or (
+        current_platform.is_device_capability((7, 2), device_id=device_id)
     )
 
 
