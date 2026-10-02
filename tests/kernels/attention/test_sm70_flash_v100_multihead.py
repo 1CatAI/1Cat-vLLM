@@ -8,6 +8,9 @@ import pytest
 import torch
 
 fa = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA attention tests require a GPU"
+)
 
 # The built-in long and grouped E4M3 paths are built for SM70 only; the XQA
 # decode above them also runs on Turing.
