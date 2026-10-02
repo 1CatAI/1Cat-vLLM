@@ -54,6 +54,10 @@ from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
     RDNA3W4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
+    Sm70AwqLinearLayerConfig,
+    TurboMindAwqLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -188,6 +192,7 @@ def _get_linear_backend() -> str:
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
+        TurboMindAwqLinearKernel,
         Qpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
         TurboMindNvFp4LinearKernel,
@@ -344,6 +349,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TurboMindAwqLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
         AllSparkLinearKernel,
@@ -665,6 +671,15 @@ def choose_mp_linear_kernel(
             compute_capability = _cc[0] * 10 + _cc[1]
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
+
+    if isinstance(config, Sm70AwqLinearLayerConfig):
+        # Other MP kernels accept GPTQ packing, not the legacy AWQ GEMM
+        # checkpoint packing. The format adapter retains its Triton fallback.
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindAwqLinearKernel)
+        ]
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()

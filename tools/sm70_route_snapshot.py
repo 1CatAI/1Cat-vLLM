@@ -321,7 +321,9 @@ def load_baseline(ref, directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--category", choices=("nvfp4", "fp8-policy"), default="nvfp4")
+    parser.add_argument(
+        "--category", choices=("nvfp4", "awq", "fp8-policy"), default="nvfp4"
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--expected-changes",
@@ -334,6 +336,10 @@ def main():
         help="Compare with the independent pre-migration module at this git ref",
     )
     args = parser.parse_args()
+    snapshot_fn, load_fn = snapshot, load_baseline
+    if args.category == "awq":
+        from tools.sm70_awq_route_snapshot import load_baseline as load_fn
+        from tools.sm70_awq_route_snapshot import snapshot as snapshot_fn
     # Explicit test sandbox: an interactive shell's production knobs must not
     # leak into the reproducible defaults matrix.
     clean = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_")}
@@ -344,14 +350,14 @@ def main():
 
             result = policy.snapshot()
         else:
-            result = snapshot()
+            result = snapshot_fn()
         reference = None
         if args.baseline_ref:
             if args.category == "fp8-policy":
                 reference = policy.baseline_snapshot(args.baseline_ref)
             else:
                 with tempfile.TemporaryDirectory() as directory:
-                    reference = snapshot(load_baseline(args.baseline_ref, directory))
+                    reference = snapshot_fn(load_fn(args.baseline_ref, directory))
         elif args.check:
             reference = json.loads(args.check.read_text())
         if reference is not None:
