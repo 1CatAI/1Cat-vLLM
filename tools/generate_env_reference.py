@@ -12,7 +12,7 @@ from tools.pre_commit.check_env_metadata import ENVS_FILE, read_metadata
 OUTPUT = Path("docs/configuration/env_var_reference.md")
 
 
-def render(metadata: dict[str, dict]) -> str:
+def render(metadata: dict[str, dict], *, include_internal: bool = False) -> str:
     def cell(value):
         parts = re.split(r"(`[^`]*`)", str(value))
         for i, part in enumerate(parts):
@@ -43,6 +43,15 @@ def render(metadata: dict[str, dict]) -> str:
         ),
         "",
         (
+            "This is the user reference. Internal tuning, diagnostics and "
+            "compatibility aliases remain in the metadata inventory; they are not "
+            "daily configuration options. Developers can render that inventory with "
+            "`--include-internal --output /tmp/environment-internals.md`. "
+            "See [SM70 environment surface](../design/sm70_environment_surface.md) "
+            "for compatibility and removal plans."
+        ),
+        "",
+        (
             "| Variable | Category | Description | Declared default "
             "| Effective default "
             "| Automatic conditions / legacy consumer defaults | Acceleration paths |"
@@ -50,6 +59,8 @@ def render(metadata: dict[str, dict]) -> str:
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for name, row in sorted(metadata.items()):
+        if not include_internal and not row["user_visible"]:
+            continue
         fields = [
             f"`{name}`",
             row["category"],
@@ -66,17 +77,23 @@ def render(metadata: dict[str, dict]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--include-internal",
+        action="store_true",
+        help="Include compatibility, tuning and diagnostic implementation controls",
+    )
+    parser.add_argument("--output", type=Path, default=OUTPUT)
     args = parser.parse_args()
     metadata, errors = read_metadata(ENVS_FILE.read_text())
     if errors:
         raise SystemExit("\n".join(errors))
-    expected = render(metadata)
+    expected = render(metadata, include_internal=args.include_internal)
     if args.check:
-        if not OUTPUT.exists() or OUTPUT.read_text() != expected:
-            print(f"{OUTPUT} is stale; run python -m tools.generate_env_reference")
+        if not args.output.exists() or args.output.read_text() != expected:
+            print(f"{args.output} is stale; run python -m tools.generate_env_reference")
             return 1
     else:
-        OUTPUT.write_text(expected)
+        args.output.write_text(expected)
     print(f"{len(metadata)} environment registrations documented")
     return 0
 

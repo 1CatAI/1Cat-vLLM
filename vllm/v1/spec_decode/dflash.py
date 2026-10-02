@@ -4,7 +4,6 @@
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -12,6 +11,7 @@ from typing_extensions import override
 
 from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.utils import replace
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase

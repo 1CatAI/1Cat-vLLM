@@ -197,7 +197,7 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
 
     env = os.environ.copy()
     env["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
-        "FLASH_ATTN_V100_CUDA_ARCH_LIST", "7.0"
+        "FLASH_ATTN_V100_CUDA_ARCH_LIST", _volta_cuda_arch_list() or "7.0"
     )
     subprocess.check_call(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
@@ -248,7 +248,7 @@ def bundle_precompiled_flash_attn_v100(build_lib: str) -> None:
 
 def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     """Precompile the SM70 GDN extension so runtime never requires NVCC."""
-    if not _cuda_arch_contains(7, 0):
+    if not _volta_cuda_arch_list():
         return
 
     src = FLASH_QLA_SM70_ROOT / "csrc" / "gdn_forward.cu"
@@ -260,7 +260,7 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     extension_build_dir = Path(build_temp) / "flash_qla_sm70_gdn_strided"
     extension_build_dir.mkdir(parents=True, exist_ok=True)
     previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = _volta_cuda_arch_list()
     try:
         extension = load_torch_extension(
             name="flash_qla_sm70_gdn_strided",
@@ -268,7 +268,7 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
             build_directory=str(extension_build_dir),
             extra_cuda_cflags=[
                 "-O3",
-                "-gencode=arch=compute_70,code=sm_70",
+                *torch.utils.cpp_extension._get_cuda_arch_flags(),
             ],
             extra_cflags=["-O3"],
             with_cuda=True,
@@ -904,6 +904,7 @@ class precompiled_wheel_utils:
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                            "vllm/vllm_flash_attn/_vllm_fa2_C_sm75.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
@@ -1180,6 +1181,22 @@ def _cuda_arch_contains(major: int, minor: int = 0) -> bool:
     return arches is not None and (major, minor) in arches
 
 
+def _volta_cuda_arch_list() -> str:
+    """Keep the requested Volta targets, including explicit PTX, for bundles."""
+    aliases = {"70": "7.0", "7.0": "7.0", "72": "7.2", "7.2": "7.2"}
+    arches = []
+    for raw in re.split(r"[;,\s]+", os.environ.get("TORCH_CUDA_ARCH_LIST", "")):
+        lowered = raw.strip().lower()
+        arch = lowered.removesuffix("+ptx")
+        arch = arch.removeprefix("sm_").removeprefix("compute_")
+        if arch not in aliases:
+            continue
+        target = aliases[arch] + ("+PTX" if lowered.endswith("+ptx") else "")
+        if target not in arches:
+            arches.append(target)
+    return ";".join(arches)
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -1255,7 +1272,8 @@ def get_requirements() -> list[str]:
         # switch remains for reproducible packaging jobs that pin the same
         # dependency while using a non-SM70 target.
         pin_torch_cu128 = bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))) or (
-            _cuda_arch_contains(7, 0) and torch.version.cuda == "12.8"
+            (_cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2))
+            and torch.version.cuda == "12.8"
         )
         torch_cu128_urls = _onecat_torch_cu128_urls() if pin_torch_cu128 else {}
         modified_requirements = []
@@ -1301,7 +1319,7 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    if _cuda_arch_contains(7, 0):
+    if _cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
         # These extensions use pybind11/libtorch_python and therefore require
         # the interpreter-specific CPython ABI suffix emitted by CMake.
@@ -1320,9 +1338,15 @@ if _is_cuda():
         ext_modules.append(
             CMakeExtension(name="vllm._sm70_sparse_attention_C", py_limited_api=False)
         )
-    build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
+    build_sm70_fa2 = (
+        _cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2)
+    ) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if _cuda_arch_contains(7, 5):
+        # Turing FA2 from a pinned fork, next to the regular library
+        # (cmake/external_projects/vllm_flash_attn_sm75.cmake).
+        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C_sm75"))
     if _cuda_arch_at_least(8, 0):
         if _cuda_arch_at_least(9, 0) and (
             USE_PRECOMPILED_EXTENSIONS

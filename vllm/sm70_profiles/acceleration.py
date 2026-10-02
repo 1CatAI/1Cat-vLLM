@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm import envs
@@ -16,6 +17,133 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+def linear_policy_report(kernel_config) -> dict[str, Any]:
+    """Discover migrated policies from KernelConfig, without a parallel registry."""
+    return {
+        field.name: {
+            "scope": "configured_policy",
+            "status": "runtime_guarded",
+            "configuration": json.loads(json.dumps(asdict(value))),
+        }
+        for field in fields(kernel_config)
+        if field.name.startswith("sm70_")
+        and is_dataclass(value := getattr(kernel_config, field.name))
+        and not isinstance(value, type)
+    }
+
+
+def loaded_linear_kernels(model) -> dict[str, Any]:
+    """Read final instances, including a QPN4 workspace fallback after selection."""
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearKernel
+    from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+        ScaledMMLinearKernel,
+    )
+
+    result: dict[str, Any] = {}
+    for name, layer in model.named_modules():
+        for holder in (
+            getattr(layer, "scheme", None),
+            getattr(layer, "quant_method", None),
+        ):
+            if holder is None:
+                continue
+            for attribute in (
+                "kernel",
+                "fp8_linear",
+                "sm70_kernel",
+                "linear_kernel",
+            ):
+                kernel = getattr(holder, attribute, None)
+                if not isinstance(
+                    kernel, (MPLinearKernel, NvFp4LinearKernel, ScaledMMLinearKernel)
+                ):
+                    continue
+                config = kernel.config
+                shape = getattr(config, "weight_shape", None)
+                if shape is None:
+                    shape = getattr(config, "partition_weight_shape", None)
+                key = f"{type(kernel).__name__}:{shape}"
+                row = result.setdefault(
+                    key,
+                    {
+                        "kernel": type(kernel).__name__,
+                        "local_weight_shape": list(shape)
+                        if shape is not None
+                        else None,
+                        "layers": [],
+                        "scope": "prepared_layer_kernel",
+                    },
+                )
+                if name not in row["layers"]:
+                    row["layers"].append(name)
+    return result
+
+
+def loaded_sm70_preparations(model) -> dict[str, Any]:
+    """Read existing preparation flags and packed buffers; never select a route."""
+    variants = {}
+    packed_buffers = []
+    storages = set()
+    packed_bytes = 0
+    for name, layer in model.named_modules():
+        flags = {
+            key: value
+            for key, value in vars(layer).items()
+            if key.startswith("_sm70_") and isinstance(value, bool)
+        }
+        buffers = []
+        for key, buffer in layer.named_buffers(recurse=False):
+            if not key.startswith("_sm70_") or "packed" not in key:
+                continue
+            buffers.append(key)
+            if buffer.is_cuda:
+                storage = buffer.untyped_storage()
+                identity = (str(buffer.device), storage.data_ptr())
+                if identity not in storages:
+                    storages.add(identity)
+                    packed_bytes += storage.nbytes()
+                packed_buffers.append(
+                    {"layer": name, "buffer": key, "bytes": storage.nbytes()}
+                )
+        if flags or buffers:
+            method = getattr(layer, "quant_method", None)
+            variants[name] = {
+                "method": type(method).__name__ if method is not None else None,
+                "flags": flags,
+                "prepared_buffers": buffers,
+                "scope": "prepared_runtime_guards",
+            }
+    return {
+        "variants": variants,
+        "packed_buffers": packed_buffers,
+        "packed_buffer_bytes": packed_bytes,
+        "scope": "resident_cuda_packed_buffers_excluding_allocator_overhead",
+    }
+
+
+async def collect_worker_reports(engine_client, cfg) -> None:
+    """Fetch loaded decisions once; startup and HTTP then read the same table."""
+    report = getattr(cfg, "sm70_acceleration_report", None)
+    if not report or not report.get("sm70"):
+        return
+    if "worker_routes" in report or "worker_report_reason" in report:
+        return
+    rpc = getattr(engine_client, "collective_rpc", None)
+    if rpc is None:
+        report["worker_report_reason"] = "executor_has_no_collective_rpc"
+        return
+    try:
+        report["worker_routes"] = await rpc("get_sm70_acceleration_report", timeout=30)
+    except Exception as exc:
+        report["worker_report_reason"] = f"{type(exc).__name__}: {exc}"
+        logger.warning("SM70 loaded-route report unavailable: %s", exc)
+        return
+    logger.info("SM70 loaded acceleration routes: %s", report["worker_routes"])
 
 
 def _row(reason: str | None = None, **values: Any) -> dict[str, Any]:
@@ -214,14 +342,23 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     from .profile import load_profile
 
     sm70 = _is_sm70(cfg)
+    release_profile = (
+        _dflash_reason(cfg) is None
+        and not cfg.kernel_config.sm70_awq.resolved
+        and not cfg.kernel_config.sm70_fp8.resolved
+    ) or envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION
     paths: dict[str, dict[str, Any]] = {}
     report = {
-        "profile": "qwen38_27b_nvfp4_dflash2",
+        "profile": "qwen38_27b_nvfp4_dflash2" if release_profile else None,
         "sm70": sm70,
         "scope": "configured_capabilities",
-        "expected_acceleration": load_profile()["expected_acceleration"],
+        "expected_acceleration": load_profile()["expected_acceleration"]
+        if release_profile
+        else [],
         "paths": paths,
     }
+    report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
+    report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
     # Configuration policy is resolved once per engine. Actual kernel selection
     # still needs each loaded layer's local layout and native capabilities.
     policy = getattr(cfg.kernel_config, "sm70_nvfp4", None)
@@ -258,7 +395,12 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
 
     tp = cfg.parallel_config.tensor_parallel_size
     paths["profile_hardware"] = _row(
-        None if tp == 4 else f"contract_mismatch:tensor_parallel_size={tp}≠4", tp=tp
+        "not_applicable"
+        if not release_profile
+        else None
+        if tp == 4
+        else f"contract_mismatch:tensor_parallel_size={tp}≠4",
+        tp=tp,
     )
     for name, defaults, reason in (
         ("dflash2_verifier", _SM70_DFLASH2_VERIFIER_DEFAULTS, _dflash_reason(cfg)),

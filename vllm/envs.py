@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from vllm.envs_metadata import env_var
 
 if TYPE_CHECKING:
+    VLLM_SM70_DEBUG: set[str] = set()
+    VLLM_SM70_E4M3_LONG_ATTENTION: str | None = None
     VLLM_CPU_CI_ENV: str | None = None
     VLLM_CPU_SIM_MULTI_NUMA: str | None = None
     VLLM_CUTLASS_SRC_DIR: str | None = None
@@ -701,12 +703,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ: int = 0
     VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ: int = 0
     VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS: int = 32
-    VLLM_DFLASH_SYNC_CONTEXT_KV: bool = False
-    VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE: bool = False
     VLLM_DFLASH_DEBUG_CONTEXT_KV: bool = False
-    VLLM_DFLASH_DUMP_LAYER_HIDDENS: bool = False
-    VLLM_DFLASH_DUMP_LAYER0_COMPONENTS: bool = False
-    VLLM_DFLASH_DUMP_ATTN_COMPONENTS: bool = False
     VLLM_DFLASH_DEBUG_CORRUPTION: bool = False
     VLLM_DFLASH_DUMP_DRAFT_LOGITS: bool = False
     VLLM_SPEC_DEBUG_CORRUPTION: bool = False
@@ -778,7 +775,6 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
-    VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN: bool = True
     VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE: bool = False
     VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE: bool = False
@@ -1103,6 +1099,13 @@ def deprecated_env(
     return _read
 
 
+def sm70_debug_enabled(channel: str, legacy_name: str) -> bool:
+    """Explicit unified channels win; unset keeps the legacy integer parser."""
+    if "VLLM_SM70_DEBUG" in os.environ:
+        return channel in environment_variables["VLLM_SM70_DEBUG"]()
+    return bool(int(os.getenv(legacy_name, "0")))
+
+
 def env_with_choices(
     env_name: str,
     default: str | None,
@@ -1340,6 +1343,42 @@ def _resolve_rust_frontend_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_SM70_E4M3_LONG_ATTENTION": env_var(
+        lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION"),
+        description=(
+            "Controls the built-in E4M3 long-context attention route. "
+            "Default enabled when the native operator is present; dtype "
+            "and page-layout checks still apply. Set 0 to diagnose "
+            "attention with the original full-context route."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "None; unset admits the built-in native operator or an explicit manifest."
+        ),
+        automatic_conditions=(
+            "vllm/v1/attention/ops/sm70_e4m3_long.py:long_attention_enabled",
+        ),
+        acceleration_paths=("Flash-V100 long-context attention",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_DEBUG": env_var(
+        env_set_with_choices(
+            "VLLM_SM70_DEBUG", [], ["trace", "mtp", "events", "routing"]
+        ),
+        description=(
+            "Select comma-separated SM70 diagnostics: trace logs, MTP phase "
+            "timing, decode events or attention routing. Default empty to "
+            "avoid logging and observer overhead. Use only to diagnose "
+            "a route or latency issue; explicit channels override old aliases."
+        ),
+        category="debug",
+        declared_default="set()",
+        effective_default="set()",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 diagnostics",),
+        user_visible=True,
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
@@ -1354,6 +1393,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'cuda'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
     "VLLM_MAIN_CUDA_VERSION": env_var(
@@ -1366,6 +1406,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'13.0'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Controls PyTorch float32 matmul precision mode within vLLM workers.
     # Valid options mirror torch.set_float32_matmul_precision
@@ -1385,6 +1426,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'highest'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
@@ -1400,6 +1442,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
@@ -1427,6 +1470,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
@@ -1441,6 +1485,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Number of threads to use for nvcc
     # By default this is 1.
@@ -1456,6 +1501,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vllm will use precompiled native binaries (*.so and vllm-rs).
     "VLLM_USE_PRECOMPILED": env_var(
@@ -1473,6 +1519,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vllm will use the precompiled Rust frontend binary (vllm-rs).
     "VLLM_USE_PRECOMPILED_RUST": env_var(
@@ -1488,6 +1535,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, skip adding +precompiled suffix to version string
     "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX": env_var(
@@ -1498,6 +1546,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Used to mark that setup.py is running in a Docker build context,
     # in order to force the use of precompiled binaries.
@@ -1515,6 +1564,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
@@ -1533,6 +1583,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vllm will print verbose logs during installation
     "VERBOSE": env_var(
@@ -1543,6 +1594,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Root directory for vLLM configuration files
     # Defaults to `~/.config/vllm` unless `XDG_CONFIG_HOME` is set
@@ -1572,6 +1624,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # ================== Runtime Env Vars ==================
     # Root directory for vLLM cache files
@@ -1597,6 +1650,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # used in distributed environment to determine the ip address
     # of the current node, when the node has multiple network interfaces.
@@ -1615,6 +1669,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # used in distributed environment to manually set the communication port
     # Note: if VLLM_PORT is set, and some code asks for multiple ports, the
@@ -1633,6 +1688,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed by get_vllm_port",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # path used for ipc when the frontend api server is running in
     # multi-processing mode to communicate with the backend engine process.
@@ -1648,6 +1704,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: tempfile.gettempdir()",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If true, will load models from ModelScope instead of Hugging Face Hub.
     # note that the value is true or false, not numbers
@@ -1662,6 +1719,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If true, replace the Rust BPE backend that powers HF fast tokenizers
     # with the `fastokens` (https://github.com/crusoecloud/fastokens) shim.
@@ -1683,6 +1741,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
     "VLLM_RINGBUFFER_WARNING_INTERVAL": env_var(
@@ -1695,6 +1754,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="60",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Shared-memory message queue chunk counts. Defaults preserve upstream
     # behavior; increasing these can absorb compile/warmup bursts where worker
@@ -1712,6 +1772,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="10",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_MQ_BROADCASTER_MAX_CHUNKS": env_var(
         lambda: int(os.getenv("VLLM_MQ_BROADCASTER_MAX_CHUNKS", "6")),
@@ -1737,6 +1798,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
@@ -1751,6 +1813,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
@@ -1766,6 +1829,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
@@ -1780,6 +1844,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # flag to control the chunk size (in MB) for sleeping memory allocations under ROCm
     "VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE": env_var(
@@ -1793,6 +1858,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Feature flag to enable/disable Inductor standalone compile.
     # In torch <= 2.7 we ignore this flag; in torch >= 2.9 this is
@@ -1809,6 +1875,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Inductor's pre-grad passes don't do anything for vLLM.
     # The pre-grad passes get run even on cache-hit and negatively impact
@@ -1830,6 +1897,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": env_var(
@@ -1859,6 +1927,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Debug CUDA graph replay input tensor address stability without enabling
     # global DEBUG logging.
@@ -1873,6 +1942,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
@@ -1887,6 +1957,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Dump fx graphs to the given directory.
     # It will override CompilationConfig.debug_dump_path if set.
@@ -1901,6 +1972,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
@@ -1935,6 +2007,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Feature flag to enable/disable bytecode in
     # TorchCompileWithNoGuardsWrapper.
@@ -1949,6 +2022,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Force vllm to always load AOT compiled models from disk. Failure
     # to load will result in a hard error when this is enabled.
@@ -1965,6 +2039,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable loading compiled models directly from cached standalone compile artifacts
     # without re-splitting graph modules. This reduces overhead during model
@@ -1982,6 +2057,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed by use_mega_aot_artifact",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
@@ -1996,6 +2072,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # used to control the visible devices in the distributed setting
     "CUDA_VISIBLE_DEVICES": env_var(
@@ -2006,6 +2083,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # timeout for each iteration in the engine
     "VLLM_ENGINE_ITERATION_TIMEOUT_S": env_var(
@@ -2016,6 +2094,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="60",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout in seconds for waiting for engine cores to become ready
     # during startup. Default is 600 seconds (10 minutes).
@@ -2030,6 +2109,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="600",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # API key for vLLM API server
     "VLLM_API_KEY": env_var(
@@ -2040,6 +2120,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": env_var(
@@ -2053,6 +2134,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # S3 access information, used for tensorizer to load model from S3
     "S3_ACCESS_KEY_ID": env_var(
@@ -2063,6 +2145,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "S3_SECRET_ACCESS_KEY": env_var(
         lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
@@ -2075,6 +2158,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "S3_ENDPOINT_URL": env_var(
         lambda: os.environ.get("S3_ENDPOINT_URL", None),
@@ -2084,6 +2168,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Usage stats collection
     "VLLM_USAGE_STATS_SERVER": env_var(
@@ -2094,6 +2179,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'https://stats.vllm.ai'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_NO_USAGE_STATS": env_var(
         lambda: os.environ.get("VLLM_NO_USAGE_STATS", "0") == "1",
@@ -2106,6 +2192,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_DO_NOT_TRACK": env_var(
         lambda: (
@@ -2125,6 +2212,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_USAGE_SOURCE": env_var(
         lambda: os.environ.get("VLLM_USAGE_SOURCE", "production"),
@@ -2137,6 +2225,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'production'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Logging configuration
     # If set to 0, vllm will not configure logging
@@ -2155,6 +2244,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_LOGGING_CONFIG_PATH": env_var(
         lambda: os.getenv("VLLM_LOGGING_CONFIG_PATH"),
@@ -2167,6 +2257,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # this is used for configuring the default logging level
     "VLLM_LOGGING_LEVEL": env_var(
@@ -2177,6 +2268,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'INFO'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": env_var(
@@ -2187,6 +2279,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'ext://sys.stdout'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
     "VLLM_LOGGING_PREFIX": env_var(
@@ -2197,6 +2290,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Controls colored logging output. Options: "auto" (default, colors when terminal),
     # "1" (always use colors), "0" (never use colors)
@@ -2211,6 +2305,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'auto'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Standard unix flag for disabling ANSI color codes
     "NO_COLOR": env_var(
@@ -2221,6 +2316,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vllm will log stats at this interval in seconds
     # If not set, vllm will log stats every 10 seconds.
@@ -2239,6 +2335,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="10.0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
@@ -2254,6 +2351,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
@@ -2279,6 +2377,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": env_var(
@@ -2289,6 +2388,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
@@ -2310,6 +2410,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.
@@ -2325,6 +2426,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'auto'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (CPU backend only) CPU cores not used by OMP threads .
     # Those CPU cores will not be used by OMP threads of a rank.
@@ -2346,6 +2448,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (CPU backend only) whether to use SGL kernels, optimized for small batch.
     "VLLM_CPU_SGL_KERNEL": env_var(
@@ -2358,6 +2461,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (CPU backend only) whether to enable attention spilt KV.
     "VLLM_CPU_ATTN_SPLIT_KV": env_var(
@@ -2368,6 +2472,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (Zen CPU backend) eagerly prepack weights into ZenDNN blocked layout
     # at model load time. Eliminates per-inference layout conversion overhead.
@@ -2383,6 +2488,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ.
     "VLLM_CPU_INT4_W4A8": env_var(
@@ -2395,6 +2501,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
@@ -2419,6 +2526,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'auto'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If the env var is set, it enables GPU communication overlap
     # (experimental feature) in Ray's Compiled Graph.
@@ -2433,6 +2541,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If the env var is set, it uses a Ray Communicator wrapping
     # vLLM's pipeline parallelism communicator to interact with Ray's
@@ -2449,6 +2558,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # When True and distributed_executor_backend="ray", use RayExecutorV2
     # (MQ-based) instead of RayDistributedExecutor (compiled-graph backend).
@@ -2464,6 +2574,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
@@ -2477,6 +2588,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'fork'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Path to the cache for storing downloaded assets
     "VLLM_ASSETS_CACHE": env_var(
@@ -2496,6 +2608,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If the env var is set, we will clean model file in
     # this path $VLLM_ASSETS_CACHE/model_streamer/$model_name
@@ -2510,6 +2623,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout for fetching images when serving multimodal models
     # Default is 5 seconds
@@ -2524,6 +2638,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="5",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout for fetching videos when serving multimodal models
     # Default is 30 seconds
@@ -2538,6 +2653,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="30",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout for fetching audio when serving multimodal models
     # Default is 10 seconds
@@ -2552,6 +2668,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="10",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Directory for caching media downloads (images, video, audio fetched
     # from URLs during inference). Empty string disables caching.
@@ -2567,6 +2684,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Maximum cache size in MB. When exceeded, least-recently-used entries
     # are evicted. Default is 5120 (5 GB).
@@ -2581,6 +2699,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="5120",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Time-to-live in hours for cached media files. Entries older than this
     # are evicted regardless of cache size. Default is 24 hours.
@@ -2595,6 +2714,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="24.0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Maximum number of retries for fetching media (images, audio, video)
     # from URLs. Each retry quadruples the timeout. Default is 3.
@@ -2610,6 +2730,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="3",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to allow HTTP redirects when fetching from media URLs.
     # Default to True
@@ -2624,6 +2745,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Max number of workers for the thread pool handling
     # media bytes loading. Set to 1 to disable parallel processing.
@@ -2639,6 +2761,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Maximum filesize in MB for a single audio file when processing
     # speech-to-text requests. Files larger than this will be rejected.
@@ -2655,6 +2778,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="25",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Backend for Video IO — selects the frame-sampling algorithm.
     # - "opencv": uniform sampling.
@@ -2682,6 +2806,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'opencv'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Media connector implementation.
     # - "http": Default connector that supports fetching media via HTTP.
@@ -2705,6 +2830,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'http'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Hash algorithm for multimodal content hashing.
     # - "blake3": Default, fast cryptographic hash (not FIPS 140-3 compliant)
@@ -2730,6 +2856,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'blake3'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Path to the XLA persistent cache directory.
     # Only used for XLA devices such as TPUs.
@@ -2753,6 +2880,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, assert on XLA recompilation after each execution step.
     "VLLM_XLA_CHECK_RECOMPILATION": env_var(
@@ -2763,6 +2891,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable SPMD mode for TPU backend.
     "VLLM_XLA_USE_SPMD": env_var(
@@ -2773,6 +2902,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
     # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
@@ -2789,6 +2919,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="512",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -2803,6 +2934,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN is set, it allows
     # the user to specify a max sequence length greater than
@@ -2824,6 +2956,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, forces FP8 Marlin to be used for FP8 quantization regardless
     # of the hardware support for FP8 compute.
@@ -2841,6 +2974,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_TEST_FORCE_LOAD_FORMAT": env_var(
         lambda: os.getenv("VLLM_TEST_FORCE_LOAD_FORMAT", "dummy"),
@@ -2853,6 +2987,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'dummy'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Time in ms for the zmq client to wait for a response from the backend
     # server for simple data operations
@@ -2867,6 +3002,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="10000",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout in seconds for keeping HTTP connections alive in API server
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": env_var(
@@ -2879,6 +3015,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="5",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
@@ -2896,6 +3033,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="16384",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # a list of plugin names to load, separated by commas.
     # if this is not set, it means all plugins will be loaded
@@ -2919,6 +3057,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
@@ -2935,6 +3074,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # A remote HF repo(s) containing one or more LoRA adapters, which
     # may be downloaded and leveraged as needed. Only works if plugins
@@ -2953,6 +3093,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": env_var(
@@ -2963,6 +3104,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
@@ -2980,6 +3122,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS", "0"))),
@@ -2992,6 +3135,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     # 1Cat SM70 public-profile opt-outs. These are consumed while building
     # EngineArgs and must be registered so environment validation does not
@@ -3009,6 +3153,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))),
@@ -3021,6 +3166,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
     # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
@@ -3036,6 +3182,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed by get_sm70_quant_backend",
         automatic_conditions=(),
         acceleration_paths=("SM70 weight-only quantization providers",),
+        user_visible=False,
     ),
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
@@ -3058,6 +3205,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "TurboMindAwqLinearKernel",
             "AWQSM70MoEMethod",
         ),
+        user_visible=False,
     ),
     # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
     # weight-only formats. These broad compressed-tensor gates stay default-off;
@@ -3075,6 +3223,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))),
@@ -3087,6 +3236,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_DISABLE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_DISABLE", "0"))),
@@ -3099,6 +3249,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Match the 0.0.3 SM70/AWQ 35B baseline: route MoE through the TurboMind
     # grouped/batched GEMM by default, with an explicit opt-out for exactness
@@ -3115,6 +3266,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Skip the materialized top-k input rows for the exact Qwen3.8
     # Flash-Next TP4 AWQ W13 prefill contract. Unsupported shapes retain the
@@ -3131,6 +3283,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Qwen3.8 TP4 g32 small-batch MoE: group active expert segments through
     # the existing active-stage op. Set to 0 before startup for the old route.
@@ -3148,6 +3301,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Default-on TP4/native-g32 single-token W13/W2 QPN route for supported
     # E512 shapes and native builds. Implicit unsupported requests fall back;
@@ -3173,6 +3327,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     # Zero disables chunking; 4096 and 6144 cap the indexed W2 scratch rows.
     "VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS": env_var(
@@ -3185,6 +3340,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": env_var(
         lambda: bool(
@@ -3199,6 +3355,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2", "0"))),
@@ -3211,6 +3368,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2", "0"))),
@@ -3223,6 +3381,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS", "0")),
@@ -3235,6 +3394,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Zero derives the resident MoE scratch cap from max_num_seqs and the MTP
     # verifier width, bounded by the historical 32-token ceiling. A positive
@@ -3252,6 +3412,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Exact Qwen3.8 TP4 AWQ experiment: persist each per-group statistic as
     # {FP16 scale, uint8 zero} and reconstruct the FP16 bias in the SM70
@@ -3273,6 +3434,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST", None),
@@ -3285,6 +3447,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST", None),
@@ -3297,6 +3460,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR", None),
@@ -3309,6 +3473,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE", None),
@@ -3321,6 +3486,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS", None),
@@ -3333,6 +3499,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS", None),
@@ -3345,6 +3512,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS", "128")),
@@ -3357,6 +3525,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="128",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # Restore the 0.0.3 AWQ decode fast path: for one-token decode, compact
     # the active top-k experts and run the legacy monolithic TurboMind MoE op
@@ -3376,6 +3545,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     # C++ SM70 TurboMind tuning knobs. Register them here so reproducible
     # benchmark commands do not trip unknown-env warnings.
@@ -3390,6 +3560,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS", "1"))),
@@ -3402,6 +3573,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     # Experimental graph-safety lane for AWQ LUT reuse: keep the measured/LUT
     # kernel choice, but force only split-K to match the heuristic/default
@@ -3421,6 +3593,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_TP2_FAST_SELECTOR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR", "1"))),
@@ -3433,6 +3606,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_TP2_FAST_TARGETS": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_TP2_FAST_TARGETS", None),
@@ -3445,6 +3619,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "0"))),
@@ -3457,6 +3632,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Default-off exact-8K TP4 experiment: fuse the row-parallel reduction,
     # mixed-FP32-residual Gemma RMSNorm, and normalized-output all-gather.
@@ -3472,6 +3648,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 prefill",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS", "512")),
@@ -3484,6 +3661,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="512",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS", "80")),
@@ -3496,6 +3674,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="80",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. The
     # first stage fuses gate_up_proj + SiluAndMul through the TurboMind GEMM
@@ -3514,6 +3693,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     # Expand selected full 4096-token TP4 AWQ projections into one reusable
     # bounded FP16 workspace before their exact dense GEMM.
@@ -3530,6 +3710,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     # Expand selected large-M TP4 FP8 projections into one reusable bounded
     # FP16 workspace before their exact dense GEMM. The allowlist and M gate
@@ -3551,6 +3732,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
     # dense projections. Pure-FP8 checkpoints must opt in. The Qwen4Exp
@@ -3583,6 +3765,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in
     # QPN8 form for exact M=9..16 projection shapes instead of reconstructing
@@ -3599,6 +3782,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     # Follow-on B4 experiment: replay the accepted M16 body in contiguous row
     # chunks through M=32 while retaining the same strict shape allowlist.
@@ -3614,6 +3798,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     # Native dense-only B4 verifier experiment. It keeps the logical split-K
     # reduction order while one CTA reuses each packed weight tile for M<=32.
@@ -3629,18 +3814,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))),
         description=(
-            "SM70: qwen4 exp online qpn8. The consumer locations and unset "
-            "defaults are listed below."
+            "Requantizes selected FP16 checkpoint weights to channel E4M3 for "
+            "online QPN8. Default off because this changes weight precision. "
+            "Set 1 only for an explicitly qualified precision/performance "
+            "experiment; keep it off for checkpoint-preserving inference."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
     # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
@@ -3662,12 +3851,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_QWEN38_FP16_GEMV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))),
         description=(
-            "SM70: qwen38 fp16 gemv. The consumer locations and unset defaults"
-            " are listed below."
+            "Selects checkpoint-FP16 SM70 row GEMV for supported Qwen4Exp "
+            "projections. Default enabled by the engine policy after "
+            "capability admission; the standalone getter is off. Set 0 to "
+            "compare the ordinary linear method when investigating a "
+            "projection regression."
         ),
         category="configuration",
         declared_default="False",
@@ -3683,15 +3876,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=True,
     ),
     # Exact-topology Qwen3.8 decode candidate: compute checkpoint-FP16 GDN
     # QKVZ and b/a projections and write their consumed splits in one launch.
     "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))),
         description=(
-            "Exact-topology Qwen3.8 decode candidate: compute checkpoint-FP16 "
-            "GDN QKVZ and b/a projections and write their consumed splits in "
-            "one launch."
+            "Fuses supported checkpoint-FP16 GDN input projections and stores. "
+            "Default enabled by the qualified Qwen4Exp policy, otherwise off. "
+            "Set 0 to isolate the original input projection chain during "
+            "diagnosis."
         ),
         category="experimental",
         declared_default="False",
@@ -3707,8 +3902,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=True,
     ),
-    # Qualified M2..16 input chain; explicit 0 trades speed for KV capacity.
+    # Qualified M2..16 input chain. Keep opt-in because its packed weights
+    # consume another 725.625 MiB/rank in the Flash-Next TP4 configuration.
     "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1"))),
         description=(
@@ -3725,6 +3922,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # TP4 MTP4 batch HC, sharing the concurrent-decode packed MMA/gather
     # implementation while preserving the current FP16 split-K boundaries.
@@ -3745,6 +3943,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Join the admitted HC phases with cooperative grid barriers, keeping
     # the same per-projection arithmetic and communicator-owned packets.
@@ -3764,8 +3963,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
-    # Exact cooperative HC schedule qualified in the #703 complete-model pair.
+    # Exact cooperative HC schedule; opt in pending same-engine comparison.
     "VLLM_SM70_MTP_HC_FULL_UNROLL": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_FULL_UNROLL", "1"))),
         description=(
@@ -3781,6 +3981,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Select only the first 16 lossless keys before the unchanged top-10 norm.
     "VLLM_SM70_MTP_ROUTER_TOP16": env_var(
@@ -3798,6 +3999,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Fused four-partition FP32 reduction for the MTP4 FP16 router projection.
     "VLLM_SM70_MTP_ROUTER_BATCH": env_var(
@@ -3816,6 +4018,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues.
     "VLLM_SM70_MTP_SHARED_BATCH": env_var(
@@ -3834,6 +4037,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
@@ -3852,6 +4056,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.
@@ -3859,10 +4064,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN38_FUSED_HC_FP16": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "0"))),
         description=(
-            "Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and "
-            "up/gate-mix stages while retaining FP16 checkpoint weights and "
-            "inter-stage rounding. This remains opt-in pending the same "
-            "model-level quality gates as GEMV."
+            "Fuses supported checkpoint-FP16 HyperConnection stages. Default "
+            "enabled by the Qwen4Exp policy, otherwise off; local geometry and "
+            "collective guards remain. Set 0 to isolate HC projection and "
+            "mixing during diagnosis."
         ),
         category="experimental",
         declared_default="False",
@@ -3878,8 +4083,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=True,
     ),
-    # Qualified small-batch HC/GDN/dense routes; explicit 0 disables them.
+    # One admission gate for exact small-batch HC/GDN/gate/TP4 candidates.
+    # Keep opt-in until their combined same-build model quality gate passes.
     "VLLM_SM70_QWEN38_BATCH_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1"))),
         description=(
@@ -3896,6 +4103,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
@@ -3913,6 +4121,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit
@@ -3935,6 +4144,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     # Experimental non-fused QPN8 route for the exact PP2 x TP4 shared-expert
     # gate/up tensor. The model-level clamp-SwiGLU remains external. This
@@ -3956,6 +4166,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
@@ -3971,6 +4182,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
+        user_visible=False,
     ),
     "VLLM_SM70_SAMPLER_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
@@ -3983,6 +4195,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FA2_D256_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_FA2_D256_LIBRARY", None),
@@ -3995,6 +4208,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Experimental q8 long attention; unset preserves the full-context route.
     "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST": env_var(
@@ -4007,6 +4221,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. Default-off keeps
     # the existing eager fallback and its memory footprint unchanged.
@@ -4016,19 +4231,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "1"))),
         description=(
-            "Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. "
-            "Default-off keeps the existing eager fallback and its memory "
-            "footprint unchanged. Capturing the B1 q1..q7 verifier tails is on"
-            " by default: the eager tail was the dominant round cost at 256K, "
-            "and 1K/128K are unchanged (<0.01 ms). "
-            "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0 restores the eager-tail "
-            "behaviour."
+            "Captures supported single-request DFlash2 verifier tails. Default "
+            "on after paired token/state and speed qualification. Set 0 to "
+            "trade tail-graph memory and speed for the eager fallback during "
+            "diagnosis."
         ),
         category="configuration",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
     ),
     "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
         lambda: os.getenv("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None),
@@ -4041,6 +4254,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PREFILL_CUTLASS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))),
@@ -4053,6 +4267,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))),
@@ -4069,6 +4284,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
@@ -4094,6 +4310,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     # Share TurboMind B/Pack1 codes with compatible QPN2 projections. Compact
     # scales additionally require native support for reusable graph scratch.
@@ -4110,6 +4327,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True; sharing requires native shared-layout operators.",
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1"))),
@@ -4134,6 +4352,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
@@ -4149,6 +4368,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
@@ -4177,6 +4397,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY"),
@@ -4189,6 +4410,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")),
@@ -4205,6 +4427,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+        user_visible=False,
     ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
@@ -4217,11 +4440,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "substrate for the MLP hidden-state reduction. This is default-off"
             " until it wins end-to-end."
         ),
-        category="tuning",
+        category="experimental",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE", "inline"),
@@ -4234,6 +4458,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'inline'",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL", "5120")),
@@ -4246,6 +4471,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="5120",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS", "1")),
@@ -4258,6 +4484,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS", "1")),
@@ -4270,6 +4497,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS", "1")),
@@ -4282,6 +4510,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     # Experimental TileRT-style fused down-proj lane. TurboMind AWQ GEMM
     # publishes per-N-tile readiness from its epilogue; a reducer worker waits
@@ -4294,11 +4523,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "worker waits on those flags and reduces TP2 peer staging into the"
             " final output."
         ),
-        category="tuning",
+        category="experimental",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM": env_var(
         lambda: bool(
@@ -4308,11 +4538,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: awq mlp down tile overlap side stream. The consumer "
             "locations and unset defaults are listed below."
         ),
-        category="tuning",
+        category="configuration",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL", "128")),
@@ -4325,6 +4556,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="128",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS": env_var(
         lambda: int(
@@ -4339,6 +4571,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="4",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS": env_var(
         lambda: int(
@@ -4353,6 +4586,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
@@ -4365,6 +4599,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_COORDINATED_TUNING": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1"))),
@@ -4377,6 +4612,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "0"))),
@@ -4389,6 +4625,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))),
@@ -4401,6 +4638,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_GROUPED_BMM_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "1"))),
@@ -4413,6 +4651,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1"))),
@@ -4425,6 +4664,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PREFILL_PRESCALED": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))),
@@ -4441,6 +4681,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PRESCALED_M1_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))),
@@ -4457,6 +4698,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Exact prescaled route for the measured PP2 x TP4 shared-expert gate/up
     # tensor. Missing operators or non-reversible scales fall back safely.
@@ -4476,6 +4718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))),
@@ -4488,6 +4731,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))),
@@ -4500,6 +4744,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES", "1"))),
@@ -4512,6 +4757,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))),
@@ -4524,6 +4770,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": env_var(
         lambda: bool(
@@ -4538,6 +4785,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Direct ten-route M=1 expert GEMMs for Qwen3.8 Flash Next NVFP4 TP4.
     # This consumes the existing TurboMind-packed weights while skipping the
@@ -4557,6 +4805,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Direct Qwen3.8 expert route for CUDA Graph local widths 2, 4, 8, and 16. It
     # retains native NVFP4 weights, FP16 activations, and FP32 accumulation
@@ -4577,6 +4826,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Experimental extension to every live width in 2..16, independent of
     # scale storage. Changing RAW_SCALE must not also change which widths use
@@ -4598,6 +4848,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Experimental grouped native-NVFP4 W13/W2 decode. Local weight shapes and
     # attention metadata gates preserve M1, prefill and multi-token verify.
@@ -4615,6 +4866,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Reuse the batched expert grouping for the exact TP4 MTP4 verifier.
     # Preserve its W13 split4 and ordered FP16 W2/FP32 weighted reduction.
@@ -4634,6 +4886,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
     # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the
@@ -4660,6 +4913,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Fuse the direct Qwen3.8 W2 projection with its fixed-order FP32 weighted
     # reduction. Ten warps compute the ten routed slots in parallel; the
@@ -4684,6 +4938,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Keep native E4M3 block-scale codes resident and reconstruct their exact
     # FP16 values in the QPN decode kernels. Generic/prefill TurboMind routes
@@ -4705,6 +4960,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Exact TP4 Qwen3.8 W13 prefill route. It retains the stable expert sort
     # and unpermute maps but reads original token rows through TurboMind's
@@ -4722,6 +4978,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Exact Qwen3.8 route: interleave W13 columns at load time and apply SwiGLU
     # in the indexed grouped-GEMM epilogue. The arithmetic is bitwise equal to
@@ -4741,6 +4998,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Exact TP4 long-prefill grouped-GEMM policy: split W13 N320 into an N256
     # head plus N64 tail, and retain W2 weights in cache across expert-local M
@@ -4758,6 +5016,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Direct fifty-route verifier expert path for Qwen3.8 MTP4. This consumes
     # checkpoint-native NVFP4 weights with FP16 activations; it does not enable
@@ -4777,6 +5036,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Exact single-token Qwen3.8 W2 epilogue. Ten expert warps retain the
     # established FP16 route rounding and reduce in top-k order with FP32 FMA.
@@ -4794,6 +5054,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QPN_M1_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY"),
@@ -4806,6 +5067,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Exact single-token E=512, K=10 softmax router used by Qwen3.8 Flash
     # Next. All other shapes and scoring modes retain the generic CUDA op.
@@ -4821,6 +5083,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))),
@@ -4833,6 +5096,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     # Warm up the accepted SM70 AWQ dense / dense-stage / active-expert
     # TurboMind routes before CUDA graph capture. This does not enable the old
@@ -4849,6 +5113,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_WARMUP_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")),
@@ -4870,6 +5135,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS", "8")),
@@ -4882,6 +5148,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AUX_KERNEL_WARMUP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))),
@@ -4894,6 +5161,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_GEMM_LUT_PATH": env_var(
         lambda: os.getenv("VLLM_SM70_GEMM_LUT_PATH"),
@@ -4906,6 +5174,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M", "16")),
@@ -4918,6 +5187,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="16",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M", "16")),
@@ -4939,6 +5209,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M", "16")),
@@ -4951,6 +5222,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="16",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "16")),
@@ -4972,6 +5244,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_FP16_GEMV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))),
@@ -4984,6 +5257,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_FP13_GEMV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "1"))),
@@ -4996,6 +5270,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))),
@@ -5008,6 +5283,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "1"))),
@@ -5020,6 +5296,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Skip PP metadata and TP reconstruction only for the exact, replicated
     # SM70 B1 hidden-state schema validated by the worker on both stages.
@@ -5035,6 +5312,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")),
@@ -5047,6 +5325,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="128",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS": env_var(
         lambda: int(os.getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "128")),
@@ -5059,6 +5338,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="128",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Experimental unquantized FP16 SM70 TurboMind fast paths. Keep default-off:
     # these must pass the numeric policy and model-level token gate before
@@ -5075,6 +5355,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", "0"))),
@@ -5087,6 +5368,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Default-on only feeds the pure-greedy top-token shortcut below. The full
     # LM-head GEMM fast path remains separately gated by
@@ -5140,6 +5422,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_LM_HEAD_TOP1_TC": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))),
@@ -5152,6 +5435,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Candidate-only QPN8 LM head. QPN8 selects a conservative local top-64
     # support, then directly re-evaluates the original FP16 rows and restores
@@ -5160,11 +5444,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_QPN8_RERANK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))),
         description=(
-            "Candidate-only QPN8 LM head. QPN8 selects a conservative local "
-            "top-64 support, then directly re-evaluates the original FP16 rows"
-            " and restores dense-vocabulary top-k tie order. Keep default-off "
-            "until real-hidden, quality, and complete Graph/Nsight gates all "
-            "pass."
+            "Selects candidate-only QPN8 LM-head screening followed by "
+            "original FP16-row reranking. Default enabled by the qualified "
+            "DFlash2 policy, otherwise off. Set 0 to compare the dense LM head "
+            "when investigating candidate selection; this does not enable "
+            "online weight requantization."
         ),
         category="experimental",
         declared_default="False",
@@ -5180,6 +5464,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
     ),
     # Explicit precision contract: retain FP32 candidate and dense logits
     # for the SM70 TP4 DFlash2 LM head, including reference fallback.
@@ -5204,6 +5489,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
     # local top-k, and return the dense result so the baseline trajectory is
@@ -5221,6 +5507,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Preserve the production full-vocabulary torch.topk tie contract by
     # default.  The candidate-order experiment avoids a host-blocking SM70
@@ -5247,6 +5534,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Candidate-order tie handling is a benchmark-only experiment. Requiring
     # a second opt-in prevents stale deployment scripts from silently trading
@@ -5274,15 +5562,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Umbrella gate for selector-based DFlash verification optimizations. Keep
     # this default-off while each stage is checked against the unchanged path.
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))),
         description=(
-            "Umbrella gate for selector-based DFlash verification "
-            "optimizations. Keep this default-off while each stage is checked "
-            "against the unchanged path."
+            "Controls selector-based DFlash2 verifier optimizations. Default "
+            "enabled by the qualified per-engine DFlash2 policy; the "
+            "standalone getter defaults off for other configurations. Set 0 to "
+            "isolate verifier execution when diagnosing an output or latency "
+            "regression."
         ),
         category="configuration",
         declared_default="False",
@@ -5303,6 +5594,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
     ),
     # Build all selector-based DFlash target GDN state-index metadata with one
     # pointer-table Triton launch. Keep separate from the shared-classification
@@ -5334,6 +5626,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Classify native MTP batches (any draft depth; the MTP4 prefix is
     # historical) once per step and share it across GDN cache groups. Set 0 to
@@ -5350,6 +5643,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Pure native-MTP graph batches can construct all GDN groups' state rows in
     # one launch. Mixed/prefill batches still fall back. Set 0 to restore
@@ -5368,6 +5662,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.
@@ -5383,6 +5678,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Debug-only device-value assertion. The metadata producers and FULL graph
     # replay share the current CUDA stream, so production ordering does not
@@ -5402,6 +5698,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Selector-based DFlash packed GDN verification kernel. This is deliberately
     # independent from the shared-metadata umbrella gate so each optimization
@@ -5409,10 +5706,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))),
         description=(
-            "Selector-based DFlash packed GDN verification kernel. This is "
-            "deliberately independent from the shared-metadata umbrella gate "
-            "so each optimization can be paired against the unchanged verifier"
-            " in isolation."
+            "Selects packed selector-based GDN verification. Default enabled "
+            "by the qualified DFlash2 policy, otherwise off; local shapes "
+            "retain their fallback. Set 0 to compare separate verifier "
+            "operations when investigating output or state updates."
         ),
         category="configuration",
         declared_default="False",
@@ -5428,6 +5725,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
     ),
     # Independently gated q8/TP2 packed GDN schedule; other shapes retain the
     # accepted recurrent launch geometry.
@@ -5442,6 +5740,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Route compatible target GDN output gates through the existing one-pass
     # CUDA RMSNormGated implementation. This remains an explicit opt-in.
@@ -5466,6 +5765,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Fuse compatible nonzero-offset GDN z/b/a materialization into one
     # copy kernel. This must stay separate from the plain-view path because
@@ -5492,6 +5792,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
     "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": env_var(
@@ -5511,6 +5812,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Return the existing projection tensor across the GDN opaque boundary.
     # This does not enable collective/norm fusion or change state arithmetic.
@@ -5526,6 +5828,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Build Flash-V100 small-query verifier rows directly in their persistent
     # graph buffers. This replaces four repeat_interleave scans per KV group.
@@ -5559,6 +5862,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Collapse five compatible target small-query metadata launches into one
     # heterogeneous-width pointer-table kernel. The paired
@@ -5590,6 +5894,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Copy the post-convolution Q/K/V row slices into the recurrent kernel's
     # packed contiguous layout with one bitwise Triton launch. This replaces
@@ -5607,6 +5912,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
     # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
@@ -5631,6 +5937,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Fixed 8192/16-warp reduction for the FP16 no-residual and
     # FP16-residual Gemma norms not covered by the existing FP32-residual path.
@@ -5659,6 +5966,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
     # DFlash2 proposal and target sampling distributions both have compact
@@ -5692,6 +6000,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Compute the compatible 25600->5120 target-hidden projection as four output
     # shards, then all-gather only the 80-KiB block-eight result. The global
@@ -5723,12 +6032,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))),
         description=(
-            "SM70: dflash2 context kv graph. The consumer locations and unset "
-            "defaults are listed below."
+            "Captures the qualified DFlash2 context-KV preparation graph. "
+            "Default enabled by the verifier policy, otherwise off. Set 0 to "
+            "compare eager context preparation when diagnosing graph or memory "
+            "behavior."
         ),
         category="configuration",
         declared_default="False",
@@ -5744,12 +6056,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
     ),
     "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))),
         description=(
-            "SM70: dflash2 context pipeline. The consumer locations and unset "
-            "defaults are listed below."
+            "Pipelines DFlash2 draft context preparation. Default enabled by "
+            "the qualified verifier policy, otherwise off. Set 0 to compare "
+            "sequential preparation when investigating draft state or "
+            "scheduling."
         ),
         category="configuration",
         declared_default="False",
@@ -5765,6 +6080,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=True,
     ),
     # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
     # topology contracts enable it while the global default remains off.
@@ -5789,6 +6105,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     # Fixed-shape SM70 q8 mHC post+dot kernel. The global default remains off;
     # audited GLM-5.3 verifier contracts enable the bitwise-qualified path.
@@ -5813,6 +6130,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     # Exact fixed-shape GLM-5.3 verifier route. It fuses the stable E288 sort,
     # inverse map, compact active-expert groups, and M8/K8 input expansion.
@@ -5828,6 +6146,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8", "1"))),
@@ -5840,6 +6159,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Exact TP8/q8 W13 path matching TurboMind's CTA-K32 split-3 tree.
     "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": env_var(
@@ -5859,6 +6179,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Fuse the local shared+routed FP16 add into the exact TP8 q8 push tree.
     "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8": env_var(
@@ -5871,6 +6192,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     "VLLM_SM70_GLM_MHC_PRE_THREADS": env_var(
         lambda: int(os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")),
@@ -5892,6 +6214,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     # Exact GLM-5.3 q8 KDA projection. The -3 variant uses a four-row CTA with
     # swizzled shared partials; zero keeps the scalar reference for audits.
@@ -5907,6 +6230,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="-3",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_GLM53_TP8_CUBLASLT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0"))),
@@ -5928,6 +6252,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Fixed-shape TP8 KDA f_b/g_b fusion. The global default remains off;
     # the quality-audited GLM-5.3 DFlash2 TP8/PP1 contract enables it.
@@ -5952,6 +6277,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
     # transformed q logits are cached for rejection sampling, so non-default
@@ -5983,6 +6309,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": env_var(
         lambda: float(os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P", "1.0")),
@@ -6009,6 +6336,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_GLM53_PP_MHC_MATERIALIZE": env_var(
         lambda: bool(int(os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0"))),
@@ -6021,6 +6349,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow DFlash2 candidate TopK when the shared target LM head is
     # quantized (e.g. compressed-tensors NVFP4 checkpoints, whose
@@ -6054,6 +6383,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Default-on SGLang-style push collective for the validated FP16 80-KiB
     # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA
@@ -6062,10 +6392,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TP4_PUSH_ALLREDUCE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))),
         description=(
-            "Default-on SGLang-style push collective for the validated FP16 "
-            "80-KiB verifier and 8-KiB decode payloads on fully-connected SM70"
-            " TP4 CUDA Graphs. Other devices, topologies, sizes, and eager "
-            "calls retain the ordinary pull path; explicit 0 is the rollback."
+            "Controls the qualified SM70 TP4 push all-reduce. Default on for "
+            "supported topology, payload and graph layouts; per-engine GLM "
+            "policy may disable it. Set 0 to isolate collective transport when "
+            "investigating correctness or latency."
         ),
         category="configuration",
         declared_default="True",
@@ -6081,6 +6411,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 collectives",),
+        user_visible=True,
     ),
     # Opt-in Qwen3.8 DFlash2 extension of the TP4 push collective from the
     # accepted M8 payload to M16/M32 verifier payloads.
@@ -6095,6 +6426,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
@@ -6112,6 +6444,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     # Bitwise-equal push collectives for FP16 [4|8|16, 2560] payloads on
     # fully-connected SM70 TP4 CUDA Graphs. Other shapes, topologies, devices,
@@ -6129,6 +6462,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Exact Qwen3.8 single-token MoE payload: FP16 [1, 2560]. Reuse the
     # already-registered SM70 TP4 push buffers for all_reduce_sum2 while
@@ -6150,6 +6484,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Experimental ordinary all-reduce admission by aligned message size.
     # SM70, fully connected TP4 and captured FP16 only; default off until the
@@ -6169,6 +6504,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Refuse to start when a checkpoint carries no calibrated QSA E4M3 K/V
     # scales. Off by default: an uncalibrated checkpoint runs on the module's
@@ -6186,6 +6522,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     # Optional task-built custom-AR fragment. Operators present in the sidecar
     # override the production namespace; every other operator falls back.
@@ -6201,6 +6538,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
@@ -6221,6 +6559,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))),
@@ -6233,6 +6572,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
     "VLLM_SM70_TOPK_TOPP_8_WARPS": env_var(
@@ -6245,6 +6585,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # The exact B8/B16, 248320-column sampler contract uses one logits row per
     # request. Eight warps preserves Qrita's masking math while improving SM70
@@ -6262,6 +6603,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
@@ -6281,6 +6623,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(0, int('0'))",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_ASYNC_STAGED_INPUT_PREP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_ASYNC_STAGED_INPUT_PREP", "0"))),
@@ -6293,6 +6636,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_ASYNC_CPU_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE", "0"))),
@@ -6305,6 +6649,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_ASYNC_CPU_TRACE_EVERY": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE_EVERY", "16"))),
@@ -6317,6 +6662,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('16'))",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Legacy 0.0.3 diagnostic gate. Logs one TP all-reduce backend decision per
     # group/backend/shape/dtype so route-hit data can distinguish custom AR,
@@ -6334,6 +6680,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT": env_var(
         lambda: (
@@ -6354,6 +6701,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Opt in exact MTP4 verifier payloads on fully-connected SM70 TP4.
     "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": env_var(
@@ -6364,6 +6712,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP4_M5_AR_THREADS": env_var(
         lambda: (
@@ -6384,6 +6733,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP4_SMALL_AR_PACK32": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP4_SMALL_AR_PACK32", "0"))),
@@ -6396,6 +6746,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
     # off until the communicator path has same-criterion model evidence.
@@ -6411,6 +6762,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_F16_DENSE_ALLOWLIST": env_var(
         lambda: os.getenv("VLLM_SM70_F16_DENSE_ALLOWLIST"),
@@ -6423,6 +6775,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_DENSE_ALLOWLIST": env_var(
         lambda: os.getenv("VLLM_SM70_MOE_DENSE_ALLOWLIST"),
@@ -6435,6 +6788,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_F16_DENSE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64")),
@@ -6447,6 +6801,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="64",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_F16_DENSE_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_F16_DENSE_DEBUG", "0"))),
@@ -6459,6 +6814,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_QWEN3_NEXT_SM70_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_QWEN3_NEXT_SM70_TRACE", "0"))),
@@ -6470,7 +6826,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE", "0"))),
@@ -6483,6 +6840,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL", "0"))),
@@ -6495,6 +6853,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_UNQUANT_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0"))),
@@ -6507,6 +6866,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_SHARED_GATE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64")),
@@ -6519,6 +6879,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="64",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Compatibility fallback for serialized FP8 checkpoints on SM70 shapes not
     # handled by the TurboMind W8A16 dense kernel: dequantize once at load time
@@ -6539,6 +6900,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # V100/SM70 block-FP8 dense path using TurboMind W8A16. Default-on matches
     # 0.0.3 for SM70 dense FP8; MoE route policy is controlled below.
@@ -6557,6 +6919,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It prepares
     # a single interleaved primary layout for gate_up_proj, avoiding the older
@@ -6579,6 +6942,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Accepted SM70 FP4-family dense routes. Default-on keeps NVFP4/MXFP4
     # checkpoints loadable and fast on V100; set either env to 0 to force the
@@ -6595,6 +6959,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Dispatch all 256 routed experts in one grouped TurboMind call for the
     # exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 decode keeps
@@ -6612,6 +6977,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Experimental GLM-5.3 verifier route. Consecutive sorted slots that hit
     # the same expert share one TurboMind group so its packed weights are read
@@ -6639,6 +7005,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_DENSE_GATED_SILU": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_DENSE_GATED_SILU", "1"))),
@@ -6651,6 +7018,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
     ),
     # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B
     # NVFP4 TP4 no-MTP contract. Larger-M prefill dequantizes into one bounded
@@ -6668,6 +7036,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Qpn4NvFp4LinearKernel",),
+        user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE", "0"))),
@@ -6680,6 +7049,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Qpn4NvFp4LinearKernel",),
+        user_visible=False,
     ),
     # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
     # The base flag enables exact compact sampling after full-logits gather.
@@ -6697,6 +7067,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_CHUNKED_TOPK20_CHUNKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_CHUNKED_TOPK20_CHUNKS", "0")),
@@ -6709,6 +7080,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER", "0"))),
@@ -6721,6 +7093,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))),
@@ -6733,6 +7106,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them
     # opt-in until full-model token and long-output quality gates pass.
@@ -6747,6 +7121,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))),
@@ -6759,6 +7134,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))),
@@ -6771,6 +7147,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))),
@@ -6783,6 +7160,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
@@ -6804,6 +7182,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Default SM70 native FP8 MoE throughput lane. The per-expert dense-stage
     # route remains available by setting this to 0 for diagnostics.
@@ -6819,6 +7198,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Stage-local dispatch choices for the native FP8 MoE batched route. They
     # reuse the shared route policy but keep FP8-specific kernels; keep them
@@ -6839,6 +7219,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_BATCHED_W2_PER_EXPERT_DISPATCH": env_var(
         lambda: bool(
@@ -6853,6 +7234,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Legacy 0.0.3 strict failure switch for the paused FP8 compact MoE
     # compare harness. Latest keeps compact/router/gated variants out of the
@@ -6873,6 +7255,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Use the same scratch-backed MoE permutation helper as AWQ when available.
     # It removes generic scratch allocation overhead while preserving the same
@@ -6892,6 +7275,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # DeepSeek V4 batch-one MXFP4 decode has six routed slots but 256 local
     # experts. Dispatch only those six fixed graph slots; expert IDs remain
@@ -6909,6 +7293,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Extend the graph-safe active-expert route beyond B1. Values above eight
     # are clamped by the exact DeepSeek V4 verifier buffer contract.
@@ -6926,6 +7311,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('8'))",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.
@@ -6941,6 +7327,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Experimental verifier-M8 grouped dispatch. This collapses the fixed 48
     # active-expert stage calls into one TurboMind grouped launch.
@@ -6956,6 +7343,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Extend the one-launch grouped verifier route from M=8 to M=2..M=8.
     # Kept independent until each width passes its CUDA Graph and model gates.
@@ -6971,6 +7359,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Group verifier slots routed to the same expert into one multi-row group.
     # This changes the MXFP4 reduction tactic, so it stays behind an
@@ -6987,6 +7376,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Use deterministic W13/W2 tactics for the fixed 48 one-row
     # verifier groups instead of relying on capture-time autotune stability.
@@ -7004,6 +7394,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Skip the generic 256-expert sort/permute/unpermute pipeline for the
     # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
@@ -7019,6 +7410,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Keep the six B1 routes in their original top-k order. Compact W13/W2
     # then consume topk_ids directly, so no sort/inverse-permutation prepare
@@ -7038,6 +7430,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # Consume the existing TurboMind E2M1/UE8M0 pack directly for the exact
     # six-route B1 W13/W2 tensors. Set to 0 to retain the dense-stage path.
@@ -7053,6 +7446,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))),
@@ -7065,6 +7459,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind MXFP4",),
+        user_visible=False,
     ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics
@@ -7086,6 +7481,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Experimental shared+routed MoE output fusion. When enabled on an
     # eligible SM70 TP graph path, this uses custom all_reduce_sum2(shared,
@@ -7093,10 +7489,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MOE_ADD_ALLREDUCE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0"))),
         description=(
-            "Experimental shared+routed MoE output fusion. When enabled on an "
-            "eligible SM70 TP graph path, this uses custom "
-            "all_reduce_sum2(shared, routed) instead of materializing "
-            "shared+routed before TP allreduce."
+            "Fuses shared and routed MoE outputs with TP all-reduce. Default "
+            "enabled by the qualified Qwen4Exp policy, otherwise off. Set 0 to "
+            "compare separate addition and communication when investigating "
+            "MoE overlap."
         ),
         category="experimental",
         declared_default="False",
@@ -7112,6 +7508,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 collectives",),
+        user_visible=True,
     ),
     "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))),
@@ -7133,6 +7530,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR", "0"))),
@@ -7154,6 +7552,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.
@@ -7175,6 +7574,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": env_var(
         lambda: bool(
@@ -7189,6 +7589,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH": env_var(
         lambda: bool(
@@ -7203,6 +7604,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH": env_var(
         lambda: bool(
@@ -7217,6 +7619,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_COMPACT_W13_FASTPATH": env_var(
         lambda: bool(
@@ -7231,6 +7634,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH": env_var(
         lambda: bool(
@@ -7245,6 +7649,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": env_var(
         lambda: bool(
@@ -7259,6 +7664,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": env_var(
         lambda: bool(
@@ -7273,6 +7679,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     # Legacy 0.0.3 FusedMoE activation chunk controls. Latest keeps this
     # explicit/default-off until model-level memory, route, and quality gates
@@ -7292,6 +7699,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int(str(16 * 1024)))",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING": env_var(
         lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING", "0"))),
@@ -7304,6 +7712,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy 0.0.3 DP all-to-all MoE chunk controls. The latest MoE runner
     # has been refactored around custom-op entry points, so the old
@@ -7324,6 +7733,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_ENABLE_MOE_DP_CHUNK": env_var(
         lambda: bool(int(os.getenv("VLLM_ENABLE_MOE_DP_CHUNK", "0"))),
@@ -7336,6 +7746,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # V100/SM70 FlashAttention backend selector. Default-on restores the 0.0.3
     # backend priority on V100; selecting Flash-V100 should keep both prefill
@@ -7344,16 +7755,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASH_ATTN_V100": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))),
         description=(
-            "V100/SM70 FlashAttention backend selector. Default-on restores "
-            "the 0.0.3 backend priority on V100; selecting Flash-V100 should "
-            "keep both prefill and decode on the Flash backend unless an "
-            "explicit diagnostic fallback is requested."
+            "Selects Flash-V100 attention automatically on V100. Default on to "
+            "use the qualified SM70 backend. Set 0 only to diagnose backend "
+            "selection; prefer the engine attention_backend option when "
+            "choosing a backend."
         ),
         category="configuration",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=True,
     ),
     # Enabled by shared SM70 configuration for compatible local operators,
     # independent of the model/quantization label or speculative method.
@@ -7380,33 +7792,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("AWQ/FP8/NVFP4/MXFP4 batch GEMM layouts",),
+        user_visible=False,
     ),
     "VLLM_SM70_PROFILE_TRACE": env_var(
-        lambda: bool(
-            int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))
-            or int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))
+        deprecated_env(
+            "VLLM_SM70_PROFILE_TRACE",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=trace.",
+            lambda: (
+                sm70_debug_enabled("trace", "VLLM_SM70_PROFILE_TRACE")
+                or sm70_debug_enabled("trace", "VLLM_SM70_DECODE_TILE_PROFILE")
+            ),
         ),
         description=(
-            "SM70: profile trace. The consumer locations and unset defaults "
-            "are listed below."
+            "Compatibility alias for VLLM_SM70_DEBUG=trace. Unset stays "
+            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "migrate explicit debugging to the unified channel."
         ),
-        category="debug",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE", "0"))),
-        description=(
-            "SM70: decode event trace. The consumer locations and unset "
-            "defaults are listed below."
+        deprecated_env(
+            "VLLM_SM70_DECODE_EVENT_TRACE",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=events.",
+            lambda: sm70_debug_enabled("events", "VLLM_SM70_DECODE_EVENT_TRACE"),
         ),
-        category="debug",
+        description=(
+            "Compatibility alias for VLLM_SM70_DEBUG=events. Unset stays "
+            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "migrate explicit debugging to the unified channel."
+        ),
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS": env_var(
         lambda: float(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS", "1.0")),
@@ -7419,6 +7846,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1.0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE_EVERY": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_EVERY", "16"))),
@@ -7431,18 +7859,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('16'))",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_PROFILE": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))),
-        description=(
-            "SM70: mtp profile. The consumer locations and unset defaults are "
-            "listed below."
+        deprecated_env(
+            "VLLM_SM70_MTP_PROFILE",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=mtp.",
+            lambda: sm70_debug_enabled("mtp", "VLLM_SM70_MTP_PROFILE"),
         ),
-        category="debug",
+        description=(
+            "Compatibility alias for VLLM_SM70_DEBUG=mtp. Unset stays "
+            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "migrate explicit debugging to the unified channel."
+        ),
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_PROFILE_INTERVAL": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))),
@@ -7455,18 +7891,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('16'))",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0"))),
         description=(
-            "SM70: mtp split draft cudagraphs. The consumer locations and "
-            "unset defaults are listed below."
+            "Separates MTP draft and verifier graph sizes so single-token "
+            "draft graphs remain available. Default enabled by the qualified "
+            "Qwen4Exp MTP engine policy, otherwise off. Set 0 only to diagnose "
+            "graph capture; speculative width is configured through "
+            "speculative_config."
         ),
         category="configuration",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=True,
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
@@ -7482,6 +7923,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_CONTEXT_BUCKETS": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
@@ -7494,6 +7936,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": env_var(
         lambda: os.getenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"),
@@ -7506,6 +7949,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # The private ring changes compressor-state ownership and lifetime. Keep it
     # opt-in until its long-context quality and capacity gates are complete.
@@ -7521,6 +7965,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"),
@@ -7533,6 +7978,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE"),
@@ -7545,6 +7991,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_REJECTION_PROFILE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_PROFILE", "0"))),
@@ -7557,6 +8004,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_REJECTION_PROFILE_INTERVAL": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_REJECTION_PROFILE_INTERVAL", "20"))),
@@ -7569,6 +8017,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('20'))",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_REJECTION_COMBINE_BONUS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1"))),
@@ -7581,6 +8030,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": env_var(
         lambda: bool(int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))),
@@ -7593,6 +8043,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DUMP_STEP_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"),
@@ -7605,6 +8056,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DUMP_STEP_MAX": env_var(
         lambda: int(os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512")),
@@ -7617,6 +8069,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="512",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DUMP_STEP_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS"),
@@ -7629,6 +8082,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU", "0"))),
@@ -7641,6 +8095,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK", "0"))),
@@ -7653,6 +8108,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P", "0"))),
@@ -7665,6 +8121,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE"),
@@ -7677,6 +8134,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE": env_var(
         lambda: float(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE", "1.0")),
@@ -7689,6 +8147,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1.0",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT", "1"))),
@@ -7701,6 +8160,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING"),
@@ -7713,6 +8173,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE": env_var(
         lambda: int(os.getenv("VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE", "0")),
@@ -7725,6 +8186,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE": env_var(
         lambda: int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE", "0")),
@@ -7737,6 +8199,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL": env_var(
         lambda: int(
@@ -7751,6 +8214,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL": env_var(
         lambda: bool(
@@ -7765,6 +8229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU", "0"))),
@@ -7777,6 +8242,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK": env_var(
         lambda: int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK", "0")),
@@ -7789,6 +8255,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DENSE_F16_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_DENSE_F16_FASTPATH", "1"))),
@@ -7801,6 +8268,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_DENSE_F16_ALLOWLIST"),
@@ -7813,6 +8281,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS", "0"))),
@@ -7825,6 +8294,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR", "0"))),
@@ -7837,6 +8307,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", "1"))),
@@ -7849,6 +8320,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING": env_var(
         lambda: bool(
@@ -7863,6 +8335,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX", "0"))),
@@ -7875,45 +8348,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     # Legacy no-MTP TileRT/Mirage planning name. It aliases the broader latest
     # SM70 profile trace gate instead of creating a separate trace surface.
     "VLLM_SM70_DECODE_TILE_PROFILE": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))),
-        description=(
-            "Legacy no-MTP TileRT/Mirage planning name. It aliases the broader"
-            " latest SM70 profile trace gate instead of creating a separate "
-            "trace surface."
+        deprecated_env(
+            "VLLM_SM70_DECODE_TILE_PROFILE",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=trace.",
+            lambda: sm70_debug_enabled("trace", "VLLM_SM70_DECODE_TILE_PROFILE"),
         ),
-        category="debug",
+        description=(
+            "Compatibility alias for VLLM_SM70_DEBUG=trace. Unset stays "
+            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "migrate explicit debugging to the unified channel."
+        ),
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_ROUTE_SUMMARY": env_var(
-        lambda: bool(int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))),
-        description=(
-            "Flash-V100 attention: route summary. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_FLASH_V100_ROUTE_SUMMARY",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=routing.",
+            lambda: sm70_debug_enabled("routing", "VLLM_FLASH_V100_ROUTE_SUMMARY"),
         ),
-        category="configuration",
+        description=(
+            "Compatibility alias for VLLM_SM70_DEBUG=routing. Unset stays "
+            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "migrate explicit debugging to the unified channel."
+        ),
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "0"))),
         description=(
-            "SM70: require profile acceleration. The consumer locations and "
-            "unset defaults are listed below."
+            "Requires the release profile acceleration selfcheck to pass at "
+            "startup. Default off so other models and diagnostic fallbacks can "
+            "start. Set 1 when validating the declared release profile; it "
+            "does not certify that requests hit every kernel."
         ),
         category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Mixed chunked-prefill batches send resident decode and short verification
     # rows through the partitioned paged-decode kernels. This prevents a q=1
@@ -7931,6 +8421,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))),
@@ -7943,6 +8434,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "16384")),
@@ -7955,6 +8447,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="16384",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16", "0"))),
@@ -7967,6 +8460,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DENSE_D256_LOW_SMEM", "0"))),
@@ -7979,6 +8473,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DENSE_D256_WMMA_QK": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DENSE_D256_WMMA_QK", "1"))),
@@ -7991,6 +8486,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1"))),
@@ -8003,6 +8499,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK", "0"))),
@@ -8015,6 +8512,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0"))),
@@ -8027,6 +8525,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1"))),
@@ -8039,6 +8538,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P", "1"))),
@@ -8051,6 +8551,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH": env_var(
         lambda: bool(
@@ -8065,6 +8566,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268": env_var(
         lambda: bool(
@@ -8079,6 +8581,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK": env_var(
         lambda: bool(
@@ -8093,6 +8596,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV": env_var(
         lambda: bool(
@@ -8107,6 +8611,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_FA2_D256_PREFILL": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_FA2_D256_PREFILL", "1"))),
@@ -8119,6 +8624,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE", "1"))),
@@ -8131,6 +8637,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY": env_var(
         lambda: bool(
@@ -8145,6 +8652,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q", "1536")),
@@ -8157,6 +8665,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1536",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV", "8192")),
@@ -8169,6 +8678,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8192",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_GATHER_DENSE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "1"))),
@@ -8181,6 +8691,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q", "4096")),
@@ -8193,6 +8704,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="4096",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV", "8192")),
@@ -8205,6 +8717,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8192",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "1"))),
@@ -8217,6 +8730,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV": env_var(
         lambda: int(
@@ -8231,6 +8745,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32768",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL": env_var(
         lambda: bool(
@@ -8250,20 +8765,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # The qualified Q8000 FP32-accumulated route is the default. Keep v37 as
     # an explicit rollback and matched-control selection.
     "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0"))),
         description=(
-            "The qualified Q8000 FP32-accumulated route is the default. Keep "
-            "v37 as an explicit rollback and matched-control selection."
+            "Selects the legacy v37 D256/GQA prefill implementation. Default "
+            "off because the qualified Q8000 FP32 route is preferred. Set 1 "
+            "only for a matched rollback or a prefill regression "
+            "investigation."
         ),
         category="configuration",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=True,
     ),
     # Reuse decode scratch across row capacities on the same CUDA stream.
     "VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE": env_var(
@@ -8276,6 +8795,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Concatenate auxiliary states directly into the draft projection dtype.
     "VLLM_DFLASH_COMPACT_AUX_HIDDEN": env_var(
@@ -8288,6 +8808,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Native Q8000/Q8192 prefix score capacity; read once per worker workspace.
     # Multiples of 8192 in [8192, 131072]. Use 16384 for the previous capacity.
@@ -8303,6 +8824,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8192",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": env_var(
         lambda: bool(
@@ -8322,6 +8844,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0"))),
@@ -8329,11 +8852,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Flash-V100 attention: prefill split kv. The consumer locations "
             "and unset defaults are listed below."
         ),
-        category="tuning",
+        category="experimental",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS", "32768")),
@@ -8346,6 +8870,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32768",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q", "1")),
@@ -8358,6 +8883,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q", "2048")),
@@ -8370,6 +8896,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="2048",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV", "32768")),
@@ -8382,6 +8909,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32768",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_PREFILL": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_BFLA_PREFILL", "0"))),
@@ -8394,6 +8922,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_MIN_Q": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MIN_Q", "4096")),
@@ -8406,6 +8935,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="4096",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_MIN_KV": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MIN_KV", "32768")),
@@ -8418,6 +8948,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32768",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_MASK_BLOCK_N": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MASK_BLOCK_N", "256")),
@@ -8430,6 +8961,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_KEEP_MASS": env_var(
         lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_KEEP_MASS", "0.99")),
@@ -8442,6 +8974,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0.99",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_KEEP_RATIO": env_var(
         lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_KEEP_RATIO", "0.0")),
@@ -8467,6 +9000,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS", "0")),
@@ -8479,6 +9013,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_THRESHOLD": env_var(
         lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_THRESHOLD", "999")),
@@ -8491,6 +9026,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="999.0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS", "8")),
@@ -8503,6 +9039,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_POOL": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_BFLA_POOL", "flat64"),
@@ -8515,6 +9052,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'flat64'",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_SPEC_STRIDE": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_SPEC_STRIDE", "0")),
@@ -8527,6 +9065,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_SPEC_PROB": env_var(
         lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_SPEC_PROB", "0")),
@@ -8539,6 +9078,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0.0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_BFLA_SPEC_SEED": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_SPEC_SEED", "1")),
@@ -8551,6 +9091,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE", "0"))),
@@ -8563,6 +9104,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0"))),
@@ -8575,6 +9117,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12")),
@@ -8587,6 +9130,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="12",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DFLASH_PREFIX_DUMP": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0"))),
@@ -8599,6 +9143,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # FlashAttention V100 backend tuning/debug switches. These are registered
     # so exactness experiments are reproducible and do not trip unknown-env
@@ -8620,6 +9165,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DISABLE_PAGED_PREFILL": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0"))),
@@ -8632,6 +9178,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0"))),
@@ -8644,6 +9191,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Explicit diagnostic fallback only. The migration goal requires selected
     # Flash-V100 routes to keep both prefill and decode on Flash by default;
@@ -8661,6 +9209,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Emergency/diagnostic fallback only. When Flash-V100 is selected, missing
     # Flash ops or unsupported features should fail loudly by default instead
@@ -8678,6 +9227,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")),
@@ -8707,6 +9257,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")),
@@ -8719,6 +9270,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1"))),
@@ -8731,6 +9283,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE"),
@@ -8743,6 +9296,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_DENSE_REFERENCE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0"))),
@@ -8755,6 +9309,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_DENSE_CACHE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_CACHE", "0"))),
@@ -8767,6 +9322,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL", "0"))),
@@ -8779,6 +9335,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_USE_BHMD_OUT": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_BHMD_OUT", "1"))),
@@ -8791,6 +9348,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0"))),
@@ -8803,6 +9361,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_USE_XQA": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))),
@@ -8815,18 +9374,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Experimental dense single-request small-Q route; not the DFlash2 q8 gate.
     "VLLM_FLASH_V100_E4M3_GROUPED_FP32": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "1"))),
         description=(
-            "Experimental dense single-request small-Q route; not the DFlash2 q8 gate."
+            "Controls grouped E4M3 decode with FP32 accumulation. Default on "
+            "for supported native layouts to retain qualified numerical "
+            "behavior. Set 0 to compare the original grouped-attention route "
+            "during diagnosis."
         ),
         category="experimental",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=True,
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))),
@@ -8848,6 +9412,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Keep batched admission independent until the request-major kernel has
     # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
@@ -8865,6 +9430,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": env_var(
         lambda: int(
@@ -8888,6 +9454,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1"))),
@@ -8900,6 +9467,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS", "1"))),
@@ -8912,6 +9480,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")),
@@ -8924,6 +9493,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32768",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1"))),
@@ -8936,6 +9506,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": env_var(
         lambda: bool(
@@ -8950,6 +9521,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": env_var(
         lambda: int(
@@ -8967,6 +9539,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="111104",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": env_var(
         lambda: int(
@@ -8984,6 +9557,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="147841",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": env_var(
         lambda: int(
@@ -9001,6 +9575,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="258176",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "1"))),
@@ -9013,6 +9588,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS", "8")),
@@ -9020,11 +9596,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Flash-V100 attention: xqa g6 qk pipeline warps. The consumer "
             "locations and unset defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="8",
         effective_default="8",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))),
@@ -9037,6 +9614,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))),
@@ -9049,6 +9627,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))),
@@ -9061,6 +9640,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the scalar
     # paged decoder for matched control runs or emergency rollback.
@@ -9076,6 +9656,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "1"))),
@@ -9088,6 +9669,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH", "1"))),
@@ -9100,6 +9682,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": env_var(
         lambda: bool(
@@ -9114,6 +9697,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))),
@@ -9126,6 +9710,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE": env_var(
         lambda: bool(
@@ -9140,6 +9725,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))),
@@ -9152,6 +9738,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE", "1"))),
@@ -9164,6 +9751,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "61633")),
@@ -9176,6 +9764,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="61633",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": env_var(
         lambda: bool(
@@ -9190,6 +9779,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))),
@@ -9202,6 +9792,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD", "1"))),
@@ -9214,6 +9805,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))),
@@ -9226,6 +9818,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_TRACE_DECODE_ACTIVE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0"))),
@@ -9238,6 +9831,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED", "1"))),
@@ -9250,6 +9844,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR"),
@@ -9262,6 +9857,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS", "0")),
@@ -9274,6 +9870,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR"),
@@ -9286,6 +9883,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS": env_var(
         lambda: int(os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS", "0")),
@@ -9298,6 +9896,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR"),
@@ -9310,6 +9909,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS": env_var(
         lambda: int(
@@ -9324,6 +9924,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="64",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0"))),
@@ -9336,6 +9937,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR"),
@@ -9348,6 +9950,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0")),
@@ -9360,6 +9963,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR"),
@@ -9372,6 +9976,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE"),
@@ -9384,6 +9989,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS"),
@@ -9396,6 +10002,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS", "128")),
@@ -9408,6 +10015,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="128",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR"),
@@ -9420,6 +10028,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE"),
@@ -9432,6 +10041,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS", "0")),
@@ -9444,6 +10054,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS"),
@@ -9456,6 +10067,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_QSA_KV_CALIBRATION_DIR": env_var(
         lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"),
@@ -9468,6 +10080,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD": env_var(
         lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD"),
@@ -9480,6 +10093,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS"),
@@ -9492,6 +10106,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE", "stream"),
@@ -9504,6 +10119,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'stream'",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS"),
@@ -9516,6 +10132,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE", "stream"),
@@ -9528,6 +10145,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'stream'",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR"),
@@ -9540,6 +10158,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE"),
@@ -9552,6 +10171,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS"),
@@ -9564,6 +10184,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS"),
@@ -9576,6 +10197,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS": env_var(
         lambda: int(
@@ -9590,6 +10212,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # 0.0.3 speculative/MTP diagnostics. These are default-off and must not
     # change sampling or model outputs.
@@ -9604,6 +10227,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_SPEC_DUMP_ALIGNMENT_LIMIT": env_var(
         lambda: int(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_LIMIT", "3")),
@@ -9616,6 +10240,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="3",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_SPEC_DUMP_ALIGNMENT_STEPS": env_var(
         lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_STEPS"),
@@ -9628,6 +10253,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_DEBUG_MTP_LOAD": env_var(
         lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
@@ -9640,6 +10266,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_DEBUG_MTP_LOAD_VERBOSE": env_var(
         lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD_VERBOSE", "0"))),
@@ -9652,6 +10279,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_PROFILE": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_PROFILE", "0"))),
@@ -9664,6 +10292,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_PROFILE_LOG_INTERVAL": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH_PROFILE_LOG_INTERVAL", "32"))),
@@ -9676,6 +10305,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('32'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     # Lookup-augmented DFlash2 controller. The lookup itself is enabled by the
     # speculative config's ngram_assist flag; these knobs tune only its
@@ -9692,6 +10322,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_NSTRONG": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))),
@@ -9704,6 +10335,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('6'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_AGREE": env_var(
         lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_AGREE", "0"))),
@@ -9716,6 +10348,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(0, int('0'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4"))),
@@ -9728,6 +10361,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('4'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_LONG_MIN": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_LONG_MIN", "6"))),
@@ -9740,6 +10374,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('6'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_SEARCH": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))),
@@ -9752,6 +10387,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int(str(1 << 30)))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_ENTRY_STREAK", "2"))),
@@ -9764,6 +10400,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(1, int('2'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_STICKY": env_var(
         lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_STICKY", "3"))),
@@ -9776,6 +10413,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(0, int('3'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": env_var(
         lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT", "0"))),
@@ -9788,6 +10426,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: max(0, int('0'))",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DUMP_FIRST_PASS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))),
@@ -9800,6 +10439,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DISABLE_AUX_OUTPUTS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DISABLE_AUX_OUTPUTS", "0"))),
@@ -9812,6 +10452,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_STATE_TABLE": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_STATE_TABLE", "0"))),
@@ -9824,6 +10465,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0"))),
@@ -9836,6 +10478,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": env_var(
         lambda: bool(
@@ -9850,6 +10493,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_FUSED_GDN": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1"))),
@@ -9862,6 +10506,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1"))),
@@ -9874,6 +10519,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": env_var(
         lambda: bool(
@@ -9888,6 +10534,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT", "1"))),
@@ -9900,6 +10547,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR"),
@@ -9912,6 +10560,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ", "0")),
@@ -9924,6 +10573,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ", "0")),
@@ -9936,6 +10586,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS", "32")),
@@ -9948,30 +10599,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
-    ),
-    "VLLM_DFLASH_SYNC_CONTEXT_KV": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_SYNC_CONTEXT_KV", "0"))),
-        description=(
-            "vLLM: dflash sync context kv. The consumer locations and unset "
-            "defaults are listed below."
-        ),
-        category="configuration",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("DFlash2 verifier",),
-    ),
-    "VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE", "0"))),
-        description=(
-            "vLLM: dflash skip context kv precompute. The consumer locations "
-            "and unset defaults are listed below."
-        ),
-        category="configuration",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_CONTEXT_KV": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_CONTEXT_KV", "0"))),
@@ -9984,42 +10612,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
-    ),
-    "VLLM_DFLASH_DUMP_LAYER_HIDDENS": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_LAYER_HIDDENS", "0"))),
-        description=(
-            "vLLM: dflash dump layer hiddens. The consumer locations and unset"
-            " defaults are listed below."
-        ),
-        category="debug",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("DFlash2 verifier",),
-    ),
-    "VLLM_DFLASH_DUMP_LAYER0_COMPONENTS": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_LAYER0_COMPONENTS", "0"))),
-        description=(
-            "vLLM: dflash dump layer0 components. The consumer locations and "
-            "unset defaults are listed below."
-        ),
-        category="debug",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("DFlash2 verifier",),
-    ),
-    "VLLM_DFLASH_DUMP_ATTN_COMPONENTS": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_ATTN_COMPONENTS", "0"))),
-        description=(
-            "vLLM: dflash dump attn components. The consumer locations and "
-            "unset defaults are listed below."
-        ),
-        category="debug",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_CORRUPTION": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_CORRUPTION", "0"))),
@@ -10032,6 +10625,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DUMP_DRAFT_LOGITS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_DRAFT_LOGITS", "0"))),
@@ -10044,6 +10638,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_SPEC_DEBUG_CORRUPTION": env_var(
         lambda: bool(int(os.getenv("VLLM_SPEC_DEBUG_CORRUPTION", "0"))),
@@ -10056,6 +10651,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_SPEC_DUMP_DRAFT_LOGITS": env_var(
         lambda: bool(int(os.getenv("VLLM_SPEC_DUMP_DRAFT_LOGITS", "0"))),
@@ -10068,6 +10664,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy 0.0.3 Mamba/GDN alignment diagnostics. Default-off because it
     # logs per-request state movement and accepted-token correction data.
@@ -10083,6 +10680,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_MAMBA_ALIGN_CPU_POSTPROCESS": env_var(
         lambda: bool(int(os.getenv("VLLM_MAMBA_ALIGN_CPU_POSTPROCESS", "0"))),
@@ -10095,6 +10693,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy 0.0.3 compatibility knob. Latest vLLM no longer has the old
     # Mamba-prefix async-scheduling hard block; see VllmConfig for the no-op
@@ -10111,6 +10710,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy FunAudioChat multimodal embedding diagnostics from 0.0.3.
     # Default-off; when enabled it prints tensor shapes/norms and can dump
@@ -10127,6 +10727,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_FUN_AUDIOCHAT_DUMP_PATH": env_var(
         lambda: os.getenv("VLLM_FUN_AUDIOCHAT_DUMP_PATH", ""),
@@ -10139,6 +10740,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Latest-TRITON attention schedule knobs for SM70. These keep the latest
     # vLLM attention implementation selected and only alter Triton launch
@@ -10160,6 +10762,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 prefill",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE": env_var(
         lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE", "0")),
@@ -10172,6 +10775,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS", "1"))),
@@ -10184,6 +10788,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_NUM_WARPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_NUM_WARPS", "0")),
@@ -10191,11 +10796,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: triton attn num warps. The consumer locations and unset "
             "defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS", "0")),
@@ -10203,11 +10809,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: triton attn prefill num warps. The consumer locations and "
             "unset defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 prefill",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS", "0")),
@@ -10215,11 +10822,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: triton attn decode num warps. The consumer locations and "
             "unset defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION": env_var(
         lambda: os.getenv("VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION"),
@@ -10232,6 +10840,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION": env_var(
         lambda: os.getenv("VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION"),
@@ -10244,6 +10853,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Experimental SM70 GDN/FLA KKT autotune search-space gate.
     "VLLM_SM70_GDN_KKT_SCHEDULE": env_var(
@@ -10264,6 +10874,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_KKT_BK": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_KKT_BK"),
@@ -10271,11 +10882,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: gdn kkt bk. The consumer locations and unset defaults are "
             "listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_KKT_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_KKT_WARPS"),
@@ -10283,11 +10895,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: gdn kkt warps. The consumer locations and unset defaults "
             "are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_KKT_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_KKT_STAGES"),
@@ -10295,11 +10908,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: gdn kkt stages. The consumer locations and unset defaults "
             "are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Experimental SM70 GDN/FLA delta-state autotune search-space gate.
     "VLLM_SM70_GDN_DELTA_H_SCHEDULE": env_var(
@@ -10320,6 +10934,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_DELTA_H_BV": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_BV"),
@@ -10327,11 +10942,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: gdn delta h bv. The consumer locations and unset defaults "
             "are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_DELTA_H_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_WARPS"),
@@ -10339,11 +10955,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: gdn delta h warps. The consumer locations and unset "
             "defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_DELTA_H_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_STAGES"),
@@ -10351,11 +10968,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: gdn delta h stages. The consumer locations and unset "
             "defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Experimental SM70 GDN/FLA output chunk autotune search-space gate.
     "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": env_var(
@@ -10363,7 +10981,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "Experimental SM70 GDN/FLA output chunk autotune search-space gate."
         ),
-        category="tuning",
+        category="experimental",
         declared_default="True",
         effective_default=(
             "True; configuration may replace the unset default under the "
@@ -10378,6 +10996,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_CHUNK_O_BK": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BK"),
@@ -10390,6 +11009,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_CHUNK_O_BV": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BV"),
@@ -10402,6 +11022,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_CHUNK_O_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_WARPS"),
@@ -10414,6 +11035,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_CHUNK_O_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_STAGES"),
@@ -10426,6 +11048,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only correctness gate: compare latest prefill prep against
     # the 0.0.3-style q/k/v split plus fused_gdn_gating path.
@@ -10435,11 +11058,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Diagnostic-only correctness gate: compare latest prefill prep "
             "against the 0.0.3-style q/k/v split plus fused_gdn_gating path."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: materialize the GDN output-projection z slice before
     # the GDN core custom-op boundary to test compile-time view/lifetime bugs.
@@ -10450,11 +11074,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "before the GDN core custom-op boundary to test compile-time "
             "view/lifetime bugs."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: restore 0.0.3-style materialization of the packed
     # Qwen3.5 GDN q/k/v slice before the custom-op boundary. This tests
@@ -10469,11 +11094,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "causal_conv1d_update can corrupt long MTP/spec-decode runs under "
             "compile/FULL graph."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: route Qwen3.5 GDN core through the 0.0.3-style
     # context-resolved custom-op boundary. This keeps cache tensors hidden
@@ -10488,11 +11114,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "explicit cache boundary changes MTP recurrent-state semantics "
             "under FULL graph."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic force-on for the SM70 Qwen GDN opaque full-forward boundary.
     # The automatic default is armed only for active MTP spec-decode batches so
@@ -10510,6 +11137,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic escape hatch for comparing the latest split Qwen GDN compile
     # boundary against the default full-forward quality guard.
@@ -10524,6 +11152,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Experimental active-MTP quality/speed lane: keep the SM70 0.0.3
     # FULL_AND_PIECEWISE compile policy, but skip FULL cudagraph replay for
@@ -10543,6 +11172,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Experimental SM70 MTP target: keep Qwen GDN input/output projections in
     # the compiled graph and isolate only the spec-aware recurrent core. The
@@ -10562,6 +11192,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: active-MTP 0.0.3-style recurrent-core boundary. This
     # consumes live forward-context GDN metadata like the 0.0.3 quality-positive
@@ -10574,11 +11205,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "quality-positive path while keeping latest explicit cache "
             "mutation args for graph safety."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Unsafe diagnostic override. The 0.0.3-style recurrent-core boundary is
     # quality-unsafe for native Qwen3.5 MTP with num_speculative_tokens >= 3
@@ -10596,6 +11228,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: keep Qwen GDN input projection plus recurrent core
     # behind an opaque custom-op boundary while leaving output projection in
@@ -10608,11 +11241,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "projection in the latest compiled path. This was not sufficient "
             "for long MTP quality."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic escape hatch for comparing the split latest Qwen GDN compile
     # boundary against the default full-forward quality guard.
@@ -10627,6 +11261,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: keep only Qwen GDN input projection/splitting behind an
     # opaque custom-op boundary while leaving the recurrent core and output
@@ -10638,11 +11273,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "behind an opaque custom-op boundary while leaving the recurrent "
             "core and output projection in the latest split path."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Diagnostic-only: keep only the Qwen GDN RMSNorm/output projection segment
     # behind an opaque custom-op boundary while leaving input projection and the
@@ -10654,11 +11290,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             " segment behind an opaque custom-op boundary while leaving input "
             "projection and the recurrent core in the latest split path."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Exact-shape SM70 GDN decode fusions. The measured workload is evidence,
     # not a model-identity selector; runtime admission uses operator contracts.
@@ -10674,6 +11311,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_RMSNORM_ONEPASS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0"))),
@@ -10686,6 +11324,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Fuse the native FP32 N128 gated RMSNorm chain without changing its
     # vector4 mean reduction, sigmoid/SiLU, or FP16 output boundary.
@@ -10710,6 +11349,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Flash-Next ordinary decode or MTP quality qualification",
         ),
         acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
@@ -10719,11 +11359,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an "
             "opaque custom-op boundary under the SM70 compile/FULL graph lane."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Diagnostic-only: restore the 0.0.3-style PyTorch Gemma RMSNorm arithmetic
     # inside torch.compile so Inductor can fuse the surrounding elementwise work.
@@ -10734,7 +11375,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "arithmetic inside torch.compile so Inductor can fuse the "
             "surrounding elementwise work."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default=(
             "False; configuration may replace the unset default under the "
@@ -10749,6 +11390,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks.
     "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": env_var(
@@ -10761,6 +11403,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 prefill",),
+        user_visible=False,
     ),
     # Experimental SM70 fused sigmoid gating launch schedule. Default-off and
     # BV-only unless WARPS/STAGES are explicitly overridden; multi-warp changes
@@ -10788,6 +11431,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FUSED_SIGMOID_GATING_BV": env_var(
         lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_BV"),
@@ -10795,11 +11439,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: fused sigmoid gating bv. The consumer locations and unset "
             "defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_WARPS"),
@@ -10807,11 +11452,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: fused sigmoid gating warps. The consumer locations and "
             "unset defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_STAGES"),
@@ -10819,11 +11465,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: fused sigmoid gating stages. The consumer locations and "
             "unset defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Legacy 0.0.3 coarse Qwen3Next fused-sigmoid gate. Latest splits this
     # into recurrent schedule and mixed-QKV controls; keep the old name visible
@@ -10841,6 +11488,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # SM70 FlashQLA decode route for Qwen GDN. Default-on for SM70 migration
     # baselines; route checks still verify platform, dtype, head shape, and
@@ -10868,6 +11516,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashQLA",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG", "0"))),
@@ -10880,6 +11529,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashQLA",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLASHQLA_DECODE_WARMUP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FLASHQLA_DECODE_WARMUP", "1"))),
@@ -10892,6 +11542,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashQLA",),
+        user_visible=False,
     ),
     # Experimental packed-QKV GDN decode loader, also reused by the small
     # SM70 fused MTP verifier. Model routing remains default-off until its
@@ -10911,6 +11562,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE", "0"))),
@@ -10923,6 +11575,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Paused old experiment: changing GDN core output allocation from zeros to
     # empty lacked route-hit and quality proof. Keep visible but do not enable.
@@ -10938,6 +11591,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     # Legacy Qwen3Next shared-MoE overlap gates from 0.0.3. Latest upstream
     # FusedMoE already enables shared_experts stream overlap when eligible;
@@ -10945,10 +11599,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": env_var(
         lambda: bool(int(os.getenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0"))),
         description=(
-            "Legacy Qwen3Next shared-MoE overlap gates from 0.0.3. Latest "
-            "upstream FusedMoE already enables shared_experts stream overlap "
-            "when eligible; the disable gate is still honored by the Qwen3Next"
-            " model hook."
+            "Allows shared-expert stream overlap on eligible "
+            "Qwen3Next/Qwen4Exp layers. Default enabled by the Qwen4Exp "
+            "policy, otherwise the standalone getter is off. Set 0 to diagnose "
+            "stream ordering; placement and DBO guards still decide "
+            "eligibility."
         ),
         category="configuration",
         declared_default="False",
@@ -10963,7 +11618,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     "VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP": env_var(
         lambda: bool(
@@ -10978,6 +11634,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))),
@@ -10990,6 +11647,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Default-on decode tiles for the audited exact-shape SM70 MTP contracts.
     # Larger or unmatched token shapes retain the 0.0.3 config; setting this
@@ -11006,6 +11664,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
     # BM2 Triton accumulation order, original weights, and FP16 boundaries.
@@ -11024,6 +11683,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on
@@ -11044,6 +11704,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # SM70/V100 production-candidate CUDA graph policy. This explicitly maps
     # to the generic breakable cudagraph path only after config verifies that
@@ -11063,6 +11724,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Recreate the 0.0.3 SM70 Flash-V100 production graph policy for baseline
     # recovery: VLLM_COMPILE + FULL_AND_PIECEWISE with small decode captures.
@@ -11086,6 +11748,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Exact Qwen3.8 TP4 lane: trace the large dynamic prefill backbone and the
     # small FULL decode backbone independently while sharing parameters/KV.
@@ -11122,6 +11785,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
     # uses the asynchronous CPU/disk-mmap offload result.
@@ -11131,8 +11795,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             in ("1", "true", "yes", "on")
         ),
         description=(
-            "Keep local pinned-host PLE shards for Qwen3.8 decode while its "
-            "prefill uses the asynchronous CPU/disk-mmap offload result."
+            "Keeps local pinned-host PLE shards for decode while prefill uses "
+            "CPU/disk offload. Default enabled by the eligible Qwen4Exp engine "
+            "policy, otherwise off. Set 0 only to compare PLE placement when "
+            "diagnosing host-memory or transfer behavior."
         ),
         category="configuration",
         declared_default="False",
@@ -11148,6 +11814,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
     # disables AOT cache reload by default due known token drift, but long
@@ -11168,11 +11835,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "drift, but long profiler runs need an explicit way to reuse "
             "compile artifacts."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # Optional 0.0.3 VLLM_COMPILE graph-preset parity knob. Keep it default-off:
     # 27B-FP8 timing showed no speed recovery and changed greedy token hashes.
@@ -11196,32 +11864,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Standalone default remains off for diagnostics. The SM70 Flash-V100
-    # 0.0.3 compile-graph policy forces benchmark_combo_kernel=True because
-    # the unbenchmarked combo-kernel choice reproduced greedy token drift.
-    "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL": env_var(
-        lambda: bool(
-            os.getenv(
-                "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL",
-                "0",
-            )
-            .strip()
-            .lower()
-            in ("1", "true", "yes", "on")
-        ),
-        description=(
-            "Standalone default remains off for diagnostics. The SM70 "
-            "Flash-V100 0.0.3 compile-graph policy forces "
-            "benchmark_combo_kernel=True because the unbenchmarked "
-            "combo-kernel choice reproduced greedy token drift."
-        ),
-        category="configuration",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("FlashAttentionV100Backend",),
-    ),
     # During memory profiling, run the 1024-token dummy batch eagerly so the
     # production compile/cudagraph path is first exercised by small decode
     # capture sizes instead of the max prefill profile shape.
@@ -11246,6 +11891,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Experimental only. Old 0.0.3 Flash-V100 logs only captured decode FULL
     # graphs even though the policy name was FULL_AND_PIECEWISE. Skipping
@@ -11275,6 +11921,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # SM70 Flash-V100 production default: use the recovered 0.0.3-style
     # VLLM_COMPILE + FULL_AND_PIECEWISE graph path. Set
@@ -11301,6 +11948,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE": env_var(
         lambda: int(os.getenv("VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE", "1")),
@@ -11313,6 +11961,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     # Experimental SM70 fused recurrent GDN/FLA decode schedule. The legacy
     # VLLM_SM70_FLA_* overrides are registered for 0.0.3 migration parity, but
@@ -11340,17 +11989,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLA_BV": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_BV"),
         description=(
             "SM70: fla bv. The consumer locations and unset defaults are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLA_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_WARPS"),
@@ -11358,11 +12009,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: fla warps. The consumer locations and unset defaults are "
             "listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLA_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_STAGES"),
@@ -11370,11 +12022,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: fla stages. The consumer locations and unset defaults are "
             "listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLA_TARGET_WAVES": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_TARGET_WAVES"),
@@ -11382,11 +12035,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: fla target waves. The consumer locations and unset defaults"
             " are listed below."
         ),
-        category="configuration",
+        category="tuning",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLA_BV_CANDIDATES": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_BV_CANDIDATES"),
@@ -11399,6 +12053,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": env_var(
@@ -11412,6 +12067,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # We assume drivers can report p2p status correctly.
     # If the program hangs when using custom allreduce,
@@ -11435,6 +12091,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
@@ -11460,6 +12117,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))),
@@ -11482,6 +12140,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": env_var(
@@ -11492,6 +12151,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
@@ -11506,6 +12166,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
@@ -11520,6 +12181,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter paged attention.
     # By default is disabled.
@@ -11534,6 +12196,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
@@ -11553,6 +12216,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter moe ops.
     # By default is enabled.
@@ -11564,6 +12228,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # MoE sorting dispatch policy for AITER fused MoE kernels.
     #   0 = auto (default): single-pass for small batches, multi-pass
@@ -11589,6 +12254,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": env_var(
@@ -11601,6 +12267,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter mla ops.
     # By default is enabled.
@@ -11612,6 +12279,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter mha ops.
     # By default is enabled.
@@ -11623,6 +12291,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.
@@ -11637,6 +12306,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter rope.
     # By default is disabled.
@@ -11651,6 +12321,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter triton fp8 bmm kernel
     # By default is enabled.
@@ -11664,6 +12335,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter triton fp4 bmm kernel
     # By default is enabled.
@@ -11677,6 +12349,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": env_var(
@@ -11690,6 +12363,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter fusion shared experts ops.
     # By default is disabled.
@@ -11706,6 +12380,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
@@ -11722,6 +12397,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": env_var(
@@ -11732,6 +12408,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": env_var(
@@ -11742,6 +12419,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Pad the weights for the moe kernel
     "VLLM_ROCM_MOE_PADDING": env_var(
@@ -11752,6 +12430,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": env_var(
@@ -11765,6 +12444,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy ROCm opt-out for the custom paged attention selector. Default-on
     # preserves latest upstream behavior; setting it false restores the old
@@ -11784,6 +12464,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy benchmark harness knob from 0.0.3. Latest vLLM routes
     # vllm.engine.llm_engine directly to the V1 engine, so this remains a
@@ -11800,6 +12481,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
@@ -11820,6 +12502,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'NONE'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Due to the lack of the bfloat16 asm instruction, bfloat16
@@ -11841,6 +12524,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Custom quick allreduce kernel for MI3* cards.
     # Controls the maximum allowed number of data bytes(MB) for custom quick
@@ -11863,6 +12547,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_int(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Custom quick allreduce kernel for MI3* cards.
     # Controls the minimum allowed number of data bytes(MB) required to use
@@ -11883,6 +12568,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_int(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Controls the minimum tensor size (KB, where 1 KB = 1024 bytes) required
     # to use the configured QuickReduce codec. Smaller tensors use FP
@@ -11902,6 +12588,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_int(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT": env_var(
@@ -11914,6 +12601,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="200",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Divisor for dynamic key scale factor calculation for FP8 KV Cache
     "K_SCALE_CONSTANT": env_var(
@@ -11924,6 +12612,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="200",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Divisor for dynamic value scale factor calculation for FP8 KV Cache
     "V_SCALE_CONSTANT": env_var(
@@ -11936,6 +12625,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="100",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, enable multiprocessing in LLM for the V1 code path.
     "VLLM_ENABLE_V1_MULTIPROCESSING": env_var(
@@ -11946,6 +12636,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_LOG_BATCHSIZE_INTERVAL": env_var(
         lambda: float(os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")),
@@ -11958,6 +12649,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="-1.0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_DISABLE_COMPILE_CACHE": env_var(
         disable_compile_cache,
@@ -11970,6 +12662,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed by disable_compile_cache",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to "0", disable LayerName opaque type for layer_name
     # parameters in custom ops.  Defaults to enabled on torch >= 2.11.
@@ -11984,6 +12677,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, use the Rust frontend binary instead of the Python API server
     # process(es).
@@ -11998,6 +12692,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Path to the Rust frontend binary. Defaults to "auto" which discovers
     # the binary installed with the vllm package. Only used when
@@ -12014,6 +12709,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: _resolve_rust_frontend_path()",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vllm will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
@@ -12030,6 +12726,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
@@ -12053,6 +12750,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="128",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": env_var(
@@ -12063,6 +12761,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
@@ -12081,6 +12780,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1.0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Bundle indices for Ray, if it is set, it can control precisely
     # which indices are used for the Ray bundle, for every worker.
@@ -12097,6 +12797,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
@@ -12112,6 +12813,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": env_var(
@@ -12122,6 +12824,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Rank of the process in the data parallel setting.
     # Defaults to VLLM_DP_RANK when not set.
@@ -12138,6 +12841,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="When unset: int(sys.modules[__name__].VLLM_DP_RANK)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # World size of the data parallel setting
     "VLLM_DP_SIZE": env_var(
@@ -12148,6 +12852,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # IP address of the master node in the data parallel setting
     "VLLM_DP_MASTER_IP": env_var(
@@ -12158,6 +12863,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'127.0.0.1'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Port of the master node in the data parallel setting
     "VLLM_DP_MASTER_PORT": env_var(
@@ -12168,6 +12874,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Randomize inputs during dummy runs when using Data Parallel
     "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": env_var(
@@ -12178,6 +12885,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Strategy to pack the data parallel ranks for Ray.
     # Available options:
@@ -12208,6 +12916,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'strict'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Comma-separated *additional* prefixes of env vars to copy from the
     # driver to Ray workers.  These are merged with the built-in defaults
@@ -12225,6 +12934,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Comma-separated *additional* individual env var names to copy from
     # the driver to Ray workers.  Merged with the built-in defaults
@@ -12243,6 +12953,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use S3 path for model loading in CI via RunAI Streamer
     "VLLM_CI_USE_S3": env_var(
@@ -12253,6 +12964,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Use model_redirect to redirect the model name to a local folder.
     # `model_redirect` can be a json file mapping the model between
@@ -12274,6 +12986,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
     "VLLM_MARLIN_USE_ATOMIC_ADD": env_var(
@@ -12284,6 +12997,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use marlin kernel in mxfp4 quantization method
     # Deprecated: use --moe-backend marlin (MoE) or --linear-backend marlin
@@ -12310,6 +13024,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_var(
@@ -12320,6 +13035,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": env_var(
@@ -12332,6 +13048,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_json_str_or_file(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # The activation dtype config for humming kernel
     "VLLM_HUMMING_INPUT_QUANT_CONFIG": env_var(
@@ -12344,6 +13061,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_json_str_or_file(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use fp16 accumulator mma
     "VLLM_HUMMING_USE_F16_ACCUM": env_var(
@@ -12354,6 +13072,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_bool('0')",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use indexed gemm for humming moe
     # if 1, force use indexed gemm
@@ -12371,6 +13090,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
@@ -12387,6 +13107,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to turn on the outlines cache for V1
     # This cache is unbounded and on disk, so it's not safe to use in
@@ -12403,6 +13124,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Gap between padding buckets for the forward pass. So we have
     # 8, we will run forward pass with [16, 24, 32, ...].
@@ -12425,6 +13147,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_TPU_MOST_MODEL_LEN": env_var(
         lambda: maybe_convert_int(os.environ.get("VLLM_TPU_MOST_MODEL_LEN", None)),
@@ -12437,6 +13160,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_int(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether using Pathways
     "VLLM_TPU_USING_PATHWAYS": env_var(
@@ -12447,6 +13171,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of DeepGemm kernels for fused moe ops.
     "VLLM_USE_DEEP_GEMM": env_var(
@@ -12457,6 +13182,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
     "VLLM_MOE_USE_DEEP_GEMM": env_var(
@@ -12469,6 +13195,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs.
     "VLLM_USE_DEEP_GEMM_E8M0": env_var(
@@ -12481,6 +13208,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": env_var(
@@ -12491,6 +13219,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
@@ -12529,6 +13258,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'relax'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": env_var(
@@ -12539,6 +13269,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
@@ -12553,6 +13284,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of FlashInfer BF16 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -12572,6 +13304,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of FlashInfer FP8 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -12591,6 +13324,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of FlashInfer NVFP4 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -12611,6 +13345,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": env_var(
@@ -12621,6 +13356,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to 1, use the FlashInfer
     # MXFP8 (activation) x MXFP4 (weight) MoE backend.
@@ -12645,6 +13381,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to 1, use the FlashInfer CUTLASS backend for
     # MXFP8 (activation) x MXFP4 (weight) MoE.
@@ -12671,6 +13408,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to 1, use the FlashInfer
     # BF16 (activation) x MXFP4 (weight) MoE backend.
@@ -12692,6 +13430,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
@@ -12708,6 +13447,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="512",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
@@ -12732,6 +13472,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, allow insecure serialization using pickle.
     # This is useful for environments where it is deemed safe to use the
@@ -12748,6 +13489,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Temporary: skip adding random suffix to internal request IDs. May be
     # needed for KV connectors that match request IDs across instances.
@@ -12763,6 +13505,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # IP address used for NIXL handshake between remote agents.
     "VLLM_NIXL_SIDE_CHANNEL_HOST": env_var(
@@ -12773,6 +13516,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'localhost'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Port used for NIXL handshake between remote agents.
     "VLLM_NIXL_SIDE_CHANNEL_PORT": env_var(
@@ -12783,6 +13527,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="5600",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Port used for Mooncake handshake between remote agents.
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": env_var(
@@ -12793,6 +13538,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="8998",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Log per-batch memory/disk tier breakdown on external GETs.
     "VLLM_MOONCAKE_STORE_TIER_LOG": env_var(
@@ -12805,6 +13551,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
     "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": env_var(
@@ -12817,6 +13564,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0.9",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Pin this rank to a specific owner segment ("host:port").
     "MOONCAKE_PREFERRED_SEGMENT": env_var(
@@ -12827,6 +13575,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Override the hostname the rank registers as a Mooncake requester.
     "MOONCAKE_REQUESTER_LOCAL_HOSTNAME": env_var(
@@ -12837,6 +13586,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Flashinfer MoE backend for vLLM's fused Mixture-of-Experts support.
     # Both require compute capability 10.0 or above.
@@ -12872,6 +13622,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("'latency'"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": env_var(
@@ -12882,6 +13633,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_var(
@@ -12896,6 +13648,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'auto'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": env_var(
@@ -12908,6 +13661,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="413138944",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
@@ -12926,6 +13680,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="163840",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Specifies the thresholds of the communicated tensor sizes under which
     # vllm should use flashinfer fused allreduce. The variable should be a
@@ -12949,6 +13704,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: json.loads('{}')",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # MoE routing strategy selector.
     # See `RoutingSimulator.get_available_strategies()` # for available
@@ -12970,6 +13726,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Regex timeout for use by the vLLM tool parsing plugins.
     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": env_var(
@@ -12980,6 +13737,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
@@ -12996,6 +13754,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="16",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout in seconds for execute_model RPC calls in multiprocessing
     # executor (only applies when TP > 1).
@@ -13010,6 +13769,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="300",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # KV Cache layout used throughout vllm.
     # Some common values are:
@@ -13032,6 +13792,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
@@ -13050,6 +13811,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable checking whether the generated logits contain NaNs,
     # indicating corrupted output. Useful for debugging low level bugs
@@ -13066,6 +13828,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Controls whether or not emulations are used for NVFP4
     # generations on machines < 100 for compressed-tensors
@@ -13088,6 +13851,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": env_var(
@@ -13100,6 +13864,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="480",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, it means we pre-downloaded cubin files and flashinfer will
     # read the cubin files directly.
@@ -13114,6 +13879,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Supported options:
     # - "flashinfer-cudnn": use flashinfer cudnn GEMM backend
@@ -13161,6 +13927,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
@@ -13177,6 +13944,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": env_var(
@@ -13187,6 +13955,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Used to set the process name prefix for vLLM processes.
     # This is useful for debugging and monitoring purposes.
@@ -13203,6 +13972,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'VLLM'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow chunked local attention with hybrid kv cache manager.
     # Currently using the Hybrid KV cache manager with chunked local attention
@@ -13230,6 +14000,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enables support for the "store" option in the OpenAI Responses API.
     # When set to 1, vLLM's OpenAI server will retain the input and output
@@ -13257,6 +14028,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set, use the fp8 mfma in rocm paged attention.
     "VLLM_ROCM_FP8_MFMA_PAGE_ATTN": env_var(
@@ -13267,6 +14039,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use pytorch symmetric memory for allreduce
     "VLLM_ALLREDUCE_USE_SYMM_MEM": env_var(
@@ -13277,6 +14050,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to use FlashInfer allreduce
     "VLLM_ALLREDUCE_USE_FLASHINFER": env_var(
@@ -13287,6 +14061,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": env_var(
@@ -13299,6 +14074,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # User override folder for tuned Triton-kernel configs. Shared by MoE,
     # Mamba SSU, and LoRA. Filenames are distinct so one folder can hold all.
@@ -13318,6 +14094,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Valid values are container,code_interpreter,web_search_preview
     # ex VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter
@@ -13345,6 +14122,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allows harmony instructions to be injected on system messages
     "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": env_var(
@@ -13355,6 +14133,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces
@@ -13375,6 +14154,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable automatic retry when tool call JSON parsing fails
     # If enabled, returns an error message to the model to retry
@@ -13391,6 +14171,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # When 1,the model structural tags will be used to enforce the model
     # output conforming to the model's tool-calling format and schema.
@@ -13407,6 +14188,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": env_var(
@@ -13419,6 +14201,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Add optional nvtx scopes for profiling, disable to avoid overheads
     "VLLM_NVTX_SCOPES_FOR_PROFILING": env_var(
@@ -13431,6 +14214,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.
@@ -13446,6 +14230,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".
@@ -13471,6 +14256,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # The size in MB of the buffers (NVL and RDMA) used by DeepEP
     "VLLM_DEEPEP_BUFFER_SIZE_MB": env_var(
@@ -13481,6 +14267,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1024",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
@@ -13499,6 +14286,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Allow DeepEP to use MNNVL (multi-node nvlink) for internode_ll kernel,
     # turn this for better latency on GB200 like system
@@ -13513,6 +14301,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # The number of SMs/CUs to allocate for communication kernels when
     # running DBO; the rest will be allocated to compute.
@@ -13541,6 +14330,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config
     # to compile static shapes passed from compile_sizes in compilation_config
@@ -13558,6 +14348,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to 1, enable coordinate_descent_tuning;
     # By default, this is enabled (1)
@@ -13574,6 +14365,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Flag to enable NCCL symmetric memory allocation and registration
     "VLLM_USE_NCCL_SYMM_MEM": env_var(
@@ -13584,6 +14376,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": env_var(
@@ -13594,6 +14387,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Flag to enable FBGemm kernels on model execution
     # Deprecated: use --linear-backend fbgemm instead.
@@ -13613,6 +14407,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("False"),
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # GC debug config
     # - VLLM_GC_DEBUG=0: disable GC debugger
@@ -13632,6 +14427,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Debug workspace allocations.
     # logging of workspace resize operations.
@@ -13645,6 +14441,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": env_var(
@@ -13657,6 +14454,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
@@ -13675,6 +14473,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="256",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
@@ -13702,6 +14501,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="1024",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Format for saving torch.compile cache artifacts
     # - "binary": saves as binary file
@@ -13726,6 +14526,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="'binary'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": env_var(
@@ -13738,6 +14539,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="Computed when unset: maybe_convert_bool(None)",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Run n-gram PLE lookup in a dedicated CPU offload worker. The initial
     # implementation supports ModelRunner V1/V2 and node-local MP DP/TP.
@@ -13762,6 +14564,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Retain Qwen4Exp PLE safetensor shards as file-backed mappings instead of
     # copying the complete learned n-gram table into anonymous host memory.
@@ -13786,6 +14589,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Number of cross-shard mmap gather workers. Zero selects a bounded
     # hardware-aware default.
@@ -13800,6 +14604,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_PLE_DISK_OFFLOAD_PROFILE": env_var(
         lambda: (
@@ -13814,6 +14619,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Keep the latency-critical PLE lookup process on the NUMA node local to
     # its first visible GPU. This changes CPU placement only; allocations use
@@ -13834,6 +14640,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Fault PLE table pages back into RAM after GPU workers finish loading.
     # Concurrent checkpoint loading can otherwise leave anonymous table pages
@@ -13851,6 +14658,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": env_var(
@@ -13861,6 +14669,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="600.0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel rank,
     # for the part of the FP8 n-gram table that does not stay in device
@@ -13874,17 +14683,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
             else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0"))
         ),
         description=(
-            "Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel"
-            " rank, for the part of the FP8 n-gram table that does not stay in"
-            ' device memory. Unset or "auto": derived from the device headroom'
-            " left beside the weights and the KV cache of the requested "
-            "context."
+            "Sets pinned-host PLE memory in GiB per TP rank. Default automatic "
+            "from actual table size and available host memory, avoiding a "
+            "checkpoint-specific manual budget. Set an explicit limit when "
+            "sharing host RAM or reproducing a fixed-memory deployment."
         ),
         category="configuration",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=True,
     ),
     # Device memory in GiB the automatic PLE placement keeps free for the
     # activation peak and the CUDA graph pool. Unset: 8 % of the device,
@@ -13905,6 +14714,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Host memory in GiB the automatic PLE placement leaves untouched for the
     # engine processes, checkpoint loading and other tenants; the rest is
@@ -13927,6 +14737,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
@@ -13943,6 +14754,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": env_var(
@@ -13953,6 +14765,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": env_var(
@@ -13963,6 +14776,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disable using UVA (Unified Virtual Addressing) for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": env_var(
@@ -13975,6 +14789,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disable logging of vLLM logo at server startup time.
     "VLLM_DISABLE_LOG_LOGO": env_var(
@@ -13985,6 +14800,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
@@ -13999,6 +14815,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable CUDA compatibility mode for datacenter GPUs with older
     # driver versions than the CUDA toolkit major version of vLLM.
@@ -14016,6 +14833,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Path to the CUDA compatibility libraries when CUDA compatibility is enabled.
     "VLLM_CUDA_COMPATIBILITY_PATH": env_var(
@@ -14029,6 +14847,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Skip model name validation in OpenAI API requests.
     # When set to 1, any model name will be accepted in the 'model' field
@@ -14051,6 +14870,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether it is a scale up launch engine for elastic EP,
     # Should only be set by EngineCoreClient.
@@ -14065,6 +14885,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to wait for all requests to drain before sending the
     # scaling command in elastic EP.
@@ -14079,6 +14900,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to 1, enable CUDA graph memory estimation during memory profiling.
     # This profiles CUDA graph memory usage to provide more accurate KV cache
@@ -14110,6 +14932,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Explicit CUDA graph memory reservation for the V2 GPU model runner,
     # which does not profile graph memory yet. The default preserves upstream
@@ -14128,6 +14951,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="0.0",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": env_var(
@@ -14138,6 +14962,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="32",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": env_var(
@@ -14148,6 +14973,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": env_var(
@@ -14158,6 +14984,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": env_var(
@@ -14168,6 +14995,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
@@ -14184,6 +15012,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
@@ -14198,6 +15027,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Legacy 0.0.3 mp broadcast idle-wait knob. Latest upstream replaced the
     # old SpinTimer/SpinSleepTimer split with SpinCondition, which already
@@ -14217,6 +15047,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
@@ -14231,6 +15062,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Comma-separated list of env vars to set from the GPU-NIC mapping.
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
@@ -14248,6 +15080,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="''",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_CPU_CI_ENV": env_var(
         lambda: os.getenv("VLLM_CPU_CI_ENV"),
@@ -14257,6 +15090,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'0' at vllm/platforms/cpu.py:check_and_update_config",),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_CPU_SIM_MULTI_NUMA": env_var(
         lambda: os.getenv("VLLM_CPU_SIM_MULTI_NUMA"),
@@ -14266,6 +15100,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'0' at vllm/utils/ompmultiprocessing.py:__init__",),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_CUTLASS_SRC_DIR": env_var(
         lambda: os.getenv("VLLM_CUTLASS_SRC_DIR"),
@@ -14284,6 +15119,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH"),
@@ -14301,6 +15137,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_CONV_KERNEL": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_CONV_KERNEL"),
@@ -14317,6 +15154,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD"),
@@ -14334,6 +15172,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE"),
@@ -14351,6 +15190,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD"),
@@ -14368,6 +15208,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE"),
@@ -14385,6 +15226,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENGINE_PROFILE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE"),
@@ -14400,6 +15242,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'0' at vllm/v1/engine/core.py:post_step",
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG"),
@@ -14412,6 +15255,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'0' at vllm/v1/attention/backends/gdn_attn.py:_miss",),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT"),
@@ -14429,6 +15273,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON"),
@@ -14446,6 +15291,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON"),
@@ -14463,6 +15309,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_GPU_SAMPLER": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_GPU_SAMPLER"),
@@ -14478,6 +15325,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1' at vllm/v1/worker/gpu_model_runner.py:_sample",
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_LINEAR_GDN": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_LINEAR_GDN"),
@@ -14495,6 +15343,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH"),
@@ -14512,6 +15361,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_METADATA_PROFILE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE"),
@@ -14533,6 +15383,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE"),
@@ -14550,6 +15401,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER"),
@@ -14568,6 +15420,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS"),
@@ -14585,6 +15438,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT"),
@@ -14602,6 +15456,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PROFILE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_PROFILE"),
@@ -14619,6 +15474,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_QLA_GDN": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_QLA_GDN"),
@@ -14636,6 +15492,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_SERIAL_GDN": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_SERIAL_GDN"),
@@ -14653,6 +15510,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT"),
@@ -14670,6 +15528,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS"),
@@ -14684,6 +15543,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX"),
@@ -14701,6 +15561,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP"),
@@ -14718,6 +15579,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRACE_JSONL": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL"),
@@ -14743,6 +15605,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "None at vllm/v1/attention/backends/gdn_attn.py:_ddtree_trace_path",
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF"),
@@ -14760,6 +15623,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRITON_SAMPLER": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_TRITON_SAMPLER"),
@@ -14781,6 +15645,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE"),
@@ -14802,6 +15667,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT"),
@@ -14819,6 +15685,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK"),
@@ -14836,6 +15703,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_WORKER_PROFILE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE"),
@@ -14878,6 +15746,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_COORD_TRACE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE"),
@@ -14896,6 +15765,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'0' at vllm/models/glm5next/sm70/sparse.py:module",
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT"),
@@ -14908,6 +15778,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'2' at vllm/models/glm5next/nvidia/model.py:__init__",),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_PROPOSAL_STAGES": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES"),
@@ -14924,6 +15795,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'0' at vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:__init__"),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE"),
@@ -14940,6 +15812,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'0' at vllm/models/glm5next/nvidia/kda.py:module",
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_TARGET_LOGITS": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_TARGET_LOGITS"),
@@ -14952,6 +15825,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'0' at vllm/v1/worker/gpu/model_runner.py:sample",),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION"),
@@ -14976,6 +15850,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'8' at vllm/v1/worker/gpu/model_runner.py:sample",
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR"),
@@ -14991,6 +15866,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'' at vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:__init__"),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT": env_var(
         lambda: os.getenv("VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT"),
@@ -15005,6 +15881,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'2' at vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:__init__"),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_DIST_IDENT": env_var(
         lambda: os.getenv("VLLM_DIST_IDENT"),
@@ -15021,14 +15898,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY": env_var(
-        lambda: os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY"),
-        description=(
-            "Flash-V100 attention: debug route summary. The consumer locations"
-            " and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=routing.",
+            lambda: os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY"),
         ),
-        category="debug",
+        description=(
+            "Compatibility alias for VLLM_SM70_DEBUG=routing. Unset stays "
+            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "migrate explicit debugging to the unified channel."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -15038,6 +15922,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA"),
@@ -15052,6 +15937,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1' at vllm/v1/attention/backends/flash_attn_v100.py:__init__",
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN"),
@@ -15069,6 +15955,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN"),
@@ -15086,6 +15973,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO"),
@@ -15101,6 +15989,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'1' at vllm/v1/attention/backends/flash_attn_v100.py:_flash_v100_decode"),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS"),
@@ -15113,6 +16002,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/v1/cudagraph_dispatcher.py:__init__",),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA"),
@@ -15130,6 +16020,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"),
@@ -15147,6 +16038,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_KPOOL_SKIP_DECODE_WRITE": env_var(
         lambda: os.getenv("VLLM_KPOOL_SKIP_DECODE_WRITE"),
@@ -15164,6 +16056,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_KPOOL_SKIP_TAIL_CACHE": env_var(
         lambda: os.getenv("VLLM_KPOOL_SKIP_TAIL_CACHE"),
@@ -15181,6 +16074,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_QWEN35_MTP_KEEP_QUANT": env_var(
         lambda: os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT"),
@@ -15192,6 +16086,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'0' at vllm/model_executor/models/qwen3_5_mtp.py:__init__",
         ),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS": env_var(
         lambda: os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS"),
@@ -15203,6 +16098,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1' at vllm/model_executor/models/qwen3_5_mtp.py:__init__",
         ),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_DFLASH2_BF16_EMULATION": env_var(
         lambda: os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION"),
@@ -15225,6 +16121,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("DFlash2 verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_AWQ_MOE_BUFFERS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_AWQ_MOE_BUFFERS"),
@@ -15242,6 +16139,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_AWQ_MOE_LABELS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_AWQ_MOE_LABELS"),
@@ -15259,6 +16157,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("MoE AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_DIR"),
@@ -15276,6 +16175,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS"),
@@ -15293,6 +16193,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_CORE_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR"),
@@ -15310,6 +16211,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE"),
@@ -15327,6 +16229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS"),
@@ -15344,6 +16247,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS"),
@@ -15361,6 +16265,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS"),
@@ -15394,6 +16299,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR"),
@@ -15423,6 +16329,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE"),
@@ -15440,6 +16347,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_LABELS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LABELS"),
@@ -15457,6 +16365,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS"),
@@ -15478,6 +16387,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_METADATA": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_METADATA"),
@@ -15495,6 +16405,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_SHAPES": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_SHAPES"),
@@ -15512,6 +16423,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES"),
@@ -15529,6 +16441,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_GRAPH_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STEPS"),
@@ -15550,6 +16463,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_PROJ_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR"),
@@ -15571,6 +16485,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE"),
@@ -15588,6 +16503,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS"),
@@ -15605,6 +16521,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS"),
@@ -15622,6 +16539,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS"),
@@ -15639,6 +16557,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_COUNTS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS"),
@@ -15668,6 +16587,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR"),
@@ -15709,6 +16629,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE"),
@@ -15726,6 +16647,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE"),
@@ -15747,6 +16669,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS"),
@@ -15772,6 +16695,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS"),
@@ -15797,6 +16721,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS"),
@@ -15822,6 +16747,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_LABELS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS"),
@@ -15843,6 +16769,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS"),
@@ -15860,6 +16787,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS"),
@@ -15881,6 +16809,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_MLP_INTERNALS"),
@@ -15898,6 +16827,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE"),
@@ -15912,6 +16842,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "None at vllm/v1/sample/sampler.py:_maybe_dump_sm70_sampler_logits",
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS"),
@@ -15929,6 +16860,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLASHQLA_DIRECT_OUTPUT": env_var(
         lambda: os.getenv("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT"),
@@ -15946,6 +16878,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashQLA",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLASHQLA_INDEXED_PREFILL": env_var(
         lambda: os.getenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL"),
@@ -15963,6 +16896,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashQLA",),
+        user_visible=False,
     ),
     "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL": env_var(
         lambda: os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL"),
@@ -15984,6 +16918,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("FlashQLA",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_BATCH_PRESCALED": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_BATCH_PRESCALED"),
@@ -15999,6 +16934,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE"),
@@ -16013,6 +16949,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'0' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS": env_var(
         lambda: os.getenv(
@@ -16032,6 +16969,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED"),
@@ -16046,6 +16984,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'0' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT"),
@@ -16060,6 +16999,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'1' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE": env_var(
         lambda: os.getenv(
@@ -16076,6 +17016,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'0' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_PREFILL_PROFILE": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE"),
@@ -16093,6 +17034,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS"),
@@ -16110,6 +17052,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE"),
@@ -16127,6 +17070,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GDN_STATE_CONTRACT_ASSERT": env_var(
         lambda: os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT"),
@@ -16144,6 +17088,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_GLM53_EXACT_KDA_GEMV": env_var(
         lambda: os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV"),
@@ -16155,6 +17100,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("'1' at vllm/models/glm5next/nvidia/kda.py:_sm70_exact_kda_gemv_enabled"),
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     "VLLM_SM70_GLM53_FP16_GEMV_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_GLM53_FP16_GEMV_LIBRARY"),
@@ -16168,6 +17114,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "None at vllm/_sm70_ops.py:_maybe_load_glm53_fp16_gemv_library",
         ),
         acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
     ),
     "VLLM_SM70_INDEXER_DECODE_CUBLAS": env_var(
         lambda: os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS"),
@@ -16180,6 +17127,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'0' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS": env_var(
         lambda: os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS"),
@@ -16194,6 +17142,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1024' at vllm/models/deepseek_v4/sm70/indexer.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_INDEXER_FUSED_LOGITS": env_var(
         lambda: os.getenv("VLLM_SM70_INDEXER_FUSED_LOGITS"),
@@ -16206,6 +17155,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_INDEXER_PREFILL_CUBLAS": env_var(
         lambda: os.getenv("VLLM_SM70_INDEXER_PREFILL_CUBLAS"),
@@ -16218,6 +17168,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_INDEXER_PREFILL_TILE_MB": env_var(
         lambda: os.getenv("VLLM_SM70_INDEXER_PREFILL_TILE_MB"),
@@ -16232,6 +17183,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'192' at vllm/models/deepseek_v4/sm70/indexer.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_INDEXER_RELU": env_var(
         lambda: os.getenv("VLLM_SM70_INDEXER_RELU"),
@@ -16244,6 +17196,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_KDA_PREFILL_SCHEDULE": env_var(
         lambda: os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE"),
@@ -16255,6 +17208,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1' at vllm/model_executor/layers/fla/ops/kda.py:module",
         ),
         acceleration_paths=("SM70 prefill",),
+        user_visible=False,
     ),
     "VLLM_SM70_MTP_DUMP_TENSOR_MAX": env_var(
         lambda: os.getenv("VLLM_SM70_MTP_DUMP_TENSOR_MAX"),
@@ -16267,6 +17221,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'512' at vllm/v1/worker/gpu_model_runner.py:_to_cpu",),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_GROUPED_PAD_FIX": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_GROUPED_PAD_FIX"),
@@ -16279,6 +17234,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_GROUPED_PAGE4": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_GROUPED_PAGE4"),
@@ -16291,6 +17247,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_INDEXER_CUBLAS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS"),
@@ -16303,48 +17260,67 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS"),
         description=(
-            "SM70 QSA attention: indexer cublas min rows. The consumer "
-            "locations and unset defaults are listed below."
+            "Legacy override for SM70_QSA_TUNING.cublas_min_rows. The operator "
+            "tuning table uses 512 when unset; retain this alias only to "
+            "replay old tuning during one released compatibility cycle. Remove in "
+            "1.5.2."
         ),
-        category="tuning",
+        category="deprecated",
         declared_default="None",
-        effective_default=("None"),
+        effective_default=(
+            "None; the operator tuning table selects 512 when the "
+            "compatibility alias is unset."
+        ),
         automatic_conditions=(
             "'512' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS"),
         description=(
-            "SM70 QSA attention: indexer cublas min score elements. The "
-            "consumer locations and unset defaults are listed below."
+            "Legacy override for SM70_QSA_TUNING.cublas_min_score_elements. "
+            "The operator tuning table uses 1048576 when unset; retain this "
+            "alias only to replay old tuning during the 1.5.1 compatibility "
+            "cycle. Remove after one released compatibility version."
         ),
-        category="tuning",
+        category="deprecated",
         declared_default="None",
-        effective_default=("None"),
+        effective_default=(
+            "None; the operator tuning table selects 1048576 when the "
+            "compatibility alias is unset."
+        ),
         automatic_conditions=(
             "str(1024 ** 2) at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB"),
         description=(
-            "SM70 QSA attention: indexer score tile mb. The consumer locations"
-            " and unset defaults are listed below."
+            "Legacy override for SM70_QSA_TUNING.score_tile_mb. The operator "
+            "tuning table uses 64 when unset; retain this alias only to replay "
+            "old tuning during one released compatibility cycle. Remove after "
+            "one released compatibility version."
         ),
-        category="tuning",
+        category="deprecated",
         declared_default="None",
-        effective_default=("None"),
+        effective_default=(
+            "None; the operator tuning table selects 64 when the compatibility "
+            "alias is unset."
+        ),
         automatic_conditions=(
             "'64' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_MTP_TOPK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QSA_MTP_TOPK", "1"))),
@@ -16364,6 +17340,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "QSA sparse attention/indexer",
             "Flash-Next qualified batch",
         ),
+        user_visible=True,
     ),
     "VLLM_SM70_QSA_TOPK_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY"),
@@ -16378,6 +17355,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "None at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_XQA_PAGE4": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_XQA_PAGE4"),
@@ -16390,20 +17368,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS"),
         description=(
-            "SM70 QSA attention: xqa page4 min rows. The consumer locations "
-            "and unset defaults are listed below."
+            "Legacy override for SM70_QSA_TUNING.xqa_page4_min_rows. The "
+            "operator tuning table uses 64 when unset; retain this alias only "
+            "to replay old tuning during one released compatibility cycle. Remove "
+            "in 1.5.2."
         ),
-        category="tuning",
+        category="deprecated",
         declared_default="None",
-        effective_default=("None"),
+        effective_default=(
+            "None; the operator tuning table selects 64 when the compatibility "
+            "alias is unset."
+        ),
         automatic_conditions=(
             "'64' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=False,
     ),
     "VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG": env_var(
         lambda: os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG"),
@@ -16418,6 +17403,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ("None at vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py:apply"),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD": env_var(
         lambda: os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD"),
@@ -16435,6 +17421,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
     ),
     "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX": env_var(
         lambda: os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_NVTX"),
@@ -16452,6 +17439,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP": env_var(
         lambda: os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP"),
@@ -16470,6 +17458,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR"),
@@ -16491,6 +17480,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH"),
@@ -16508,6 +17498,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE"),
@@ -16522,6 +17513,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1' at vllm/v1/attention/backends/turboquant_attn.py:__init__",
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL"),
@@ -16536,6 +17528,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'1' at vllm/v1/attention/backends/turboquant_attn.py:__init__",
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
     ),
     "VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE"),
@@ -16553,6 +17546,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
     ),
     "VLLM_SPEC_DUMP_ALIGNMENT_DIR": env_var(
         lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR"),
@@ -16571,6 +17565,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     "VLLM_SPEC_DUMP_ALIGNMENT_TAG": env_var(
         lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG"),
@@ -16589,6 +17584,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+        user_visible=True,
     ),
     # Raw native-only controls; native code retains parsing and defaults.
     "VLLM_CUSTOM_ALLREDUCE_ALGO": env_var(
@@ -16622,6 +17618,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_E4M3_SCALAR_FAST": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_E4M3_SCALAR_FAST"),
@@ -16643,6 +17640,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_CONTIG_FAST": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_FAST"),
@@ -16669,6 +17667,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 prefill",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE"),
@@ -16687,6 +17686,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 prefill",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_PREFILL_SCALAR_PV": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_PREFILL_SCALAR_PV"),
@@ -16705,6 +17705,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 prefill",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST"),
@@ -16726,6 +17727,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM"),
@@ -16754,6 +17756,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE"),
@@ -16782,6 +17785,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT"),
@@ -16810,6 +17814,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE"),
@@ -16838,6 +17843,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE"),
@@ -16866,6 +17872,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BLOCK784_INDEX": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX"),
@@ -16894,6 +17901,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE"),
@@ -16922,6 +17930,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN"),
@@ -16950,6 +17959,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH"),
@@ -16982,6 +17992,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN"),
@@ -17010,6 +18021,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN"),
@@ -17038,6 +18050,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE"),
@@ -17066,6 +18079,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN"),
@@ -17094,6 +18108,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE"),
@@ -17122,6 +18137,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_AUTO": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO"),
@@ -17150,6 +18166,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE"),
@@ -17178,6 +18195,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_PADDED_SMEM": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM"),
@@ -17206,6 +18224,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE"),
@@ -17234,6 +18253,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("Flash-V100 XQA attention",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MOE_DISPATCH_POLICY": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY"),
@@ -17253,6 +18273,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind AWQ MoE",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR"),
@@ -17271,6 +18292,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_AWQ_TP4_QKV_CTA64": env_var(
         lambda: os.getenv("VLLM_SM70_AWQ_TP4_QKV_CTA64"),
@@ -17289,6 +18311,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind AWQ",),
+        user_visible=False,
     ),
     "VLLM_SM70_F16_DENSE_TUNE_MAX_M": env_var(
         lambda: os.getenv("VLLM_SM70_F16_DENSE_TUNE_MAX_M"),
@@ -17306,6 +18329,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 FP16 GEMM",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR"),
@@ -17323,6 +18347,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_PREPARE_VEC": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_MOE_PREPARE_VEC"),
@@ -17340,6 +18365,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH"),
@@ -17357,6 +18383,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("TurboMind FP8",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS": env_var(
         lambda: os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS"),
@@ -17374,6 +18401,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS": env_var(
         lambda: os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS"),
@@ -17394,6 +18422,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
     "VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS": env_var(
         lambda: os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS"),
@@ -17414,6 +18443,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
     ),
 }
 

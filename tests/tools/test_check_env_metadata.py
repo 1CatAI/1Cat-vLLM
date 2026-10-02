@@ -17,6 +17,7 @@ def source(*, getter='lambda: os.getenv("VLLM_EXAMPLE", "0")', **changes):
         effective_default="'0'",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     )
     fields.update(changes)
     arguments = ", ".join(f"{key}={value!r}" for key, value in fields.items())
@@ -91,6 +92,7 @@ def test_metadata_wrapper_only_delegates_when_read():
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
     )
     assert not calls
     assert variable() is sentinel and calls == ["read"]
@@ -104,3 +106,15 @@ def test_all_current_registrations_and_generated_reference_are_complete():
     assert "qualified DFlash" in metadata["VLLM_SM70_NVFP4_QPN2"]["effective_default"]
     assert metadata["VLLM_SM70_DUMP_GDN_CORE_DIR"]["category"] == "debug"
     assert metadata["VLLM_SM70_DUMP_GDN_CORE_DIR"]["automatic_conditions"]
+
+
+def test_internal_metadata_is_kept_out_of_public_reference():
+    metadata, errors = read_metadata(source(user_visible=False))
+    assert not errors
+    assert "VLLM_EXAMPLE" not in render(metadata)
+    assert "VLLM_EXAMPLE" in render(metadata, include_internal=True)
+
+
+def test_non_boolean_visibility_is_rejected():
+    _, errors = read_metadata(source(user_visible="false"))
+    assert errors and "literal boolean" in errors[0]

@@ -133,6 +133,9 @@ class CPUOffloadingManager(OffloadingManager):
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
 
+    def demote(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        self._policy.demote(keys)
+
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
@@ -289,6 +292,10 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         for group_idx, group_keys in self._partition(keys).items():
             self.managers[group_idx].touch(group_keys, req_context)
+
+    def demote(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        for group_idx, group_keys in self._partition(keys).items():
+            self.managers[group_idx].demote(group_keys, req_context)
 
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext

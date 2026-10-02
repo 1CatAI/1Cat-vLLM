@@ -164,6 +164,8 @@ class Sm70NvFp4Config:
     remain with the linear kernels. Explicit fields override deprecated envs.
     """
 
+    dense_qpn2: bool = True
+    """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
     """Enable QPN2 small-M kernels; auto follows the qualified draft workload."""
     prefill: bool | None = None
@@ -426,6 +428,11 @@ class KernelConfig:
     sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
     """SM70 serialized block-FP8 variant policy, resolved per engine."""
 
+    linear_kernel_selections: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed selector decisions for loaded local layouts; diagnostic only."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -449,6 +456,7 @@ class KernelConfig:
         ignored_factors = {
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
+            "linear_kernel_selections",
         }
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.

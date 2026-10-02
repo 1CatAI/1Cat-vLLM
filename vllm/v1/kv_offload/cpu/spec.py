@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
@@ -21,6 +22,8 @@ from vllm.v1.kv_offload.cpu.manager import (
     GroupedCPUOffloadingManager,
 )
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
+
+logger = init_logger(__name__)
 
 
 def mamba_state_slots(
@@ -174,6 +177,20 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.cpu_group_num_blocks[i] = (
                     state_slots(num_blocks) if i in mamba_groups else num_blocks
                 )
+            logger.info(
+                "Grouped CPU offload pool: %d token slots, %d state slots per "
+                "Mamba group; per-worker token page %d B, state page %d B "
+                "(%d Mamba groups), budget %d B per worker, retention=%s, "
+                "state reference tokens=%d.",
+                num_blocks,
+                state_slots(num_blocks),
+                token_page,
+                state_page,
+                len(mamba_groups),
+                budget_per_worker,
+                self.retention_interval,
+                self.state_slots_reference_tokens,
+            )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
             self.cpu_page_size_per_worker = (

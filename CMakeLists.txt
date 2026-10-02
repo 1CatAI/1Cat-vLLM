@@ -110,9 +110,9 @@ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
   # Keep SM70 available for the isolated V100 TurboMind backend. CUDA 12.8
   # still supports offline SM70 compilation, while CUDA 13 warns that pre-7.5
   # offline support is removed.
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
 else()
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0")
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
 
 #
@@ -1576,6 +1576,14 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
         "Skipping QuTLASS external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
     endif()
 
+    # Turing gets its own FA2 build (see the file for why it is a separate
+    # project). Independent of which FA2 tree the block below fetches.
+    cuda_archs_loose_intersection(VLLM_FLASH_ATTN_SM75_ARCHS
+      "7.5" "${CUDA_ARCHS}")
+    if(VLLM_FLASH_ATTN_SM75_ARCHS)
+      include(cmake/external_projects/vllm_flash_attn_sm75.cmake)
+    endif()
+
     cuda_archs_loose_intersection(VLLM_FLASH_ATTN_ARCHS
       "8.0+PTX" "${CUDA_ARCHS}")
     if(VLLM_FLASH_ATTN_ARCHS)
@@ -1583,7 +1591,7 @@ if (VLLM_GPU_LANG STREQUAL "CUDA")
       include(cmake/external_projects/vllm_flash_attn.cmake)
     else()
       cuda_archs_loose_intersection(VLLM_FLASH_ATTN_SM70_ARCHS
-        "7.0" "${CUDA_ARCHS}")
+        "7.0;7.2" "${CUDA_ARCHS}")
       if(VLLM_FLASH_ATTN_SM70_ARCHS)
         set(VLLM_FLASH_ATTN_SM70 ON)
         include(cmake/external_projects/vllm_flash_attn.cmake)
