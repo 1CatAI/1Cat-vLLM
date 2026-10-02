@@ -153,6 +153,7 @@ def test_mxfp4_sm70_weight_layout_rejects_wrong_ue8m0_scale_shape():
 
 
 def test_mxfp4_sm70_platform_gate_is_exact(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(sm70_tm.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         sm70_tm.current_platform,
@@ -616,11 +617,94 @@ def test_mxfp4_sm70_tp4_compact_shapes_match_per_expert(
         torch.testing.assert_close(direct, reference, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires NVIDIA V100/SM70",
+)
+def test_mxfp4_sm70_post_load_repacks_without_a_second_expert_copy():
+    config = _v4_flash_moe_config()
+    num_experts = config.num_local_experts
+    hidden_size = config.hidden_dim
+    intermediate_size = config.intermediate_size_per_partition
+    group_size = sm70_tm.MXFP4_GROUP_SIZE
+    torch.manual_seed(20260930)
+
+    def checkpoint(rows: int, cols: int) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = torch.randint(
+            0, 256, (num_experts, rows, cols // 2), dtype=torch.uint8, device="cuda"
+        )
+        scale = torch.randint(
+            120,
+            135,
+            (num_experts, rows, cols // group_size),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        return weight, scale
+
+    def stacked_per_expert(
+        weight: torch.Tensor, scale: torch.Tensor
+    ) -> list[torch.Tensor]:
+        prepared = [
+            sm70_ops.mxfp4_sm70_prepare(
+                sm70_tm.unpack_mxfp4_weight(weight[expert_id]),
+                scale[expert_id].t().contiguous(),
+                group_size,
+            )
+            for expert_id in range(num_experts)
+        ]
+        return [torch.stack(parts) for parts in zip(*prepared)]
+
+    w13_weight, w13_scale = checkpoint(2 * intermediate_size, hidden_size)
+    w2_weight, w2_scale = checkpoint(hidden_size, intermediate_size)
+    expected = {
+        "w13": stacked_per_expert(w13_weight, w13_scale),
+        "w2": stacked_per_expert(w2_weight, w2_scale),
+    }
+    layer = SimpleNamespace(
+        local_num_experts=num_experts,
+        global_num_experts=config.num_experts,
+        top_k=config.experts_per_token,
+        moe_config=config,
+        activation=MoEActivation.SILU,
+        apply_router_weight_on_input=False,
+        w13_weight=torch.nn.Parameter(w13_weight, requires_grad=False),
+        w13_weight_scale=torch.nn.Parameter(w13_scale, requires_grad=False),
+        w2_weight=torch.nn.Parameter(w2_weight, requires_grad=False),
+        w2_weight_scale=torch.nn.Parameter(w2_scale, requires_grad=False),
+    )
+    # The layer must own the checkpoint tensors alone, as in a real model,
+    # so that releasing them shows up in the allocator statistics.
+    del w13_weight, w13_scale, w2_weight, w2_scale
+
+    torch.accelerator.synchronize()
+    baseline = torch.accelerator.memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
+    Mxfp4SM70MoEMethod(config).process_weights_after_loading(layer)
+    peak_growth = torch.accelerator.max_memory_allocated() - baseline
+
+    for projection, stacks in expected.items():
+        for suffix, stack in zip(("tm_weight", "tm_scales", "tm_meta"), stacks):
+            assert torch.equal(getattr(layer, f"{projection}_{suffix}"), stack)
+    # Building a per-expert list and stacking it afterwards needs two
+    # prepared copies of both projections on top of the checkpoint; writing
+    # into the stacks and releasing each checkpoint projection needs less
+    # than one.
+    prepared_bytes = sum(
+        stack.numel() * stack.element_size()
+        for stacks in expected.values()
+        for stack in stacks
+    )
+    assert peak_growth < prepared_bytes
+
+
 def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):
     for op_name in (
         "mxfp4_sm70_prepare",
         "mxfp4_moe_dense_stage_sm70_out",
         "awq_moe_build_strided_ptrs",
+        "mxfp4_moe_single_token_prepare_w13_sm70_out",
+        "awq_moe_single_token_weighted_reduce_out",
     ):
         monkeypatch.setattr(torch.ops._C, op_name, object(), raising=False)
     monkeypatch.setattr(

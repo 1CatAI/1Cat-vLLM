@@ -9269,7 +9269,8 @@ class GPUModelRunner(
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
+                    sampler_output.sampled_token_ids,
+                    sample_hidden_states if logits is None else logits,
                 )
 
         self._draft_token_ids = None
@@ -9628,9 +9629,13 @@ class GPUModelRunner(
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
-        self, sampled_token_ids: torch.Tensor
+        self, sampled_token_ids: torch.Tensor, sampler_input: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Broadcast sampled token ids (GPU) from last PP stage.
+
+        `sampler_input` is what the sampler drew from (logits, or the hidden
+        states when it computed the logits itself); only read to explain an
+        invalid sample."""
         pp = get_pp_group()
         assert pp.is_last_rank
         # Skip for chunked prefill: sampled tokens are dummy
@@ -9655,6 +9660,13 @@ class GPUModelRunner(
                 device=sampled_token_ids.device,
             )
             payload[:, : sampled_token_ids.shape[1]] = sampled_token_ids
+            payload_cpu = payload.cpu()
+            self._pp_check_token_ids(
+                "sampled",
+                payload_cpu,
+                skip_discarded=True,
+                sampler_input=sampler_input,
+            )
             # The speculative round state goes over the gloo cpu_group. An
             # NCCL broadcast on the device_group shares the communicator with
             # the pipeline's send/recv; with five stages the two interleave
@@ -9662,7 +9674,7 @@ class GPUModelRunner(
             # 3-4 in irecv). A CPU rendezvous has no stream ordering to
             # violate, and the payload is [num_reqs, num_spec_tokens + 1]
             # int32.
-            torch.distributed.broadcast(payload.cpu(), src=pp.rank, group=pp.cpu_group)
+            torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
             return
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
@@ -9696,7 +9708,58 @@ class GPUModelRunner(
                 dtype=torch.int32,
                 device=self.device,
             )
-        torch.distributed.broadcast(payload.cpu(), src=pp.rank, group=pp.cpu_group)
+        payload_cpu = payload.cpu()
+        self._pp_check_token_ids("draft", payload_cpu, skip_discarded=False)
+        torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
+
+    def _pp_check_token_ids(
+        self,
+        kind: str,
+        token_ids: torch.Tensor,
+        skip_discarded: bool,
+        sampler_input: torch.Tensor | None = None,
+    ) -> None:
+        """Token ids the last PP stage hands to the others feed their embedding
+        lookup. An id outside the vocabulary would surface there as an
+        anonymous device-side assert that takes the engine down, so check the
+        payload while it is in host memory anyway: on the last stage before it
+        is sent (where the cause can still be named), and on arrival. A
+        discarded request's sampled token is never read."""
+        invalid = (token_ids < 0) | (token_ids >= self.input_batch.vocab_size)
+        if kind == "sampled":
+            # Only the contiguous accepted prefix is consumed. Later -1
+            # entries are padding; an active request still needs a first token.
+            consumed = (token_ids != -1).to(torch.int32).cumprod(dim=1).bool()
+            invalid &= consumed
+            invalid[:, 0] |= token_ids[:, 0] < 0
+        if skip_discarded:
+            num_reqs = token_ids.shape[0]
+            discarded = torch.from_numpy(self.discard_request_mask.np[:num_reqs])
+            invalid &= ~discarded[:, None]
+        if invalid.any():
+            num_reqs = token_ids.shape[0]
+            cause = ""
+            if sampler_input is not None:
+                metadata = self.input_batch.sampling_metadata
+                temperature = metadata.temperature
+                cause = (
+                    f"; non-finite values per sampler input row "
+                    f"{(~torch.isfinite(sampler_input)).sum(dim=-1).tolist()} of "
+                    f"{tuple(sampler_input.shape)}, all_greedy={metadata.all_greedy}, "
+                    f"all_random={metadata.all_random}, temperature="
+                    f"{None if temperature is None else temperature.tolist()}, "
+                    f"num_computed_tokens="
+                    f"{self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()}, "
+                    f"step input_ids="
+                    f"{self.input_ids.gpu[: sampler_input.shape[0]].tolist()}, "
+                    f"positions={self.positions[: sampler_input.shape[0]].tolist()}"
+                )
+            raise RuntimeError(
+                f"PP spec decode: invalid {kind} token ids from the last stage: "
+                f"{token_ids.tolist()} for requests "
+                f"{self.input_batch.req_ids[:num_reqs]}, discarded="
+                f"{self.discard_request_mask.np[:num_reqs].tolist()}{cause}"
+            )
 
     def _pp_receive_spec_decode_state(self, num_reqs: int) -> None:
         """Receive the speculative round state from the last PP stage.
@@ -9713,6 +9776,7 @@ class GPUModelRunner(
             (num_reqs, self.num_spec_tokens + 1), dtype=torch.int32
         )
         torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
+        self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
         valid_counts = _count_contiguous_spec_tokens(sampled)
         next_token_ids = sampled.gather(
@@ -9723,6 +9787,7 @@ class GPUModelRunner(
 
         drafts_cpu = torch.empty((num_reqs, self.num_spec_tokens), dtype=torch.int32)
         torch.distributed.broadcast(drafts_cpu, src=pp.last_rank, group=pp.cpu_group)
+        self._pp_check_token_ids("draft", drafts_cpu, skip_discarded=False)
         self._draft_token_ids = drafts_cpu.to(self.device, non_blocking=True)
 
         scheduler_output = self._pp_nonlast_scheduler_output
