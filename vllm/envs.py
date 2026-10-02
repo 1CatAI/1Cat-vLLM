@@ -10690,20 +10690,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse the native FP32 N128 gated RMSNorm chain without changing its
     # vector4 mean reduction, sigmoid/SiLU, or FP16 output boundary.
     "VLLM_SM70_RMSNORM_GATED_EXACT": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "1"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0"))),
         description=(
             "Uses native FP32 gated RMSNorm for supported SM70 layouts. "
             "Default on after #703/#704 quality qualification to preserve "
-            "arithmetic across compiled graph contexts. Set 0 only to diagnose "
+            "arithmetic across compiled graph contexts. Other models remain off "
+            "until qualified. Set 0 only to diagnose "
             "the original normalization route."
         ),
         category="configuration",
-        declared_default="True",
+        declared_default="False",
         effective_default=(
-            "True; operator dtype, geometry, numerical policy and native "
+            "False at the compatibility getter; resolved per engine to True for "
+            "qualified Flash-Next ordinary/MTP configurations. Operator "
+            "dtype, geometry, numerical policy and native "
             "availability checks still apply."
         ),
-        automatic_conditions=(),
+        automatic_conditions=(
+            "Flash-Next ordinary decode or MTP quality qualification",
+        ),
         acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque

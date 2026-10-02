@@ -59,6 +59,11 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
         if "Flash-Next qualified batch"
         in cast(EnvVar, getter).metadata.acceleration_paths
     }
+    norm = cfg.kernel_config.sm70_rmsnorm_gated_exact
+    if norm is not None:
+        controls["VLLM_SM70_RMSNORM_GATED_EXACT"].update(
+            enabled=bool(norm), reason=None if norm else "resolved_policy_disabled"
+        )
     text = cfg.model_config.hf_text_config
     tp = cfg.parallel_config.tensor_parallel_size
     layers = int(getattr(text, "num_hidden_layers", 0))
@@ -101,6 +106,14 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
             "components": copies,
             "total_bytes": sum(copies.values()) if reference_layout else None,
             "excludes": "allocator overhead, graphs, temporary workspaces and KV cache",
+            "capacity_note": (
+                "Packed weights reduce memory available to KV and graph/workspace "
+                "peaks. An explicit KV byte budget does not shrink automatically. "
+                "The TP4 reference added about 1.25 GiB/rank at load; C4 with "
+                "1.5 GiB KV and prefill budget 8192 exhausted memory, while the "
+                "matched budget-4096 profile completed. Reserve peak headroom "
+                "or disable the packed-copy controls below."
+            ),
             "mitigation": (
                 "Set QWEN38_BATCH_FASTPATH, QWEN38_GDN_INPUT_BATCH, MTP_HC_BATCH, "
                 "MTP_ROUTER_BATCH and MTP_SHARED_BATCH to 0 (VLLM_SM70_ prefix) "

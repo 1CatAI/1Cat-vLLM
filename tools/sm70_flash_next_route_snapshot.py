@@ -19,6 +19,7 @@ from unittest.mock import patch
 import torch
 
 from vllm import envs
+from vllm.config.kernel import KernelConfig
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc as hc
 
@@ -106,6 +107,7 @@ def collect(ref=None):
         (4096, 8192),
     ):
         cfg = NS(
+            kernel_config=KernelConfig(),
             model_config=NS(
                 architectures=["Qwen4ExpForCausalLM"]
                 if model == "flash_next"
@@ -116,6 +118,9 @@ def collect(ref=None):
             if spec == "none"
             else NS(method=spec, num_speculative_tokens=4),
             parallel_config=NS(tensor_parallel_size=tp, use_ubatching=False),
+        )
+        cfg.kernel_config.resolve_sm70_rmsnorm_gated(
+            qualified=model == "flash_next" and spec in ("none", "mtp")
         )
         key = f"{model}/{kv}/tp{tp}/{spec}/c{concurrency}/p{budget}"
         with (
@@ -164,6 +169,11 @@ def collect(ref=None):
                         connection.add_module(name, projection)
                     h.enable_qwen38_sm70_fp16_fused_hc(connection, torch.float16, cfg)
                     rows[key] = {
+                        "rmsnorm_gated_permission": (
+                            model == "flash_next" and spec == "none"
+                            if ref
+                            else cfg.kernel_config.sm70_rmsnorm_gated_exact
+                        ),
                         "dense_batch_prepared": getattr(
                             layer, "_sm70_qwen38_dense_batch", False
                         ),
@@ -187,6 +197,9 @@ def collect(ref=None):
                             if "Flash-Next qualified batch"
                             in getter.metadata.acceleration_paths
                         }
+                        rows[key]["controls"]["VLLM_SM70_RMSNORM_GATED_EXACT"] = rows[
+                            key
+                        ]["rmsnorm_gated_permission"]
                         rows[key]["dense_by_m"] = {
                             str(m): bool(
                                 getattr(layer, "_sm70_qwen38_dense_batch", False)
