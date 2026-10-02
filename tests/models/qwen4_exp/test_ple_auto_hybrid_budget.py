@@ -59,3 +59,26 @@ def test_explicit_host_budget_is_preserved(monkeypatch):
         )
         == 123
     )
+
+
+def test_hybrid_host_budget_does_not_group_provisional_cache_pages(monkeypatch):
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    monkeypatch.setattr(ple, "_ple_host_budget_bytes", lambda: None)
+    monkeypatch.setattr(ple, "available_host_bytes", lambda: None)
+    monkeypatch.setattr(ple, "total_host_bytes", lambda: None)
+    monkeypatch.setattr(ple, "get_current_vllm_config", lambda: SimpleNamespace())
+
+    def unresolved_layout(*_args):
+        raise ValueError("CSA+linear layer 3 violates cache geometry.")
+
+    monkeypatch.setattr(ple, "kv_cache_bytes_for_max_model_len", unresolved_layout)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", unresolved_layout)
+    table = SimpleNamespace(_meta_weight_shape=(100, 4), embedding_dim=4)
+    assert (
+        ple.Qwen4ExpPinnedHostEmbedding._resolve_host_budget(
+            table, torch.device("cuda:0")
+        )
+        == 400
+    )
+    envs.disable_envs_cache()

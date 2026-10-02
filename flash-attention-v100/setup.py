@@ -3,12 +3,30 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2025, D.Skryabin
 
+import os
 from pathlib import Path
 
 from packaging.version import parse
 from setuptools import setup
 
 this_dir = Path(__file__).parent.resolve()
+
+
+def _volta_gencode_flags():
+    arches = os.environ.get("TORCH_CUDA_ARCH_LIST", "7.0").replace(" ", ";")
+    flags = []
+    for arch in dict.fromkeys(arches.split(";")):
+        if not arch:
+            continue
+        ptx = arch.endswith("+PTX")
+        arch = arch.removesuffix("+PTX")
+        if arch not in {"7.0", "7.2"}:
+            raise ValueError("Flash-V100 supports only CUDA architectures 7.0 and 7.2")
+        digits = arch.replace(".", "")
+        flags.extend(["-gencode", f"arch=compute_{digits},code=sm_{digits}"])
+        if ptx:
+            flags.extend(["-gencode", f"arch=compute_{digits},code=compute_{digits}"])
+    return flags
 
 
 def get_ext_modules():
@@ -38,8 +56,7 @@ def get_ext_modules():
                 "nvcc": [
                     "-O3",
                     "-std=c++17",
-                    "-gencode",
-                    "arch=compute_70,code=sm_70",
+                    *_volta_gencode_flags(),
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -58,8 +75,7 @@ def get_ext_modules():
                 "nvcc": [
                     "-O3",
                     "-std=c++17",
-                    "-gencode",
-                    "arch=compute_70,code=sm_70",
+                    *_volta_gencode_flags(),
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_HALF2_OPERATORS__",
