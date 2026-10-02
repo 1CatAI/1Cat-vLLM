@@ -9663,7 +9663,7 @@ class GPUModelRunner(
             payload_cpu = payload.cpu()
             self._pp_check_token_ids(
                 "sampled",
-                payload_cpu[:, :1],
+                payload_cpu,
                 skip_discarded=True,
                 sampler_input=sampler_input,
             )
@@ -9708,7 +9708,9 @@ class GPUModelRunner(
                 dtype=torch.int32,
                 device=self.device,
             )
-        torch.distributed.broadcast(payload.cpu(), src=pp.rank, group=pp.cpu_group)
+        payload_cpu = payload.cpu()
+        self._pp_check_token_ids("draft", payload_cpu, skip_discarded=False)
+        torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
 
     def _pp_check_token_ids(
         self,
@@ -9724,6 +9726,12 @@ class GPUModelRunner(
         is sent (where the cause can still be named), and on arrival. A
         discarded request's sampled token is never read."""
         invalid = (token_ids < 0) | (token_ids >= self.input_batch.vocab_size)
+        if kind == "sampled":
+            # Only the contiguous accepted prefix is consumed. Later -1
+            # entries are padding; an active request still needs a first token.
+            consumed = (token_ids != -1).to(torch.int32).cumprod(dim=1).bool()
+            invalid &= consumed
+            invalid[:, 0] |= token_ids[:, 0] < 0
         if skip_discarded:
             num_reqs = token_ids.shape[0]
             discarded = torch.from_numpy(self.discard_request_mask.np[:num_reqs])
@@ -9768,7 +9776,7 @@ class GPUModelRunner(
             (num_reqs, self.num_spec_tokens + 1), dtype=torch.int32
         )
         torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
-        self._pp_check_token_ids("sampled", sampled_cpu[:, :1], skip_discarded=True)
+        self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
         valid_counts = _count_contiguous_spec_tokens(sampled)
         next_token_ids = sampled.gather(
