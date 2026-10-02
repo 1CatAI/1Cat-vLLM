@@ -48807,6 +48807,7 @@ The historical QWEN38 +29%/+18% batch result is pre-repair and not quality
 qualified; do not repeat it as accepted current performance. #703 has stronger
 same-contract quality evidence and is the next default-promotion candidate
 to screen, with resident-weight memory and KV capacity checked explicitly.
+
 ## 2026-09-26 MTP4 trace and historical-verifier timing reconciliation
 
 - Retain the accepted 27.3963-ms full-round baseline. Same 8192/129 request,
