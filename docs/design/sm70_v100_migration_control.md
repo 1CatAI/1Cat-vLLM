@@ -48900,8 +48900,9 @@ reported as a deterministic numerical oracle.
 
 All21 deterministic paired quality sequences were identical and ended
 naturally: MBPP11/12,32K needle3/3,ChineseQA5/6 in both arms, with no new failures.
-The main-synced AWQ native shape/graph oracle remains a separate gate; the earlier
-20-case exact result is retained with its original source boundary.
+The final installed-wheel AWQ oracle also passed: all 20 shape/group cases and
+CUDA Graph replays were bitwise identical. The earlier result is retained with
+its original source boundary.
 
 CI passed after adding explicit types to two imported ROCm router buffers.
 That annotation-only change preserves executable bytecode and constants. No
