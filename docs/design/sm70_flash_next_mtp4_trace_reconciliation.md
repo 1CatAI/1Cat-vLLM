@@ -138,16 +138,9 @@ decorator overload argument. The original measured tree was reconstructed from
 the recorded commit/patch and compared before running. Native extensions and
 all production flags match the frozen baseline. No wheel was built.
 
-Raw evidence is retained under the same owned worktree's `.artifacts/`:
-
-- `paired_trace_source_audit.json`: reconstructed-tree comparison.
-- `paired_trace_audit_retry1.json`, `_contract.json`, `.log`, `_trace.nsys-rep`,
-  `_trace.sqlite`, `_summary.json`, `_wall.json`, `_target_breakdown.json`:
-  complete off/on/off measurements and their node trace.
-- `target_phase_audit.json`, `_contract.json`, `.log`, `.exit`, `_summary.json`:
-  separate phase-only completion, exit 0, and all worker means/output tokens.
-- `stacked_mtp_graph_target_breakdown.json` and `target_graph_original_audit.md`:
-  original target-only decomposition.
+The retained measurements include the source comparison, complete off/on/off
+outputs and acceptance counters, per-rank timing intervals, and a separate
+phase-only run. The latter completed with exit 0.
 
 Two harness failures are retained explicitly. The first startup stopped after
 warmup because LLM construction mutated a nested configuration used for JSON
@@ -156,4 +149,4 @@ then rejected a callable diagnostic RPC under secure serialization. Its overall
 exit is 1 and report completion flag is false; only the completed three-arm
 segment is admitted. No phase result is claimed from it. The final phase-only
 startup uses the previously exercised named worker interface, without enabling
-insecure serialization or recapturing the trace. All owned GPU workers exited.
+insecure serialization or recapturing the trace. The measurement processes exited.
