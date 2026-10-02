@@ -48881,3 +48881,28 @@ AWQ quality pair; the available27B NVFP4 model cannot qualify those changes.
   serialization override, repeated node capture or broad quality rerun.
 - Full scope, per-rank values and limitations:
   [MTP4 timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
+
+### AWQ final main-synced validation (2026-10-03)
+
+Against main `f350e2ebe7`, the source-complete installed-wheel comparison passed
+on four V100 32 GB GPUs with Torch 2.10.0+cu128 and CUDA 12.8. The 27B NVFP4
+DFlash2 release profile retained TP4, FP16 activations, E4M3 KV, page2048,
+8192-token budget, four sequences, seven speculative tokens, and its existing
+attention/graph modes. The latency workload used 32K input and a 256-token
+output limit, temperature1, top-p0.95, top-k20, seed4201+j.
+
+After excluding the first warmup sample, pure C1 decode was130.63→132.47 tokens/s
+and C4 was258.93→264.89 tokens/s; C1 TTFT was8.937→8.939 seconds. No slowdown
+was observed and no acceleration gain is claimed for this structural change.
+C1 matched all four token sequences. C4 matched three of twelve sequences with
+probabilistic drafting and concurrent admission; these latency requests are not
+reported as a deterministic numerical oracle.
+
+All21 deterministic paired quality sequences were identical and ended
+naturally: MBPP11/12,32K needle3/3,ChineseQA5/6 in both arms, with no new failures.
+The main-synced AWQ native shape/graph oracle remains a separate gate; the earlier
+20-case exact result is retained with its original source boundary.
+
+CI passed after adding explicit types to two imported ROCm router buffers.
+That annotation-only change preserves executable bytecode and constants. No
+AWQ qualification limit, native numerical code, or calculation precision changes.
