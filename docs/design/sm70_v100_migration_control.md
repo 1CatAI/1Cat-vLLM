@@ -48941,3 +48941,17 @@ before #790; assignment-only counts are19 and21. All1003 registrations have
 metadata. No environment name is deleted during this compatibility version.
 Actual 35B-A3B AWQ/FP8 checkpoints remain required before widening qualification
 or claiming same-criterion 35B decode parity.
+
+### Loaded SM70 route reporting (2026-10-03)
+
+- Record decisions and actual rejection reasons in the existing linear selectors;
+  do not probe lower-priority kernels just to populate a report. KernelConfig
+  owns the data per engine and excludes it from the compilation hash.
+- Collect worker tables once after initialization. Startup and acceleration HTTP
+  diagnostics read the same table, including final NVFP4/AWQ/FP8 instances,
+  preparation flags and resident packed-buffer bytes. Never claim request hits.
+- Discover SM70 policy configuration fields automatically; unrelated AWQ/FP8
+  models no longer claim the fixed 27B NVFP4 release profile. Legacy non-linear
+  rows remain until their category migrations.
+- This is route-preserving instrumentation. Environment counts, model/TP
+  qualifications and the 20 configuration environment writes do not change.

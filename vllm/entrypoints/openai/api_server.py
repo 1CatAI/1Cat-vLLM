@@ -356,6 +356,9 @@ async def init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
+    from vllm.sm70_profiles.acceleration import collect_worker_reports
+
+    await collect_worker_reports(engine_client, vllm_config)
     state.args = args
     resolved_chat_template = load_chat_template(args.chat_template)
 
