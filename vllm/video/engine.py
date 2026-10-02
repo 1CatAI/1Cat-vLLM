@@ -38,11 +38,11 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
         initialize_model_parallel,
     )
     from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
+    from vllm.utils.torch_utils import set_high_precision_cuda_matmul_defaults
 
     torch.set_num_threads(4)
     torch.accelerator.set_device_index(rank)
-    # Explicitly disallow reduced-precision GEMM reductions for FP16 islands.
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    set_high_precision_cuda_matmul_defaults()
     current = VllmConfig(
         parallel_config=ParallelConfig(tensor_parallel_size=config.tensor_parallel_size)
     )
