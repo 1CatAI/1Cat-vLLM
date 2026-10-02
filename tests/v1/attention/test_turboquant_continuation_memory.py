@@ -1,64 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from types import SimpleNamespace
+"""Bound attention intermediates while retaining dense continuation semantics."""
 
+import math
+
+import pytest
 import torch
+import torch.nn.functional as functional
 
 from vllm.v1.attention.backends import turboquant_attn as attention
 
 
-def test_large_continuation_uses_bounded_decode_chunks(monkeypatch):
-    implementation = attention.TurboQuantAttentionImpl.__new__(
-        attention.TurboQuantAttentionImpl
+@pytest.mark.parametrize("rows", [129, 257])
+@pytest.mark.parametrize("cached_len", [0, 255])
+@pytest.mark.parametrize("heads", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_bounded_sdpa_matches_dense_current_chunk(
+    monkeypatch, rows, cached_len, heads, dtype, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    generator = torch.Generator(device=device).manual_seed(123)
+    query = torch.randn(rows, heads, 32, generator=generator, device=device).to(dtype)
+    key = torch.randn(rows + cached_len, 2, 32, generator=generator, device=device).to(
+        dtype
     )
-    implementation.use_flash_attn_prefill = False
-    implementation.use_flash_v100_dense_prefill = False
-    implementation.scale = 1.0
-    implementation.tq_config = SimpleNamespace(
-        key_mse_bits=2,
-        key_packed_size=32,
-        effective_value_quant_bits=4,
-        key_fp8=False,
-        norm_correction=False,
-    )
+    value = torch.randn_like(key)
+    scale = 1 / math.sqrt(32)
+    positions = torch.arange(rows, device=device)[:, None] + cached_len
+    mask = torch.arange(key.shape[0], device=device)[None, :] <= positions
+    original = functional.scaled_dot_product_attention
+    expected = original(
+        query.transpose(0, 1).unsqueeze(0),
+        key.transpose(0, 1).unsqueeze(0),
+        value.transpose(0, 1).unsqueeze(0),
+        attn_mask=mask,
+        scale=scale,
+        enable_gqa=(heads > 2),
+    )[0].transpose(0, 1)
     calls = []
 
-    def observe_lengths(**kwargs):
-        query = kwargs["query"]
-        calls.append(query.shape[0])
-        return kwargs["seq_lens"].to(query.dtype).view(-1, 1, 1).expand_as(query)
+    def observe(q, k, v, **kwargs):
+        calls.append(q.shape[2])
+        assert q.shape[2] <= 128
+        assert kwargs["attn_mask"].shape == (q.shape[2], key.shape[0])
+        # The current chunk stays in its original precision and storage.
+        assert k.data_ptr() == key.data_ptr()
+        assert v.data_ptr() == value.data_ptr()
+        return original(q, k, v, **kwargs)
 
-    def reject_dense(*args, **kwargs):
-        raise AssertionError(
-            "The large continuation must not materialize dense history"
-        )
-
-    monkeypatch.setattr(
-        attention, "triton_turboquant_decode_attention", observe_lengths
-    )
-    monkeypatch.setattr(implementation, "_continuation_prefill", reject_dense)
-    rows, context = 257, 512
-    metadata = attention.TurboQuantMetadata(
-        seq_lens=torch.tensor([context], dtype=torch.int32),
-        slot_mapping=torch.arange(rows),
-        block_table=torch.zeros(1, 32, dtype=torch.int32),
-        query_start_loc=torch.tensor([0, rows], dtype=torch.int32),
-        num_actual_tokens=rows,
-        max_query_len=rows,
-        max_seq_len=context,
-        query_start_loc_cpu=torch.tensor([0, rows], dtype=torch.int32),
-        seq_lens_cpu=torch.tensor([context], dtype=torch.int32),
-    )
-    query = torch.zeros(rows, 1, 128, dtype=torch.float16)
-    result = implementation._prefill_attention(
-        query,
-        query,
-        query,
-        torch.empty(32, 16, 1, 96, dtype=torch.uint8),
-        metadata,
-        torch.eye(128),
-        torch.tensor([-1.0, -0.25, 0.25, 1.0]),
-    )
-    assert calls == [128, 128, 1]
-    expected = torch.arange(context - rows + 1, context + 1).to(query.dtype)
-    torch.testing.assert_close(result[:, 0, 0], expected, rtol=0, atol=0)
+    monkeypatch.setattr(functional, "scaled_dot_product_attention", observe)
+    actual = attention._continuation_sdpa(query, key, value, cached_len, scale)
+    assert calls == ([128, 1] if rows == 129 else [128, 128, 1])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
