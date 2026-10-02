@@ -4,6 +4,8 @@
 import importlib.util
 import os
 
+import regex as re
+
 
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().
@@ -118,6 +120,31 @@ os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")
 # Opt into per-process tempdirs unless the user explicitly chose the
 # debug layout (see https://github.com/vllm-project/vllm/issues/41410).
 os.environ.setdefault("TILELANG_CLEANUP_TEMP_FILES", "1")
+
+
+def _default_nccl_graph_register(environ) -> None:
+    """Keep NCCL from registering CUDA graph buffers on expandable segments.
+
+    NCCL registers the buffers of collectives captured in a CUDA graph and
+    assumes each one lies in a single physical allocation. PyTorch's
+    expandable segments can back one tensor with several, and a later replay
+    can then fault inside the collective
+    (https://github.com/pytorch/pytorch/issues/158029). NCCL caches the
+    setting on first use, so it is chosen here, before any communicator runs;
+    an explicit value is kept.
+    """
+    # PyTorch 2.10 prefers the CUDA-specific variable whenever it is present.
+    if "PYTORCH_CUDA_ALLOC_CONF" in environ:
+        allocator_conf = environ["PYTORCH_CUDA_ALLOC_CONF"]
+    else:
+        allocator_conf = environ.get("PYTORCH_ALLOC_CONF", "")
+    if re.search(
+        r"(?:^|,)\s*expandable_segments\s*:\s*True(?=\s*(?:,|$))", allocator_conf
+    ):
+        environ.setdefault("NCCL_GRAPH_REGISTER", "0")
+
+
+_default_nccl_graph_register(os.environ)
 
 # ===================================================
 # torch 2.9 Inductor PythonWrapperCodegen monkeypatch

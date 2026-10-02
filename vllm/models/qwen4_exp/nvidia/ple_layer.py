@@ -102,7 +102,12 @@ def _advise_random_file_access(tensor: torch.Tensor) -> str:
             fields = line.rstrip().split(maxsplit=5)
             start_text, end_text = fields[0].split("-", maxsplit=1)
             if int(start_text, 16) <= address < int(end_text, 16):
-                if len(fields) == 6 and fields[5].startswith("/"):
+                # Shared anonymous memory shows up as "/dev/zero (deleted)".
+                if (
+                    len(fields) == 6
+                    and fields[5].startswith("/")
+                    and not fields[5].startswith("/dev/zero")
+                ):
                     mapped_path = fields[5]
                 break
     if mapped_path is None:

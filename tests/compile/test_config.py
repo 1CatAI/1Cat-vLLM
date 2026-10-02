@@ -491,6 +491,36 @@ def test_sm70_full_and_piecewise_compile_range_includes_decode_token(monkeypatch
 
 
 @pytest.mark.skipif(
+    not current_platform.is_device_capability((7, 0)),
+    reason="SM70 Flash-V100 graph sizing",
+)
+@pytest.mark.parametrize("max_num_batched_tokens", [50, 2048])
+def test_sm70_speculative_capture_cap_fits_batched_tokens(max_num_batched_tokens):
+    # With speculative decoding the SM70 capture sizes reach 64; a token
+    # budget below that used to fail validation ("customized
+    # max_cudagraph_capture_size(=64) should be consistent with ... (=48)").
+    from vllm.config import ModelConfig, SpeculativeConfig
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model="facebook/opt-125m", dtype="float16"),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=16,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_num_batched_tokens,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+        ),
+        speculative_config=SpeculativeConfig(model="ngram", num_speculative_tokens=3),
+    )
+
+    compilation_config = vllm_config.compilation_config
+    assert compilation_config.max_cudagraph_capture_size == max(
+        compilation_config.cudagraph_capture_sizes
+    )
+    assert compilation_config.max_cudagraph_capture_size <= max_num_batched_tokens
+
+
+@pytest.mark.skipif(
     not current_platform.support_static_graph_mode(),
     reason="Skip if not cudagraph mode supported",
 )

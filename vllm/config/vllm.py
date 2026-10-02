@@ -431,6 +431,15 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     return sorted(capture_sizes)
 
 
+def _sm70_max_cudagraph_capture_size(
+    capture_sizes: list[int], max_num_batched_tokens: int
+) -> int:
+    # The generic sizing later drops capture sizes above max_num_batched_tokens.
+    # A cap above the largest remaining size would then read as a user setting
+    # that contradicts the capture sizes and fail config validation.
+    return max(size for size in capture_sizes if size <= max_num_batched_tokens)
+
+
 def _sm70_mtp_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,
@@ -2197,10 +2206,13 @@ class VllmConfig:
                 and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
-                self.compilation_config.mode = CompilationMode.VLLM_COMPILE
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.FULL_AND_PIECEWISE
-                )
+                # None means unspecified; explicit modes take precedence.
+                if self.compilation_config.mode is None:
+                    self.compilation_config.mode = CompilationMode.VLLM_COMPILE
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_AND_PIECEWISE
+                    )
                 if self.compilation_config.cudagraph_capture_sizes is None:
                     cudagraph_capture_sizes = _sm70_nomtp_cudagraph_capture_sizes(
                         self.scheduler_config.max_num_seqs
@@ -2260,8 +2272,11 @@ class VllmConfig:
                         cudagraph_capture_sizes
                     )
                 if self.compilation_config.max_cudagraph_capture_size is None:
-                    self.compilation_config.max_cudagraph_capture_size = max(
-                        self.compilation_config.cudagraph_capture_sizes
+                    self.compilation_config.max_cudagraph_capture_size = (
+                        _sm70_max_cudagraph_capture_size(
+                            self.compilation_config.cudagraph_capture_sizes,
+                            self.scheduler_config.max_num_batched_tokens,
+                        )
                     )
                 if self.compilation_config.use_inductor_graph_partition is None:
                     self.compilation_config.use_inductor_graph_partition = False
@@ -2352,8 +2367,10 @@ class VllmConfig:
                 )
                 logger.info_once(
                     "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
-                    "mode=VLLM_COMPILE, cudagraph_mode=FULL_AND_PIECEWISE, "
+                    "mode=%s, cudagraph_mode=%s, "
                     "capture_sizes=%s.",
+                    self.compilation_config.mode.name,
+                    self.compilation_config.cudagraph_mode.name,
                     tuple(self.compilation_config.cudagraph_capture_sizes),
                 )
             else:
@@ -2377,18 +2394,29 @@ class VllmConfig:
                     1,
                     envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE,
                 )
-                self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-                if self.compilation_config.max_cudagraph_capture_size is None:
-                    self.compilation_config.max_cudagraph_capture_size = capture_size
+                if self.compilation_config.mode is None:
+                    self.compilation_config.mode = CompilationMode.NONE
+                if self.compilation_config.cudagraph_mode is None:
+                    self.compilation_config.cudagraph_mode = (
+                        CUDAGraphMode.FULL_DECODE_ONLY
+                    )
                 if self.compilation_config.cudagraph_capture_sizes is None:
                     self.compilation_config.cudagraph_capture_sizes = list(
                         range(1, capture_size + 1)
                     )
+                if self.compilation_config.max_cudagraph_capture_size is None:
+                    self.compilation_config.max_cudagraph_capture_size = (
+                        _sm70_max_cudagraph_capture_size(
+                            self.compilation_config.cudagraph_capture_sizes,
+                            self.scheduler_config.max_num_batched_tokens,
+                        )
+                    )
                 logger.info_once(
                     "Using SM70 Flash-V100 no-compile decode CUDA graph "
-                    "policy: mode=NONE, cudagraph_mode=FULL_DECODE_ONLY, "
+                    "policy: mode=%s, cudagraph_mode=%s, "
                     "capture_size=%d.",
+                    self.compilation_config.mode.name,
+                    self.compilation_config.cudagraph_mode.name,
                     capture_size,
                 )
             else:
