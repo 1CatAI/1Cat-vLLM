@@ -30,6 +30,13 @@ they no longer block independent FP16 projections. MTP split draft graphs are
 selected independently of draft width. Experimental batch arithmetic remains
 opt-in pending its existing numerical/performance qualification.
 
+Hybrid PLE automatically budgets the actual per-rank table in pinned host
+memory, capped by available host memory across local TP and DP ranks. This
+avoids consuming apparent VRAM headroom before draft loading and graph
+profiling. Users do not need to supply a checkpoint-specific host-size override;
+explicit `VLLM_QWEN4EXP_PLE_HOST_GIB` settings remain supported. A host-memory
+cap can still prevent the requested model/context from fitting and is logged.
+
 Prefix-cache bulk prefill is used when multiple recurrent-state blocks fit in
 the scheduled-token budget. A full-chunk or larger state block keeps dense
 boundary scheduling; this preserves the 27B C4 behavior while retaining
