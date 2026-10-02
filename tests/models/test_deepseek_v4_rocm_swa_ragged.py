@@ -7,23 +7,32 @@ import torch
 
 from vllm.platforms import current_platform
 
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="the ragged pack is a Triton kernel",
-)
-
 WINDOW_SIZE = 128
 # cdiv(window_size + num_speculative_tokens, 128) * 128 for DSpark
 DSPARK_INDEX_WIDTH = 256
 
 
 @pytest.mark.parametrize(
+    "device_type",
+    [
+        "cpu",
+        pytest.param(
+            current_platform.device_type,
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda_alike(),
+                reason="the native ragged pack requires CUDA or ROCm",
+            ),
+            id="native",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     "noncausal_index_width",
     [0, DSPARK_INDEX_WIDTH],
     ids=["causal", "dspark"],
 )
 def test_rocm_swa_builder_keeps_full_decode_rows(
-    monkeypatch: pytest.MonkeyPatch, noncausal_index_width: int
+    monkeypatch: pytest.MonkeyPatch, noncausal_index_width: int, device_type: str
 ):
     """The ROCm SWA builder copies the ragged decode indices into its graph
     buffer. DSpark's non-causal rows are wider than the window; both the
@@ -36,7 +45,7 @@ def test_rocm_swa_builder_keeps_full_decode_rows(
         DeepseekSparseSWAMetadataBuilder,
     )
 
-    device = torch.device(current_platform.device_type)
+    device = torch.device(device_type)
     # Every schedulable token is a decode token, so the graph buffer is
     # filled to its size.
     max_tokens = 4
@@ -72,6 +81,22 @@ def test_rocm_swa_builder_keeps_full_decode_rows(
 
     monkeypatch.setattr(DeepseekSparseSWAMetadataBuilder, "__init__", fake_init)
     monkeypatch.setattr(DeepseekSparseSWAMetadataBuilder, "build", fake_build)
+    if device_type == "cpu":
+        from vllm.models.deepseek_v4.amd import rocm
+
+        def cpu_pack(dense, lengths):
+            # Only replace the Triton pack. Allocation, slice sizing, graph
+            # buffer copies, and returned metadata execute the real builder.
+            packed = dense.new_empty(dense.numel())
+            prefix = torch.cat(
+                [dense[row, : int(length)] for row, length in enumerate(lengths)]
+            )
+            packed[: prefix.numel()].copy_(prefix)
+            indptr = lengths.new_zeros(lengths.numel() + 1)
+            torch.cumsum(lengths, dim=0, out=indptr[1:])
+            return packed, indptr
+
+        monkeypatch.setattr(rocm, "build_ragged_indices_from_dense", cpu_pack)
 
     builder = DeepseekV4ROCMAiterSparseSWAMetadataBuilder()
     metadata = builder.build(0, None)
@@ -90,4 +115,13 @@ def test_rocm_swa_builder_keeps_full_decode_rows(
     assert (
         metadata.decode_swa_ragged_indices.data_ptr()
         == builder.decode_swa_ragged_indices_buffer.data_ptr()
+    )
+    buffer_pointer = builder.decode_swa_ragged_indices_buffer.data_ptr()
+    indices.add_(1)
+    repeated = builder.build(0, None)
+    assert repeated.decode_swa_ragged_indices is not None
+    assert repeated.decode_swa_ragged_indices.data_ptr() == buffer_pointer
+    expected = torch.cat([indices[i, 0, : int(n)] for i, n in enumerate(lens)])
+    torch.testing.assert_close(
+        repeated.decode_swa_ragged_indices[: expected.numel()], expected
     )
