@@ -44,6 +44,9 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.model_executor.model_loader.direct_io import (
     RunSharing,
+    _group_ready,
+    cgroup_available_bytes,
+    direct_io_capability,
     direct_io_weights,
     is_decoder_layer_weight,
     released_mapped_weights,
@@ -818,7 +821,9 @@ def _get_available_ram_bytes() -> int:
     """Return the available RAM in bytes."""
     import psutil
 
-    return psutil.virtual_memory().available
+    available = psutil.virtual_memory().available
+    group_available = cgroup_available_bytes()
+    return available if group_available is None else min(available, group_available)
 
 
 def _get_fs_type(files: list[str]) -> str:
@@ -1002,6 +1007,7 @@ def safetensors_weights_iterator(
     indexed_weights_by_file: Mapping[str, set[str]] | None = None,
     skip_weight: Callable[[str], bool] | None = None,
     map_weight: Callable[[str], bool] | None = None,
+    auto_direct: bool = True,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1048,6 +1054,32 @@ def safetensors_weights_iterator(
         total_bytes / 1024**3,
         avail_bytes / 1024**3,
     )
+
+    if safetensors_load_strategy is None and auto_direct:
+        direct_ok = not fits_in_ram and fs_type not in ("tmpfs", "ramfs")
+        reason: str | None = (
+            "checkpoint fits the available-RAM budget"
+            if fits_in_ram
+            else "checkpoint storage is memory-backed"
+        )
+        if direct_ok:
+            reason = None
+            for path in sorted_files:
+                direct_ok, reason = direct_io_capability(path)
+                if not direct_ok:
+                    break
+        sharing = _direct_io_sharing(local_expert_ids)
+        if sharing is not None and not _group_ready(direct_ok, sharing):
+            direct_ok = False
+            reason = reason or "a tensor-parallel peer does not qualify"
+        if direct_ok:
+            safetensors_load_strategy = "direct"
+            logger.info_once(
+                "Auto direct I/O enabled: checkpoint exceeds the available-RAM "
+                "budget and aligned storage reads are supported."
+            )
+        else:
+            logger.info_once("Auto direct I/O unavailable: %s.", reason)
 
     should_prefetch = safetensors_load_strategy == "prefetch"
     if safetensors_load_strategy is None:

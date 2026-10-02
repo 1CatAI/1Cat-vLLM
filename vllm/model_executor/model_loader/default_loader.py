@@ -345,6 +345,7 @@ class DefaultModelLoader(BaseModelLoader):
                         indexed_weights_by_file=indexed_weights_by_file,
                         skip_weight=source.skip_weight,
                         map_weight=source.map_weight,
+                        auto_direct=not getattr(self, "_auto_direct_disabled", False),
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -382,13 +383,28 @@ class DefaultModelLoader(BaseModelLoader):
         from vllm.distributed import get_pp_group
 
         skip_weight = getattr(model, "skip_checkpoint_weight", None)
-        if self.load_config.safetensors_load_strategy != "direct":
+        strategy = self.load_config.safetensors_load_strategy
+        if strategy not in (None, "direct"):
+            return skip_weight
+        from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+        if not model_parallel_is_initialized():
             return skip_weight
         # Without pipeline parallelism there is no stage to filter, and not
         # every multimodal model can name its language model.
         if get_pp_group().world_size == 1:
             return skip_weight
-        layer_range = _pipeline_stage_layer_range(model)
+        try:
+            layer_range = _pipeline_stage_layer_range(model)
+        except ValueError:
+            if strategy == "direct":
+                raise
+            self._auto_direct_disabled = True
+            logger.info_once(
+                "Auto direct I/O unavailable: pipeline decoder layer ranges "
+                "are ambiguous; retaining mapped loading."
+            )
+            return skip_weight
         if layer_range is None:
             return skip_weight
         other_stage = decoder_layer_filter(*layer_range)

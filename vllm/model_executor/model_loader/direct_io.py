@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Read safetensors checkpoints with O_DIRECT, past the page cache.
 
-The default loader memory-maps each shard, so every byte it touches lands in
-the page cache and stays there. With a checkpoint larger than host RAM that
-cache pushes other processes into swap while the model loads. Reading with
-O_DIRECT into private buffers leaves the page cache alone, the way llama.cpp's
-direct I/O does.
+Automatic loading uses this path when a checkpoint exceeds the available
+host/cgroup RAM budget and aligned storage reads are supported. Otherwise
+it retains mapped loading. Direct reads use private buffers instead of
+filling the page cache with checkpoint weights.
 
 Under pipeline parallelism a memory-mapped shard only reads the pages a stage
 touches. A reader that fills buffers itself has to decide up front, so
@@ -25,6 +24,7 @@ import os
 import struct
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
+from pathlib import Path
 
 import regex as re
 import torch
@@ -204,7 +204,7 @@ def _check_same_runs(
     together instead of waiting for a lost peer."""
     leader_runs: list[object] = [runs]
     dist.broadcast_object_list(leader_runs, src=sharing.leader, group=sharing.group)
-    same = torch.tensor([int(leader_runs[0] == runs and leader_ok)])
+    same = torch.tensor([int(leader_runs[0] == runs and leader_ok)], device="cpu")
     dist.all_reduce(same, op=dist.ReduceOp.MIN, group=sharing.group)
     if not same.item():
         raise RuntimeError(
@@ -216,9 +216,72 @@ def _check_same_runs(
 def _group_ready(ok: bool, sharing: RunSharing) -> bool:
     """Whether every rank of the group has its part of the run: the leader
     the data it read, the others a buffer to receive it into."""
-    status = torch.tensor([int(ok)])
+    status = torch.tensor([int(ok)], device="cpu")
     dist.all_reduce(status, op=dist.ReduceOp.MIN, group=sharing.group)
     return bool(status.item())
+
+
+def cgroup_available_bytes(
+    root: Path = Path("/sys/fs/cgroup"),
+    membership: Path = Path("/proc/self/cgroup"),
+) -> int | None:
+    """Respect cgroup-v2 hard and pressure limits, including parent groups."""
+    try:
+        entry = next(
+            line[3:]
+            for line in membership.read_text().splitlines()
+            if line.startswith("0::")
+        )
+    except (OSError, StopIteration):
+        return None
+    root = root.resolve()
+    node = (root / entry.lstrip("/")).resolve()
+    if not node.is_relative_to(root):
+        return None
+    remaining = []
+    while True:
+        try:
+            used = int((node / "memory.current").read_text())
+            for name in ("memory.max", "memory.high"):
+                try:
+                    limit = int((node / name).read_text())
+                    remaining.append(max(0, limit - used))
+                except (OSError, ValueError):
+                    pass
+        except (OSError, ValueError):
+            pass
+        if node == root:
+            break
+        node = node.parent
+    return min(remaining) if remaining else None
+
+
+def direct_io_capability(path: str) -> tuple[bool, str | None]:
+    """Probe an aligned read before auto selection yields any tensors."""
+    if not hasattr(os, "O_DIRECT"):
+        return False, "O_DIRECT is unavailable on this platform"
+    fd = -1
+    try:
+        with open(path, "rb", buffering=0) as header_file:
+            header, _ = _read_header(header_file.fileno())
+        unsupported = {
+            info["dtype"]
+            for name, info in header.items()
+            if name != "__metadata__" and info["dtype"] not in _DTYPES
+        }
+        if unsupported:
+            return False, f"unsupported direct tensor formats: {sorted(unsupported)}"
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        size = os.fstat(fd).st_size
+        if size:
+            buffer, _ = _read_run(fd, 0, min(_ALIGN, size))
+            buffer.close()
+    except (OSError, EOFError) as error:
+        return False, f"aligned O_DIRECT read is unavailable: {error}"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return True, None
 
 
 def direct_io_weights(
