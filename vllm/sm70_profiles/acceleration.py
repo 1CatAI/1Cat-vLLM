@@ -117,6 +117,16 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
 
 
 def build_report(cfg: VllmConfig) -> dict[str, Any]:
+    if cfg.model_config is None:
+        # PLE/component processes create a config without a target model.
+        # They must not probe target operators or enforce a serving profile.
+        return {
+            "profile": None,
+            "sm70": _is_sm70(cfg),
+            "scope": "component_config",
+            "expected_acceleration": [],
+            "paths": {},
+        }
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
     from vllm.config.vllm import (
         _SM70_BATCH_GEMM_DEFAULTS,
@@ -194,13 +204,20 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     decode_contract = _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     )
+    if decode_contract:
+        report["profile"] = "qwen4exp_fp16_decode"
+        report["expected_acceleration"] = [
+            "qwen38_decode",
+            "batch_gemm",
+            "compile_graph",
+        ]
     paths["qwen38_decode"] = _row(
         "not_applicable"
         if not decode_contract
         else (
-            "kv_dtype"
-            if cfg.cache_config.cache_dtype not in ("auto", "float16")
-            else (None if all(decode_values.values()) else "user_override")
+            None
+            if all(decode_values[name] for name in decode_names[:3])
+            else "user_override"
         ),
         switches=decode_values,
     )
@@ -338,14 +355,15 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
 
 
 def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
-    from .profile import load_profile
-
     report = build_report(cfg)
+    if getattr(cfg, "is_speculative_draft", False):
+        report["scope"] = "internal_draft_config"
+        report["expected_acceleration"] = []
     # Diagnostic state must not become part of additional_config's compile hash.
     cfg.sm70_acceleration_report = report
     failures = []
     if report["sm70"] or envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION:
-        for name in load_profile()["expected_acceleration"]:
+        for name in report["expected_acceleration"]:
             row = report["paths"][name]
             if not row["enabled"]:
                 failures.append(f"{name}: {row['reason']}")

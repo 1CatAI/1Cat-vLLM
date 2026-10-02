@@ -11,6 +11,7 @@ import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -37,7 +38,7 @@ def _mtp_batch_runtime_contract(vllm_config=None) -> bool:
     return bool(
         speculative is not None
         and getattr(speculative, "method", None) == "mtp"
-        and getattr(speculative, "num_speculative_tokens", None) == 4
+        # M=5/10 arithmetic is checked at dispatch, independently of draft width.
         and not getattr(config.parallel_config, "use_ubatching", False)
     )
 
@@ -532,9 +533,20 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not enabled or not use_sm70_decode_graph_semantics():
         return None
+    # LoRA wrappers and quantized methods must retain their own forward path.
+    # Enabling unrelated FP16 projections must never bypass adapter updates.
+    if not all(
+        isinstance(layer, LinearBase)
+        and type(layer.quant_method)
+        in (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod)
+        for layer in (down_layer, up_layer)
+    ):
+        return None
     down_weight = getattr(down_layer, "weight", None)
     up_weight = getattr(up_layer, "weight", None)
     if down_weight is None or up_weight is None:
+        return None
+    if down_weight.dtype != torch.float16 or up_weight.dtype != torch.float16:
         return None
     if down_weight.shape != (
         _HC_RANK + _HC_COUNT + 12,
@@ -565,6 +577,9 @@ def enable_qwen38_sm70_fp16_fused_hc(
         return
 
     enabled_count = 0
+    tp4 = (
+        vllm_config or get_current_vllm_config()
+    ).parallel_config.tensor_parallel_size == 4
     for child in module.modules():
         if not (
             getattr(child, "use_combine", False)
@@ -579,12 +594,16 @@ def enable_qwen38_sm70_fp16_fused_hc(
         concurrent_batch = bool(
             envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
             and _batch_runtime_contract(vllm_config)
+            and tp4
         )
-        if concurrent_batch or (
-            envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
+        # Only HC's packed collective owns exactly four TP shards. Local router
+        # and shared-expert kernels use the independent MTP admission above.
+        if tp4 and (
+            concurrent_batch
+            or (
+                envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
+            )
         ):
-            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
             for role, layer in (
                 ("down", child.input_mix_weight_down_block_inject),
                 ("up", child.input_mix_weight_up),

@@ -8,6 +8,53 @@ packaging, no-MTP baseline sweeps or repeated broad quality matrices are needed.
 
 ## Shared implementation
 
+### 1.5.1 operator admission
+
+The FP16 projection defaults are selected for the SM70 Qwen4Exp language-model
+lane independently of checkpoint quantization, KV precision, TP/PP/DP size,
+expert parallelism and speculative method/width. Model-wide hidden size, layer
+count, expert count and indexer settings no longer reject otherwise legal
+projections. Explicit environment overrides are preserved.
+
+Individual operators retain their actual requirements: GEMV needs contiguous
+FP16 single-row inputs and weights; tuned role/shape plans take precedence over
+the generic masked FP32 row reduction. Fused GDN needs its supported projection
+geometry/layout; HC needs the supported replicated HC geometry. The packed HC
+collective additionally requires TP4. Other TP sizes keep local HC/GEMV routes.
+LoRA wrappers retain their adapter forwards, and unsupported shapes use the
+ordinary linear path. These checks do not establish that every attention/KV
+format is supported by the separate QSA implementation.
+
+MoE overlap, collectives and hybrid PLE keep their own placement/stream guards;
+they no longer block independent FP16 projections. MTP split draft graphs are
+selected independently of draft width. Experimental batch arithmetic remains
+opt-in pending its existing numerical/performance qualification.
+
+Hybrid PLE automatically budgets the actual per-rank table in pinned host
+memory, capped by available host memory across local TP and DP ranks. This
+avoids consuming apparent VRAM headroom before draft loading and graph
+profiling. Users do not need to supply a checkpoint-specific host-size override;
+explicit `VLLM_QWEN4EXP_PLE_HOST_GIB` settings remain supported. A host-memory
+cap can still prevent the requested model/context from fitting and is logged.
+
+Prefix-cache bulk prefill is used when multiple recurrent-state blocks fit in
+the scheduled-token budget. A full-chunk or larger state block keeps dense
+boundary scheduling; this preserves the 27B C4 behavior while retaining
+Flash-Next's fine-grained prefix reuse and bulk prefill.
+
+Strict acceleration validation applies to the target release profile, with
+internal proposer configs marked separately before draft KV/backend overrides.
+An FP16 draft does not need to provide the target's E4M3 attention operators.
+
+The wheel installs `serve_flash_next_nvfp4_v100.sh MODEL [serve options...]`.
+Its release defaults match the four-V100 MTP4/FP16-KV prefix-cache recipe:
+131072 context, 8192 prefill tokens, one sequence and memory utilization 0.90.
+It does not set any `VLLM_*` variable. The remaining TileLang kernels require
+a standard CUDA 12.8 Toolkit on PATH; CUDA 12.0 compilation fails in the clean
+runtime check. Hybrid PLE uses the actual checkpoint table size (approximately
+47.68 GiB across four ranks for this checkpoint) plus memory for the other
+processes and checkpoint loading. Low host capacity is capped and logged.
+
 PR #684 enables the direct M5 experts and TP4 push collective from merged
 PR #398 together with shared/fused GDN metadata. It also admits exact MTP4 to
 the existing Qwen3.8 common defaults: checkpoint-FP16 GEMV, fused GDN inputs,

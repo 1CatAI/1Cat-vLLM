@@ -134,6 +134,61 @@ def test_user_override_and_strict_failure(config, monkeypatch):
         acc.log_and_validate(config)
 
 
+def test_strict_target_requirements_do_not_apply_to_internal_draft(config, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    config.cache_config.cache_dtype = "auto"
+    with pytest.raises(ValueError, match="e4m3_grouped_fp32"):
+        acc.log_and_validate(config)
+    config.is_speculative_draft = True
+    report = acc.log_and_validate(config)
+    assert report["scope"] == "internal_draft_config"
+    assert report["expected_acceleration"] == []
+    assert report["expected_failures"] == []
+    assert not report["paths"]["e4m3_grouped_fp32"]["enabled"]
+
+
+def test_flashnext_report_uses_its_own_required_paths_and_ignores_kv_dtype(
+    config, monkeypatch
+):
+    config.model_config.architectures = ["Qwen4ExpForCausalLM"]
+    config.speculative_config = NS(method="mtp", num_speculative_tokens=3)
+    for name in (
+        "VLLM_SM70_QWEN38_FP16_GEMV",
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16",
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16",
+    ):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    # MoE stream policy is independent; target FP16 projections do not read KV.
+    monkeypatch.setenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0")
+    monkeypatch.setenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0")
+    for dtype in ("auto", "fp8_e4m3"):
+        config.cache_config.cache_dtype = dtype
+        report = acc.log_and_validate(config)
+        assert report["profile"] == "qwen4exp_fp16_decode"
+        assert report["expected_acceleration"] == [
+            "qwen38_decode",
+            "batch_gemm",
+            "compile_graph",
+        ]
+        assert not report["expected_failures"]
+
+
+def test_model_less_component_config_does_not_validate_a_target(config, monkeypatch):
+    config.model_config = None
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+
+    def unexpected_probe(_page):
+        raise AssertionError("component configs must not probe target operators")
+
+    monkeypatch.setattr(acc, "_native_capabilities", unexpected_probe)
+    report = acc.log_and_validate(config)
+    assert report["scope"] == "component_config"
+    assert report["expected_acceleration"] == []
+    assert report["expected_failures"] == []
+    assert report["paths"] == {}
+
+
 def test_non_sm70_is_not_applicable(config, monkeypatch):
     monkeypatch.setattr(acc, "_is_sm70", lambda cfg: False)
     report = acc.log_and_validate(config)

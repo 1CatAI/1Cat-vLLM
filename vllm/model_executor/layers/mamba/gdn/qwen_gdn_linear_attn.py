@@ -39,6 +39,7 @@ from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -4202,6 +4203,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         use_qwen38_fused_input = bool(
             getattr(self, "sm70_qwen38_fp16_fused_input", False)
+            # A LoRA wrapper owns additional projection work. Only bypass plain
+            # linears; other layers still benefit from their base GEMV method.
+            and isinstance(self.in_proj_qkvz, LinearBase)
+            and isinstance(self.in_proj_ba, LinearBase)
             and use_sm70_decode_graph_semantics()
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )

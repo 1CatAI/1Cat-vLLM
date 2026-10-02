@@ -57,6 +57,35 @@ def test_scheduler_records_mamba_group_block_size() -> None:
     assert scheduler.mamba_state_block_size == MAMBA_BLOCK_SIZE
 
 
+@pytest.mark.parametrize("state_block_size", [816, 8192, 16384])
+def test_bulk_prefill_only_when_multiple_states_fit_in_a_chunk(state_block_size):
+    spec = MambaSpec(
+        block_size=state_block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    original = create_scheduler(
+        max_num_batched_tokens=8192,
+        block_size=state_block_size,
+        num_blocks=16,
+        kv_cache_spec=spec,
+    )
+    config = original.vllm_config
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.enable_prefix_caching = True
+    scheduler = Scheduler(
+        vllm_config=config,
+        kv_cache_config=KVCacheConfig(16, [], [KVCacheGroupSpec(["mamba"], spec)]),
+        structured_output_manager=StructuredOutputManager(config),
+        block_size=state_block_size,
+        hash_block_size=state_block_size,
+    )
+    assert scheduler.mamba_state_retention_interval == (
+        0 if state_block_size < 8192 else None
+    )
+
+
 @pytest.mark.parametrize("mixed_alignment", [False, True])
 def test_scheduler_only_batches_sparse_compatible_state_groups(mixed_alignment):
     mamba_spec = MambaSpec(

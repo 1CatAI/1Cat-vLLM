@@ -33,7 +33,8 @@ def test_same_shape_roles_reach_kernel(monkeypatch, role, policy):
 def test_linear_method_forwards_role(monkeypatch):
     seen = []
 
-    def record_role(x, weight, role):
+    def record_role(x, weight, role, packed_router, dense_batch):
+        assert packed_router is None and dense_batch is False
         seen.append(role)
         return x
 
@@ -79,6 +80,36 @@ def test_role_is_preserved_through_fake_export():
     ]
     assert len(calls) == 1
     assert calls[0].args[2] == "layers.0.linear_attn.out_proj"
+
+
+@pytest.mark.parametrize("shape", [(64, 1537), (768, 5120), (1024, 2560)])
+def test_other_tp_shards_and_widths_have_a_row_kernel_plan(shape):
+    assert gemv._plan_for("model.layers.0.mlp.gate", shape) is not None
+    assert gemv._plan_for("unrelated.layer", shape) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_generic_row_plan_masks_tails_and_replays_changing_inputs():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    torch.manual_seed(511)
+    x = torch.randn(1, 1537, dtype=torch.float16, device="cuda")
+    weight = torch.randn(65, 1537, dtype=torch.float16, device="cuda")
+    role = "model.layers.0.mlp.gate"
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            gemv._qwen38_sm70_fp16_gemv(x, weight, role)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = gemv._qwen38_sm70_fp16_gemv(x, weight, role)
+    for _ in range(8):
+        x.normal_()
+        graph.replay()
+        reference = (x.float() @ weight.float().T).half()
+        torch.testing.assert_close(output, reference, atol=2e-3, rtol=1e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
