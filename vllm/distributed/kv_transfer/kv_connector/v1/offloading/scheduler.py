@@ -119,6 +119,8 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
+    # See OffloadingSpec.demote_superseded_states.
+    demote_superseded_states: bool = True
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -223,6 +225,7 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
+            demote_superseded_states=getattr(spec, "demote_superseded_states", True),
         )
 
 
@@ -1230,6 +1233,8 @@ class OffloadingConnectorScheduler:
 
         if req_status is None:
             return False, None
+        if self.config.demote_superseded_states:
+            self._demote_superseded_states(req_status)
         # Blocks are freed right after this call; a store for a still
         # pending boundary offer could not be issued before block reuse.
         self._drop_pending_boundary_offloads(req_status, "request finished")
@@ -1243,6 +1248,25 @@ class OffloadingConnectorScheduler:
             for bid in job_status.non_sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
         return False, None
+
+    # Replay boundaries (resend and extension) sit within this many blocks of
+    # the request's last full block; older positions only held checkpoints of
+    # earlier turns that the newest boundary supersedes.
+    _KEEP_TAIL_STATE_BLOCKS = 3
+
+    def _demote_superseded_states(self, req_status: RequestOffloadState) -> None:
+        keys: list[OffloadKey] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.sliding_window_size_in_blocks != 1:
+                continue
+            if not group_config.requires_exact_boundary_source:
+                continue
+            group_keys = req_status.group_states[group_config.group_idx].offload_keys
+            keep = self._KEEP_TAIL_STATE_BLOCKS
+            if len(group_keys) > keep:
+                keys.extend(group_keys[: len(group_keys) - keep])
+        if keys:
+            self.manager.demote(keys, req_status.req_context)
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.

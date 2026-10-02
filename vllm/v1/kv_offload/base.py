@@ -173,6 +173,18 @@ class OffloadingManager(ABC):
         """
         return
 
+    def demote(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """
+        Mark the given blocks as the first eviction candidates, e.g. recurrent
+        checkpoints that a newer boundary of the same request has superseded.
+        Missing keys are ignored.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context (e.g. kv_transfer_params).
+        """
+        return
+
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Marks previous blocks that were prepared to load as done loading.
@@ -386,6 +398,12 @@ class OffloadingSpec(ABC):
         # reasoning models that strip thinking).
         self.offload_prompt_only: bool = bool(
             self.extra_config.get("offload_prompt_only", True)
+        )
+        # Hybrid recurrent groups store a new boundary state every turn; when a
+        # request finishes, demote the states its newest boundary supersedes so
+        # they are evicted before other conversations' reusable prefixes.
+        self.demote_superseded_states: bool = bool(
+            self.extra_config.get("demote_superseded_states", True)
         )
 
         parallel_config = vllm_config.parallel_config
