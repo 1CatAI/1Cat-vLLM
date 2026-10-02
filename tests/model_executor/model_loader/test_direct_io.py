@@ -317,3 +317,110 @@ def test_ambiguous_stage_ranges_raise():
     model = nn.Sequential(_Encoder(), _Stack(14, 28, 28))
     with pytest.raises(ValueError, match="several pipeline-partial"):
         _pipeline_stage_layer_range(model)
+
+
+@pytest.mark.parametrize("failure", [None, "storage", "dtype"])
+def test_auto_direct_admission_preserves_checkpoint_bytes(
+    tmp_path, monkeypatch, failure
+):
+    from vllm.model_executor.model_loader import weight_utils
+
+    path = tmp_path / "auto.safetensors"
+    _checkpoint(path)
+    monkeypatch.setattr(weight_utils, "_get_available_ram_bytes", lambda: 0)
+    monkeypatch.setattr(weight_utils, "_get_fs_type", lambda files: "ext4")
+    if failure == "storage":
+        monkeypatch.setattr(
+            weight_utils,
+            "direct_io_capability",
+            lambda path: (False, "storage does not support aligned reads"),
+        )
+    if failure == "dtype":
+        read_header = direct_io._read_header
+
+        def unsupported(fd):
+            header, start = read_header(fd)
+            header["layers.3.ffn.w"]["dtype"] = "UNSUPPORTED"
+            return header, start
+
+        monkeypatch.setattr(direct_io, "_read_header", unsupported)
+    got = dict(safetensors_weights_iterator([str(path)], use_tqdm_on_load=False))
+    _assert_same(got, _reference(path))
+    assert _file_backed(got["layers.3.ffn.w"]) is (failure is not None)
+
+
+def test_explicit_lazy_does_not_probe_or_enable_direct_io(tmp_path, monkeypatch):
+    from vllm.model_executor.model_loader import weight_utils
+
+    path = tmp_path / "lazy.safetensors"
+    _checkpoint(path)
+    monkeypatch.setattr(weight_utils, "_get_available_ram_bytes", lambda: 0)
+
+    def unexpected(path):
+        raise AssertionError("explicit lazy loading must retain its precedence")
+
+    monkeypatch.setattr(weight_utils, "direct_io_capability", unexpected)
+    got = dict(
+        safetensors_weights_iterator(
+            [str(path)], use_tqdm_on_load=False, safetensors_load_strategy="lazy"
+        )
+    )
+    _assert_same(got, _reference(path))
+    assert _file_backed(got["layers.3.ffn.w"])
+
+
+def test_cgroup_parent_pressure_limits_are_respected(tmp_path):
+    root = tmp_path / "groups"
+    child = root / "child"
+    child.mkdir(parents=True)
+    membership = tmp_path / "membership"
+    membership.write_text("0::/child\n")
+    for node, used, maximum, high in (
+        (root, 50, 256, 128),
+        (child, 10, 512, 256),
+    ):
+        (node / "memory.current").write_text(str(used))
+        (node / "memory.max").write_text(str(maximum))
+        (node / "memory.high").write_text(str(high))
+    assert direct_io.cgroup_available_bytes(root, membership) == 78
+    (root / "memory.high").write_text("max")
+    assert direct_io.cgroup_available_bytes(root, membership) == 206
+    (root / "memory.current").write_text("300")
+    assert direct_io.cgroup_available_bytes(root, membership) == 0
+
+
+def _auto_rank(rank, init_file, path, out_dir):
+    import json
+
+    from vllm.model_executor.model_loader import weight_utils
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
+    )
+    weight_utils._get_available_ram_bytes = lambda: 0
+    weight_utils._get_fs_type = lambda files: "ext4"
+    weight_utils.direct_io_capability = lambda path: (rank == 0, "unsupported storage")
+    weight_utils._direct_io_sharing = lambda ids: direct_io.RunSharing(
+        dist.group.WORLD, 0, rank == 0
+    )
+    try:
+        got = dict(
+            weight_utils.safetensors_weights_iterator([path], use_tqdm_on_load=False)
+        )
+        _assert_same(got, _reference(path))
+        with open(f"{out_dir}/{rank}.json", "w") as result:
+            json.dump({"mapped": _file_backed(got["layers.3.ffn.w"])}, result)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_auto_direct_requires_tensor_parallel_consensus(tmp_path):
+    import json
+
+    path = tmp_path / "shared.safetensors"
+    _checkpoint(path)
+    mp.spawn(
+        _auto_rank, args=(str(tmp_path / "init"), str(path), str(tmp_path)), nprocs=2
+    )
+    for rank in range(2):
+        assert json.loads((tmp_path / f"{rank}.json").read_text())["mapped"]
