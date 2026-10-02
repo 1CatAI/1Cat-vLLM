@@ -103,3 +103,52 @@ def test_launcher_propagates_profile_failure(tmp_path):
     python.chmod(0o755)
     result = subprocess.run([str(script), "MODEL"], capture_output=True)
     assert result.returncode == 17
+
+
+def test_launcher_local_draft_and_override(tmp_path):
+    draft = tmp_path / "draft with spaces"
+    draft.mkdir()
+    script = tmp_path / "serve_qwen38_27b_nvfp4_v100.sh"
+    shutil.copy(ROOT / "scripts" / script.name, script)
+    (tmp_path / "python").symlink_to(sys.executable)
+    cli = tmp_path / "vllm"
+    cli.write_text(
+        f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n"
+    )
+    cli.chmod(0o755)
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    result = subprocess.run(
+        [str(script), "target", "--port", "8000", "--draft", str(draft)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    argv = json.loads(result.stdout)
+    assert argv == [
+        "serve",
+        "target",
+        *profile_argv(draft=str(draft)),
+        "--port",
+        "8000",
+    ]
+    spec = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert spec["model"] == str(draft)
+    assert "revision" not in spec
+    assert spec["num_speculative_tokens"] == 7
+
+
+@pytest.mark.parametrize("draft_args", [["--draft"], ["--draft", "/missing/draft"]])
+def test_launcher_rejects_invalid_local_draft(tmp_path, draft_args):
+    script = tmp_path / "serve_qwen38_27b_nvfp4_v100.sh"
+    shutil.copy(ROOT / "scripts" / script.name, script)
+    (tmp_path / "python").symlink_to(sys.executable)
+    cli = tmp_path / "vllm"
+    cli.write_text("#!/bin/sh\nexit 0\n")
+    cli.chmod(0o755)
+    result = subprocess.run(
+        [str(script), "target", *draft_args],
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+    )
+    assert result.returncode == 2

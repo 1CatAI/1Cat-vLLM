@@ -7,6 +7,7 @@ installed Python environment. Extra command-line options override its values.
 ```bash
 python -m pip install ./1cat_vllm-1.5.1-cp312-cp312-linux_x86_64.whl
 serve_qwen38_27b_nvfp4_v100.sh /path/to/target
+serve_qwen38_27b_nvfp4_v100.sh /path/to/target --draft /path/to/downloaded-draft
 python -m vllm.sm70_profiles show qwen38_27b_nvfp4_dflash2 --json
 ```
 
@@ -16,6 +17,10 @@ context, an 8192-token prefill budget, four sequences, 0.80 memory utilization,
 2048-token KV blocks and 8192-token mamba blocks. Model weights are downloaded
 separately; pip installs the declared Python and CUDA runtime dependencies.
 No source overlay or private native extension is required.
+
+The first launch downloads approximately 3.85 GB of draft weights unless
+`--draft` selects a local checkpoint directory. This option keeps the profile's
+sampling and acceleration settings and removes the remote revision argument.
 
 The release owner selected E4M3 KV for the profile and the main qualification
 path. It admits the grouped, long-context and scalar-tail capabilities.

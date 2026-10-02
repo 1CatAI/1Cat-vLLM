@@ -7,7 +7,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: serve_qwen38_27b_nvfp4_v100.sh MODEL [vllm serve options...]
+Usage: serve_qwen38_27b_nvfp4_v100.sh MODEL [--draft LOCAL_PATH] [vllm serve options...]
 
 MODEL is a local checkpoint directory or a Hugging Face model ID.
 Uses the installed vllm, bundled kernels and automatic SM70 operator defaults.
@@ -21,8 +21,8 @@ override the profile, for example:
   serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-NVFP4 --port 8001
   serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-NVFP4 --max-model-len 32768
 
-To use a local draft, pass a replacement --speculative-config JSON after the
-profile arguments. The release default uses the pinned DFlash2 revision.
+To use a downloaded draft, pass --draft /models/Qwen3.8-27B-DFlash2.
+Without --draft, the release default downloads the pinned DFlash2 revision.
 EOF
 }
 
@@ -37,6 +37,21 @@ fi
 model=$1
 shift
 PROFILE_NAME=qwen38_27b_nvfp4_dflash2
+profile_options=()
+serve_options=()
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == --draft ]]; then
+    if [[ $# -lt 2 || $2 == -* ]]; then
+      usage >&2
+      exit 2
+    fi
+    profile_options+=(--draft "$2")
+    shift 2
+  else
+    serve_options+=("$1")
+    shift
+  fi
+done
 
 # Prefer the CLI installed alongside this script, including when the caller
 # invokes it by absolute path without activating that Python environment.
@@ -48,6 +63,7 @@ fi
 
 vllm_cli=$(command -v "$vllm_cli")
 python_bin="$(dirname "$vllm_cli")/python"
-profile_output=$("$python_bin" -m vllm.sm70_profiles argv "$PROFILE_NAME" --argv-lines)
+profile_output=$("$python_bin" -m vllm.sm70_profiles argv "$PROFILE_NAME" \
+  --argv-lines "${profile_options[@]}")
 mapfile -t profile_args <<< "$profile_output"
-exec "$vllm_cli" serve "$model" "${profile_args[@]}" "$@"
+exec "$vllm_cli" serve "$model" "${profile_args[@]}" "${serve_options[@]}"
