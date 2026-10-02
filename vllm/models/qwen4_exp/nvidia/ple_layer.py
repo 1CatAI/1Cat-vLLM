@@ -692,39 +692,42 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if explicit is not None:
             return explicit
         vllm_config = get_current_vllm_config()
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
-        reserve_bytes = _ple_vram_reserve_bytes(total_bytes)
-        gmu = vllm_config.cache_config.gpu_memory_utilization
         table_bytes = self._meta_weight_shape[0] * self.embedding_dim
-        budget = auto_ple_host_budget_bytes(
-            table_bytes=table_bytes,
-            device_total_bytes=total_bytes,
-            device_allocated_bytes=total_bytes - free_bytes,
-            gpu_memory_utilization=gmu,
-            kv_cache_bytes=kv_bytes,
-            reserve_bytes=reserve_bytes,
-        )
         if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
-            # This decision precedes draft loading and graph profiling. The
-            # measured allocation is not the final non-PLE footprint; filling
-            # its apparent headroom can leave no memory for KV/graph pools.
-            # Hybrid PLE already executes prefill off-device. Keep its decode
-            # table in host memory too, subject to the host cap below, rather
-            # than requiring a checkpoint-specific HOST_GIB launch override.
+            # Cache pages are resolved after model loading. Hybrid placement
+            # keeps the entire table on host and does not need a provisional
+            # device/KV estimate, which can reject not-yet-padded CSA pages.
             budget = table_bytes
-        logger.info(
-            "Qwen4Exp PLE auto placement: %s usable at gmu=%.2f, %s already "
-            "allocated, %s KV for %d tokens, %s reserve -> %s of the table go "
-            "to host memory",
-            format_gib(int(total_bytes * gmu)),
-            gmu,
-            format_gib(total_bytes - free_bytes),
-            format_gib(kv_bytes),
-            vllm_config.model_config.max_model_len,
-            format_gib(reserve_bytes),
-            format_gib(budget),
-        )
+            logger.info(
+                "Qwen4Exp hybrid PLE auto placement: %s of the table go to "
+                "host memory before cache layout resolution",
+                format_gib(budget),
+            )
+        else:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
+            reserve_bytes = _ple_vram_reserve_bytes(total_bytes)
+            gmu = vllm_config.cache_config.gpu_memory_utilization
+            budget = auto_ple_host_budget_bytes(
+                table_bytes=table_bytes,
+                device_total_bytes=total_bytes,
+                device_allocated_bytes=total_bytes - free_bytes,
+                gpu_memory_utilization=gmu,
+                kv_cache_bytes=kv_bytes,
+                reserve_bytes=reserve_bytes,
+            )
+            logger.info(
+                "Qwen4Exp PLE auto placement: %s usable at gmu=%.2f, %s already "
+                "allocated, %s KV for %d tokens, %s reserve -> %s of the table go "
+                "to host memory",
+                format_gib(int(total_bytes * gmu)),
+                gmu,
+                format_gib(total_bytes - free_bytes),
+                format_gib(kv_bytes),
+                vllm_config.model_config.max_model_len,
+                format_gib(reserve_bytes),
+                format_gib(budget),
+            )
         # The table lives on the first pipeline stage only, so its
         # tensor-parallel ranks are the ones sharing this host's memory.
         host_available = available_host_bytes()
