@@ -409,6 +409,11 @@ class KernelConfig:
     sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
     """SM70 serialized block-FP8 variant policy, resolved per engine."""
 
+    linear_kernel_selections: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed selector decisions for loaded local layouts; diagnostic only."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -432,6 +437,7 @@ class KernelConfig:
         ignored_factors = {
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
+            "linear_kernel_selections",
         }
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.

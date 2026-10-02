@@ -924,6 +924,22 @@ class Worker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    def get_sm70_acceleration_report(self) -> dict:
+        """Read local selector decisions without rerunning capability probes."""
+        from vllm.sm70_profiles.acceleration import (
+            loaded_linear_kernels,
+            loaded_sm70_preparations,
+        )
+
+        selections = self.vllm_config.kernel_config.linear_kernel_selections
+        return {
+            "rank": self.rank,
+            "scope": "loaded_layer_selection",
+            "linear_kernel_selections": selections,
+            "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
+            "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
+        }
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
