@@ -228,7 +228,9 @@ def scan_file(path: str, known: set[str]) -> int:
                 key = (
                     node.args[0]
                     if node.args
-                    else next((kw.value for kw in node.keywords if kw.arg == "key"), None)
+                    else next(
+                        (kw.value for kw in node.keywords if kw.arg == "key"), None
+                    )
                 )
         elif (
             isinstance(node, ast.Subscript)
