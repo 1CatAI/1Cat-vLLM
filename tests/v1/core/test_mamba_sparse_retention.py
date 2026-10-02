@@ -13,6 +13,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -352,3 +353,58 @@ def test_sparse_mamba_publishes_only_retained_state_tokens(eagle):
     assert len(events) == 1
     assert len(events[0].block_hashes) == 1
     assert events[0].token_ids == list(range(boundary - 32, boundary))
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize("length", [8160, 8192, 32768])
+@pytest.mark.parametrize("interval_blocks", [0, 5])
+def test_bulk_prefill_materializes_every_admitted_state(eagle, length, interval_blocks):
+    block_size = 816
+    interval = interval_blocks * block_size
+    cm = _cache_manager(block_size=block_size, interval=interval, eagle=eagle)
+    request = _request("bulk", length)
+    request.num_computed_tokens = 0
+    request.num_prompt_tokens = length
+    request.shared_prefix_boundary = 3 * block_size
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=8),
+        mamba_state_block_size=block_size,
+        mamba_state_retention_interval=interval,
+        kv_cache_manager=cm,
+        use_eagle=eagle,
+    )
+    materialized = {}
+    ends = []
+    while request.num_computed_tokens < length:
+        start = request.num_computed_tokens
+        chunk = Scheduler._mamba_block_aligned_split(
+            scheduler, request, min(8192, length - start)
+        )
+        assert chunk > 0
+        end = start + chunk
+        for manager in cm.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start)
+            manager.allocate_new_blocks(request.request_id, end, end)
+            if isinstance(manager, MambaManager):
+                # The GPU only writes the final state of this chunk. Verify
+                # no admitted interior block is advertised as that state.
+                slot = (end - 1) // block_size
+                block = manager.req_to_blocks[request.request_id][slot]
+                assert not block.is_null
+                materialized[block.block_id] = end
+        cm.coordinator.cache_blocks(request, end)
+        request.num_computed_tokens = end
+        ends.append(end)
+    manager = cm.coordinator.single_type_managers[1]
+    hashes = BlockHashListWithBlockSize(request.block_hashes, 8, block_size)
+    for i, block_hash in enumerate(hashes):
+        if cached := cm.block_pool.get_cached_block(block_hash, [1]):
+            assert materialized[cached[0].block_id] == (i + 1) * block_size
+    cm.coordinator.free(request.request_id)
+    _, hit = cm.get_computed_blocks(_request("bulk", length))
+    assert hit == max(0, (length - 1) // block_size - int(eagle)) * block_size
+    assert request.shared_prefix_boundary in ends
+    if interval == 0:
+        assert len(ends) <= length // 8000 + 4
+    assert cm.block_pool.get_num_free_blocks() == 999
