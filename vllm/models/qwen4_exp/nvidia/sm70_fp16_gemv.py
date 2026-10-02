@@ -634,9 +634,13 @@ def _batch_runtime_contract(vllm_config=None) -> bool:
     if not _exact_runtime_contract(vllm_config) or envs.VLLM_BATCH_INVARIANT:
         return False
     config = vllm_config or get_current_vllm_config()
-    return bool(
-        config.speculative_config is None
-        and not getattr(config.parallel_config, "use_ubatching", False)
+    from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
+
+    # Verifier and draft projections obey the same local shape/layout checks.
+    # Speculation is not an operator capability. HC retains its separate
+    # split-K numerical policy, selected in its loader.
+    return sm70_flash_next_batch_qualified(config) and not getattr(
+        config.parallel_config, "use_ubatching", False
     )
 
 

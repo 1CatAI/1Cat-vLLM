@@ -595,6 +595,10 @@ def enable_qwen38_sm70_fp16_fused_hc(
             envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
             and _batch_runtime_contract(vllm_config)
             and tp4
+            # MTP's qualified schedule rounds each K512 partial to FP16.
+            # Batch admission must not replace that numerical contract with
+            # the no-MTP FP32-partial schedule.
+            and not _mtp_batch_runtime_contract(vllm_config)
         )
         # Only HC's packed collective owns exactly four TP shards. Local router
         # and shared-expert kernels use the independent MTP admission above.

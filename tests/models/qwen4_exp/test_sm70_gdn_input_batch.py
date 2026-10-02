@@ -36,8 +36,10 @@ def full_precision_reductions():
 @pytest.mark.parametrize(
     "name", ("VLLM_SM70_QWEN38_BATCH_FASTPATH", "VLLM_SM70_QWEN38_GDN_INPUT_BATCH")
 )
-def test_default_off(monkeypatch, name):
+def test_default_on_and_explicit_disable(monkeypatch, name):
     monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name)
+    monkeypatch.setenv(name, "0")
     assert not getattr(envs, name)
 
 

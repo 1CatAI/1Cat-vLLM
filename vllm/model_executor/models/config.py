@@ -25,6 +25,12 @@ class VerifyAndUpdateConfig:
         return
 
 
+def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
+    """Batch quality covers ordinary decode and MTP; other proposers await gates."""
+    speculative = vllm_config.speculative_config
+    return speculative is None or getattr(speculative, "method", None) == "mtp"
+
+
 def sm70_fp8_serialized_pipeline_qualified(vllm_config: "VllmConfig") -> bool:
     """Retain the measured PP2/TP4 no-spec single-request validation boundary.
 

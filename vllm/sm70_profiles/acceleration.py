@@ -6,9 +6,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm import envs
+from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -44,6 +45,69 @@ def _is_sm70(cfg: VllmConfig) -> bool:
     return bool(devices) and all(
         current_platform.is_device_capability((7, 0), device_id=i) for i in devices
     )
+
+
+def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
+    """Explain qualified defaults and packed-copy cost, without claiming hits."""
+    controls = {
+        name: {
+            "enabled": bool(getattr(envs, name)),
+            "reason": None if getattr(envs, name) else "user_override",
+            "description": cast(EnvVar, getter).metadata.description,
+        }
+        for name, getter in envs.environment_variables.items()
+        if "Flash-Next qualified batch"
+        in cast(EnvVar, getter).metadata.acceleration_paths
+    }
+    text = cfg.model_config.hf_text_config
+    tp = cfg.parallel_config.tensor_parallel_size
+    layers = int(getattr(text, "num_hidden_layers", 0))
+    draft_layers = (
+        int(getattr(text, "mtp_num_hidden_layers", 0))
+        if getattr(cfg.speculative_config, "method", None) == "mtp"
+        else 0
+    )
+    # These are sizes of existing packed buffers, not another admission gate.
+    # Different local geometries are checked by their weight loaders; omit an
+    # estimate rather than assuming that they allocate the TP4 reference packs.
+    reference_layout = (
+        tp == 4
+        and getattr(text, "hidden_size", None) == 2560
+        and getattr(text, "hc_count", None) == 4
+        and getattr(text, "hc_lowrank", None) == 320
+    )
+    copies: dict[str, int] = {}
+    if reference_layout:
+        batch = envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        gdn_layers = list(getattr(text, "layer_types", ())).count("linear_attention")
+        if batch or envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH:
+            copies["gdn_input"] = gdn_layers * (4096 + 32) * 2560 * 2
+        if batch or (draft_layers and envs.VLLM_SM70_MTP_HC_BATCH):
+            copies["hc_target"] = layers * 2 * (96 * 10240 + 2560 * 320) * 2
+            copies["hc_draft"] = draft_layers * 2 * (96 * 10240 + 2560 * 320) * 2
+        if draft_layers and envs.VLLM_SM70_MTP_ROUTER_BATCH:
+            copies["router"] = (layers + draft_layers) * 512 * 2560 * 2
+        if draft_layers and envs.VLLM_SM70_MTP_SHARED_BATCH:
+            copies["shared_expert"] = (layers + draft_layers) * 320 * 2560 * 2
+    return {
+        "scope": "configured_capabilities",
+        "status": "runtime_guarded",
+        "controls": controls,
+        "packed_weight_memory": {
+            "scope": "estimated_additional_bytes_per_rank",
+            "reason": None
+            if reference_layout
+            else "estimate_requires_reference_layout",
+            "components": copies,
+            "total_bytes": sum(copies.values()) if reference_layout else None,
+            "excludes": "allocator overhead, graphs, temporary workspaces and KV cache",
+            "mitigation": (
+                "Set QWEN38_BATCH_FASTPATH, QWEN38_GDN_INPUT_BATCH, MTP_HC_BATCH, "
+                "MTP_ROUTER_BATCH and MTP_SHARED_BATCH to 0 (VLLM_SM70_ prefix) "
+                "to remove the corresponding packed copies."
+            ),
+        },
+    }
 
 
 def _native_capabilities(page_size: int) -> dict[str, bool]:
@@ -211,6 +275,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             "batch_gemm",
             "compile_graph",
         ]
+        report["flash_next_batch"] = _flash_next_batch_report(cfg)
     paths["qwen38_decode"] = _row(
         "not_applicable"
         if not decode_contract

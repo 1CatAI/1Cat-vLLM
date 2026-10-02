@@ -95,12 +95,12 @@ def test_bad_packing_rejected(shape, dtype, role, rank):
         hc._pack_hc_batch_weight(torch.empty(shape, dtype=dtype), role, rank)
 
 
-def test_batch_contract_does_not_admit_mtp_or_ubatching(config, monkeypatch):
+def test_batch_contract_admits_mtp_and_rejects_ubatching(config, monkeypatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     assert gemv._batch_runtime_contract(config)
     config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
     assert gemv._exact_runtime_contract(config)  # Existing M1/MTP contract.
-    assert not gemv._batch_runtime_contract(config)
+    assert gemv._batch_runtime_contract(config)
     config.speculative_config = None
     config.parallel_config.use_ubatching = True
     assert not gemv._batch_runtime_contract(config)
@@ -306,4 +306,4 @@ def test_dense_loader_permission_respects_batch_contract(
         config.parallel_config.use_ubatching = True
     layer = Dense()
     gemv.enable_qwen38_sm70_fp16_gemv(layer, torch.float16, config)
-    assert layer._sm70_qwen38_dense_batch == (policy == "normal")
+    assert layer._sm70_qwen38_dense_batch == (policy in ("normal", "mtp"))
