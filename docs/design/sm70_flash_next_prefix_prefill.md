@@ -15,6 +15,14 @@ and mixed cache alignments that require dense admission retain the old split.
 The allocator continues to materialize one running state at each chunk end;
 the scheduler must end a chunk at every boundary that admission will retain.
 
+When a recurrent-state block is at least the scheduler's token budget,
+contending requests retain dense scheduling boundaries to preserve concurrent
+decode throughput. A single request keeps sparse replay boundaries; applying
+the contention fallback unconditionally changed prefix reuse and reduced
+32K speculative decode throughput in the release check. Flash-Next's
+816-token state block with an 8192-token budget continues to use sparse
+scheduling for both single and concurrent requests.
+
 This is a local adaptation of the retention-aware scheduling idea discussed
 in upstream [PR #53479](https://github.com/vllm-project/vllm/pull/53479).
 Its other proposed changes, including removing the speculative block back-off,

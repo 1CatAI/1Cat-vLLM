@@ -311,15 +311,19 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_retention_interval = (
             self.cache_config.prefix_cache_retention_interval
             if self.need_mamba_block_aligned_split
-            # Bulk forwards help when several recurrent checkpoints fit in a
-            # prefill chunk. With a full-chunk state block, keep the existing
-            # scheduling boundaries (27B C4 regressed when these were skipped).
-            and self.mamba_state_block_size is not None
-            and self.mamba_state_block_size < self.max_num_scheduled_tokens
             and all(spec.mamba_cache_mode == "align" for spec in mamba_specs)
             and getattr(coordinator, "lcm_block_size", self.mamba_state_block_size)
             == self.mamba_state_block_size
             else None
+        )
+        # Full-chunk recurrent states need dense boundaries under contention
+        # to preserve concurrent decode throughput. A lone request still uses
+        # sparse replay boundaries: forcing dense admission there changes its
+        # prefix reuse and regresses speculative acceptance on warm repeats.
+        self.mamba_dense_boundaries_on_contention = (
+            self.mamba_state_retention_interval is not None
+            and self.mamba_state_block_size is not None
+            and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -480,6 +484,10 @@ class Scheduler(SchedulerInterface):
         # Stop at every *retained* boundary so none is admitted with a null
         # state, while batching across the discarded interior states.
         retention_interval = getattr(self, "mamba_state_retention_interval", None)
+        if getattr(self, "mamba_dense_boundaries_on_contention", False) and (
+            len(self.running) + len(self.waiting) > 1
+        ):
+            retention_interval = None
         if retention_interval is None:
             retained_boundaries = [(start // block_size + 1) * block_size]
         else:
