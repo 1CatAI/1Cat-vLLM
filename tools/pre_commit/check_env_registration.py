@@ -13,15 +13,7 @@ there, so it does not invalidate the cache.
 import ast
 import sys
 
-import regex as re
-
 ENVS_FILE = "vllm/envs.py"
-
-_READ_PATTERN = re.compile(
-    r"""(?:os\.getenv|os\.environ\.get|os\.environ\.setdefault)\(\s*"""
-    r"""["'](VLLM_[A-Z0-9_]+)["']"""
-    r"""|os\.environ\[\s*["'](VLLM_[A-Z0-9_]+)["']\s*\](?!\s*=[^=])"""
-)
 
 # Direct reads that existed when this check was added. Register them in
 # vllm/envs.py (or delete them) and drop them from this list over time; do not
@@ -195,14 +187,64 @@ def registered_variables() -> set[str]:
 def scan_file(path: str, known: set[str]) -> int:
     with open(path, encoding="utf-8") as f:
         content = f.read()
+    tree = ast.parse(content, filename=path)
+    os_names = {"os"}
+    environ_names: set[str] = set()
+    getenv_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            os_names.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "os"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "os":
+            for alias in node.names:
+                if alias.name == "environ":
+                    environ_names.add(alias.asname or alias.name)
+                elif alias.name == "getenv":
+                    getenv_names.add(alias.asname or alias.name)
+
+    def is_os(node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id in os_names
+
+    def is_environ(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Name) and node.id in environ_names) or (
+            isinstance(node, ast.Attribute)
+            and node.attr == "environ"
+            and is_os(node.value)
+        )
+
     returncode = 0
-    for match in _READ_PATTERN.finditer(content):
-        name = match.group(1) or match.group(2)
+    for node in ast.walk(tree):
+        key: ast.AST | None = None
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and (
+                    (func.attr == "getenv" and is_os(func.value))
+                    or (func.attr in {"get", "setdefault"} and is_environ(func.value))
+                )
+            ) or (isinstance(func, ast.Name) and func.id in getenv_names):
+                key = (
+                    node.args[0]
+                    if node.args
+                    else next((kw.value for kw in node.keywords if kw.arg == "key"), None)
+                )
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Load)
+            and is_environ(node.value)
+        ):
+            key = node.slice
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            continue
+        name = key.value
+        if not name.startswith("VLLM_"):
+            continue
         if name in known or name in BASELINE:
             continue
-        line_num = content[: match.start()].count("\n") + 1
         print(
-            f"{path}:{line_num}: \033[91merror:\033[0m {name} is read from "
+            f"{path}:{node.lineno}: \033[91merror:\033[0m {name} is read from "
             f"os.environ but not registered in {ENVS_FILE}. Register it there "
             "(and add it to ignored_factors if it never changes compiled code)."
         )
