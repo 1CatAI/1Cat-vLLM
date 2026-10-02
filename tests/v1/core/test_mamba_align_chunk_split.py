@@ -58,7 +58,7 @@ def test_scheduler_records_mamba_group_block_size() -> None:
 
 
 @pytest.mark.parametrize("state_block_size", [816, 8192, 16384])
-def test_bulk_prefill_only_when_multiple_states_fit_in_a_chunk(state_block_size):
+def test_full_chunk_states_use_dense_boundaries_only_under_contention(state_block_size):
     spec = MambaSpec(
         block_size=state_block_size,
         shapes=((1,),),
@@ -81,9 +81,40 @@ def test_bulk_prefill_only_when_multiple_states_fit_in_a_chunk(state_block_size)
         block_size=state_block_size,
         hash_block_size=state_block_size,
     )
-    assert scheduler.mamba_state_retention_interval == (
-        0 if state_block_size < 8192 else None
+    assert scheduler.mamba_state_retention_interval == 0
+    assert scheduler.mamba_dense_boundaries_on_contention == (state_block_size >= 8192)
+
+
+@pytest.mark.parametrize("running,waiting", [(1, 0), (0, 1), (2, 0), (1, 1), (0, 2)])
+def test_contention_switch_keeps_single_request_sparse(running, waiting):
+    replay_queries = []
+
+    def replay_boundaries(request, block):
+        replay_queries.append(block)
+        return ()
+
+    request = SimpleNamespace(
+        num_computed_tokens=0,
+        num_prompt_tokens=32768,
+        num_tokens=32768,
     )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
+        mamba_state_block_size=8192,
+        use_eagle=True,
+        mamba_state_retention_interval=0,
+        mamba_dense_boundaries_on_contention=True,
+        running=[request] * running,
+        waiting=[request] * waiting,
+        kv_cache_manager=SimpleNamespace(
+            coordinator=SimpleNamespace(get_replay_boundaries=replay_boundaries)
+        ),
+    )
+    # Start between state boundaries to expose the dense split. This can occur
+    # after a shared-prefix hit or a smaller chunk in the previous iteration.
+    request.num_computed_tokens = 4096
+    assert Scheduler._mamba_block_aligned_split(scheduler, request, 8192) == 4096
+    assert replay_queries == ([] if running + waiting > 1 else [8192])
 
 
 @pytest.mark.parametrize("mixed_alignment", [False, True])
