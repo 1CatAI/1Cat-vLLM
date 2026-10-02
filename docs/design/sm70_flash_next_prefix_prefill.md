@@ -54,7 +54,40 @@ shared junctions, periodic retention, sub-block progress, dense fallback,
 mixed alignments and allocation/admission together. Every admitted state must
 belong to the actual chunk end, with identical-repeat lookup preserved.
 
-Candidate wheel performance, repeated-request quality, long-context quality
-and decode regression validation are pending. No measured candidate speedup
-is claimed until these gates complete. AWQ, E4M3 and concurrent prefill are
-outside the existing baseline evidence.
+## Candidate wheel result
+
+Candidate source `8daf57282e107752378be6551a183720422def14`, wheel SHA256
+`dbd63e4d6007ffd88e5f8ba37a6770fa3d9e61cae81fb07f744f4e593b3c54bf`.
+The wheel installs with its declared dependencies in a fresh uv environment.
+All 15 native binary hashes match the main wheel; the installed scheduler
+matches the owned source. No source overlay, copied private extension or
+new performance flag is used. Key runtime dependency versions match baseline.
+
+| Input tokens | Main prefix-on tokens/s | Fixed prefix-on tokens/s | Main / fixed warm prefill seconds | Reused tokens, both |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 3060 | 5356 | 0.438 / 0.237 | 7344 |
+| 32768 | 3046 | 5068 | 0.479 / 0.282 | 31824 |
+| 131040 | 2818 | 4666 | 0.723 / 0.416 | 129744 |
+
+The 8K throughput row uses the second, warmed cold request in both runs:
+the candidate's first request still includes JIT and takes 4.049 seconds,
+versus 1.529 seconds on its second. The 32K/128K rows use total computed
+tokens divided by total prefill time across two independent cold requests.
+Each configuration has only one successful startup. Relative to prefix off,
+the fixed second 8K remains 12.6% slower; 32K/128K means remain 6.3%/1.4%
+slower. Retained boundary forwards still have a cost; this does not promise
+identical cold performance to disabling caching.
+
+All nine performance responses finish with normal EOS and the same three
+token IDs as main. Six fact/trace interpretation requests over real 32K/128K
+design-document contexts pass the answer oracle with checkpoint sampling;
+repeat outputs are token-identical and reuse 31008/128928 tokens. The short
+natural response is identical to main's 315-token response; native decode
+time is 3.967 versus 3.941 seconds (+0.65%, single request).
+These are focused quality checks, not a broad model accuracy benchmark.
+
+All 152 CPU regressions and scoped pre-commit pass. The service exits zero
+and releases all four GPUs. Candidate startup takes 450.35 seconds with empty
+task caches; compilation-cache defaults, first-request JIT coverage, toolkit
+dependence and the separate 0.95-memory failure remain release work. AWQ,
+E4M3, concurrent prefill and the 256K boundary are untested in this fix.
