@@ -7,10 +7,10 @@ The kernel admits static E4M3 weights with 128 x 128 scales, aligned positive
 N/K, and FP16 activations/output on Volta and Turing. KernelConfig owns the
 policy; no model identity or parallel layout limits this admission.
 
-M=0 returns an empty output. M=1..8 uses packed GEMM; larger M dequantizes to
-FP16 and runs the existing dense prefill operator. Each invocation allocates
-its own dense scratch on its stream, preventing concurrent layers from
-sharing and overwriting dequantized weights. Native arithmetic is unchanged.
+M=0 returns an empty output. M=1..8 uses packed GEMM. Volta retains its
+TurboMind layout for larger M, avoiding a full dense reconstruction on short
+prefills. Turing uses invocation-private dense scratch for its existing FP16
+prefill operator. Native arithmetic is unchanged.
 """
 
 from collections.abc import Sequence
@@ -21,6 +21,7 @@ from torch.library import custom_op
 from vllm import _sm70_ops as sm70_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.kernel import Sm70Fp8Config
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     ScaledMMLinearKernel,
 )
@@ -33,8 +34,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
-# The QPN8 GEMM serves M up to this bound; larger M takes the dense prefill.
+# Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
 _QPN8_MAX_M = 8
+logger = init_logger(__name__)
 
 
 @custom_op("sm70_fp8::qpn8_native_linear", mutates_args=())
@@ -45,6 +47,10 @@ def _qpn8_native_linear(
     split_k: int,
     accumulator_chains: int,
     prefetch_codes: bool,
+    fallback_weight: torch.Tensor | None = None,
+    fallback_scales: torch.Tensor | None = None,
+    fallback_k_ld: int = 0,
+    fallback_q_ld: int = 0,
 ) -> torch.Tensor:
     # The M decision stays inside the opaque op: a compiled graph covers a
     # dynamic M range, so a Python branch traced at small M would be reused
@@ -65,6 +71,18 @@ def _qpn8_native_linear(
             prefetch_codes,
         )
         return out
+    if fallback_weight is not None:
+        sm70_ops.fp8_gemm_sm70_out(
+            out,
+            x,
+            fallback_weight,
+            fallback_scales,
+            128,
+            fallback_k_ld,
+            fallback_q_ld,
+            False,
+        )
+        return out
     dense = torch.empty((k_dim * n_dim,), dtype=torch.float16, device=x.device)
     sm70_ops.fp8_qpn8_prefill_sm70_out(
         out, dense.data_ptr(), x, codes, group_scales, False
@@ -74,7 +92,16 @@ def _qpn8_native_linear(
 
 @_qpn8_native_linear.register_fake
 def _qpn8_native_linear_fake(
-    x, codes, group_scales, split_k, accumulator_chains, prefetch_codes
+    x,
+    codes,
+    group_scales,
+    split_k,
+    accumulator_chains,
+    prefetch_codes,
+    fallback_weight=None,
+    fallback_scales=None,
+    fallback_k_ld=0,
+    fallback_q_ld=0,
 ):
     return x.new_empty((x.shape[0], codes.shape[1]))
 
@@ -109,6 +136,10 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         policy.resolve()
         if not policy.block_qpn8:
             return False, "disabled by kernel_config.sm70_fp8.block_qpn8"
+        if set(policy.explicit_enables).intersection(
+            {"gated_silu", "prefill_prescaled", "prescaled_decode"}
+        ):
+            return False, "retains the explicitly configured fused or prescaled variant"
         if policy.force_marlin:
             return False, "Marlin selected by legacy backend compatibility policy"
         if getattr(config, "is_bmm", False):
@@ -157,12 +188,35 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
 
         codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(weight, block_scales)
         k_dim, n_dim = (int(dim) for dim in codes.shape)
-        layer._qpn8_codes = codes
-        layer._qpn8_scales = group_scales
+        layer.register_buffer(
+            "_sm70_block_fp8_qpn8_packed_codes", codes, persistent=False
+        )
+        layer.register_buffer(
+            "_sm70_block_fp8_qpn8_packed_scales", group_scales, persistent=False
+        )
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.to_int() in (70, 72):
+            packed, scales, metadata = sm70_ops.fp8_sm70_prepare(
+                weight, block_scales, 128, False
+            )
+            layer.register_buffer(
+                "_sm70_block_fp8_turbomind_packed_weight", packed, persistent=False
+            )
+            layer.register_buffer(
+                "_sm70_block_fp8_turbomind_packed_scales", scales, persistent=False
+            )
+            layer._qpn8_fallback_k_ld = int(metadata[0].item())
+            layer._qpn8_fallback_q_ld = int(metadata[1].item())
+        logger.info_once(
+            "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses %s "
+            "because the native block-scale GEMM does not support those rows.",
+            "TurboMind" if hasattr(layer, "_qpn8_fallback_k_ld") else "FP16 prefill",
+        )
         layer._qpn8_out_features = n
         layer._qpn8_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, False)
         layer.sm70_fp8_turbomind = True
-        # The packed codes are now the only resident copy.
+        # The startup memory profile accounts for both packed layouts on
+        # Volta. Raw checkpoint weights are no longer resident.
         layer.weight = torch.nn.Parameter(
             torch.empty(0, dtype=torch.uint8, device=codes.device), requires_grad=False
         )
@@ -179,15 +233,19 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        codes = layer._qpn8_codes
+        codes = layer._sm70_block_fp8_qpn8_packed_codes
         split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
         y = torch.ops.sm70_fp8.qpn8_native_linear(
             x.reshape(-1, codes.shape[0]).contiguous(),
             codes,
-            layer._qpn8_scales,
+            layer._sm70_block_fp8_qpn8_packed_scales,
             split_k,
             accumulator_chains,
             prefetch_codes,
+            getattr(layer, "_sm70_block_fp8_turbomind_packed_weight", None),
+            getattr(layer, "_sm70_block_fp8_turbomind_packed_scales", None),
+            getattr(layer, "_qpn8_fallback_k_ld", 0),
+            getattr(layer, "_qpn8_fallback_q_ld", 0),
         )
         if bias is not None:
             y = y + bias
