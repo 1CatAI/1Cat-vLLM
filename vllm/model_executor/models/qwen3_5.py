@@ -436,14 +436,16 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
                 device=hidden_states.device,
             )
             assert self.in_proj_ba is not None
-            torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out(
+            # The workspace address is resolved inside the opaque op; an int
+            # here would be baked into AOT artifacts as a stale address.
+            torch.ops.vllm.sm70_fp8_qpn8_dispatch_ba_split(
                 mixed_qkv,
                 z,
                 b,
                 a,
                 qkvz_staging,
                 ba_staging,
-                int(self.in_proj_qkvz.sm70_fp8_prefill_exact_dense_workspace_ptr),
+                self.in_proj_qkvz.prefix,
                 hidden_states,
                 self.in_proj_qkvz.weight,
                 self.in_proj_qkvz.weight_scale_inv,

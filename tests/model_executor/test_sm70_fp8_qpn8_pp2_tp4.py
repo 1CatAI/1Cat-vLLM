@@ -9,6 +9,7 @@ import torch
 
 from vllm import envs
 from vllm.model_executor.layers.quantization import fp8
+from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces as ws
 
 
 def _layer(
@@ -180,6 +181,14 @@ def test_pp2_tp4_qpn8_runtime_and_workspace_contract() -> None:
     assert fp8._SM70_FP8_QPN8_PP2_TP4_WORKSPACE_ELEMENTS * 2 == 16 * 1024 * 1024
 
 
+def _cpu_impl(op_name: str, impl) -> torch.library.Library | None:
+    if torch._C._dispatch_has_kernel_for_dispatch_key(f"vllm::{op_name}", "CPU"):
+        return None
+    library = torch.library.Library("vllm", "IMPL", "CPU")
+    library.impl(op_name, impl)
+    return library
+
+
 def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
     layer = _layer("wo_a", 4, 4096, 2048)
     layer.is_bmm = True
@@ -194,9 +203,11 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
     layer.sm70_fp8_qpn8_split_k = 32
     layer.sm70_fp8_qpn8_nacc = 2
     layer.sm70_fp8_qpn8_prefetch = False
-    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = 123
-    layer.weight = torch.empty((2, 4096, 1024), device="meta")
-    layer.weight_scale_inv = torch.empty((2, 256, 32), device="meta")
+    fp8.clear_sm70_fp8_workspaces()
+    workspace = torch.empty(1, dtype=torch.float16)
+    fp8._bind_sm70_fp8_prefill_workspace(layer, workspace)
+    layer.weight = torch.empty((2, 4096, 1024), dtype=torch.uint8)
+    layer.weight_scale_inv = torch.empty((2, 256, 32), dtype=torch.float16)
 
     calls: list[tuple[tuple[int, ...], int, int, bool, bool]] = []
 
@@ -219,12 +230,18 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
         assert nacc == 2
 
     x = torch.zeros((1, 2, 4096), dtype=torch.float16)
-    with patch.object(fp8.sm70_ops, "fp8_qpn8_dispatch_sm70_out", fake_dispatch):
-        out = fp8.Fp8LinearMethod.apply(None, layer, x)
+    library = _cpu_impl("sm70_fp8_qpn8_dispatch", ws._sm70_fp8_qpn8_dispatch)
+    try:
+        with patch.object(fp8.sm70_ops, "fp8_qpn8_dispatch_sm70_out", fake_dispatch):
+            out = fp8.Fp8LinearMethod.apply(None, layer, x)
+    finally:
+        if library is not None:
+            library._destroy()
+        fp8.clear_sm70_fp8_workspaces()
 
     assert calls == [
-        ((1, 4096), 123, 32, False, False),
-        ((1, 4096), 123, 32, False, False),
+        ((1, 4096), workspace.data_ptr(), 32, False, False),
+        ((1, 4096), workspace.data_ptr(), 32, False, False),
     ]
     assert out.shape == (1, 2, 1024)
     torch.testing.assert_close(out[:, 0], torch.ones_like(out[:, 0]))
@@ -232,6 +249,8 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
 
 
 def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> None:
+    # The converter is mocked below; advertise the corresponding native symbol.
+    monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
     envs.disable_envs_cache()
@@ -289,6 +308,8 @@ def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> No
 
 
 def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> None:
+    # The converter is mocked below; advertise the corresponding native symbol.
+    monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_QPN8", raising=False)
@@ -357,6 +378,7 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
 def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(torch.ops._C, "fp8_sm70_prepare", object(), raising=False)
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0")
     monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", raising=False)
