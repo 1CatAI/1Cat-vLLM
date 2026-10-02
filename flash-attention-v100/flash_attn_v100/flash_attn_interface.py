@@ -49,6 +49,13 @@ class _DecodeWorkspace:
 
 
 @dataclass
+class _XQAStagedRescaleWorkspace:
+    buffer: torch.Tensor
+    captured: bool = False
+    previous: "_XQAStagedRescaleWorkspace | None" = None
+
+
+@dataclass
 class _PrefillSplitkv3Workspace:
     tmp_out: torch.Tensor
     row_max: torch.Tensor
@@ -417,15 +424,23 @@ def _get_xqa_staged_rescale_workspace(
         if _can_cache_workspace(q)
         else None
     )
-    if workspace is None or workspace.size(2) < max_num_partitions:
-        workspace = torch.empty(
-            (batch_capacity, num_heads, max_num_partitions),
-            dtype=torch.float32,
-            device=q.device,
+    if workspace is None or workspace.buffer.size(2) < max_num_partitions:
+        previous = workspace
+        workspace = _XQAStagedRescaleWorkspace(
+            buffer=torch.empty(
+                (batch_capacity, num_heads, max_num_partitions),
+                dtype=torch.float32,
+                device=q.device,
+            ),
         )
+        if previous is not None:
+            workspace.previous = previous if previous.captured else previous.previous
         if _can_cache_workspace(q):
             _xqa_staged_rescale_workspace_cache[key] = workspace
-    return workspace
+    # Warmup allocations can become graph storage when reused during capture.
+    if _cuda_graph_capture_active():
+        workspace.captured = True
+    return workspace.buffer
 
 
 def _get_turboquant_decode_workspace(
