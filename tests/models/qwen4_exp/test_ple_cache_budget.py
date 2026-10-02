@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import vllm.config
+import vllm.platforms
 from vllm.models.qwen4_exp.common.ple import kv_cache_bytes_for_max_model_len
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
@@ -13,6 +14,17 @@ from vllm.v1.core.kv_cache_utils import (
     get_max_concurrency_for_kv_cache_config,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+
+
+@pytest.fixture(autouse=True)
+def _settled_block_size(monkeypatch):
+    # These configs are stand-ins without an attention backend; their block
+    # size is already final.
+    monkeypatch.setattr(
+        vllm.platforms.current_platform,
+        "update_block_size_for_backend",
+        lambda cfg: None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -77,3 +89,43 @@ def test_automatic_ple_budget_without_cache_layers(monkeypatch):
     monkeypatch.setattr(vllm.config, "get_layers_from_vllm_config", lambda *args: {})
     config = NS(scheduler_config=NS(disable_hybrid_kv_cache_manager=False))
     assert kv_cache_bytes_for_max_model_len(config) == 0
+
+
+def test_automatic_ple_budget_settles_block_size_before_reading_specs(monkeypatch):
+    # The worker settles the hybrid block size only after load_model(), while
+    # the PLE table is placed during loading: the estimate must read the specs
+    # at the final block size.
+    events = []
+    config = NS(
+        model_config=NS(max_model_len=64),
+        parallel_config=NS(
+            decode_context_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        scheduler_config=NS(disable_hybrid_kv_cache_manager=False),
+        cache_config=NS(block_size=16, num_gpu_blocks_override=None),
+        max_in_flight_tokens=16,
+    )
+
+    def settle(cfg):
+        events.append(("settle", cfg.cache_config.block_size))
+        cfg.cache_config.block_size = 64
+
+    def spec(cfg):
+        events.append(("spec", cfg.cache_config.block_size))
+        return FullAttentionSpec(
+            block_size=cfg.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=16,
+            dtype=torch.float16,
+        )
+
+    monkeypatch.setattr(
+        vllm.platforms.current_platform, "update_block_size_for_backend", settle
+    )
+    monkeypatch.setattr(
+        vllm.config,
+        "get_layers_from_vllm_config",
+        lambda *args: {"full-0": NS(get_kv_cache_spec=spec)},
+    )
+    kv_cache_bytes_for_max_model_len(config)
+    assert events == [("settle", 16), ("spec", 64)]
