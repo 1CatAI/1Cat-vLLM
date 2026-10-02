@@ -48907,3 +48907,37 @@ its original source boundary.
 CI passed after adding explicit types to two imported ROCm router buffers.
 That annotation-only change preserves executable bytecode and constants. No
 AWQ qualification limit, native numerical code, or calculation precision changes.
+
+### Serialized FP8 kernel integration gate (2026-10-03, #794)
+
+Control source `1fa49b3645`, candidate `333217c91a`; normal installed wheels
+contain identical hashes for all 15 native shared objects. The actual historical
+FP8 loader dispatch snapshot matches all 324 standard configurations and 226
+additional FP8 configurations/edges. Eleven Python aliases resolve into
+`KernelConfig.sm70_fp8`; two flags shared with native host dispatch retain their
+legacy interface. Duplicate PP2/TP4 quality predicates have one definition in
+`models/config.py`; no admission boundary is widened.
+
+The numerical oracle covers four FP8 geometries, M1/4/8/4096/8192, TurboMind and
+QPN8: all 40 cases match checkpoint, packed-weight, scale and output hashes.
+Fused gate/up outputs and three CUDA Graph replays at M8 also match bitwise.
+This is an operator oracle, not a 35B model speed baseline.
+
+The 27B NVFP4 DFlash2 release-profile gate uses four V100 32 GB GPUs, Torch
+2.10.0+cu128, CUDA 12.8, TP4, FP16 compute, E4M3 KV, page2048, budget8192,
+C4 capacity, memory utilization0.8, max length262144, 32K input and a 256-token
+output limit. Target sampling remains temperature1/top-p0.95/top-k20 with
+probabilistic drafting. Pure C1 decode is132.08→130.34 tokens/s (-1.32%);
+C4 is252.17→255.23 (+1.21%); C1 TTFT is8.949→8.952s. Individual C1 samples
+span more than the median shift. Retain the raw observations; no speedup claim.
+All21 deterministic quality outputs match tokens and natural EOS, with unchanged
+MBPP11/12, needle3/3 and ChineseQA5/6; the same two baseline failures remain.
+
+The mandatory CPU gate passes54 common tests plus64 scoped tests, and CI passes.
+Two NVFP4 padded-output warmup tests fail under forced CpuPlatform identically
+on the unmodified control; retain that negative result outside this FP8 scope.
+Config environment writes remain20 including one `setdefault`, down from22
+before #790; assignment-only counts are19 and21. All1003 registrations have
+metadata. No environment name is deleted during this compatibility version.
+Actual 35B-A3B AWQ/FP8 checkpoints remain required before widening qualification
+or claiming same-criterion 35B decode parity.
