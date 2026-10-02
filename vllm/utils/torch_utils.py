@@ -29,7 +29,9 @@ else:
 logger = init_logger(__name__)
 
 
-def set_high_precision_cuda_matmul_defaults() -> None:
+def set_high_precision_cuda_matmul_defaults(
+    *, allow_split_k: bool | None = None
+) -> None:
     """Disable reduced-precision CUDA GEMM reductions for vLLM workers.
 
     PyTorch enables reduced-precision accumulation/reduction for some FP16 and
@@ -40,17 +42,29 @@ def set_high_precision_cuda_matmul_defaults() -> None:
     policy in one place so workers configure it before model loading and graph
     capture.
 
-    The attributes are CUDA-only and their exact types vary between supported
-    PyTorch releases (PyTorch 2.10 also accepts a two-element tuple for the
-    split-K controls), so assign ``False`` rather than relying on a version-
-    specific representation.
+    Preserve existing split-K choices unless the caller specifies one. Builds
+    with independent split-K controls accept a reduction/split-K tuple; older
+    builds retain their boolean-only setting. Batch invariant mode requires
+    split-K to stay disabled.
     """
     if not torch.cuda.is_available():
         return
 
     matmul = torch.backends.cuda.matmul
-    matmul.allow_fp16_reduced_precision_reduction = False
-    matmul.allow_bf16_reduced_precision_reduction = False
+    for name in (
+        "allow_fp16_reduced_precision_reduction",
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        split_k_name = f"{name}_split_k"
+        setting: bool | tuple[bool, bool] = False
+        if hasattr(matmul, split_k_name):
+            split_k = (
+                getattr(matmul, split_k_name)
+                if allow_split_k is None
+                else allow_split_k
+            )
+            setting = (False, split_k)
+        setattr(matmul, name, setting)
 
     # This switch is present in current PyTorch releases and controls whether
     # FP16 products may accumulate in FP16. Keep the guard for older builds.
