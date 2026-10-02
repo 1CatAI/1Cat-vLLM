@@ -16,6 +16,8 @@ NAMES = {
     "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT",
     "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES",
     "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M",
+    "VLLM_SM70_AWQ_MLP_ENGINE",
+    "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE",
 }
 ALLOWED = {"vllm/envs.py", "vllm/config/kernel.py"}
 
@@ -34,7 +36,7 @@ def violations(path: Path) -> list[str]:
         if name in NAMES:
             errors.append(
                 f"{path}:{node.lineno}: {name} belongs to the deprecated compatibility "
-                "adapter; consume kernel_config.sm70_nvfp4 instead"
+                "adapter; consume the resolved kernel_config policy instead"
             )
     return errors
 
