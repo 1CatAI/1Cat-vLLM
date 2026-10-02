@@ -98,6 +98,12 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+        # Set by managers whose attention reads only the last `reuse_window`
+        # tokens: lets the base class tell which released blocks can never
+        # serve a future hit from the one run a repeat of the prompt needs.
+        self.reuse_window: int | None = None
+        # Cache-hit alignment, set by the coordinator (its ``lcm_block_size``).
+        self.alignment_tokens: int | None = None
 
     def take_pending_boundary_state_offloads(
         self,
@@ -469,11 +475,21 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         first_block: int,
         last_block: int,
+        hold: tuple[int, int] | None = None,
+        reuse_first: bool = False,
     ) -> None:
         """Free blocks in ``[first_block, last_block)`` and replace with null_block.
 
         Iterates backward so newly-evictable tail blocks are reached even after
         earlier blocks in the range were nulled in a prior call.
+
+        Args:
+            hold: Block range ``[start, end)`` that is left allocated (neither
+                freed nor nulled) so it is released with the rest of the
+                request when it finishes: the cached window a repeat of this
+                prompt needs.
+            reuse_first: Hand the freed blocks out again before other free
+                blocks (see ``BlockPool.free_blocks``).
         """
         if request_id not in self.req_to_blocks:
             return
@@ -484,6 +500,8 @@ class SingleTypeKVCacheManager(ABC):
 
         freed: list[KVCacheBlock] = []
         for i in range(last_block - 1, first_block - 1, -1):
+            if hold is not None and hold[0] <= i < hold[1]:
+                continue
             if blocks[i] == self._null_block:
                 # If the block is already a null block, the blocks before it
                 # should also have been set to null blocks by the previous calls
@@ -492,7 +510,33 @@ class SingleTypeKVCacheManager(ABC):
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
-            self.block_pool.free_blocks(freed)
+            self.block_pool.free_blocks(freed, reuse_first=reuse_first)
+
+    def _cached_window_at_last_boundary(
+        self, num_prompt_tokens: int | None
+    ) -> tuple[int, int] | None:
+        """Block range a repeat of this prompt will look up, or ``None``.
+
+        A hit ends on an ``alignment_tokens`` boundary and, for a sliding
+        window, consults only the blocks ``reachable_block_mask`` caches there:
+        the ``need``-wide run ending at that boundary, shifted by one when
+        EAGLE peeks past it. Those blocks stay allocated until the request
+        finishes, so they are released together with the rest of it; every
+        other block the window moves past is dead and reused first.
+        """
+        if num_prompt_tokens is None or self.reuse_window is None:
+            return None
+        alignment = self.alignment_tokens or self.block_size
+        boundary = num_prompt_tokens // alignment * alignment
+        if boundary <= 0:
+            return None
+        need = cdiv(self.reuse_window - 1, self.block_size)
+        shift = 0
+        if self.use_eagle:
+            need += 1
+            shift = 1
+        end = boundary // self.block_size + shift
+        return (max(0, end - need), end)
 
     def remove_skipped_blocks(
         self,
@@ -515,7 +559,6 @@ class SingleTypeKVCacheManager(ABC):
                 prefix-anchored SWA) that evict a middle gap rather than a head
                 prefix. Ignored by the default implementation.
         """
-        del num_prompt_tokens
         # Remove the blocks that will be skipped during attention computation.
         num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
         if num_skipped_tokens <= 0:
@@ -525,11 +568,23 @@ class SingleTypeKVCacheManager(ABC):
             # before the request is finished.
             return
         num_skipped_blocks = num_skipped_tokens // self.block_size
+        if self.reuse_window is None:
+            self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+            return
+        # Sliding window: blocks the window has moved past can never serve a
+        # future hit, so they are reused first -- otherwise a long prefill
+        # walks the whole free queue and evicts other requests' prefixes. The
+        # one exception is the cached window at the last alignment boundary
+        # of the prompt: a repeat of this prompt looks exactly that up, so it
+        # stays allocated and is released with the request.
+        hold = self._cached_window_at_last_boundary(num_prompt_tokens)
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
         # (e.g., when the attention window moves into the external computed tokens
         # range); `_remove_blocks_in_range` caps to the number of blocks that
         # currently exist for this request.
-        self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+        self._remove_blocks_in_range(
+            request_id, 0, num_skipped_blocks, hold=hold, reuse_first=True
+        )
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -753,6 +808,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
+        self.reuse_window = kv_cache_spec.sliding_window
 
     @classmethod
     def _contiguous_blocks_for_hit(
