@@ -188,15 +188,23 @@ def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
 
     Use the allocator's grouped layout so hybrid padding and shared pools are
     included before deciding how much of the PLE table can stay on device.
+
+    The PLE table is placed while the model loads, but the worker settles the
+    hybrid block size only after load_model(). Settle it here first: with the
+    provisional block size the specs describe pages the allocator never uses,
+    and CSA+linear models fail the cache geometry check outright. The call is
+    idempotent, so the worker's later one changes nothing.
     """
 
     from vllm.config import get_layers_from_vllm_config
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.platforms import current_platform
     from vllm.v1.core.kv_cache_utils import (
         _max_memory_usage_bytes_from_groups,
         get_kv_cache_groups,
     )
 
+    current_platform.update_block_size_for_backend(vllm_config)
     layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)  # type: ignore[type-abstract]
     specs = {}
     for name, layer in layers.items():
