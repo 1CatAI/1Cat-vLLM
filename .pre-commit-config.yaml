@@ -244,6 +244,14 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
+  # prevent new VLLM_* reads that bypass vllm/envs.py (compile cache key)
+  - id: check-env-registration
+    name: "Prevent unregistered 'VLLM_*' environment reads"
+    entry: python tools/pre_commit/check_env_registration.py
+    language: python
+    types: [python]
+    files: ^vllm/
+    additional_dependencies: [regex]
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py
