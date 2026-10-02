@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in checkpoint-FP16 Qwen3.8 decode routes for SM70.
+"""Shape-checked checkpoint-FP16 Qwen4Exp decode routes for SM70.
 
-The route is deliberately narrow: exact Qwen3.8 Flash Next topology, TP4,
-FP16 checkpoint weights, and CUDA-graph decode. GEMV covers single-token
+Admission depends on the individual projection rather than a model/TP profile.
+GEMV covers single-token
 decode and draft; a separately gated packed GDN input kernel covers M2..16 batch
 decode. All prefill and unsupported shapes retain the ordinary unquantized
 linear path.
@@ -227,6 +227,7 @@ def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and weight.is_cuda
         and x.device == weight.device
         and x.shape[1] == weight.shape[1]
+        and current_platform.is_device_capability(70)
     )
 
 
@@ -610,40 +611,23 @@ def _plan_for(prefix: str, shape: tuple[int, int]) -> _GemvPlan | None:
     for suffix, expected_shape, plan in _ROLE_PLANS:
         if prefix.endswith(suffix) and shape == expected_shape:
             return plan
+    # The row kernel masks K tails and accumulates in FP32; the tuned plans
+    # above are preferred, but different TP shards/model widths are legal.
+    if min(shape) > 0 and any(prefix.endswith(role) for role, _, _ in _ROLE_PLANS):
+        return _GemvPlan(512, 4, 0)
     return None
 
 
 def _exact_runtime_contract(vllm_config=None) -> bool:
     try:
         config = vllm_config or get_current_vllm_config()
-        text_config = config.model_config.hf_text_config
-        tp_size = int(config.parallel_config.tensor_parallel_size)
+        from vllm.config.vllm import _is_sm70_qwen38_decode_compile_contract
+
+        return _is_sm70_qwen38_decode_compile_contract(
+            config.model_config, config.speculative_config, config.parallel_config
+        )
     except (AssertionError, AttributeError, RuntimeError):
         return False
-
-    return bool(
-        tp_size == 4
-        and (
-            config.speculative_config is None
-            or (
-                getattr(config.speculative_config, "method", None) == "mtp"
-                and getattr(config.speculative_config, "num_speculative_tokens", None)
-                == 4
-            )
-        )
-        and int(getattr(text_config, "hidden_size", 0)) == 2560
-        and int(getattr(text_config, "num_hidden_layers", 0)) == 48
-        and int(getattr(text_config, "num_experts", 0)) == 512
-        and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
-        and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
-        and int(getattr(text_config, "hc_count", 0)) == 4
-        and int(getattr(text_config, "hc_lowrank", 0)) == 320
-        and int(getattr(text_config, "num_attention_heads", 0)) == 24
-        and int(getattr(text_config, "num_key_value_heads", 0)) == 2
-        and int(getattr(text_config, "indexer_head_dim", 0)) == 128
-        and int(getattr(text_config, "indexer_budget", 0)) == 2048
-        and int(getattr(text_config, "indexer_compress_ratio", 0)) == 4
-    )
 
 
 def _batch_runtime_contract(vllm_config=None) -> bool:

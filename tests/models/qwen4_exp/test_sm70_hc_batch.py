@@ -8,7 +8,7 @@ import pytest
 import torch
 
 import vllm.envs as envs
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc as hc
 
@@ -33,6 +33,8 @@ def restore_precision_and_env_cache():
 def config():
     return SimpleNamespace(
         model_config=SimpleNamespace(
+            architectures=("Qwen4ExpForCausalLM",),
+            dtype=torch.float16,
             hf_text_config=SimpleNamespace(
                 hidden_size=2560,
                 num_hidden_layers=48,
@@ -46,7 +48,7 @@ def config():
                 indexer_head_dim=128,
                 indexer_budget=2048,
                 indexer_compress_ratio=4,
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=4, use_ubatching=False),
         speculative_config=None,
@@ -107,7 +109,7 @@ def test_batch_contract_does_not_admit_mtp_or_ubatching(config, monkeypatch):
     assert not gemv._batch_runtime_contract(config)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     config.parallel_config.tensor_parallel_size = 2
-    assert not gemv._batch_runtime_contract(config)
+    assert gemv._batch_runtime_contract(config)
 
 
 def test_full_precision_also_applies_to_control(config, monkeypatch):
@@ -202,6 +204,42 @@ def test_packed_hc_survives_fake_export():
         if node.target == torch.ops.vllm.qwen38_sm70_fp16_fused_hc.default
     ]
     assert len(calls) == 1 and len(calls[0].args) == 5
+
+
+def test_hc_fusion_never_bypasses_adapter_or_quantized_forward(monkeypatch):
+    monkeypatch.setattr(hc, "use_sm70_decode_graph_semantics", lambda: True)
+    calls = []
+
+    def record(*args):
+        calls.append(args)
+        return args[0], args[0]
+
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen38_sm70_fp16_fused_hc",
+        record,
+    )
+
+    def plain(shape):
+        layer = object.__new__(LinearBase)
+        torch.nn.Module.__init__(layer)
+        layer.weight = torch.nn.Parameter(
+            torch.empty(shape, dtype=torch.float16, device="meta")
+        )
+        layer.quant_method = UnquantizedLinearMethod()
+        return layer
+
+    down, up = plain((336, 10240)), plain((10240, 320))
+    x = torch.empty(1, 10240, dtype=torch.float16, device="meta")
+    assert hc.maybe_apply_qwen38_sm70_fp16_fused_hc(down, up, x, True) is not None
+    assert len(calls) == 1
+    wrapped = torch.nn.Module()
+    wrapped.weight, wrapped.quant_method = down.weight, down.quant_method
+    wrapped.base_layer = down
+    assert hc.maybe_apply_qwen38_sm70_fp16_fused_hc(wrapped, up, x, True) is None
+    down.quant_method = object()
+    assert hc.maybe_apply_qwen38_sm70_fp16_fused_hc(down, up, x, True) is None
+    assert len(calls) == 1
 
 
 def test_admitted_hc_selects_fused_native_output(monkeypatch):

@@ -705,6 +705,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             kv_cache_bytes=kv_bytes,
             reserve_bytes=reserve_bytes,
         )
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+            # This decision precedes draft loading and graph profiling. The
+            # measured allocation is not the final non-PLE footprint; filling
+            # its apparent headroom can leave no memory for KV/graph pools.
+            # Hybrid PLE already executes prefill off-device. Keep its decode
+            # table in host memory too, subject to the host cap below, rather
+            # than requiring a checkpoint-specific HOST_GIB launch override.
+            budget = table_bytes
         logger.info(
             "Qwen4Exp PLE auto placement: %s usable at gmu=%.2f, %s already "
             "allocated, %s KV for %d tokens, %s reserve -> %s of the table go "
@@ -722,7 +730,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         host_available = available_host_bytes()
         host_total = total_host_bytes()
         if budget and host_available is not None and host_total is not None:
-            ranks = vllm_config.parallel_config.tensor_parallel_size
+            parallel = vllm_config.parallel_config
+            ranks = min(parallel.tensor_parallel_size, parallel.local_world_size) * (
+                parallel.data_parallel_size_local
+            )
             host_reserve = _ple_host_reserve_bytes(host_total)
             capped = cap_host_budget_bytes(
                 budget_bytes=budget,
