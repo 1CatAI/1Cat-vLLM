@@ -29,6 +29,40 @@ else:
 logger = init_logger(__name__)
 
 
+def set_high_precision_cuda_matmul_defaults() -> None:
+    """Disable reduced-precision CUDA GEMM reductions for vLLM workers.
+
+    PyTorch enables reduced-precision accumulation/reduction for some FP16 and
+    BF16 GEMMs by default. That is a useful throughput knob for applications
+    that explicitly accept the numerical trade-off, but it is not a safe
+    production default for vLLM: the reduction order is part of the model's
+    numerical behavior and can change logits at batch boundaries. Keep this
+    policy in one place so workers configure it before model loading and graph
+    capture.
+
+    The attributes are CUDA-only and their exact types vary between supported
+    PyTorch releases (PyTorch 2.10 also accepts a two-element tuple for the
+    split-K controls), so assign ``False`` rather than relying on a version-
+    specific representation.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    matmul = torch.backends.cuda.matmul
+    matmul.allow_fp16_reduced_precision_reduction = False
+    matmul.allow_bf16_reduced_precision_reduction = False
+
+    # This switch is present in current PyTorch releases and controls whether
+    # FP16 products may accumulate in FP16. Keep the guard for older builds.
+    if hasattr(matmul, "allow_fp16_accumulation"):
+        matmul.allow_fp16_accumulation = False
+
+    logger.info_once(
+        "CUDA matmul precision policy: FP16/BF16 reduced-precision "
+        "reductions and FP16 accumulation are disabled."
+    )
+
+
 STR_DTYPE_TO_TORCH_DTYPE = {
     "float32": torch.float32,
     "half": torch.half,
