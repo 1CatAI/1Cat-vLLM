@@ -260,6 +260,7 @@ def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> No
     layer.weight_scale_inv = torch.empty((12, 32), device="meta")
     method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
     method.use_marlin = False
+    method.use_qpn8 = False
     method.use_sm70_fp8_turbomind = True
     method.weight_block_size = [128, 128]
     config = SimpleNamespace(
@@ -327,6 +328,7 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
     layer.weight_scale_inv = torch.empty((8, 32), device="meta")
     method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
     method.use_marlin = False
+    method.use_qpn8 = False
     method.use_sm70_fp8_turbomind = True
     method.weight_block_size = [128, 128]
     config = SimpleNamespace(
@@ -401,6 +403,7 @@ def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
 
     method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
     method.use_marlin = False
+    method.use_qpn8 = False
     method.use_sm70_fp8_turbomind = True
     method.weight_block_size = [128, 128]
     method.is_scale_e8m0 = True
