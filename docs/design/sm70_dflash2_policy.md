@@ -75,3 +75,20 @@ SM70 controls decrease from 36 to 31, checked unregistered reads remain zero,
 and `config/vllm.py` environment-write sites decrease from 20 to 19. Two combined
 copy model/TP locks are replaced with one operator capability predicate. No
 CUDA/C++ numerical implementation or computation precision changes.
+
+## Recorded validation
+
+The installed ordinary wheel passed all six existing bitwise copy and graph
+replay cases on a Tesla V100-SXM2-32GB (Torch 2.10.0+cu128, CUDA 12.8).
+The aliased eight-row, 4128-stride local-layout comparison alternated eight
+samples per arm with 1024 CUDA graph replays per sample. Median graph replay
+was 6.824 microseconds for the former three contiguous copies and 6.233
+microseconds for the unchanged combined copy, about 8.7% lower. This is local
+copy timing, not complete-model throughput or a 35B acceptance baseline.
+
+The integration gate passed 57 shared tests plus 181 scoped tests, with 13
+explicit GPU cases skipped in the CPU gate. NVFP4, AWQ and FP8 each preserved
+all 324 configuration routes. The verifier matrix preserved its 324 standard
+rows and accepted only the checked explicit TP2/local-layout edge. Local mypy
+used `MYPYPATH=flash-attention-v100` to resolve the actual vendored optional
+package; GitHub CI passed independently.
