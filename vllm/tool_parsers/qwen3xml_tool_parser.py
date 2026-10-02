@@ -122,6 +122,9 @@ class StreamingXMLToolCallParser:
 
         self.streaming_buffer += xml_chunk
 
+        # A chunk may close one call and open another. Closing tags in that
+        # chunk must never make the fallback close the newly opened call.
+        initial_call_id = self.current_call_id
         found_elements = self._process_complete_xml_elements()
 
         if found_elements:
@@ -133,6 +136,8 @@ class StreamingXMLToolCallParser:
                 # but didn't generate '}', then complete it
                 if (
                     self.current_call_id is not None
+                    and self.current_call_id == initial_call_id
+                    and self.current_function_open
                     and self.function_end_token in xml_chunk
                 ):
                     # - Added '}' (non-empty parameter ending)
@@ -162,6 +167,7 @@ class StreamingXMLToolCallParser:
                 # but didn't generate final empty delta, then complete it
                 if (
                     self.current_call_id is not None
+                    and self.current_call_id == initial_call_id
                     and self.tool_call_end_token in xml_chunk
                 ):
                     has_toolcall_close = any(
@@ -208,9 +214,13 @@ class StreamingXMLToolCallParser:
             # Only execute when still on the same call as when entered,
             # to prevent accidentally closing new calls
             # in multi <tool_call> scenarios
-            if self.current_call_id is not None and (
-                self.function_end_token in xml_chunk
-                or self.tool_call_end_token in xml_chunk
+            if (
+                self.current_call_id is not None
+                and self.current_call_id == initial_call_id
+                and (
+                    self.function_end_token in xml_chunk
+                    or self.tool_call_end_token in xml_chunk
+                )
             ):
                 # Close potentially unclosed element
                 if self.current_param_name:
