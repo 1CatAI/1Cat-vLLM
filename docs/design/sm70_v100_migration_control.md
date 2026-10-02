@@ -48832,5 +48832,5 @@ to screen, with resident-weight memory and KV capacity checked explicitly.
   warmup, and callable-RPC rejection after the successful off/on/off segment.
   The separate named-worker phase probe completes with exit 0. No insecure
   serialization override, repeated node capture or broad quality rerun.
-- Full scope, per-rank values, artifact paths and limitations:
+- Full scope, per-rank values and limitations:
   [MTP4 timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
