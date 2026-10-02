@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import weakref
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -9,9 +8,15 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import PretrainedConfig
 
 from vllm import _custom_ops as ops
-from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config.kernel import Sm70AwqConfig
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import choose_mp_linear_kernel
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
+    Sm70AwqLinearLayerConfig,
+    TurboMindAwqLinearKernel,
+)
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     UnquantizedFusedMoEMethod,
@@ -29,6 +34,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 
 if TYPE_CHECKING:
@@ -36,24 +42,6 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
-
-_SM70_AWQ_PREFILL_DENSE_M = 4096
-_SM70_AWQ_PREFILL_DENSE_SHAPES = {
-    "gate_up_proj": (5120, 8704),
-    "down_proj": (4352, 5120),
-    "in_proj_qkvz": (5120, 4096),
-    "out_proj": (1536, 5120),
-    "o_proj": (1536, 5120),
-}
-_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
-    k * n for k, n in _SM70_AWQ_PREFILL_DENSE_SHAPES.values()
-)
-_SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES = (
-    _SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
-)
-_sm70_awq_prefill_dense_workspaces: weakref.WeakValueDictionary[
-    tuple[int, torch.dtype, int], torch.Tensor
-] = weakref.WeakValueDictionary()
 
 
 def _unpack_awq_gemm_qweight(qweight: torch.Tensor) -> torch.Tensor:
@@ -95,41 +83,6 @@ def _awq_exact_f16_weight(
         bias = (-zeros[group] * scales[group]).unsqueeze(0)
         dense[start:end].copy_(torch.addcmul(bias, quant, scale))
     return dense
-
-
-def _is_sm70_awq_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    if suffix not in _SM70_AWQ_PREFILL_DENSE_SHAPES or len(layer.qweight.shape) != 2:
-        return False
-    k, packed_n = layer.qweight.shape
-    return k > 0 and k % 128 == 0 and packed_n > 0 and packed_n % 16 == 0
-
-
-def _get_sm70_awq_prefill_exact_dense_workspace(
-    weight: torch.Tensor,
-) -> torch.Tensor | None:
-    device_index = weight.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
-    elements = max(_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 8)
-    cache_key = (device_index, torch.float16, elements)
-    workspace = _sm70_awq_prefill_dense_workspaces.get(cache_key)
-    if workspace is not None:
-        return workspace
-    try:
-        workspace = torch.empty(
-            (elements,),
-            dtype=torch.float16,
-            device=weight.device,
-        )
-    except torch.OutOfMemoryError:
-        logger.warning_once(
-            "Insufficient memory for the bounded SM70 AWQ prefill workspace; "
-            "falling back to TurboMind AWQ."
-        )
-        return None
-    _sm70_awq_prefill_dense_workspaces[cache_key] = workspace
-    return workspace
 
 
 class AWQConfig(QuantizationConfig):
@@ -354,6 +307,12 @@ class AWQLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
+        config = get_current_vllm_config_or_none()
+        self.sm70_policy = (
+            config.kernel_config.sm70_awq if config is not None else Sm70AwqConfig()
+        )
+        self.sm70_policy.resolve()
+        self.sm70_kernel: TurboMindAwqLinearKernel | None = None
 
     def create_weights(
         self,
@@ -433,90 +392,42 @@ class AWQLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_awq_sm70_prepared", False):
             return
-
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-
-        if (
-            not sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
-            or not layer.qweight.is_cuda
-        ):
+        if not self.sm70_policy.enabled or not layer.qweight.is_cuda:
             return
-
-        cap = torch.cuda.get_device_capability(layer.qweight.device)
-        if cap != (7, 0):
+        if torch.cuda.get_device_capability(layer.qweight.device) != (7, 0):
             return
-
+        k, packed_n = layer.qweight.shape
         group_size = self.quant_config.group_size
         if group_size == -1:
-            group_size = layer.qweight.shape[0]
-        if group_size not in (32, 64, 128):
-            raise RuntimeError(
-                "SM70 TurboMind AWQ supports group_size 32/64/128, "
-                f"but got {group_size}."
-            )
-        if not hasattr(torch.ops._C, "awq_sm70_prepare"):
-            raise RuntimeError(
-                "VLLM_SM70_AWQ_TURBOMIND=1 requires a build with CUDA arch 7.0 "
-                "and the SM70 TurboMind extension."
-            )
-
-        is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
-        use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_AWQ_MLP_ENGINE
-
-        use_prefill_exact_dense = (
-            envs.VLLM_SM70_AWQ_PREFILL_EXACT_DENSE
-            and group_size == 128
-            and _is_sm70_awq_prefill_exact_dense_layer(layer)
-            and not use_gated_silu
-            and hasattr(torch.ops._C, "awq_sm70_dequantize_out")
+            group_size = k
+        config = Sm70AwqLinearLayerConfig(
+            full_weight_shape=(k, packed_n * 8),
+            partition_weight_shape=(k, packed_n * 8),
+            weight_type=scalar_types.uint4,
+            act_type=torch.float16,
+            group_size=group_size,
+            zero_points=True,
+            has_g_idx=False,
+            policy=self.sm70_policy,
+            gated_silu=self._is_sm70_gated_silu_layer(layer),
         )
-
-        tm_weight, tm_scales, meta = sm70_ops.awq_sm70_prepare(
-            layer.qweight,
-            layer.scales,
-            layer.qzeros,
-            group_size,
-            use_gated_silu,
-        )
-        layer._awq_sm70_weight = tm_weight
-        layer._awq_sm70_scales = tm_scales
-        layer._awq_sm70_k_ld = int(meta[0])
-        layer._awq_sm70_q_ld = int(meta[1])
-        layer._awq_sm70_group_size = group_size
-        layer._awq_sm70_prepared = True
-        if use_gated_silu:
-            layer._awq_sm70_gated_silu = True
-            layer._awq_sm70_gated_silu_primary = True
-            logger.info_once(
-                "SM70 AWQ dense MLP gated-SiLU single-layout path enabled."
-            )
-
-        # The runtime path consumes only the TurboMind-packed tensors above.
-        # Releasing the original AWQ tensors matches the 0.0.3 SM70 path and
-        # avoids carrying duplicate quantized weights in long-context runs.
-        layer.qweight = torch.nn.Parameter(
-            torch.empty(0, dtype=torch.int32, device=tm_weight.device),
-            requires_grad=False,
-        )
-        layer.qzeros = torch.nn.Parameter(
-            torch.empty(0, dtype=torch.int32, device=tm_weight.device),
-            requires_grad=False,
-        )
-        layer.scales = torch.nn.Parameter(
-            torch.empty(0, dtype=tm_scales.dtype, device=tm_weight.device),
-            requires_grad=False,
-        )
-        if use_prefill_exact_dense:
-            workspace = _get_sm70_awq_prefill_exact_dense_workspace(tm_weight)
-            if workspace is not None:
-                layer._awq_sm70_prefill_exact_dense_workspace = workspace
-                logger.info_once(
-                    "SM70 AWQ exact-dense prefill path enabled with a bounded "
-                    "layout-sized workspace."
-                )
-        logger.info_once("SM70 AWQ TurboMind dense path enabled.")
+        try:
+            kernel_type = choose_mp_linear_kernel(config, compute_capability=70)
+        except ValueError as exc:
+            # Class disabling is a new explicit user control. Missing native
+            # support and invalid group sizes retain the previous fail-closed
+            # behavior rather than silently changing legacy routing.
+            if "TurboMindAwqLinearKernel" in envs.VLLM_DISABLED_KERNELS:
+                layer._awq_sm70_fallback_reason = "disabled by VLLM_DISABLED_KERNELS"
+                return
+            raise RuntimeError(str(exc)) from exc
+        kernel = kernel_type(config, "qweight", "scales", "qzeros")
+        assert isinstance(kernel, TurboMindAwqLinearKernel)
+        self.sm70_kernel = kernel
+        kernel.process_weights_after_loading(layer)
 
     @staticmethod
     def _is_sm70_gated_silu_layer(layer: torch.nn.Module) -> bool:
@@ -530,43 +441,10 @@ class AWQLinearMethod(LinearMethodBase):
             and output_partition_sizes[0] == output_partition_sizes[1]
         )
 
-    def apply_fused_silu_and_mul(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if not envs.VLLM_SM70_AWQ_MLP_ENGINE:
+    def apply_fused_silu_and_mul(self, layer, x):
+        if self.sm70_kernel is None:
             return None
-        if not getattr(layer, "_awq_sm70_gated_silu", False):
-            return None
-        if not getattr(layer, "_awq_sm70_prepared", False):
-            return None
-        if getattr(layer, "tp_size", 1) != 2:
-            return None
-
-        x_2d = x.reshape(-1, x.shape[-1])
-        if x_2d.shape[0] != 1:
-            return None
-        if x_2d.stride(-1) != 1:
-            x_2d = x_2d.contiguous()
-
-        out_features = layer.output_size_per_partition // 2
-        out_2d = torch.empty(
-            (x_2d.shape[0], out_features),
-            dtype=x.dtype,
-            device=x.device,
-        )
-        sm70_ops.awq_gemm_sm70_out(
-            out_2d,
-            x_2d,
-            layer._awq_sm70_weight,
-            layer._awq_sm70_scales,
-            layer._awq_sm70_group_size,
-            layer._awq_sm70_k_ld,
-            layer._awq_sm70_q_ld,
-            True,
-        )
-        return out_2d.reshape(*x.shape[:-1], out_features)
+        return self.sm70_kernel.apply_fused_silu_and_mul(layer, x)
 
     def apply(
         self,
@@ -582,54 +460,8 @@ class AWQLinearMethod(LinearMethodBase):
 
         # num_tokens >= threshold
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
-        if getattr(layer, "_awq_sm70_prepared", False):
-            out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * pack_factor,)
-            prefill_workspace = getattr(
-                layer, "_awq_sm70_prefill_exact_dense_workspace", None
-            )
-            if (
-                prefill_workspace is not None
-                and reshaped_x.dtype == torch.float16
-                and reshaped_x.shape[0] == _SM70_AWQ_PREFILL_DENSE_M
-            ):
-                logger.info_once(
-                    "SM70 AWQ bounded-workspace exact-dense 4096-token "
-                    "prefill runtime path active."
-                )
-                k = reshaped_x.shape[1]
-                n = out_shape[-1]
-                prefill_weight = prefill_workspace[: k * n].view(k, n)
-                sm70_ops.awq_sm70_dequantize_out(
-                    prefill_weight,
-                    layer._awq_sm70_weight,
-                    layer._awq_sm70_scales,
-                    layer._awq_sm70_group_size,
-                )
-                out = torch.mm(reshaped_x, prefill_weight)
-                if bias is not None:
-                    out.add_(bias)
-                return out.reshape(out_shape)
-            out = torch.empty(
-                (reshaped_x.shape[0], out_shape[-1]),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            sm70_ops.awq_gemm_sm70_out(
-                out,
-                reshaped_x,
-                layer._awq_sm70_weight,
-                layer._awq_sm70_scales,
-                layer._awq_sm70_group_size,
-                layer._awq_sm70_k_ld,
-                layer._awq_sm70_q_ld,
-            )
-            if getattr(layer, "_awq_sm70_gated_silu_primary", False):
-                out_features = out_shape[-1] // 2
-                out = (
-                    out.reshape(reshaped_x.shape[0], out_features, 2)
-                    .transpose(1, 2)
-                    .reshape(reshaped_x.shape[0], out_shape[-1])
-                )
+        if self.sm70_kernel is not None:
+            return self.sm70_kernel.apply_weights(layer, x, bias)
         elif current_platform.is_cuda() and current_platform.is_device_capability(70):
             # The classic AWQ GEMM is unsupported on SM70, while its dequantize
             # fallback can produce NaNs there. Use the architecture-independent

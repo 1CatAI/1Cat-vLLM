@@ -3043,15 +3043,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_TURBOMIND": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_TURBOMIND", "1"))),
         description=(
-            "V100/SM70 AWQ dense path using the local TurboMind backend. This "
-            "matches the 0.0.3 route semantics: enable by default on SM70 and "
-            "allow an explicit opt-out with VLLM_SM70_AWQ_TURBOMIND=0."
+            "Dense-linear compatibility alias for "
+            "kernel_config.sm70_awq.enabled. The shared environment setting "
+            "still controls unmigrated AWQ MoE. V100/SM70 AWQ dense path using"
+            " the local TurboMind backend. This matches the 0.0.3 route "
+            "semantics: enable by default on SM70 and allow an explicit "
+            "opt-out with VLLM_SM70_AWQ_TURBOMIND=0."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("TurboMindAwqLinearKernel", "AWQSM70MoEMethod"),
+        acceleration_paths=(
+            "TurboMindAwqLinearKernel",
+            "AWQSM70MoEMethod",
+        ),
     ),
     # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
     # weight-only formats. These broad compressed-tensor gates stay default-off;
@@ -3497,12 +3503,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_MLP_ENGINE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))),
         description=(
-            "Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. "
-            "The first stage fuses gate_up_proj + SiluAndMul through the "
-            "TurboMind GEMM epilogue for M=1/TP2 while keeping the existing "
-            "down_proj/reduce path."
+            "Dense-linear compatibility alias for "
+            "kernel_config.sm70_awq.fused_silu. Experimental TileRT-inspired "
+            "dense MLP lane for SM70 AWQ decode. The first stage fuses "
+            "gate_up_proj + SiluAndMul through the TurboMind GEMM epilogue for"
+            " M=1/TP2 while keeping the existing down_proj/reduce path."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -3513,10 +3520,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))),
         description=(
-            "Expand selected full 4096-token TP4 AWQ projections into one "
-            "reusable bounded FP16 workspace before their exact dense GEMM."
+            "Dense-linear compatibility alias for "
+            "kernel_config.sm70_awq.prefill_exact_dense. Expand selected full "
+            "4096-token TP4 AWQ projections into one reusable bounded FP16 "
+            "workspace before their exact dense GEMM."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),

@@ -13,3 +13,10 @@ def test_reject_registered_variable_outside_compatibility_adapter(tmp_path):
     assert len(violations(path)) == 1
     path.write_text("x = config.kernel_config.sm70_nvfp4.qpn2\n")
     assert not violations(path)
+
+
+def test_awq_runtime_alias_read_is_rejected(tmp_path):
+    path = tmp_path / "vllm" / "new_awq_kernel.py"
+    path.parent.mkdir()
+    path.write_text("x = envs.VLLM_SM70_AWQ_MLP_ENGINE\n")
+    assert len(violations(path)) == 1
