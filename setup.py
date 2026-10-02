@@ -69,6 +69,8 @@ def _onecat_torch_cu128_urls() -> dict[str, str]:
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
+# Preload its dependency without importing vllm's runtime initialization.
+load_module_from_path("vllm.envs_metadata", ROOT_DIR / "vllm" / "envs_metadata.py")
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
