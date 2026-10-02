@@ -54,3 +54,26 @@ def test_current_tree_is_clean():
     ).stdout.split()
     known = registered_variables()
     assert not any(scan_file(path, known) for path in files if path != "vllm/envs.py")
+
+
+def test_comments_strings_and_deletions_are_not_environment_reads(tmp_path):
+    source = (
+        '# os.getenv("VLLM_NOT_A_SWITCH")\n'
+        "example = 'os.environ[\"VLLM_NOT_A_SWITCH\"]'\n"
+        'del os.environ["VLLM_NOT_A_SWITCH"]\n'
+    )
+    assert not _scan(tmp_path, source)
+
+
+def test_import_aliases_cannot_bypass_registration(tmp_path):
+    sources = (
+        'import os as system\nx = system.getenv("VLLM_NOT_A_SWITCH")\n',
+        'from os import environ as env\nx = env.get("VLLM_NOT_A_SWITCH")\n',
+        'from os import getenv as lookup\nx = lookup("VLLM_NOT_A_SWITCH")\n',
+    )
+    for source in sources:
+        assert _scan(tmp_path, source)
+
+
+def test_keyword_environment_keys_are_checked(tmp_path):
+    assert _scan(tmp_path, 'import os\nx = os.getenv(key="VLLM_NOT_A_SWITCH")\n')
