@@ -1729,7 +1729,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
@@ -2752,7 +2752,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="512",
         effective_default="512",
         automatic_conditions=(),
-        acceleration_paths=("QSA sparse attention/indexer",),
+        acceleration_paths=(),
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -2804,7 +2804,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     "VLLM_TEST_FORCE_LOAD_FORMAT": env_var(
         lambda: os.getenv("VLLM_TEST_FORCE_LOAD_FORMAT", "dummy"),
@@ -2926,7 +2926,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("TurboMindAwqLinearKernel",),
+        acceleration_paths=(),
     ),
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
@@ -2999,7 +2999,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="'auto'",
         effective_default="Computed by get_sm70_quant_backend",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 weight-only quantization providers",),
     ),
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
@@ -3015,7 +3015,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("TurboMindAwqLinearKernel",),
+        acceleration_paths=("TurboMindAwqLinearKernel", "AWQSM70MoEMethod"),
     ),
     # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
     # weight-only formats. These broad compressed-tensor gates stay default-off;
@@ -3032,7 +3032,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))),
@@ -3044,7 +3044,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_AWQ_MOE_DISABLE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_DISABLE", "0"))),
@@ -3441,7 +3441,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="512",
         effective_default="512",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS", "80")),
@@ -3453,7 +3453,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="80",
         effective_default="80",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. The
     # first stage fuses gate_up_proj + SiluAndMul through the TurboMind GEMM
@@ -3587,7 +3587,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
     # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
@@ -3799,7 +3799,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
@@ -3816,7 +3816,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit
@@ -3878,7 +3878,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FA2_D256_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_FA2_D256_LIBRARY", None),
@@ -3890,7 +3890,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Experimental q8 long attention; unset preserves the full-context route.
     "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST": env_var(
@@ -3902,7 +3902,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. Default-off keeps
     # the existing eager fallback and its memory footprint unchanged.
@@ -4696,7 +4696,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))),
@@ -4769,7 +4769,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_GEMM_LUT_PATH": env_var(
         lambda: os.getenv("VLLM_SM70_GEMM_LUT_PATH"),
@@ -4781,7 +4781,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M", "16")),
@@ -4895,7 +4895,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Skip PP metadata and TP reconstruction only for the exact, replicated
     # SM70 B1 hidden-state schema validated by the worker on both stages.
@@ -4910,7 +4910,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")),
@@ -4950,7 +4950,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", "0"))),
@@ -4962,7 +4962,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Default-on only feeds the pure-greedy top-token shortcut below. The full
     # LM-head GEMM fast path remains separately gated by
@@ -5015,7 +5015,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 " override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_LM_HEAD_TOP1_TC": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))),
@@ -5027,7 +5027,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Candidate-only QPN8 LM head. QPN8 selects a conservative local top-64
     # support, then directly re-evaluates the original FP16 rows and restores
@@ -5703,7 +5703,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8", "1"))),
@@ -5715,7 +5715,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Exact TP8/q8 W13 path matching TurboMind's CTA-K32 split-3 tree.
     "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": env_var(
@@ -5734,7 +5734,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "apply only when the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Fuse the local shared+routed FP16 add into the exact TP8 q8 push tree.
     "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8": env_var(
@@ -5782,7 +5782,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="-3",
         effective_default="-3",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_GLM53_TP8_CUBLASLT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0"))),
@@ -5803,7 +5803,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "apply only when the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Fixed-shape TP8 KDA f_b/g_b fusion. The global default remains off;
     # the quality-audited GLM-5.3 DFlash2 TP8/PP1 contract enables it.
@@ -5827,7 +5827,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "apply only when the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
     # transformed q logits are cached for rejection sampling, so non-default
@@ -5896,7 +5896,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("SM70 FP16 linear",),
+        acceleration_paths=(),
     ),
     # Allow DFlash2 candidate TopK when the shared target LM head is
     # quantized (e.g. compressed-tensors NVFP4 checkpoints, whose
@@ -6096,7 +6096,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))),
@@ -6108,7 +6108,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
     "VLLM_SM70_TOPK_TOPP_8_WARPS": env_var(
@@ -6120,7 +6120,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # The exact B8/B16, 248320-column sampler contract uses one logits row per
     # request. Eight warps preserves Qrita's masking math while improving SM70
@@ -6137,7 +6137,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
@@ -6156,7 +6156,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="Computed when unset: max(0, int('0'))",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_ASYNC_STAGED_INPUT_PREP": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_ASYNC_STAGED_INPUT_PREP", "0"))),
@@ -6168,7 +6168,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_ASYNC_CPU_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE", "0"))),
@@ -6180,7 +6180,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_ASYNC_CPU_TRACE_EVERY": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE_EVERY", "16"))),
@@ -6192,7 +6192,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="16",
         effective_default="Computed when unset: max(1, int('16'))",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Legacy 0.0.3 diagnostic gate. Logs one TP all-reduce backend decision per
     # group/backend/shape/dtype so route-hit data can distinguish custom AR,
@@ -6209,7 +6209,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT": env_var(
         lambda: (
@@ -6229,7 +6229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "'VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT' in os.environ else None"
         ),
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Opt in exact MTP4 verifier payloads on fully-connected SM70 TP4.
     "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": env_var(
@@ -6286,7 +6286,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_F16_DENSE_ALLOWLIST": env_var(
         lambda: os.getenv("VLLM_SM70_F16_DENSE_ALLOWLIST"),
@@ -6298,7 +6298,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_DENSE_ALLOWLIST": env_var(
         lambda: os.getenv("VLLM_SM70_MOE_DENSE_ALLOWLIST"),
@@ -6310,7 +6310,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_F16_DENSE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64")),
@@ -6322,7 +6322,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="64",
         effective_default="64",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_F16_DENSE_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_F16_DENSE_DEBUG", "0"))),
@@ -6334,7 +6334,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_QWEN3_NEXT_SM70_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_QWEN3_NEXT_SM70_TRACE", "0"))),
@@ -6358,7 +6358,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL", "0"))),
@@ -6370,7 +6370,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_UNQUANT_DEBUG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0"))),
@@ -6382,7 +6382,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_SHARED_GATE_MAX_M": env_var(
         lambda: int(os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64")),
@@ -6394,7 +6394,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="64",
         effective_default="64",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Compatibility fallback for serialized FP8 checkpoints on SM70 shapes not
     # handled by the TurboMind W8A16 dense kernel: dequantize once at load time
@@ -6577,7 +6577,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_CHUNKED_TOPK20_CHUNKS": env_var(
         lambda: int(os.getenv("VLLM_SM70_CHUNKED_TOPK20_CHUNKS", "0")),
@@ -6589,7 +6589,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER", "0"))),
@@ -6601,7 +6601,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))),
@@ -6627,7 +6627,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))),
@@ -6639,7 +6639,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))),
@@ -6651,7 +6651,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))),
@@ -6663,7 +6663,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
@@ -7030,7 +7030,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "apply only when the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR", "0"))),
@@ -7051,7 +7051,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "apply only when the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.
@@ -7072,7 +7072,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": env_var(
         lambda: bool(
@@ -7086,7 +7086,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH": env_var(
         lambda: bool(
@@ -7100,7 +7100,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH": env_var(
         lambda: bool(
@@ -7114,7 +7114,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_COMPACT_W13_FASTPATH": env_var(
         lambda: bool(
@@ -7128,7 +7128,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH": env_var(
         lambda: bool(
@@ -7142,7 +7142,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": env_var(
         lambda: bool(
@@ -7156,7 +7156,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": env_var(
         lambda: bool(
@@ -7277,7 +7277,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("AWQ/FP8/NVFP4/MXFP4 batch GEMM layouts",),
     ),
     "VLLM_SM70_PROFILE_TRACE": env_var(
         lambda: bool(
@@ -7292,7 +7292,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE", "0"))),
@@ -7304,7 +7304,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS": env_var(
         lambda: float(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS", "1.0")),
@@ -7316,7 +7316,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="1.0",
         effective_default="1.0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE_EVERY": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_EVERY", "16"))),
@@ -7328,7 +7328,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="16",
         effective_default="Computed when unset: max(1, int('16'))",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_MTP_PROFILE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))),
@@ -7403,7 +7403,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # The private ring changes compressor-state ownership and lifetime. Keep it
     # opt-in until its long-context quality and capacity gates are complete.
@@ -7418,7 +7418,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": env_var(
         lambda: os.getenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"),
@@ -7454,7 +7454,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_REJECTION_PROFILE_INTERVAL": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_REJECTION_PROFILE_INTERVAL", "20"))),
@@ -7466,7 +7466,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="20",
         effective_default="Computed when unset: max(1, int('20'))",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_REJECTION_COMBINE_BONUS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1"))),
@@ -7478,7 +7478,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": env_var(
         lambda: bool(int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))),
@@ -7787,7 +7787,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_FLASH_V100_ROUTE_SUMMARY": env_var(
         lambda: bool(int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))),
@@ -7811,7 +7811,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Mixed chunked-prefill batches send resident decode and short verification
     # rows through the partitioned paged-decode kernels. This prevents a q=1
@@ -9245,7 +9245,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0")),
@@ -9257,7 +9257,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR"),
@@ -9269,7 +9269,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE"),
@@ -9281,7 +9281,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS"),
@@ -9293,7 +9293,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS", "128")),
@@ -9305,7 +9305,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="128",
         effective_default="128",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR"),
@@ -9317,7 +9317,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE"),
@@ -9329,7 +9329,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS", "0")),
@@ -9341,7 +9341,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS"),
@@ -9353,7 +9353,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_QSA_KV_CALIBRATION_DIR": env_var(
         lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"),
@@ -9389,7 +9389,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE", "stream"),
@@ -9401,7 +9401,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="'stream'",
         effective_default="'stream'",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS"),
@@ -9413,7 +9413,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE": env_var(
         lambda: os.getenv("VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE", "stream"),
@@ -9425,7 +9425,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="'stream'",
         effective_default="'stream'",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR"),
@@ -10069,7 +10069,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS", "1"))),
@@ -10081,7 +10081,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TRITON_ATTN_NUM_WARPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_NUM_WARPS", "0")),
@@ -10093,7 +10093,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS": env_var(
         lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS", "0")),
@@ -10117,7 +10117,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION": env_var(
         lambda: os.getenv("VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION"),
@@ -10129,7 +10129,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION": env_var(
         lambda: os.getenv("VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION"),
@@ -10141,7 +10141,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Experimental SM70 GDN/FLA KKT autotune search-space gate.
     "VLLM_SM70_GDN_KKT_SCHEDULE": env_var(
@@ -10598,7 +10598,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
@@ -10612,7 +10612,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Diagnostic-only: restore the 0.0.3-style PyTorch Gemma RMSNorm arithmetic
     # inside torch.compile so Inductor can fuse the surrounding elementwise work.
@@ -10637,7 +10637,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks.
     "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": env_var(
@@ -10676,7 +10676,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FUSED_SIGMOID_GATING_BV": env_var(
         lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_BV"),
@@ -10688,7 +10688,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_WARPS"),
@@ -10700,7 +10700,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_STAGES"),
@@ -10712,7 +10712,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Legacy 0.0.3 coarse Qwen3Next fused-sigmoid gate. Latest splits this
     # into recurrent schedule and mixed-QKV controls; keep the old name visible
@@ -10796,7 +10796,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE", "0"))),
@@ -10808,7 +10808,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Paused old experiment: changing GDN core output allocation from zeros to
     # empty lacked route-hit and quality proof. Keep visible but do not enable.
@@ -10863,7 +10863,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))),
@@ -10875,7 +10875,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Default-on decode tiles for the audited exact-shape SM70 MTP contracts.
     # Larger or unmatched token shapes retain the 0.0.3 config; setting this
@@ -10926,7 +10926,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # SM70/V100 production-candidate CUDA graph policy. This explicitly maps
     # to the generic breakable cudagraph path only after config verifies that
@@ -10945,7 +10945,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Recreate the 0.0.3 SM70 Flash-V100 production graph policy for baseline
     # recovery: VLLM_COMPILE + FULL_AND_PIECEWISE with small decode captures.
@@ -11004,7 +11004,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "defaults apply only when the environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
     # uses the asynchronous CPU/disk-mmap offload result.
@@ -11030,7 +11030,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "environment override is absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
     # disables AOT cache reload by default due known token drift, but long
@@ -11055,7 +11055,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # Optional 0.0.3 VLLM_COMPILE graph-preset parity knob. Keep it default-off:
     # 27B-FP8 timing showed no speed recovery and changed greedy token hashes.
@@ -11222,7 +11222,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "absent."
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FLA_BV": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_BV"),
@@ -11233,7 +11233,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FLA_WARPS": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_WARPS"),
@@ -11245,7 +11245,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FLA_STAGES": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_STAGES"),
@@ -11257,7 +11257,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FLA_TARGET_WAVES": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_TARGET_WAVES"),
@@ -11269,7 +11269,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FLA_BV_CANDIDATES": env_var(
         lambda: os.getenv("VLLM_SM70_FLA_BV_CANDIDATES"),
@@ -11281,7 +11281,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": env_var(
@@ -11374,7 +11374,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
@@ -11546,7 +11546,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # Whether to use aiter triton fp4 bmm kernel
     # By default is enabled.
@@ -11624,7 +11624,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # Pad the weights for the moe kernel
     "VLLM_ROCM_MOE_PADDING": env_var(
@@ -11723,7 +11723,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("SM70 FP16 linear",),
+        acceleration_paths=(),
     ),
     # Custom quick allreduce kernel for MI3* cards.
     # Controls the maximum allowed number of data bytes(MB) for custom quick
@@ -12107,7 +12107,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="''",
         effective_default="''",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Comma-separated *additional* individual env var names to copy from
     # the driver to Ray workers.  Merged with the built-in defaults
@@ -12192,7 +12192,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "None)))"
         ),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind MXFP4",),
+        acceleration_paths=(),
     ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_var(
@@ -12269,7 +12269,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("TurboMind NVFP4",),
+        acceleration_paths=(),
     ),
     # Whether to turn on the outlines cache for V1
     # This cache is unbounded and on disk, so it's not safe to use in
@@ -12435,7 +12435,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # Allow use of FlashInfer BF16 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -12454,7 +12454,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=("False"),
         automatic_conditions=(),
-        acceleration_paths=("SM70 FP16 linear",),
+        acceleration_paths=(),
     ),
     # Allow use of FlashInfer FP8 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -12473,7 +12473,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=("False"),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # Allow use of FlashInfer NVFP4 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -12527,7 +12527,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=("False"),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # If set to 1, use the FlashInfer CUTLASS backend for
     # MXFP8 (activation) x MXFP4 (weight) MoE.
@@ -12553,7 +12553,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=("False"),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # If set to 1, use the FlashInfer
     # BF16 (activation) x MXFP4 (weight) MoE backend.
@@ -12574,7 +12574,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=("False"),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind MXFP4",),
+        acceleration_paths=(),
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
@@ -12590,7 +12590,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="512",
         effective_default="512",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
@@ -12778,7 +12778,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="'auto'",
         effective_default="'auto'",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": env_var(
@@ -12831,7 +12831,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="Computed when unset: json.loads('{}')",
         effective_default="Computed when unset: json.loads('{}')",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # MoE routing strategy selector.
     # See `RoutingSimulator.get_available_strategies()` # for available
@@ -12970,7 +12970,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=("False"),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind NVFP4",),
+        acceleration_paths=(),
     ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": env_var(
@@ -13043,7 +13043,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind NVFP4",),
+        acceleration_paths=(),
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
@@ -13149,7 +13149,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("TurboMind FP8",),
+        acceleration_paths=(),
     ),
     # Whether to use pytorch symmetric memory for allreduce
     "VLLM_ALLREDUCE_USE_SYMM_MEM": env_var(
@@ -13159,7 +13159,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Whether to use FlashInfer allreduce
     "VLLM_ALLREDUCE_USE_FLASHINFER": env_var(
@@ -13169,7 +13169,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": env_var(
@@ -13466,7 +13466,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": env_var(
@@ -13476,7 +13476,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
-        acceleration_paths=("SM70 collectives",),
+        acceleration_paths=(),
     ),
     # Flag to enable FBGemm kernels on model execution
     # Deprecated: use --linear-backend fbgemm instead.
@@ -15158,7 +15158,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ph_inputs"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS"),
@@ -15175,7 +15175,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ph_inputs"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_GDN_CORE_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR"),
@@ -15550,7 +15550,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "layer_graph_buffers"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR"),
@@ -15591,7 +15591,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 ":_sm70_moe_runner_dump_requested"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE"),
@@ -15608,7 +15608,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "dump_impl"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE"),
@@ -15629,7 +15629,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ayer_graph_buffers"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS"),
@@ -15654,7 +15654,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "layer_graph_buffers"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS"),
@@ -15679,7 +15679,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "layer_graph_buffers"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_IDS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS"),
@@ -15704,7 +15704,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "y:_sm70_moe_runner_dump_requested"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_LABELS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS"),
@@ -15725,7 +15725,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "sm70_moe_runner_dump_requested"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS"),
@@ -15742,7 +15742,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "dump_impl"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS"),
@@ -15763,7 +15763,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 ":_sm70_moe_runner_dump_token_count_allowed"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_QWEN_MLP_INTERNALS"),
@@ -15780,7 +15780,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "lp_tensor"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE"),
@@ -15794,7 +15794,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(
             "None at vllm/v1/sample/sampler.py:_maybe_dump_sm70_sampler_logits",
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS": env_var(
         lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS"),
@@ -15811,7 +15811,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "p_top_token_margin"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_FLASHQLA_DIRECT_OUTPUT": env_var(
         lambda: os.getenv("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT"),
@@ -16293,7 +16293,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(
             ("None at vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py:apply"),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD": env_var(
         lambda: os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD"),
@@ -16327,7 +16327,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "orward_profile_scope"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP": env_var(
         lambda: os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP"),
@@ -16345,7 +16345,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ard_profiler_step"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR"),
@@ -16366,7 +16366,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "_flash_v100_decode_compare"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH"),
@@ -16383,7 +16383,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "pare_result"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE": env_var(
         lambda: os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE"),
@@ -16428,7 +16428,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "tinuation_prefill_workspace"
             ),
         ),
-        acceleration_paths=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
     ),
     "VLLM_SPEC_DUMP_ALIGNMENT_DIR": env_var(
         lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR"),

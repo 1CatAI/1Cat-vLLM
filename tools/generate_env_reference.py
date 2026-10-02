@@ -57,7 +57,7 @@ def render(metadata: dict[str, dict]) -> str:
             row["declared_default"],
             row["effective_default"],
             "<br>".join(row["automatic_conditions"]) or "None",
-            ", ".join(row["acceleration_paths"]) or "Not acceleration-specific",
+            ", ".join(row["acceleration_paths"]) or "No SM70 path association",
         ]
         lines.append("| " + " | ".join(map(cell, fields)) + " |")
     return "\n".join(lines) + "\n"
