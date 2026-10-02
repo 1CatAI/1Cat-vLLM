@@ -12,6 +12,9 @@ there, so it does not invalidate the cache.
 
 import ast
 import sys
+from pathlib import Path
+
+import regex as re
 
 ENVS_FILE = "vllm/envs.py"
 
@@ -19,6 +22,61 @@ ENVS_FILE = "vllm/envs.py"
 # vllm/envs.py (or delete them) and drop them from this list over time; do not
 # add new entries.
 BASELINE: frozenset[str] = frozenset()
+
+NATIVE_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
+
+
+def native_reads(content: str) -> list[tuple[str, int]]:
+    """Find literal keys and constant aliases passed to native env readers.
+
+    Preserve quoted strings and line numbers while removing C/C++ comments.
+    Native wrappers such as env_flag_enabled and *_from_env are readers too.
+    This is a lexical check, not an evaluator of dynamic string construction.
+    """
+    tokens = re.compile(
+        r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*[\s\S]*?\*/'
+    )
+
+    def mask_comments(match):
+        token = match.group()
+        return re.sub(r"[^\n]", " ", token) if token.startswith(("//", "/*")) else token
+
+    source = tokens.sub(mask_comments, content)
+    aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(VLLM_[A-Z0-9_]+)"', source))
+    calls = re.finditer(
+        r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"(VLLM_[A-Z0-9_]+)"|(\w+)\b)',
+        source,
+    )
+    reads = []
+    for call in calls:
+        if "env" not in call[1].lower():
+            continue
+        name = call[2]
+        if name is None:
+            name = next(
+                (
+                    alias[2]
+                    for alias in reversed(aliases)
+                    if alias[1] == call[3] and alias.start() < call.start()
+                ),
+                None,
+            )
+        if name:
+            reads.append((name, source.count("\n", 0, call.start()) + 1))
+    return reads
+
+
+def scan_native_file(path: str, known: set[str]) -> int:
+    content = Path(path).read_text(encoding="utf-8")
+    missing = {
+        (name, line) for name, line in native_reads(content) if name not in known
+    }
+    for name, line in sorted(missing):
+        print(
+            f"{path}:{line}: error: {name} is read by native code but not "
+            f"registered in {ENVS_FILE}. Register it with complete metadata."
+        )
+    return int(bool(missing))
 
 
 def registered_variables() -> set[str]:
@@ -45,6 +103,8 @@ def registered_variables() -> set[str]:
 
 
 def scan_file(path: str, known: set[str]) -> int:
+    if Path(path).suffix in NATIVE_SUFFIXES:
+        return scan_native_file(path, known)
     with open(path, encoding="utf-8") as f:
         content = f.read()
     tree = ast.parse(content, filename=path)
