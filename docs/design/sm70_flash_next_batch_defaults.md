@@ -10,7 +10,12 @@ retain their existing fallbacks. Native arithmetic and weight precision are
 unchanged; online QPN8 remains opt-in.
 
 The 14 controls tagged `Flash-Next qualified batch` in environment metadata
-are enabled by default, retaining explicit `0` overrides. Their qualification
+are enabled by default for qualified operation, retaining explicit `0`
+overrides. Gated RMSNorm is resolved per engine in
+`KernelConfig.sm70_rmsnorm_gated_exact`: Flash-Next ordinary decode and MTP
+select it automatically; unrelated models retain their previous route.
+The compatibility getter remains off. The loaded layer holds its own decision,
+and the resolved value participates in the compilation hash. Their qualification
 comes from [#703](https://github.com/1CatAI/1Cat-vLLM/pull/703) and
 [#704](https://github.com/1CatAI/1Cat-vLLM/pull/704). These references contain
 bounded model quality and performance evidence; they do not establish general
@@ -57,7 +62,26 @@ Flash-Next rows; unrelated model rows retain their routes. It does not replace
 paired model quality or target throughput measurements for admission/default
 changes. M1/prefill and unsupported local geometries retain their fallbacks.
 
-Small-batch dense output under the MTP reduced-reduction policy can differ
-from the original cuBLAS result in FP16 bits. Admission therefore needs paired
-model quality, rather than a claim of universal bit identity. No global
-accumulation flags are changed for MTP.
+With the MTP reduced-reduction policy, M2/M4/M5 output projections retain
+baseline cuBLAS routing: the native oracle showed different FP16 bits there.
+M8 and the measured small router rows remain admitted. An explicit request for
+FP16 accumulation also keeps its original dispatch. No global precision flags
+are changed for MTP.
+
+## Promotion validation remains open
+
+The earlier candidate passed MBPP 12/12, 32K retrieval 3/3 and Chinese QA 6/6
+with 17/21 exact token sequences. A matched 1-GiB-KV configuration improved
+C1 throughput by 13.24%; its long C4 sample lacked four simultaneous decoders
+and is excluded. A valid four-request profile at 32K capacity, 4K inputs and
+1024 outputs, TP4/MTP4, FP16 KV, 1.5 GiB KV/rank and prefill budget 4096
+initially regressed by 3.85%. The same KV budget with prefill budget 8192
+exhausted memory. Packed weights added about 1.25 GiB/rank at load; manually
+specified KV bytes do not automatically shrink to reserve peak workspace.
+
+The small-row routing follow-up measured C4 at 220.410 versus 222.553 token/s
+(0.96% lower), while its warmup was about 1% faster. These adjacent values do
+not prove that the guard repaired the earlier performance regression: control
+throughput also changed across runs. A single-switch dense-batch diagnostic is
+queued. The current final artifact still requires paired quality and target
+speed validation before promotion. PR #796 remains draft.

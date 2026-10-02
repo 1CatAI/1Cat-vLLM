@@ -111,9 +111,11 @@ def test_qwen38_sm70_shared_expert_custom_silu_capability(
         ("model.layers.3.self_attn.o_proj", (2560, 1536)),
         ("model.layers.3.self_attn.indexer.index_qk_proj", (640, 2560)),
         ("model.layers.3.mlp.gate", (512, 2560)),
+        ("model.layers.0.linear_attn.out_proj", (2560, 2560)),
+        ("other.linear_attn.in_proj_qkvz", (4096, 2561)),
     ],
 )
-def test_qwen38_sm70_fp16_gemv_exact_role_allowlist(
+def test_qwen38_sm70_fp16_gemv_role_and_geometry_capability(
     prefix: str, shape: tuple[int, int]
 ) -> None:
     assert _plan_for(prefix, shape) is not None
@@ -125,8 +127,6 @@ def test_qwen38_sm70_fp16_gemv_exact_role_allowlist(
         ("model.layers.0.attn_hyper_connection.input_mix_weight_up", (10240, 320)),
         ("model.layers.0.mlp.shared_expert.gate_up_proj", (320, 2560)),
         ("model.layers.0.mlp.shared_expert_gate", (1, 2560)),
-        ("model.layers.0.linear_attn.out_proj", (2560, 2560)),
-        ("other.linear_attn.in_proj_qkvz", (4096, 2561)),
     ],
 )
 def test_qwen38_sm70_fp16_gemv_rejects_other_roles(

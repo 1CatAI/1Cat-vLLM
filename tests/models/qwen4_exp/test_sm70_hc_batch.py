@@ -331,6 +331,9 @@ def test_mtp_dense_batch_honors_explicit_fp16_accumulation(monkeypatch):
         stride=lambda: (1536, 1),
         data_ptr=lambda: 16,
     )
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False
+    )
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
     assert gemv._can_use_dense_batch(x, weight, "model.layers.0.linear_attn.out_proj")
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", True)

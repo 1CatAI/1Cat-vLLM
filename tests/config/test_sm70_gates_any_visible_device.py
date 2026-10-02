@@ -142,6 +142,7 @@ def _patch_visible_devices(monkeypatch, capabilities: list[tuple[int, int]]):
     # instance-level attributes behind that would shadow a class patch.
     from vllm.platforms import current_platform
 
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(current_platform, "device_count", lambda: len(capabilities))
     monkeypatch.setattr(
         current_platform,
