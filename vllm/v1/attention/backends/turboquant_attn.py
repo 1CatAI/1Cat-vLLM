@@ -298,9 +298,15 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TurboQuantMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
-        # Set seq_lens to 1 so CUDA graph capture is fast
-        # (real seq_lens are filled at replay time).
-        attn_metadata.seq_lens.fill_(1)
+        # Present a continuation/decode-shaped batch (seq_len > q_len) so
+        # the captured branch matches replay-time verify/decode. Filling
+        # seq_lens with 1 makes max_query_len == max_seq_len and routes
+        # capture to the first-chunk flash path (no KV-cache history),
+        # which then replays for verify steps and corrupts attention.
+        attn_metadata.seq_lens.fill_(attn_metadata.max_query_len + 1)
+        attn_metadata.max_seq_len = attn_metadata.max_query_len + 1
+        if attn_metadata.seq_lens_cpu is not None:
+            attn_metadata.seq_lens_cpu.fill_(attn_metadata.max_query_len + 1)
         return attn_metadata
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
@@ -1177,8 +1183,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
-                    # Slice from pre-built arange (no kernel launch)
-                    synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
+                    # Graph-safe: derive per-row seq_lens from the GPU-resident
+                    # seq_lens tensor (refreshed before each CUDA graph replay)
+                    # plus a freshly built arange. A python slice of
+                    # _arange_cache would bake a stale pointer at capture.
+                    synth_seq_lens = (
+                        attn_metadata.seq_lens[i : i + 1]
+                        - q_len
+                        + 1
+                        + torch.arange(
+                            q_len,
+                            device=query.device,
+                            dtype=attn_metadata.seq_lens.dtype,
+                        )
+                    )
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                     out = triton_turboquant_decode_attention(
                         query=q_seq,

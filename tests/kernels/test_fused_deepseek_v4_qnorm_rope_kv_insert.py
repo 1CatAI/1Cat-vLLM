@@ -23,6 +23,7 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
 )
+from vllm.platforms import current_platform
 
 # ── Constants matching the kernel ────────────────────────────────────────────
 HEAD_DIM = 512
@@ -115,8 +116,11 @@ def _op_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not _op_available(),
-    reason="CUDA not available or fused DeepseekV4 op not built in",
+    not torch.cuda.is_available()
+    or not _op_available()
+    or not current_platform.has_device_capability(80),
+    reason="CUDA not available, fused DeepseekV4 op not built in, or below "
+    "sm_80 (the op refuses pre-Ampere at run time)",
 )
 
 

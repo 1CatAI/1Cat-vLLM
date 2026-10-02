@@ -2099,7 +2099,9 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        # Every replace reruns config validation. Set the scope before changing
+        # draft KV/backend so strict target checks never inspect draft settings.
+        base = replace(self.vllm_config, is_speculative_draft=True)
 
         if spec_cfg.moe_backend is not None:
             base = replace(

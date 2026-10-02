@@ -23,9 +23,9 @@ from typing import Any
 
 import torch
 
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from .cache_utils import needs_software_fp8
 from .fp8_software import fp32_to_fp8_e4m3fn_bits
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
@@ -253,9 +253,7 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
-        USE_SOFTWARE_FP8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-        ),
+        USE_SOFTWARE_FP8=needs_software_fp8(),
         USE_PRIVATE_STATE=use_private_state,
         USE_DENSE_PRIVATE_STATE=use_dense_private_state,
         RING_SIZE=ring_size,

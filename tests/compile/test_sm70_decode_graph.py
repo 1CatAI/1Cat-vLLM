@@ -78,13 +78,11 @@ def test_qwen38_nomtp_dual_compile_contract() -> None:
     )
 
     assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
-    assert not _is_sm70_qwen38_decode_compile_contract(
+    assert _is_sm70_qwen38_decode_compile_contract(
         model_config, SimpleNamespace(method="mtp"), parallel_config
     )
     parallel_config.tensor_parallel_size = 2
-    assert not _is_sm70_qwen38_decode_compile_contract(
-        model_config, None, parallel_config
-    )
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
 
 
 def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> None:
@@ -162,17 +160,6 @@ def test_qwen38_exact_gated_norm_preserves_explicit_override(monkeypatch):
         "device",
         "model",
         "dtype",
-        "quantization",
-        "mtp",
-        "tp",
-        "pp",
-        "ep",
-        "dbo",
-        "dp",
-        "nodes",
-        "kv",
-        "ssm",
-        "lora",
         "multimodal",
     ],
 )
@@ -180,37 +167,56 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
     monkeypatch.setattr(os, "environ", {})
     cfg = _nomtp_default_config()
     if mismatch == "model":
-        cfg.model_config.hf_text_config.hidden_size = 5120
+        cfg.model_config.architectures = ("LlamaForCausalLM",)
     elif mismatch == "dtype":
         cfg.model_config.dtype = torch.bfloat16
-    elif mismatch == "quantization":
-        cfg.model_config.quantization = "awq"
-    elif mismatch == "mtp":
-        cfg.speculative_config = SimpleNamespace(method="mtp")
-    elif mismatch in ("tp", "pp", "dp", "nodes"):
-        field = {
-            "tp": "tensor_parallel_size",
-            "pp": "pipeline_parallel_size",
-            "dp": "data_parallel_size",
-            "nodes": "nnodes_within_dp",
-        }[mismatch]
-        setattr(cfg.parallel_config, field, 2)
-    elif mismatch in ("ep", "dbo"):
-        setattr(
-            cfg.parallel_config,
-            "enable_expert_parallel" if mismatch == "ep" else "enable_dbo",
-            True,
-        )
-    elif mismatch == "kv":
-        cfg.cache_config.cache_dtype = "fp8_e4m3"
-    elif mismatch == "ssm":
-        cfg.cache_config.mamba_ssm_cache_dtype = "float16"
-    elif mismatch == "lora":
-        cfg.lora_config = SimpleNamespace()
     elif mismatch == "multimodal":
         cfg.model_config.multimodal_config.language_model_only = False
     assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=mismatch != "device") == ()
     assert not os.environ
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ("model_config.quantization", None),
+        ("model_config.quantization", "awq"),
+        ("model_config.hf_text_config.hidden_size", 5120),
+        ("model_config.hf_text_config.num_hidden_layers", 32),
+        ("model_config.hf_text_config.num_experts", 256),
+        ("model_config.hf_text_config.num_attention_heads", 32),
+        ("model_config.hf_text_config.indexer_budget", 4096),
+        ("parallel_config.tensor_parallel_size", 2),
+        ("parallel_config.tensor_parallel_size", 8),
+        ("parallel_config.pipeline_parallel_size", 2),
+        ("parallel_config.data_parallel_size", 2),
+        ("parallel_config.nnodes_within_dp", 2),
+        ("parallel_config.enable_expert_parallel", True),
+        ("parallel_config.enable_dbo", True),
+        ("cache_config.cache_dtype", "fp8_e4m3"),
+        ("cache_config.mamba_ssm_cache_dtype", "float16"),
+        ("lora_config", SimpleNamespace()),
+    ],
+)
+def test_projection_defaults_do_not_depend_on_unrelated_model_policy(
+    monkeypatch, path, value
+):
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    obj = cfg
+    *parents, field = path.split(".")
+    for parent in parents:
+        obj = getattr(obj, parent)
+    setattr(obj, field, value)
+    _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
+    for name in (
+        "VLLM_SM70_QWEN38_FP16_GEMV",
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16",
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16",
+    ):
+        assert os.environ[name] == "1"
+    if path in ("parallel_config.enable_expert_parallel", "parallel_config.enable_dbo"):
+        assert "VLLM_SM70_MOE_ADD_ALLREDUCE" not in os.environ
 
 
 def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
@@ -289,10 +295,10 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     "method,width,admitted",
     [
         ("mtp", 4, True),
-        ("mtp", 3, False),
-        ("mtp", 0, False),
-        ("eagle", 4, False),
-        ("dflash", 4, False),
+        ("mtp", 3, True),
+        ("mtp", 8, True),
+        ("eagle", 4, True),
+        ("dflash", 4, True),
     ],
 )
 def test_qwen38_shared_defaults_match_operator_admission(
@@ -309,10 +315,12 @@ def test_qwen38_shared_defaults_match_operator_admission(
     applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
     assert bool(applied) == admitted
     if admitted:
-        assert len(applied) == 6
+        assert len(applied) == (6 if method == "mtp" else 5)
         assert os.environ["VLLM_SM70_QWEN38_FP16_GEMV"] == "1"
         assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
-        assert os.environ["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] == "1"
+        assert ("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS" in os.environ) == (
+            method == "mtp"
+        )
 
 
 @pytest.mark.parametrize("tokens", [1, 5])

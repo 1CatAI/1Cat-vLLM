@@ -311,6 +311,11 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_retention_interval = (
             self.cache_config.prefix_cache_retention_interval
             if self.need_mamba_block_aligned_split
+            # Bulk forwards help when several recurrent checkpoints fit in a
+            # prefill chunk. With a full-chunk state block, keep the existing
+            # scheduling boundaries (27B C4 regressed when these were skipped).
+            and self.mamba_state_block_size is not None
+            and self.mamba_state_block_size < self.max_num_scheduled_tokens
             and all(spec.mamba_cache_mode == "align" for spec in mamba_specs)
             and getattr(coordinator, "lcm_block_size", self.mamba_state_block_size)
             == self.mamba_state_block_size

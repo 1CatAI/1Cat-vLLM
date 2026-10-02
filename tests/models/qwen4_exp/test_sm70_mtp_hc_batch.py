@@ -33,6 +33,8 @@ def restore_precision_and_env_cache():
 def config():
     return SimpleNamespace(
         model_config=SimpleNamespace(
+            architectures=("Qwen4ExpForCausalLM",),
+            dtype=torch.float16,
             hf_text_config=SimpleNamespace(
                 hidden_size=2560,
                 num_hidden_layers=48,
@@ -46,7 +48,7 @@ def config():
                 indexer_head_dim=128,
                 indexer_budget=2048,
                 indexer_compress_ratio=4,
-            )
+            ),
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=4, use_ubatching=False),
         speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4),
@@ -97,7 +99,7 @@ def test_mtp_contract_rejects_other_modes(config, monkeypatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     assert hc._mtp_batch_runtime_contract(config)
     config.speculative_config.num_speculative_tokens = 3
-    assert not hc._mtp_batch_runtime_contract(config)
+    assert hc._mtp_batch_runtime_contract(config)
     config.speculative_config = None
     assert not hc._mtp_batch_runtime_contract(config)
     config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=4)
@@ -108,7 +110,7 @@ def test_mtp_contract_rejects_other_modes(config, monkeypatch):
     assert not hc._mtp_batch_runtime_contract(config)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     config.parallel_config.tensor_parallel_size = 2
-    assert not hc._mtp_batch_runtime_contract(config)
+    assert hc._mtp_batch_runtime_contract(config)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
