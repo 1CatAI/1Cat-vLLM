@@ -178,26 +178,8 @@ The prior 73-75 tok/s no-MTP run used explicit CPU-worker RAM PLE and cannot
 stand in for the historical 97.7-97.9 tok/s hybrid/pinned-UVA baseline. One
 attempt at its 262144 capacity failed before generation: required KV 3.24 GiB,
 available 1.25 GiB. Preserve `baseline_nomtp.log`; do not repeat that experiment
-or claim a new matched 97 tok/s measurement. The owner explicitly narrowed
-further work to shared-path integration, this baseline and its trace.
+or claim a new matched 97 tok/s measurement. Further comparisons retain the shared-path integration and the frozen baseline.
 
-All local evidence is retained under:
-
-```text
-/home/ymzx/桌面/1cat-vllm/worktrees/v100-mtp4-full-defaults-20260926-103036/.artifacts/
-```
-
-- `mtp4_baseline_27_396ms.json`: accepted contract, source-patch/native hashes,
-  raw artifact paths and hashes, metric definition and future comparison rule.
-- `stacked_mtp_graph.json`, `_contract.json`, `_source.patch`, `.log`, `.exit`:
-  endpoint text/tokens/stats, environment, measured source and clean exit.
-- `stacked_mtp_graph_trace.nsys-rep` and `.sqlite`: raw graph-node capture.
-- `stacked_mtp_graph_wall.json`, `_kernels.json`, `_target_busy.json`,
-  `_summary.json`: closed intervals, service attribution and quality/parity.
-- `run_probe.py`, `mtp_probe.py`, `analyze_stacked_trace.py`,
-  `analyze_kernel_trace.py`: exact retained launcher, fixture and analysis.
-
-The completed run command was
-`.venv/bin/python .artifacts/run_probe.py stacked_mtp_graph --ple auto --ple-host-gib 12 --focused-trace`.
-All task-owned model/profiler workers exited. The worktree is retained for
-baseline/trace reuse; unrelated GPU workloads must not be stopped.
+The measurement contract records the source/native hashes, input and output
+tokens, acceptance counters, timing intervals, and analysis method. Reproduce
+comparisons with the same placement, sampling, graph, and tracing settings.
