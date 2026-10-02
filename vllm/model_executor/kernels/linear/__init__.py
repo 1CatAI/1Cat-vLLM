@@ -160,6 +160,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
@@ -196,6 +199,7 @@ def _get_linear_backend() -> str:
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
+        QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindAwqLinearKernel,
         TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
@@ -318,6 +322,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindFp8LinearKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
@@ -517,6 +522,8 @@ def choose_scaled_mm_linear_kernel(
         )
 
     platform_kernels = possible_kernels[current_platform._enum]
+    report_qpn8 = QPN8Fp8BlockScaledMMLinearKernel in platform_kernels
+    qpn8_reason = None
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
@@ -528,19 +535,63 @@ def choose_scaled_mm_linear_kernel(
                 f"'{linear_backend}' kernel exists for this layer type."
             )
         platform_kernels = filtered
+        if report_qpn8 and QPN8Fp8BlockScaledMMLinearKernel not in filtered:
+            qpn8_reason = f"provider override: {linear_backend}"
 
     for kernel in platform_kernels:
         is_supported_and_can_implement, failure_reason = (
             is_supported_and_can_implement_kernel(kernel, config, compute_capability)
         )
         if is_supported_and_can_implement:
+            if report_qpn8:
+                _record_block_qpn8_selection(config, kernel, qpn8_reason)
             return kernel
+        if kernel is QPN8Fp8BlockScaledMMLinearKernel:
+            qpn8_reason = failure_reason
         failure_reason_list.append(failure_reason)
 
     raise ValueError(
         "Failed to find a kernel that can implement the "
         "ScaledMM linear layer. Reasons: \n" + "\n".join(failure_reason_list)
     )
+
+
+def _record_block_qpn8_selection(config, kernel, reason):
+    from vllm.config import get_current_vllm_config_or_none
+
+    enabled = kernel is QPN8Fp8BlockScaledMMLinearKernel
+    logger.info_once(
+        "Block FP8 QPN8 startup: enabled=%s, weight_shape=%s, "
+        "input_dtype=%s, selected=%s, fallback_reason=%s",
+        enabled,
+        config.weight_shape,
+        config.input_dtype,
+        kernel.__name__,
+        reason,
+    )
+    engine = get_current_vllm_config_or_none()
+    report = getattr(engine, "sm70_acceleration_report", None)
+    if isinstance(report, dict):
+        rows = report.setdefault("linear_kernel_selection", {})
+        grouped = bool(getattr(config, "is_bmm", False))
+        key = (
+            f"block_fp8_qpn8:{config.weight_shape}:{config.input_dtype}:"
+            f"{config.weight_quant_key}:grouped={grouped}"
+        )
+        row = rows.setdefault(
+            key,
+            {
+                "operator": "block_fp8_qpn8",
+                "enabled": enabled,
+                "reason": reason,
+                "selected": kernel.__name__,
+                "weight_shape": config.weight_shape,
+                "input_dtype": str(config.input_dtype),
+                "grouped": grouped,
+                "layers": 0,
+            },
+        )
+        row["layers"] += 1
 
 
 def init_sm70_fp8_linear_kernel(
@@ -550,6 +601,7 @@ def init_sm70_fp8_linear_kernel(
     out_dtype: torch.dtype,
     weight_shape: tuple[int, int],
     is_scale_e8m0: bool,
+    is_bmm: bool = False,
 ) -> TurboMindFp8LinearKernel:
     from vllm.config import get_current_vllm_config
 
@@ -560,6 +612,7 @@ def init_sm70_fp8_linear_kernel(
         out_dtype=out_dtype,
         weight_shape=weight_shape,
         is_scale_e8m0=is_scale_e8m0,
+        is_bmm=is_bmm,
         policy=get_current_vllm_config().kernel_config.sm70_fp8,
     )
     kernel_type = choose_scaled_mm_linear_kernel(
