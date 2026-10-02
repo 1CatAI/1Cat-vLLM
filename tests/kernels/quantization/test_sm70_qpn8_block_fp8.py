@@ -69,7 +69,7 @@ def test_matches_dequantized_reference(
     layer, reference = _layer(n, k, scale_dtype)
     kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(n, k))
     kernel.process_weights_after_loading(layer)
-    # Only the packed codes stay resident.
+    # Raw checkpoint weights are released after packing.
     assert layer.weight.numel() == 0
     x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.1
     y = kernel.apply_weights(layer, x)
@@ -79,7 +79,10 @@ def test_matches_dequantized_reference(
         assert ((y.float() - expected).norm() / expected.norm()).item() < 1e-3
 
 
-def test_concurrent_streams_keep_their_own_prefill_buffer(default_vllm_config):
+@pytest.mark.parametrize("dense_only", [False, True])
+def test_concurrent_streams_keep_their_own_prefill_buffer(
+    default_vllm_config, dense_only
+):
     # DeepSeek-V4 runs the indexer's wq_b on an aux stream next to the main
     # wq_b; with one shared dense buffer the prefill of one overwrote the
     # other's dequantized weight.
@@ -89,6 +92,14 @@ def test_concurrent_streams_keep_their_own_prefill_buffer(default_vllm_config):
     kernel_b = QPN8Fp8BlockScaledMMLinearKernel(_config(4096, 1024))
     kernel_a.process_weights_after_loading(layer_a)
     kernel_b.process_weights_after_loading(layer_b)
+    if dense_only:
+        for layer in (layer_a, layer_b):
+            for name in (
+                "_sm70_block_fp8_turbomind_packed_weight",
+                "_sm70_block_fp8_turbomind_packed_scales",
+            ):
+                if hasattr(layer, name):
+                    delattr(layer, name)
     x = torch.randn(256, 1024, device="cuda", dtype=torch.float16) * 0.1
     aux = torch.cuda.Stream()
     # vLLM's stream, as the model code takes it: leaving the aux context below
@@ -105,3 +116,27 @@ def test_concurrent_streams_keep_their_own_prefill_buffer(default_vllm_config):
     for y, reference in ((y_a, reference_a), (y_b, reference_b)):
         expected = x.float() @ reference.t()
         assert ((y.float() - expected).norm() / expected.norm()).item() < 1e-3
+
+
+@pytest.mark.parametrize("m", [9, 64])
+def test_volta_medium_prefill_keeps_original_turbomind_output(default_vllm_config, m):
+    if torch.cuda.get_device_capability()[0:2] not in ((7, 0), (7, 2)):
+        pytest.skip("Volta retains the TurboMind fallback layout")
+    from vllm import _sm70_ops as ops
+
+    layer, _ = _layer(1536, 4096)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096))
+    kernel.process_weights_after_loading(layer)
+    x = torch.randn(m, 4096, device="cuda", dtype=torch.float16)
+    expected = torch.empty((m, 1536), device="cuda", dtype=torch.float16)
+    ops.fp8_gemm_sm70_out(
+        expected,
+        x,
+        layer._sm70_block_fp8_turbomind_packed_weight,
+        layer._sm70_block_fp8_turbomind_packed_scales,
+        128,
+        layer._qpn8_fallback_k_ld,
+        layer._qpn8_fallback_q_ld,
+        False,
+    )
+    torch.testing.assert_close(kernel.apply_weights(layer, x), expected, rtol=0, atol=0)

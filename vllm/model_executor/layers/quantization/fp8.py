@@ -477,8 +477,11 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if (
             self.use_marlin
-            or isinstance(
-                getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
+            or (
+                not self.use_sm70_fp8_turbomind
+                and isinstance(
+                    getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
+                )
             )
         ) and getattr(layer, "is_bmm", False):
             # Marlin packs one [N, K] matrix and cannot serve the grouped
@@ -493,6 +496,14 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             replace_parameter(layer, "weight", weight)
             layer.dequantized_bmm = True
+            if isinstance(
+                getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
+            ):
+                logger.info_once(
+                    "Block FP8 QPN8 unavailable: grouped BMM uses the "
+                    "existing dequantized grouped implementation."
+                )
+                del self.fp8_linear
             return
 
         if self.use_marlin:
