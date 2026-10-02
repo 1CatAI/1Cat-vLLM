@@ -5250,6 +5250,11 @@ class GPUModelRunner(
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 draft_len = len(draft_token_ids)
+                # _calc_spec_decode_metadata places a request's sampled rows at
+                # [cumulative_end - (draft_len + 1), cumulative_end). Fewer
+                # query rows than that would silently select the preceding
+                # request's hidden states.
+                assert num_scheduled_tokens[req_idx] >= draft_len + 1
                 num_draft_tokens[req_idx] = draft_len
                 if (
                     self.input_batch.num_computed_tokens_cpu[req_idx]
