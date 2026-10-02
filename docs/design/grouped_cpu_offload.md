@@ -44,6 +44,15 @@ consumes it on the offload side:
 
 ### Group pool sizing
 
+On request completion, the CPU LRU tier demotes older recurrent checkpoints
+before other reusable prefixes. The last three block positions remain in
+their normal order to preserve resend and extension boundaries. This applies
+only to sliding-window-of-one groups that require an exact boundary source;
+attention groups and blocks pinned by in-flight transfers remain protected.
+ARC and secondary tiers retain their own eviction policies. This behavior is
+enabled by default; set `demote_superseded_states: false` in
+`kv_connector_extra_config` to disable it.
+
 Token groups receive `N` slots. Each Mamba group receives the number of states
 the retention mask keeps for a request of `mamba_state_slots_reference_tokens`
 tokens (default `max_model_len`), plus one junction allowance per request,

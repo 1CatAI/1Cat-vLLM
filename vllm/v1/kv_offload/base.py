@@ -403,7 +403,7 @@ class OffloadingSpec(ABC):
         # request finishes, demote the states its newest boundary supersedes so
         # they are evicted before other conversations' reusable prefixes.
         self.demote_superseded_states: bool = bool(
-            self.extra_config.get("demote_superseded_states", False)
+            self.extra_config.get("demote_superseded_states", True)
         )
 
         parallel_config = vllm_config.parallel_config

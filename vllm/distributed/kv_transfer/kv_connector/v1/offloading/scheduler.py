@@ -120,7 +120,7 @@ class SchedulerOffloadConfig(NamedTuple):
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
     # See OffloadingSpec.demote_superseded_states.
-    demote_superseded_states: bool = False
+    demote_superseded_states: bool = True
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -225,7 +225,7 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
-            demote_superseded_states=getattr(spec, "demote_superseded_states", False),
+            demote_superseded_states=getattr(spec, "demote_superseded_states", True),
         )
 
 

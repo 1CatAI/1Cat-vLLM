@@ -3,13 +3,14 @@
 """Superseded recurrent checkpoints are the host tier's first eviction victims."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
-from vllm.v1.kv_offload.base import ReqContext, make_offload_key
+from vllm.v1.kv_offload.base import OffloadingSpec, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.manager import (
     CPUOffloadingManager,
     GroupedCPUOffloadingManager,
@@ -18,6 +19,21 @@ from vllm.v1.kv_offload.cpu.manager import (
 pytestmark = pytest.mark.cpu_test
 
 CTX = ReqContext("test")
+
+
+@pytest.mark.parametrize("override,expected", [(None, True), (False, False)])
+def test_demotion_defaults_on_and_accepts_disable_override(override, expected):
+    extra = {} if override is None else {"demote_superseded_states": override}
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+    )
+    spec = SimpleNamespace()
+    OffloadingSpec.__init__(spec, config, SimpleNamespace(kv_cache_groups=[]))
+    assert spec.demote_superseded_states is expected
 
 
 def key(group, index):
@@ -70,6 +86,35 @@ def _scheduler(enabled, configs, manager):
     )
     s.manager = manager
     return s
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_request_completion_respects_demotion_policy(enabled):
+    manager = MagicMock()
+    config = SimpleNamespace(
+        group_idx=0,
+        sliding_window_size_in_blocks=1,
+        requires_exact_boundary_source=True,
+    )
+    keys = [key(0, i) for i in range(6)]
+    state = SimpleNamespace(
+        group_states=(SimpleNamespace(offload_keys=keys),),
+        req_context=CTX,
+        transfer_jobs=[],
+    )
+    scheduler = _scheduler(enabled, (config,), manager)
+    scheduler._req_status = {"test": state}
+    scheduler._drop_pending_boundary_offloads = MagicMock()
+    assert scheduler.request_finished(SimpleNamespace(request_id="test")) == (
+        False,
+        None,
+    )
+    manager.on_request_finished.assert_called_once_with(CTX)
+    if enabled:
+        manager.demote.assert_called_once_with(keys[:3], CTX)
+    else:
+        manager.demote.assert_not_called()
+    assert "test" not in scheduler._req_status
 
 
 def test_request_finished_demotes_all_but_the_tail_states():
