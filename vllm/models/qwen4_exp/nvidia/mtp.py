@@ -226,6 +226,7 @@ def _make_draft_vllm_config(
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
+        is_speculative_draft=True,
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
