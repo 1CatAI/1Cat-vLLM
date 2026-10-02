@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -22,6 +23,77 @@ class VerifyAndUpdateConfig:
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         return
+
+
+def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
+    """Retained QPN2 whole-workload qualification, not operator capability.
+
+    TP, KV dtype and service concurrency are already outside this boundary.
+    Keep the draft selector/state contract until a broader quality gate passes.
+    """
+    parallel = vllm_config.parallel_config
+    spec = vllm_config.speculative_config
+    draft = getattr(spec, "draft_model_config", None)
+    hf = getattr(draft, "hf_config", None)
+    dflash = getattr(hf, "dflash_config", None) or {}
+    selector = (
+        int(dflash.get("selector_top_k", 0) or 0) if isinstance(dflash, Mapping) else 0
+    )
+    return bool(
+        getattr(spec, "method", None) == "dflash"
+        and int(getattr(spec, "num_speculative_tokens", 0) or 0) == 7
+        and selector == 16
+        and parallel.pipeline_parallel_size == 1
+        and not parallel.enable_dbo
+        and int(parallel.ubatch_size or 0) <= 1
+    )
+
+
+def sm70_nvfp4_projection_qualified(prefix: str) -> bool:
+    """Roles covered by the existing real-weight QPN2 quality audit.
+
+    This whitelist is a temporary qualification boundary. Local K/N checks
+    belong to Qpn2NvFp4LinearKernel.can_implement, independent of these names.
+    """
+    return prefix.rsplit(".", 1)[-1] in {
+        "in_proj_qkvz",
+        "qkv_proj",
+        "out_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    }
+
+
+def sm70_nvfp4_gate_up_qualified(layer) -> bool:
+    """Retained dense gated layout audited with the 5120-wide model."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "gate_up_proj"
+        and getattr(layer, "input_size_per_partition", 0) == 5120
+        and getattr(layer, "output_size_per_partition", 0) > 0
+        and layer.output_size_per_partition % 64 == 0
+        and getattr(layer, "logical_widths", None)
+        == [layer.output_size_per_partition // 2] * 2
+    )
+
+
+def sm70_nvfp4_down_qualified(layer) -> bool:
+    """Retained QPN4 down projection audited with the 5120-wide model."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and getattr(layer, "input_size_per_partition", 0) > 0
+        and layer.input_size_per_partition % 128 == 0
+        and getattr(layer, "output_size_per_partition", 0) == 5120
+    )
+
+
+def sm70_nvfp4_qpn4_qualified(vllm_config: "VllmConfig") -> bool:
+    """QPN4's quality audit covers a single sequence without speculation."""
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    return (
+        int(getattr(scheduler, "max_num_seqs", 1)) == 1
+        and vllm_config.speculative_config is None
+    )
 
 
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
@@ -291,7 +363,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 

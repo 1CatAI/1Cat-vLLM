@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 from vllm import envs
@@ -46,10 +47,16 @@ def _is_sm70(cfg: VllmConfig) -> bool:
 
 
 def _native_capabilities(page_size: int) -> dict[str, bool]:
-    from flash_attn_v100 import flash_attn_grouped_e4m3_fp32_available
-
-    # The package import alone does not register the FA2 operators.
+    # Register FA2 operators before probing availability.
     import vllm.vllm_flash_attn._vllm_fa2_C  # noqa: F401
+
+    # isort: split
+    # Keep the companion import stable with and without extracted build files.
+    from flash_attn_v100 import (  # type: ignore[attr-defined]
+        flash_attn_grouped_e4m3_fp32_available,
+    )
+
+    # isort: split
     from vllm.v1.attention.backends.flash_attn_v100 import (
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
@@ -128,6 +135,27 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "expected_acceleration": load_profile()["expected_acceleration"],
         "paths": paths,
     }
+    # Configuration policy is resolved once per engine. Actual kernel selection
+    # still needs each loaded layer's local layout and native capabilities.
+    policy = getattr(cfg.kernel_config, "sm70_nvfp4", None)
+    if policy is not None:
+        report["linear_kernel_policy"] = {
+            "scope": "ct_nvfp4_linear",
+            "status": "runtime_guarded",
+            "configuration": asdict(policy),
+            "qpn2_reason": (
+                "configuration_not_resolved"
+                if not policy.resolved
+                else "disabled_by_configuration_or_legacy_override"
+                if not policy.qpn2
+                else None
+            ),
+            "default_qualification_reason": (
+                None
+                if policy.qualified
+                else "draft_selector_state_contract_not_quality_qualified"
+            ),
+        }
     if not sm70:
         names = set(load_profile()["expected_acceleration"]) | {
             "qwen38_decode",

@@ -7,6 +7,7 @@ import torch
 
 from vllm import envs
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config.kernel import KernelConfig
 from vllm.config.vllm import _SM70_BATCH_GEMM_DEFAULTS, _SM70_DFLASH2_VERIFIER_DEFAULTS
 from vllm.sm70_profiles import acceleration as acc
 
@@ -41,6 +42,7 @@ def config(monkeypatch):
         ),
     )
     return NS(
+        kernel_config=KernelConfig(),
         model_config=NS(
             architectures=["Qwen3_5ForConditionalGeneration"],
             dtype=torch.float16,
@@ -235,4 +237,26 @@ def test_compile_cache_reports_effective_disable(config, monkeypatch, disabled_b
         "compilation_disabled"
         if disabled_by in ("eager", "mode")
         else "inductor_cache_disabled"
+    )
+
+
+def test_resolved_linear_policy_is_reported_without_reparsing_env(config, monkeypatch):
+    config.kernel_config.sm70_nvfp4.resolve(qualified=True)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "0")
+    envs.disable_envs_cache()
+    row = acc.build_report(config)["linear_kernel_policy"]
+    assert row["status"] == "runtime_guarded"
+    assert row["configuration"]["qpn2"] is True
+    assert row["configuration"]["qualified"] is True
+    assert row["qpn2_reason"] is None
+    assert row["default_qualification_reason"] is None
+
+
+def test_unqualified_linear_default_reports_reason(config):
+    config.kernel_config.sm70_nvfp4.resolve(qualified=False)
+    row = acc.build_report(config)["linear_kernel_policy"]
+    assert not row["configuration"]["qpn2"]
+    assert row["qpn2_reason"] == "disabled_by_configuration_or_legacy_override"
+    assert row["default_qualification_reason"] == (
+        "draft_selector_state_contract_not_quality_qualified"
     )

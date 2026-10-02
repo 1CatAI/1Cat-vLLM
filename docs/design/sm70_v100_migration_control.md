@@ -48714,3 +48714,96 @@ expected routes. Its full backend suite passes (512 passed, 17 skipped), fronten
 typecheck and build pass, and the existing build chunk-size warning is retained.
 Keep all candidate PRs Draft and preserve existing release failures; do not
 merge, tag or publish from this qualification task.
+
+### 2026-10-02: SM70 linear policy migration on main
+
+The maintainer approved integrating SM70 paths into existing linear/MoE
+selectors, attention validators and model configuration policies, rather than
+adding a parallel acceleration registry. The acceleration cleanup has separate
+authorization to merge verified PRs into main; it does not alter the release
+qualification task above or release/1.5.1.
+
+The first owned scope is compressed-tensors NVFP4 QPN2/QPN4/TurboMind, based
+on main e21372d7547f96949dbfc5ccd1c1073d05ba1e55. Kernel preparation and
+execution move into the existing NVFP4 framework. Five QPN2 compatibility
+aliases resolve once in KernelConfig; model quality restrictions remain in
+models/config.py. Native numerical sources, precision, tuning values and
+default admitted routes are retained. See [the implementation design](sm70_linear_kernel_integration.md).
+
+The independent original quantization adapter and migrated adapter agree on
+324 category configurations and 18 boundary cases. This is CPU loading and
+native-entry dispatch evidence, not an all-category GPU routing claim.
+Flash-Next ModelOpt and 35B AWQ are explicitly outside this CT category.
+
+Comparable static-inventory metrics remain 494 registered SM70-related names,
+619 total names, 125 unregistered SM70-related direct-read names (177 across
+all VLLM names), and 110 hardcoded-comparison candidates (51 in config/vllm.py).
+The matching inventory scope is Python vllm/**/*.py and csrc C/CUDA, with name
+filter SM70|FLASH_V100|FLASHQLA; dynamic keys and companion packages are
+excluded. Comparison candidates are a lexical audit counter, not a semantic
+count of quality restrictions. No model parameter locks are removed here.
+The five migrated names remain registered throughout their compatibility
+release, so their count does not decrease yet.
+
+GPU validation is a matched ordinary installed-wheel release-profile 27B,
+TP4, GPU0–3, FP16, E4M3, 32K input, C1/C4 run with separate prefill and pure
+decode metrics. An initial baseline startup lost free memory to a concurrent
+owner and also exposed an editable Flash-V100 packaging omission; neither
+is candidate performance evidence. Preserve that failed startup, use normal
+complete wheels for both arms, and wait for free GPUs rather than stopping
+other services. The native-library hashes match between the two rebuilt
+Python wheels and have no private RPATHs.
+
+The ordinary installed-wheel comparison completed on 4x V100-SXM2-32GB,
+Torch 2.10.0+cu128/CUDA 12.8, Flash-V100, FULL_AND_PIECEWISE graphs and
+compiled-subgraph caching without AOT reload. Both arms use the same profile,
+32,768 input tokens, 256-token output budget and per-request seed 4201+j,
+temperature 1, top-p 0.95 and top-k 20. Development APIs are enabled solely
+to reset prefix cache and pause admission. No preload or private library/source
+path is set. Discard the first C1 request and first C4 cohort as warmup.
+
+| Client pure-decode metric | Original adapter | Kernel framework | Change |
+| --- | --- | --- | --- |
+| C1 median tokens/s, three measured requests | 133.277 | 140.224 | +5.21% |
+| C4 median aggregate tokens/s, two measured cohorts | 267.494 | 266.306 | -0.44% |
+
+C1 excludes the first emitted chunk and prefill. C4 counts returned tokens
+only during the interval in which all four requests are decoding. TTFT is
+retained separately. The small C4 difference is within the repeated-cohort
+variation; the C1 increase is not claimed as a new optimization. These are
+emitted-token service measurements, not synchronized kernel timings.
+
+The fixed C1 outputs diverge at token 86 while repeats within each arm match.
+The code and arithmetic health answers match exactly and naturally stop;
+the longer explanation reaches the 1024-token limit in both arms and is
+inconclusive as a complete-answer gate. Preserve this difference rather than
+claiming bitwise full-model parity. Its exact numerical origin is not localized;
+native arithmetic, precision and captured category dispatch plans are retained.
+
+A deterministic target-temperature-zero paired gate adds 12 sanitized MBPP
+tasks in C4 cohorts (IDs 2,3,4,6,7,8,9,11,12,14,16,17), three approximately
+32K needle cases at 10/50/90% depth, and six Chinese QA cases. Both arms score
+MBPP 11/12, needle 3/3 and Chinese QA 5/6, with no new case failure. All 21
+requests naturally stop; 20/21 token sequences match, and the differing MBPP
+task 4 passes its original assertions in both arms. Existing failures are
+MBPP task 16's lowercase/underscore check and the machine-rate question
+(both answer 18 instead of 36). This is a paired subset gate, not a full model
+quality qualification or evidence for widening other contracts. Dataset SHA256:
+ca95deaa9a01ef0a6f439f88bcf0dd3db3563d22f22aad6cae04ebb9a8d8c8e9.
+
+The GPU source pair is original e21372d7547f96949dbfc5ccd1c1073d05ba1e55
+and migration bc8b673812deebcad4cbc791e44c7d1ffd11d86e. Production Python
+files in the candidate wheel match that commit, and its 15 bundled native
+libraries match the control. Subsequent synchronization with main changes
+upstream graph-override/NCCL policies; its CPU merge gate passes 34 profile/API/
+cache tests and 41 category/selector/guard tests. The category's independent
+324+18 dispatch snapshot still has zero changes. The 25 visible-device mock
+tests pass on their CUDA-platform harness; three of them are incompatible
+with forcibly replacing that platform by CpuPlatform, which is not a routing
+regression. A CI/local Ruff import-classification difference caused by extracted
+companion build files is fixed with an explicit import-block boundary.
+
+The historical QWEN38 +29%/+18% batch result is pre-repair and not quality
+qualified; do not repeat it as accepted current performance. #703 has stronger
+same-contract quality evidence and is the next default-promotion candidate
+to screen, with resident-weight memory and KV capacity checked explicitly.
