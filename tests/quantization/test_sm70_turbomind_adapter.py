@@ -90,6 +90,8 @@ def test_mxfp4_unpack_flattens_last_two_block_dims_like_lmdeploy():
 
 @pytest.mark.parametrize("logical_n", [24, 48])
 def test_nvfp4_prepare_pads_output_to_converter_alignment(monkeypatch, logical_n):
+    # The converter is mocked below; no compiled extension is required here.
+    monkeypatch.setattr(torch.ops._C, "nvfp4_sm70_prepare", object(), raising=False)
     tm = _load_adapter()
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(
