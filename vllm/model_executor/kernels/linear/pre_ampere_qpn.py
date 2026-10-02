@@ -128,7 +128,10 @@ class TuringQpn8Fp8LinearKernel(FP8ScaledMMLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer):
-        tm.prepare_fp8_qpn8_dense_linear(layer, layer.weight, layer.weight_scale)
+        # The scaled-MM lifecycle supplies [K, N], while native QPN8 packs [N, K].
+        tm.prepare_fp8_qpn8_dense_linear(
+            layer, layer.weight.t().contiguous(), layer.weight_scale
+        )
         layer.weight = Parameter(layer.weight.new_empty(0), requires_grad=False)
 
     def apply_weights(self, layer, x, bias=None):

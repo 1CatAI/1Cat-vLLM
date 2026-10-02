@@ -123,6 +123,82 @@ def test_fp8_real_selector_prefers_native_turing_kernel():
     )
 
 
+def test_modelopt_fp8_preserves_checkpoint_orientation(engine, monkeypatch):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers.quantization import modelopt
+
+    engine.model_config = NS(dtype=torch.float16)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(modelopt.sm70_tm, "is_exact_sm70_cuda_platform", lambda: False)
+    monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.float16)
+    captured = []
+    monkeypatch.setattr(
+        qpn.tm,
+        "prepare_fp8_qpn8_dense_linear",
+        lambda layer, weight, scale: captured.append(weight.clone()),
+    )
+    method = modelopt.ModelOptFp8LinearMethod(NS(is_checkpoint_fp8_serialized=True))
+    layer = torch.nn.Module()
+    method.create_weights(layer, 128, [32], 128, 32, torch.float16)
+    checkpoint = (
+        torch.arange(32 * 128).reshape(32, 128).remainder(8).to(torch.float8_e4m3fn)
+    )
+    layer.weight.data.copy_(checkpoint)
+    layer.weight_scale.data.fill_(0.5)
+    layer.input_scale.data.fill_(1)
+    method.process_weights_after_loading(layer)
+    assert isinstance(method.fp8_linear, qpn.TuringQpn8Fp8LinearKernel)
+    assert len(captured) == 1
+    assert torch.equal(captured[0].float(), checkpoint.float())
+    assert layer.weight.numel() == 0
+
+
+def test_modelopt_fp8_marlin_fallback_prepares_scales(engine, monkeypatch):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+        MarlinFP8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.layers.quantization import modelopt
+    from vllm.model_executor.layers.quantization.utils import marlin_utils_fp8
+
+    engine.model_config = NS(dtype=torch.float16)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(modelopt.sm70_tm, "is_exact_sm70_cuda_platform", lambda: False)
+    monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.float16)
+    kernel = object.__new__(MarlinFP8ScaledMMLinearKernel)
+    kernel.layer_param_names = [
+        "weight",
+        "weight_scale",
+        "input_scale",
+        "input_scale_ub",
+    ]
+    kernel.block_quant = False
+    kernel.size_k_first = True
+    kernel.marlin_input_dtype = None
+    monkeypatch.setattr(modelopt, "init_fp8_linear_kernel", lambda **kwargs: kernel)
+    monkeypatch.setattr(
+        marlin_utils_fp8,
+        "marlin_make_workspace_new",
+        lambda device: torch.zeros(1, dtype=torch.int32, device=device),
+    )
+    monkeypatch.setattr(
+        marlin_utils_fp8.ops,
+        "gptq_marlin_repack",
+        lambda **kwargs: kwargs["b_q_weight"].clone(),
+    )
+    method = modelopt.ModelOptFp8LinearMethod(NS(is_checkpoint_fp8_serialized=True))
+    layer = torch.nn.Module()
+    method.create_weights(layer, 128, [64], 128, 64, torch.float16)
+    layer.weight.data.fill_(1)
+    layer.weight_scale.data.fill_(0.5)
+    layer.input_scale.data.fill_(1)
+    method.process_weights_after_loading(layer)
+    assert layer.weight_scale.dtype == torch.float16
+    assert layer.weight_scale.numel() == 64
+
+
 @pytest.mark.parametrize("n,k", [(1, 128), (40, 384), (97, 768), (1024, 2048)])
 def test_nvfp4_admits_padding_and_aligned_shapes(n, k):
     assert qpn.TuringQpn2NvFp4LinearKernel.can_implement(nvfp4_config(n, k))[0]
@@ -188,6 +264,7 @@ def test_native_missing_and_worker_device(monkeypatch):
         "get_device_capability",
         worker_capability,
     )
+
     assert qpn.TuringQpn2NvFp4LinearKernel.is_supported()[0]
     assert asked == [2]
     assert not qpn.TuringQpn2NvFp4LinearKernel.is_supported(70)[0]
@@ -195,6 +272,22 @@ def test_native_missing_and_worker_device(monkeypatch):
     monkeypatch.setattr(torch.ops, "_C", NS())
     assert (
         "missing native" in qpn.TuringQpn8Fp8LinearKernel.can_implement(fp8_config())[1]
+    )
+
+
+def test_nvfp4_fallback_is_recorded_for_startup(engine, monkeypatch):
+    engine.kernel_config.sm70_nvfp4.dense_qpn2 = False
+    monkeypatch.setattr(
+        linear.MarlinNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, *args: (True, None)),
+    )
+    selected = linear.init_nvfp4_linear_kernel(nvfp4_config())
+    assert isinstance(selected, linear.MarlinNvFp4LinearKernel)
+    rows = engine.kernel_config.linear_kernel_selections.values()
+    assert any(
+        "KernelConfig" in row["paths"]["TuringQpn2NvFp4LinearKernel"]["reason"]
+        for row in rows
     )
 
 

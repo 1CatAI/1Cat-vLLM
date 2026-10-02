@@ -123,6 +123,7 @@ from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
     TurboMindNvFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
+    TuringNvFp4LinearLayerConfig,
     TuringQpn2NvFp4LinearKernel,
     TuringQpn8Fp8LinearKernel,
 )
@@ -1143,8 +1144,12 @@ def init_nvfp4_linear_kernel(
             )
 
         logger.info_once("Using %s for NVFP4 GEMM", kernel_cls.__name__)
+        if isinstance(config, TuringNvFp4LinearLayerConfig):
+            _record_kernel_selection(config, possible, kernel_cls, failure_reasons)
         return kernel_cls(config)
 
+    if isinstance(config, TuringNvFp4LinearLayerConfig):
+        _record_kernel_selection(config, possible, None, failure_reasons)
     raise ValueError(
         "Failed to find a kernel that can implement the "
         "NVFP4 linear layer. Reasons: \n" + "\n".join(failure_reasons)

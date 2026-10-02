@@ -598,6 +598,10 @@ def prepare_fp8_qpn8_dense_linear(
     codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(
         weight.contiguous(), channel_scales
     )
+    layer.register_buffer("_sm70_turing_fp8_packed_codes", codes, persistent=False)
+    layer.register_buffer(
+        "_sm70_turing_fp8_packed_scales", group_scales, persistent=False
+    )
     split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(k)
     setattr(
         layer,

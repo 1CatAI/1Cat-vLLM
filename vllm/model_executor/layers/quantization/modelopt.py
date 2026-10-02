@@ -499,6 +499,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
+        layer.orig_dtype = params_dtype
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         weight_dtype = (
@@ -588,7 +589,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             return
 
         if self.use_sm75_fp8_qpn8:
-            replace_parameter(layer, "weight", weight)
+            replace_parameter(layer, "weight", weight.t())
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
             self.fp8_linear.process_weights_after_loading(layer)
             layer.input_scale = None
