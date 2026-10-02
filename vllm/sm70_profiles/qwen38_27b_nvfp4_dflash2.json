@@ -1,0 +1,67 @@
+{
+  "name": "qwen38_27b_nvfp4_dflash2",
+  "version": "1.5.1",
+  "model": "Qwen3.8-27B-NVFP4",
+  "draft": {
+    "repo": "incoai/Qwen3.8-27B-DFlash2",
+    "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+    "modelscope_revision": "5cfe71fd56ed83d5ca27f04c1345cc7d862bbe4f",
+    "config_sha256": "873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980",
+    "weights_sha256": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c"
+  },
+  "hardware": {
+    "gpu": "Tesla V100-SXM2-32GB",
+    "compute_capability": "7.0",
+    "count": 4,
+    "tensor_parallel_size": 4
+  },
+  "args": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "dtype": "half",
+    "tensor_parallel_size": 4,
+    "attention_backend": "FLASH_ATTN_V100",
+    "kv_cache_dtype": "fp8_e4m3",
+    "max_model_len": 262144,
+    "gpu_memory_utilization": 0.8,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 4,
+    "block_size": 2048,
+    "mamba_block_size": 8192,
+    "enable_prefix_caching": true,
+    "mamba_cache_mode": "align",
+    "served_model_name": "qwen3.8-27b-dflash2",
+    "limit_mm_per_prompt": {
+      "image": 0,
+      "video": 0
+    },
+    "enable_auto_tool_choice": true,
+    "tool_call_parser": "qwen3_coder",
+    "reasoning_parser": "qwen3",
+    "default_chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "seed": 0,
+    "speculative_config": {
+      "method": "dflash",
+      "model": "incoai/Qwen3.8-27B-DFlash2",
+      "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+      "num_speculative_tokens": 7,
+      "kv_cache_dtype": "auto",
+      "attention_backend": "FLASH_ATTN_V100",
+      "draft_sample_method": "probabilistic",
+      "enforce_eager": false
+    },
+    "trust_remote_code": true
+  },
+  "expected_acceleration": [
+    "profile_hardware",
+    "dflash2_verifier",
+    "batch_gemm",
+    "e4m3_grouped_fp32",
+    "long_context",
+    "scalar_tail",
+    "q8000_prefill",
+    "compile_graph"
+  ]
+}

@@ -7,13 +7,13 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: serve_qwen38_27b_nvfp4_v100.sh MODEL [vllm serve options...]
+Usage: serve_qwen38_27b_nvfp4_v100.sh MODEL [--draft LOCAL_PATH] [vllm serve options...]
 
 MODEL is a local checkpoint directory or a Hugging Face model ID.
 Uses the installed vllm, bundled kernels and automatic SM70 operator defaults.
 The pinned DFlash2 checkpoint is downloaded normally; no offline mode is forced.
 
-Profile: FP16, TP4, E5M2 KV, 256K context, 8192-token prefill, up to 4 sequences.
+Profile: FP16, TP4, E4M3 KV, 256K context, 8192-token prefill, up to 4 sequences.
 Requires four peer-connected V100-SXM2 32GB GPUs. Other hardware/capacities
 need their own memory and performance validation. Additional CLI options
 override the profile, for example:
@@ -21,8 +21,8 @@ override the profile, for example:
   serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-NVFP4 --port 8001
   serve_qwen38_27b_nvfp4_v100.sh /models/Qwen3.8-27B-NVFP4 --max-model-len 32768
 
-To use a local draft, pass a replacement --speculative-config JSON after the
-profile arguments. The release default uses the pinned DFlash2 revision.
+To use a downloaded draft, pass --draft /models/Qwen3.8-27B-DFlash2.
+Without --draft, the release default downloads the pinned DFlash2 revision.
 EOF
 }
 
@@ -36,6 +36,22 @@ if [[ $# -eq 0 || $1 == -* ]]; then
 fi
 model=$1
 shift
+PROFILE_NAME=qwen38_27b_nvfp4_dflash2
+profile_options=()
+serve_options=()
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == --draft ]]; then
+    if [[ $# -lt 2 || $2 == -* ]]; then
+      usage >&2
+      exit 2
+    fi
+    profile_options+=(--draft "$2")
+    shift 2
+  else
+    serve_options+=("$1")
+    shift
+  fi
+done
 
 # Prefer the CLI installed alongside this script, including when the caller
 # invokes it by absolute path without activating that Python environment.
@@ -45,23 +61,9 @@ if [[ -x "$script_dir/vllm" ]]; then
   vllm_cli="$script_dir/vllm"
 fi
 
-# Keep the prefill budget and recurrent-state grid at 8192 together: the
-# long-prefill specialization admits Q=8000..8192, and the grid must be a
-# multiple of the KV block size. Smaller prompts use the normal fallback.
-exec "$vllm_cli" serve "$model" \
-  --host 127.0.0.1 --port 8000 \
-  --served-model-name qwen3.8-27b-dflash2 \
-  --trust-remote-code \
-  --dtype half --tensor-parallel-size 4 --attention-backend FLASH_ATTN_V100 \
-  --kv-cache-dtype fp8_e5m2 --max-model-len 262144 \
-  --gpu-memory-utilization 0.80 \
-  --max-num-batched-tokens 8192 --max-num-seqs 4 \
-  --enable-prefix-caching --mamba-cache-mode align \
-  --block-size 2048 --mamba-block-size 8192 \
-  --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 \
-  --default-chat-template-kwargs '{"enable_thinking":false}' \
-  --seed 0 \
-  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","num_speculative_tokens":7,"kv_cache_dtype":"auto","attention_backend":"FLASH_ATTN_V100","draft_sample_method":"probabilistic","enforce_eager":false}' \
-  "$@"
+vllm_cli=$(command -v "$vllm_cli")
+python_bin="$(dirname "$vllm_cli")/python"
+profile_output=$("$python_bin" -m vllm.sm70_profiles argv "$PROFILE_NAME" \
+  --argv-lines "${profile_options[@]}")
+mapfile -t profile_args <<< "$profile_output"
+exec "$vllm_cli" serve "$model" "${profile_args[@]}" "${serve_options[@]}"

@@ -416,6 +416,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
+    VLLM_SM70_REQUIRE_PROFILE_ACCELERATION: bool = False
     VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
     VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
@@ -2976,6 +2977,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_ROUTE_SUMMARY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))
     ),
+    "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION": lambda: bool(
+        int(os.getenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "0"))
+    ),
     # Mixed chunked-prefill batches send resident decode and short verification
     # rows through the partitioned paged-decode kernels. This prevents a q=1
     # row from walking a long prefix serially in the paged-prefill kernel.
@@ -5012,6 +5016,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
+        "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",

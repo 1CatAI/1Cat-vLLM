@@ -48598,3 +48598,119 @@ The tested private service is stopped and public serving remains off.
   original precision and batch decode. <20 ms and reliable internal HC
   attribution remain unmet follow-ups. All owned GPU workers are stopped;
   no foreign service was interrupted and no wheel was built.
+
+## 2026-10-02 release acceleration admission audit
+
+Release baseline remains `d30469863287471a7082842500ae73299a697e0d`.
+Using its installed 1.5.1 wheel, Torch2.10.0+cu128, four V100-SXM2-32GB devices,
+and the proposed Draft #748 E4M3/TP4/8192-budget/2048-block/seven-draft recipe, ordinary
+`EngineArgs.create_engine_config()` selected all eight required configured
+capabilities with no launch-time performance environment variables. Native
+QPN2/shared-layout/prefill operator checks had no missing operators; QPN2 decode
+and bounded prefill defaults resolved inside the quantization layer even though
+their global env getters default to false. No weights were loaded, no worker
+started, and no new output-quality or throughput result is claimed.
+
+Nine configuration cases cover the release recipe, E5M2, a 4096-token budget,
+TP2, eight sequences, 16-token blocks, target-only, five drafts and eager mode.
+These identify E4M3, prefill-budget, scalar-page, speculative-width and graph
+fallback reasons. TP and service capacity do not globally disable compatible
+batch GEMM or verifier operators. Flash-Next MoE decode belongs to another model
+contract; the 27B release status must not count it as a missing required path.
+
+Draft #748 publishes the recipe's expected path list for status consumers.
+Studio Draft #6 pairs already verified release drafts with new presets and
+offers explicit updates for existing presets. A revision label alone does not
+admit modified draft files, and inherited external FlashQLA DSO paths are
+filtered. No acceleration defaults or native arithmetic changed. Preserve the
+compile-cache quality guard: #675 demonstrated first-reload mechanics but its
+recorded complete output parity failed. Final rebuilt-wheel GPU qualification,
+three-start quality/speed gates and 35B-A3B AWQ/FP8 speed gates remain open.
+
+## 2026-10-02 Release default-cache requirement and E4M3 reload diagnosis
+
+The release owner now explicitly requires compilation caching on by default.
+This supersedes the previous release policy of retaining automatic cache-off
+as the final behavior. Existing PR #621 removes both main's env getter default
+and VllmConfig's forced opt-out; do not duplicate that change. Its patch applies
+to main d30469863287471a7082842500ae73299a697e0d. Six getter cases preserve
+explicit opt-out and default to cache-on; 16 AOT/side-table/startup-cache CPU
+regressions pass. This does not qualify cached numerical behavior.
+
+User-path evidence is retained at
+`/data/minimax-h3/task-cache/release151-qualification-20260930/compile-cache-20261002`.
+It uses the independent installed main 1.5.1 wheel with SHA256
+`b3cd873677f17cc779dbf3bb7ffcc03d64d243378df331b9a3ab38e97c32a2f7`,
+Torch 2.10.0+cu128, four authorized V100 GPUs 0-3, the QUASAR NVFP4 target
+and pinned DFlash2 draft, E4M3 KV, TP4/FP16, q7 probabilistic draft sampling,
+262144 context, 8192 budget, four sequences, memory 0.80, block2048,
+mamba8192 and FULL_AND_PIECEWISE graphs. Production launcher and bundled
+native libraries are used, with no source overlay or external kernel DSO.
+The isolated cache-directory variables are test hygiene. Explicit
+VLLM_DISABLE_COMPILE_CACHE=0 simulates #621 on the unmodified main wheel;
+the final no-variable default-on wheel remains unbuilt/unqualified.
+
+- Empty-cache startup: 237.164 seconds. The complete deterministic LRU answer
+  has 2181 tokens, normal stop, and all 11 generated unit tests pass.
+- First cached startup: 76.778 seconds, 12 AOT loads, zero load failures and
+  no graph recompilation. Its LRU answer has 2106 tokens. First token difference
+  is at zero-based position 1370; a generated test incorrectly expects
+  LRUCache(0.5) to raise ValueError. One of its 13 tests fails. This is a failed
+  quality gate, not an accepted startup improvement.
+- A same-contract cache-off control starts in 182.033 seconds with zero AOT
+  loads. Its entire 2181-token answer and response fingerprint match the cold
+  reference. The control retains populated lower-level caches and does not
+  isolate a particular compiler/kernel defect, but narrows this reproduction
+  to AOT reload behavior rather than ordinary restart alone.
+- Second cached startup: 73.268 seconds. Complete-output parity again fails;
+  this is not a three-start quality pass.
+- The separate binary-search request hit its 1024-token limit during the cold
+  run. Preserve that failure; it is excluded from the complete-output parity
+  probe rather than relabeled as a pass. The LRU cold response was retained
+  before the controller stopped and is reused as the full-output reference.
+
+The release diagnostic now uses the compiler's effective cache predicate,
+also reporting eager/NONE mode and Torch/config force_disable_caches. A false
+environment opt-out alone must not report caching available when another
+control disables it. 24 profile/API/stream CPU cases pass, including four
+effective-disable cases; five worker cleanup regressions also pass. Caching
+remains a startup diagnostic, outside the
+decode-acceleration count. The default-on requirement and existing #621
+dependency are documented in the release profile.
+
+Do not repeat the rejected #675 rank isolation or #682 subgraph/autotune
+isolation experiments. #710 separately resolves process-local linear workspace
+addresses and must be reviewed before universal cache-on qualification, but
+its changed routes are not established as the cause of this V100 reproduction.
+Unchanged tuning records alone do not close the CUDA-graph/AOT output gate.
+
+An alternative retains compilation caching and FULL_AND_PIECEWISE CUDA graphs
+but reconstructs the FX graph normally (VLLM_USE_AOT_COMPILE=0), reusing compiled
+subgraphs from disk. With a separate empty cache, startup times are 221.114,
+92.317 and 92.842 seconds. Each complete 2181-token response matches the original
+cold reference exactly, including the token IDs and generated code. Each warm
+launch reports three compiled-graph cache loads, zero graph compilations and
+zero AOT loads. This closes this single-request cold/warm reproduction, not the
+full B6 or cross-model gate. It is an explicit-switch diagnostic on the installed
+main wheel, not final default-wheel/B0 qualification.
+
+A separate owned cache-policy change, Draft
+[#753](https://github.com/1CatAI/1Cat-vLLM/pull/753), uses this strategy when
+compilation caching is enabled for the tested compressed-tensors NVFP4,
+TP4/E4M3 DFlash2 verifier contract. It preserves explicit AOT selection and
+warns about the failed AOT-reload quality gate. Other model contracts keep their
+existing defaults. It depends on #621 for cache-on without user variables and
+does not duplicate #621's removal of cache opt-outs. A final combined wheel and
+broader quality/performance checks remain required.
+Its head is 6de965641d10ca9a5bb74b68034aee7030ec09dd; 25 policy/cache CPU cases
+and scoped hooks pass. Source configuration with #621 has no initial performance
+variables, cache-on/AOT-off and FULL_AND_PIECEWISE graphs. Native symbols come
+from the matching baseline wheel for that configuration-only diagnostic; this
+mixed source setup is not used for the installed-wheel GPU measurements.
+
+Studio now exposes startup compilation-cache status separately from the
+required decode-capability count, instead of dropping that row when counting
+expected routes. Its full backend suite passes (512 passed, 17 skipped), frontend
+typecheck and build pass, and the existing build chunk-size warning is retained.
+Keep all candidate PRs Draft and preserve existing release failures; do not
+merge, tag or publish from this qualification task.

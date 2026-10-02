@@ -1401,6 +1401,7 @@ package_data = {
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",
         "third_party/deep_gemm/include/**/*.hpp",
+        "sm70_profiles/*.json",
     ],
 }
 
