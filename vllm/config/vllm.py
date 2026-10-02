@@ -318,36 +318,85 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
     parallel_config.ensure_ple_offload_ipc_path()
 
 
-def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
-    """Whether the PLE overflow cascade is configured, checking its contract.
+def _ple_disk_cascade_cuda_supported() -> bool:
+    from vllm.platforms import current_platform
 
-    ``VLLM_QWEN4EXP_PLE_DISK`` lets the rows beyond the device and pinned-host
-    tiers be read from the mapped checkpoint and starts the cascade. The PLE
-    offload worker then serves those rows next to the resident tables, which
-    is a different contract from the whole-table offload and from the hybrid
-    lane.
+    return current_platform.is_cuda()
 
-    Only a config that carries a model is checked: helper configs without one,
-    such as the PLE offload worker's isolated single-rank world, inherit the
-    variable but have no table to place.
-    """
-    if not envs.VLLM_QWEN4EXP_PLE_DISK:
-        return False
-    if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
-        raise ValueError(
-            "The Qwen4Exp PLE cascade is configured, but the model has no PLE layers"
+
+def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
+    """Resolve disk tiers from storage, dtype and worker topology capabilities."""
+    policy = cfg.kernel_config
+    policy.ple_disk_cascade_active = False
+    reason = None
+    model = cfg.model_config
+    text = getattr(model, "hf_text_config", None)
+    layers = getattr(text, "ple_layer_ids", None)
+    if not policy.ple_disk_cascade:
+        reason = "disabled by KernelConfig"
+    elif model is None or not layers:
+        reason = "no PLE layers"
+    elif not _ple_disk_cascade_cuda_supported():
+        reason = "requires CUDA resident tiers"
+    elif model.dtype != torch.float16:
+        reason = "requires FP16 embedding output"
+    elif (
+        envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        or envs.VLLM_PLE_DISK_OFFLOAD
+        or envs.VLLM_PLE_CPU_OFFLOAD
+    ):
+        reason = "existing explicit PLE placement takes precedence"
+    elif cfg.load_config.load_format not in ("auto", "safetensors"):
+        reason = "requires file-backed safetensors shards"
+    elif (
+        cfg.parallel_config.prefill_context_parallel_size != 1
+        or cfg.parallel_config.decode_context_parallel_size != 1
+    ):
+        reason = "PLE worker does not yet support context-parallel groups"
+    elif (
+        cfg.parallel_config.nnodes != 1
+        or cfg.parallel_config.data_parallel_backend != "mp"
+        or cfg.parallel_config.data_parallel_size_local
+        != cfg.parallel_config.data_parallel_size
+        or cfg.parallel_config.use_ubatching
+        or cfg.weight_transfer_config is not None
+    ):
+        reason = "requires local multiprocessing workers without DBO or weight transfer"
+    else:
+        from vllm.models.qwen4_exp.common.ple import (
+            check_ple_layers_on_first_pp_rank,
         )
-    if envs.VLLM_SM70_QWEN38_HYBRID_PLE or envs.VLLM_PLE_DISK_OFFLOAD:
-        raise ValueError(
-            "The Qwen4Exp PLE cascade cannot be combined with "
-            "VLLM_SM70_QWEN38_HYBRID_PLE or VLLM_PLE_DISK_OFFLOAD"
+        from vllm.models.qwen4_exp.nvidia.ple_layer import (
+            _get_ple_embedding_quant_method,
         )
-    return True
+
+        try:
+            check_ple_layers_on_first_pp_rank(
+                text, cfg.parallel_config.pipeline_parallel_size
+            )
+        except (ValueError, RuntimeError) as exc:
+            reason = str(exc)
+        if reason is None:
+            storage = str(getattr(text, "ple_embedding_dtype", "")).removeprefix(
+                "torch."
+            )
+            methods = [
+                _get_ple_embedding_quant_method(
+                    cfg.quant_config,
+                    f"model.layers.{index}.ple.ple_embedding.ngram_embedding",
+                    force_fp8_storage=storage == "float8_e4m3fn",
+                )
+                for index in layers
+            ]
+            if any(method is None for method in methods):
+                reason = "checkpoint metadata does not provide raw E4M3 PLE storage"
+    policy.ple_disk_cascade_reason = reason
+    policy.ple_disk_cascade_active = reason is None
+    return policy.ple_disk_cascade_active
 
 
 def _apply_qwen4exp_ple_cascade_defaults(parallel_config: ParallelConfig) -> None:
-    """Start the PLE offload worker that serves the cascade's outer tiers."""
-    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    """Prepare the worker endpoint without changing process environment."""
     parallel_config.ensure_ple_offload_ipc_path()
 
 
@@ -1345,7 +1394,11 @@ class VllmConfig:
         model_config.hf_config = hf_config
         model_config.model_arch_config = model_config.get_model_arch_config()
 
-        return replace(self, model_config=model_config)
+        return replace(
+            self,
+            model_config=model_config,
+            kernel_config=copy.deepcopy(self.kernel_config),
+        )
 
     def _set_config_default(self, config_obj: Any, key: str, value: Any) -> None:
         """Set config attribute to default if not already set by user.
@@ -1905,15 +1958,6 @@ class VllmConfig:
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
         )
 
-        if self.model_config is not None and _qwen4exp_ple_cascade_requested(
-            self.model_config
-        ):
-            _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
-            logger.info_once(
-                "Qwen4Exp PLE overflow cascade: the PLE offload worker reads the "
-                "rows beyond the resident tiers from the mapped checkpoint."
-            )
-
         attention_backend = self.attention_config.backend
         attention_backend_name = getattr(attention_backend, "name", attention_backend)
         sm70_flash_v100_backend = (
@@ -2387,6 +2431,13 @@ class VllmConfig:
             custom_ops = self.compilation_config.custom_ops
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
+
+        if self.model_config is not None and _qwen4exp_ple_cascade_requested(self):
+            _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
+            logger.info_once(
+                "Qwen4Exp PLE overflow cascade: the PLE offload worker reads the "
+                "rows beyond the resident tiers from the mapped checkpoint."
+            )
 
         current_platform.apply_config_platform_defaults(self)
 
