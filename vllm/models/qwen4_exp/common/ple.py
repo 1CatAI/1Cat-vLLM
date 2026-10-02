@@ -192,7 +192,7 @@ def plan_ple_placement(
             f"The PLE table does not fit: {disk_rows} rows "
             f"({disk_rows * row_bytes} bytes) remain beyond the device and "
             "host tiers. Raise VLLM_QWEN4EXP_PLE_HOST_GIB, or set "
-            "VLLM_QWEN4EXP_PLE_DISK=1 to read the rest from the checkpoint on disk."
+            "kernel_config.ple_disk_cascade to read the remainder from disk."
         )
     return PLEPlacement(vram_rows=vram_rows, host_rows=host_rows, disk_rows=disk_rows)
 
@@ -466,7 +466,11 @@ def ple_cascade_configured() -> bool:
     """Whether the overflow cascade is on: rows beyond the device and host
     tiers are read from the mapped checkpoint by the PLE offload worker."""
 
-    return bool(envs.VLLM_QWEN4EXP_PLE_DISK)
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    kernel = getattr(config, "kernel_config", None)
+    return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
 def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:

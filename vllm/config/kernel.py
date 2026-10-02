@@ -418,6 +418,15 @@ class KernelConfig:
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
+    ple_disk_cascade: bool = True
+    """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
+    ple_disk_release_pages: bool = False
+    """Release file-backed PLE mappings after gathers to reduce resident RAM."""
+    ple_disk_cascade_active: bool = Field(default=False, init=False)
+    """Resolved FP8 storage, dtype and pipeline capability admission."""
+    ple_disk_cascade_reason: str | None = Field(default=None, init=False)
+    """Startup reason when the disk cascade cannot serve this configuration."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -442,7 +451,16 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
+            "ple_disk_cascade_reason",
         }
+        if not self.ple_disk_cascade_active:
+            ignored_factors.update(
+                {
+                    "ple_disk_cascade",
+                    "ple_disk_release_pages",
+                    "ple_disk_cascade_active",
+                }
+            )
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.
             ignored_factors.add("sm70_awq")

@@ -46,6 +46,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -166,17 +167,17 @@ class Worker(WorkerBase):
         self._ple_offload_spawn_config: VllmConfig | None = None
         if envs.VLLM_SM70_QWEN38_HYBRID_PLE and not (
             envs.VLLM_SM70_QWEN38_DUAL_COMPILE
-            and envs.VLLM_PLE_CPU_OFFLOAD
+            and ple_offload_enabled(self.vllm_config)
             and envs.VLLM_PLE_DISK_OFFLOAD
         ):
             raise ValueError(
                 "VLLM_SM70_QWEN38_HYBRID_PLE requires dual compilation plus "
                 "PLE CPU and disk offload"
             )
-        if envs.VLLM_PLE_DISK_OFFLOAD and not envs.VLLM_PLE_CPU_OFFLOAD:
+        if envs.VLLM_PLE_DISK_OFFLOAD and not ple_offload_enabled(self.vllm_config):
             raise ValueError("VLLM_PLE_DISK_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1")
         self._ple_offload_enabled = self._has_ple_layers()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if ple_offload_enabled(self.vllm_config):
             if self._ple_offload_enabled:
                 self._validate_ple_offload_config()
             elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
@@ -191,7 +192,7 @@ class Worker(WorkerBase):
         self._pp_send_work: list[Handle] = []
 
     def _has_ple_layers(self) -> bool:
-        if not envs.VLLM_PLE_CPU_OFFLOAD:
+        if not ple_offload_enabled(getattr(self, "vllm_config", None)):
             return False
         return bool(getattr(self.model_config.hf_text_config, "ple_layer_ids", None))
 

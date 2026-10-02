@@ -38,6 +38,18 @@ from vllm.utils.torch_utils import direct_register_custom_op
 _offload_worker_flag = False
 
 
+def ple_offload_enabled(config=None) -> bool:
+    """Use the engine's resolved cascade, retaining legacy explicit offload."""
+    if envs.VLLM_PLE_CPU_OFFLOAD:
+        return True
+    if config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    kernel = getattr(config, "kernel_config", None)
+    return bool(getattr(kernel, "ple_disk_cascade_active", False))
+
+
 def is_offload_process() -> bool:
     """Return True inside the dedicated PLE CPU-offload subprocess."""
     return _offload_worker_flag
@@ -200,7 +212,7 @@ class PleOffloadLayer(nn.Module, ABC):
             self: "PleOffloadLayer", *args: object, **kwargs: object
         ) -> None:
             if (
-                envs.VLLM_PLE_CPU_OFFLOAD
+                ple_offload_enabled()
                 and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
                 and not self.offload_keeps_local_tables()
                 and not is_offload_process()
@@ -228,7 +240,7 @@ class PleOffloadLayer(nn.Module, ABC):
         keeps_gpu_tables = (
             envs.VLLM_SM70_QWEN38_HYBRID_PLE or cls.offload_keeps_local_tables()
         )
-        if envs.VLLM_PLE_CPU_OFFLOAD and not (
+        if ple_offload_enabled() and not (
             keeps_gpu_tables and not is_offload_process()
         ):
             return torch.device("cpu")

@@ -289,6 +289,11 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
+    report["ple_disk_cascade"] = {
+        "enabled": cfg.kernel_config.ple_disk_cascade_active,
+        "reason": cfg.kernel_config.ple_disk_cascade_reason,
+        "scope": "configuration_capability",
+    }
     # Configuration policy is resolved once per engine. Actual kernel selection
     # still needs each loaded layer's local layout and native capabilities.
     policy = getattr(cfg.kernel_config, "sm70_nvfp4", None)

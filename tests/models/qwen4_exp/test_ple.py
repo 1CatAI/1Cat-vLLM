@@ -918,7 +918,7 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
 
 def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
     # Real file-backed shards, as the loader hands them over: the disk lane
-    # refuses anything else, and with VLLM_PLE_DISK_RELEASE_PAGES the gather
+    # refuses anything else, and with kernel_config.ple_disk_release_pages the gather
     # releases the mapped pages, which would destroy anonymous memory.
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -1653,7 +1653,7 @@ def _make_cascade_worker_embedding(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
     set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
+    monkeypatch.setattr(ple_module, "ple_cascade_configured", lambda: True)
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
     config = SimpleNamespace(
         ngram_size=3,
@@ -1951,7 +1951,9 @@ def _map_worker_shards_from_file(
 def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
     # A mapped page is one the kernel keeps; with the release switch the disk
     # tier must not collect them. The rows stay readable from the file.
-    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_RELEASE_PAGES", "1")
+    runtime = VllmConfig()
+    runtime.kernel_config.ple_disk_release_pages = True
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
     layer = _make_cascade_worker_embedding(monkeypatch)
     raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
     # Opening the checkpoint may touch its header pages; only the gather counts.
@@ -1966,7 +1968,7 @@ def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
 
 def test_disk_gather_keeps_its_pages_mapped_by_default(monkeypatch, tmp_path) -> None:
     # Without the switch the worker keeps what it read mapped, as before.
-    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_RELEASE_PAGES", None)
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: None)
     layer = _make_cascade_worker_embedding(monkeypatch)
     raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
     resident_before = _mapped_rss_kib(path)
