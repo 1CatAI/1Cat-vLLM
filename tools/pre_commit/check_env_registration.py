@@ -108,6 +108,59 @@ def scan_file(path: str, known: set[str]) -> int:
     with open(path, encoding="utf-8") as f:
         content = f.read()
     tree = ast.parse(content, filename=path)
+    # Resolve stable module constants, such as DISABLE_ENV. Never substitute
+    # a module alias through a function argument/local binding with that name.
+    module_constants: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        else:
+            continue
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            bindings = [
+                n
+                for n in tree.body
+                if isinstance(n, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(t, ast.Name) and t.id == target.id
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+                )
+            ]
+            if len(bindings) == 1:
+                module_constants[target.id] = node.value.value
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def constant_alias(key: ast.Name) -> str | None:
+        parent = parents.get(key)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                parameters = (
+                    *parent.args.posonlyargs,
+                    *parent.args.args,
+                    *parent.args.kwonlyargs,
+                )
+                if any(arg.arg == key.id for arg in parameters):
+                    return None
+                if any(
+                    isinstance(n, ast.Name)
+                    and n.id == key.id
+                    and isinstance(n.ctx, ast.Store)
+                    for n in ast.walk(parent)
+                ):
+                    return None
+            parent = parents.get(parent)
+        return module_constants.get(key.id)
+
     os_names = {"os"}
     environ_names: set[str] = set()
     getenv_names: set[str] = set()
@@ -158,9 +211,15 @@ def scan_file(path: str, known: set[str]) -> int:
             and is_environ(node.value)
         ):
             key = node.slice
-        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+        name = (
+            key.value
+            if isinstance(key, ast.Constant)
+            else constant_alias(key)
+            if isinstance(key, ast.Name)
+            else None
+        )
+        if not isinstance(name, str):
             continue
-        name = key.value
         if not name.startswith("VLLM_"):
             continue
         if name in known or name in BASELINE:

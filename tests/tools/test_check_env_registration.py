@@ -128,3 +128,27 @@ void first() { const char* key = "VLLM_FIRST"; getenv(key); }
 void second() { const char* key = "VLLM_SECOND"; getenv(key); }
 """
     assert native_reads(source) == [("VLLM_FIRST", 2), ("VLLM_SECOND", 3)]
+
+
+def test_stable_module_alias_is_checked(tmp_path):
+    assert _scan(
+        tmp_path,
+        'import os\nKEY = "VLLM_NOT_A_SWITCH"\n'
+        "def read():\n    return os.getenv(KEY)\n",
+    )
+
+
+def test_module_alias_does_not_override_function_parameter(tmp_path):
+    assert not _scan(
+        tmp_path,
+        'import os\nKEY = "VLLM_NOT_A_SWITCH"\n'
+        "def read(KEY):\n    return os.getenv(KEY)\n",
+    )
+
+
+def test_module_alias_does_not_override_function_local_binding(tmp_path):
+    assert not _scan(
+        tmp_path,
+        'import os\nKEY = "VLLM_NOT_A_SWITCH"\n'
+        'def read():\n    KEY = "VLLM_PORT"\n    return os.getenv(KEY)\n',
+    )

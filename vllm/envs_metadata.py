@@ -17,6 +17,7 @@ class EnvVarMetadata:
     effective_default: str
     automatic_conditions: tuple[str, ...]
     acceleration_paths: tuple[str, ...]
+    user_visible: bool
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ def env_var(
     effective_default: str,
     automatic_conditions: tuple[str, ...],
     acceleration_paths: tuple[str, ...],
+    user_visible: bool,
 ) -> EnvVar:
     """Keep parsing and metadata at the same registration site in envs.py."""
     return EnvVar(
@@ -48,5 +50,6 @@ def env_var(
             effective_default,
             automatic_conditions,
             acceleration_paths,
+            user_visible,
         ),
     )

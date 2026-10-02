@@ -48941,3 +48941,23 @@ before #790; assignment-only counts are19 and21. All1003 registrations have
 metadata. No environment name is deleted during this compatibility version.
 Actual 35B-A3B AWQ/FP8 checkpoints remain required before widening qualification
 or claiming same-criterion 35B decode parity.
+
+### SM70 environment surface cleanup (2026-10-03)
+
+- Remove six inactive registrations with no runtime/native consumer; add the
+  unified debug entry and register long attention's stable opt-out. Net change
+  is four fewer registered variables (1003 -> 999), not hundreds deleted.
+- Curate 36 public SM70 controls. Keep internal tuning, compatibility and
+  diagnostic metadata in the developer inventory; this does not remove the
+  remaining implementation switches. Public descriptions explain behavior,
+  defaults and override use, and CI rejects consumer placeholder text there.
+- Move four QSA defaults into `SM70_QSA_TUNING`, preserving all explicit legacy
+  values/parsing with warnings for one full released compatibility version.
+  Consolidate six observer aliases into `VLLM_SM70_DEBUG` channels.
+- NVFP4/AWQ/FP8 historical dispatch matrices have zero route changes. Repair
+  the FP8 snapshot loader so it loads the historical kernel after #794 instead
+  of assuming the helpers still live in fp8.py. The 43 QSA function/kernel ASTs
+  are identical; only the unchanged tuning assignments move into a table.
+- Configuration environment writes remain 20; model/TP locks are unchanged in
+  this pure cleanup. Default promotions and MTP admission belong to the
+  separately validated Flash-Next PR. No GPU speed A/B is needed here.

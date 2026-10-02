@@ -972,6 +972,8 @@ def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
 
 
 def _route_summary_enabled() -> bool:
+    if "VLLM_SM70_DEBUG" in os.environ:
+        return "routing" in envs.VLLM_SM70_DEBUG
     return (
         os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0") == "1"
         or os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY", "0") == "1"
