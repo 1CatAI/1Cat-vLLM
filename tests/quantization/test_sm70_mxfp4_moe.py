@@ -153,6 +153,7 @@ def test_mxfp4_sm70_weight_layout_rejects_wrong_ue8m0_scale_shape():
 
 
 def test_mxfp4_sm70_platform_gate_is_exact(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(sm70_tm.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         sm70_tm.current_platform,
@@ -702,6 +703,8 @@ def test_mxfp4_sm70_post_load_reads_bias_from_method_config(monkeypatch):
         "mxfp4_sm70_prepare",
         "mxfp4_moe_dense_stage_sm70_out",
         "awq_moe_build_strided_ptrs",
+        "mxfp4_moe_single_token_prepare_w13_sm70_out",
+        "awq_moe_single_token_weighted_reduce_out",
     ):
         monkeypatch.setattr(torch.ops._C, op_name, object(), raising=False)
     monkeypatch.setattr(
