@@ -15,6 +15,7 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 - User-entry route-hit, speed, and output-quality evidence:
 - Existing kernel/backend registry and capability-rejection reasons:
 - Per-engine configuration and deprecated-variable compatibility:
+- New/changed environment metadata and generated reference check:
 - Route snapshot command and intentional changed rows (write "none" for refactors):
 - SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after:
 
