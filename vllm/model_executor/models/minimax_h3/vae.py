@@ -96,7 +96,7 @@ def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
     *,
-    skip_parameter_init: bool = False,
+    reuse_checkpoint_storage: bool = False,
 ) -> nn.Module:
     auto_map = config.get("auto_map") or {}
     class_reference = auto_map.get("AutoModel")
@@ -113,11 +113,11 @@ def _load_remote_component(
     # anti-aliasing filters call torch.kaiser_window). Callers place the module
     # explicitly right after this returns, so nothing depends on the context.
     with torch.device("cpu"):
-        if skip_parameter_init:
-            from .initialization import load_without_random_parameter_init
+        if reuse_checkpoint_storage:
+            from .initialization import load_with_checkpoint_storage
 
             before = _checkpoint_file_identity(component_path, config)
-            model = load_without_random_parameter_init(
+            model = load_with_checkpoint_storage(
                 lambda: component_cls.from_pretrained(component_path)
             )
             if before != _checkpoint_file_identity(component_path, config):
@@ -179,7 +179,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         load_device: torch.device | None = None,
         pin_memory: bool = True,
         shared_weights_dir: str | None = None,
-        skip_parameter_init: bool = False,
+        reuse_checkpoint_storage: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -187,7 +187,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
-            skip_parameter_init=skip_parameter_init,
+            reuse_checkpoint_storage=reuse_checkpoint_storage,
         )
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
