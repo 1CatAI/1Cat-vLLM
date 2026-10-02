@@ -25,6 +25,21 @@ class VerifyAndUpdateConfig:
         return
 
 
+def sm70_awq_prefill_projection_qualified(prefix: str) -> bool:
+    """Retain the measured AWQ exact-dense projection roles.
+
+    This is a quality boundary, not a shape or TP requirement. Renamed and
+    additional roles need a paired kernel/quality check before admission.
+    """
+    return prefix.rsplit(".", 1)[-1] in {
+        "gate_up_proj",
+        "down_proj",
+        "in_proj_qkvz",
+        "out_proj",
+        "o_proj",
+    }
+
+
 def sm70_dflash2_nvfp4_qualified(vllm_config: "VllmConfig") -> bool:
     """Retained QPN2 whole-workload qualification, not operator capability.
 

@@ -48807,3 +48807,49 @@ The historical QWEN38 +29%/+18% batch result is pre-repair and not quality
 qualified; do not repeat it as accepted current performance. #703 has stronger
 same-contract quality evidence and is the next default-promotion candidate
 to screen, with resident-weight memory and KV capacity checked explicitly.
+
+### AWQ dense kernel framework migration (2026-10-03)
+
+The AWQ adapter now selects `TurboMindAwqLinearKernel` through the existing
+mixed-precision registry. Preparation, exact-dense workspace and execution
+move to the kernel with unchanged native calls. Dense policy resolves in
+`KernelConfig.sm70_awq`; three legacy switches remain compatible. AWQ MoE,
+FP8/QPN8, attention and verifier policies remain separate scopes.
+
+The independent legacy/candidate CPU snapshot covers 324 configurations and
+10 boundaries with zero default route changes. Twenty real AWQ eager cases
+(K/N representative of dense projections, groups 32/64/128 and M=1/4/8/4096/
+8192) plus three graph replays at each M=8 case match bitwise. No native
+arithmetic or accumulation precision is changed.
+
+Matched ordinary-wheel 27B release-profile32K validation used V1000-3,
+TP4, E4M3, DFlash7, page2048, budget8192, maximum4 sequences and FULL/
+PIECEWISE graphs. Initial C1 pure-decode median was 133.30 ->131.38 tokens/s,
+with identical returned tokens and TTFT 8.921 ->8.933s. The first two C4
+sampling pairs showed opposite changes (263.35 ->244.52 and, with ordered
+admission, 247.93 ->254.65); neither was a stable trajectory comparison.
+Deterministic target sampling still diverged at long context before the hash
+fix, and measured259.61 ->234.86. Preserve these failed controls.
+
+A new, unused AWQ subconfig had salted NVFP4's graph fingerprint. Resolve and
+hash AWQ only when it is used; an independent pre-migration hash fixture now
+protects that boundary. With the original fingerprint restored, all12 C4
+request token sequences match the deterministic control. Pure-decode C4 is
+259.61 ->254.68 tokens/s (-1.90%, inside the baseline's two-repeat spread of
+252.64..266.59). This is refactor validation, not a speedup claim. The change
+in long-context trajectory associated with the unused fingerprint is measured;
+its exact compiler/warmup numerical mechanism is not localized.
+
+Paired natural-stop quality checks have identical tokens in all21 requests:
+MBPP subset11/12, 32K needle3/3 and Chinese QA5/6 in both arms, with no new
+failure. The existing lowercase/underscore and machine-rate failures are
+retained. Dataset SHA256 remains the #764 sanitized-MBPP manifest.
+
+Measured source pair starts at b5f36b66434531cf888f463696f9769fb3520c69;
+normal wheels carry identical hashes for12 bundled vllm native libraries.
+Artifacts are retained in the task's sm70-awq-routing-20261002 audit directory,
+including failed starts, samplings, fixed-order controls, hash ablation,
+full returned tokens and checkpoint/input/output digests. These tests do not
+establish a new35B speed baseline or qualify new AWQ projection roles. AWQ
+exact-dense role expansion and the fused epilogue's TP boundary await a real
+AWQ quality pair; the available27B NVFP4 model cannot qualify those changes.

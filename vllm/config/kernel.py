@@ -208,6 +208,44 @@ class Sm70NvFp4Config:
 
 
 @config
+class Sm70AwqConfig:
+    """Per-engine AWQ policy; native support is checked by the linear kernel."""
+
+    enabled: bool | None = None
+    """Use TurboMind AWQ; auto preserves the legacy backend preference."""
+    prefill_exact_dense: bool | None = None
+    """Use bounded exact-dense prefill for quality-qualified projections."""
+    fused_silu: bool | None = None
+    """Experimental fused gate/up epilogue; auto remains disabled."""
+    resolved: bool = Field(default=False, init=False)
+    """Whether the compatibility adapter has resolved this engine's policy."""
+
+    def resolve(self) -> None:
+        from vllm import envs
+
+        if self.resolved:
+            return
+        for field, name in {
+            "enabled": "VLLM_SM70_AWQ_TURBOMIND",
+            "prefill_exact_dense": "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE",
+            "fused_silu": "VLLM_SM70_AWQ_MLP_ENGINE",
+        }.items():
+            if envs.is_set(name):
+                logger.warning_once(
+                    "%s is deprecated for dense linear layers; use "
+                    "kernel_config.sm70_awq.%s. Explicit configuration wins.",
+                    name,
+                    field,
+                )
+            if getattr(self, field) is None:
+                value = getattr(envs, name)
+                if field == "enabled":
+                    value = envs.use_sm70_turbomind(value)
+                setattr(self, field, value)
+        self.resolved = True
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -264,6 +302,9 @@ class KernelConfig:
     sm70_nvfp4: Sm70NvFp4Config = Field(default_factory=Sm70NvFp4Config)
     """SM70 compressed-tensors NVFP4 policy, resolved per engine."""
 
+    sm70_awq: Sm70AwqConfig = Field(default_factory=Sm70AwqConfig)
+    """SM70 dense AWQ policy, resolved per engine."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -288,6 +329,9 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
         }
+        if not self.sm70_awq.resolved:
+            # An unused format must not perturb another format's graph cache.
+            ignored_factors.add("sm70_awq")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)

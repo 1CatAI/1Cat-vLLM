@@ -1605,6 +1605,8 @@ class VllmConfig:
         self.kernel_config.sm70_nvfp4.resolve(
             qualified=sm70_dflash2_nvfp4_qualified(self)
         )
+        if self.model_config is not None and self.model_config.quantization == "awq":
+            self.kernel_config.sm70_awq.resolve()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
