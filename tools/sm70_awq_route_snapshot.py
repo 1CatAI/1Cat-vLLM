@@ -14,8 +14,10 @@ import torch
 
 from vllm import _sm70_ops, envs
 from vllm.config.kernel import KernelConfig
+from vllm.model_executor.kernels import linear
 from vllm.model_executor.kernels.linear.mixed_precision import sm70_awq
 from vllm.model_executor.layers.quantization import awq as candidate
+from vllm.platforms import PlatformEnum
 
 SCHEME = "vllm/model_executor/layers/quantization/awq.py"
 MODELS = ("27b_dflash2_nvfp4", "flash_next_mtp4_nvfp4", "35b_a3b_awq")
@@ -89,6 +91,7 @@ def snapshot_layer(
         NS(awq_sm70_prepare=True, awq_sm70_dequantize_out=True) if native else NS()
     )
     with (
+        patch.object(linear, "current_platform", NS(_enum=PlatformEnum.CUDA)),
         patch.object(
             module, "get_current_vllm_config_or_none", lambda: cfg, create=True
         ),

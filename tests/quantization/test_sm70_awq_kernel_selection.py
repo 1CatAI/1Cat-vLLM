@@ -13,11 +13,13 @@ import torch
 from tools.sm70_awq_route_snapshot import snapshot
 from vllm import envs
 from vllm.config.kernel import KernelConfig, Sm70AwqConfig
+from vllm.model_executor.kernels import linear
 from vllm.model_executor.kernels.linear import choose_mp_linear_kernel
 from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     Sm70AwqLinearLayerConfig,
     TurboMindAwqLinearKernel,
 )
+from vllm.platforms import PlatformEnum
 from vllm.scalar_type import scalar_types
 
 pytestmark = pytest.mark.cpu_test
@@ -25,6 +27,9 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.fixture(autouse=True)
 def clean_route_environment(monkeypatch):
+    monkeypatch.setattr(
+        linear, "current_platform", SimpleNamespace(_enum=PlatformEnum.CUDA)
+    )
     for name in list(os.environ):
         if name.startswith("VLLM_"):
             monkeypatch.delenv(name)
