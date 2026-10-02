@@ -17,7 +17,13 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
-from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -31,6 +37,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.ple_offload_layer import (
     PleOffloadLayer,
     is_offload_process,
+    ple_offload_enabled,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -542,6 +549,8 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     # directly. The UVA pinned-host implementation is only for GPU execution.
     if is_offload_process():
         return False
+    if ple_cascade_configured():
+        return True
     explicit = getattr(config, "ple_offload_embedding", None)
     if explicit is not None:
         return bool(explicit)
@@ -1104,7 +1113,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_shard_arrays: list[np.ndarray] = []
         self._disk_shard_pointers: list[int] = []
         self._disk_mapped_paths: set[str] = set()
-        self._release_disk_pages = envs.VLLM_PLE_DISK_RELEASE_PAGES
+        runtime = get_current_vllm_config_or_none()
+        self._release_disk_pages = bool(
+            getattr(
+                getattr(runtime, "kernel_config", None), "ple_disk_release_pages", False
+            )
+        )
         self._disk_executor: ThreadPoolExecutor | None = None
         if self._file_backed_shards:
             if quant_method is None:
@@ -1506,7 +1520,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def _release_mapped_pages(self, shard: torch.Tensor) -> None:
         """Unmap the pages of a file-backed shard this process has read.
 
-        Only with VLLM_PLE_DISK_RELEASE_PAGES. The pages stay in the page
+        Only with kernel_config.ple_disk_release_pages. The pages stay in the page
         cache, so reading them again is a cheap minor fault, but a mapped page
         is one the kernel keeps: with them mapped the offload worker held
         1.9 GiB of the checkpoint after twelve disk-tier requests while the
@@ -1707,7 +1721,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # returned by the CPU process. The embedding weights live exclusively
         # in that process.
         if (
-            envs.VLLM_PLE_CPU_OFFLOAD
+            ple_offload_enabled()
             and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
             and not self.offload_keeps_local_tables()
             and not is_offload_process()
@@ -1888,7 +1902,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # preserve the caller's existing device context (including SM70 UVA).
         ple_device = (
             torch.device(Qwen4ExpNGramEmbedding.get_target_device())
-            if envs.VLLM_PLE_CPU_OFFLOAD
+            if ple_offload_enabled()
             else nullcontext()
         )
         with ple_device:
