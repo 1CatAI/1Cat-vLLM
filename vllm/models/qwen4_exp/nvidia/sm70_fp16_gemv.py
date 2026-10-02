@@ -407,6 +407,7 @@ def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bo
     return bool(
         envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
         and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and _is_packed_row_major(x)
         and _is_packed_row_major(weight)
         and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))

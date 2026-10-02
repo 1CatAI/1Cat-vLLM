@@ -307,3 +307,33 @@ def test_dense_loader_permission_respects_batch_contract(
     layer = Dense()
     gemv.enable_qwen38_sm70_fp16_gemv(layer, torch.float16, config)
     assert layer._sm70_qwen38_dense_batch == (policy in ("normal", "mtp"))
+
+
+def test_mtp_dense_batch_honors_explicit_fp16_accumulation(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    x = SimpleNamespace(
+        shape=(5, 1536),
+        ndim=2,
+        dtype=torch.float16,
+        is_cuda=True,
+        device="cuda:0",
+        stride=lambda: (1536, 1),
+        data_ptr=lambda: 16,
+    )
+    weight = SimpleNamespace(
+        shape=(2560, 1536),
+        ndim=2,
+        dtype=torch.float16,
+        is_cuda=True,
+        device="cuda:0",
+        stride=lambda: (1536, 1),
+        data_ptr=lambda: 16,
+    )
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+    assert gemv._can_use_dense_batch(x, weight, "model.layers.0.linear_attn.out_proj")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", True)
+    assert not gemv._can_use_dense_batch(
+        x, weight, "model.layers.0.linear_attn.out_proj"
+    )
