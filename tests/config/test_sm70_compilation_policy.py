@@ -92,6 +92,8 @@ def policy_module():
         "_is_sm70_qwen38_decode_compile_contract",
         "_apply_sm70_qwen38_decode_defaults",
         "_sm70_nomtp_cudagraph_capture_sizes",
+        "_sm70_max_cudagraph_capture_size",
+        "_configure_sm70_dflash2_graph_cache",
     }
     helpers = [
         node
@@ -172,7 +174,7 @@ def _config(**overrides: object) -> SimpleNamespace:
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         attention_config=SimpleNamespace(backend=None),
-        scheduler_config=SimpleNamespace(max_num_seqs=10),
+        scheduler_config=SimpleNamespace(max_num_seqs=10, max_num_batched_tokens=2048),
         kernel_config=SimpleNamespace(ir_op_priority=SimpleNamespace()),
         compilation_config=SimpleNamespace(**compilation),
         use_v2_model_runner=False,
@@ -311,3 +313,30 @@ def test_explicit_baseline_opt_out_remains_effective(policy, monkeypatch):
     assert os.environ[COMPILE_POLICY] == "0"
     assert config.compilation_config.mode is None
     assert config.compilation_config.cudagraph_mode is None
+
+
+@pytest.mark.parametrize("policy_name", [COMPILE_POLICY, DECODE_POLICY])
+@pytest.mark.parametrize("budget", [1, 2, 8, 50, 2048])
+def test_policy_capture_cap_respects_token_budget(
+    policy, monkeypatch, policy_name, budget
+):
+    monkeypatch.setenv(policy_name, "1")
+    config = _config()
+    config.scheduler_config.max_num_batched_tokens = budget
+    policy.apply_policy(config)
+    sizes = config.compilation_config.cudagraph_capture_sizes
+    eligible = [size for size in sizes if size <= budget]
+    assert config.compilation_config.max_cudagraph_capture_size == max(eligible)
+
+
+@pytest.mark.parametrize("policy_name", [COMPILE_POLICY, DECODE_POLICY])
+@pytest.mark.parametrize("budget,expected", [(3, 2), (7, 4), (50, 8)])
+def test_policy_infers_cap_from_explicit_capture_sizes(
+    policy, monkeypatch, policy_name, budget, expected
+):
+    monkeypatch.setenv(policy_name, "1")
+    config = _config(cudagraph_capture_sizes=[2, 4, 8])
+    config.scheduler_config.max_num_batched_tokens = budget
+    policy.apply_policy(config)
+    assert config.compilation_config.cudagraph_capture_sizes == [2, 4, 8]
+    assert config.compilation_config.max_cudagraph_capture_size == expected
