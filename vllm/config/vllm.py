@@ -1591,6 +1591,12 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
 
+        from vllm.model_executor.models.config import sm70_dflash2_nvfp4_qualified
+
+        self.kernel_config.sm70_nvfp4.resolve(
+            qualified=sm70_dflash2_nvfp4_qualified(self)
+        )
+
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)

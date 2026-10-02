@@ -138,6 +138,7 @@ MoEBackend = Literal[
 
 LinearBackend = Literal[
     "auto",
+    "turbomind",
     "cutlass",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
@@ -153,6 +154,57 @@ LinearBackend = Literal[
     "exllama",
     "emulation",
 ]
+
+
+@config
+class Sm70NvFp4Config:
+    """Per-engine weight-only NVFP4 policy; None retains legacy auto selection.
+
+    Resolve before loading layers. Native capability and local layout checks
+    remain with the linear kernels. Explicit fields override deprecated envs.
+    """
+
+    qpn2: bool | None = None
+    """Enable QPN2 small-M kernels; auto follows the qualified draft workload."""
+    prefill: bool | None = None
+    """Enable the existing bounded QPN2 prefill dispatcher."""
+    shared_weight: bool | None = None
+    """Share packed codes with TurboMind instead of retaining a second copy."""
+    shared_scales: bool | None = None
+    """Allow compact scales when batch layouts and native ABI permit them."""
+    prefill_min_m: int | None = None
+    """User override for the retained prefill threshold, normally 1024 rows."""
+    qualified: bool = Field(default=False, init=False)
+    """Whether the draft/state contract has passed the retained quality gate."""
+    resolved: bool = Field(default=False, init=False)
+    """Prevent reparsing process environment when a config is reused."""
+
+    def resolve(self, *, qualified: bool) -> None:
+        from vllm import envs
+
+        if self.resolved:
+            return
+        self.qualified = qualified
+        defaults = {
+            "qpn2": ("VLLM_SM70_NVFP4_QPN2", qualified),
+            "prefill": ("VLLM_SM70_NVFP4_QPN2_PREFILL", qualified),
+            "shared_weight": ("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", True),
+            "shared_scales": ("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True),
+            "prefill_min_m": ("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", 1024),
+        }
+        for field, (name, default) in defaults.items():
+            if envs.is_set(name):
+                logger.warning_once(
+                    "%s is deprecated; use kernel_config.sm70_nvfp4.%s. "
+                    "Explicit configuration takes precedence.",
+                    name,
+                    field,
+                )
+            if getattr(self, field) is None:
+                setattr(
+                    self, field, getattr(envs, name) if envs.is_set(name) else default
+                )
+        self.resolved = True
 
 
 @config
@@ -193,6 +245,7 @@ class KernelConfig:
     """Backend for quantized linear layer GEMM kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
+    - "turbomind": SM70 compressed-tensors NVFP4 weight-only kernels
     - "cutlass": Use CUTLASS-based kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TensorRT-LLM kernels
@@ -207,6 +260,9 @@ class KernelConfig:
     - "conch": Use Conch mixed-precision kernels
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
+
+    sm70_nvfp4: Sm70NvFp4Config = Field(default_factory=Sm70NvFp4Config)
+    """SM70 compressed-tensors NVFP4 policy, resolved per engine."""
 
     @field_validator("moe_backend", mode="before")
     @classmethod

@@ -48714,3 +48714,47 @@ expected routes. Its full backend suite passes (512 passed, 17 skipped), fronten
 typecheck and build pass, and the existing build chunk-size warning is retained.
 Keep all candidate PRs Draft and preserve existing release failures; do not
 merge, tag or publish from this qualification task.
+
+### 2026-10-02: SM70 linear policy migration on main
+
+The maintainer approved integrating SM70 paths into existing linear/MoE
+selectors, attention validators and model configuration policies, rather than
+adding a parallel acceleration registry. The acceleration cleanup has separate
+authorization to merge verified PRs into main; it does not alter the release
+qualification task above or release/1.5.1.
+
+The first owned scope is compressed-tensors NVFP4 QPN2/QPN4/TurboMind, based
+on main e21372d7547f96949dbfc5ccd1c1073d05ba1e55. Kernel preparation and
+execution move into the existing NVFP4 framework. Five QPN2 compatibility
+aliases resolve once in KernelConfig; model quality restrictions remain in
+models/config.py. Native numerical sources, precision, tuning values and
+default admitted routes are retained. See [the implementation design](sm70_linear_kernel_integration.md).
+
+The independent original quantization adapter and migrated adapter agree on
+324 category configurations and 18 boundary cases. This is CPU loading and
+native-entry dispatch evidence, not an all-category GPU routing claim.
+Flash-Next ModelOpt and 35B AWQ are explicitly outside this CT category.
+
+Comparable static-inventory metrics remain 494 registered SM70-related names,
+619 total names, 125 unregistered SM70-related direct-read names (177 across
+all VLLM names), and 110 hardcoded-comparison candidates (51 in config/vllm.py).
+The matching inventory scope is Python vllm/**/*.py and csrc C/CUDA, with name
+filter SM70|FLASH_V100|FLASHQLA; dynamic keys and companion packages are
+excluded. Comparison candidates are a lexical audit counter, not a semantic
+count of quality restrictions. No model parameter locks are removed here.
+The five migrated names remain registered throughout their compatibility
+release, so their count does not decrease yet.
+
+GPU validation is a matched ordinary installed-wheel release-profile 27B,
+TP4, GPU0–3, FP16, E4M3, 32K input, C1/C4 run with separate prefill and pure
+decode metrics. An initial baseline startup lost free memory to a concurrent
+owner and also exposed an editable Flash-V100 packaging omission; neither
+is candidate performance evidence. Preserve that failed startup, use normal
+complete wheels for both arms, and wait for free GPUs rather than stopping
+other services. The native-library hashes match between the two rebuilt
+Python wheels and have no private RPATHs. GPU results remain pending.
+
+The historical QWEN38 +29%/+18% batch result is pre-repair and not quality
+qualified; do not repeat it as accepted current performance. #703 has stronger
+same-contract quality evidence and is the next default-promotion candidate
+to screen, with resident-weight memory and KV capacity checked explicitly.

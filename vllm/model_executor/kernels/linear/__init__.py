@@ -112,6 +112,12 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
+    Qpn2NvFp4LinearKernel,
+    Qpn4NvFp4LinearKernel,
+    Sm70NvFp4LinearLayerConfig,
+    TurboMindNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -181,6 +187,11 @@ def _get_linear_backend() -> str:
 # set are considered candidates. If none can implement the layer config,
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
+    "turbomind": {
+        Qpn2NvFp4LinearKernel,
+        Qpn4NvFp4LinearKernel,
+        TurboMindNvFp4LinearKernel,
+    },
     "cutlass": {
         CutlassInt8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -375,6 +386,9 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        Qpn4NvFp4LinearKernel,
+        Qpn2NvFp4LinearKernel,
+        TurboMindNvFp4LinearKernel,
         # FlashInferB12xNvFp4LinearKernel excluded from auto-selection until
         # upstream CUTLASS SM121 MMA op guard is resolved; use
         # VLLM_NVFP4_GEMM_BACKEND=flashinfer-b12x to opt in explicitly.
@@ -403,8 +417,12 @@ _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
 
 # TODO make all kernels inherit from MMLinearKernel
 # then bound _KernelT only to MMLinearKernel
-_KernelT = TypeVar("_KernelT", bound=ScaledMMLinearKernel | MMLinearKernel)
-_KernelConfigT = TypeVar("_KernelConfigT", bound=MMLinearLayerConfig)
+_KernelT = TypeVar(
+    "_KernelT", bound=ScaledMMLinearKernel | MMLinearKernel | NvFp4LinearKernel
+)
+_KernelConfigT = TypeVar(
+    "_KernelConfigT", bound=MMLinearLayerConfig | NvFp4LinearLayerConfig
+)
 
 
 def is_supported_and_can_implement_kernel(
@@ -422,7 +440,12 @@ def is_supported_and_can_implement_kernel(
     if not is_supported:
         return False, f"{kernel.__name__} {failure_reason}."
 
-    can_implement, failure_reason = kernel.can_implement(config)
+    if issubclass(kernel, NvFp4LinearKernel):
+        if not isinstance(config, NvFp4LinearLayerConfig):
+            return False, f"{kernel.__name__} requires an NVFP4 layer configuration"
+        can_implement, failure_reason = kernel.can_implement(config)
+    else:
+        can_implement, failure_reason = kernel.can_implement(config)
     if not can_implement:
         return (
             False,
@@ -834,10 +857,59 @@ _NVFP4_BACKEND_TO_KERNEL: dict[str, type[NvFp4LinearKernel]] = {
 }
 
 
-def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
+def select_sm70_nvfp4_linear_kernel(
+    config: Sm70NvFp4LinearLayerConfig,
+    *,
+    skip_qpn4: bool = False,
+    compute_capability: int | None = None,
+) -> tuple[type[NvFp4LinearKernel] | None, dict[str, str | None]]:
+    """One decision source for execution and route snapshots.
+
+    Capability checks live in the kernels. Retained workload/projection quality
+    boundaries are supplied by model policy, outside can_implement.
+    """
+    decisions: dict[str, str | None] = {}
+    for kernel in _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]:
+        if not issubclass(kernel, TurboMindNvFp4LinearKernel):
+            continue
+        reason = None
+        if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:
+            reason = "disabled by VLLM_DISABLED_KERNELS"
+        elif kernel is Qpn4NvFp4LinearKernel:
+            if skip_qpn4:
+                reason = "insufficient QPN4 workspace"
+            elif not config.qpn4_qualified or not envs.VLLM_SM70_NVFP4_QPN4:
+                reason = "QPN4 disabled or outside the qualified workload"
+        elif kernel is Qpn2NvFp4LinearKernel:
+            if not config.policy.qpn2:
+                reason = "QPN2 disabled by configuration or unqualified workload"
+            elif not config.qpn2_qualified:
+                reason = "projection role not yet quality-qualified for QPN2"
+        if reason is None:
+            enabled, failure = is_supported_and_can_implement_kernel(
+                kernel, config, compute_capability
+            )
+            reason = None if enabled else failure
+        decisions[kernel.__name__] = reason
+        if reason is None:
+            return kernel, decisions
+    return None, decisions
+
+
+def init_nvfp4_linear_kernel(
+    config: NvFp4LinearLayerConfig | None = None, *, skip_qpn4: bool = False
+) -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
-    config = NvFp4LinearLayerConfig()
+    config = config if config is not None else NvFp4LinearLayerConfig()
+
+    if isinstance(config, Sm70NvFp4LinearLayerConfig):
+        kernel, decisions = select_sm70_nvfp4_linear_kernel(config, skip_qpn4=skip_qpn4)
+        if kernel is None:
+            raise ValueError(f"No SM70 NVFP4 weight-only kernel available: {decisions}")
+        logger.info_once("Using %s for SM70 NVFP4 GEMM", kernel.__name__)
+        logger.debug("SM70 NVFP4 selection: %s", decisions)
+        return kernel(config)
 
     # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the
     # batch-invariant CUTLASS implementation when available, otherwise fall
