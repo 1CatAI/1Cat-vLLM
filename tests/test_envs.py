@@ -159,16 +159,18 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
 def test_sm70_concurrency_tuning_envs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    names = (
-        "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING",
-        "VLLM_SM70_TOPK_TOPP_8_WARPS",
-        "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY",
-    )
-    for name in names:
+    defaults = {
+        "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": False,
+        "VLLM_SM70_TOPK_TOPP_8_WARPS": False,
+        "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": True,
+    }
+    for name, default in defaults.items():
         monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() is False
+        assert environment_variables[name]() is default
         monkeypatch.setenv(name, "1")
         assert environment_variables[name]() is True
+        monkeypatch.setenv(name, "0")
+        assert environment_variables[name]() is False
 
     for name in (
         "VLLM_SM70_FP8_QPN8_M16",
