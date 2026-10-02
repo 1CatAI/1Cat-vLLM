@@ -142,3 +142,14 @@ def test_combined_copy_capability_is_local_layout(rows, dtype, qkv, z, ba, reaso
         reason is None,
         reason,
     )
+
+
+def test_loaded_report_includes_actual_verifier_flags_and_reason():
+    from vllm.sm70_profiles.acceleration import loaded_sm70_preparations
+
+    layer = torch.nn.Module()
+    layer.enable_sm70_dflash2_fused_gdn_combined_split = False
+    layer._sm70_dflash2_combined_split_reason = "local_tail_layout"
+    row = loaded_sm70_preparations(layer)["variants"][""]
+    assert row["flags"]["enable_sm70_dflash2_fused_gdn_combined_split"] is False
+    assert row["reasons"]["_sm70_dflash2_combined_split_reason"] == "local_tail_layout"

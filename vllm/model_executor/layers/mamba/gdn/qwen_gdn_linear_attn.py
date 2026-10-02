@@ -2491,6 +2491,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self._sm70_dflash2_combined_split_reason = (
+            None
+            if self.enable_sm70_dflash2_fused_gdn_combined_split
+            else "policy_hardware_or_speculation"
+        )
         if self.enable_sm70_dflash2_fused_gdn_combined_split:
             from vllm.model_executor.models.qwen3_5 import (
                 _can_implement_sm70_combined_gdn_split,

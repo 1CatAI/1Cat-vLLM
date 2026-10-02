@@ -93,7 +93,7 @@ def loaded_sm70_preparations(model) -> dict[str, Any]:
         flags = {
             key: value
             for key, value in vars(layer).items()
-            if key.startswith("_sm70_") and isinstance(value, bool)
+            if key.startswith(("_sm70_", "enable_sm70_")) and isinstance(value, bool)
         }
         buffers = []
         for key, buffer in layer.named_buffers(recurse=False):
@@ -114,6 +114,13 @@ def loaded_sm70_preparations(model) -> dict[str, Any]:
             variants[name] = {
                 "method": type(method).__name__ if method is not None else None,
                 "flags": flags,
+                "reasons": {
+                    key: value
+                    for key, value in vars(layer).items()
+                    if key.startswith("_sm70_")
+                    and key.endswith("_reason")
+                    and isinstance(value, str)
+                },
                 "prepared_buffers": buffers,
                 "scope": "prepared_runtime_guards",
             }
