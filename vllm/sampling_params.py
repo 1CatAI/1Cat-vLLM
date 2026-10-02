@@ -622,15 +622,24 @@ class SamplingParams(
             return
         self._bad_words_token_ids = []
         for bad_word in self.bad_words:
+            # Preserve literal whitespace-only sequences rather than stripping
+            # them into an empty token list.
+            word = bad_word.lstrip() or bad_word
             # To prohibit words both at the beginning
             # and in the middle of text
             # (related to add_prefix_space tokenizer parameter)
             for add_prefix_space in [False, True]:
                 prefix = " " if add_prefix_space else ""
-                prompt = prefix + bad_word.lstrip()
+                prompt = prefix + word
                 prompt_token_ids = tokenizer.encode(
                     text=prompt, add_special_tokens=False
                 )
+                if not prompt_token_ids:
+                    raise VLLMValidationError(
+                        f"bad_words entry {bad_word!r} encodes to no tokens.",
+                        parameter="bad_words",
+                        value=bad_word,
+                    )
 
                 # If no space at the beginning
                 # or if prefix space produces a new word token
@@ -705,8 +714,9 @@ class SamplingParams(
     ) -> None:
         self._validate_logprobs(model_config)
         self._validate_logit_bias(model_config)
+        self._validate_stop_token_ids(model_config)
         self._validate_logits_processors(model_config)
-        self._validate_allowed_token_ids(tokenizer)
+        self._validate_allowed_token_ids(model_config, tokenizer)
         self._validate_spec_decode(speculative_config)
         self._validate_structured_outputs(structured_outputs_config, tokenizer)
 
@@ -799,7 +809,28 @@ class SamplingParams(
 
         validate_logits_processors_parameters(model_config.logits_processors, self)
 
-    def _validate_allowed_token_ids(self, tokenizer: TokenizerLike | None) -> None:
+    def _validate_stop_token_ids(self, model_config: ModelConfig) -> None:
+        # min_tokens turns these IDs into logit indices, not just stop labels.
+        stop_token_ids = self.all_stop_token_ids.union(self.stop_token_ids or [])
+        if not stop_token_ids:
+            return
+        vocab_size = model_config.get_vocab_size()
+        invalid_token_ids = sorted(
+            token_id
+            for token_id in stop_token_ids
+            if token_id < 0 or token_id >= vocab_size
+        )
+        if invalid_token_ids:
+            raise VLLMValidationError(
+                f"stop_token_ids contains out-of-vocab token ids "
+                f"{invalid_token_ids}. Vocabulary size: {vocab_size}",
+                parameter="stop_token_ids",
+                value=invalid_token_ids,
+            )
+
+    def _validate_allowed_token_ids(
+        self, model_config: ModelConfig, tokenizer: TokenizerLike | None
+    ) -> None:
         allowed_token_ids = self.allowed_token_ids
         if allowed_token_ids is None:
             return
@@ -811,19 +842,22 @@ class SamplingParams(
                 value=allowed_token_ids,
             )
 
+        # Token-ID-only requests may skip the tokenizer entirely. When present,
+        # retain its existing limit as well as the model's logit width.
+        vocab_size = model_config.get_vocab_size()
         if tokenizer is not None:
-            vocab_size = len(tokenizer)
-            invalid_token_ids = [
-                token_id
-                for token_id in allowed_token_ids
-                if token_id < 0 or token_id >= vocab_size
-            ]
-            if invalid_token_ids:
-                raise VLLMValidationError(
-                    "allowed_token_ids contains out-of-vocab token id!",
-                    parameter="allowed_token_ids",
-                    value=invalid_token_ids,
-                )
+            vocab_size = min(vocab_size, len(tokenizer))
+        invalid_token_ids = [
+            token_id
+            for token_id in allowed_token_ids
+            if token_id < 0 or token_id >= vocab_size
+        ]
+        if invalid_token_ids:
+            raise VLLMValidationError(
+                "allowed_token_ids contains out-of-vocab token id!",
+                parameter="allowed_token_ids",
+                value=invalid_token_ids,
+            )
 
     def _validate_spec_decode(
         self,

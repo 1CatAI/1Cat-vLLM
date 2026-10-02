@@ -133,7 +133,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
-            if device_capability.major == 7 and device_capability.minor == 0:
+            if device_capability.major == 7 and device_capability.minor in (0, 2):
                 backends.insert(0, AttentionBackendEnum.GLM5_SM70_SPARSE)
             return backends
     else:
@@ -149,7 +149,7 @@ def _get_backend_priorities(
             if (
                 envs.VLLM_SM70_FLASH_ATTN_V100
                 and device_capability.major == 7
-                and device_capability.minor == 0
+                and device_capability.minor in (0, 2)
             ):
                 return [
                     AttentionBackendEnum.FLASH_ATTN_V100,
@@ -779,8 +779,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
     @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
-        return pynvml.nvmlDeviceGetName(handle)
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+            return pynvml.nvmlDeviceGetName(handle)
+        except pynvml.NVMLError:
+            # A failed diagnostic query must not abort platform initialization.
+            return f"<unavailable:{device_id}>"
 
     @classmethod
     @with_nvml_context
