@@ -229,16 +229,14 @@ def _is_sm70_qwen38_decode_compile_contract(
     speculative_config: Any,
     parallel_config: Any,
 ) -> bool:
-    """Admit the shared Qwen3.8 TP4 decode topology, including MTP4."""
+    """Select the FP16 Qwen4Exp lane; each operator validates its own geometry.
+
+    Quantization and KV precision do not describe the unquantized checkpoint
+    projections. TP, model dimensions and speculative width are likewise not
+    requirements of an M=1 GEMV. Do not gate all operators on one benchmark.
+    """
     if model_config is None or parallel_config is None:
         return False
-    if speculative_config is not None and not (
-        getattr(speculative_config, "method", None) == "mtp"
-        and getattr(speculative_config, "num_speculative_tokens", None) == 4
-    ):
-        return False
-
-    hf_text_config = getattr(model_config, "hf_text_config", None)
     architectures = set(getattr(model_config, "architectures", ()) or ())
     multimodal_config = getattr(model_config, "multimodal_config", None)
     supported_architecture = "Qwen4ExpForCausalLM" in architectures or (
@@ -247,22 +245,7 @@ def _is_sm70_qwen38_decode_compile_contract(
         and getattr(multimodal_config, "language_model_only", False)
     )
     return bool(
-        supported_architecture
-        and getattr(model_config, "dtype", None) == torch.float16
-        and getattr(hf_text_config, "hidden_size", None) == 2560
-        and getattr(hf_text_config, "num_hidden_layers", None) == 48
-        and getattr(hf_text_config, "num_experts", None) == 512
-        and getattr(hf_text_config, "num_experts_per_tok", None) == 10
-        and getattr(hf_text_config, "moe_intermediate_size", None) == 640
-        and getattr(hf_text_config, "hc_count", None) == 4
-        and getattr(hf_text_config, "hc_lowrank", None) == 320
-        and getattr(hf_text_config, "num_attention_heads", None) == 24
-        and getattr(hf_text_config, "num_key_value_heads", None) == 2
-        and getattr(hf_text_config, "indexer_head_dim", None) == 128
-        and getattr(hf_text_config, "indexer_budget", None) == 2048
-        and getattr(hf_text_config, "indexer_compress_ratio", None) == 4
-        and getattr(parallel_config, "tensor_parallel_size", None) == 4
-        and getattr(parallel_config, "pipeline_parallel_size", None) == 1
+        supported_architecture and getattr(model_config, "dtype", None) == torch.float16
     )
 
 
@@ -301,36 +284,26 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
 def _apply_sm70_qwen38_decode_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
-    """Complete the admitted NVFP4 baseline without global experimental defaults."""
+    """Enable shape-checked FP16 routes without coupling them to MoE/KV policy."""
     if not is_sm70 or not _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     ):
         return ()
     parallel = cfg.parallel_config
-    if (
-        cfg.model_config.quantization != "modelopt_fp4"
-        or cfg.lora_config is not None
-        or parallel.enable_expert_parallel
-        or parallel.enable_dbo
-        or parallel.data_parallel_size != 1
-        or parallel.nnodes_within_dp != 1
-        or cfg.cache_config.cache_dtype not in ("auto", "float16")
-        or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
-    ):
-        return ()
-
     defaults = {
         "VLLM_SM70_QWEN38_FP16_GEMV": "1",
         "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": "1",
         "VLLM_SM70_QWEN38_FUSED_HC_FP16": "1",
-        "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
-        "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
     }
-    if cfg.speculative_config is not None:
-        # Keep M=1 draft graphs when target graph sizes are multiples of five.
+    # These are collective/stream policies, not FP16 projection requirements.
+    if not parallel.enable_expert_parallel and not parallel.enable_dbo:
+        defaults["VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP"] = "1"
+        defaults["VLLM_SM70_MOE_ADD_ALLREDUCE"] = "1"
+    if cfg.speculative_config is not None and cfg.speculative_config.method == "mtp":
+        # Keep M=1 draft graphs independently of the verifier query width.
         # Otherwise the prepared single-token operators never reach capture.
         defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
-    else:
+    elif cfg.speculative_config is None:
         # Pin the native FP32 gated-norm arithmetic across independently
         # compiled C1/batch graphs. Tiny fusion-dependent rounding differences
         # can change an MoE route and ultimately flip an EOS token.
@@ -1004,6 +977,11 @@ class VllmConfig:
         default_factory=dict, init=False, repr=False, exclude=True
     )
     """Diagnostic route capabilities, excluded from the computation graph hash."""
+    is_speculative_draft: bool = Field(default=False, repr=False, exclude=True)
+    """Internal proposer config; target release-profile requirements do not apply.
+
+    This validation scope does not affect the computation graph hash.
+    """
     instance_id: str = ""
     """The ID of the vLLM instance."""
     optimization_level: OptimizationLevel = OptimizationLevel.O2
@@ -2127,8 +2105,8 @@ class VllmConfig:
                     ),
                 ):
                     logger.info_once(
-                        "Auto-setting %s=1 for the quality-qualified SM70 "
-                        "Qwen3.8 NVFP4 TP4 decode path. Set it explicitly to override.",
+                        "Auto-setting %s=1 for shape-checked SM70 Qwen4Exp "
+                        "FP16 decode operators. Set it explicitly to override.",
                         env_name,
                     )
             if (
@@ -2157,6 +2135,12 @@ class VllmConfig:
                     self.parallel_config,
                 )
                 and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+                # Hybrid PLE has its own placement requirements. Other PP/DP
+                # layouts still use the independently admitted FP16 operators.
+                and self.parallel_config.pipeline_parallel_size == 1
+                and self.parallel_config.data_parallel_backend == "mp"
+                and self.parallel_config.data_parallel_size_local
+                == self.parallel_config.data_parallel_size
                 and not any(
                     name in os.environ
                     for name in (
