@@ -12,7 +12,146 @@ import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from vllm.envs_metadata import env_var
+
 if TYPE_CHECKING:
+    VLLM_CPU_CI_ENV: str | None = None
+    VLLM_CPU_SIM_MULTI_NUMA: str | None = None
+    VLLM_CUTLASS_SRC_DIR: str | None = None
+    VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH: str | None = None
+    VLLM_DFLASH_DDTREE_CONV_KERNEL: str | None = None
+    VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD: str | None = None
+    VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE: str | None = None
+    VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD: str | None = None
+    VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE: str | None = None
+    VLLM_DFLASH_DDTREE_ENGINE_PROFILE: str | None = None
+    VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG: str | None = None
+    VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT: str | None = None
+    VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON: str | None = None
+    VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON: str | None = None
+    VLLM_DFLASH_DDTREE_GPU_SAMPLER: str | None = None
+    VLLM_DFLASH_DDTREE_LINEAR_GDN: str | None = None
+    VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH: str | None = None
+    VLLM_DFLASH_DDTREE_METADATA_PROFILE: str | None = None
+    VLLM_DFLASH_DDTREE_PATH_PROBE: str | None = None
+    VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER: str | None = None
+    VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS: str | None = None
+    VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT: str | None = None
+    VLLM_DFLASH_DDTREE_PROFILE: str | None = None
+    VLLM_DFLASH_DDTREE_QLA_GDN: str | None = None
+    VLLM_DFLASH_DDTREE_SERIAL_GDN: str | None = None
+    VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT: str | None = None
+    VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS: str | None = None
+    VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX: str | None = None
+    VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP: str | None = None
+    VLLM_DFLASH_DDTREE_TRACE_JSONL: str | None = None
+    VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF: str | None = None
+    VLLM_DFLASH_DDTREE_TRITON_SAMPLER: str | None = None
+    VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE: str | None = None
+    VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT: str | None = None
+    VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK: str | None = None
+    VLLM_DFLASH_DDTREE_WORKER_PROFILE: str | None = None
+    VLLM_DFLASH_DEBUG_COORD_TRACE: str | None = None
+    VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT: str | None = None
+    VLLM_DFLASH_DEBUG_PROPOSAL_STAGES: str | None = None
+    VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE: str | None = None
+    VLLM_DFLASH_DEBUG_TARGET_LOGITS: str | None = None
+    VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION: str | None = None
+    VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR: str | None = None
+    VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT: str | None = None
+    VLLM_DIST_IDENT: str | None = None
+    VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY: str | None = None
+    VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA: str | None = None
+    VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS: str | None = None
+    VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA: str | None = None
+    VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE: str | None = None
+    VLLM_KPOOL_SKIP_DECODE_WRITE: str | None = None
+    VLLM_KPOOL_SKIP_TAIL_CACHE: str | None = None
+    VLLM_QWEN35_MTP_KEEP_QUANT: str | None = None
+    VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS: str | None = None
+    VLLM_SM70_DFLASH2_BF16_EMULATION: str | None = None
+    VLLM_SM70_DUMP_AWQ_MOE_BUFFERS: str | None = None
+    VLLM_SM70_DUMP_AWQ_MOE_LABELS: str | None = None
+    VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_DIR: str | None = None
+    VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS: str | None = None
+    VLLM_SM70_DUMP_GDN_CORE_DIR: str | None = None
+    VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE: str | None = None
+    VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS: str | None = None
+    VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_DIR: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_LABELS: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_METADATA: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_SHAPES: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES: str | None = None
+    VLLM_SM70_DUMP_GDN_GRAPH_STEPS: str | None = None
+    VLLM_SM70_DUMP_GDN_PROJ_DIR: str | None = None
+    VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE: str | None = None
+    VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS: str | None = None
+    VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS: str | None = None
+    VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_COUNTS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_DIR: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_IDS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_LABELS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS: str | None = None
+    VLLM_SM70_DUMP_QWEN_MLP_INTERNALS: str | None = None
+    VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE: str | None = None
+    VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS: str | None = None
+    VLLM_SM70_FLASHQLA_DIRECT_OUTPUT: str | None = None
+    VLLM_SM70_FLASHQLA_INDEXED_PREFILL: str | None = None
+    VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL: str | None = None
+    VLLM_SM70_FP8_BATCH_PRESCALED: str | None = None
+    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE: str | None = None
+    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS: str | None = None
+    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED: str | None = None
+    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT: str | None = None
+    VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE: str | None = None
+    VLLM_SM70_GDN_PREFILL_PROFILE: str | None = None
+    VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS: str | None = None
+    VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE: str | None = None
+    VLLM_SM70_GDN_STATE_CONTRACT_ASSERT: str | None = None
+    VLLM_SM70_GLM53_EXACT_KDA_GEMV: str | None = None
+    VLLM_SM70_GLM53_FP16_GEMV_LIBRARY: str | None = None
+    VLLM_SM70_INDEXER_DECODE_CUBLAS: str | None = None
+    VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS: str | None = None
+    VLLM_SM70_INDEXER_FUSED_LOGITS: str | None = None
+    VLLM_SM70_INDEXER_PREFILL_CUBLAS: str | None = None
+    VLLM_SM70_INDEXER_PREFILL_TILE_MB: str | None = None
+    VLLM_SM70_INDEXER_RELU: str | None = None
+    VLLM_SM70_KDA_PREFILL_SCHEDULE: str | None = None
+    VLLM_SM70_MTP_DUMP_TENSOR_MAX: str | None = None
+    VLLM_SM70_QSA_GROUPED_PAD_FIX: str | None = None
+    VLLM_SM70_QSA_GROUPED_PAGE4: str | None = None
+    VLLM_SM70_QSA_INDEXER_CUBLAS: str | None = None
+    VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS: str | None = None
+    VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
+    VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB: str | None = None
+    VLLM_SM70_QSA_MTP_TOPK: str | None = None
+    VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
+    VLLM_SM70_QSA_XQA_PAGE4: str | None = None
+    VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
+    VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG: str | None = None
+    VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD: str | None = None
+    VLLM_SM70_SPEC_TARGET_FORWARD_NVTX: str | None = None
+    VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP: str | None = None
+    VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR: str | None = None
+    VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH: str | None = None
+    VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE: str | None = None
+    VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL: str | None = None
+    VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE: str | None = None
+    VLLM_SPEC_DUMP_ALIGNMENT_DIR: str | None = None
+    VLLM_SPEC_DUMP_ALIGNMENT_TAG: str | None = None
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -64,7 +203,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
-    VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
+    VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = True
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
@@ -699,7 +838,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG: bool = False
-    VLLM_DP_MASTER_IP: str = ""
+    VLLM_DP_MASTER_IP: str = "127.0.0.1"
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
@@ -738,7 +877,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
-    VLLM_XGRAMMAR_CACHE_MB: int = 0
+    VLLM_XGRAMMAR_CACHE_MB: int = 512
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
     VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: bool = False
@@ -1168,22 +1307,64 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
-    "VLLM_TARGET_DEVICE": lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
+    "VLLM_TARGET_DEVICE": env_var(
+        lambda: os.getenv("VLLM_TARGET_DEVICE", "cuda").lower(),
+        description=(
+            "================== Installation Time Env Vars ================== "
+            "Target device of vLLM, supporting [cuda (by default), rocm, cpu]"
+        ),
+        category="configuration",
+        declared_default="'cuda'",
+        effective_default="'cuda'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Main CUDA version of vLLM. This follows PyTorch but can be overridden.
-    "VLLM_MAIN_CUDA_VERSION": lambda: (
-        os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0"
+    "VLLM_MAIN_CUDA_VERSION": env_var(
+        lambda: os.getenv("VLLM_MAIN_CUDA_VERSION", "").lower() or "13.0",
+        description=(
+            "Main CUDA version of vLLM. This follows PyTorch but can be overridden."
+        ),
+        category="configuration",
+        declared_default="'13.0'",
+        effective_default="'13.0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Controls PyTorch float32 matmul precision mode within vLLM workers.
     # Valid options mirror torch.set_float32_matmul_precision
-    "VLLM_FLOAT32_MATMUL_PRECISION": env_with_choices(
-        "VLLM_FLOAT32_MATMUL_PRECISION",
-        "highest",
-        ["highest", "high", "medium"],
-        case_sensitive=False,
+    "VLLM_FLOAT32_MATMUL_PRECISION": env_var(
+        env_with_choices(
+            "VLLM_FLOAT32_MATMUL_PRECISION",
+            "highest",
+            ["highest", "high", "medium"],
+            case_sensitive=False,
+        ),
+        description=(
+            "Controls PyTorch float32 matmul precision mode within vLLM "
+            "workers. Valid options mirror torch.set_float32_matmul_precision"
+        ),
+        category="configuration",
+        declared_default="'highest'",
+        effective_default="'highest'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
-    "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    "VLLM_BATCH_INVARIANT": env_var(
+        lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+        description=(
+            "Enable batch-invariant mode: deterministic results regardless of "
+            "batch composition. Requires NVIDIA GPU with compute capability >="
+            " 9.0."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton
@@ -1191,117 +1372,407 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unset (default) lets the `triton_attn` backend auto-select per
     # platform (currently auto-enabled on XPU only); ``1`` forces TD on;
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
-    "VLLM_TRITON_ATTN_USE_TD": lambda: {"1": True, "0": False}.get(
-        os.getenv("VLLM_TRITON_ATTN_USE_TD", "").strip()
+    "VLLM_TRITON_ATTN_USE_TD": env_var(
+        lambda: {"1": True, "0": False}.get(
+            os.getenv("VLLM_TRITON_ATTN_USE_TD", "").strip()
+        ),
+        description=(
+            "Use tensor descriptors for Q/K/V loads and output stores in the "
+            "Triton unified-attention kernel.  Enables HW 2D block reads on "
+            "Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at "
+            "Triton compile time so other platforms see no overhead.  "
+            "Tri-state override: unset (default) lets the `triton_attn` "
+            "backend auto-select per platform (currently auto-enabled on XPU "
+            "only); ``1`` forces TD on; ``0`` forces TD off.  Useful for A/B "
+            "benchmarking the TD path."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
-    "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
+    "MAX_JOBS": env_var(
+        lambda: os.getenv("MAX_JOBS", None),
+        description=(
+            "Maximum number of compilation jobs to run in parallel. By default"
+            " this is the number of CPUs"
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Number of threads to use for nvcc
     # By default this is 1.
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
-    "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
+    "NVCC_THREADS": env_var(
+        lambda: os.getenv("NVCC_THREADS", None),
+        description=(
+            "Number of threads to use for nvcc By default this is 1. If set, "
+            "`MAX_JOBS` will be reduced to avoid oversubscribing the CPU."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, vllm will use precompiled native binaries (*.so and vllm-rs).
-    "VLLM_USE_PRECOMPILED": lambda: (
-        os.environ.get("VLLM_USE_PRECOMPILED", "").strip().lower() in ("1", "true")
-        or bool(os.environ.get("VLLM_PRECOMPILED_WHEEL_LOCATION"))
+    "VLLM_USE_PRECOMPILED": env_var(
+        lambda: (
+            os.environ.get("VLLM_USE_PRECOMPILED", "").strip().lower() in ("1", "true")
+            or bool(os.environ.get("VLLM_PRECOMPILED_WHEEL_LOCATION"))
+        ),
+        description=(
+            "If set, vllm will use precompiled native binaries (*.so and vllm-rs)."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "Computed when unset: ''.strip().lower() in ('1', 'true') or bool(None)"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, vllm will use the precompiled Rust frontend binary (vllm-rs).
-    "VLLM_USE_PRECOMPILED_RUST": lambda: (
-        os.environ.get("VLLM_USE_PRECOMPILED_RUST", "").strip().lower() in ("1", "true")
+    "VLLM_USE_PRECOMPILED_RUST": env_var(
+        lambda: (
+            os.environ.get("VLLM_USE_PRECOMPILED_RUST", "").strip().lower()
+            in ("1", "true")
+        ),
+        description=(
+            "If set, vllm will use the precompiled Rust frontend binary (vllm-rs)."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, skip adding +precompiled suffix to version string
-    "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX": lambda: bool(
-        int(os.environ.get("VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX", "0"))
+    "VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX": env_var(
+        lambda: bool(int(os.environ.get("VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX", "0"))),
+        description="If set, skip adding +precompiled suffix to version string",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Used to mark that setup.py is running in a Docker build context,
     # in order to force the use of precompiled binaries.
-    "VLLM_DOCKER_BUILD_CONTEXT": lambda: (
-        os.environ.get("VLLM_DOCKER_BUILD_CONTEXT", "").strip().lower() in ("1", "true")
+    "VLLM_DOCKER_BUILD_CONTEXT": env_var(
+        lambda: (
+            os.environ.get("VLLM_DOCKER_BUILD_CONTEXT", "").strip().lower()
+            in ("1", "true")
+        ),
+        description=(
+            "Used to mark that setup.py is running in a Docker build context, "
+            "in order to force the use of precompiled binaries."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"
-    "CMAKE_BUILD_TYPE": env_with_choices(
-        "CMAKE_BUILD_TYPE", None, ["Debug", "Release", "RelWithDebInfo"]
+    "CMAKE_BUILD_TYPE": env_var(
+        env_with_choices(
+            "CMAKE_BUILD_TYPE", None, ["Debug", "Release", "RelWithDebInfo"]
+        ),
+        description=(
+            'CMake build type If not set, defaults to "Debug" or '
+            '"RelWithDebInfo" Available options: "Debug", "Release", '
+            '"RelWithDebInfo"'
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, vllm will print verbose logs during installation
-    "VERBOSE": lambda: bool(int(os.getenv("VERBOSE", "0"))),
+    "VERBOSE": env_var(
+        lambda: bool(int(os.getenv("VERBOSE", "0"))),
+        description="If set, vllm will print verbose logs during installation",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Root directory for vLLM configuration files
     # Defaults to `~/.config/vllm` unless `XDG_CONFIG_HOME` is set
     # Note that this not only affects how vllm finds its configuration files
     # during runtime, but also affects how vllm installs its configuration
     # files during **installation**.
-    "VLLM_CONFIG_ROOT": lambda: os.path.expanduser(
-        os.getenv(
-            "VLLM_CONFIG_ROOT",
-            os.path.join(get_default_config_root(), "vllm"),
-        )
+    "VLLM_CONFIG_ROOT": env_var(
+        lambda: os.path.expanduser(
+            os.getenv(
+                "VLLM_CONFIG_ROOT",
+                os.path.join(get_default_config_root(), "vllm"),
+            )
+        ),
+        description=(
+            "Root directory for vLLM configuration files Defaults to "
+            "`~/.config/vllm` unless `XDG_CONFIG_HOME` is set Note that this "
+            "not only affects how vllm finds its configuration files during "
+            "runtime, but also affects how vllm installs its configuration "
+            "files during **installation**."
+        ),
+        category="configuration",
+        declared_default="os.path.expanduser('~/.config/vllm')",
+        effective_default=(
+            "Computed when unset: "
+            "os.path.expanduser(os.path.join(get_default_config_root(), "
+            "'vllm'))"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # ================== Runtime Env Vars ==================
     # Root directory for vLLM cache files
     # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
-    "VLLM_CACHE_ROOT": lambda: os.path.expanduser(
-        os.getenv(
-            "VLLM_CACHE_ROOT",
-            os.path.join(get_default_cache_root(), "vllm"),
-        )
+    "VLLM_CACHE_ROOT": env_var(
+        lambda: os.path.expanduser(
+            os.getenv(
+                "VLLM_CACHE_ROOT",
+                os.path.join(get_default_cache_root(), "vllm"),
+            )
+        ),
+        description=(
+            "================== Runtime Env Vars ================== Root "
+            "directory for vLLM cache files Defaults to `~/.cache/vllm` unless"
+            " `XDG_CACHE_HOME` is set"
+        ),
+        category="configuration",
+        declared_default="os.path.expanduser('~/.cache/vllm')",
+        effective_default=(
+            "Computed when unset: "
+            "os.path.expanduser(os.path.join(get_default_cache_root(), "
+            "'vllm'))"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # used in distributed environment to determine the ip address
     # of the current node, when the node has multiple network interfaces.
     # If you are using multi-node inference, you should set this differently
     # on each node.
-    "VLLM_HOST_IP": lambda: os.getenv("VLLM_HOST_IP", ""),
+    "VLLM_HOST_IP": env_var(
+        lambda: os.getenv("VLLM_HOST_IP", ""),
+        description=(
+            "used in distributed environment to determine the ip address of "
+            "the current node, when the node has multiple network interfaces. "
+            "If you are using multi-node inference, you should set this "
+            "differently on each node."
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # used in distributed environment to manually set the communication port
     # Note: if VLLM_PORT is set, and some code asks for multiple ports, the
     # VLLM_PORT will be used as the first port, and the rest will be generated
     # by incrementing the VLLM_PORT value.
-    "VLLM_PORT": get_vllm_port,
+    "VLLM_PORT": env_var(
+        get_vllm_port,
+        description=(
+            "used in distributed environment to manually set the communication"
+            " port Note: if VLLM_PORT is set, and some code asks for multiple "
+            "ports, the VLLM_PORT will be used as the first port, and the rest"
+            " will be generated by incrementing the VLLM_PORT value."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="Computed by get_vllm_port",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # path used for ipc when the frontend api server is running in
     # multi-processing mode to communicate with the backend engine process.
-    "VLLM_RPC_BASE_PATH": lambda: os.getenv(
-        "VLLM_RPC_BASE_PATH", tempfile.gettempdir()
+    "VLLM_RPC_BASE_PATH": env_var(
+        lambda: os.getenv("VLLM_RPC_BASE_PATH", tempfile.gettempdir()),
+        description=(
+            "path used for ipc when the frontend api server is running in "
+            "multi-processing mode to communicate with the backend engine "
+            "process."
+        ),
+        category="configuration",
+        declared_default="tempfile.gettempdir()",
+        effective_default="Computed when unset: tempfile.gettempdir()",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If true, will load models from ModelScope instead of Hugging Face Hub.
     # note that the value is true or false, not numbers
-    "VLLM_USE_MODELSCOPE": lambda: (
-        os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true"
+    "VLLM_USE_MODELSCOPE": env_var(
+        lambda: os.environ.get("VLLM_USE_MODELSCOPE", "False").lower() == "true",
+        description=(
+            "If true, will load models from ModelScope instead of Hugging Face"
+            " Hub. note that the value is true or false, not numbers"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If true, replace the Rust BPE backend that powers HF fast tokenizers
     # with the `fastokens` (https://github.com/crusoecloud/fastokens) shim.
     # Applies to any tokenizer mode that loads an HF fast tokenizer
     # (`hf`, `deepseek_v32`, `deepseek_v4`, `qwen_vl`, …). The `fastokens`
     # Python package must be installed.
-    "VLLM_USE_FASTOKENS": lambda: bool(int(os.getenv("VLLM_USE_FASTOKENS", "0"))),
+    "VLLM_USE_FASTOKENS": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_FASTOKENS", "0"))),
+        description=(
+            "If true, replace the Rust BPE backend that powers HF fast "
+            "tokenizers with the `fastokens` "
+            "(https://github.com/crusoecloud/fastokens) shim. Applies to any "
+            "tokenizer mode that loads an HF fast tokenizer (`hf`, "
+            "`deepseek_v32`, `deepseek_v4`, `qwen_vl`, …). The `fastokens` "
+            "Python package must be installed."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Interval in seconds to log a warning message when the ring buffer is full
-    "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
-        os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
+    "VLLM_RINGBUFFER_WARNING_INTERVAL": env_var(
+        lambda: int(os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")),
+        description=(
+            "Interval in seconds to log a warning message when the ring buffer is full"
+        ),
+        category="configuration",
+        declared_default="60",
+        effective_default="60",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Shared-memory message queue chunk counts. Defaults preserve upstream
     # behavior; increasing these can absorb compile/warmup bursts where worker
     # readers do not consume scheduler broadcasts for a long time.
-    "VLLM_MQ_MAX_CHUNKS": lambda: int(os.getenv("VLLM_MQ_MAX_CHUNKS", "10")),
-    "VLLM_MQ_BROADCASTER_MAX_CHUNKS": lambda: int(
-        os.getenv("VLLM_MQ_BROADCASTER_MAX_CHUNKS", "6")
+    "VLLM_MQ_MAX_CHUNKS": env_var(
+        lambda: int(os.getenv("VLLM_MQ_MAX_CHUNKS", "10")),
+        description=(
+            "Shared-memory message queue chunk counts. Defaults preserve "
+            "upstream behavior; increasing these can absorb compile/warmup "
+            "bursts where worker readers do not consume scheduler broadcasts "
+            "for a long time."
+        ),
+        category="tuning",
+        declared_default="10",
+        effective_default="10",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_MQ_BROADCASTER_MAX_CHUNKS": env_var(
+        lambda: int(os.getenv("VLLM_MQ_BROADCASTER_MAX_CHUNKS", "6")),
+        description=(
+            "vLLM: mq broadcaster max chunks. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="6",
+        effective_default=(
+            "6; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '64' when "
+                "sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user "
+                "and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FLASH_ATTN_V100 and "
+                "'VLLM_MQ_BROADCASTER_MAX_CHUNKS' not in os.environ; automatic "
+                "defaults apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
-    "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
+    "CUDA_HOME": env_var(
+        lambda: os.environ.get("CUDA_HOME", None),
+        description=(
+            "path to cudatoolkit home directory, under which should be bin, "
+            "include, and lib directories."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
-    "VLLM_NCCL_SO_PATH": lambda: os.environ.get("VLLM_NCCL_SO_PATH", None),
+    "VLLM_NCCL_SO_PATH": env_var(
+        lambda: os.environ.get("VLLM_NCCL_SO_PATH", None),
+        description=(
+            "Path to the NCCL library file. It is needed because nccl>=2.19 "
+            "brought by PyTorch contains a bug: "
+            "https://github.com/NVIDIA/nccl/issues/1234"
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+    ),
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
-    "LD_LIBRARY_PATH": lambda: os.environ.get("LD_LIBRARY_PATH", None),
+    "LD_LIBRARY_PATH": env_var(
+        lambda: os.environ.get("LD_LIBRARY_PATH", None),
+        description=(
+            "when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the "
+            "nccl library file in the locations specified by `LD_LIBRARY_PATH`"
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # flag to control the chunk size (in MB) for sleeping memory allocations under ROCm
-    "VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE": lambda: int(
-        os.environ.get("VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE", "256")
+    "VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE": env_var(
+        lambda: int(os.environ.get("VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE", "256")),
+        description=(
+            "flag to control the chunk size (in MB) for sleeping memory "
+            "allocations under ROCm"
+        ),
+        category="tuning",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Feature flag to enable/disable Inductor standalone compile.
     # In torch <= 2.7 we ignore this flag; in torch >= 2.9 this is
     # enabled by default.
-    "VLLM_USE_STANDALONE_COMPILE": lambda: (
-        os.environ.get("VLLM_USE_STANDALONE_COMPILE", "1") == "1"
+    "VLLM_USE_STANDALONE_COMPILE": env_var(
+        lambda: os.environ.get("VLLM_USE_STANDALONE_COMPILE", "1") == "1",
+        description=(
+            "Feature flag to enable/disable Inductor standalone compile. In "
+            "torch <= 2.7 we ignore this flag; in torch >= 2.9 this is enabled"
+            " by default."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Inductor's pre-grad passes don't do anything for vLLM.
     # The pre-grad passes get run even on cache-hit and negatively impact
@@ -1309,151 +1780,586 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Can remove this after the following issue gets fixed
     # TODO(luka): maybe_inplace requires this
     # https://github.com/pytorch/pytorch/issues/174502
-    "VLLM_ENABLE_PREGRAD_PASSES": lambda: (
-        os.environ.get("VLLM_ENABLE_PREGRAD_PASSES", "1") == "1"
+    "VLLM_ENABLE_PREGRAD_PASSES": env_var(
+        lambda: os.environ.get("VLLM_ENABLE_PREGRAD_PASSES", "1") == "1",
+        description=(
+            "Inductor's pre-grad passes don't do anything for vLLM. The "
+            "pre-grad passes get run even on cache-hit and negatively impact "
+            "vllm cold compile times by O(1s) Can remove this after the "
+            "following issue gets fixed TODO(luka): maybe_inplace requires "
+            "this https://github.com/pytorch/pytorch/issues/174502"
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Experimental: breakable cudagraph does not rely on torch.compile
-    "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
-        os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    "VLLM_USE_BREAKABLE_CUDAGRAPH": env_var(
+        lambda: os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1",
+        description="Experimental: breakable cudagraph does not rely on torch.compile",
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when self.model_config"
+                " is not None and 'VLLM_USE_BREAKABLE_CUDAGRAPH' not in os.environ"
+                " and any((a in ('DeepseekV4ForCausalLM', 'DeepSeekV4MTPModel') "
+                "for a in self.model_config.architectures)); automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "envs.VLLM_SM70_USE_BREAKABLE_CUDAGRAPH and "
+                "current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "'VLLM_USE_BREAKABLE_CUDAGRAPH' not in os.environ; automatic "
+                "defaults apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Debug CUDA graph replay input tensor address stability without enabling
     # global DEBUG logging.
-    "VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG": lambda: (
-        os.environ.get("VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG", "0") == "1"
+    "VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG": env_var(
+        lambda: os.environ.get("VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG", "0") == "1",
+        description=(
+            "Debug CUDA graph replay input tensor address stability without "
+            "enabling global DEBUG logging."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
-    "VLLM_PATTERN_MATCH_DEBUG": lambda: os.environ.get(
-        "VLLM_PATTERN_MATCH_DEBUG", None
+    "VLLM_PATTERN_MATCH_DEBUG": env_var(
+        lambda: os.environ.get("VLLM_PATTERN_MATCH_DEBUG", None),
+        description=(
+            "Debug pattern matching inside custom passes. Should be set to the"
+            " fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3')."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Dump fx graphs to the given directory.
     # It will override CompilationConfig.debug_dump_path if set.
-    "VLLM_DEBUG_DUMP_PATH": lambda: os.environ.get("VLLM_DEBUG_DUMP_PATH", None),
+    "VLLM_DEBUG_DUMP_PATH": env_var(
+        lambda: os.environ.get("VLLM_DEBUG_DUMP_PATH", None),
+        description=(
+            "Dump fx graphs to the given directory. It will override "
+            "CompilationConfig.debug_dump_path if set."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Feature flag to enable/disable AOT compilation. This will ensure
     # compilation is done in warmup phase and the compilation will be
     # reused in subsequent calls.
-    "VLLM_USE_AOT_COMPILE": use_aot_compile,
+    "VLLM_USE_AOT_COMPILE": env_var(
+        use_aot_compile,
+        description=(
+            "Feature flag to enable/disable AOT compilation. This will ensure "
+            "compilation is done in warmup phase and the compilation will be "
+            "reused in subsequent calls."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "Computed by use_aot_compile; configuration may replace the unset "
+            "default under the automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '0' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user "
+                "and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FLASH_ATTN_V100 and 'VLLM_USE_AOT_COMPILE' not in "
+                "os.environ; automatic defaults apply only when the environment "
+                "override is absent."
+            ),
+        ),
+        acceleration_paths=(),
+    ),
     # Feature flag to enable/disable bytecode in
     # TorchCompileWithNoGuardsWrapper.
-    "VLLM_USE_BYTECODE_HOOK": lambda: bool(
-        int(os.environ.get("VLLM_USE_BYTECODE_HOOK", "1"))
+    "VLLM_USE_BYTECODE_HOOK": env_var(
+        lambda: bool(int(os.environ.get("VLLM_USE_BYTECODE_HOOK", "1"))),
+        description=(
+            "Feature flag to enable/disable bytecode in "
+            "TorchCompileWithNoGuardsWrapper."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Force vllm to always load AOT compiled models from disk. Failure
     # to load will result in a hard error when this is enabled.
     # Will be ignored when VLLM_USE_AOT_COMPILE is disabled.
-    "VLLM_FORCE_AOT_LOAD": lambda: os.environ.get("VLLM_FORCE_AOT_LOAD", "0") == "1",
+    "VLLM_FORCE_AOT_LOAD": env_var(
+        lambda: os.environ.get("VLLM_FORCE_AOT_LOAD", "0") == "1",
+        description=(
+            "Force vllm to always load AOT compiled models from disk. Failure "
+            "to load will result in a hard error when this is enabled. Will be"
+            " ignored when VLLM_USE_AOT_COMPILE is disabled."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Enable loading compiled models directly from cached standalone compile artifacts
     # without re-splitting graph modules. This reduces overhead during model
     # loading by using reconstruct_serializable_fn_from_mega_artifact.
-    "VLLM_USE_MEGA_AOT_ARTIFACT": use_mega_aot_artifact,
+    "VLLM_USE_MEGA_AOT_ARTIFACT": env_var(
+        use_mega_aot_artifact,
+        description=(
+            "Enable loading compiled models directly from cached standalone "
+            "compile artifacts without re-splitting graph modules. This "
+            "reduces overhead during model loading by using "
+            "reconstruct_serializable_fn_from_mega_artifact."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="Computed by use_mega_aot_artifact",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
-    "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    "LOCAL_RANK": env_var(
+        lambda: int(os.environ.get("LOCAL_RANK", "0")),
+        description=(
+            "local rank of the process in the distributed setting, used to "
+            "determine the GPU device id"
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # used to control the visible devices in the distributed setting
-    "CUDA_VISIBLE_DEVICES": lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),
+    "CUDA_VISIBLE_DEVICES": env_var(
+        lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),
+        description="used to control the visible devices in the distributed setting",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # timeout for each iteration in the engine
-    "VLLM_ENGINE_ITERATION_TIMEOUT_S": lambda: int(
-        os.environ.get("VLLM_ENGINE_ITERATION_TIMEOUT_S", "60")
+    "VLLM_ENGINE_ITERATION_TIMEOUT_S": env_var(
+        lambda: int(os.environ.get("VLLM_ENGINE_ITERATION_TIMEOUT_S", "60")),
+        description="timeout for each iteration in the engine",
+        category="configuration",
+        declared_default="60",
+        effective_default="60",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Timeout in seconds for waiting for engine cores to become ready
     # during startup. Default is 600 seconds (10 minutes).
-    "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
-        os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S", "600")
+    "VLLM_ENGINE_READY_TIMEOUT_S": env_var(
+        lambda: int(os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S", "600")),
+        description=(
+            "Timeout in seconds for waiting for engine cores to become ready "
+            "during startup. Default is 600 seconds (10 minutes)."
+        ),
+        category="configuration",
+        declared_default="600",
+        effective_default="600",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # API key for vLLM API server
-    "VLLM_API_KEY": lambda: os.environ.get("VLLM_API_KEY", None),
+    "VLLM_API_KEY": env_var(
+        lambda: os.environ.get("VLLM_API_KEY", None),
+        description="API key for vLLM API server",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Whether to log responses from API Server for debugging
-    "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
-        os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
+    "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": env_var(
+        lambda: (
+            os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower()
+            == "true"
+        ),
+        description="Whether to log responses from API Server for debugging",
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # S3 access information, used for tensorizer to load model from S3
-    "S3_ACCESS_KEY_ID": lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
-    "S3_SECRET_ACCESS_KEY": lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
-    "S3_ENDPOINT_URL": lambda: os.environ.get("S3_ENDPOINT_URL", None),
+    "S3_ACCESS_KEY_ID": env_var(
+        lambda: os.environ.get("S3_ACCESS_KEY_ID", None),
+        description="S3 access information, used for tensorizer to load model from S3",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "S3_SECRET_ACCESS_KEY": env_var(
+        lambda: os.environ.get("S3_SECRET_ACCESS_KEY", None),
+        description=(
+            "Secret key for the S3 model storage connection; values are never "
+            "included in this reference."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "S3_ENDPOINT_URL": env_var(
+        lambda: os.environ.get("S3_ENDPOINT_URL", None),
+        description="Override the endpoint URL for the S3 model storage connection.",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Usage stats collection
-    "VLLM_USAGE_STATS_SERVER": lambda: os.environ.get(
-        "VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"
+    "VLLM_USAGE_STATS_SERVER": env_var(
+        lambda: os.environ.get("VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"),
+        description="Usage stats collection",
+        category="configuration",
+        declared_default="'https://stats.vllm.ai'",
+        effective_default="'https://stats.vllm.ai'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_NO_USAGE_STATS": lambda: os.environ.get("VLLM_NO_USAGE_STATS", "0") == "1",
-    "VLLM_DO_NOT_TRACK": lambda: (
-        (
-            os.environ.get("VLLM_DO_NOT_TRACK", None)
-            or os.environ.get("DO_NOT_TRACK", None)
-            or "0"
-        )
-        == "1"
+    "VLLM_NO_USAGE_STATS": env_var(
+        lambda: os.environ.get("VLLM_NO_USAGE_STATS", "0") == "1",
+        description=(
+            "vLLM: no usage stats. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_USAGE_SOURCE": lambda: os.environ.get("VLLM_USAGE_SOURCE", "production"),
+    "VLLM_DO_NOT_TRACK": env_var(
+        lambda: (
+            (
+                os.environ.get("VLLM_DO_NOT_TRACK", None)
+                or os.environ.get("DO_NOT_TRACK", None)
+                or "0"
+            )
+            == "1"
+        ),
+        description=(
+            "vLLM: do not track. The consumer locations and unset defaults are"
+            " listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_USAGE_SOURCE": env_var(
+        lambda: os.environ.get("VLLM_USAGE_SOURCE", "production"),
+        description=(
+            "vLLM: usage source. The consumer locations and unset defaults are"
+            " listed below."
+        ),
+        category="configuration",
+        declared_default="'production'",
+        effective_default="'production'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Logging configuration
     # If set to 0, vllm will not configure logging
     # If set to 1, vllm will configure logging using the default configuration
     #    or the configuration file specified by VLLM_LOGGING_CONFIG_PATH
-    "VLLM_CONFIGURE_LOGGING": lambda: bool(
-        int(os.getenv("VLLM_CONFIGURE_LOGGING", "1"))
+    "VLLM_CONFIGURE_LOGGING": env_var(
+        lambda: bool(int(os.getenv("VLLM_CONFIGURE_LOGGING", "1"))),
+        description=(
+            "Logging configuration If set to 0, vllm will not configure "
+            "logging If set to 1, vllm will configure logging using the "
+            "default configuration or the configuration file specified by "
+            "VLLM_LOGGING_CONFIG_PATH"
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_LOGGING_CONFIG_PATH": lambda: os.getenv("VLLM_LOGGING_CONFIG_PATH"),
+    "VLLM_LOGGING_CONFIG_PATH": env_var(
+        lambda: os.getenv("VLLM_LOGGING_CONFIG_PATH"),
+        description=(
+            "vLLM: logging config path. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # this is used for configuring the default logging level
-    "VLLM_LOGGING_LEVEL": lambda: os.getenv("VLLM_LOGGING_LEVEL", "INFO").upper(),
+    "VLLM_LOGGING_LEVEL": env_var(
+        lambda: os.getenv("VLLM_LOGGING_LEVEL", "INFO").upper(),
+        description="this is used for configuring the default logging level",
+        category="configuration",
+        declared_default="'INFO'",
+        effective_default="'INFO'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # this is used for configuring the default logging stream
-    "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
+    "VLLM_LOGGING_STREAM": env_var(
+        lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
+        description="this is used for configuring the default logging stream",
+        category="configuration",
+        declared_default="'ext://sys.stdout'",
+        effective_default="'ext://sys.stdout'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
-    "VLLM_LOGGING_PREFIX": lambda: os.getenv("VLLM_LOGGING_PREFIX", ""),
+    "VLLM_LOGGING_PREFIX": env_var(
+        lambda: os.getenv("VLLM_LOGGING_PREFIX", ""),
+        description="if set, VLLM_LOGGING_PREFIX will be prepended to all log messages",
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Controls colored logging output. Options: "auto" (default, colors when terminal),
     # "1" (always use colors), "0" (never use colors)
-    "VLLM_LOGGING_COLOR": lambda: os.getenv("VLLM_LOGGING_COLOR", "auto"),
+    "VLLM_LOGGING_COLOR": env_var(
+        lambda: os.getenv("VLLM_LOGGING_COLOR", "auto"),
+        description=(
+            'Controls colored logging output. Options: "auto" (default, colors'
+            ' when terminal), "1" (always use colors), "0" (never use colors)'
+        ),
+        category="configuration",
+        declared_default="'auto'",
+        effective_default="'auto'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Standard unix flag for disabling ANSI color codes
-    "NO_COLOR": lambda: os.getenv("NO_COLOR", "0") != "0",
+    "NO_COLOR": env_var(
+        lambda: os.getenv("NO_COLOR", "0") != "0",
+        description="Standard unix flag for disabling ANSI color codes",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, vllm will log stats at this interval in seconds
     # If not set, vllm will log stats every 10 seconds.
-    "VLLM_LOG_STATS_INTERVAL": lambda: (
-        val
-        if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
-        else 10.0
+    "VLLM_LOG_STATS_INTERVAL": env_var(
+        lambda: (
+            val
+            if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
+            else 10.0
+        ),
+        description=(
+            "If set, vllm will log stats at this interval in seconds If not "
+            "set, vllm will log stats every 10 seconds."
+        ),
+        category="configuration",
+        declared_default="10.0",
+        effective_default="10.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
-    "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+    "VLLM_TRACE_FUNCTION": env_var(
+        lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+        description=(
+            "Trace function calls If set to 1, vllm will trace function calls "
+            "Useful for debugging"
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Whether to use the FlashInfer top-k / top-p sampler on CUDA. Enabled
     # by default when the hardware supports it — set to 0 to opt out
     # explicitly, which forces the PyTorch-native (Triton for bs>=8) path.
-    "VLLM_USE_FLASHINFER_SAMPLER": lambda: (
-        bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
-        if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
-        else True
+    "VLLM_USE_FLASHINFER_SAMPLER": env_var(
+        lambda: (
+            bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
+            if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
+            else True
+        ),
+        description=(
+            "Whether to use the FlashInfer top-k / top-p sampler on CUDA. "
+            "Enabled by default when the hardware supports it — set to 0 to "
+            "opt out explicitly, which forces the PyTorch-native (Triton for "
+            "bs>=8) path."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "Computed when unset: "
+            "bool(int(os.environ['VLLM_USE_FLASHINFER_SAMPLER'])) if "
+            "'VLLM_USE_FLASHINFER_SAMPLER' in os.environ else True"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Pipeline stage partition strategy
-    "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    "VLLM_PP_LAYER_PARTITION": env_var(
+        lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+        description="Pipeline stage partition strategy",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
-    "VLLM_CPU_KVCACHE_SPACE": lambda: (
-        int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0"))
-        if "VLLM_CPU_KVCACHE_SPACE" in os.environ
-        else None
+    "VLLM_CPU_KVCACHE_SPACE": env_var(
+        lambda: (
+            int(os.getenv("VLLM_CPU_KVCACHE_SPACE", "0"))
+            if "VLLM_CPU_KVCACHE_SPACE" in os.environ
+            else None
+        ),
+        description=(
+            "(CPU backend only) CPU key-value cache space. default is None and"
+            " will be set as 4 GB"
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default=(
+            "Computed when unset: int('0') if 'VLLM_CPU_KVCACHE_SPACE' in "
+            "os.environ else None"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.
-    "VLLM_CPU_OMP_THREADS_BIND": lambda: os.getenv("VLLM_CPU_OMP_THREADS_BIND", "auto"),
+    "VLLM_CPU_OMP_THREADS_BIND": env_var(
+        lambda: os.getenv("VLLM_CPU_OMP_THREADS_BIND", "auto"),
+        description=(
+            "(CPU backend only) CPU core ids bound by OpenMP threads, e.g., "
+            '"0-31", "0,1,2", "0-31,33". CPU cores of different ranks are '
+            "separated by '|'."
+        ),
+        category="tuning",
+        declared_default="'auto'",
+        effective_default="'auto'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # (CPU backend only) CPU cores not used by OMP threads .
     # Those CPU cores will not be used by OMP threads of a rank.
-    "VLLM_CPU_NUM_OF_RESERVED_CPU": lambda: (
-        int(os.getenv("VLLM_CPU_NUM_OF_RESERVED_CPU", "0"))
-        if "VLLM_CPU_NUM_OF_RESERVED_CPU" in os.environ
-        else None
+    "VLLM_CPU_NUM_OF_RESERVED_CPU": env_var(
+        lambda: (
+            int(os.getenv("VLLM_CPU_NUM_OF_RESERVED_CPU", "0"))
+            if "VLLM_CPU_NUM_OF_RESERVED_CPU" in os.environ
+            else None
+        ),
+        description=(
+            "(CPU backend only) CPU cores not used by OMP threads . Those CPU "
+            "cores will not be used by OMP threads of a rank."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "Computed when unset: int('0') if 'VLLM_CPU_NUM_OF_RESERVED_CPU' "
+            "in os.environ else None"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # (CPU backend only) whether to use SGL kernels, optimized for small batch.
-    "VLLM_CPU_SGL_KERNEL": lambda: bool(int(os.getenv("VLLM_CPU_SGL_KERNEL", "0"))),
+    "VLLM_CPU_SGL_KERNEL": env_var(
+        lambda: bool(int(os.getenv("VLLM_CPU_SGL_KERNEL", "0"))),
+        description=(
+            "(CPU backend only) whether to use SGL kernels, optimized for small batch."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # (CPU backend only) whether to enable attention spilt KV.
-    "VLLM_CPU_ATTN_SPLIT_KV": lambda: bool(
-        int(os.getenv("VLLM_CPU_ATTN_SPLIT_KV", "1"))
+    "VLLM_CPU_ATTN_SPLIT_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_CPU_ATTN_SPLIT_KV", "1"))),
+        description="(CPU backend only) whether to enable attention spilt KV.",
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # (Zen CPU backend) eagerly prepack weights into ZenDNN blocked layout
     # at model load time. Eliminates per-inference layout conversion overhead.
-    "VLLM_ZENTORCH_WEIGHT_PREPACK": lambda: bool(
-        int(os.getenv("VLLM_ZENTORCH_WEIGHT_PREPACK", "1"))
+    "VLLM_ZENTORCH_WEIGHT_PREPACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_ZENTORCH_WEIGHT_PREPACK", "1"))),
+        description=(
+            "(Zen CPU backend) eagerly prepack weights into ZenDNN blocked "
+            "layout at model load time. Eliminates per-inference layout "
+            "conversion overhead."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ.
-    "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+    "VLLM_CPU_INT4_W4A8": env_var(
+        lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+        description=(
+            "(CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
     # different pipeline-parallel stages.
@@ -1461,89 +2367,258 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "auto": use the default channel type
     # - "nccl": use NCCL for communication
     # - "shm": use shared memory and gRPC for communication
-    "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE": env_with_choices(
-        "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "auto", ["auto", "nccl", "shm"]
+    "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE": env_var(
+        env_with_choices(
+            "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "auto", ["auto", "nccl", "shm"]
+        ),
+        description=(
+            "If the env var is set, Ray Compiled Graph uses the specified "
+            "channel type to communicate between workers belonging to "
+            'different pipeline-parallel stages. Available options: - "auto": '
+            'use the default channel type - "nccl": use NCCL for communication'
+            ' - "shm": use shared memory and gRPC for communication'
+        ),
+        category="configuration",
+        declared_default="'auto'",
+        effective_default="'auto'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If the env var is set, it enables GPU communication overlap
     # (experimental feature) in Ray's Compiled Graph.
-    "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM": lambda: bool(
-        int(os.getenv("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM", "0"))
+    "VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM", "0"))),
+        description=(
+            "If the env var is set, it enables GPU communication overlap "
+            "(experimental feature) in Ray's Compiled Graph."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If the env var is set, it uses a Ray Communicator wrapping
     # vLLM's pipeline parallelism communicator to interact with Ray's
     # Compiled Graph. Otherwise, it uses Ray's NCCL communicator.
-    "VLLM_USE_RAY_WRAPPED_PP_COMM": lambda: bool(
-        int(os.getenv("VLLM_USE_RAY_WRAPPED_PP_COMM", "1"))
+    "VLLM_USE_RAY_WRAPPED_PP_COMM": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_RAY_WRAPPED_PP_COMM", "1"))),
+        description=(
+            "If the env var is set, it uses a Ray Communicator wrapping vLLM's"
+            " pipeline parallelism communicator to interact with Ray's "
+            "Compiled Graph. Otherwise, it uses Ray's NCCL communicator."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # When True and distributed_executor_backend="ray", use RayExecutorV2
     # (MQ-based) instead of RayDistributedExecutor (compiled-graph backend).
-    "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": lambda: bool(
-        int(os.getenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1"))
+    "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1"))),
+        description=(
+            'When True and distributed_executor_backend="ray", use '
+            "RayExecutorV2 (MQ-based) instead of RayDistributedExecutor "
+            "(compiled-graph backend)."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
-    "VLLM_WORKER_MULTIPROC_METHOD": env_with_choices(
-        "VLLM_WORKER_MULTIPROC_METHOD", "fork", ["spawn", "fork"]
+    "VLLM_WORKER_MULTIPROC_METHOD": env_var(
+        env_with_choices("VLLM_WORKER_MULTIPROC_METHOD", "fork", ["spawn", "fork"]),
+        description=(
+            "Use dedicated multiprocess context for workers. Both spawn and fork work"
+        ),
+        category="configuration",
+        declared_default="'fork'",
+        effective_default="'fork'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Path to the cache for storing downloaded assets
-    "VLLM_ASSETS_CACHE": lambda: os.path.expanduser(
-        os.getenv(
-            "VLLM_ASSETS_CACHE",
-            os.path.join(get_default_cache_root(), "vllm", "assets"),
-        )
+    "VLLM_ASSETS_CACHE": env_var(
+        lambda: os.path.expanduser(
+            os.getenv(
+                "VLLM_ASSETS_CACHE",
+                os.path.join(get_default_cache_root(), "vllm", "assets"),
+            )
+        ),
+        description="Path to the cache for storing downloaded assets",
+        category="configuration",
+        declared_default="os.path.join(VLLM_CACHE_ROOT, 'assets')",
+        effective_default=(
+            "Computed when unset: "
+            "os.path.expanduser(os.path.join(get_default_cache_root(), 'vllm',"
+            " 'assets'))"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If the env var is set, we will clean model file in
     # this path $VLLM_ASSETS_CACHE/model_streamer/$model_name
-    "VLLM_ASSETS_CACHE_MODEL_CLEAN": lambda: bool(
-        int(os.getenv("VLLM_ASSETS_CACHE_MODEL_CLEAN", "0"))
+    "VLLM_ASSETS_CACHE_MODEL_CLEAN": env_var(
+        lambda: bool(int(os.getenv("VLLM_ASSETS_CACHE_MODEL_CLEAN", "0"))),
+        description=(
+            "If the env var is set, we will clean model file in this path "
+            "$VLLM_ASSETS_CACHE/model_streamer/$model_name"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Timeout for fetching images when serving multimodal models
     # Default is 5 seconds
-    "VLLM_IMAGE_FETCH_TIMEOUT": lambda: int(os.getenv("VLLM_IMAGE_FETCH_TIMEOUT", "5")),
+    "VLLM_IMAGE_FETCH_TIMEOUT": env_var(
+        lambda: int(os.getenv("VLLM_IMAGE_FETCH_TIMEOUT", "5")),
+        description=(
+            "Timeout for fetching images when serving multimodal models "
+            "Default is 5 seconds"
+        ),
+        category="configuration",
+        declared_default="5",
+        effective_default="5",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Timeout for fetching videos when serving multimodal models
     # Default is 30 seconds
-    "VLLM_VIDEO_FETCH_TIMEOUT": lambda: int(
-        os.getenv("VLLM_VIDEO_FETCH_TIMEOUT", "30")
+    "VLLM_VIDEO_FETCH_TIMEOUT": env_var(
+        lambda: int(os.getenv("VLLM_VIDEO_FETCH_TIMEOUT", "30")),
+        description=(
+            "Timeout for fetching videos when serving multimodal models "
+            "Default is 30 seconds"
+        ),
+        category="configuration",
+        declared_default="30",
+        effective_default="30",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Timeout for fetching audio when serving multimodal models
     # Default is 10 seconds
-    "VLLM_AUDIO_FETCH_TIMEOUT": lambda: int(
-        os.getenv("VLLM_AUDIO_FETCH_TIMEOUT", "10")
+    "VLLM_AUDIO_FETCH_TIMEOUT": env_var(
+        lambda: int(os.getenv("VLLM_AUDIO_FETCH_TIMEOUT", "10")),
+        description=(
+            "Timeout for fetching audio when serving multimodal models Default"
+            " is 10 seconds"
+        ),
+        category="configuration",
+        declared_default="10",
+        effective_default="10",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Directory for caching media downloads (images, video, audio fetched
     # from URLs during inference). Empty string disables caching.
-    "VLLM_MEDIA_CACHE": lambda: os.getenv("VLLM_MEDIA_CACHE", ""),
+    "VLLM_MEDIA_CACHE": env_var(
+        lambda: os.getenv("VLLM_MEDIA_CACHE", ""),
+        description=(
+            "Directory for caching media downloads (images, video, audio "
+            "fetched from URLs during inference). Empty string disables "
+            "caching."
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Maximum cache size in MB. When exceeded, least-recently-used entries
     # are evicted. Default is 5120 (5 GB).
-    "VLLM_MEDIA_CACHE_MAX_SIZE_MB": lambda: int(
-        os.getenv("VLLM_MEDIA_CACHE_MAX_SIZE_MB", "5120")
+    "VLLM_MEDIA_CACHE_MAX_SIZE_MB": env_var(
+        lambda: int(os.getenv("VLLM_MEDIA_CACHE_MAX_SIZE_MB", "5120")),
+        description=(
+            "Maximum cache size in MB. When exceeded, least-recently-used "
+            "entries are evicted. Default is 5120 (5 GB)."
+        ),
+        category="tuning",
+        declared_default="5120",
+        effective_default="5120",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Time-to-live in hours for cached media files. Entries older than this
     # are evicted regardless of cache size. Default is 24 hours.
-    "VLLM_MEDIA_CACHE_TTL_HOURS": lambda: float(
-        os.getenv("VLLM_MEDIA_CACHE_TTL_HOURS", "24")
+    "VLLM_MEDIA_CACHE_TTL_HOURS": env_var(
+        lambda: float(os.getenv("VLLM_MEDIA_CACHE_TTL_HOURS", "24")),
+        description=(
+            "Time-to-live in hours for cached media files. Entries older than "
+            "this are evicted regardless of cache size. Default is 24 hours."
+        ),
+        category="configuration",
+        declared_default="24",
+        effective_default="24.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Maximum number of retries for fetching media (images, audio, video)
     # from URLs. Each retry quadruples the timeout. Default is 3.
-    "VLLM_MEDIA_FETCH_MAX_RETRIES": lambda: int(
-        os.getenv("VLLM_MEDIA_FETCH_MAX_RETRIES", "3")
+    "VLLM_MEDIA_FETCH_MAX_RETRIES": env_var(
+        lambda: int(os.getenv("VLLM_MEDIA_FETCH_MAX_RETRIES", "3")),
+        description=(
+            "Maximum number of retries for fetching media (images, audio, "
+            "video) from URLs. Each retry quadruples the timeout. Default is "
+            "3."
+        ),
+        category="tuning",
+        declared_default="3",
+        effective_default="3",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to allow HTTP redirects when fetching from media URLs.
     # Default to True
-    "VLLM_MEDIA_URL_ALLOW_REDIRECTS": lambda: bool(
-        int(os.getenv("VLLM_MEDIA_URL_ALLOW_REDIRECTS", "1"))
+    "VLLM_MEDIA_URL_ALLOW_REDIRECTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_MEDIA_URL_ALLOW_REDIRECTS", "1"))),
+        description=(
+            "Whether to allow HTTP redirects when fetching from media URLs. "
+            "Default to True"
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Max number of workers for the thread pool handling
     # media bytes loading. Set to 1 to disable parallel processing.
     # Default is 8
-    "VLLM_MEDIA_LOADING_THREAD_COUNT": lambda: int(
-        os.getenv("VLLM_MEDIA_LOADING_THREAD_COUNT", "8")
+    "VLLM_MEDIA_LOADING_THREAD_COUNT": env_var(
+        lambda: int(os.getenv("VLLM_MEDIA_LOADING_THREAD_COUNT", "8")),
+        description=(
+            "Max number of workers for the thread pool handling media bytes "
+            "loading. Set to 1 to disable parallel processing. Default is 8"
+        ),
+        category="configuration",
+        declared_default="8",
+        effective_default="8",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Maximum filesize in MB for a single audio file when processing
     # speech-to-text requests. Files larger than this will be rejected.
     # Default is 25 MB
-    "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": lambda: int(
-        os.getenv("VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", "25")
+    "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": env_var(
+        lambda: int(os.getenv("VLLM_MAX_AUDIO_CLIP_FILESIZE_MB", "25")),
+        description=(
+            "Maximum filesize in MB for a single audio file when processing "
+            "speech-to-text requests. Files larger than this will be rejected."
+            " Default is 25 MB"
+        ),
+        category="tuning",
+        declared_default="25",
+        effective_default="25",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Backend for Video IO — selects the frame-sampling algorithm.
     # - "opencv": uniform sampling.
@@ -1554,8 +2629,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # via `@VIDEO_LOADER_REGISTRY.register("my_custom_video_loader")` and
     # imported at runtime.
     # If a non-existing backend is used, an AssertionError will be thrown.
-    "VLLM_VIDEO_LOADER_BACKEND": lambda: os.getenv(
-        "VLLM_VIDEO_LOADER_BACKEND", "opencv"
+    "VLLM_VIDEO_LOADER_BACKEND": env_var(
+        lambda: os.getenv("VLLM_VIDEO_LOADER_BACKEND", "opencv"),
+        description=(
+            "Backend for Video IO — selects the frame-sampling algorithm. - "
+            '"opencv": uniform sampling. - "opencv_dynamic": duration-aware '
+            'dynamic sampling. - "identity": returns raw video bytes for model'
+            " processor to handle.  Custom backend implementations can be "
+            "registered via "
+            '`@VIDEO_LOADER_REGISTRY.register("my_custom_video_loader")` and '
+            "imported at runtime. If a non-existing backend is used, an "
+            "AssertionError will be thrown."
+        ),
+        category="configuration",
+        declared_default="'opencv'",
+        effective_default="'opencv'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Media connector implementation.
     # - "http": Default connector that supports fetching media via HTTP.
@@ -1564,671 +2654,2315 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # via `@MEDIA_CONNECTOR_REGISTRY.register("my_custom_media_connector")` and
     # imported at runtime.
     # If a non-existing backend is used, an AssertionError will be thrown.
-    "VLLM_MEDIA_CONNECTOR": lambda: os.getenv("VLLM_MEDIA_CONNECTOR", "http"),
+    "VLLM_MEDIA_CONNECTOR": env_var(
+        lambda: os.getenv("VLLM_MEDIA_CONNECTOR", "http"),
+        description=(
+            'Media connector implementation. - "http": Default connector that '
+            "supports fetching media via HTTP.  Custom implementations can be "
+            "registered via "
+            '`@MEDIA_CONNECTOR_REGISTRY.register("my_custom_media_connector")`'
+            " and imported at runtime. If a non-existing backend is used, an "
+            "AssertionError will be thrown."
+        ),
+        category="configuration",
+        declared_default="'http'",
+        effective_default="'http'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Hash algorithm for multimodal content hashing.
     # - "blake3": Default, fast cryptographic hash (not FIPS 140-3 compliant)
     # - "sha256": FIPS 140-3 compliant, widely supported
     # - "sha512": FIPS 140-3 compliant, faster on 64-bit systems
     # Use sha256 or sha512 for FIPS compliance in government/enterprise deployments
-    "VLLM_MM_HASHER_ALGORITHM": env_with_choices(
-        "VLLM_MM_HASHER_ALGORITHM",
-        "blake3",
-        ["blake3", "sha256", "sha512"],
-        case_sensitive=False,
+    "VLLM_MM_HASHER_ALGORITHM": env_var(
+        env_with_choices(
+            "VLLM_MM_HASHER_ALGORITHM",
+            "blake3",
+            ["blake3", "sha256", "sha512"],
+            case_sensitive=False,
+        ),
+        description=(
+            'Hash algorithm for multimodal content hashing. - "blake3": '
+            "Default, fast cryptographic hash (not FIPS 140-3 compliant) - "
+            '"sha256": FIPS 140-3 compliant, widely supported - "sha512": FIPS'
+            " 140-3 compliant, faster on 64-bit systems Use sha256 or sha512 "
+            "for FIPS compliance in government/enterprise deployments"
+        ),
+        category="configuration",
+        declared_default="'blake3'",
+        effective_default="'blake3'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Path to the XLA persistent cache directory.
     # Only used for XLA devices such as TPUs.
-    "VLLM_XLA_CACHE_PATH": lambda: os.path.expanduser(
-        os.getenv(
-            "VLLM_XLA_CACHE_PATH",
-            os.path.join(get_default_cache_root(), "vllm", "xla_cache"),
-        )
+    "VLLM_XLA_CACHE_PATH": env_var(
+        lambda: os.path.expanduser(
+            os.getenv(
+                "VLLM_XLA_CACHE_PATH",
+                os.path.join(get_default_cache_root(), "vllm", "xla_cache"),
+            )
+        ),
+        description=(
+            "Path to the XLA persistent cache directory. Only used for XLA "
+            "devices such as TPUs."
+        ),
+        category="configuration",
+        declared_default="os.path.join(VLLM_CACHE_ROOT, 'xla_cache')",
+        effective_default=(
+            "Computed when unset: "
+            "os.path.expanduser(os.path.join(get_default_cache_root(), 'vllm',"
+            " 'xla_cache'))"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, assert on XLA recompilation after each execution step.
-    "VLLM_XLA_CHECK_RECOMPILATION": lambda: bool(
-        int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION", "0"))
+    "VLLM_XLA_CHECK_RECOMPILATION": env_var(
+        lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION", "0"))),
+        description="If set, assert on XLA recompilation after each execution step.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Enable SPMD mode for TPU backend.
-    "VLLM_XLA_USE_SPMD": lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
+    "VLLM_XLA_USE_SPMD": env_var(
+        lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
+        description="Enable SPMD mode for TPU backend.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
     # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
     # Default: 512 MB
-    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
-        os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": env_var(
+        lambda: int(os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")),
+        description=(
+            "Maximum size (in MB) for logits tensor in sparse MLA indexer "
+            "prefill chunks. Bounds the [M, N] float32 logits tensor to "
+            "prevent CUDA OOM. Default: 512 MB"
+        ),
+        category="tuning",
+        declared_default="512",
+        effective_default="512",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
-    "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
-        int(os.getenv("VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", "0"))
+    "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_KEEP_ALIVE_ON_ENGINE_DEATH", "0"))),
+        description=(
+            "If set, the OpenAI API server will stay alive even after the "
+            "underlying AsyncLLMEngine errors and stops serving requests"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN is set, it allows
     # the user to specify a max sequence length greater than
     # the max length derived from the model's config.json.
     # To enable this, set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1.
-    "VLLM_ALLOW_LONG_MAX_MODEL_LEN": lambda: (
-        os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").strip().lower()
-        in ("1", "true")
+    "VLLM_ALLOW_LONG_MAX_MODEL_LEN": env_var(
+        lambda: (
+            os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").strip().lower()
+            in ("1", "true")
+        ),
+        description=(
+            "If the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN is set, it allows "
+            "the user to specify a max sequence length greater than the max "
+            "length derived from the model's config.json. To enable this, set "
+            "VLLM_ALLOW_LONG_MAX_MODEL_LEN=1."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, forces FP8 Marlin to be used for FP8 quantization regardless
     # of the hardware support for FP8 compute.
-    "VLLM_TEST_FORCE_FP8_MARLIN": lambda: (
-        os.environ.get("VLLM_TEST_FORCE_FP8_MARLIN", "0").strip().lower()
-        in ("1", "true")
+    "VLLM_TEST_FORCE_FP8_MARLIN": env_var(
+        lambda: (
+            os.environ.get("VLLM_TEST_FORCE_FP8_MARLIN", "0").strip().lower()
+            in ("1", "true")
+        ),
+        description=(
+            "If set, forces FP8 Marlin to be used for FP8 quantization "
+            "regardless of the hardware support for FP8 compute."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_TEST_FORCE_LOAD_FORMAT": lambda: os.getenv(
-        "VLLM_TEST_FORCE_LOAD_FORMAT", "dummy"
+    "VLLM_TEST_FORCE_LOAD_FORMAT": env_var(
+        lambda: os.getenv("VLLM_TEST_FORCE_LOAD_FORMAT", "dummy"),
+        description=(
+            "vLLM: test force load format. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="'dummy'",
+        effective_default="'dummy'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Time in ms for the zmq client to wait for a response from the backend
     # server for simple data operations
-    "VLLM_RPC_TIMEOUT": lambda: int(os.getenv("VLLM_RPC_TIMEOUT", "10000")),
+    "VLLM_RPC_TIMEOUT": env_var(
+        lambda: int(os.getenv("VLLM_RPC_TIMEOUT", "10000")),
+        description=(
+            "Time in ms for the zmq client to wait for a response from the "
+            "backend server for simple data operations"
+        ),
+        category="configuration",
+        declared_default="10000",
+        effective_default="10000",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Timeout in seconds for keeping HTTP connections alive in API server
-    "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
-        os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
+    "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": env_var(
+        lambda: int(os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")),
+        description=(
+            "Timeout in seconds for keeping HTTP connections alive in API server"
+        ),
+        category="configuration",
+        declared_default="5",
+        effective_default="5",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
     # denial-of-service via excessively large fan-out. Default: 16384.
-    "VLLM_MAX_N_SEQUENCES": lambda: int(
-        os.environ.get("VLLM_MAX_N_SEQUENCES", "16384")
+    "VLLM_MAX_N_SEQUENCES": env_var(
+        lambda: int(os.environ.get("VLLM_MAX_N_SEQUENCES", "16384")),
+        description=(
+            "Maximum allowed value for the `n` sampling parameter (number of "
+            "output sequences per request). Limits resource consumption to "
+            "prevent denial-of-service via excessively large fan-out. Default:"
+            " 16384."
+        ),
+        category="tuning",
+        declared_default="16384",
+        effective_default="16384",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # a list of plugin names to load, separated by commas.
     # if this is not set, it means all plugins will be loaded
     # if this is set to an empty string, no plugins will be loaded
-    "VLLM_PLUGINS": lambda: (
-        None
-        if "VLLM_PLUGINS" not in os.environ
-        else os.environ["VLLM_PLUGINS"].split(",")
+    "VLLM_PLUGINS": env_var(
+        lambda: (
+            None
+            if "VLLM_PLUGINS" not in os.environ
+            else os.environ["VLLM_PLUGINS"].split(",")
+        ),
+        description=(
+            "a list of plugin names to load, separated by commas. if this is "
+            "not set, it means all plugins will be loaded if this is set to an"
+            " empty string, no plugins will be loaded"
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "Computed when unset: None if 'VLLM_PLUGINS' not in os.environ "
+            "else os.environ['VLLM_PLUGINS'].split(',')"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
     # VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.
-    "VLLM_LORA_RESOLVER_CACHE_DIR": lambda: os.getenv(
-        "VLLM_LORA_RESOLVER_CACHE_DIR", None
+    "VLLM_LORA_RESOLVER_CACHE_DIR": env_var(
+        lambda: os.getenv("VLLM_LORA_RESOLVER_CACHE_DIR", None),
+        description=(
+            "a local directory to look in for unrecognized LoRA adapters. only"
+            " works if plugins are enabled and "
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # A remote HF repo(s) containing one or more LoRA adapters, which
     # may be downloaded and leveraged as needed. Only works if plugins
     # are enabled and VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled.
     # Values should be comma separated.
-    "VLLM_LORA_RESOLVER_HF_REPO_LIST": lambda: os.getenv(
-        "VLLM_LORA_RESOLVER_HF_REPO_LIST", None
+    "VLLM_LORA_RESOLVER_HF_REPO_LIST": env_var(
+        lambda: os.getenv("VLLM_LORA_RESOLVER_HF_REPO_LIST", None),
+        description=(
+            "A remote HF repo(s) containing one or more LoRA adapters, which "
+            "may be downloaded and leveraged as needed. Only works if plugins "
+            "are enabled and VLLM_ALLOW_RUNTIME_LORA_UPDATING is enabled. "
+            "Values should be comma separated."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, vLLM will use Triton implementations of AWQ.
-    "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
+    "VLLM_USE_TRITON_AWQ": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
+        description="If set, vLLM will use Triton implementations of AWQ.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+    ),
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
     # not warn users that our own documented knobs are unknown.
-    "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": lambda: bool(
-        int(os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS", "0"))
+    "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS", "0"))),
+        description=(
+            "1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed"
+            " while building EngineArgs and must be registered so environment "
+            "validation does not warn users that our own documented knobs are "
+            "unknown."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS": lambda: bool(
-        int(os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS", "0"))
+    "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS", "0"))),
+        description=(
+            "vLLM: 1cat enable qwen35 mtp defaults. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # 1Cat SM70 public-profile opt-outs. These are consumed while building
     # EngineArgs and must be registered so environment validation does not
     # warn users that our own documented knobs are unknown.
-    "VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS": lambda: bool(
-        int(os.getenv("VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS", "0"))
+    "VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS", "0"))),
+        description=(
+            "1Cat SM70 public-profile opt-outs. These are consumed while "
+            "building EngineArgs and must be registered so environment "
+            "validation does not warn users that our own documented knobs are "
+            "unknown."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS": lambda: bool(
-        int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))
+    "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))),
+        description=(
+            "vLLM: 1cat disable qwen35 mtp defaults. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
     # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
-    "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
+    "VLLM_SM70_QUANT_BACKEND": env_var(
+        get_sm70_quant_backend,
+        description=(
+            'Unified V100/SM70 quantized linear backend selector. "auto" '
+            "resolves to TurboMind for supported SM70 quant routes; only "
+            '"marlin" forces Marlin.'
+        ),
+        category="configuration",
+        declared_default="'auto'",
+        effective_default="Computed by get_sm70_quant_backend",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
     # opt-out with VLLM_SM70_AWQ_TURBOMIND=0.
-    "VLLM_SM70_AWQ_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_TURBOMIND", "1"))
+    "VLLM_SM70_AWQ_TURBOMIND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_TURBOMIND", "1"))),
+        description=(
+            "V100/SM70 AWQ dense path using the local TurboMind backend. This "
+            "matches the 0.0.3 route semantics: enable by default on SM70 and "
+            "allow an explicit opt-out with VLLM_SM70_AWQ_TURBOMIND=0."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
     # weight-only formats. These broad compressed-tensor gates stay default-off;
     # individual accepted formats such as NVFP4/MXFP4 are gated below.
-    "VLLM_SM70_GPTQ_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_GPTQ_TURBOMIND", "0"))
+    "VLLM_SM70_GPTQ_TURBOMIND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GPTQ_TURBOMIND", "0"))),
+        description=(
+            "Experimental SM70 TurboMind routes for latest LMDeploy-compatible"
+            " weight-only formats. These broad compressed-tensor gates stay "
+            "default-off; individual accepted formats such as NVFP4/MXFP4 are "
+            "gated below."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))
+    "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))),
+        description=(
+            "SM70: compressed tensors turbomind. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_AWQ_MOE_DISABLE": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_DISABLE", "0"))
+    "VLLM_SM70_AWQ_MOE_DISABLE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_DISABLE", "0"))),
+        description=(
+            "SM70: awq moe disable. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Match the 0.0.3 SM70/AWQ 35B baseline: route MoE through the TurboMind
     # grouped/batched GEMM by default, with an explicit opt-out for exactness
     # diagnostics and fallback comparison.
-    "VLLM_SM70_AWQ_MOE_BATCHED_GEMM": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_GEMM", "1"))
+    "VLLM_SM70_AWQ_MOE_BATCHED_GEMM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_GEMM", "1"))),
+        description=(
+            "Match the 0.0.3 SM70/AWQ 35B baseline: route MoE through the "
+            "TurboMind grouped/batched GEMM by default, with an explicit "
+            "opt-out for exactness diagnostics and fallback comparison."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Skip the materialized top-k input rows for the exact Qwen3.8
     # Flash-Next TP4 AWQ W13 prefill contract. Unsupported shapes retain the
     # existing materialized-input path.
-    "VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL", "1"))
+    "VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL", "1"))),
+        description=(
+            "Skip the materialized top-k input rows for the exact Qwen3.8 "
+            "Flash-Next TP4 AWQ W13 prefill contract. Unsupported shapes "
+            "retain the existing materialized-input path."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Qwen3.8 TP4 g32 small-batch MoE: group active expert segments through
     # the existing active-stage op. Set to 0 before startup for the old route.
-    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1"))
+    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1"))
+        ),
+        description=(
+            "Qwen3.8 TP4 g32 small-batch MoE: group active expert segments "
+            "through the existing active-stage op. Set to 0 before startup for"
+            " the old route."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Default-on TP4/native-g32 single-token W13/W2 QPN route for supported
     # E512 shapes and native builds. Implicit unsupported requests fall back;
     # explicit 1 fails closed, and 0 restores the legacy route. Keeps prepared
     # metadata and FP16 boundaries, but changes reduction order.
-    "VLLM_SM70_AWQ_QWEN38_QPN_M1": lambda: (
-        env_with_choices("VLLM_SM70_AWQ_QWEN38_QPN_M1", "1", ["0", "1"])() == "1"
+    "VLLM_SM70_AWQ_QWEN38_QPN_M1": env_var(
+        lambda: (
+            env_with_choices("VLLM_SM70_AWQ_QWEN38_QPN_M1", "1", ["0", "1"])() == "1"
+        ),
+        description=(
+            "Default-on TP4/native-g32 single-token W13/W2 QPN route for "
+            "supported E512 shapes and native builds. Implicit unsupported "
+            "requests fall back; explicit 1 fails closed, and 0 restores the "
+            "legacy route. Keeps prepared metadata and FP16 boundaries, but "
+            "changes reduction order."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "Computed when unset: "
+            "env_with_choices('VLLM_SM70_AWQ_QWEN38_QPN_M1', '1', ['0', "
+            "'1'])() == '1'"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Zero disables chunking; 4096 and 6144 cap the indexed W2 scratch rows.
-    "VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS", "0")
+    "VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS", "0")),
+        description=(
+            "Zero disables chunking; 4096 and 6144 cap the indexed W2 scratch rows."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13", "0"))
+    "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13", "0"))
+        ),
+        description=(
+            "SM70: awq moe batched single token dense w13. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2", "0"))
+    "VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2", "0"))),
+        description=(
+            "SM70: awq moe batched exact w2. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2", "0"))
+    "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2", "0"))),
+        description=(
+            "SM70: awq moe batched active exact w2. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS", "0")
+    "VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS", "0")),
+        description=(
+            "SM70: awq moe batched decode max tokens. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Zero derives the resident MoE scratch cap from max_num_seqs and the MTP
     # verifier width, bounded by the historical 32-token ceiling. A positive
     # value is an experimental cap and is still bounded by that ceiling.
-    "VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS", "0")
+    "VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS", "0")),
+        description=(
+            "Zero derives the resident MoE scratch cap from max_num_seqs and "
+            "the MTP verifier width, bounded by the historical 32-token "
+            "ceiling. A positive value is an experimental cap and is still "
+            "bounded by that ceiling."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Exact Qwen3.8 TP4 AWQ experiment: persist each per-group statistic as
     # {FP16 scale, uint8 zero} and reconstruct the FP16 bias in the SM70
     # iterator. Default on for the supported Qwen3.8 TP4 E512 native-g32 shape;
     # unsupported builds or shapes fall back to the 4-byte layout unless the
     # variable is set explicitly, which fails closed. Set to 0 for 4-byte.
-    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "1"))
+    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "1"))),
+        description=(
+            "Exact Qwen3.8 TP4 AWQ experiment: persist each per-group "
+            "statistic as {FP16 scale, uint8 zero} and reconstruct the FP16 "
+            "bias in the SM70 iterator. Default on for the supported Qwen3.8 "
+            "TP4 E512 native-g32 shape; unsupported builds or shapes fall back"
+            " to the 4-byte layout unless the variable is set explicitly, "
+            "which fails closed. Set to 0 for 4-byte."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST", None
+    "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST", None),
+        description=(
+            "SM70: awq moe batched layer allowlist. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST", None
+    "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST", None),
+        description=(
+            "SM70: awq moe batched layer denylist. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR", None
+    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR", None),
+        description=(
+            "SM70: awq moe compare dense dir. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE", None
+    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE", None),
+        description=(
+            "SM70: awq moe compare dense enable file. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS", None
+    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS", None),
+        description=(
+            "SM70: awq moe compare dense layer ids. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS", None
+    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS", None),
+        description=(
+            "SM70: awq moe compare dense steps. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS", "128")
+    "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS", "128")),
+        description=(
+            "SM70: awq moe compare dense max reports. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # Restore the 0.0.3 AWQ decode fast path: for one-token decode, compact
     # the active top-k experts and run the legacy monolithic TurboMind MoE op
     # before falling back to the all-expert batched GEMM route.
-    "VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT", "1"))
+    "VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT", "1"))
+        ),
+        description=(
+            "Restore the 0.0.3 AWQ decode fast path: for one-token decode, "
+            "compact the active top-k experts and run the legacy monolithic "
+            "TurboMind MoE op before falling back to the all-expert batched "
+            "GEMM route."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
     # C++ SM70 TurboMind tuning knobs. Register them here so reproducible
     # benchmark commands do not trip unknown-env warnings.
-    "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", "0"))
+    "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", "0"))),
+        description=(
+            "C++ SM70 TurboMind tuning knobs. Register them here so "
+            "reproducible benchmark commands do not trip unknown-env warnings."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS", "1"))
+    "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS", "1"))),
+        description=(
+            "SM70: awq preserve default splits. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Experimental graph-safety lane for AWQ LUT reuse: keep the measured/LUT
     # kernel choice, but force only split-K to match the heuristic/default
     # launch. This tests whether no-preserve LUT regressions come from graph
     # dependencies introduced by measured split/workspace topology.
-    "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))
+    "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))),
+        description=(
+            "Experimental graph-safety lane for AWQ LUT reuse: keep the "
+            "measured/LUT kernel choice, but force only split-K to match the "
+            "heuristic/default launch. This tests whether no-preserve LUT "
+            "regressions come from graph dependencies introduced by measured "
+            "split/workspace topology."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_TP2_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR", "1"))
+    "VLLM_SM70_AWQ_TP2_FAST_SELECTOR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR", "1"))),
+        description=(
+            "SM70: awq tp2 fast selector. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_TP2_FAST_TARGETS": lambda: os.getenv(
-        "VLLM_SM70_AWQ_TP2_FAST_TARGETS", None
+    "VLLM_SM70_AWQ_TP2_FAST_TARGETS": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_TP2_FAST_TARGETS", None),
+        description=(
+            "SM70: awq tp2 fast targets. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "0"))
+    "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "0"))),
+        description=(
+            "SM70: tp2 ar gemma rms fusion. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Default-off exact-8K TP4 experiment: fuse the row-parallel reduction,
     # mixed-FP32-residual Gemma RMSNorm, and normalized-output all-gather.
-    "VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM", "0"))
+    "VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM", "0"))),
+        description=(
+            "Default-off exact-8K TP4 experiment: fuse the row-parallel "
+            "reduction, mixed-FP32-residual Gemma RMSNorm, and "
+            "normalized-output all-gather."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 prefill",),
     ),
-    "VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS": lambda: int(
-        os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS", "512")
+    "VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS", "512")),
+        description=(
+            "SM70: tp4 long fused norm threads. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="512",
+        effective_default="512",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS", "80")
+    "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS", "80")),
+        description=(
+            "SM70: tp4 long fused norm blocks. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="80",
+        effective_default="80",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. The
     # first stage fuses gate_up_proj + SiluAndMul through the TurboMind GEMM
     # epilogue for M=1/TP2 while keeping the existing down_proj/reduce path.
-    "VLLM_SM70_AWQ_MLP_ENGINE": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))
+    "VLLM_SM70_AWQ_MLP_ENGINE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MLP_ENGINE", "0"))),
+        description=(
+            "Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. "
+            "The first stage fuses gate_up_proj + SiluAndMul through the "
+            "TurboMind GEMM epilogue for M=1/TP2 while keeping the existing "
+            "down_proj/reduce path."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Expand selected full 4096-token TP4 AWQ projections into one reusable
     # bounded FP16 workspace before their exact dense GEMM.
-    "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))
+    "VLLM_SM70_AWQ_PREFILL_EXACT_DENSE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_PREFILL_EXACT_DENSE", "1"))),
+        description=(
+            "Expand selected full 4096-token TP4 AWQ projections into one "
+            "reusable bounded FP16 workspace before their exact dense GEMM."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Expand selected large-M TP4 FP8 projections into one reusable bounded
     # FP16 workspace before their exact dense GEMM. The allowlist and M gate
     # keep decode, tails, and numerically unsafe QKV projections on TurboMind.
-    "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
+    "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))),
+        description=(
+            "Expand selected large-M TP4 FP8 projections into one reusable "
+            "bounded FP16 workspace before their exact dense GEMM. The "
+            "allowlist and M gate keep decode, tails, and numerically unsafe "
+            "QKV projections on TurboMind."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
     # dense projections. Pure-FP8 checkpoints must opt in. The Qwen4Exp
     # online route also stays opt-in because it requantizes checkpoint BF16
     # attention, GDN, QSA, and mHC weights without calibration.
-    "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    "VLLM_SM70_FP8_QPN8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+        description=(
+            "Memory-neutral QPN8 layout for shape- and runtime-gated TP4 "
+            "block-FP8 dense projections. Pure-FP8 checkpoints must opt in. "
+            "The Qwen4Exp online route also stays opt-in because it "
+            "requantizes checkpoint BF16 attention, GDN, QSA, and mHC weights "
+            "without calibration."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("FP8 QPN8",),
+    ),
     # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in
     # QPN8 form for exact M=9..16 projection shapes instead of reconstructing
     # a full FP16 matrix before every GEMM.
-    "VLLM_SM70_FP8_QPN8_M16": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_M16", "1"))
+    "VLLM_SM70_FP8_QPN8_M16": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8_M16", "1"))),
+        description=(
+            "Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights"
+            " in QPN8 form for exact M=9..16 projection shapes instead of "
+            "reconstructing a full FP16 matrix before every GEMM."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FP8 QPN8",),
     ),
     # Follow-on B4 experiment: replay the accepted M16 body in contiguous row
     # chunks through M=32 while retaining the same strict shape allowlist.
-    "VLLM_SM70_FP8_QPN8_M32_CHUNKED": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_M32_CHUNKED", "1"))
+    "VLLM_SM70_FP8_QPN8_M32_CHUNKED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8_M32_CHUNKED", "1"))),
+        description=(
+            "Follow-on B4 experiment: replay the accepted M16 body in "
+            "contiguous row chunks through M=32 while retaining the same "
+            "strict shape allowlist."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FP8 QPN8",),
     ),
     # Native dense-only B4 verifier experiment. It keeps the logical split-K
     # reduction order while one CTA reuses each packed weight tile for M<=32.
-    "VLLM_SM70_FP8_QPN8_M32_NATIVE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_M32_NATIVE", "1"))
+    "VLLM_SM70_FP8_QPN8_M32_NATIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8_M32_NATIVE", "1"))),
+        description=(
+            "Native dense-only B4 verifier experiment. It keeps the logical "
+            "split-K reduction order while one CTA reuses each packed weight "
+            "tile for M<=32."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FP8 QPN8",),
     ),
-    "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
+    "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))),
+        description=(
+            "SM70: qwen4 exp online qpn8. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
     # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
     # opt-in until operator, token, task-quality, and matched speed gates pass.
     # Copy-only optimization of the existing batched fused-input fallback.
     # Does not opt a model into the separate FP16 GEMV arithmetic path.
-    "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1"))
+    "VLLM_SM70_GDN_BATCH_SPLIT_COPY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "1"))),
+        description=(
+            "Precision-preserving checkpoint-FP16 row GEMV for the exact "
+            "no-MTP, TP4 Qwen3.8 Flash Next single-token decode contract on "
+            "SM70. This stays opt-in until operator, token, task-quality, and "
+            "matched speed gates pass. Copy-only optimization of the existing "
+            "batched fused-input fallback. Does not opt a model into the "
+            "separate FP16 GEMV arithmetic path."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
+    "VLLM_SM70_QWEN38_FP16_GEMV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))),
+        description=(
+            "SM70: qwen38 fp16 gemv. The consumer locations and unset defaults"
+            " are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' "
+                "when name not in os.environ; automatic defaults apply only when "
+                "the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Exact-topology Qwen3.8 decode candidate: compute checkpoint-FP16 GDN
     # QKVZ and b/a projections and write their consumed splits in one launch.
-    "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
+    "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))),
+        description=(
+            "Exact-topology Qwen3.8 decode candidate: compute checkpoint-FP16 "
+            "GDN QKVZ and b/a projections and write their consumed splits in "
+            "one launch."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' "
+                "when name not in os.environ; automatic defaults apply only when "
+                "the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Qualified M2..16 input chain. Keep opt-in because its packed weights
     # consume another 725.625 MiB/rank in the Flash-Next TP4 configuration.
-    "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"))
+    "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"))),
+        description=(
+            "Qualified M2..16 input chain. Keep opt-in because its packed "
+            "weights consume another 725.625 MiB/rank in the Flash-Next TP4 "
+            "configuration."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # TP4 MTP4 batch HC, sharing the concurrent-decode packed MMA/gather
     # implementation while preserving the current FP16 split-K boundaries.
-    "VLLM_SM70_MTP_HC_BATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_HC_BATCH", "0"))
+    "VLLM_SM70_MTP_HC_BATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_BATCH", "0"))),
+        description=(
+            "TP4 MTP4 batch HC, sharing the concurrent-decode packed "
+            "MMA/gather implementation while preserving the current FP16 "
+            "split-K boundaries."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Join the admitted HC phases with cooperative grid barriers, keeping
     # the same per-projection arithmetic and communicator-owned packets.
-    "VLLM_SM70_MTP_HC_COOPERATIVE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_HC_COOPERATIVE", "0"))
+    "VLLM_SM70_MTP_HC_COOPERATIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_COOPERATIVE", "0"))),
+        description=(
+            "Join the admitted HC phases with cooperative grid barriers, "
+            "keeping the same per-projection arithmetic and communicator-owned"
+            " packets."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Exact cooperative HC schedule; opt in pending same-engine comparison.
-    "VLLM_SM70_MTP_HC_FULL_UNROLL": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_HC_FULL_UNROLL", "0"))
+    "VLLM_SM70_MTP_HC_FULL_UNROLL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_FULL_UNROLL", "0"))),
+        description=(
+            "Exact cooperative HC schedule; opt in pending same-engine comparison."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Select only the first 16 lossless keys before the unchanged top-10 norm.
-    "VLLM_SM70_MTP_ROUTER_TOP16": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "0"))
+    "VLLM_SM70_MTP_ROUTER_TOP16": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "0"))),
+        description=(
+            "Select only the first 16 lossless keys before the unchanged top-10 norm."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Fused four-partition FP32 reduction for the MTP4 FP16 router projection.
-    "VLLM_SM70_MTP_ROUTER_BATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_ROUTER_BATCH", "0"))
+    "VLLM_SM70_MTP_ROUTER_BATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ROUTER_BATCH", "0"))),
+        description=(
+            "Fused four-partition FP32 reduction for the MTP4 FP16 router projection."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues.
-    "VLLM_SM70_MTP_SHARED_BATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_SHARED_BATCH", "0"))
+    "VLLM_SM70_MTP_SHARED_BATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_SHARED_BATCH", "0"))),
+        description=(
+            "Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
-    "VLLM_SM70_MTP_PLE_CONV": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "0"))
+    "VLLM_SM70_MTP_PLE_CONV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "0"))),
+        description=(
+            "Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.
     # This remains opt-in pending the same model-level quality gates as GEMV.
-    "VLLM_SM70_QWEN38_FUSED_HC_FP16": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "0"))
+    "VLLM_SM70_QWEN38_FUSED_HC_FP16": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "0"))),
+        description=(
+            "Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and "
+            "up/gate-mix stages while retaining FP16 checkpoint weights and "
+            "inter-stage rounding. This remains opt-in pending the same "
+            "model-level quality gates as GEMV."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' "
+                "when name not in os.environ; automatic defaults apply only when "
+                "the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # One admission gate for exact small-batch HC/GDN/gate/TP4 candidates.
     # Keep opt-in until their combined same-build model quality gate passes.
-    "VLLM_SM70_QWEN38_BATCH_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "0"))
+    "VLLM_SM70_QWEN38_BATCH_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "0"))),
+        description=(
+            "One admission gate for exact small-batch HC/GDN/gate/TP4 "
+            "candidates. Keep opt-in until their combined same-build model "
+            "quality gate passes."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
     # retaining the checkpoint's FP16 accumulation and output rounding.
-    "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "1"))
+    "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "1"))),
+        description=(
+            "Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This "
+            "replaces the scalar GEMV, sigmoid, and output multiply with one "
+            "SM70 kernel while retaining the checkpoint's FP16 accumulation "
+            "and output rounding."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit
     # opt-in still requires exact operator shapes/layouts, B1, no speculative
     # decoding, no DBO, and no explicit ubatching.
-    "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "0"))
+    "VLLM_SM70_FP8_QPN8_PP2_TP4": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "0"))),
+        description=(
+            "Experimental QPN8 route for the serialized PP2 x TP4 contract. It"
+            " is default-off after matched model-level quality regressions. An"
+            " explicit opt-in still requires exact operator shapes/layouts, "
+            "B1, no speculative decoding, no DBO, and no explicit ubatching."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FP8 QPN8",),
     ),
     # Experimental non-fused QPN8 route for the exact PP2 x TP4 shared-expert
     # gate/up tensor. The model-level clamp-SwiGLU remains external. This
     # numerically sensitive role requires an explicit opt-in.
-    "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0"))
+    "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0"))),
+        description=(
+            "Experimental non-fused QPN8 route for the exact PP2 x TP4 "
+            "shared-expert gate/up tensor. The model-level clamp-SwiGLU "
+            "remains external. This numerically sensitive role requires an "
+            "explicit opt-in."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FP8 QPN8",),
     ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
-    "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
-    "VLLM_SM70_SAMPLER_LIBRARY": lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
-    "VLLM_SM70_FA2_D256_LIBRARY": lambda: os.getenv("VLLM_SM70_FA2_D256_LIBRARY", None),
+    "VLLM_SM70_FP8_QPN8_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
+        description=(
+            "Optional source-built QPN8-only extension. Production builds "
+            "leave this unset because the same operators are linked into "
+            "vllm._C."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("FP8 QPN8",),
+    ),
+    "VLLM_SM70_SAMPLER_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
+        description=(
+            "SM70: sampler library. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_FA2_D256_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_FA2_D256_LIBRARY", None),
+        description=(
+            "SM70: fa2 d256 library. The consumer locations and unset defaults"
+            " are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Experimental q8 long attention; unset preserves the full-context route.
-    "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST": lambda: os.getenv(
-        "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", None
+    "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST": env_var(
+        lambda: os.getenv("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", None),
+        description=(
+            "Experimental q8 long attention; unset preserves the full-context route."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. Default-off keeps
     # the existing eager fallback and its memory footprint unchanged.
     # Capturing the B1 q1..q7 verifier tails is on by default: the eager tail
     # was the dominant round cost at 256K, and 1K/128K are unchanged (<0.01 ms).
     # VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0 restores the eager-tail behaviour.
-    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "1"))
+    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "1"))),
+        description=(
+            "Capture exact B1 q1..q7 verifier tails for SM70 DFlash2. "
+            "Default-off keeps the existing eager fallback and its memory "
+            "footprint unchanged. Capturing the B1 q1..q7 verifier tails is on"
+            " by default: the eager tail was the dominant round cost at 256K, "
+            "and 1K/128K are unchanged (<0.01 ms). "
+            "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0 restores the eager-tail "
+            "behaviour."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": lambda: os.getenv(
-        "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None
+    "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST": env_var(
+        lambda: os.getenv("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST", None),
+        description=(
+            "SM70: dflash2 scalar attention manifest. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SM70_FP8_PREFILL_CUTLASS": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))
+    "VLLM_SM70_FP8_PREFILL_CUTLASS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))),
+        description=(
+            "SM70: fp8 prefill cutlass. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))
+    "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))),
+        description=(
+            "SM70: fp8 prefill visible dense mm. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
-    "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+    "VLLM_SM70_NVFP4_QPN2": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+        description=(
+            "Deprecated alias for kernel_config.sm70_nvfp4.qpn2. QPN2 is an "
+            "explicit opt-in for compatible NVFP4 small-M shapes; larger M "
+            "stays on the existing TurboMind path."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the env getter; per-engine auto=True only for the "
+            "qualified DFlash workload."
+        ),
+        automatic_conditions=(
+            (
+                "DFlash draft method=dflash, 7 speculative tokens, selector "
+                "top-k=16, PP=1, DBO disabled and ubatch<=1; see "
+                "sm70_dflash2_nvfp4_qualified in "
+                "vllm/model_executor/models/config.py."
+            ),
+        ),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
+    ),
     # Share TurboMind B/Pack1 codes with compatible QPN2 projections. Compact
     # scales additionally require native support for reusable graph scratch.
-    "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "1"))
+    "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "1"))),
+        description=(
+            "Deprecated alias for kernel_config.sm70_nvfp4.shared_weight. "
+            "Share TurboMind B/Pack1 codes with compatible QPN2 projections. "
+            "Compact scales additionally require native support for reusable "
+            "graph scratch."
+        ),
+        category="deprecated",
+        declared_default="True",
+        effective_default="True; sharing requires native shared-layout operators.",
+        automatic_conditions=(),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
     ),
-    "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1"))
+    "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1"))),
+        description=(
+            "Deprecated alias for kernel_config.sm70_nvfp4.shared_scales. "
+            "SM70: nvfp4 qpn2 shared scales. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
+        declared_default="True",
+        effective_default=(
+            "True is permission; batch GEMM layouts take precedence, and "
+            "compact scales require native ABI>=1 and the qualified DFlash "
+            "workload."
+        ),
+        automatic_conditions=(
+            (
+                "DFlash draft method=dflash, 7 speculative tokens, selector "
+                "top-k=16, PP=1, DBO disabled and ubatch<=1; see "
+                "sm70_dflash2_nvfp4_qualified in "
+                "vllm/model_executor/models/config.py."
+            ),
+        ),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
     ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
-    "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_M16_NATIVE", "1"))
+    "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2_M16_NATIVE", "1"))),
+        description=(
+            "Reuse each packed NVFP4 tile across two eight-row verifier groups"
+            " in one CTA. This is a default-off Qwen3.8 DFlash2 B2 operator "
+            "candidate."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
     ),
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
-    "VLLM_SM70_NVFP4_QPN2_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0"))
+    "VLLM_SM70_NVFP4_QPN2_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0"))),
+        description=(
+            "Deprecated alias for kernel_config.sm70_nvfp4.prefill. Reuse the "
+            "already resident QPN2 code/scale layout for bounded-workspace "
+            "FP16 large-M prefill. M<=8 decode and speculative verification "
+            "remain on QPN2. This stays opt-in until full-model speed and "
+            "quality gates pass."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=(
+            "False at the env getter; per-engine auto=True only for the "
+            "qualified DFlash workload."
+        ),
+        automatic_conditions=(
+            (
+                "DFlash draft method=dflash, 7 speculative tokens, selector "
+                "top-k=16, PP=1, DBO disabled and ubatch<=1; see "
+                "sm70_dflash2_nvfp4_qualified in "
+                "vllm/model_executor/models/config.py."
+            ),
+        ),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
     ),
-    "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY": lambda: os.getenv(
-        "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY"
+    "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY"),
+        description=(
+            "SM70: nvfp4 qpn2 prefill library. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
     ),
-    "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": lambda: int(
-        os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")
+    "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")),
+        description=(
+            "Deprecated alias for kernel_config.sm70_nvfp4.prefill_min_m. "
+            "SM70: nvfp4 qpn2 prefill min m. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
+        declared_default="1024",
+        effective_default=(
+            "1024; the selected prefill dispatcher also checks its runtime M "
+            "and layout."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("Qpn2NvFp4LinearKernel",),
     ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR", "0"))
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR", "0"))),
+        description=(
+            "Experimental TileRT-inspired down-proj lane: after the "
+            "row-parallel AWQ GEMM, use the local tile-runtime TP2 all-reduce "
+            "substrate for the MLP hidden-state reduction. This is default-off"
+            " until it wins end-to-end."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE": lambda: os.getenv(
-        "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE", "inline"
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE", "inline"),
+        description=(
+            "SM70: awq mlp down tile ar mode. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="'inline'",
+        effective_default="'inline'",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL", "5120")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL", "5120")),
+        description=(
+            "SM70: awq mlp down tile ar tile numel. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="5120",
+        effective_default="5120",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS", "1")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS", "1")),
+        description=(
+            "SM70: awq mlp down tile ar engine blocks. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS", "1")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS", "1")),
+        description=(
+            "SM70: awq mlp down tile ar producer blocks. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS", "1")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS", "1")),
+        description=(
+            "SM70: awq mlp down tile ar reducer blocks. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Experimental TileRT-style fused down-proj lane. TurboMind AWQ GEMM
     # publishes per-N-tile readiness from its epilogue; a reducer worker waits
     # on those flags and reduces TP2 peer staging into the final output.
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP", "0"))
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP", "0"))),
+        description=(
+            "Experimental TileRT-style fused down-proj lane. TurboMind AWQ "
+            "GEMM publishes per-N-tile readiness from its epilogue; a reducer "
+            "worker waits on those flags and reduces TP2 peer staging into the"
+            " final output."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM", "1"))
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM", "1"))
+        ),
+        description=(
+            "SM70: awq mlp down tile overlap side stream. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL", "128")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL", "128")),
+        description=(
+            "SM70: awq mlp down tile overlap tile numel. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS", "4")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS", "4")
+        ),
+        description=(
+            "SM70: awq mlp down tile overlap reducer blocks. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="4",
+        effective_default="4",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS", "0")
+    "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS", "0")
+        ),
+        description=(
+            "SM70: awq mlp down tile overlap kernel reducer blocks. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))
+    "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
+        description=(
+            "SM70: fp8 tune small shapes. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_COORDINATED_TUNING": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1"))
+    "VLLM_SM70_FP8_COORDINATED_TUNING": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1"))),
+        description=(
+            "SM70: fp8 coordinated tuning. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "0"))
+    "VLLM_SM70_FP8_REUSE_IMPORTED_CACHE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "0"))),
+        description=(
+            "SM70: fp8 reuse imported cache. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
+    "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))),
+        description=(
+            "SM70: fp8 safe fast selector. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_GROUPED_BMM_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "1"))
+    "VLLM_SM70_FP8_GROUPED_BMM_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "1"))),
+        description=(
+            "SM70: fp8 grouped bmm decode. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1"))
+    "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1"))),
+        description=(
+            "SM70: fp8 prefill fast selector. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_PREFILL_PRESCALED": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))
+    "VLLM_SM70_FP8_PREFILL_PRESCALED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))),
+        description=(
+            "SM70: fp8 prefill prescaled. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_PRESCALED_M1_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))
+    "VLLM_SM70_FP8_PRESCALED_M1_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))),
+        description=(
+            "SM70: fp8 prescaled m1 decode. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Exact prescaled route for the measured PP2 x TP4 shared-expert gate/up
     # tensor. Missing operators or non-reversible scales fall back safely.
-    "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "1"))
+    "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "1"))),
+        description=(
+            "Exact prescaled route for the measured PP2 x TP4 shared-expert "
+            "gate/up tensor. Missing operators or non-reversible scales fall "
+            "back safely."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))
+    "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))),
+        description=(
+            "SM70: fp8 preserve default splits. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))
+    "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))),
+        description=(
+            "SM70: fp8 preserve default splits only. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES", "1"))
+    "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES", "1"))),
+        description=(
+            "SM70: mxfp4 tune small shapes. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
-    "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))
+    "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))),
+        description=(
+            "SM70: nvfp4 tune small shapes. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
-    "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR", "1"))
+        ),
+        description=(
+            "SM70: nvfp4 qwen38 tp4 m1 fast selector. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Direct ten-route M=1 expert GEMMs for Qwen3.8 Flash Next NVFP4 TP4.
     # This consumes the existing TurboMind-packed weights while skipping the
     # replicated-input prepare kernel. The fixed TP4 8192x512 acceptance run
     # reached 82.274 tokens/s with unchanged arithmetic and Chinese hashes.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1"))),
+        description=(
+            "Direct ten-route M=1 expert GEMMs for Qwen3.8 Flash Next NVFP4 "
+            "TP4. This consumes the existing TurboMind-packed weights while "
+            "skipping the replicated-input prepare kernel. The fixed TP4 "
+            "8192x512 acceptance run reached 82.274 tokens/s with unchanged "
+            "arithmetic and Chinese hashes."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Direct Qwen3.8 expert route for CUDA Graph local widths 2, 4, 8, and 16. It
     # retains native NVFP4 weights, FP16 activations, and FP32 accumulation
     # while skipping expert sort and input expansion. Exact shape/capability
     # gates preserve the generic fallback.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "1"))
+        ),
+        description=(
+            "Direct Qwen3.8 expert route for CUDA Graph local widths 2, 4, 8, "
+            "and 16. It retains native NVFP4 weights, FP16 activations, and "
+            "FP32 accumulation while skipping expert sort and input expansion."
+            " Exact shape/capability gates preserve the generic fallback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Experimental extension to every live width in 2..16, independent of
     # scale storage. Changing RAW_SCALE must not also change which widths use
     # QPN versus grouped TurboMind (which can use a different reduction order).
     # Keep off until dynamic-width endpoint quality admission is complete.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE", "0"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE", "0"))
+        ),
+        description=(
+            "Experimental extension to every live width in 2..16, independent "
+            "of scale storage. Changing RAW_SCALE must not also change which "
+            "widths use QPN versus grouped TurboMind (which can use a "
+            "different reduction order). Keep off until dynamic-width endpoint"
+            " quality admission is complete."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Experimental grouped native-NVFP4 W13/W2 decode. Local weight shapes and
     # attention metadata gates preserve M1, prefill and multi-token verify.
     # Default off pending endpoint and model-quality admission.
-    "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))
+    "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))),
+        description=(
+            "Experimental grouped native-NVFP4 W13/W2 decode. Local weight "
+            "shapes and attention metadata gates preserve M1, prefill and "
+            "multi-token verify. Default off pending endpoint and "
+            "model-quality admission."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Reuse the batched expert grouping for the exact TP4 MTP4 verifier.
     # Preserve its W13 split4 and ordered FP16 W2/FP32 weighted reduction.
-    "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "0"))
+    "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "0"))),
+        description=(
+            "Reuse the batched expert grouping for the exact TP4 MTP4 "
+            "verifier. Preserve its W13 split4 and ordered FP16 W2/FP32 "
+            "weighted reduction."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
     # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the
     # existing interleaved native-NVFP4 layout. M2 retains its faster separate
     # activation. Set to 0 to retain the standalone activation path.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13",
-                "1",
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13",
+                    "1",
+                )
             )
-        )
+        ),
+        description=(
+            "Split-preserving M4/M8/M16 specializations for the direct Qwen3.8"
+            " expert route. They fuse the FP16 SwiGLU epilogue into W13 while "
+            "reading the existing interleaved native-NVFP4 layout. M2 retains "
+            "its faster separate activation. Set to 0 to retain the standalone"
+            " activation path."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Fuse the direct Qwen3.8 W2 projection with its fixed-order FP32 weighted
     # reduction. Ten warps compute the ten routed slots in parallel; the
     # capability and shape gate keeps every other MoE route unchanged.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2",
-                "1",
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2",
+                    "1",
+                )
             )
-        )
+        ),
+        description=(
+            "Fuse the direct Qwen3.8 W2 projection with its fixed-order FP32 "
+            "weighted reduction. Ten warps compute the ten routed slots in "
+            "parallel; the capability and shape gate keeps every other MoE "
+            "route unchanged."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Keep native E4M3 block-scale codes resident and reconstruct their exact
     # FP16 values in the QPN decode kernels. Generic/prefill TurboMind routes
     # use one reusable expansion workspace, so this reduces persistent scale
     # memory instead of retaining a second representation. Experimental until
     # full-model prefill/decode quality admission is complete.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE", "0"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE", "0"))),
+        description=(
+            "Keep native E4M3 block-scale codes resident and reconstruct their"
+            " exact FP16 values in the QPN decode kernels. Generic/prefill "
+            "TurboMind routes use one reusable expansion workspace, so this "
+            "reduces persistent scale memory instead of retaining a second "
+            "representation. Experimental until full-model prefill/decode "
+            "quality admission is complete."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Exact TP4 Qwen3.8 W13 prefill route. It retains the stable expert sort
     # and unpermute maps but reads original token rows through TurboMind's
     # indexed-A iterator instead of materializing top-k replicated FP16 rows.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL", "1"))),
+        description=(
+            "Exact TP4 Qwen3.8 W13 prefill route. It retains the stable expert"
+            " sort and unpermute maps but reads original token rows through "
+            "TurboMind's indexed-A iterator instead of materializing top-k "
+            "replicated FP16 rows."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Exact Qwen3.8 route: interleave W13 columns at load time and apply SwiGLU
     # in the indexed grouped-GEMM epilogue. The arithmetic is bitwise equal to
     # the standalone FP16 activation and avoids its intermediate traffic.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL", "1"))
+        ),
+        description=(
+            "Exact Qwen3.8 route: interleave W13 columns at load time and "
+            "apply SwiGLU in the indexed grouped-GEMM epilogue. The arithmetic"
+            " is bitwise equal to the standalone FP16 activation and avoids "
+            "its intermediate traffic."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Exact TP4 long-prefill grouped-GEMM policy: split W13 N320 into an N256
     # head plus N64 tail, and retain W2 weights in cache across expert-local M
     # tiles. Both use zero-copy views of the established packed weights.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL", "1"))),
+        description=(
+            "Exact TP4 long-prefill grouped-GEMM policy: split W13 N320 into "
+            "an N256 head plus N64 tail, and retain W2 weights in cache across"
+            " expert-local M tiles. Both use zero-copy views of the "
+            "established packed weights."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Direct fifty-route verifier expert path for Qwen3.8 MTP4. This consumes
     # checkpoint-native NVFP4 weights with FP16 activations; it does not enable
     # online QPN8 activation quantization. The TP4/M5 shape gate is retained;
     # set 0 to restore the grouped expert path and its accumulation order.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1"))),
+        description=(
+            "Direct fifty-route verifier expert path for Qwen3.8 MTP4. This "
+            "consumes checkpoint-native NVFP4 weights with FP16 activations; "
+            "it does not enable online QPN8 activation quantization. The "
+            "TP4/M5 shape gate is retained; set 0 to restore the grouped "
+            "expert path and its accumulation order."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Exact single-token Qwen3.8 W2 epilogue. Ten expert warps retain the
     # established FP16 route rounding and reduce in top-k order with FP32 FMA.
-    "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE", "1"))
+    "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE", "1"))
+        ),
+        description=(
+            "Exact single-token Qwen3.8 W2 epilogue. Ten expert warps retain "
+            "the established FP16 route rounding and reduce in top-k order "
+            "with FP32 FMA."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
-    "VLLM_SM70_NVFP4_QPN_M1_LIBRARY": lambda: os.getenv(
-        "VLLM_SM70_NVFP4_QPN_M1_LIBRARY"
+    "VLLM_SM70_NVFP4_QPN_M1_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY"),
+        description=(
+            "SM70: nvfp4 qpn m1 library. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Exact single-token E=512, K=10 softmax router used by Qwen3.8 Flash
     # Next. All other shapes and scoring modes retain the generic CUDA op.
-    "VLLM_SM70_QWEN38_ROUTER_TOPK": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN38_ROUTER_TOPK", "1"))
+    "VLLM_SM70_QWEN38_ROUTER_TOPK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_ROUTER_TOPK", "1"))),
+        description=(
+            "Exact single-token E=512, K=10 softmax router used by Qwen3.8 "
+            "Flash Next. All other shapes and scoring modes retain the generic"
+            " CUDA op."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))
+    "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))),
+        description=(
+            "SM70: awq reuse imported cache. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
     # Warm up the accepted SM70 AWQ dense / dense-stage / active-expert
     # TurboMind routes before CUDA graph capture. This does not enable the old
     # compact AWQ MoE experiments.
-    "VLLM_SM70_AWQ_WARMUP": lambda: bool(int(os.getenv("VLLM_SM70_AWQ_WARMUP", "1"))),
-    "VLLM_SM70_AWQ_WARMUP_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")
+    "VLLM_SM70_AWQ_WARMUP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_WARMUP", "1"))),
+        description=(
+            "Warm up the accepted SM70 AWQ dense / dense-stage / active-expert"
+            " TurboMind routes before CUDA graph capture. This does not enable"
+            " the old compact AWQ MoE experiments."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS", "8")
+    "VLLM_SM70_AWQ_WARMUP_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")),
+        description=(
+            "SM70: awq warmup max m. The consumer locations and unset defaults"
+            " are listed below."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default=(
+            "16; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_batch_gemm_defaults sets '64' "
+                "when env_name not in os.environ; automatic defaults apply only "
+                "when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_AUX_KERNEL_WARMUP": lambda: bool(
-        int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))
+    "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS", "8")),
+        description=(
+            "SM70: awq warmup max moe tokens. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="8",
+        effective_default="8",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_GEMM_LUT_PATH": lambda: os.getenv("VLLM_SM70_GEMM_LUT_PATH"),
-    "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M", "16")
+    "VLLM_SM70_AUX_KERNEL_WARMUP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AUX_KERNEL_WARMUP", "1"))),
+        description=(
+            "SM70: aux kernel warmup. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M", "16")
+    "VLLM_SM70_GEMM_LUT_PATH": env_var(
+        lambda: os.getenv("VLLM_SM70_GEMM_LUT_PATH"),
+        description=(
+            "SM70: gemm lut path. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M", "16")
+    "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_DENSE_TUNE_MAX_M", "16")),
+        description=(
+            "SM70: awq dense tune max m. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default="16",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
     ),
-    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "16")
+    "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M", "16")),
+        description=(
+            "SM70: fp8 dense tune max m. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default=(
+            "16; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_batch_gemm_defaults sets '64' "
+                "when env_name not in os.environ; automatic defaults apply only "
+                "when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_DSV4_FP16_GEMV": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))
+    "VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M", "16")),
+        description=(
+            "SM70: mxfp4 dense tune max m. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default="16",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
-    "VLLM_SM70_DSV4_FP13_GEMV": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "1"))
+    "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "16")),
+        description=(
+            "SM70: nvfp4 dense tune max m. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default=(
+            "16; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_batch_gemm_defaults sets '64' "
+                "when env_name not in os.environ; automatic defaults apply only "
+                "when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
-    "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
+    "VLLM_SM70_DSV4_FP16_GEMV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))),
+        description=(
+            "SM70: dsv4 fp16 gemv. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
-    "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "1"))
+    "VLLM_SM70_DSV4_FP13_GEMV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "1"))),
+        description=(
+            "SM70: dsv4 fp13 gemv. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
+    ),
+    "VLLM_SM70_DSV4_MHC_FP32_STAGE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))),
+        description=(
+            "SM70: dsv4 mhc fp32 stage. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
+    ),
+    "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "1"))),
+        description=(
+            "SM70: dsv4 qnorm kv fused tp4. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Skip PP metadata and TP reconstruction only for the exact, replicated
     # SM70 B1 hidden-state schema validated by the worker on both stages.
-    "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER": lambda: bool(
-        int(os.getenv("VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER", "1"))
+    "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER", "1"))),
+        description=(
+            "Skip PP metadata and TP reconstruction only for the exact, "
+            "replicated SM70 B1 hidden-state schema validated by the worker on"
+            " both stages."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
+    "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")),
+        description=(
+            "SM70: awq moe tune max tokens. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
     ),
-    "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "128")
+    "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "128")),
+        description=(
+            "SM70: nvfp4 moe tune max tokens. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Experimental unquantized FP16 SM70 TurboMind fast paths. Keep default-off:
     # these must pass the numeric policy and model-level token gate before
     # becoming part of the default V100 route.
-    "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", "0"))
+    "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", "0"))),
+        description=(
+            "Experimental unquantized FP16 SM70 TurboMind fast paths. Keep "
+            "default-off: these must pass the numeric policy and model-level "
+            "token gate before becoming part of the default V100 route."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", "0"))
+    "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", "0"))),
+        description=(
+            "SM70: enable lm head fastpath. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Default-on only feeds the pure-greedy top-token shortcut below. The full
     # LM-head GEMM fast path remains separately gated by
@@ -2237,225 +4971,932 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not make normal sampling use the full fast path. The SM70 Flash-V100
     # 0.0.3 compile-graph policy defaults this to 0 unless explicitly
     # overridden, keeping greedy decode on the local-logits top1 fallback.
-    "VLLM_SM70_LM_HEAD_TOP1": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_SM70_LM_HEAD_TOP1",
-                "0"
-                if os.getenv(
-                    "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
-                    "0",
+    "VLLM_SM70_LM_HEAD_TOP1": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_LM_HEAD_TOP1",
+                    "0"
+                    if os.getenv(
+                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
+                        "0",
+                    )
+                    .strip()
+                    .lower()
+                    in ("1", "true", "yes", "on")
+                    else "1",
                 )
-                .strip()
-                .lower()
-                in ("1", "true", "yes", "on")
-                else "1",
             )
-        )
+        ),
+        description=(
+            "Default-on only feeds the pure-greedy top-token shortcut below. "
+            "The full LM-head GEMM fast path remains separately gated by "
+            "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=0 because its full-logits "
+            "output is not bitwise identical to torch. Preparing the TurboMind"
+            " layout for top1 must not make normal sampling use the full fast "
+            "path. The SM70 Flash-V100 0.0.3 compile-graph policy defaults "
+            "this to 0 unless explicitly overridden, keeping greedy decode on "
+            "the local-logits top1 fallback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '0' when "
+                "sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user "
+                "and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FLASH_ATTN_V100 and 'VLLM_SM70_LM_HEAD_TOP1' not "
+                "in os.environ; automatic defaults apply only when the environment"
+                " override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_LM_HEAD_TOP1_TC": lambda: bool(
-        int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))
+    "VLLM_SM70_LM_HEAD_TOP1_TC": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))),
+        description=(
+            "SM70: lm head top1 tc. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Candidate-only QPN8 LM head. QPN8 selects a conservative local top-64
     # support, then directly re-evaluates the original FP16 rows and restores
     # dense-vocabulary top-k tie order. Keep default-off until real-hidden,
     # quality, and complete Graph/Nsight gates all pass.
-    "VLLM_SM70_DFLASH2_QPN8_RERANK": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))
+    "VLLM_SM70_DFLASH2_QPN8_RERANK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))),
+        description=(
+            "Candidate-only QPN8 LM head. QPN8 selects a conservative local "
+            "top-64 support, then directly re-evaluates the original FP16 rows"
+            " and restores dense-vocabulary top-k tie order. Keep default-off "
+            "until real-hidden, quality, and complete Graph/Nsight gates all "
+            "pass."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Explicit precision contract: retain FP32 candidate and dense logits
     # for the SM70 TP4 DFlash2 LM head, including reference fallback.
-    "VLLM_SM70_DFLASH2_FP32_LOGITS": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FP32_LOGITS", "0"))
+    "VLLM_SM70_DFLASH2_FP32_LOGITS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FP32_LOGITS", "0"))),
+        description=(
+            "Explicit precision contract: retain FP32 candidate and dense "
+            "logits for the SM70 TP4 DFlash2 LM head, including reference "
+            "fallback."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
     # local top-k, and return the dense result so the baseline trajectory is
     # unchanged.  This intentionally synchronizes for diagnostics.
-    "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", "0"))
+    "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", "0"))),
+        description=(
+            "Audit-only eager mode: execute QPN8+rerank, compare it with the "
+            "dense local top-k, and return the dense result so the baseline "
+            "trajectory is unchanged.  This intentionally synchronizes for "
+            "diagnostics."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Preserve the production full-vocabulary torch.topk tie contract by
     # default.  The candidate-order experiment avoids a host-blocking SM70
     # multi-block top-k, but may be enabled only for paired quality tests.
-    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))
+    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))),
+        description=(
+            "Preserve the production full-vocabulary torch.topk tie contract "
+            "by default.  The candidate-order experiment avoids a "
+            "host-blocking SM70 multi-block top-k, but may be enabled only for"
+            " paired quality tests."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Candidate-order tie handling is a benchmark-only experiment. Requiring
     # a second opt-in prevents stale deployment scripts from silently trading
     # scored quality for a small selector win.
-    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "0"))
+    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "0"))
+        ),
+        description=(
+            "Candidate-order tie handling is a benchmark-only experiment. "
+            "Requiring a second opt-in prevents stale deployment scripts from "
+            "silently trading scored quality for a small selector win."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'0' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Umbrella gate for selector-based DFlash verification optimizations. Keep
     # this default-off while each stage is checked against the unchanged path.
-    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))),
+        description=(
+            "Umbrella gate for selector-based DFlash verification "
+            "optimizations. Keep this default-off while each stage is checked "
+            "against the unchanged path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Build all selector-based DFlash target GDN state-index metadata with one
     # pointer-table Triton launch. Keep separate from the shared-classification
     # gate until the fixed-trajectory and mixed-batch Graph checks pass.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))),
+        description=(
+            "Build all selector-based DFlash target GDN state-index metadata "
+            "with one pointer-table Triton launch. Keep separate from the "
+            "shared-classification gate until the fixed-trajectory and "
+            "mixed-batch Graph checks pass."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Classify native MTP batches (any draft depth; the MTP4 prefix is
     # historical) once per step and share it across GDN cache groups. Set 0 to
     # restore separate per-group GDN metadata builds.
-    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
+    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))),
+        description=(
+            "Classify native MTP batches (any draft depth; the MTP4 prefix is "
+            "historical) once per step and share it across GDN cache groups. "
+            "Set 0 to restore separate per-group GDN metadata builds."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Pure native-MTP graph batches can construct all GDN groups' state rows in
     # one launch. Mixed/prefill batches still fall back. Set 0 to restore
     # separate per-group metadata writes while retaining the shared batch
     # classification.
-    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))
+    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))),
+        description=(
+            "Pure native-MTP graph batches can construct all GDN groups' state"
+            " rows in one launch. Mixed/prefill batches still fall back. Set 0"
+            " to restore separate per-group metadata writes while retaining "
+            "the shared batch classification."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.
-    "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "0"))
+    "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "0"))),
+        description=(
+            "Debug-only oracle: materialize the legacy advanced-indexing "
+            "contract and compare it with the fused persistent buffers before "
+            "graph replay."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Debug-only device-value assertion. The metadata producers and FULL graph
     # replay share the current CUDA stream, so production ordering does not
     # require a host-blocking Tensor.item(). The no-sync route preserves the
     # accepted token/acceptance trajectory; opt in only when auditing metadata.
-    "VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT", "0"))
+    "VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT", "0"))),
+        description=(
+            "Debug-only device-value assertion. The metadata producers and "
+            "FULL graph replay share the current CUDA stream, so production "
+            "ordering does not require a host-blocking Tensor.item(). The "
+            "no-sync route preserves the accepted token/acceptance trajectory;"
+            " opt in only when auditing metadata."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Selector-based DFlash packed GDN verification kernel. This is deliberately
     # independent from the shared-metadata umbrella gate so each optimization
     # can be paired against the unchanged verifier in isolation.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))),
+        description=(
+            "Selector-based DFlash packed GDN verification kernel. This is "
+            "deliberately independent from the shared-metadata umbrella gate "
+            "so each optimization can be paired against the unchanged verifier"
+            " in isolation."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Independently gated q8/TP2 packed GDN schedule; other shapes retain the
     # accepted recurrent launch geometry.
-    "VLLM_SM70_DFLASH2_TP2_GDN_BV2": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_TP2_GDN_BV2", "0"))
+    "VLLM_SM70_DFLASH2_TP2_GDN_BV2": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_TP2_GDN_BV2", "0"))),
+        description=(
+            "Independently gated q8/TP2 packed GDN schedule; other shapes "
+            "retain the accepted recurrent launch geometry."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Route compatible target GDN output gates through the existing one-pass
     # CUDA RMSNormGated implementation. This remains an explicit opt-in.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))),
+        description=(
+            "Route compatible target GDN output gates through the existing "
+            "one-pass CUDA RMSNormGated implementation. This remains an "
+            "explicit opt-in."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Fuse compatible nonzero-offset GDN z/b/a materialization into one
     # copy kernel. This must stay separate from the plain-view path because
     # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))),
+        description=(
+            "Fuse compatible nonzero-offset GDN z/b/a materialization into one"
+            " copy kernel. This must stay separate from the plain-view path "
+            "because nonzero-offset views are unsafe under the SM70 "
+            "compile/full-graph route."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT", "0"))),
+        description="Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.",
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Return the existing projection tensor across the GDN opaque boundary.
     # This does not enable collective/norm fusion or change state arithmetic.
-    "VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT", "0"))
+    "VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT", "0"))),
+        description=(
+            "Return the existing projection tensor across the GDN opaque "
+            "boundary. This does not enable collective/norm fusion or change "
+            "state arithmetic."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Build Flash-V100 small-query verifier rows directly in their persistent
     # graph buffers. This replaces four repeat_interleave scans per KV group.
     # The matched TP4 trace is token/acceptance exact and cuts the synchronized
     # DFlash2 draft-to-target interval from 5.720 ms to 1.911 ms on V100.
-    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))),
+        description=(
+            "Build Flash-V100 small-query verifier rows directly in their "
+            "persistent graph buffers. This replaces four repeat_interleave "
+            "scans per KV group. The matched TP4 trace is token/acceptance "
+            "exact and cuts the synchronized DFlash2 draft-to-target interval "
+            "from 5.720 ms to 1.911 ms on V100."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Collapse five compatible target small-query metadata launches into one
     # heterogeneous-width pointer-table kernel. The paired
     # TP4 node trace is token/acceptance exact and reduces synchronized D2T.
-    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA", "0"))
+    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA", "0"))),
+        description=(
+            "Collapse five compatible target small-query metadata launches "
+            "into one heterogeneous-width pointer-table kernel. The paired TP4"
+            " node trace is token/acceptance exact and reduces synchronized "
+            "D2T."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Copy the post-convolution Q/K/V row slices into the recurrent kernel's
     # packed contiguous layout with one bitwise Triton launch. This replaces
     # three reshape copies plus one cat in the exact block-eight verifier.
-    "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_QKV_PACK", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_QKV_PACK", "0"))),
+        description=(
+            "Copy the post-convolution Q/K/V row slices into the recurrent "
+            "kernel's packed contiguous layout with one bitwise Triton launch."
+            " This replaces three reshape copies plus one cat in the exact "
+            "block-eight verifier."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
     # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
-    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
+    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))),
+        description=(
+            "Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix "
+            "used by small DFlash2 verifier graphs. Default-off pending "
+            "numeric/quality gates."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Fixed 8192/16-warp reduction for the FP16 no-residual and
     # FP16-residual Gemma norms not covered by the existing FP32-residual path.
     # Prevents per-rank/startup autotune from changing reduction order. Enabled
     # by the SM70 DFlash2 profile; explicit zero retains the rollback path.
-    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))),
+        description=(
+            "Fixed 8192/16-warp reduction for the FP16 no-residual and "
+            "FP16-residual Gemma norms not covered by the existing "
+            "FP32-residual path. Prevents per-rank/startup autotune from "
+            "changing reduction order. Enabled by the SM70 DFlash2 profile; "
+            "explicit zero retains the rollback path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
     # DFlash2 proposal and target sampling distributions both have compact
     # top-k support. Default-off until paired output/acceptance and end-to-end
     # V100 gates pass; unsupported sampling features fall back to dense logits.
-    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))),
+        description=(
+            "Avoid materializing/gathering full-vocabulary target logits when "
+            "the DFlash2 proposal and target sampling distributions both have "
+            "compact top-k support. Default-off until paired output/acceptance"
+            " and end-to-end V100 gates pass; unsupported sampling features "
+            "fall back to dense logits."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '0' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Compute the compatible 25600->5120 target-hidden projection as four output
     # shards, then all-gather only the 80-KiB block-eight result. The global
     # default remains off; audited DFlash2 contracts enable it explicitly.
-    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))),
+        description=(
+            "Compute the compatible 25600->5120 target-hidden projection as "
+            "four output shards, then all-gather only the 80-KiB block-eight "
+            "result. The global default remains off; audited DFlash2 contracts"
+            " enable it explicitly."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))
+    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))),
+        description=(
+            "SM70: dflash2 context kv graph. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))
+    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))),
+        description=(
+            "SM70: dflash2 context pipeline. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
     # topology contracts enable it while the global default remains off.
-    "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))
+    "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))),
+        description=(
+            "Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited "
+            "model and topology contracts enable it while the global default "
+            "remains off."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Fixed-shape SM70 q8 mHC post+dot kernel. The global default remains off;
     # audited GLM-5.3 verifier contracts enable the bitwise-qualified path.
-    "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8", "0"))
+    "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8", "0"))),
+        description=(
+            "Fixed-shape SM70 q8 mHC post+dot kernel. The global default "
+            "remains off; audited GLM-5.3 verifier contracts enable the "
+            "bitwise-qualified path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Exact fixed-shape GLM-5.3 verifier route. It fuses the stable E288 sort,
     # inverse map, compact active-expert groups, and M8/K8 input expansion.
-    "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8", "1"))
+    "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8", "1"))),
+        description=(
+            "Exact fixed-shape GLM-5.3 verifier route. It fuses the stable "
+            "E288 sort, inverse map, compact active-expert groups, and M8/K8 "
+            "input expansion."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8", "1"))
+    "VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8", "1"))),
+        description=(
+            "SM70: glm53 moe shuffle sort q8. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Exact TP8/q8 W13 path matching TurboMind's CTA-K32 split-3 tree.
-    "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_MOE_QPN_W13_Q8", "0"))
+    "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MOE_QPN_W13_Q8", "0"))),
+        description="Exact TP8/q8 W13 path matching TurboMind's CTA-K32 split-3 tree.",
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '0' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Fuse the local shared+routed FP16 add into the exact TP8 q8 push tree.
-    "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8", "1"))
+    "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8", "1"))),
+        description=(
+            "Fuse the local shared+routed FP16 add into the exact TP8 q8 push tree."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
-    "VLLM_SM70_GLM_MHC_PRE_THREADS": lambda: int(
-        os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")
+    "VLLM_SM70_GLM_MHC_PRE_THREADS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")),
+        description=(
+            "SM70: glm mhc pre threads. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="256",
+        effective_default=(
+            "256; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1024' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Exact GLM-5.3 q8 KDA projection. The -3 variant uses a four-row CTA with
     # swizzled shared partials; zero keeps the scalar reference for audits.
-    "VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS": lambda: int(
-        os.getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-3")
+    "VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-3")),
+        description=(
+            "Exact GLM-5.3 q8 KDA projection. The -3 variant uses a four-row "
+            "CTA with swizzled shared partials; zero keeps the scalar "
+            "reference for audits."
+        ),
+        category="configuration",
+        declared_default="-3",
+        effective_default="-3",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_GLM53_TP8_CUBLASLT": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0"))
+    "VLLM_SM70_GLM53_TP8_CUBLASLT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0"))),
+        description=(
+            "SM70: glm53 tp8 cublaslt. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Fixed-shape TP8 KDA f_b/g_b fusion. The global default remains off;
     # the quality-audited GLM-5.3 DFlash2 TP8/PP1 contract enables it.
-    "VLLM_SM70_GLM53_TP8_FUSED_FG_B": lambda: bool(
-        int(os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0"))
+    "VLLM_SM70_GLM53_TP8_FUSED_FG_B": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0"))),
+        description=(
+            "Fixed-shape TP8 KDA f_b/g_b fusion. The global default remains "
+            "off; the quality-audited GLM-5.3 DFlash2 TP8/PP1 contract enables"
+            " it."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
     # transformed q logits are cached for rejection sampling, so non-default
     # values preserve the target distribution while changing acceptance.
-    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": lambda: float(
-        os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE", "1.0")
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": env_var(
+        lambda: float(os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE", "1.0")),
+        description=(
+            "Proposal-only calibration for DFlash2 probabilistic drafting. The"
+            " exact transformed q logits are cached for rejection sampling, so"
+            " non-default values preserve the target distribution while "
+            "changing acceptance."
+        ),
+        category="configuration",
+        declared_default="1.0",
+        effective_default=(
+            "1.0; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '0.9' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp4_pp2_acceptanc"
+                "e_path sets '0.8' when name not in os.environ; automatic defaults"
+                " apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": lambda: float(
-        os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P", "1.0")
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": env_var(
+        lambda: float(os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P", "1.0")),
+        description=(
+            "SM70: dflash2 proposal top p. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="1.0",
+        effective_default=(
+            "1.0; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '0.95' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp4_pp2_acceptanc"
+                "e_path sets '0.95' when name not in os.environ; automatic "
+                "defaults apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_GLM53_PP_MHC_MATERIALIZE": lambda: bool(
-        int(os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0"))
+    "VLLM_GLM53_PP_MHC_MATERIALIZE": env_var(
+        lambda: bool(int(os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0"))),
+        description=(
+            "vLLM: glm53 pp mhc materialize. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Allow DFlash2 candidate TopK when the shared target LM head is
     # quantized (e.g. compressed-tensors NVFP4 checkpoints, whose
@@ -2464,1453 +5905,5396 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # candidates instead of the QPN8 fast path. Opt-in because draft
     # acceptance may differ from the unquantized baseline; quality gates
     # must follow before broad rollout.
-    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QUANT_LM_HEAD", "0"))
+    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QUANT_LM_HEAD", "0"))),
+        description=(
+            "Allow DFlash2 candidate TopK when the shared target LM head is "
+            "quantized (e.g. compressed-tensors NVFP4 checkpoints, whose "
+            "unquantized-head guard predates this deployment). The dense-logit"
+            " fallback (quant_method.apply over the full vocabulary) produces "
+            "the candidates instead of the QPN8 fast path. Opt-in because "
+            "draft acceptance may differ from the unquantized baseline; "
+            "quality gates must follow before broad rollout."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
+                "'1' when env_name not in os.environ; automatic defaults apply "
+                "only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Default-on SGLang-style push collective for the validated FP16 80-KiB
     # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA
     # Graphs. Other devices, topologies, sizes, and eager calls retain the
     # ordinary pull path; explicit 0 is the rollback.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))),
+        description=(
+            "Default-on SGLang-style push collective for the validated FP16 "
+            "80-KiB verifier and 8-KiB decode payloads on fully-connected SM70"
+            " TP4 CUDA Graphs. Other devices, topologies, sizes, and eager "
+            "calls retain the ordinary pull path; explicit 0 is the rollback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp4_push_allreduc"
+                "e sets '0' when env_name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Opt-in Qwen3.8 DFlash2 extension of the TP4 push collective from the
     # accepted M8 payload to M16/M32 verifier payloads.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY", "1"))
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY", "1"))),
+        description=(
+            "Opt-in Qwen3.8 DFlash2 extension of the TP4 push collective from "
+            "the accepted M8 payload to M16/M32 verifier payloads."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
     # only. Other shapes/topologies retain their gates; explicit 0 rolls back.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "1"))
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "1"))),
+        description=(
+            "Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The"
+            " existing push allocation is sized for 80 KiB, so this changes "
+            "dispatch only. Other shapes/topologies retain their gates; "
+            "explicit 0 rolls back."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Bitwise-equal push collectives for FP16 [4|8|16, 2560] payloads on
     # fully-connected SM70 TP4 CUDA Graphs. Other shapes, topologies, devices,
     # and eager execution retain the normal custom-allreduce path.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH", "1"))
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH", "1"))),
+        description=(
+            "Bitwise-equal push collectives for FP16 [4|8|16, 2560] payloads "
+            "on fully-connected SM70 TP4 CUDA Graphs. Other shapes, "
+            "topologies, devices, and eager execution retain the normal "
+            "custom-allreduce path."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Exact Qwen3.8 single-token MoE payload: FP16 [1, 2560]. Reuse the
     # already-registered SM70 TP4 push buffers for all_reduce_sum2 while
     # retaining the existing FP16 local sum and rank-ordered FP32 reduction.
     # The TP4 CUDA Graph gate is bitwise across all ranks and cuts 48
     # collectives from 0.459 ms to 0.136 ms; explicit 0 is the rollback.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1", "1"))
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1", "1"))),
+        description=(
+            "Exact Qwen3.8 single-token MoE payload: FP16 [1, 2560]. Reuse the"
+            " already-registered SM70 TP4 push buffers for all_reduce_sum2 "
+            "while retaining the existing FP16 local sum and rank-ordered FP32"
+            " reduction. The TP4 CUDA Graph gate is bitwise across all ranks "
+            "and cuts 48 collectives from 0.459 ms to 0.136 ms; explicit 0 is "
+            "the rollback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Experimental ordinary all-reduce admission by aligned message size.
     # SM70, fully connected TP4 and captured FP16 only; default off until the
     # mixed-size graph replay, numerical and full-model quality gates pass.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "1"))
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "1"))
+        ),
+        description=(
+            "Experimental ordinary all-reduce admission by aligned message "
+            "size. SM70, fully connected TP4 and captured FP16 only; default "
+            "off until the mixed-size graph replay, numerical and full-model "
+            "quality gates pass."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Refuse to start when a checkpoint carries no calibrated QSA E4M3 K/V
     # scales. Off by default: an uncalibrated checkpoint runs on the module's
     # 1.0 defaults with a warning instead of failing to serve.
-    "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES": lambda: bool(
-        int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0"))
+    "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES": env_var(
+        lambda: bool(int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0"))),
+        description=(
+            "Refuse to start when a checkpoint carries no calibrated QSA E4M3 "
+            "K/V scales. Off by default: an uncalibrated checkpoint runs on "
+            "the module's 1.0 defaults with a warning instead of failing to "
+            "serve."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
     ),
     # Optional task-built custom-AR fragment. Operators present in the sidecar
     # override the production namespace; every other operator falls back.
-    "VLLM_SM70_CUSTOM_AR_LIBRARY": lambda: os.getenv("VLLM_SM70_CUSTOM_AR_LIBRARY"),
+    "VLLM_SM70_CUSTOM_AR_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_CUSTOM_AR_LIBRARY"),
+        description=(
+            "Optional task-built custom-AR fragment. Operators present in the "
+            "sidecar override the production namespace; every other operator "
+            "falls back."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+    ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
     # or custom logits processing. It still computes local logits with the
     # normal LM head unless the separate experimental LM-head top1 gates are
     # enabled.
-    "VLLM_SM70_GREEDY_TOKEN_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH", "1"))
+    "VLLM_SM70_GREEDY_TOKEN_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH", "1"))),
+        description=(
+            "Safe greedy-only shortcut: avoid full vocab all-gather/sampler "
+            "work when the request batch is pure greedy and has no penalties, "
+            "logprobs, grammar, or custom logits processing. It still computes"
+            " local logits with the normal LM head unless the separate "
+            "experimental LM-head top1 gates are enabled."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": lambda: bool(
-        int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))
+    "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))),
+        description=(
+            "SM70: greedy token fastpath trace. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
-    "VLLM_SM70_TOPK_TOPP_8_WARPS": lambda: bool(
-        int(os.getenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "0"))
+    "VLLM_SM70_TOPK_TOPP_8_WARPS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "0"))),
+        description=(
+            "Opt-in V100 launch for the exact validated combined top-k/top-p shapes."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # The exact B8/B16, 248320-column sampler contract uses one logits row per
     # request. Eight warps preserves Qrita's masking math while improving SM70
     # reduction parallelism. Set to 0 to restore Triton's launch heuristic.
-    "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS": lambda: bool(
-        int(os.getenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1"))
+    "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1"))),
+        description=(
+            "The exact B8/B16, 248320-column sampler contract uses one logits "
+            "row per request. Eight warps preserves Qrita's masking math while"
+            " improving SM70 reduction parallelism. Set to 0 to restore "
+            "Triton's launch heuristic."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
     # decode steps before collecting CPU-visible outputs; this changes queueing
     # only, not token contents or scheduler output semantics.
-    "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH": lambda: max(
-        0, int(os.getenv("VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH", "0"))
+    "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH": env_var(
+        lambda: max(0, int(os.getenv("VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH", "0"))),
+        description=(
+            "Diagnostic SM70 async scheduling depth override. Default 0 "
+            "preserves upstream behavior. Values >2 let no-PP async scheduling"
+            " enqueue more real decode steps before collecting CPU-visible "
+            "outputs; this changes queueing only, not token contents or "
+            "scheduler output semantics."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="Computed when unset: max(0, int('0'))",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_ASYNC_STAGED_INPUT_PREP": lambda: bool(
-        int(os.getenv("VLLM_SM70_ASYNC_STAGED_INPUT_PREP", "0"))
+    "VLLM_SM70_ASYNC_STAGED_INPUT_PREP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_ASYNC_STAGED_INPUT_PREP", "0"))),
+        description=(
+            "SM70: async staged input prep. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_ASYNC_CPU_TRACE": lambda: bool(
-        int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE", "0"))
+    "VLLM_SM70_ASYNC_CPU_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE", "0"))),
+        description=(
+            "SM70: async cpu trace. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_ASYNC_CPU_TRACE_EVERY": lambda: max(
-        1, int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE_EVERY", "16"))
+    "VLLM_SM70_ASYNC_CPU_TRACE_EVERY": env_var(
+        lambda: max(1, int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE_EVERY", "16"))),
+        description=(
+            "SM70: async cpu trace every. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="16",
+        effective_default="Computed when unset: max(1, int('16'))",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy 0.0.3 diagnostic gate. Logs one TP all-reduce backend decision per
     # group/backend/shape/dtype so route-hit data can distinguish custom AR,
     # pynccl, flashinfer, symmetric-memory, and torch fallback paths.
-    "VLLM_TP_ALLREDUCE_TRACE": lambda: bool(
-        int(os.getenv("VLLM_TP_ALLREDUCE_TRACE", "0"))
+    "VLLM_TP_ALLREDUCE_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_TP_ALLREDUCE_TRACE", "0"))),
+        description=(
+            "Legacy 0.0.3 diagnostic gate. Logs one TP all-reduce backend "
+            "decision per group/backend/shape/dtype so route-hit data can "
+            "distinguish custom AR, pynccl, flashinfer, symmetric-memory, and "
+            "torch fallback paths."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
-    "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT": lambda: (
-        int(os.environ["VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT"])
-        if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
-        else None
+    "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT": env_var(
+        lambda: (
+            int(os.environ["VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT"])
+            if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
+            else None
+        ),
+        description=(
+            "vLLM: custom allreduce block limit. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "Computed when unset: "
+            "int(os.environ['VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT']) if "
+            "'VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT' in os.environ else None"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Opt in exact MTP4 verifier payloads on fully-connected SM70 TP4.
-    "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING", "0"))
+    "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING", "0"))),
+        description="Opt in exact MTP4 verifier payloads on fully-connected SM70 TP4.",
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_TP4_M5_AR_THREADS": lambda: (
-        int(os.environ["VLLM_SM70_TP4_M5_AR_THREADS"])
-        if "VLLM_SM70_TP4_M5_AR_THREADS" in os.environ
-        else None
+    "VLLM_SM70_TP4_M5_AR_THREADS": env_var(
+        lambda: (
+            int(os.environ["VLLM_SM70_TP4_M5_AR_THREADS"])
+            if "VLLM_SM70_TP4_M5_AR_THREADS" in os.environ
+            else None
+        ),
+        description=(
+            "SM70: tp4 m5 ar threads. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=(
+            "Computed when unset: "
+            "int(os.environ['VLLM_SM70_TP4_M5_AR_THREADS']) if "
+            "'VLLM_SM70_TP4_M5_AR_THREADS' in os.environ else None"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
-    "VLLM_SM70_TP4_SMALL_AR_PACK32": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_SMALL_AR_PACK32", "0"))
+    "VLLM_SM70_TP4_SMALL_AR_PACK32": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP4_SMALL_AR_PACK32", "0"))),
+        description=(
+            "SM70: tp4 small ar pack32. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
     # off until the communicator path has same-criterion model evidence.
-    "VLLM_SM70_TOP1_CUSTOM_AR": lambda: bool(
-        int(os.getenv("VLLM_SM70_TOP1_CUSTOM_AR", "0"))
+    "VLLM_SM70_TOP1_CUSTOM_AR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TOP1_CUSTOM_AR", "0"))),
+        description=(
+            "Optional custom allreduce for the tiny per-rank top1 pair. Keep "
+            "default off until the communicator path has same-criterion model "
+            "evidence."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_F16_DENSE_ALLOWLIST": lambda: os.getenv("VLLM_SM70_F16_DENSE_ALLOWLIST"),
-    "VLLM_SM70_MOE_DENSE_ALLOWLIST": lambda: os.getenv("VLLM_SM70_MOE_DENSE_ALLOWLIST"),
-    "VLLM_SM70_F16_DENSE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64")
+    "VLLM_SM70_F16_DENSE_ALLOWLIST": env_var(
+        lambda: os.getenv("VLLM_SM70_F16_DENSE_ALLOWLIST"),
+        description=(
+            "SM70: f16 dense allowlist. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_F16_DENSE_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_SM70_F16_DENSE_DEBUG", "0"))
+    "VLLM_SM70_MOE_DENSE_ALLOWLIST": env_var(
+        lambda: os.getenv("VLLM_SM70_MOE_DENSE_ALLOWLIST"),
+        description=(
+            "SM70: moe dense allowlist. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_QWEN3_NEXT_SM70_TRACE": lambda: bool(
-        int(os.getenv("VLLM_QWEN3_NEXT_SM70_TRACE", "0"))
+    "VLLM_SM70_F16_DENSE_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64")),
+        description=(
+            "SM70: f16 dense max m. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="tuning",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE", "0"))
+    "VLLM_SM70_F16_DENSE_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_F16_DENSE_DEBUG", "0"))),
+        description=(
+            "SM70: f16 dense debug. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL": lambda: bool(
-        int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL", "0"))
+    "VLLM_QWEN3_NEXT_SM70_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_QWEN3_NEXT_SM70_TRACE", "0"))),
+        description=(
+            "vLLM: qwen3 next sm70 trace. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_UNQUANT_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0"))
+    "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE", "0"))),
+        description=(
+            "SM70: disable unquantized moe inplace. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_SHARED_GATE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64")
+    "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL", "0"))),
+        description=(
+            "SM70: unquantized moe 0dot3 functional. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_UNQUANT_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0"))),
+        description=(
+            "SM70: unquant debug. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_SHARED_GATE_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64")),
+        description=(
+            "SM70: shared gate max m. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Compatibility fallback for serialized FP8 checkpoints on SM70 shapes not
     # handled by the TurboMind W8A16 dense kernel: dequantize once at load time
     # and run regular fp16 linear.
-    "VLLM_SM70_FP8_DEQUANT_FALLBACK": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_DEQUANT_FALLBACK", "1"))
+    "VLLM_SM70_FP8_DEQUANT_FALLBACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_DEQUANT_FALLBACK", "1"))),
+        description=(
+            "Compatibility fallback for serialized FP8 checkpoints on SM70 "
+            "shapes not handled by the TurboMind W8A16 dense kernel: "
+            "dequantize once at load time and run regular fp16 linear."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # V100/SM70 block-FP8 dense path using TurboMind W8A16. Default-on matches
     # 0.0.3 for SM70 dense FP8; MoE route policy is controlled below.
-    "VLLM_SM70_FP8_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_TURBOMIND", "1"))
+    "VLLM_SM70_FP8_TURBOMIND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_TURBOMIND", "1"))),
+        description=(
+            "V100/SM70 block-FP8 dense path using TurboMind W8A16. Default-on "
+            "matches 0.0.3 for SM70 dense FP8; MoE route policy is controlled "
+            "below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '0' when self.model_config"
+                " is not None and self.model_config.quantization == 'fp8' and "
+                "self.model_config.is_moe and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FP8_DEQUANT_FALLBACK and "
+                "envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK and (not "
+                "envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)) and (not "
+                "envs.force_sm70_marlin()) and ('VLLM_SM70_FP8_TURBOMIND' not in "
+                "os.environ); automatic defaults apply only when the environment "
+                "override is absent."
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It prepares
     # a single interleaved primary layout for gate_up_proj, avoiding the older
     # duplicate normal+gated layouts that cost about 5.4 GiB/rank on
     # Qwen3.6-27B-FP8 TP2.
-    "VLLM_SM70_FP8_DENSE_GATED_SILU": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_DENSE_GATED_SILU", "1"))
+    "VLLM_SM70_FP8_DENSE_GATED_SILU": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_DENSE_GATED_SILU", "1"))),
+        description=(
+            "Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It "
+            "prepares a single interleaved primary layout for gate_up_proj, "
+            "avoiding the older duplicate normal+gated layouts that cost about"
+            " 5.4 GiB/rank on Qwen3.6-27B-FP8 TP2."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Accepted SM70 FP4-family dense routes. Default-on keeps NVFP4/MXFP4
     # checkpoints loadable and fast on V100; set either env to 0 to force the
     # non-TurboMind route for diagnostics.
-    "VLLM_SM70_NVFP4_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "1"))
+    "VLLM_SM70_NVFP4_TURBOMIND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "1"))),
+        description=(
+            "Accepted SM70 FP4-family dense routes. Default-on keeps "
+            "NVFP4/MXFP4 checkpoints loadable and fast on V100; set either env"
+            " to 0 to force the non-TurboMind route for diagnostics."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Dispatch all 256 routed experts in one grouped TurboMind call for the
     # exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 decode keeps
     # the compact active-expert route; larger graph shapes use full groups.
-    "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1"))
+    "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1"))),
+        description=(
+            "Dispatch all 256 routed experts in one grouped TurboMind call for"
+            " the exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 "
+            "decode keeps the compact active-expert route; larger graph shapes"
+            " use full groups."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Experimental GLM-5.3 verifier route. Consecutive sorted slots that hit
     # the same expert share one TurboMind group so its packed weights are read
     # once for all rows. The candidate stays opt-in until its exactness and
     # model-quality gates pass.
-    "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS", "0"))
+    "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS", "0"))),
+        description=(
+            "Experimental GLM-5.3 verifier route. Consecutive sorted slots "
+            "that hit the same expert share one TurboMind group so its packed "
+            "weights are read once for all rows. The candidate stays opt-in "
+            "until its exactness and model-quality gates pass."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
-    "VLLM_SM70_NVFP4_DENSE_GATED_SILU": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_DENSE_GATED_SILU", "1"))
+    "VLLM_SM70_NVFP4_DENSE_GATED_SILU": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_DENSE_GATED_SILU", "1"))),
+        description=(
+            "SM70: nvfp4 dense gated silu. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B
     # NVFP4 TP4 no-MTP contract. Larger-M prefill dequantizes into one bounded
     # shared FP16 workspace. Set to 0 to retain the TurboMind NVFP4 route.
-    "VLLM_SM70_NVFP4_QPN4": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN4", "1"))),
-    "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE", "0"))
+    "VLLM_SM70_NVFP4_QPN4": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN4", "1"))),
+        description=(
+            "Memory-neutral native QPN4 M=1 decode for the accepted "
+            "Qwen3.8-27B NVFP4 TP4 no-MTP contract. Larger-M prefill "
+            "dequantizes into one bounded shared FP16 workspace. Set to 0 to "
+            "retain the TurboMind NVFP4 route."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Qpn4NvFp4LinearKernel",),
+    ),
+    "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE", "0"))),
+        description=(
+            "SM70: nvfp4 qpn4 down scale code. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Qpn4NvFp4LinearKernel",),
     ),
     # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
     # The base flag enables exact compact sampling after full-logits gather.
     # The separate TP-local flag opts into rank-local top-20 reduction.
-    "VLLM_SM70_COMPACT_TOPK20_SAMPLER": lambda: bool(
-        int(os.getenv("VLLM_SM70_COMPACT_TOPK20_SAMPLER", "0"))
+    "VLLM_SM70_COMPACT_TOPK20_SAMPLER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_COMPACT_TOPK20_SAMPLER", "0"))),
+        description=(
+            "Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one "
+            "contract. The base flag enables exact compact sampling after "
+            "full-logits gather. The separate TP-local flag opts into "
+            "rank-local top-20 reduction."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_CHUNKED_TOPK20_CHUNKS": lambda: int(
-        os.getenv("VLLM_SM70_CHUNKED_TOPK20_CHUNKS", "0")
+    "VLLM_SM70_CHUNKED_TOPK20_CHUNKS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_CHUNKED_TOPK20_CHUNKS", "0")),
+        description=(
+            "SM70: chunked topk20 chunks. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER", "0"))
+    "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER", "0"))),
+        description=(
+            "SM70: tp local topk20 sampler. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
+    "VLLM_SM70_MXFP4_TURBOMIND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))),
+        description=(
+            "SM70: mxfp4 turbomind. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them
     # opt-in until full-model token and long-output quality gates pass.
-    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", "0"))
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", "0"))),
+        description=(
+            "DeepSeek V4 sparse MLA decode split-K routes for SM70. Keep them "
+            "opt-in until full-model token and long-output quality gates pass."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4", "0"))),
+        description=(
+            "SM70: dsv4 sparse mla splitk c4. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))
+    "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128", "0"))),
+        description=(
+            "SM70: dsv4 sparse mla splitk c128. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
+    "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))),
+        description=(
+            "SM70: dsv4 sparse mla qk dsplit. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
     # then executed by the unquantized Triton MoE path. Keep this default-off:
     # the production SM70 FP8 baseline should use the native TurboMind MoE
     # route without requiring a manual env override.
-    "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK", "0"))
+    "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK", "0"))),
+        description=(
+            "Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can "
+            "still use TurboMind W8A16, but MoE expert weights are dequantized"
+            " once to fp16 and then executed by the unquantized Triton MoE "
+            "path. Keep this default-off: the production SM70 FP8 baseline "
+            "should use the native TurboMind MoE route without requiring a "
+            "manual env override."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '0' when self.model_config"
+                " is not None and self.model_config.quantization == 'fp8' and "
+                "self.model_config.is_moe and "
+                "(self.parallel_config.tensor_parallel_size <= 2) and "
+                "sm70_fp8_kv_requested and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FP8_DEQUANT_FALLBACK and "
+                "envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND) and "
+                "('VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK' not in os.environ); "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Default SM70 native FP8 MoE throughput lane. The per-expert dense-stage
     # route remains available by setting this to 0 for diagnostics.
-    "VLLM_SM70_FP8_MOE_BATCHED_GEMM": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_BATCHED_GEMM", "1"))
+    "VLLM_SM70_FP8_MOE_BATCHED_GEMM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_MOE_BATCHED_GEMM", "1"))),
+        description=(
+            "Default SM70 native FP8 MoE throughput lane. The per-expert "
+            "dense-stage route remains available by setting this to 0 for "
+            "diagnostics."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Stage-local dispatch choices for the native FP8 MoE batched route. They
     # reuse the shared route policy but keep FP8-specific kernels; keep them
     # default-off as diagnostic lanes separate from the batched throughput
     # default above.
-    "VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH", "0"))
+    "VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH", "0"))
+        ),
+        description=(
+            "Stage-local dispatch choices for the native FP8 MoE batched "
+            "route. They reuse the shared route policy but keep FP8-specific "
+            "kernels; keep them default-off as diagnostic lanes separate from "
+            "the batched throughput default above."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_FP8_MOE_BATCHED_W2_PER_EXPERT_DISPATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_BATCHED_W2_PER_EXPERT_DISPATCH", "0"))
+    "VLLM_SM70_FP8_MOE_BATCHED_W2_PER_EXPERT_DISPATCH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_FP8_MOE_BATCHED_W2_PER_EXPERT_DISPATCH", "0"))
+        ),
+        description=(
+            "SM70 FP8 MoE: batched w2 per expert dispatch. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Legacy 0.0.3 strict failure switch for the paused FP8 compact MoE
     # compare harness. Latest keeps compact/router/gated variants out of the
     # safe path; this env is registered only for compatibility and route-ledger
     # visibility.
-    "VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL", "0"))
+    "VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL", "0"))
+        ),
+        description=(
+            "Legacy 0.0.3 strict failure switch for the paused FP8 compact MoE"
+            " compare harness. Latest keeps compact/router/gated variants out "
+            "of the safe path; this env is registered only for compatibility "
+            "and route-ledger visibility."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Use the same scratch-backed MoE permutation helper as AWQ when available.
     # It removes generic scratch allocation overhead while preserving the same
     # sorted route metadata contract. If the extension lacks the op, FP8 falls
     # back to the generic vLLM permute path in Python.
-    "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH", "1"))
+    "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH", "1"))),
+        description=(
+            "Use the same scratch-backed MoE permutation helper as AWQ when "
+            "available. It removes generic scratch allocation overhead while "
+            "preserving the same sorted route metadata contract. If the "
+            "extension lacks the op, FP8 falls back to the generic vLLM "
+            "permute path in Python."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # DeepSeek V4 batch-one MXFP4 decode has six routed slots but 256 local
     # experts. Dispatch only those six fixed graph slots; expert IDs remain
     # device tensors and can change between CUDA Graph replays.
-    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
+    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))),
+        description=(
+            "DeepSeek V4 batch-one MXFP4 decode has six routed slots but 256 "
+            "local experts. Dispatch only those six fixed graph slots; expert "
+            "IDs remain device tensors and can change between CUDA Graph "
+            "replays."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Extend the graph-safe active-expert route beyond B1. Values above eight
     # are clamped by the exact DeepSeek V4 verifier buffer contract.
-    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS": lambda: max(
-        1, int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS", "8"))
+    "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS": env_var(
+        lambda: max(
+            1, int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS", "8"))
+        ),
+        description=(
+            "Extend the graph-safe active-expert route beyond B1. Values above"
+            " eight are clamped by the exact DeepSeek V4 verifier buffer "
+            "contract."
+        ),
+        category="tuning",
+        declared_default="8",
+        effective_default="Computed when unset: max(1, int('8'))",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.
-    "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "1"))
+    "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "1"))),
+        description=(
+            "Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one "
+            "TurboMind launch. The C++ route reads this value directly as "
+            "well."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Experimental verifier-M8 grouped dispatch. This collapses the fixed 48
     # active-expert stage calls into one TurboMind grouped launch.
-    "VLLM_SM70_MXFP4_MOE_GROUPED_M8": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))),
+        description=(
+            "Experimental verifier-M8 grouped dispatch. This collapses the "
+            "fixed 48 active-expert stage calls into one TurboMind grouped "
+            "launch."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Extend the one-launch grouped verifier route from M=8 to M=2..M=8.
     # Kept independent until each width passes its CUDA Graph and model gates.
-    "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER", "0"))
+    "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER", "0"))),
+        description=(
+            "Extend the one-launch grouped verifier route from M=8 to "
+            "M=2..M=8. Kept independent until each width passes its CUDA Graph"
+            " and model gates."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Group verifier slots routed to the same expert into one multi-row group.
     # This changes the MXFP4 reduction tactic, so it stays behind an
     # independent acceptance/quality gate.
-    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS", "0"))
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS", "0"))),
+        description=(
+            "Group verifier slots routed to the same expert into one multi-row"
+            " group. This changes the MXFP4 reduction tactic, so it stays "
+            "behind an independent acceptance/quality gate."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Use deterministic W13/W2 tactics for the fixed 48 one-row
     # verifier groups instead of relying on capture-time autotune stability.
-    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR", "1"))
+    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR", "1"))
+        ),
+        description=(
+            "Use deterministic W13/W2 tactics for the fixed 48 one-row "
+            "verifier groups instead of relying on capture-time autotune "
+            "stability."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Skip the generic 256-expert sort/permute/unpermute pipeline for the
     # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
-    "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "1"))
+    "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "1"))),
+        description=(
+            "Skip the generic 256-expert sort/permute/unpermute pipeline for "
+            "the exact DeepSeek V4 B1, replicated-expert, top-k=6 decode "
+            "contract."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Keep the six B1 routes in their original top-k order. Compact W13/W2
     # then consume topk_ids directly, so no sort/inverse-permutation prepare
     # kernel is needed. Exact shape/route checks remain in the caller and =0
     # restores the stable-sort path.
-    "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))
+    "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))),
+        description=(
+            "Keep the six B1 routes in their original top-k order. Compact "
+            "W13/W2 then consume topk_ids directly, so no "
+            "sort/inverse-permutation prepare kernel is needed. Exact "
+            "shape/route checks remain in the caller and =0 restores the "
+            "stable-sort path."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Consume the existing TurboMind E2M1/UE8M0 pack directly for the exact
     # six-route B1 W13/W2 tensors. Set to 0 to retain the dense-stage path.
-    "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1"))
+    "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1"))),
+        description=(
+            "Consume the existing TurboMind E2M1/UE8M0 pack directly for the "
+            "exact six-route B1 W13/W2 tensors. Set to 0 to retain the "
+            "dense-stage path."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
-    "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))
+    "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))),
+        description=(
+            "SM70: mxfp4 moe broadcast input decode. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics
     # while skipping inactive experts; this route is default-on after the
     # compact-vs-reference numeric gate passed for 35B-FP8.
-    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT", "1"))
+    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT", "1"))
+        ),
+        description=(
+            "FP8 caller for the generic SM70 TurboMind active-source-group "
+            "compact decode path. The backend scheduler keeps source expert "
+            "group semantics while skipping inactive experts; this route is "
+            "default-on after the compact-vs-reference numeric gate passed for"
+            " 35B-FP8."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Experimental shared+routed MoE output fusion. When enabled on an
     # eligible SM70 TP graph path, this uses custom all_reduce_sum2(shared,
     # routed) instead of materializing shared+routed before TP allreduce.
-    "VLLM_SM70_MOE_ADD_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0"))
+    "VLLM_SM70_MOE_ADD_ALLREDUCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0"))),
+        description=(
+            "Experimental shared+routed MoE output fusion. When enabled on an "
+            "eligible SM70 TP graph path, this uses custom "
+            "all_reduce_sum2(shared, routed) instead of materializing "
+            "shared+routed before TP allreduce."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' "
+                "when name not in os.environ; automatic defaults apply only when "
+                "the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
     ),
-    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))
+    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))),
+        description=(
+            "SM70: tp8 hierarchical custom ar. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR", "0"))
+    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR", "0"))),
+        description=(
+            "SM70: tp8 hierarchical push ar. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.
     # The unpermute-only subpath has strict Type-A regression coverage and is
     # default-on for SM70 AWQ/FP8 safe MoE decode; the combined/permute C++
     # path remains default-off until model-level timing and quality gates pass.
-    "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH", "0"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH", "0"))),
+        description=(
+            "Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They "
+            "bypass CUB sort and the generic k-way reduction for the "
+            "n_token==1 decode case. The unpermute-only subpath has strict "
+            "Type-A regression coverage and is default-on for SM70 AWQ/FP8 "
+            "safe MoE decode; the combined/permute C++ path remains "
+            "default-off until model-level timing and quality gates pass."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH", "0"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH", "0"))
+        ),
+        description=(
+            "SM70: moe single token permute fastpath. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH", "1"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH", "1"))
+        ),
+        description=(
+            "SM70: moe single token unpermute fastpath. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH", "0"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH", "0"))
+        ),
+        description=(
+            "SM70: moe single token indexed stage fastpath. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MOE_SINGLE_TOKEN_COMPACT_W13_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_COMPACT_W13_FASTPATH", "0"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_COMPACT_W13_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_COMPACT_W13_FASTPATH", "0"))
+        ),
+        description=(
+            "SM70: moe single token compact w13 fastpath. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH", "0"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH", "0"))
+        ),
+        description=(
+            "SM70: moe single token indexed w13 fastpath. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH", "0"))
+    "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH", "0"))
+        ),
+        description=(
+            "SM70: moe single token indexed w2 fastpath. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH", "1"))
+    "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH", "1"))
+        ),
+        description=(
+            "SM70 FP8 MoE: single token indexed w2 fastpath. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Legacy 0.0.3 FusedMoE activation chunk controls. Latest keeps this
     # explicit/default-off until model-level memory, route, and quality gates
     # prove the chunked path for the target backend.
-    "VLLM_FUSED_MOE_CHUNK_SIZE": lambda: max(
-        1,
-        int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", str(16 * 1024))),
+    "VLLM_FUSED_MOE_CHUNK_SIZE": env_var(
+        lambda: max(
+            1,
+            int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", str(16 * 1024))),
+        ),
+        description=(
+            "Legacy 0.0.3 FusedMoE activation chunk controls. Latest keeps "
+            "this explicit/default-off until model-level memory, route, and "
+            "quality gates prove the chunked path for the target backend."
+        ),
+        category="tuning",
+        declared_default="16 * 1024",
+        effective_default="Computed when unset: max(1, int(str(16 * 1024)))",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING", "0"))
+    "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING", "0"))),
+        description=(
+            "vLLM: enable fused moe activation chunking. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy 0.0.3 DP all-to-all MoE chunk controls. The latest MoE runner
     # has been refactored around custom-op entry points, so the old
     # FusedMoE.forward_impl_chunked loop is not restored here. Keep these
     # visible as pending compatibility knobs until a latest-runner chunk loop
     # is ported and validated.
-    "VLLM_MOE_DP_CHUNK_SIZE": lambda: int(os.getenv("VLLM_MOE_DP_CHUNK_SIZE", "256")),
-    "VLLM_ENABLE_MOE_DP_CHUNK": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_MOE_DP_CHUNK", "0"))
+    "VLLM_MOE_DP_CHUNK_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_MOE_DP_CHUNK_SIZE", "256")),
+        description=(
+            "Legacy 0.0.3 DP all-to-all MoE chunk controls. The latest MoE "
+            "runner has been refactored around custom-op entry points, so the "
+            "old FusedMoE.forward_impl_chunked loop is not restored here. Keep"
+            " these visible as pending compatibility knobs until a "
+            "latest-runner chunk loop is ported and validated."
+        ),
+        category="tuning",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_ENABLE_MOE_DP_CHUNK": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_MOE_DP_CHUNK", "0"))),
+        description=(
+            "vLLM: enable moe dp chunk. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # V100/SM70 FlashAttention backend selector. Default-on restores the 0.0.3
     # backend priority on V100; selecting Flash-V100 should keep both prefill
     # and decode on the Flash backend unless an explicit diagnostic fallback is
     # requested.
-    "VLLM_SM70_FLASH_ATTN_V100": lambda: bool(
-        int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))
+    "VLLM_SM70_FLASH_ATTN_V100": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLASH_ATTN_V100", "1"))),
+        description=(
+            "V100/SM70 FlashAttention backend selector. Default-on restores "
+            "the 0.0.3 backend priority on V100; selecting Flash-V100 should "
+            "keep both prefill and decode on the Flash backend unless an "
+            "explicit diagnostic fallback is requested."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Enabled by shared SM70 configuration for compatible local operators,
     # independent of the model/quantization label or speculative method.
     # An explicit zero preserves the original layout policy.
-    "VLLM_SM70_BATCH_GEMM_LAYOUTS": lambda: bool(
-        int(os.getenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0"))
+    "VLLM_SM70_BATCH_GEMM_LAYOUTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_BATCH_GEMM_LAYOUTS", "0"))),
+        description=(
+            "Enabled by shared SM70 configuration for compatible local "
+            "operators, independent of the model/quantization label or "
+            "speculative method. An explicit zero preserves the original "
+            "layout policy."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_batch_gemm_defaults sets '1' when"
+                " env_name not in os.environ; automatic defaults apply only when "
+                "the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_PROFILE_TRACE": lambda: bool(
-        int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))
-        or int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))
+    "VLLM_SM70_PROFILE_TRACE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))
+            or int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))
+        ),
+        description=(
+            "SM70: profile trace. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DECODE_EVENT_TRACE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE", "0"))
+    "VLLM_SM70_DECODE_EVENT_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE", "0"))),
+        description=(
+            "SM70: decode event trace. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS": lambda: float(
-        os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS", "1.0")
+    "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS": env_var(
+        lambda: float(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS", "1.0")),
+        description=(
+            "SM70: decode event trace threshold ms. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="1.0",
+        effective_default="1.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DECODE_EVENT_TRACE_EVERY": lambda: max(
-        1, int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_EVERY", "16"))
+    "VLLM_SM70_DECODE_EVENT_TRACE_EVERY": env_var(
+        lambda: max(1, int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_EVERY", "16"))),
+        description=(
+            "SM70: decode event trace every. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="16",
+        effective_default="Computed when unset: max(1, int('16'))",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_MTP_PROFILE": lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))),
-    "VLLM_SM70_MTP_PROFILE_INTERVAL": lambda: max(
-        1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
+    "VLLM_SM70_MTP_PROFILE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))),
+        description=(
+            "SM70: mtp profile. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0"))
+    "VLLM_SM70_MTP_PROFILE_INTERVAL": env_var(
+        lambda: max(1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))),
+        description=(
+            "SM70: mtp profile interval. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="16",
+        effective_default="Computed when unset: max(1, int('16'))",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0"))),
+        description=(
+            "SM70: mtp split draft cudagraphs. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
-    "VLLM_SM70_MTP_CONCURRENCY_WARMUP": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_CONCURRENCY_WARMUP", "0"))
+    "VLLM_SM70_MTP_CONCURRENCY_WARMUP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_CONCURRENCY_WARMUP", "0"))),
+        description=(
+            "Compile alternate single/concurrent MTP helper signatures at "
+            "startup. Default-off until matched cold-start and steady-state "
+            "evidence is complete."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_CONTEXT_BUCKETS": lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
-    "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
-        "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
+    "VLLM_SM70_MTP_CONTEXT_BUCKETS": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
+        description=(
+            "SM70: mtp context buckets. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": env_var(
+        lambda: os.getenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"),
+        description=(
+            "SM70: dsv4 decode context buckets. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # The private ring changes compressor-state ownership and lifetime. Keep it
     # opt-in until its long-context quality and capacity gates are complete.
-    "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE", "0"))
+    "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE", "0"))),
+        description=(
+            "The private ring changes compressor-state ownership and lifetime."
+            " Keep it opt-in until its long-context quality and capacity gates"
+            " are complete."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
-        "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
+    "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"),
+        description=(
+            "SM70: fp8 kv decode context buckets. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
-    "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE": lambda: os.getenv(
-        "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE"
+    "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE"),
+        description=(
+            "SM70: mtp context bucket partition size. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_REJECTION_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_SM70_REJECTION_PROFILE", "0"))
+    "VLLM_SM70_REJECTION_PROFILE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_PROFILE", "0"))),
+        description=(
+            "SM70: rejection profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_REJECTION_PROFILE_INTERVAL": lambda: max(
-        1, int(os.getenv("VLLM_SM70_REJECTION_PROFILE_INTERVAL", "20"))
+    "VLLM_SM70_REJECTION_PROFILE_INTERVAL": env_var(
+        lambda: max(1, int(os.getenv("VLLM_SM70_REJECTION_PROFILE_INTERVAL", "20"))),
+        description=(
+            "SM70: rejection profile interval. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="20",
+        effective_default="Computed when unset: max(1, int('20'))",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_REJECTION_COMBINE_BONUS": lambda: bool(
-        int(os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1"))
+    "VLLM_SM70_REJECTION_COMBINE_BONUS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1"))),
+        description=(
+            "SM70: rejection combine bonus. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": lambda: bool(
-        int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))
+    "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": env_var(
+        lambda: bool(int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))),
+        description=(
+            "vLLM: mtp stochastic token matching. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DUMP_STEP_DIR": lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"),
-    "VLLM_SM70_MTP_DUMP_STEP_MAX": lambda: int(
-        os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512")
+    "VLLM_SM70_MTP_DUMP_STEP_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"),
+        description=(
+            "SM70: mtp dump step dir. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DUMP_STEP_STEPS": lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS"),
-    "VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU", "0"))
+    "VLLM_SM70_MTP_DUMP_STEP_MAX": env_var(
+        lambda: int(os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512")),
+        description=(
+            "SM70: mtp dump step max. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="512",
+        effective_default="512",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK", "0"))
+    "VLLM_SM70_MTP_DUMP_STEP_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS"),
+        description=(
+            "SM70: mtp dump step steps. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P", "0"))
+    "VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU", "0"))),
+        description=(
+            "SM70: mtp exact draft seq lens cpu. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE": lambda: os.getenv(
-        "VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE"
+    "VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK", "0"))),
+        description=(
+            "SM70: mtp prob draft sparse topk. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE": lambda: float(
-        os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE", "1.0")
+    "VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P", "0"))),
+        description=(
+            "SM70: mtp prob draft apply top p. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT", "1"))
+    "VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE"),
+        description=(
+            "SM70: mtp prob draft top p override. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING": lambda: os.getenv(
-        "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING"
+    "VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE": env_var(
+        lambda: float(os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE", "1.0")),
+        description=(
+            "SM70: mtp prob draft temperature scale. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="1.0",
+        effective_default="1.0",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE": lambda: int(
-        os.getenv("VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE", "0")
+    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT", "1"))),
+        description=(
+            "SM70: mtp dynamic draft vocab default. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE": lambda: int(
-        os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE", "0")
+    "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING"),
+        description=(
+            "SM70: mtp static draft vocab ranking. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL": lambda: int(
-        os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL", "0")
+    "VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE", "0")),
+        description=(
+            "SM70: mtp static draft vocab size. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL", "0"))
+    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE", "0")),
+        description=(
+            "SM70: mtp dynamic draft vocab tail size. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU", "0"))
+    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL", "0")
+        ),
+        description=(
+            "SM70: mtp dynamic draft vocab full refresh interval. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK": lambda: int(
-        os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK", "0")
+    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL", "0"))
+        ),
+        description=(
+            "SM70: mtp dynamic draft vocab fused proposal. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DENSE_F16_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_DENSE_F16_FASTPATH", "1"))
+    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU", "0"))),
+        description=(
+            "SM70: mtp dynamic draft vocab gpu lru. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST": lambda: os.getenv(
-        "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST"
+    "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK": env_var(
+        lambda: int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK", "0")),
+        description=(
+            "SM70: mtp dynamic draft vocab prefill topk. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS", "0"))
+    "VLLM_SM70_MTP_DENSE_F16_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_DENSE_F16_FASTPATH", "1"))),
+        description=(
+            "SM70: mtp dense f16 fastpath. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR", "0"))
+    "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_DENSE_F16_ALLOWLIST"),
+        description=(
+            "SM70: mtp dense f16 allowlist. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", "1"))
+    "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS", "0"))),
+        description=(
+            "SM70: mtp sync accept counts. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING", "1"))
+    "VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR", "0"))),
+        description=(
+            "SM70: mtp legacy output token repair. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX", "0"))
+    "VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", "1"))),
+        description=(
+            "SM70: mtp legacy gdn non spec slot0. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING", "1"))
+        ),
+        description=(
+            "SM70: mtp legacy gdn mixed decode routing. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX", "0"))),
+        description=(
+            "SM70: mtp legacy qwen step idx. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Legacy no-MTP TileRT/Mirage planning name. It aliases the broader latest
     # SM70 profile trace gate instead of creating a separate trace surface.
-    "VLLM_SM70_DECODE_TILE_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))
+    "VLLM_SM70_DECODE_TILE_PROFILE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))),
+        description=(
+            "Legacy no-MTP TileRT/Mirage planning name. It aliases the broader"
+            " latest SM70 profile trace gate instead of creating a separate "
+            "trace surface."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_FLASH_V100_ROUTE_SUMMARY": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))
+    "VLLM_FLASH_V100_ROUTE_SUMMARY": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))),
+        description=(
+            "Flash-V100 attention: route summary. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION": lambda: bool(
-        int(os.getenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "0"))
+    "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "0"))),
+        description=(
+            "SM70: require profile acceleration. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Mixed chunked-prefill batches send resident decode and short verification
     # rows through the partitioned paged-decode kernels. This prevents a q=1
     # row from walking a long prefix serially in the paged-prefill kernel.
-    "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS", "1"))
+    "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS", "1"))),
+        description=(
+            "Mixed chunked-prefill batches send resident decode and short "
+            "verification rows through the partitioned paged-decode kernels. "
+            "This prevents a q=1 row from walking a long prefix serially in "
+            "the paged-prefill kernel."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))
+    "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))),
+        description=(
+            "Flash-V100 attention: fp8 prefill bridge. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "16384")
+    "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "16384")),
+        description=(
+            "Flash-V100 attention: decode fp8 xqa min seq len. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16384",
+        effective_default="16384",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16", "0"))
+    "VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16", "0"))),
+        description=(
+            "Flash-V100 attention: kernel block size16. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DENSE_D256_LOW_SMEM", "0"))
+    "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DENSE_D256_LOW_SMEM", "0"))),
+        description=(
+            "Flash-V100 attention: dense d256 low smem. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DENSE_D256_WMMA_QK": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DENSE_D256_WMMA_QK", "1"))
+    "VLLM_FLASH_V100_DENSE_D256_WMMA_QK": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DENSE_D256_WMMA_QK", "1"))),
+        description=(
+            "Flash-V100 attention: dense d256 wmma qk. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1"))),
+        description=(
+            "Flash-V100 attention: prefill d256 low smem. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK", "0"))
+    "VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK", "0"))),
+        description=(
+            "Flash-V100 attention: prefill d256 scalar qk. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_BM32": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0"))
+    "VLLM_FLASH_V100_PREFILL_D256_BM32": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0"))),
+        description=(
+            "Flash-V100 attention: prefill d256 bm32. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1"))),
+        description=(
+            "Flash-V100 attention: prefill d256 bm32 phase. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P", "1"))),
+        description=(
+            "Flash-V100 attention: prefill d256 bm32 all p. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH", "1"))
+        ),
+        description=(
+            "Flash-V100 attention: prefill d256 bm32 pair scratch. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268", "1"))
+        ),
+        description=(
+            "Flash-V100 attention: prefill d256 output stride 268. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK", "1"))
+        ),
+        description=(
+            "Flash-V100 attention: prefill d256 sw pipeline qk. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV", "1"))
+    "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV", "1"))
+        ),
+        description=(
+            "Flash-V100 attention: prefill d256 sw pipeline pv. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_FA2_D256_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_FA2_D256_PREFILL", "1"))
+    "VLLM_FLASH_V100_FA2_D256_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_FA2_D256_PREFILL", "1"))),
+        description=(
+            "Flash-V100 attention: fa2 d256 prefill. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE", "1"))
+    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE", "1"))),
+        description=(
+            "Flash-V100 attention: prefill contig dense. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY", "0"))
+    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY", "0"))
+        ),
+        description=(
+            "Flash-V100 attention: prefill contig dense allow copy. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q", "1536")
+    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q", "1536")),
+        description=(
+            "Flash-V100 attention: prefill contig dense min q. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="1536",
+        effective_default="1536",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV", "8192")
+    "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV", "8192")),
+        description=(
+            "Flash-V100 attention: prefill contig dense min kv. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="8192",
+        effective_default="8192",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "1"))
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE", "1"))),
+        description=(
+            "Flash-V100 attention: prefill gather dense. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q", "4096")
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q", "4096")),
+        description=(
+            "Flash-V100 attention: prefill gather dense min q. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="4096",
+        effective_default="4096",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV", "8192")
+    "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV", "8192")),
+        description=(
+            "Flash-V100 attention: prefill gather dense min kv. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="8192",
+        effective_default="8192",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "1"))
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "1"))),
+        description=(
+            "Flash-V100 attention: prefill dense splitkv3. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", "32768")
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV": env_var(
+        lambda: int(
+            os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", "32768")
+        ),
+        description=(
+            "Flash-V100 attention: prefill dense splitkv3 min kv. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default="32768",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL",
-                "0",
+    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL",
+                    "0",
+                )
             )
-        )
+        ),
+        description=(
+            "Flash-V100 attention: prefill dense splitkv3 q8000 experimental. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # The qualified Q8000 FP32-accumulated route is the default. Keep v37 as
     # an explicit rollback and matched-control selection.
-    "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0"))
+    "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0"))),
+        description=(
+            "The qualified Q8000 FP32-accumulated route is the default. Keep "
+            "v37 as an explicit rollback and matched-control selection."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Reuse decode scratch across row capacities on the same CUDA stream.
-    "VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE": lambda: os.getenv(
-        "VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1"
-    )
-    != "0",
+    "VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0",
+        description=(
+            "Reuse decode scratch across row capacities on the same CUDA stream."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
     # Concatenate auxiliary states directly into the draft projection dtype.
-    "VLLM_DFLASH_COMPACT_AUX_HIDDEN": lambda: os.getenv(
-        "VLLM_DFLASH_COMPACT_AUX_HIDDEN", "1"
-    )
-    != "0",
+    "VLLM_DFLASH_COMPACT_AUX_HIDDEN": env_var(
+        lambda: os.getenv("VLLM_DFLASH_COMPACT_AUX_HIDDEN", "1") != "0",
+        description=(
+            "Concatenate auxiliary states directly into the draft projection dtype."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
     # Native Q8000/Q8192 prefix score capacity; read once per worker workspace.
     # Multiples of 8192 in [8192, 131072]. Use 16384 for the previous capacity.
-    "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS", "8192")
+    "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS", "8192")),
+        description=(
+            "Native Q8000/Q8192 prefix score capacity; read once per worker "
+            "workspace. Multiples of 8192 in [8192, 131072]. Use 16384 for the"
+            " previous capacity."
+        ),
+        category="configuration",
+        declared_default="8192",
+        effective_default="8192",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL",
-                "1",
+    "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL",
+                    "1",
+                )
             )
-        )
+        ),
+        description=(
+            "Flash-V100 attention: prefill d256 gqa arch 128k experimental. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_SPLIT_KV": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0"))
+    "VLLM_FLASH_V100_PREFILL_SPLIT_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0"))),
+        description=(
+            "Flash-V100 attention: prefill split kv. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS", "32768")
+    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS", "32768")),
+        description=(
+            "Flash-V100 attention: prefill split kv tokens. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default="32768",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q", "1")
+    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q", "1")),
+        description=(
+            "Flash-V100 attention: prefill split kv min q. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q", "2048")
+    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q", "2048")),
+        description=(
+            "Flash-V100 attention: prefill split kv max q. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="2048",
+        effective_default="2048",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV": lambda: int(
-        os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV", "32768")
+    "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV", "32768")),
+        description=(
+            "Flash-V100 attention: prefill split kv min kv. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default="32768",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_BFLA_PREFILL", "0"))
+    "VLLM_FLASH_V100_BFLA_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_BFLA_PREFILL", "0"))),
+        description=(
+            "Flash-V100 attention: bfla prefill. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_MIN_Q": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_MIN_Q", "4096")
+    "VLLM_FLASH_V100_BFLA_MIN_Q": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MIN_Q", "4096")),
+        description=(
+            "Flash-V100 attention: bfla min q. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="4096",
+        effective_default="4096",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_MIN_KV": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_MIN_KV", "32768")
+    "VLLM_FLASH_V100_BFLA_MIN_KV": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MIN_KV", "32768")),
+        description=(
+            "Flash-V100 attention: bfla min kv. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default="32768",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_MASK_BLOCK_N": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_MASK_BLOCK_N", "256")
+    "VLLM_FLASH_V100_BFLA_MASK_BLOCK_N": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MASK_BLOCK_N", "256")),
+        description=(
+            "Flash-V100 attention: bfla mask block n. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_KEEP_MASS": lambda: float(
-        os.getenv("VLLM_FLASH_V100_BFLA_KEEP_MASS", "0.99")
+    "VLLM_FLASH_V100_BFLA_KEEP_MASS": env_var(
+        lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_KEEP_MASS", "0.99")),
+        description=(
+            "Flash-V100 attention: bfla keep mass. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0.99",
+        effective_default="0.99",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_KEEP_RATIO": lambda: float(
-        os.getenv("VLLM_FLASH_V100_BFLA_KEEP_RATIO", "0.0")
+    "VLLM_FLASH_V100_BFLA_KEEP_RATIO": env_var(
+        lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_KEEP_RATIO", "0.0")),
+        description=(
+            "Flash-V100 attention: bfla keep ratio. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0.0",
+        effective_default=(
+            "0.0; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '0.10' when "
+                "sm70_flash_v100_baseline and envs.VLLM_FLASH_V100_BFLA_PREFILL "
+                "and self.model_config is not None and "
+                "('VLLM_FLASH_V100_BFLA_KEEP_RATIO' not in os.environ) and "
+                "num_attention_heads == 24 and num_key_value_heads == 4 and "
+                "(head_dim == 256); automatic defaults apply only when the "
+                "environment override is absent."
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS", "0")
+    "VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS", "0")),
+        description=(
+            "Flash-V100 attention: bfla min keep blocks. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_THRESHOLD": lambda: float(
-        os.getenv("VLLM_FLASH_V100_BFLA_THRESHOLD", "999")
+    "VLLM_FLASH_V100_BFLA_THRESHOLD": env_var(
+        lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_THRESHOLD", "999")),
+        description=(
+            "Flash-V100 attention: bfla threshold. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="999.0",
+        effective_default="999.0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS", "8")
+    "VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS", "8")),
+        description=(
+            "Flash-V100 attention: bfla local blocks. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="8",
+        effective_default="8",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_POOL": lambda: os.getenv(
-        "VLLM_FLASH_V100_BFLA_POOL", "flat64"
+    "VLLM_FLASH_V100_BFLA_POOL": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_BFLA_POOL", "flat64"),
+        description=(
+            "Flash-V100 attention: bfla pool. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="'flat64'",
+        effective_default="'flat64'",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_SPEC_STRIDE": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_SPEC_STRIDE", "0")
+    "VLLM_FLASH_V100_BFLA_SPEC_STRIDE": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_SPEC_STRIDE", "0")),
+        description=(
+            "Flash-V100 attention: bfla spec stride. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_SPEC_PROB": lambda: float(
-        os.getenv("VLLM_FLASH_V100_BFLA_SPEC_PROB", "0")
+    "VLLM_FLASH_V100_BFLA_SPEC_PROB": env_var(
+        lambda: float(os.getenv("VLLM_FLASH_V100_BFLA_SPEC_PROB", "0")),
+        description=(
+            "Flash-V100 attention: bfla spec prob. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0.0",
+        effective_default="0.0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_BFLA_SPEC_SEED": lambda: int(
-        os.getenv("VLLM_FLASH_V100_BFLA_SPEC_SEED", "1")
+    "VLLM_FLASH_V100_BFLA_SPEC_SEED": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_BFLA_SPEC_SEED", "1")),
+        description=(
+            "Flash-V100 attention: bfla spec seed. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE", "0"))
+    "VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE", "0"))),
+        description=(
+            "Flash-V100 attention: prefill chunk profile. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0"))
+    "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0"))),
+        description=(
+            "Flash-V100 attention: draft graph debug. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT": lambda: int(
-        os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12")
+    "VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12")),
+        description=(
+            "Flash-V100 attention: draft graph debug limit. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="12",
+        effective_default="12",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DFLASH_PREFIX_DUMP": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0"))
+    "VLLM_FLASH_V100_DFLASH_PREFIX_DUMP": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0"))),
+        description=(
+            "Flash-V100 attention: dflash prefix dump. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # FlashAttention V100 backend tuning/debug switches. These are registered
     # so exactness experiments are reproducible and do not trip unknown-env
     # checks. Decode defaults to scalar paged Flash-V100 after classified
     # Type-B long-decode validation; opt into the paged-prefill bridge only
     # for strict diagnostics because it is slower than scalar q=1 decode.
-    "VLLM_FLASH_V100_ENABLE_PAGED_PREFILL": lambda: os.getenv(
-        "VLLM_FLASH_V100_ENABLE_PAGED_PREFILL"
+    "VLLM_FLASH_V100_ENABLE_PAGED_PREFILL": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL"),
+        description=(
+            "FlashAttention V100 backend tuning/debug switches. These are "
+            "registered so exactness experiments are reproducible and do not "
+            "trip unknown-env checks. Decode defaults to scalar paged "
+            "Flash-V100 after classified Type-B long-decode validation; opt "
+            "into the paged-prefill bridge only for strict diagnostics because"
+            " it is slower than scalar q=1 decode."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DISABLE_PAGED_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0"))
+    "VLLM_FLASH_V100_DISABLE_PAGED_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0"))),
+        description=(
+            "Flash-V100 attention: disable paged prefill. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0"))
+    "VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0"))),
+        description=(
+            "Flash-V100 attention: prefill use paged cache. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Explicit diagnostic fallback only. The migration goal requires selected
     # Flash-V100 routes to keep both prefill and decode on Flash by default;
     # prefill max-diff/root-cause work must not be hidden by this switch.
-    "VLLM_FLASH_V100_PREFILL_USE_TRITON": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_USE_TRITON", "0"))
+    "VLLM_FLASH_V100_PREFILL_USE_TRITON": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_PREFILL_USE_TRITON", "0"))),
+        description=(
+            "Explicit diagnostic fallback only. The migration goal requires "
+            "selected Flash-V100 routes to keep both prefill and decode on "
+            "Flash by default; prefill max-diff/root-cause work must not be "
+            "hidden by this switch."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Emergency/diagnostic fallback only. When Flash-V100 is selected, missing
     # Flash ops or unsupported features should fail loudly by default instead
     # of silently turning the route into Triton and corrupting route-hit data.
-    "VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK", "0"))
+    "VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK", "0"))),
+        description=(
+            "Emergency/diagnostic fallback only. When Flash-V100 is selected, "
+            "missing Flash ops or unsupported features should fail loudly by "
+            "default instead of silently turning the route into Triton and "
+            "corrupting route-hit data."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q": lambda: int(
-        os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+    "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")),
+        description=(
+            "Flash-V100 attention: smallq decode max q. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default=(
+            "16; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets str(decode_query_len) when"
+                " sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user"
+                " and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FLASH_ATTN_V100 and "
+                "self.compilation_config.cudagraph_capture_sizes is None and "
+                "self.speculative_config is not None and "
+                "self.speculative_config.num_speculative_tokens and smallq_env not"
+                " in os.environ and decode_query_len > "
+                "envs.VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
+    "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")),
+        description=(
+            "Flash-V100 attention: smallq decode max model len. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1"))
+    "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1"))),
+        description=(
+            "Flash-V100 attention: decode dynamic partitions. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": lambda: os.getenv(
-        "VLLM_FLASH_V100_DECODE_PARTITION_SIZE"
+    "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE"),
+        description=(
+            "Flash-V100 attention: decode partition size. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_DENSE_REFERENCE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0"))
+    "VLLM_FLASH_V100_DECODE_DENSE_REFERENCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0"))),
+        description=(
+            "Flash-V100 attention: decode dense reference. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_DENSE_CACHE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_CACHE", "0"))
+    "VLLM_FLASH_V100_DECODE_DENSE_CACHE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_DENSE_CACHE", "0"))),
+        description=(
+            "Flash-V100 attention: decode dense cache. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL", "0"))
+    "VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL", "0"))),
+        description=(
+            "Flash-V100 attention: decode use paged prefill. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_USE_BHMD_OUT": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_USE_BHMD_OUT", "1"))
+    "VLLM_FLASH_V100_DECODE_USE_BHMD_OUT": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_BHMD_OUT", "1"))),
+        description=(
+            "Flash-V100 attention: decode use bhmd out. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0"))
+    "VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0"))),
+        description=(
+            "Flash-V100 attention: decode use wmma wrapper. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
+    "VLLM_FLASH_V100_DECODE_USE_XQA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))),
+        description=(
+            "Flash-V100 attention: decode use xqa. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Experimental dense single-request small-Q route; not the DFlash2 q8 gate.
-    "VLLM_FLASH_V100_E4M3_GROUPED_FP32": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "1"))
+    "VLLM_FLASH_V100_E4M3_GROUPED_FP32": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_GROUPED_FP32", "1"))),
+        description=(
+            "Experimental dense single-request small-Q route; not the DFlash2 q8 gate."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))),
+        description=(
+            "Flash-V100 attention: dflash2 grouped verify. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Keep batched admission independent until the request-major kernel has
     # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
-    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
+    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
+        ),
+        description=(
+            "Keep batched admission independent until the request-major kernel"
+            " has passed B2/B4/B8 operator, graph, endpoint, and quality "
+            "gates."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": env_var(
+        lambda: int(
+            os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
+        ),
+        description=(
+            "Flash-V100 attention: dflash2 grouped verify min model len. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default=(
+            "32768; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1"))
+    "VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED", "1"))),
+        description=(
+            "Flash-V100 attention: dflash2 fixed interleaved. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS", "1"))
+    "VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS", "1"))),
+        description=(
+            "Flash-V100 attention: dflash2 stage page ids. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")
+    "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")),
+        description=(
+            "Flash-V100 attention: decode xqa q4 min seq len. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="32768",
+        effective_default="32768",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1"))
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1"))),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE", "0"))
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE", "0"))
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": lambda: int(
-        os.getenv(
-            "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN",
-            "111104",
-        )
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN",
+                "111104",
+            )
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth p1024 mid seq len. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="111104",
+        effective_default="111104",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": lambda: int(
-        os.getenv(
-            "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN",
-            "147841",
-        )
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P256_LONG_SEQ_LEN",
+                "147841",
+            )
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth p256 long seq len. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="147841",
+        effective_default="147841",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": lambda: int(
-        os.getenv(
-            "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN",
-            "258176",
-        )
+    "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_FINAL_SEQ_LEN",
+                "258176",
+            )
+        ),
+        description=(
+            "Flash-V100 attention: xqa g6 p1024 sawtooth p1024 final seq len. "
+            "The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="258176",
+        effective_default="258176",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "1"))
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE", "1"))),
+        description=(
+            "Flash-V100 attention: xqa g6 qk pipeline. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS", "8")
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS", "8")),
+        description=(
+            "Flash-V100 attention: xqa g6 qk pipeline warps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="8",
+        effective_default="8",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))
+    "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))),
+        description=(
+            "Flash-V100 attention: xqa g6 qk pipeline trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))),
+        description=(
+            "Flash-V100 attention: xqa g6 dual cta. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))
+    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))),
+        description=(
+            "Flash-V100 attention: xqa split reduce. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the scalar
     # paged decoder for matched control runs or emergency rollback.
-    "VLLM_FLASH_V100_E4M3_BATCH_XQA": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1"))
+    "VLLM_FLASH_V100_E4M3_BATCH_XQA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1"))),
+        description=(
+            "Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the "
+            "scalar paged decoder for matched control runs or emergency "
+            "rollback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "1"))
+    "VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "1"))),
+        description=(
+            "Flash-V100 attention: e4m3 batch xqa optimized. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH", "1"))
+    "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH", "1"))),
+        description=(
+            "Flash-V100 attention: e4m3 page800 fastpath. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE", "0"))
+    "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE", "0"))
+        ),
+        description=(
+            "Flash-V100 attention: e4m3 page800 fastpath trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))
+    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))),
+        description=(
+            "Flash-V100 attention: xqa batch context routing. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE", "0"))
+    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE", "0"))
+        ),
+        description=(
+            "Flash-V100 attention: xqa batch context routing trace. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))
+    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 g6 dual cta. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE", "1"))
+    "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 g6 split reduce. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "61633")
+    "VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "61633")),
+        description=(
+            "Flash-V100 attention: xqa e5m2 p1024 begin. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="61633",
+        effective_default="61633",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS", "1"))
+    "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS", "1"))
+        ),
+        description=(
+            "Flash-V100 attention: xqa e5m2 partition page ids. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))
+    "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 pair load. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD", "1"))
+    "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD", "1"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 batch wide load. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))
+    "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))),
+        description=(
+            "Flash-V100 attention: xqa e5m2 g6 dual cta trace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_TRACE_DECODE_ACTIVE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0"))
+    "VLLM_FLASH_V100_TRACE_DECODE_ACTIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0"))),
+        description=(
+            "Flash-V100 attention: trace decode active. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED", "1"))
+    "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED", "1"))),
+        description=(
+            "Flash-V100 attention: decode use scalar paged. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR": lambda: os.getenv(
-        "VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR"
+    "VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR"),
+        description=(
+            "Flash-V100 attention: compare bhmd out dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS", "0")
+    "VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS", "0")),
+        description=(
+            "Flash-V100 attention: compare bhmd out max calls. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR": lambda: os.getenv(
-        "VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR"
+    "VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR"),
+        description=(
+            "Flash-V100 attention: compare triton out dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS", "0")
+    "VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS": env_var(
+        lambda: int(os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS", "0")),
+        description=(
+            "Flash-V100 attention: compare triton out max calls. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR": lambda: os.getenv(
-        "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR"
+    "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR"),
+        description=(
+            "Flash-V100 attention: compare triton tensor dump dir. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS", "64")
+    "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS": env_var(
+        lambda: int(
+            os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS", "64")
+        ),
+        description=(
+            "Flash-V100 attention: compare triton tensor dump max tokens. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0"))
+    "VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE": env_var(
+        lambda: bool(int(os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0"))),
+        description=(
+            "Flash-V100 attention: debug prefill compare. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR": lambda: os.getenv(
-        "VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR"
+    "VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR"),
+        description=(
+            "SM70 diagnostic capture: sampler logits dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS": lambda: int(
-        os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0")
+    "VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0")),
+        description=(
+            "SM70 diagnostic capture: sampler logits max steps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR": lambda: os.getenv(
-        "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR"
+    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR"),
+        description=(
+            "SM70 diagnostic capture: top token margin dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE": lambda: os.getenv(
-        "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE"
+    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: top token margin enable file. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS": lambda: os.getenv(
-        "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS"
+    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS"),
+        description=(
+            "SM70 diagnostic capture: top token margin steps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS": lambda: int(
-        os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS", "128")
+    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS", "128")),
+        description=(
+            "SM70 diagnostic capture: top token margin max reports. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR": lambda: os.getenv(
-        "VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR"
+    "VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR"),
+        description=(
+            "SM70 diagnostic capture: sample tensors dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE": lambda: os.getenv(
-        "VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE"
+    "VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: sample tensors enable file. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS": lambda: int(
-        os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS", "0")
+    "VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS", "0")),
+        description=(
+            "SM70 diagnostic capture: sample tensors max steps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS": lambda: os.getenv(
-        "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS"
+    "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS"),
+        description=(
+            "SM70 diagnostic capture: sample tensors steps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_QSA_KV_CALIBRATION_DIR": lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"),
-    "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD": lambda: os.getenv(
-        "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD"
+    "VLLM_QSA_KV_CALIBRATION_DIR": env_var(
+        lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"),
+        description=(
+            "vLLM: qsa kv calibration dir. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
     ),
-    "VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS": lambda: os.getenv(
-        "VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS"
+    "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD": env_var(
+        lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD"),
+        description=(
+            "vLLM: qsa kv calibration corpus shard. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
     ),
-    "VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE": lambda: os.getenv(
-        "VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE", "stream"
+    "VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS"),
+        description=(
+            "SM70: sync sample tensors steps. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS": lambda: os.getenv(
-        "VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS"
+    "VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE": env_var(
+        lambda: os.getenv("VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE", "stream"),
+        description=(
+            "SM70: sync sample tensors mode. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="'stream'",
+        effective_default="'stream'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE": lambda: os.getenv(
-        "VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE", "stream"
+    "VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS"),
+        description=(
+            "SM70: sync top1 allgather steps. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR": lambda: os.getenv(
-        "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR"
+    "VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE": env_var(
+        lambda: os.getenv("VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE", "stream"),
+        description=(
+            "SM70: sync top1 allgather mode. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="'stream'",
+        effective_default="'stream'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE": lambda: os.getenv(
-        "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE"
+    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR"),
+        description=(
+            "SM70: compare gdn packed decode dir. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS": lambda: os.getenv(
-        "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS"
+    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE"),
+        description=(
+            "SM70: compare gdn packed decode enable file. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS": lambda: os.getenv(
-        "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS"
+    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS": env_var(
+        lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS"),
+        description=(
+            "SM70: compare gdn packed decode layer ids. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS": lambda: int(
-        os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS", "256")
+    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS"),
+        description=(
+            "SM70: compare gdn packed decode steps. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS", "256")
+        ),
+        description=(
+            "SM70: compare gdn packed decode max reports. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # 0.0.3 speculative/MTP diagnostics. These are default-off and must not
     # change sampling or model outputs.
-    "VLLM_SPEC_DUMP_ALIGNMENT": lambda: bool(
-        int(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT", "0"))
+    "VLLM_SPEC_DUMP_ALIGNMENT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT", "0"))),
+        description=(
+            "0.0.3 speculative/MTP diagnostics. These are default-off and must"
+            " not change sampling or model outputs."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SPEC_DUMP_ALIGNMENT_LIMIT": lambda: int(
-        os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_LIMIT", "3")
+    "VLLM_SPEC_DUMP_ALIGNMENT_LIMIT": env_var(
+        lambda: int(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_LIMIT", "3")),
+        description=(
+            "Speculative-decoding diagnostic: dump alignment limit. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="3",
+        effective_default="3",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SPEC_DUMP_ALIGNMENT_STEPS": lambda: os.getenv(
-        "VLLM_SPEC_DUMP_ALIGNMENT_STEPS"
+    "VLLM_SPEC_DUMP_ALIGNMENT_STEPS": env_var(
+        lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_STEPS"),
+        description=(
+            "Speculative-decoding diagnostic: dump alignment steps. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_DEBUG_MTP_LOAD": lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
-    "VLLM_DEBUG_MTP_LOAD_VERBOSE": lambda: bool(
-        int(os.getenv("VLLM_DEBUG_MTP_LOAD_VERBOSE", "0"))
+    "VLLM_DEBUG_MTP_LOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
+        description=(
+            "vLLM: debug mtp load. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
-    "VLLM_DFLASH_PROFILE": lambda: bool(int(os.getenv("VLLM_DFLASH_PROFILE", "0"))),
-    "VLLM_DFLASH_PROFILE_LOG_INTERVAL": lambda: max(
-        1, int(os.getenv("VLLM_DFLASH_PROFILE_LOG_INTERVAL", "32"))
+    "VLLM_DEBUG_MTP_LOAD_VERBOSE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD_VERBOSE", "0"))),
+        description=(
+            "vLLM: debug mtp load verbose. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_DFLASH_PROFILE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_PROFILE", "0"))),
+        description=(
+            "vLLM: dflash profile. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_PROFILE_LOG_INTERVAL": env_var(
+        lambda: max(1, int(os.getenv("VLLM_DFLASH_PROFILE_LOG_INTERVAL", "32"))),
+        description=(
+            "vLLM: dflash profile log interval. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="32",
+        effective_default="Computed when unset: max(1, int('32'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
     # Lookup-augmented DFlash2 controller. The lookup itself is enabled by the
     # speculative config's ngram_assist flag; these knobs tune only its
     # experimental fusion and adaptive q8/q16 policy.
-    "VLLM_DFLASH2_LOOKUP_ADAPTIVE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1"))
+    "VLLM_DFLASH2_LOOKUP_ADAPTIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1"))),
+        description=(
+            "Lookup-augmented DFlash2 controller. The lookup itself is enabled"
+            " by the speculative config's ngram_assist flag; these knobs tune "
+            "only its experimental fusion and adaptive q8/q16 policy."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_NSTRONG": lambda: max(
-        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))
+    "VLLM_DFLASH2_LOOKUP_NSTRONG": env_var(
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))),
+        description=(
+            "vLLM: dflash2 lookup nstrong. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(1, int('6'))",
+        effective_default="Computed when unset: max(1, int('6'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_AGREE": lambda: max(
-        0, int(os.getenv("VLLM_DFLASH2_LOOKUP_AGREE", "0"))
+    "VLLM_DFLASH2_LOOKUP_AGREE": env_var(
+        lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_AGREE", "0"))),
+        description=(
+            "vLLM: dflash2 lookup agree. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(0, int('0'))",
+        effective_default="Computed when unset: max(0, int('0'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": lambda: max(
-        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4"))
+    "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": env_var(
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4"))),
+        description=(
+            "vLLM: dflash2 lookup nmin tail. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="Computed when unset: max(1, int('4'))",
+        effective_default="Computed when unset: max(1, int('4'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_LONG_MIN": lambda: max(
-        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_LONG_MIN", "6"))
+    "VLLM_DFLASH2_LOOKUP_LONG_MIN": env_var(
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_LONG_MIN", "6"))),
+        description=(
+            "vLLM: dflash2 lookup long min. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(1, int('6'))",
+        effective_default="Computed when unset: max(1, int('6'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_SEARCH": lambda: max(
-        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))
+    "VLLM_DFLASH2_LOOKUP_SEARCH": env_var(
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))),
+        description=(
+            "vLLM: dflash2 lookup search. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(1, int(str(1 << 30)))",
+        effective_default="Computed when unset: max(1, int(str(1 << 30)))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK": lambda: max(
-        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_ENTRY_STREAK", "2"))
+    "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK": env_var(
+        lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_ENTRY_STREAK", "2"))),
+        description=(
+            "vLLM: dflash2 lookup entry streak. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(1, int('2'))",
+        effective_default="Computed when unset: max(1, int('2'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_STICKY": lambda: max(
-        0, int(os.getenv("VLLM_DFLASH2_LOOKUP_STICKY", "3"))
+    "VLLM_DFLASH2_LOOKUP_STICKY": env_var(
+        lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_STICKY", "3"))),
+        description=(
+            "vLLM: dflash2 lookup sticky. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(0, int('3'))",
+        effective_default="Computed when unset: max(0, int('3'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": lambda: max(
-        0, int(os.getenv("VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT", "0"))
+    "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": env_var(
+        lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT", "0"))),
+        description=(
+            "vLLM: dflash2 lookup cheap context. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="Computed when unset: max(0, int('0'))",
+        effective_default="Computed when unset: max(0, int('0'))",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DUMP_FIRST_PASS": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))
+    "VLLM_DFLASH_DUMP_FIRST_PASS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))),
+        description=(
+            "vLLM: dflash dump first pass. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DISABLE_AUX_OUTPUTS": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DISABLE_AUX_OUTPUTS", "0"))
+    "VLLM_DFLASH_DISABLE_AUX_OUTPUTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DISABLE_AUX_OUTPUTS", "0"))),
+        description=(
+            "vLLM: dflash disable aux outputs. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DEBUG_STATE_TABLE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DEBUG_STATE_TABLE", "0"))
+    "VLLM_DFLASH_DEBUG_STATE_TABLE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_STATE_TABLE", "0"))),
+        description=(
+            "DFlash diagnostic: state table. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DDTREE_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0"))
+    "VLLM_DFLASH_DDTREE_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0"))),
+        description=(
+            "DFlash tree verifier: debug. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0"))
+    "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0"))
+        ),
+        description=(
+            "DFlash tree verifier: enable hybrid tree state. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DDTREE_FUSED_GDN": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1"))
+    "VLLM_DFLASH_DDTREE_FUSED_GDN": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1"))),
+        description=(
+            "DFlash tree verifier: fused gdn. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1"))
+    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1"))),
+        description=(
+            "DFlash tree verifier: triton branch attn. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0"))
+    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0"))
+        ),
+        description=(
+            "DFlash tree verifier: triton branch attn strict. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT", "1"))
+    "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT", "1"))),
+        description=(
+            "DFlash tree verifier: compact drafter context. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR": lambda: os.getenv(
-        "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR"
+    "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR"),
+        description=(
+            "SM70 diagnostic capture: gdn state table dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ": lambda: int(
-        os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ", "0")
+    "VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ": env_var(
+        lambda: int(os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ", "0")),
+        description=(
+            "SM70 diagnostic capture: gdn state table start seq. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ": lambda: int(
-        os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ", "0")
+    "VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ": env_var(
+        lambda: int(os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ", "0")),
+        description=(
+            "SM70 diagnostic capture: gdn state table end seq. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS": lambda: int(
-        os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS", "32")
+    "VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS", "32")),
+        description=(
+            "SM70 diagnostic capture: gdn state table max dumps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="32",
+        effective_default="32",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_DFLASH_SYNC_CONTEXT_KV": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_SYNC_CONTEXT_KV", "0"))
+    "VLLM_DFLASH_SYNC_CONTEXT_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_SYNC_CONTEXT_KV", "0"))),
+        description=(
+            "vLLM: dflash sync context kv. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE", "0"))
+    "VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE", "0"))),
+        description=(
+            "vLLM: dflash skip context kv precompute. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DEBUG_CONTEXT_KV": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DEBUG_CONTEXT_KV", "0"))
+    "VLLM_DFLASH_DEBUG_CONTEXT_KV": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_CONTEXT_KV", "0"))),
+        description=(
+            "DFlash diagnostic: context kv. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DUMP_LAYER_HIDDENS": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DUMP_LAYER_HIDDENS", "0"))
+    "VLLM_DFLASH_DUMP_LAYER_HIDDENS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_LAYER_HIDDENS", "0"))),
+        description=(
+            "vLLM: dflash dump layer hiddens. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DUMP_LAYER0_COMPONENTS": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DUMP_LAYER0_COMPONENTS", "0"))
+    "VLLM_DFLASH_DUMP_LAYER0_COMPONENTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_LAYER0_COMPONENTS", "0"))),
+        description=(
+            "vLLM: dflash dump layer0 components. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DUMP_ATTN_COMPONENTS": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DUMP_ATTN_COMPONENTS", "0"))
+    "VLLM_DFLASH_DUMP_ATTN_COMPONENTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_ATTN_COMPONENTS", "0"))),
+        description=(
+            "vLLM: dflash dump attn components. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DEBUG_CORRUPTION": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DEBUG_CORRUPTION", "0"))
+    "VLLM_DFLASH_DEBUG_CORRUPTION": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_CORRUPTION", "0"))),
+        description=(
+            "DFlash diagnostic: corruption. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_DFLASH_DUMP_DRAFT_LOGITS": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_DUMP_DRAFT_LOGITS", "0"))
+    "VLLM_DFLASH_DUMP_DRAFT_LOGITS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_DRAFT_LOGITS", "0"))),
+        description=(
+            "vLLM: dflash dump draft logits. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("DFlash2 verifier",),
     ),
-    "VLLM_SPEC_DEBUG_CORRUPTION": lambda: bool(
-        int(os.getenv("VLLM_SPEC_DEBUG_CORRUPTION", "0"))
+    "VLLM_SPEC_DEBUG_CORRUPTION": env_var(
+        lambda: bool(int(os.getenv("VLLM_SPEC_DEBUG_CORRUPTION", "0"))),
+        description=(
+            "Speculative-decoding diagnostic: debug corruption. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SPEC_DUMP_DRAFT_LOGITS": lambda: bool(
-        int(os.getenv("VLLM_SPEC_DUMP_DRAFT_LOGITS", "0"))
+    "VLLM_SPEC_DUMP_DRAFT_LOGITS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SPEC_DUMP_DRAFT_LOGITS", "0"))),
+        description=(
+            "Speculative-decoding diagnostic: dump draft logits. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy 0.0.3 Mamba/GDN alignment diagnostics. Default-off because it
     # logs per-request state movement and accepted-token correction data.
-    "VLLM_MAMBA_ALIGN_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_MAMBA_ALIGN_DEBUG", "0"))
+    "VLLM_MAMBA_ALIGN_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_MAMBA_ALIGN_DEBUG", "0"))),
+        description=(
+            "Legacy 0.0.3 Mamba/GDN alignment diagnostics. Default-off because"
+            " it logs per-request state movement and accepted-token correction"
+            " data."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_MAMBA_ALIGN_CPU_POSTPROCESS": lambda: bool(
-        int(os.getenv("VLLM_MAMBA_ALIGN_CPU_POSTPROCESS", "0"))
+    "VLLM_MAMBA_ALIGN_CPU_POSTPROCESS": env_var(
+        lambda: bool(int(os.getenv("VLLM_MAMBA_ALIGN_CPU_POSTPROCESS", "0"))),
+        description=(
+            "vLLM: mamba align cpu postprocess. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy 0.0.3 compatibility knob. Latest vLLM no longer has the old
     # Mamba-prefix async-scheduling hard block; see VllmConfig for the no-op
     # compatibility warning when this is explicitly set.
-    "VLLM_ENABLE_MAMBA_PREFIX_ASYNC": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_MAMBA_PREFIX_ASYNC", "0"))
+    "VLLM_ENABLE_MAMBA_PREFIX_ASYNC": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_MAMBA_PREFIX_ASYNC", "0"))),
+        description=(
+            "Legacy 0.0.3 compatibility knob. Latest vLLM no longer has the "
+            "old Mamba-prefix async-scheduling hard block; see VllmConfig for "
+            "the no-op compatibility warning when this is explicitly set."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy FunAudioChat multimodal embedding diagnostics from 0.0.3.
     # Default-off; when enabled it prints tensor shapes/norms and can dump
     # one-sample audio embeddings for offline quality debugging.
-    "VLLM_FUN_AUDIOCHAT_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_FUN_AUDIOCHAT_DEBUG", "0"))
+    "VLLM_FUN_AUDIOCHAT_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_FUN_AUDIOCHAT_DEBUG", "0"))),
+        description=(
+            "Legacy FunAudioChat multimodal embedding diagnostics from 0.0.3. "
+            "Default-off; when enabled it prints tensor shapes/norms and can "
+            "dump one-sample audio embeddings for offline quality debugging."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_FUN_AUDIOCHAT_DUMP_PATH": lambda: os.getenv(
-        "VLLM_FUN_AUDIOCHAT_DUMP_PATH", ""
+    "VLLM_FUN_AUDIOCHAT_DUMP_PATH": env_var(
+        lambda: os.getenv("VLLM_FUN_AUDIOCHAT_DUMP_PATH", ""),
+        description=(
+            "vLLM: fun audiochat dump path. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Latest-TRITON attention schedule knobs for SM70. These keep the latest
     # vLLM attention implementation selected and only alter Triton launch
     # meta-parameters. Safe SM70 defaults are enabled after strict
     # max_diff == 0 and speed evidence; set
     # VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS=0 to recover upstream defaults.
-    "VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE": lambda: int(
-        os.getenv("VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE", "0")
+    "VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE", "0")),
+        description=(
+            "Latest-TRITON attention schedule knobs for SM70. These keep the "
+            "latest vLLM attention implementation selected and only alter "
+            "Triton launch meta-parameters. Safe SM70 defaults are enabled "
+            "after strict max_diff == 0 and speed evidence; set "
+            "VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS=0 to recover upstream "
+            "defaults."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 prefill",),
     ),
-    "VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE": lambda: int(
-        os.getenv("VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE", "0")
+    "VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE", "0")),
+        description=(
+            "SM70: triton attn decode tile size. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS": lambda: bool(
-        int(os.getenv("VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS", "1"))
+    "VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS", "1"))),
+        description=(
+            "SM70: triton attn safe defaults. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TRITON_ATTN_NUM_WARPS": lambda: int(
-        os.getenv("VLLM_SM70_TRITON_ATTN_NUM_WARPS", "0")
+    "VLLM_SM70_TRITON_ATTN_NUM_WARPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_NUM_WARPS", "0")),
+        description=(
+            "SM70: triton attn num warps. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS": lambda: int(
-        os.getenv("VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS", "0")
+    "VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS", "0")),
+        description=(
+            "SM70: triton attn prefill num warps. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 prefill",),
     ),
-    "VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS": lambda: int(
-        os.getenv("VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS", "0")
+    "VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS", "0")),
+        description=(
+            "SM70: triton attn decode num warps. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION": lambda: os.getenv(
-        "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION"
+    "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION": env_var(
+        lambda: os.getenv("VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION"),
+        description=(
+            "SM70: triton attn qk input precision. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION": lambda: os.getenv(
-        "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION"
+    "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION": env_var(
+        lambda: os.getenv("VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION"),
+        description=(
+            "SM70: triton attn pv input precision. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Experimental SM70 GDN/FLA KKT autotune search-space gate.
-    "VLLM_SM70_GDN_KKT_SCHEDULE": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1"))
+    "VLLM_SM70_GDN_KKT_SCHEDULE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1"))),
+        description="Experimental SM70 GDN/FLA KKT autotune search-space gate.",
+        category="experimental",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_GDN_KKT_BK": lambda: os.getenv("VLLM_SM70_GDN_KKT_BK"),
-    "VLLM_SM70_GDN_KKT_WARPS": lambda: os.getenv("VLLM_SM70_GDN_KKT_WARPS"),
-    "VLLM_SM70_GDN_KKT_STAGES": lambda: os.getenv("VLLM_SM70_GDN_KKT_STAGES"),
+    "VLLM_SM70_GDN_KKT_BK": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_KKT_BK"),
+        description=(
+            "SM70: gdn kkt bk. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_KKT_WARPS": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_KKT_WARPS"),
+        description=(
+            "SM70: gdn kkt warps. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_KKT_STAGES": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_KKT_STAGES"),
+        description=(
+            "SM70: gdn kkt stages. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
     # Experimental SM70 GDN/FLA delta-state autotune search-space gate.
-    "VLLM_SM70_GDN_DELTA_H_SCHEDULE": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1"))
+    "VLLM_SM70_GDN_DELTA_H_SCHEDULE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1"))),
+        description="Experimental SM70 GDN/FLA delta-state autotune search-space gate.",
+        category="experimental",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_GDN_DELTA_H_BV": lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_BV"),
-    "VLLM_SM70_GDN_DELTA_H_WARPS": lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_WARPS"),
-    "VLLM_SM70_GDN_DELTA_H_STAGES": lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_STAGES"),
+    "VLLM_SM70_GDN_DELTA_H_BV": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_BV"),
+        description=(
+            "SM70: gdn delta h bv. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_DELTA_H_WARPS": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_WARPS"),
+        description=(
+            "SM70: gdn delta h warps. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_DELTA_H_STAGES": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_STAGES"),
+        description=(
+            "SM70: gdn delta h stages. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
     # Experimental SM70 GDN/FLA output chunk autotune search-space gate.
-    "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_CHUNK_O_SCHEDULE", "1"))
+    "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_CHUNK_O_SCHEDULE", "1"))),
+        description=(
+            "Experimental SM70 GDN/FLA output chunk autotune search-space gate."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_GDN_CHUNK_O_BK": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BK"),
-    "VLLM_SM70_GDN_CHUNK_O_BV": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BV"),
-    "VLLM_SM70_GDN_CHUNK_O_WARPS": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_WARPS"),
-    "VLLM_SM70_GDN_CHUNK_O_STAGES": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_STAGES"),
+    "VLLM_SM70_GDN_CHUNK_O_BK": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BK"),
+        description=(
+            "SM70: gdn chunk o bk. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_CHUNK_O_BV": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BV"),
+        description=(
+            "SM70: gdn chunk o bv. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_CHUNK_O_WARPS": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_WARPS"),
+        description=(
+            "SM70: gdn chunk o warps. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_CHUNK_O_STAGES": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_STAGES"),
+        description=(
+            "SM70: gdn chunk o stages. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
     # Diagnostic-only correctness gate: compare latest prefill prep against
     # the 0.0.3-style q/k/v split plus fused_gdn_gating path.
-    "VLLM_SM70_GDN_LEGACY_PREFILL_PREP": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_LEGACY_PREFILL_PREP", "0"))
+    "VLLM_SM70_GDN_LEGACY_PREFILL_PREP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_LEGACY_PREFILL_PREP", "0"))),
+        description=(
+            "Diagnostic-only correctness gate: compare latest prefill prep "
+            "against the 0.0.3-style q/k/v split plus fused_gdn_gating path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: materialize the GDN output-projection z slice before
     # the GDN core custom-op boundary to test compile-time view/lifetime bugs.
-    "VLLM_SM70_GDN_Z_CONTIGUOUS": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_Z_CONTIGUOUS", "0"))
+    "VLLM_SM70_GDN_Z_CONTIGUOUS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_Z_CONTIGUOUS", "0"))),
+        description=(
+            "Diagnostic-only: materialize the GDN output-projection z slice "
+            "before the GDN core custom-op boundary to test compile-time "
+            "view/lifetime bugs."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: restore 0.0.3-style materialization of the packed
     # Qwen3.5 GDN q/k/v slice before the custom-op boundary. This tests
     # whether a strided projection view that is mutated by causal_conv1d_update
     # can corrupt long MTP/spec-decode runs under compile/FULL graph.
-    "VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS", "0"))
+    "VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS", "0"))),
+        description=(
+            "Diagnostic-only: restore 0.0.3-style materialization of the "
+            "packed Qwen3.5 GDN q/k/v slice before the custom-op boundary. "
+            "This tests whether a strided projection view that is mutated by "
+            "causal_conv1d_update can corrupt long MTP/spec-decode runs under "
+            "compile/FULL graph."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: route Qwen3.5 GDN core through the 0.0.3-style
     # context-resolved custom-op boundary. This keeps cache tensors hidden
     # from the op signature and tests whether the latest explicit cache
     # boundary changes MTP recurrent-state semantics under FULL graph.
-    "VLLM_SM70_QWEN_GDN_CONTEXT_CORE": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_CONTEXT_CORE", "0"))
+    "VLLM_SM70_QWEN_GDN_CONTEXT_CORE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_CONTEXT_CORE", "0"))),
+        description=(
+            "Diagnostic-only: route Qwen3.5 GDN core through the 0.0.3-style "
+            "context-resolved custom-op boundary. This keeps cache tensors "
+            "hidden from the op signature and tests whether the latest "
+            "explicit cache boundary changes MTP recurrent-state semantics "
+            "under FULL graph."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic force-on for the SM70 Qwen GDN opaque full-forward boundary.
     # The automatic default is armed only for active MTP spec-decode batches so
     # no-MTP services, prefill, and ordinary decode keep the faster split path.
-    "VLLM_SM70_QWEN_GDN_FULL_FORWARD": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_FULL_FORWARD", "0"))
+    "VLLM_SM70_QWEN_GDN_FULL_FORWARD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_FULL_FORWARD", "0"))),
+        description=(
+            "Diagnostic force-on for the SM70 Qwen GDN opaque full-forward "
+            "boundary. The automatic default is armed only for active MTP "
+            "spec-decode batches so no-MTP services, prefill, and ordinary "
+            "decode keep the faster split path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic escape hatch for comparing the latest split Qwen GDN compile
     # boundary against the default full-forward quality guard.
-    "VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD", "0"))
+    "VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD", "0"))),
+        description=(
+            "Diagnostic escape hatch for comparing the latest split Qwen GDN "
+            "compile boundary against the default full-forward quality guard."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Experimental active-MTP quality/speed lane: keep the SM70 0.0.3
     # FULL_AND_PIECEWISE compile policy, but skip FULL cudagraph replay for
     # Qwen GDN/Mamba verifier decode batches so the recurrent state boundary
     # executes through PIECEWISE instead of the unstable split FULL graph.
-    "VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE", "0"))
+    "VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE", "0"))),
+        description=(
+            "Experimental active-MTP quality/speed lane: keep the SM70 0.0.3 "
+            "FULL_AND_PIECEWISE compile policy, but skip FULL cudagraph replay"
+            " for Qwen GDN/Mamba verifier decode batches so the recurrent "
+            "state boundary executes through PIECEWISE instead of the unstable"
+            " split FULL graph."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Experimental SM70 MTP target: keep Qwen GDN input/output projections in
     # the compiled graph and isolate only the spec-aware recurrent core. The
     # default remains the full-Qwen-GDN active-MTP quality guard until this
     # narrower boundary passes long-output quality.
-    "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0"))
+    "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0"))),
+        description=(
+            "Experimental SM70 MTP target: keep Qwen GDN input/output "
+            "projections in the compiled graph and isolate only the spec-aware"
+            " recurrent core. The default remains the full-Qwen-GDN active-MTP"
+            " quality guard until this narrower boundary passes long-output "
+            "quality."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: active-MTP 0.0.3-style recurrent-core boundary. This
     # consumes live forward-context GDN metadata like the 0.0.3 quality-positive
     # path while keeping latest explicit cache mutation args for graph safety.
-    "VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", "0"))
+    "VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", "0"))),
+        description=(
+            "Diagnostic-only: active-MTP 0.0.3-style recurrent-core boundary. "
+            "This consumes live forward-context GDN metadata like the 0.0.3 "
+            "quality-positive path while keeping latest explicit cache "
+            "mutation args for graph safety."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Unsafe diagnostic override. The 0.0.3-style recurrent-core boundary is
     # quality-unsafe for native Qwen3.5 MTP with num_speculative_tokens >= 3
     # on long official-sampling outputs; keep it blocked by default there.
-    "VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP", "0"))
+    "VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP", "0"))),
+        description=(
+            "Unsafe diagnostic override. The 0.0.3-style recurrent-core "
+            "boundary is quality-unsafe for native Qwen3.5 MTP with "
+            "num_speculative_tokens >= 3 on long official-sampling outputs; "
+            "keep it blocked by default there."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: keep Qwen GDN input projection plus recurrent core
     # behind an opaque custom-op boundary while leaving output projection in
     # the latest compiled path. This was not sufficient for long MTP quality.
-    "VLLM_SM70_QWEN_GDN_INPUT_CORE_OP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_INPUT_CORE_OP", "0"))
+    "VLLM_SM70_QWEN_GDN_INPUT_CORE_OP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_INPUT_CORE_OP", "0"))),
+        description=(
+            "Diagnostic-only: keep Qwen GDN input projection plus recurrent "
+            "core behind an opaque custom-op boundary while leaving output "
+            "projection in the latest compiled path. This was not sufficient "
+            "for long MTP quality."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic escape hatch for comparing the split latest Qwen GDN compile
     # boundary against the default full-forward quality guard.
-    "VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP", "0"))
+    "VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP", "0"))),
+        description=(
+            "Diagnostic escape hatch for comparing the split latest Qwen GDN "
+            "compile boundary against the default full-forward quality guard."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: keep only Qwen GDN input projection/splitting behind an
     # opaque custom-op boundary while leaving the recurrent core and output
     # projection in the latest split path.
-    "VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP", "0"))
+    "VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP", "0"))),
+        description=(
+            "Diagnostic-only: keep only Qwen GDN input projection/splitting "
+            "behind an opaque custom-op boundary while leaving the recurrent "
+            "core and output projection in the latest split path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Diagnostic-only: keep only the Qwen GDN RMSNorm/output projection segment
     # behind an opaque custom-op boundary while leaving input projection and the
     # recurrent core in the latest split path.
-    "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP", "0"))
+    "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP", "0"))),
+        description=(
+            "Diagnostic-only: keep only the Qwen GDN RMSNorm/output projection"
+            " segment behind an opaque custom-op boundary while leaving input "
+            "projection and the recurrent core in the latest split path."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Exact-shape SM70 GDN decode fusions. The measured workload is evidence,
     # not a model-identity selector; runtime admission uses operator contracts.
-    "VLLM_SM70_GDN_QPN8_BA_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", "0"))
+    "VLLM_SM70_GDN_QPN8_BA_SPLIT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", "0"))),
+        description=(
+            "Exact-shape SM70 GDN decode fusions. The measured workload is "
+            "evidence, not a model-identity selector; runtime admission uses "
+            "operator contracts."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
-    "VLLM_SM70_GDN_RMSNORM_ONEPASS": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0"))
+    "VLLM_SM70_GDN_RMSNORM_ONEPASS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0"))),
+        description=(
+            "SM70: gdn rmsnorm onepass. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Fuse the native FP32 N128 gated RMSNorm chain without changing its
     # vector4 mean reduction, sigmoid/SiLU, or FP16 output boundary.
-    "VLLM_SM70_RMSNORM_GATED_EXACT": lambda: bool(
-        int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0"))
+    "VLLM_SM70_RMSNORM_GATED_EXACT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0"))),
+        description=(
+            "Fuse the native FP32 N128 gated RMSNorm chain without changing "
+            "its vector4 mean reduction, sigmoid/SiLU, or FP16 output "
+            "boundary."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
-    "VLLM_SM70_GEMMA_RMS_NORM_EAGER": lambda: bool(
-        int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_EAGER", "0"))
+    "VLLM_SM70_GEMMA_RMS_NORM_EAGER": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_EAGER", "0"))),
+        description=(
+            "Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an "
+            "opaque custom-op boundary under the SM70 compile/FULL graph lane."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Diagnostic-only: restore the 0.0.3-style PyTorch Gemma RMSNorm arithmetic
     # inside torch.compile so Inductor can fuse the surrounding elementwise work.
-    "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": lambda: bool(
-        int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "0"))
+    "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE", "0"))),
+        description=(
+            "Diagnostic-only: restore the 0.0.3-style PyTorch Gemma RMSNorm "
+            "arithmetic inside torch.compile so Inductor can fuse the "
+            "surrounding elementwise work."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks.
-    "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": lambda: bool(
-        int(os.getenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", "1"))
+    "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GEMMA_LONG_PREFILL_FUSED", "1"))),
+        description=(
+            "Exact mixed-dtype local fusion for long SM70 Qwen/Gemma prefill chunks."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 prefill",),
     ),
     # Experimental SM70 fused sigmoid gating launch schedule. Default-off and
     # BV-only unless WARPS/STAGES are explicitly overridden; multi-warp changes
     # require separate exactness evidence before they can count toward mainline.
-    "VLLM_SM70_FUSED_SIGMOID_GATING_SCHED": lambda: bool(
-        int(os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_SCHED", "1"))
+    "VLLM_SM70_FUSED_SIGMOID_GATING_SCHED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_SCHED", "1"))),
+        description=(
+            "Experimental SM70 fused sigmoid gating launch schedule. "
+            "Default-off and BV-only unless WARPS/STAGES are explicitly "
+            "overridden; multi-warp changes require separate exactness "
+            "evidence before they can count toward mainline."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FUSED_SIGMOID_GATING_BV": lambda: os.getenv(
-        "VLLM_SM70_FUSED_SIGMOID_GATING_BV"
+    "VLLM_SM70_FUSED_SIGMOID_GATING_BV": env_var(
+        lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_BV"),
+        description=(
+            "SM70: fused sigmoid gating bv. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS": lambda: os.getenv(
-        "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS"
+    "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS": env_var(
+        lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_WARPS"),
+        description=(
+            "SM70: fused sigmoid gating warps. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES": lambda: os.getenv(
-        "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES"
+    "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES": env_var(
+        lambda: os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_STAGES"),
+        description=(
+            "SM70: fused sigmoid gating stages. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy 0.0.3 coarse Qwen3Next fused-sigmoid gate. Latest splits this
     # into recurrent schedule and mixed-QKV controls; keep the old name visible
     # for command compatibility and route-ledger diagnostics.
-    "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING": lambda: bool(
-        int(os.getenv("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING", "1"))
+    "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING": env_var(
+        lambda: bool(int(os.getenv("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING", "1"))),
+        description=(
+            "Legacy 0.0.3 coarse Qwen3Next fused-sigmoid gate. Latest splits "
+            "this into recurrent schedule and mixed-QKV controls; keep the old"
+            " name visible for command compatibility and route-ledger "
+            "diagnostics."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # SM70 FlashQLA decode route for Qwen GDN. Default-on for SM70 migration
     # baselines; route checks still verify platform, dtype, head shape, and
     # FlashQLA import availability before using the kernel.
-    "VLLM_SM70_GDN_DECODE_FLASHQLA": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_DECODE_FLASHQLA", "1"))
+    "VLLM_SM70_GDN_DECODE_FLASHQLA": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_DECODE_FLASHQLA", "1"))),
+        description=(
+            "SM70 FlashQLA decode route for Qwen GDN. Default-on for SM70 "
+            "migration baselines; route checks still verify platform, dtype, "
+            "head shape, and FlashQLA import availability before using the "
+            "kernel."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=("FlashQLA",),
     ),
-    "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG", "0"))
+    "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG", "0"))),
+        description=(
+            "SM70: gdn decode flashqla route debug. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashQLA",),
     ),
-    "VLLM_SM70_FLASHQLA_DECODE_WARMUP": lambda: bool(
-        int(os.getenv("VLLM_SM70_FLASHQLA_DECODE_WARMUP", "1"))
+    "VLLM_SM70_FLASHQLA_DECODE_WARMUP": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLASHQLA_DECODE_WARMUP", "1"))),
+        description=(
+            "SM70: flashqla decode warmup. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashQLA",),
     ),
     # Experimental packed-QKV GDN decode loader, also reused by the small
     # SM70 fused MTP verifier. Model routing remains default-off until its
     # token/quality/throughput gates pass.
-    "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV": lambda: bool(
-        int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "0"))
+    "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "0"))),
+        description=(
+            "Experimental packed-QKV GDN decode loader, also reused by the "
+            "small SM70 fused MTP verifier. Model routing remains default-off "
+            "until its token/quality/throughput gates pass."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE", "0"))
+    "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE", "0"))),
+        description=(
+            "SM70: fused sigmoid mixed qkv compare. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Paused old experiment: changing GDN core output allocation from zeros to
     # empty lacked route-hit and quality proof. Keep visible but do not enable.
-    "VLLM_SM70_GDN_EMPTY_CORE_OUT": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_EMPTY_CORE_OUT", "0"))
+    "VLLM_SM70_GDN_EMPTY_CORE_OUT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_EMPTY_CORE_OUT", "0"))),
+        description=(
+            "Paused old experiment: changing GDN core output allocation from "
+            "zeros to empty lacked route-hit and quality proof. Keep visible "
+            "but do not enable."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
     ),
     # Legacy Qwen3Next shared-MoE overlap gates from 0.0.3. Latest upstream
     # FusedMoE already enables shared_experts stream overlap when eligible;
     # the disable gate is still honored by the Qwen3Next model hook.
-    "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": lambda: bool(
-        int(os.getenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0"))
+    "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": env_var(
+        lambda: bool(int(os.getenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0"))),
+        description=(
+            "Legacy Qwen3Next shared-MoE overlap gates from 0.0.3. Latest "
+            "upstream FusedMoE already enables shared_experts stream overlap "
+            "when eligible; the disable gate is still honored by the Qwen3Next"
+            " model hook."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' "
+                "when name not in os.environ; automatic defaults apply only when "
+                "the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP": lambda: bool(
-        int(os.getenv("VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP", "0"))
+    "VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP", "0"))
+        ),
+        description=(
+            "SM70: disable qwen3next shared moe overlap. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": lambda: bool(
-        int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))
+    "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))),
+        description=(
+            "SM70: unquantized moe 0dot3 config. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Default-on decode tiles for the audited exact-shape SM70 MTP contracts.
     # Larger or unmatched token shapes retain the 0.0.3 config; setting this
     # variable to zero is the explicit rollback.
-    "VLLM_SM70_MTP_MOE_TUNED_CONFIG": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1"))
+    "VLLM_SM70_MTP_MOE_TUNED_CONFIG": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1"))),
+        description=(
+            "Default-on decode tiles for the audited exact-shape SM70 MTP "
+            "contracts. Larger or unmatched token shapes retain the 0.0.3 "
+            "config; setting this variable to zero is the explicit rollback."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
     # BM2 Triton accumulation order, original weights, and FP16 boundaries.
-    "VLLM_SM70_MTP_MOE_FP16_EXACT": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "0"))
+    "VLLM_SM70_MTP_MOE_FP16_EXACT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "0"))),
+        description=(
+            "Opt-in exact FP16 Flash-Next TP4 draft projections; retains the "
+            "tuned BM2 Triton accumulation order, original weights, and FP16 "
+            "boundaries."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on
     # SM70 it restores the old fine-grained small-batch capture list.
-    "VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE": lambda: bool(
-        os.getenv("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", "0").strip().lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE": env_var(
+        lambda: bool(
+            os.getenv("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. "
+            "Default-off because dense capture can increase startup/compile "
+            "cost; when enabled on SM70 it restores the old fine-grained "
+            "small-batch capture list."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # SM70/V100 production-candidate CUDA graph policy. This explicitly maps
     # to the generic breakable cudagraph path only after config verifies that
     # the current platform is exactly SM70.
-    "VLLM_SM70_USE_BREAKABLE_CUDAGRAPH": lambda: bool(
-        os.getenv("VLLM_SM70_USE_BREAKABLE_CUDAGRAPH", "0").strip().lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_USE_BREAKABLE_CUDAGRAPH": env_var(
+        lambda: bool(
+            os.getenv("VLLM_SM70_USE_BREAKABLE_CUDAGRAPH", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "SM70/V100 production-candidate CUDA graph policy. This explicitly"
+            " maps to the generic breakable cudagraph path only after config "
+            "verifies that the current platform is exactly SM70."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Recreate the 0.0.3 SM70 Flash-V100 production graph policy for baseline
     # recovery: VLLM_COMPILE + FULL_AND_PIECEWISE with small decode captures.
-    "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
-            "0",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
+                "0",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Recreate the 0.0.3 SM70 Flash-V100 production graph policy for "
+            "baseline recovery: VLLM_COMPILE + FULL_AND_PIECEWISE with small "
+            "decode captures."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Exact Qwen3.8 TP4 lane: trace the large dynamic prefill backbone and the
     # small FULL decode backbone independently while sharing parameters/KV.
     # Config auto-enables this only for the admitted no-MTP model contract.
-    "VLLM_SM70_QWEN38_DUAL_COMPILE": lambda: bool(
-        os.getenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "0").strip().lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_QWEN38_DUAL_COMPILE": env_var(
+        lambda: bool(
+            os.getenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Exact Qwen3.8 TP4 lane: trace the large dynamic prefill backbone "
+            "and the small FULL decode backbone independently while sharing "
+            "parameters/KV. Config auto-enables this only for the admitted "
+            "no-MTP model contract."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and "
+                "_is_sm70_qwen38_decode_compile_contract(self.model_config, "
+                "self.speculative_config, self.parallel_config) and "
+                "envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH and "
+                "(envs.VLLM_SM70_QWEN38_FP16_GEMV or "
+                "envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16 or "
+                "envs.VLLM_SM70_QWEN38_FUSED_HC_FP16) and "
+                "('VLLM_SM70_QWEN38_DUAL_COMPILE' not in os.environ); automatic "
+                "defaults apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
     # uses the asynchronous CPU/disk-mmap offload result.
-    "VLLM_SM70_QWEN38_HYBRID_PLE": lambda: bool(
-        os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_QWEN38_HYBRID_PLE": env_var(
+        lambda: bool(
+            os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Keep local pinned-host PLE shards for Qwen3.8 decode while its "
+            "prefill uses the asynchronous CPU/disk-mmap offload result."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_hybrid_ple_defaults sets "
+                "'1' when owner policy; automatic defaults apply only when the "
+                "environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
     # disables AOT cache reload by default due known token drift, but long
     # profiler runs need an explicit way to reuse compile artifacts.
-    "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
-            "0",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
+                "0",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Diagnostic-only profiling knob. The SM70 compile-graph quality "
+            "profile disables AOT cache reload by default due known token "
+            "drift, but long profiler runs need an explicit way to reuse "
+            "compile artifacts."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Optional 0.0.3 VLLM_COMPILE graph-preset parity knob. Keep it default-off:
     # 27B-FP8 timing showed no speed recovery and changed greedy token hashes.
-    "VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS",
-            "0",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS",
+                "0",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Optional 0.0.3 VLLM_COMPILE graph-preset parity knob. Keep it "
+            "default-off: 27B-FP8 timing showed no speed recovery and changed "
+            "greedy token hashes."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Standalone default remains off for diagnostics. The SM70 Flash-V100
     # 0.0.3 compile-graph policy forces benchmark_combo_kernel=True because
     # the unbenchmarked combo-kernel choice reproduced greedy token drift.
-    "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL",
-            "0",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL",
+                "0",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Standalone default remains off for diagnostics. The SM70 "
+            "Flash-V100 0.0.3 compile-graph policy forces "
+            "benchmark_combo_kernel=True because the unbenchmarked "
+            "combo-kernel choice reproduced greedy token drift."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # During memory profiling, run the 1024-token dummy batch eagerly so the
     # production compile/cudagraph path is first exercised by small decode
     # capture sizes instead of the max prefill profile shape.
-    "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
-            "1",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
+                "1",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "During memory profiling, run the 1024-token dummy batch eagerly "
+            "so the production compile/cudagraph path is first exercised by "
+            "small decode capture sizes instead of the max prefill profile "
+            "shape."
+        ),
+        category="debug",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Experimental only. Old 0.0.3 Flash-V100 logs only captured decode FULL
     # graphs even though the policy name was FULL_AND_PIECEWISE. Skipping
     # latest-tree mixed/piecewise captures lowers startup cost, but can change
     # which shape traces the shared compiled range first. Keep this opt-in
     # until the prefill/decode compiled graph split is made safe.
-    "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE",
-            "0",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE",
+                "0",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Experimental only. Old 0.0.3 Flash-V100 logs only captured decode"
+            " FULL graphs even though the policy name was FULL_AND_PIECEWISE. "
+            "Skipping latest-tree mixed/piecewise captures lowers startup "
+            "cost, but can change which shape traces the shared compiled range"
+            " first. Keep this opt-in until the prefill/decode compiled graph "
+            "split is made safe."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # SM70 Flash-V100 production default: use the recovered 0.0.3-style
     # VLLM_COMPILE + FULL_AND_PIECEWISE graph path. Set
     # VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1 to opt into the lighter
     # diagnostic decode-only graph path.
-    "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE": lambda: bool(
-        os.getenv(
-            "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE",
-            "0",
-        )
-        .strip()
-        .lower()
-        in ("1", "true", "yes", "on")
+    "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE": env_var(
+        lambda: bool(
+            os.getenv(
+                "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE",
+                "0",
+            )
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "SM70 Flash-V100 production default: use the recovered 0.0.3-style"
+            " VLLM_COMPILE + FULL_AND_PIECEWISE graph path. Set "
+            "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1 to opt into the "
+            "lighter diagnostic decode-only graph path."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
-    "VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE": lambda: int(
-        os.getenv("VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE", "1")
+    "VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE", "1")),
+        description=(
+            "SM70: flash v100 decode graph capture size. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
     ),
     # Experimental SM70 fused recurrent GDN/FLA decode schedule. The legacy
     # VLLM_SM70_FLA_* overrides are registered for 0.0.3 migration parity, but
     # the route remains default-off until op/model-level acceptance.
-    "VLLM_SM70_FLA_RECURRENT_SCHEDULE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1"))
+    "VLLM_SM70_FLA_RECURRENT_SCHEDULE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1"))),
+        description=(
+            "Experimental SM70 fused recurrent GDN/FLA decode schedule. The "
+            "legacy VLLM_SM70_FLA_* overrides are registered for 0.0.3 "
+            "migration parity, but the route remains default-off until "
+            "op/model-level acceptance."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
-    "VLLM_SM70_FLA_BV": lambda: os.getenv("VLLM_SM70_FLA_BV"),
-    "VLLM_SM70_FLA_WARPS": lambda: os.getenv("VLLM_SM70_FLA_WARPS"),
-    "VLLM_SM70_FLA_STAGES": lambda: os.getenv("VLLM_SM70_FLA_STAGES"),
-    "VLLM_SM70_FLA_TARGET_WAVES": lambda: os.getenv("VLLM_SM70_FLA_TARGET_WAVES"),
-    "VLLM_SM70_FLA_BV_CANDIDATES": lambda: os.getenv("VLLM_SM70_FLA_BV_CANDIDATES"),
+    "VLLM_SM70_FLA_BV": env_var(
+        lambda: os.getenv("VLLM_SM70_FLA_BV"),
+        description=(
+            "SM70: fla bv. The consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_FLA_WARPS": env_var(
+        lambda: os.getenv("VLLM_SM70_FLA_WARPS"),
+        description=(
+            "SM70: fla warps. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_FLA_STAGES": env_var(
+        lambda: os.getenv("VLLM_SM70_FLA_STAGES"),
+        description=(
+            "SM70: fla stages. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_FLA_TARGET_WAVES": env_var(
+        lambda: os.getenv("VLLM_SM70_FLA_TARGET_WAVES"),
+        description=(
+            "SM70: fla target waves. The consumer locations and unset defaults"
+            " are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_FLA_BV_CANDIDATES": env_var(
+        lambda: os.getenv("VLLM_SM70_FLA_BV_CANDIDATES"),
+        description=(
+            "SM70: fla bv candidates. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, allow loading or unloading lora adapters in runtime,
-    "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
-        os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
-        in ("1", "true")
+    "VLLM_ALLOW_RUNTIME_LORA_UPDATING": env_var(
+        lambda: (
+            os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
+            in ("1", "true")
+        ),
+        description="If set, allow loading or unloading lora adapters in runtime,",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # We assume drivers can report p2p status correctly.
     # If the program hangs when using custom allreduce,
@@ -3918,49 +11302,151 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # if might be helpful to set VLLM_SKIP_P2P_CHECK=0
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
-    "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    "VLLM_SKIP_P2P_CHECK": env_var(
+        lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+        description=(
+            "We assume drivers can report p2p status correctly. If the program"
+            " hangs when using custom allreduce, potantially caused by a bug "
+            "in the driver (535 series), if might be helpful to set "
+            "VLLM_SKIP_P2P_CHECK=0 so that vLLM can verify if p2p is actually "
+            "working. See https://github.com/vllm-project/vllm/blob/a9b15c606f"
+            "ea67a072416ea0ea115261a2756058/vllm/distributed/device_communicat"
+            "ors/custom_all_reduce_utils.py#L101-L108 for details. # noqa"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
     # (kernels: MacheteLinearKernel, MarlinLinearKernel, ExllamaLinearKernel)
-    "VLLM_DISABLED_KERNELS": lambda: (
-        []
-        if "VLLM_DISABLED_KERNELS" not in os.environ
-        else os.environ["VLLM_DISABLED_KERNELS"].split(",")
+    "VLLM_DISABLED_KERNELS": env_var(
+        lambda: (
+            []
+            if "VLLM_DISABLED_KERNELS" not in os.environ
+            else os.environ["VLLM_DISABLED_KERNELS"].split(",")
+        ),
+        description=(
+            "List of quantization kernels that should be disabled, used for "
+            "testing and performance comparisons. Currently only affects "
+            "MPLinearKernel selection (kernels: MacheteLinearKernel, "
+            "MarlinLinearKernel, ExllamaLinearKernel)"
+        ),
+        category="configuration",
+        declared_default="[]",
+        effective_default=(
+            "Computed when unset: [] if 'VLLM_DISABLED_KERNELS' not in "
+            "os.environ else os.environ['VLLM_DISABLED_KERNELS'].split(',')"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+    "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))),
+        description=(
+            "vLLM: enable fla packed recurrent decode. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '1' when "
+                "sm70_flash_v100_baseline and env_name not in os.environ; "
+                "automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Disable pynccl (using torch.distributed instead)
-    "VLLM_DISABLE_PYNCCL": lambda: (
-        os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+    "VLLM_DISABLE_PYNCCL": env_var(
+        lambda: os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1"),
+        description="Disable pynccl (using torch.distributed instead)",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
-    "VLLM_USE_OINK_OPS": lambda: (
-        os.getenv("VLLM_USE_OINK_OPS", "False").lower() in ("true", "1")
+    "VLLM_USE_OINK_OPS": env_var(
+        lambda: os.getenv("VLLM_USE_OINK_OPS", "False").lower() in ("true", "1"),
+        description=(
+            "Optional: enable external Oink custom ops (e.g., Blackwell "
+            "RMSNorm). Disabled by default."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
-    "VLLM_ROCM_USE_AITER": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER": env_var(
+        lambda: os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1"),
+        description=(
+            "Disable aiter ops unless specifically enabled. Acts as a parent "
+            "switch to enable the rest of the other operations."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter paged attention.
     # By default is disabled.
-    "VLLM_ROCM_USE_AITER_PAGED_ATTN": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_PAGED_ATTN", "False").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_PAGED_ATTN": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_PAGED_ATTN", "False").lower()
+            in ("true", "1")
+        ),
+        description="Whether to use aiter paged attention. By default is disabled.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
     # - scaled_mm (per-tensor / rowwise)
     # - use aiter tuned gemms for unquantized gemms
-    "VLLM_ROCM_USE_AITER_LINEAR": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_LINEAR", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_LINEAR": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_LINEAR", "True").lower() in ("true", "1")
+        ),
+        description=(
+            "use aiter linear op if aiter ops are enabled The following list "
+            "of related ops - scaled_mm (per-tensor / rowwise) - use aiter "
+            "tuned gemms for unquantized gemms"
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter moe ops.
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_MOE": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_MOE": env_var(
+        lambda: os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1"),
+        description="Whether to use aiter moe ops. By default is enabled.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # MoE sorting dispatch policy for AITER fused MoE kernels.
     #   0 = auto (default): single-pass for small batches, multi-pass
@@ -3970,96 +11456,274 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   2 = always multi-pass: can be faster for MoE-heavy models
     #       (e.g., +2-5% on Qwen3-Next, +1.5% on DeepSeek-V3 at TP4,
     #       see PR #39177 for benchmarks)
-    "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY": lambda: int(
-        os.getenv("VLLM_ROCM_AITER_MOE_DISPATCH_POLICY", "0")
+    "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY": env_var(
+        lambda: int(os.getenv("VLLM_ROCM_AITER_MOE_DISPATCH_POLICY", "0")),
+        description=(
+            "MoE sorting dispatch policy for AITER fused MoE kernels. 0 = auto"
+            " (default): single-pass for small batches, multi-pass for large "
+            "batches 1 = always single-pass: one kernel launch, no workspace, "
+            "may be preferred for low-concurrency decode workloads 2 = always "
+            "multi-pass: can be faster for MoE-heavy models (e.g., +2-5% on "
+            "Qwen3-Next, +1.5% on DeepSeek-V3 at TP4, see PR #39177 for "
+            "benchmarks)"
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # use aiter rms norm op if aiter ops are enabled.
-    "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_RMSNORM": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in ("true", "1")
+        ),
+        description="use aiter rms norm op if aiter ops are enabled.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter mla ops.
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_MLA": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_MLA": env_var(
+        lambda: os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1"),
+        description="Whether to use aiter mla ops. By default is enabled.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter mha ops.
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_MHA": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_MHA": env_var(
+        lambda: os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1"),
+        description="Whether to use aiter mha ops. By default is enabled.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.
-    "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower()
+            in ("true", "1")
+        ),
+        description="Whether to use aiter fp4 gemm asm. By default is disabled.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter rope.
     # By default is disabled.
-    "VLLM_ROCM_USE_AITER_TRITON_ROPE": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_TRITON_ROPE", "False").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_TRITON_ROPE": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_TRITON_ROPE", "False").lower()
+            in ("true", "1")
+        ),
+        description="Whether to use aiter rope. By default is disabled.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter triton fp8 bmm kernel
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_FP8BMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FP8BMM", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_FP8BMM": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_FP8BMM", "True").lower() in ("true", "1")
+        ),
+        description="Whether to use aiter triton fp8 bmm kernel By default is enabled.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Whether to use aiter triton fp4 bmm kernel
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_FP4BMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FP4BMM", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_FP4BMM": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_FP4BMM", "True").lower() in ("true", "1")
+        ),
+        description="Whether to use aiter triton fp4 bmm kernel By default is enabled.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Use AITER triton unified attention for V1 attention
-    "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
-        in ("true", "1")
+    "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
+            in ("true", "1")
+        ),
+        description="Use AITER triton unified attention for V1 attention",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter fusion shared experts ops.
     # By default is disabled.
-    "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
-        in ("true", "1")
+    "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
+            in ("true", "1")
+        ),
+        description=(
+            "Whether to use aiter fusion shared experts ops. By default is disabled."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_TRITON_GEMM": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower()
+            in ("true", "1")
+        ),
+        description=(
+            "Whether to use aiter triton kernels for gemm ops. By default is enabled."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # use rocm skinny gemms
-    "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_SKINNY_GEMM": env_var(
+        lambda: os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1"),
+        description="use rocm skinny gemms",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
-    "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
+    "VLLM_ROCM_FP8_PADDING": env_var(
+        lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
+        description="Pad the fp8 weights to 256 bytes for ROCm",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
+    ),
     # Pad the weights for the moe kernel
-    "VLLM_ROCM_MOE_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_MOE_PADDING", "1"))),
+    "VLLM_ROCM_MOE_PADDING": env_var(
+        lambda: bool(int(os.getenv("VLLM_ROCM_MOE_PADDING", "1"))),
+        description="Pad the weights for the moe kernel",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Whether to use the shuffled kv cache layout
-    "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
-        os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower()
+            in ("true", "1")
+        ),
+        description="Whether to use the shuffled kv cache layout",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy ROCm opt-out for the custom paged attention selector. Default-on
     # preserves latest upstream behavior; setting it false restores the old
     # escape hatch for ROCm numerical or backend issues.
-    "VLLM_ROCM_CUSTOM_PAGED_ATTN": lambda: (
-        os.getenv("VLLM_ROCM_CUSTOM_PAGED_ATTN", "True").lower() in ("true", "1")
+    "VLLM_ROCM_CUSTOM_PAGED_ATTN": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_CUSTOM_PAGED_ATTN", "True").lower() in ("true", "1")
+        ),
+        description=(
+            "Legacy ROCm opt-out for the custom paged attention selector. "
+            "Default-on preserves latest upstream behavior; setting it false "
+            "restores the old escape hatch for ROCm numerical or backend "
+            "issues."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Legacy benchmark harness knob from 0.0.3. Latest vLLM routes
     # vllm.engine.llm_engine directly to the V1 engine, so this remains a
     # no-op compatibility value.
-    "VLLM_USE_V1": lambda: bool(int(os.getenv("VLLM_USE_V1", "1"))),
+    "VLLM_USE_V1": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_V1", "1"))),
+        description=(
+            "Legacy benchmark harness knob from 0.0.3. Latest vLLM routes "
+            "vllm.engine.llm_engine directly to the V1 engine, so this remains"
+            " a no-op compatibility value."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
     # Recommended for large models to get allreduce
-    "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION": env_with_choices(
-        "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
-        "NONE",
-        ["FP", "INT8", "INT6", "INT4", "NONE"],
+    "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION": env_var(
+        env_with_choices(
+            "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
+            "NONE",
+            ["FP", "INT8", "INT6", "INT4", "NONE"],
+        ),
+        description=(
+            "Custom quick allreduce kernel for MI3* cards Choice of "
+            "quantization level: FP, INT8, INT6, INT4 or NONE Recommended for "
+            "large models to get allreduce"
+        ),
+        category="configuration",
+        declared_default="'NONE'",
+        effective_default="'NONE'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Due to the lack of the bfloat16 asm instruction, bfloat16
     # kernels are slower than fp16,
     # If environment variable is set to 1, the input is converted to fp16
-    "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": lambda: (
-        os.getenv("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "True").lower()
-        in ("true", "1")
+    "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": env_var(
+        lambda: (
+            os.getenv("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "True").lower()
+            in ("true", "1")
+        ),
+        description=(
+            "Custom quick allreduce kernel for MI3* cards Due to the lack of "
+            "the bfloat16 asm instruction, bfloat16 kernels are slower than "
+            "fp16, If environment variable is set to 1, the input is converted"
+            " to fp16"
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Custom quick allreduce kernel for MI3* cards.
     # Controls the maximum allowed number of data bytes(MB) for custom quick
@@ -4067,52 +11731,189 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 2048 MB.
     # Data exceeding this size will use either custom allreduce or RCCL
     # communication.
-    "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": lambda: maybe_convert_int(
-        os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
+    "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": env_var(
+        lambda: maybe_convert_int(
+            os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
+        ),
+        description=(
+            "Custom quick allreduce kernel for MI3* cards. Controls the "
+            "maximum allowed number of data bytes(MB) for custom quick "
+            "allreduce communication. Default: 2048 MB. Data exceeding this "
+            "size will use either custom allreduce or RCCL communication."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_int(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Custom quick allreduce kernel for MI3* cards.
     # Controls the minimum allowed number of data bytes(MB) required to use
     # custom quick allreduce communication.
     # If unset, use the built-in threshold table.
-    "VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB": lambda: maybe_convert_int(
-        os.environ.get("VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB", None)
+    "VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB": env_var(
+        lambda: maybe_convert_int(
+            os.environ.get("VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB", None)
+        ),
+        description=(
+            "Custom quick allreduce kernel for MI3* cards. Controls the "
+            "minimum allowed number of data bytes(MB) required to use custom "
+            "quick allreduce communication. If unset, use the built-in "
+            "threshold table."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_int(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Controls the minimum tensor size (KB, where 1 KB = 1024 bytes) required
     # to use the configured QuickReduce codec. Smaller tensors use FP
     # QuickReduce. This does not affect QuickReduce eligibility.
-    "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB": lambda: maybe_convert_int(
-        os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB", None)
+    "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB": env_var(
+        lambda: maybe_convert_int(
+            os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB", None)
+        ),
+        description=(
+            "Controls the minimum tensor size (KB, where 1 KB = 1024 bytes) "
+            "required to use the configured QuickReduce codec. Smaller tensors"
+            " use FP QuickReduce. This does not affect QuickReduce "
+            "eligibility."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_int(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
-    "Q_SCALE_CONSTANT": lambda: int(os.getenv("Q_SCALE_CONSTANT", "200")),
+    "Q_SCALE_CONSTANT": env_var(
+        lambda: int(os.getenv("Q_SCALE_CONSTANT", "200")),
+        description=(
+            "Divisor for dynamic query scale factor calculation for FP8 KV Cache"
+        ),
+        category="configuration",
+        declared_default="200",
+        effective_default="200",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Divisor for dynamic key scale factor calculation for FP8 KV Cache
-    "K_SCALE_CONSTANT": lambda: int(os.getenv("K_SCALE_CONSTANT", "200")),
+    "K_SCALE_CONSTANT": env_var(
+        lambda: int(os.getenv("K_SCALE_CONSTANT", "200")),
+        description="Divisor for dynamic key scale factor calculation for FP8 KV Cache",
+        category="configuration",
+        declared_default="200",
+        effective_default="200",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Divisor for dynamic value scale factor calculation for FP8 KV Cache
-    "V_SCALE_CONSTANT": lambda: int(os.getenv("V_SCALE_CONSTANT", "100")),
+    "V_SCALE_CONSTANT": env_var(
+        lambda: int(os.getenv("V_SCALE_CONSTANT", "100")),
+        description=(
+            "Divisor for dynamic value scale factor calculation for FP8 KV Cache"
+        ),
+        category="configuration",
+        declared_default="100",
+        effective_default="100",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, enable multiprocessing in LLM for the V1 code path.
-    "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))
+    "VLLM_ENABLE_V1_MULTIPROCESSING": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))),
+        description="If set, enable multiprocessing in LLM for the V1 code path.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
-        os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
+    "VLLM_LOG_BATCHSIZE_INTERVAL": env_var(
+        lambda: float(os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")),
+        description=(
+            "vLLM: log batchsize interval. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="-1",
+        effective_default="-1.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
+    "VLLM_DISABLE_COMPILE_CACHE": env_var(
+        disable_compile_cache,
+        description=(
+            "vLLM: disable compile cache. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="Computed by disable_compile_cache",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set to "0", disable LayerName opaque type for layer_name
     # parameters in custom ops.  Defaults to enabled on torch >= 2.11.
-    "VLLM_USE_LAYERNAME": lambda: bool(int(os.getenv("VLLM_USE_LAYERNAME", "1"))),
+    "VLLM_USE_LAYERNAME": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_LAYERNAME", "1"))),
+        description=(
+            'If set to "0", disable LayerName opaque type for layer_name '
+            "parameters in custom ops.  Defaults to enabled on torch >= 2.11."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, use the Rust frontend binary instead of the Python API server
     # process(es).
-    "VLLM_USE_RUST_FRONTEND": lambda: bool(
-        int(os.getenv("VLLM_USE_RUST_FRONTEND", "0"))
+    "VLLM_USE_RUST_FRONTEND": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_RUST_FRONTEND", "0"))),
+        description=(
+            "If set, use the Rust frontend binary instead of the Python API "
+            "server process(es)."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Path to the Rust frontend binary. Defaults to "auto" which discovers
     # the binary installed with the vllm package. Only used when
     # VLLM_USE_RUST_FRONTEND=1.
-    "VLLM_RUST_FRONTEND_PATH": lambda: _resolve_rust_frontend_path(),
+    "VLLM_RUST_FRONTEND_PATH": env_var(
+        lambda: _resolve_rust_frontend_path(),
+        description=(
+            'Path to the Rust frontend binary. Defaults to "auto" which '
+            "discovers the binary installed with the vllm package. Only used "
+            "when VLLM_USE_RUST_FRONTEND=1."
+        ),
+        category="configuration",
+        declared_default="'auto'",
+        effective_default="Computed when unset: _resolve_rust_frontend_path()",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, vllm will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
-    "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    "VLLM_SERVER_DEV_MODE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+        description=(
+            "If set, vllm will run in development mode, which will enable some"
+            " additional endpoints for developing and debugging, e.g. "
+            "`/reset_prefix_cache`"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high
@@ -4120,41 +11921,146 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Setting this too high can result in a higher variance of
     # inter-message latencies. Setting it too low can negatively impact
     # TTFT and overall throughput.
-    "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
-        os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
+    "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")),
+        description=(
+            "Controls the maximum number of requests to handle in a single "
+            "asyncio task when processing per-token outputs in the V1 AsyncLLM"
+            " interface. It is applicable when handling a high concurrency of "
+            "streaming requests. Setting this too high can result in a higher "
+            "variance of inter-message latencies. Setting it too low can "
+            "negatively impact TTFT and overall throughput."
+        ),
+        category="tuning",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, vLLM will disable the MLA attention optimizations.
-    "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    "VLLM_MLA_DISABLE": env_var(
+        lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+        description="If set, vLLM will disable the MLA attention optimizations.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
     # so that users can colocate other actors on the same GPUs as vLLM.
-    "VLLM_RAY_PER_WORKER_GPUS": lambda: float(
-        os.getenv("VLLM_RAY_PER_WORKER_GPUS", "1.0")
+    "VLLM_RAY_PER_WORKER_GPUS": env_var(
+        lambda: float(os.getenv("VLLM_RAY_PER_WORKER_GPUS", "1.0")),
+        description=(
+            "If set, vLLM will pick up the provided Flash Attention MLA Number"
+            " of GPUs per worker in Ray, if it is set to be a fraction, it "
+            "allows ray to schedule multiple actors on a single GPU, so that "
+            "users can colocate other actors on the same GPUs as vLLM."
+        ),
+        category="configuration",
+        declared_default="1.0",
+        effective_default="1.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Bundle indices for Ray, if it is set, it can control precisely
     # which indices are used for the Ray bundle, for every worker.
     # Format: comma-separated list of integers, e.g. "0,1,2,3"
-    "VLLM_RAY_BUNDLE_INDICES": lambda: os.getenv("VLLM_RAY_BUNDLE_INDICES", ""),
+    "VLLM_RAY_BUNDLE_INDICES": env_var(
+        lambda: os.getenv("VLLM_RAY_BUNDLE_INDICES", ""),
+        description=(
+            "Bundle indices for Ray, if it is set, it can control precisely "
+            "which indices are used for the Ray bundle, for every worker. "
+            'Format: comma-separated list of integers, e.g. "0,1,2,3"'
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
-    "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
+    "VLLM_CUDART_SO_PATH": env_var(
+        lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
+        description=(
+            "In some system, find_loaded_library() may not work. So we allow "
+            "users to specify the path through environment variable "
+            "VLLM_CUDART_SO_PATH."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Rank of the process in the data parallel setting
-    "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
+    "VLLM_DP_RANK": env_var(
+        lambda: int(os.getenv("VLLM_DP_RANK", "0")),
+        description="Rank of the process in the data parallel setting",
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Rank of the process in the data parallel setting.
     # Defaults to VLLM_DP_RANK when not set.
-    "VLLM_DP_RANK_LOCAL": lambda: int(
-        os.getenv("VLLM_DP_RANK_LOCAL", sys.modules[__name__].VLLM_DP_RANK)
+    "VLLM_DP_RANK_LOCAL": env_var(
+        lambda: int(
+            os.getenv("VLLM_DP_RANK_LOCAL", sys.modules[__name__].VLLM_DP_RANK)
+        ),
+        description=(
+            "Rank of the process in the data parallel setting. Defaults to "
+            "VLLM_DP_RANK when not set."
+        ),
+        category="configuration",
+        declared_default="-1",
+        effective_default="When unset: int(sys.modules[__name__].VLLM_DP_RANK)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # World size of the data parallel setting
-    "VLLM_DP_SIZE": lambda: int(os.getenv("VLLM_DP_SIZE", "1")),
+    "VLLM_DP_SIZE": env_var(
+        lambda: int(os.getenv("VLLM_DP_SIZE", "1")),
+        description="World size of the data parallel setting",
+        category="configuration",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # IP address of the master node in the data parallel setting
-    "VLLM_DP_MASTER_IP": lambda: os.getenv("VLLM_DP_MASTER_IP", "127.0.0.1"),
+    "VLLM_DP_MASTER_IP": env_var(
+        lambda: os.getenv("VLLM_DP_MASTER_IP", "127.0.0.1"),
+        description="IP address of the master node in the data parallel setting",
+        category="configuration",
+        declared_default="'127.0.0.1'",
+        effective_default="'127.0.0.1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Port of the master node in the data parallel setting
-    "VLLM_DP_MASTER_PORT": lambda: int(os.getenv("VLLM_DP_MASTER_PORT", "0")),
+    "VLLM_DP_MASTER_PORT": env_var(
+        lambda: int(os.getenv("VLLM_DP_MASTER_PORT", "0")),
+        description="Port of the master node in the data parallel setting",
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Randomize inputs during dummy runs when using Data Parallel
-    "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": lambda: (
-        os.environ.get("VLLM_RANDOMIZE_DP_DUMMY_INPUTS", "0") == "1"
+    "VLLM_RANDOMIZE_DP_DUMMY_INPUTS": env_var(
+        lambda: os.environ.get("VLLM_RANDOMIZE_DP_DUMMY_INPUTS", "0") == "1",
+        description="Randomize inputs during dummy runs when using Data Parallel",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Strategy to pack the data parallel ranks for Ray.
     # Available options:
@@ -4167,108 +12073,307 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   Should be used only when a single DP rank requires multiple nodes.
     #   allocate one DP rank over as many nodes as required for set world_size;
     # This environment variable is ignored if data-parallel-backend is not Ray.
-    "VLLM_RAY_DP_PACK_STRATEGY": lambda: os.getenv(
-        "VLLM_RAY_DP_PACK_STRATEGY", "strict"
+    "VLLM_RAY_DP_PACK_STRATEGY": env_var(
+        lambda: os.getenv("VLLM_RAY_DP_PACK_STRATEGY", "strict"),
+        description=(
+            "Strategy to pack the data parallel ranks for Ray. Available "
+            'options: - "fill": for DP master node, allocate exactly '
+            "data-parallel-size-local DP ranks, for non-master nodes, allocate"
+            ' as many DP ranks as can fit; - "strict": allocate exactly '
+            'data-parallel-size-local DP ranks to each picked node; - "span": '
+            "Should be used only when a single DP rank requires multiple "
+            "nodes. allocate one DP rank over as many nodes as required for "
+            "set world_size; This environment variable is ignored if "
+            "data-parallel-backend is not Ray."
+        ),
+        category="configuration",
+        declared_default="'strict'",
+        effective_default="'strict'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Comma-separated *additional* prefixes of env vars to copy from the
     # driver to Ray workers.  These are merged with the built-in defaults
     # defined in ``vllm.ray.ray_env`` (VLLM_, etc.).  Example: "MYLIB_,OTHER_"
-    "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": lambda: os.getenv(
-        "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY", ""
+    "VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY": env_var(
+        lambda: os.getenv("VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY", ""),
+        description=(
+            "Comma-separated *additional* prefixes of env vars to copy from "
+            "the driver to Ray workers.  These are merged with the built-in "
+            "defaults defined in ``vllm.ray.ray_env`` (VLLM_, etc.).  Example:"
+            ' "MYLIB_,OTHER_"'
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Comma-separated *additional* individual env var names to copy from
     # the driver to Ray workers.  Merged with the built-in defaults
     # defined in ``vllm.ray.ray_env`` (PYTHONHASHSEED).
     # Example: "MY_SECRET,MY_FLAG"
-    "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY": lambda: os.getenv(
-        "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", ""
+    "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY": env_var(
+        lambda: os.getenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", ""),
+        description=(
+            "Comma-separated *additional* individual env var names to copy "
+            "from the driver to Ray workers.  Merged with the built-in "
+            "defaults defined in ``vllm.ray.ray_env`` (PYTHONHASHSEED). "
+            'Example: "MY_SECRET,MY_FLAG"'
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use S3 path for model loading in CI via RunAI Streamer
-    "VLLM_CI_USE_S3": lambda: os.environ.get("VLLM_CI_USE_S3", "0") == "1",
+    "VLLM_CI_USE_S3": env_var(
+        lambda: os.environ.get("VLLM_CI_USE_S3", "0") == "1",
+        description="Whether to use S3 path for model loading in CI via RunAI Streamer",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Use model_redirect to redirect the model name to a local folder.
     # `model_redirect` can be a json file mapping the model between
     # repo_id and local folder:
     # {"meta-llama/Llama-3.2-1B": "/tmp/Llama-3.2-1B"}
     # or a space separated values table file:
     # meta-llama/Llama-3.2-1B   /tmp/Llama-3.2-1B
-    "VLLM_MODEL_REDIRECT_PATH": lambda: os.environ.get(
-        "VLLM_MODEL_REDIRECT_PATH", None
+    "VLLM_MODEL_REDIRECT_PATH": env_var(
+        lambda: os.environ.get("VLLM_MODEL_REDIRECT_PATH", None),
+        description=(
+            "Use model_redirect to redirect the model name to a local folder. "
+            "`model_redirect` can be a json file mapping the model between "
+            'repo_id and local folder: {"meta-llama/Llama-3.2-1B": '
+            '"/tmp/Llama-3.2-1B"} or a space separated values table file: '
+            "meta-llama/Llama-3.2-1B   /tmp/Llama-3.2-1B"
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use atomicAdd reduce in gptq/awq marlin kernel.
-    "VLLM_MARLIN_USE_ATOMIC_ADD": lambda: (
-        os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1"
+    "VLLM_MARLIN_USE_ATOMIC_ADD": env_var(
+        lambda: os.environ.get("VLLM_MARLIN_USE_ATOMIC_ADD", "0") == "1",
+        description="Whether to use atomicAdd reduce in gptq/awq marlin kernel.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use marlin kernel in mxfp4 quantization method
     # Deprecated: use --moe-backend marlin (MoE) or --linear-backend marlin
     # (linear) instead.
-    "VLLM_MXFP4_USE_MARLIN": deprecated_env(
-        "VLLM_MXFP4_USE_MARLIN",
-        "v0.23",
-        "Use --moe-backend marlin or --linear-backend marlin.",
-        lambda: maybe_convert_bool(os.environ.get("VLLM_MXFP4_USE_MARLIN", None)),
+    "VLLM_MXFP4_USE_MARLIN": env_var(
+        deprecated_env(
+            "VLLM_MXFP4_USE_MARLIN",
+            "v0.23",
+            "Use --moe-backend marlin or --linear-backend marlin.",
+            lambda: maybe_convert_bool(os.environ.get("VLLM_MXFP4_USE_MARLIN", None)),
+        ),
+        description=(
+            "Whether to use marlin kernel in mxfp4 quantization method "
+            "Deprecated: use --moe-backend marlin (MoE) or --linear-backend "
+            "marlin (linear) instead."
+        ),
+        category="deprecated",
+        declared_default="None",
+        effective_default=(
+            "Computed by deprecated_env('VLLM_MXFP4_USE_MARLIN', 'v0.23', 'Use"
+            " --moe-backend marlin or --linear-backend marlin.', lambda: "
+            "maybe_convert_bool(os.environ.get('VLLM_MXFP4_USE_MARLIN', "
+            "None)))"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # The activation dtype for marlin kernel
-    "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
-        "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    "VLLM_MARLIN_INPUT_DTYPE": env_var(
+        env_with_choices("VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]),
+        description="The activation dtype for marlin kernel",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # The online quantization dtype for humming kernel
-    "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
-        os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
+    "VLLM_HUMMING_ONLINE_QUANT_CONFIG": env_var(
+        lambda: maybe_convert_json_str_or_file(
+            os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
+        ),
+        description="The online quantization dtype for humming kernel",
+        category="configuration",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_json_str_or_file(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # The activation dtype config for humming kernel
-    "VLLM_HUMMING_INPUT_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
-        os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
+    "VLLM_HUMMING_INPUT_QUANT_CONFIG": env_var(
+        lambda: maybe_convert_json_str_or_file(
+            os.environ.get("VLLM_HUMMING_INPUT_QUANT_CONFIG", None)
+        ),
+        description="The activation dtype config for humming kernel",
+        category="configuration",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_json_str_or_file(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use fp16 accumulator mma
-    "VLLM_HUMMING_USE_F16_ACCUM": lambda: maybe_convert_bool(
-        os.environ.get("VLLM_HUMMING_USE_F16_ACCUM", "0")
+    "VLLM_HUMMING_USE_F16_ACCUM": env_var(
+        lambda: maybe_convert_bool(os.environ.get("VLLM_HUMMING_USE_F16_ACCUM", "0")),
+        description="Whether to use fp16 accumulator mma",
+        category="configuration",
+        declared_default="False",
+        effective_default="Computed when unset: maybe_convert_bool('0')",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use indexed gemm for humming moe
     # if 1, force use indexed gemm
     # if 0, force use grouped gemm
     # if None, choose better gemm type automatically
-    "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
-        "VLLM_HUMMING_MOE_GEMM_TYPE", None
+    "VLLM_HUMMING_MOE_GEMM_TYPE": env_var(
+        lambda: os.environ.get("VLLM_HUMMING_MOE_GEMM_TYPE", None),
+        description=(
+            "Whether to use indexed gemm for humming moe if 1, force use "
+            "indexed gemm if 0, force use grouped gemm if None, choose better "
+            "gemm type automatically"
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with
     # https://github.com/deepseek-ai/DeepEP/pull/341
-    "VLLM_DEEPEPLL_NVFP4_DISPATCH": lambda: bool(
-        int(os.getenv("VLLM_DEEPEPLL_NVFP4_DISPATCH", "0"))
+    "VLLM_DEEPEPLL_NVFP4_DISPATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEEPEPLL_NVFP4_DISPATCH", "0"))),
+        description=(
+            "Whether to use DeepEPLL kernels for NVFP4 quantization and "
+            "dispatch method only supported on Blackwell GPUs and with "
+            "https://github.com/deepseek-ai/DeepEP/pull/341"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Whether to turn on the outlines cache for V1
     # This cache is unbounded and on disk, so it's not safe to use in
     # an environment with potentially malicious users.
-    "VLLM_V1_USE_OUTLINES_CACHE": lambda: (
-        os.environ.get("VLLM_V1_USE_OUTLINES_CACHE", "0") == "1"
+    "VLLM_V1_USE_OUTLINES_CACHE": env_var(
+        lambda: os.environ.get("VLLM_V1_USE_OUTLINES_CACHE", "0") == "1",
+        description=(
+            "Whether to turn on the outlines cache for V1 This cache is "
+            "unbounded and on disk, so it's not safe to use in an environment "
+            "with potentially malicious users."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Gap between padding buckets for the forward pass. So we have
     # 8, we will run forward pass with [16, 24, 32, ...].
-    "VLLM_TPU_BUCKET_PADDING_GAP": lambda: (
-        int(os.environ["VLLM_TPU_BUCKET_PADDING_GAP"])
-        if "VLLM_TPU_BUCKET_PADDING_GAP" in os.environ
-        else 0
+    "VLLM_TPU_BUCKET_PADDING_GAP": env_var(
+        lambda: (
+            int(os.environ["VLLM_TPU_BUCKET_PADDING_GAP"])
+            if "VLLM_TPU_BUCKET_PADDING_GAP" in os.environ
+            else 0
+        ),
+        description=(
+            "Gap between padding buckets for the forward pass. So we have 8, "
+            "we will run forward pass with [16, 24, 32, ...]."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default=(
+            "Computed when unset: "
+            "int(os.environ['VLLM_TPU_BUCKET_PADDING_GAP']) if "
+            "'VLLM_TPU_BUCKET_PADDING_GAP' in os.environ else 0"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_TPU_MOST_MODEL_LEN": lambda: maybe_convert_int(
-        os.environ.get("VLLM_TPU_MOST_MODEL_LEN", None)
+    "VLLM_TPU_MOST_MODEL_LEN": env_var(
+        lambda: maybe_convert_int(os.environ.get("VLLM_TPU_MOST_MODEL_LEN", None)),
+        description=(
+            "vLLM: tpu most model len. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_int(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether using Pathways
-    "VLLM_TPU_USING_PATHWAYS": lambda: bool(
-        "proxy" in os.getenv("JAX_PLATFORMS", "").lower()
+    "VLLM_TPU_USING_PATHWAYS": env_var(
+        lambda: bool("proxy" in os.getenv("JAX_PLATFORMS", "").lower()),
+        description="Whether using Pathways",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Allow use of DeepGemm kernels for fused moe ops.
-    "VLLM_USE_DEEP_GEMM": lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
+    "VLLM_USE_DEEP_GEMM": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "1"))),
+        description="Allow use of DeepGemm kernels for fused moe ops.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE).
-    "VLLM_MOE_USE_DEEP_GEMM": lambda: bool(
-        int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))
+    "VLLM_MOE_USE_DEEP_GEMM": env_var(
+        lambda: bool(int(os.getenv("VLLM_MOE_USE_DEEP_GEMM", "1"))),
+        description=(
+            "Allow use of DeepGemm specifically for MoE fused ops (overrides only MoE)."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs.
-    "VLLM_USE_DEEP_GEMM_E8M0": lambda: bool(
-        int(os.getenv("VLLM_USE_DEEP_GEMM_E8M0", "1"))
+    "VLLM_USE_DEEP_GEMM_E8M0": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM_E8M0", "1"))),
+        description=(
+            "Whether to use E8M0 scaling when DeepGEMM is used on Blackwell GPUs."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to create TMA-aligned scale tensor when DeepGEMM is used.
-    "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
-        int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
+    "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))),
+        description="Whether to create TMA-aligned scale tensor when DeepGEMM is used.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
@@ -4281,90 +12386,212 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "relax" : Select gemm shapes to run based on some heuristics. The
     #   heuristic aims to have the same effect as running all possible gemm
     #   shapes, but provides no guarantees.
-    "VLLM_DEEP_GEMM_WARMUP": env_with_choices(
-        "VLLM_DEEP_GEMM_WARMUP",
-        "relax",
-        [
-            "skip",
-            "full",
+    "VLLM_DEEP_GEMM_WARMUP": env_var(
+        env_with_choices(
+            "VLLM_DEEP_GEMM_WARMUP",
             "relax",
-        ],
+            [
+                "skip",
+                "full",
+                "relax",
+            ],
+        ),
+        description=(
+            "DeepGemm JITs the kernels on-demand. The warmup attempts to make "
+            "DeepGemm JIT all the required kernels before model execution so "
+            "there is no JIT'ing in the hot-path. However, this warmup "
+            "increases the engine startup time by a couple of minutes. "
+            'Available options: - "skip"  : Skip warmup. - "full"  : Warmup '
+            "deepgemm by running all possible gemm shapes the engine could "
+            'encounter. - "relax" : Select gemm shapes to run based on some '
+            "heuristics. The heuristic aims to have the same effect as running"
+            " all possible gemm shapes, but provides no guarantees."
+        ),
+        category="configuration",
+        declared_default="'relax'",
+        effective_default="'relax'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
-    "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
-        int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))
+    "VLLM_USE_FUSED_MOE_GROUPED_TOPK": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))),
+        description="Whether to use fused grouped_topk used for MoE expert selection.",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
-    "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
-        int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "1"))
+    "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": env_var(
+        lambda: bool(int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "1"))),
+        description=(
+            "Allow use of FlashInfer FP8 block-scale GEMM for linear layers. "
+            "This uses TensorRT-LLM kernels and requires SM90+ (Hopper)."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Allow use of FlashInfer BF16 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
-    "VLLM_USE_FLASHINFER_MOE_FP16": deprecated_env(
-        "VLLM_USE_FLASHINFER_MOE_FP16",
-        "v0.23",
-        "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass).",
-        lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP16", "0"))),
+    "VLLM_USE_FLASHINFER_MOE_FP16": env_var(
+        deprecated_env(
+            "VLLM_USE_FLASHINFER_MOE_FP16",
+            "v0.23",
+            "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass).",
+            lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP16", "0"))),
+        ),
+        description=(
+            "Allow use of FlashInfer BF16 MoE kernels for fused moe ops. "
+            "Deprecated: use --moe-backend to select a kernel explicitly."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
     ),
     # Allow use of FlashInfer FP8 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
-    "VLLM_USE_FLASHINFER_MOE_FP8": deprecated_env(
-        "VLLM_USE_FLASHINFER_MOE_FP8",
-        "v0.23",
-        "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass).",
-        lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP8", "0"))),
+    "VLLM_USE_FLASHINFER_MOE_FP8": env_var(
+        deprecated_env(
+            "VLLM_USE_FLASHINFER_MOE_FP8",
+            "v0.23",
+            "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass).",
+            lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP8", "0"))),
+        ),
+        description=(
+            "Allow use of FlashInfer FP8 MoE kernels for fused moe ops. "
+            "Deprecated: use --moe-backend to select a kernel explicitly."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Allow use of FlashInfer NVFP4 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
-    "VLLM_USE_FLASHINFER_MOE_FP4": deprecated_env(
-        "VLLM_USE_FLASHINFER_MOE_FP4",
-        "v0.23",
-        "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass, "
-        "flashinfer_cutedsl).",
-        lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP4", "0"))),
+    "VLLM_USE_FLASHINFER_MOE_FP4": env_var(
+        deprecated_env(
+            "VLLM_USE_FLASHINFER_MOE_FP4",
+            "v0.23",
+            "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass, "
+            "flashinfer_cutedsl).",
+            lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP4", "0"))),
+        ),
+        description=(
+            "Allow use of FlashInfer NVFP4 MoE kernels for fused moe ops. "
+            "Deprecated: use --moe-backend to select a kernel explicitly."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
-    "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
-        int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
+    "VLLM_USE_FLASHINFER_MOE_INT4": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))),
+        description="Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set to 1, use the FlashInfer
     # MXFP8 (activation) x MXFP4 (weight) MoE backend.
     # Deprecated: use --moe-backend flashinfer_trtllm combined with
     # --quantization_config.moe.activation mxfp8.
-    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8": deprecated_env(
-        "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8",
-        "v0.23",
-        "Use --moe-backend flashinfer_trtllm with "
-        "--quantization_config.moe.activation mxfp8.",
-        lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0"))),
+    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8": env_var(
+        deprecated_env(
+            "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8",
+            "v0.23",
+            "Use --moe-backend flashinfer_trtllm with "
+            "--quantization_config.moe.activation mxfp8.",
+            lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0"))),
+        ),
+        description=(
+            "If set to 1, use the FlashInfer MXFP8 (activation) x MXFP4 "
+            "(weight) MoE backend. Deprecated: use --moe-backend "
+            "flashinfer_trtllm combined with "
+            "--quantization_config.moe.activation mxfp8."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # If set to 1, use the FlashInfer CUTLASS backend for
     # MXFP8 (activation) x MXFP4 (weight) MoE.
     # Deprecated: use --moe-backend flashinfer_cutlass combined with
     # --quantization_config.moe.activation mxfp8.
-    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS": deprecated_env(
-        "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS",
-        "v0.23",
-        "Use --moe-backend flashinfer_cutlass with "
-        "--quantization_config.moe.activation mxfp8.",
-        lambda: bool(
-            int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0"))
+    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS": env_var(
+        deprecated_env(
+            "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS",
+            "v0.23",
+            "Use --moe-backend flashinfer_cutlass with "
+            "--quantization_config.moe.activation mxfp8.",
+            lambda: bool(
+                int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0"))
+            ),
         ),
+        description=(
+            "If set to 1, use the FlashInfer CUTLASS backend for MXFP8 "
+            "(activation) x MXFP4 (weight) MoE. Deprecated: use --moe-backend "
+            "flashinfer_cutlass combined with "
+            "--quantization_config.moe.activation mxfp8."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # If set to 1, use the FlashInfer
     # BF16 (activation) x MXFP4 (weight) MoE backend.
     # Deprecated: use --moe-backend to select a kernel explicitly.
-    "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": deprecated_env(
-        "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16",
-        "v0.23",
-        "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass).",
-        lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))),
+    "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": env_var(
+        deprecated_env(
+            "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16",
+            "v0.23",
+            "Use --moe-backend (e.g. flashinfer_trtllm, flashinfer_cutlass).",
+            lambda: bool(int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))),
+        ),
+        description=(
+            "If set to 1, use the FlashInfer BF16 (activation) x MXFP4 "
+            "(weight) MoE backend. Deprecated: use --moe-backend to select a "
+            "kernel explicitly."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind MXFP4",),
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.
-    "VLLM_XGRAMMAR_CACHE_MB": lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
+    "VLLM_XGRAMMAR_CACHE_MB": env_var(
+        lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
+        description=(
+            "Control the cache sized used by the xgrammar compiler. The "
+            "default of 512 MB should be enough for roughly 1000 JSON schemas."
+            " It can be changed with this variable if needed for some reason."
+        ),
+        category="configuration",
+        declared_default="512",
+        effective_default="512",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+    ),
     # Control the threshold for msgspec to use 'zero copy' for
     # serialization/deserialization of tensors. Tensors below
     # this limit will be encoded into the msgpack buffer, and
@@ -4372,45 +12599,127 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # While the sending side still actually copies the tensor
     # in all cases, on the receiving side, tensors above this
     # limit will actually be zero-copy decoded.
-    "VLLM_MSGPACK_ZERO_COPY_THRESHOLD": lambda: int(
-        os.getenv("VLLM_MSGPACK_ZERO_COPY_THRESHOLD", "256")
+    "VLLM_MSGPACK_ZERO_COPY_THRESHOLD": env_var(
+        lambda: int(os.getenv("VLLM_MSGPACK_ZERO_COPY_THRESHOLD", "256")),
+        description=(
+            "Control the threshold for msgspec to use 'zero copy' for "
+            "serialization/deserialization of tensors. Tensors below this "
+            "limit will be encoded into the msgpack buffer, and tensors above "
+            "will instead be sent via a separate message. While the sending "
+            "side still actually copies the tensor in all cases, on the "
+            "receiving side, tensors above this limit will actually be "
+            "zero-copy decoded."
+        ),
+        category="tuning",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, allow insecure serialization using pickle.
     # This is useful for environments where it is deemed safe to use the
     # insecure method and it is needed for some reason.
-    "VLLM_ALLOW_INSECURE_SERIALIZATION": lambda: bool(
-        int(os.getenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0"))
+    "VLLM_ALLOW_INSECURE_SERIALIZATION": env_var(
+        lambda: bool(int(os.getenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0"))),
+        description=(
+            "If set, allow insecure serialization using pickle. This is useful"
+            " for environments where it is deemed safe to use the insecure "
+            "method and it is needed for some reason."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Temporary: skip adding random suffix to internal request IDs. May be
     # needed for KV connectors that match request IDs across instances.
-    "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION": lambda: bool(
-        int(os.getenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "0"))
+    "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION": env_var(
+        lambda: bool(int(os.getenv("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "0"))),
+        description=(
+            "Temporary: skip adding random suffix to internal request IDs. May"
+            " be needed for KV connectors that match request IDs across "
+            "instances."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # IP address used for NIXL handshake between remote agents.
-    "VLLM_NIXL_SIDE_CHANNEL_HOST": lambda: os.getenv(
-        "VLLM_NIXL_SIDE_CHANNEL_HOST", "localhost"
+    "VLLM_NIXL_SIDE_CHANNEL_HOST": env_var(
+        lambda: os.getenv("VLLM_NIXL_SIDE_CHANNEL_HOST", "localhost"),
+        description="IP address used for NIXL handshake between remote agents.",
+        category="configuration",
+        declared_default="'localhost'",
+        effective_default="'localhost'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Port used for NIXL handshake between remote agents.
-    "VLLM_NIXL_SIDE_CHANNEL_PORT": lambda: int(
-        os.getenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5600")
+    "VLLM_NIXL_SIDE_CHANNEL_PORT": env_var(
+        lambda: int(os.getenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5600")),
+        description="Port used for NIXL handshake between remote agents.",
+        category="configuration",
+        declared_default="5600",
+        effective_default="5600",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Port used for Mooncake handshake between remote agents.
-    "VLLM_MOONCAKE_BOOTSTRAP_PORT": lambda: int(
-        os.getenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", "8998")
+    "VLLM_MOONCAKE_BOOTSTRAP_PORT": env_var(
+        lambda: int(os.getenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", "8998")),
+        description="Port used for Mooncake handshake between remote agents.",
+        category="configuration",
+        declared_default="8998",
+        effective_default="8998",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Log per-batch memory/disk tier breakdown on external GETs.
-    "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
-        os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
+    "VLLM_MOONCAKE_STORE_TIER_LOG": env_var(
+        lambda: (
+            os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")
+        ),
+        description="Log per-batch memory/disk tier breakdown on external GETs.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Fraction of the owner's DirectIO staging buffer to fill per GET batch.
-    "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": lambda: float(
-        os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")
+    "VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO": env_var(
+        lambda: float(os.getenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "0.9")),
+        description=(
+            "Fraction of the owner's DirectIO staging buffer to fill per GET batch."
+        ),
+        category="configuration",
+        declared_default="0.9",
+        effective_default="0.9",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Pin this rank to a specific owner segment ("host:port").
-    "MOONCAKE_PREFERRED_SEGMENT": lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),
+    "MOONCAKE_PREFERRED_SEGMENT": env_var(
+        lambda: os.getenv("MOONCAKE_PREFERRED_SEGMENT"),
+        description='Pin this rank to a specific owner segment ("host:port").',
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Override the hostname the rank registers as a Mooncake requester.
-    "MOONCAKE_REQUESTER_LOCAL_HOSTNAME": lambda: os.getenv(
-        "MOONCAKE_REQUESTER_LOCAL_HOSTNAME"
+    "MOONCAKE_REQUESTER_LOCAL_HOSTNAME": env_var(
+        lambda: os.getenv("MOONCAKE_REQUESTER_LOCAL_HOSTNAME"),
+        description="Override the hostname the rank registers as a Mooncake requester.",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Flashinfer MoE backend for vLLM's fused Mixture-of-Experts support.
     # Both require compute capability 10.0 or above.
@@ -4420,37 +12729,86 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "latency":
     #     Uses TensorRT-LLM kernels optimized for low-latency inference.
     # Deprecated: pass --moe-backend flashinfer_{trtllm,cutlass,cutedsl} directly.
-    "VLLM_FLASHINFER_MOE_BACKEND": deprecated_env(
-        "VLLM_FLASHINFER_MOE_BACKEND",
-        "v0.23",
-        "Use --moe-backend flashinfer_trtllm, flashinfer_cutlass, or "
-        "flashinfer_cutedsl.",
-        env_with_choices(
+    "VLLM_FLASHINFER_MOE_BACKEND": env_var(
+        deprecated_env(
             "VLLM_FLASHINFER_MOE_BACKEND",
-            "latency",
-            ["throughput", "latency", "masked_gemm"],
+            "v0.23",
+            "Use --moe-backend flashinfer_trtllm, flashinfer_cutlass, or "
+            "flashinfer_cutedsl.",
+            env_with_choices(
+                "VLLM_FLASHINFER_MOE_BACKEND",
+                "latency",
+                ["throughput", "latency", "masked_gemm"],
+            ),
         ),
+        description=(
+            "Flashinfer MoE backend for vLLM's fused Mixture-of-Experts "
+            "support. Both require compute capability 10.0 or above. Available"
+            ' options: - "throughput":  [default] Uses CUTLASS kernels '
+            'optimized for high-throughput batch inference. - "latency": Uses '
+            "TensorRT-LLM kernels optimized for low-latency inference. "
+            "Deprecated: pass --moe-backend "
+            "flashinfer_{trtllm,cutlass,cutedsl} directly."
+        ),
+        category="deprecated",
+        declared_default="'latency'",
+        effective_default=("'latency'"),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Override the directory for the FlashInfer autotune config cache.
-    "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
-        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
+    "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": env_var(
+        lambda: os.getenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None),
+        description="Override the directory for the FlashInfer autotune config cache.",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Flashinfer fused allreduce backend.
-    "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
-        "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
-        "auto",
-        ["auto", "trtllm", "mnnvl"],
+    "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_var(
+        env_with_choices(
+            "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
+            "auto",
+            ["auto", "trtllm", "mnnvl"],
+        ),
+        description="Flashinfer fused allreduce backend.",
+        category="configuration",
+        declared_default="'auto'",
+        effective_default="'auto'",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Control the workspace buffer size for the FlashInfer backend.
-    "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
-        os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+    "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": env_var(
+        lambda: int(
+            os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+        ),
+        description="Control the workspace buffer size for the FlashInfer backend.",
+        category="configuration",
+        declared_default="394 * 1024 * 1024",
+        effective_default="413138944",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
     # the blockscale tensor of activations NVFP4 Quantization.
     # This is used to prevent the kernel from running out of memory.
-    "VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE": lambda: int(
-        os.getenv("VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE", "163840")
+    "VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE": env_var(
+        lambda: int(os.getenv("VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE", "163840")),
+        description=(
+            "Control the maximum number of tokens per expert supported by the "
+            "NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer "
+            "for the blockscale tensor of activations NVFP4 Quantization. This"
+            " is used to prevent the kernel from running out of memory."
+        ),
+        category="tuning",
+        declared_default="163840",
+        effective_default="163840",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Specifies the thresholds of the communicated tensor sizes under which
     # vllm should use flashinfer fused allreduce. The variable should be a
@@ -4458,8 +12816,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     { <world size>: <max size in mb> }
     # Unspecified world sizes will fall back to
     #     { 2: 64, 4: 1, <everything else>: 0.5 }
-    "VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB": lambda: json.loads(
-        os.getenv("VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB", "{}")
+    "VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB": env_var(
+        lambda: json.loads(
+            os.getenv("VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB", "{}")
+        ),
+        description=(
+            "Specifies the thresholds of the communicated tensor sizes under "
+            "which vllm should use flashinfer fused allreduce. The variable "
+            "should be a JSON with the following format: { <world size>: <max "
+            "size in mb> } Unspecified world sizes will fall back to { 2: 64, "
+            "4: 1, <everything else>: 0.5 }"
+        ),
+        category="tuning",
+        declared_default="Computed when unset: json.loads('{}')",
+        effective_default="Computed when unset: json.loads('{}')",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # MoE routing strategy selector.
     # See `RoutingSimulator.get_available_strategies()` # for available
@@ -4467,23 +12839,60 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Custom routing strategies can be registered by
     # RoutingSimulator.register_strategy()
     # Note: custom strategies may not produce correct model outputs
-    "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": lambda: os.environ.get(
-        "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", ""
-    ).lower(),
+    "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": env_var(
+        lambda: os.environ.get("VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "").lower(),
+        description=(
+            "MoE routing strategy selector. See "
+            "`RoutingSimulator.get_available_strategies()` # for available "
+            "strategies. Custom routing strategies can be registered by "
+            "RoutingSimulator.register_strategy() Note: custom strategies may "
+            "not produce correct model outputs"
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Regex timeout for use by the vLLM tool parsing plugins.
-    "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
-        os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
+    "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": env_var(
+        lambda: int(os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")),
+        description="Regex timeout for use by the vLLM tool parsing plugins.",
+        category="configuration",
+        declared_default="1",
+        effective_default="1",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
-    "VLLM_MQ_MAX_CHUNK_BYTES_MB": lambda: int(
-        os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")
+    "VLLM_MQ_MAX_CHUNK_BYTES_MB": env_var(
+        lambda: int(os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")),
+        description=(
+            "Control the max chunk bytes (in MB) for the rpc message queue. "
+            "Object larger than this threshold will be broadcast to worker "
+            "processes via zmq."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default="16",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Timeout in seconds for execute_model RPC calls in multiprocessing
     # executor (only applies when TP > 1).
-    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": lambda: int(
-        os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
+    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": env_var(
+        lambda: int(os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")),
+        description=(
+            "Timeout in seconds for execute_model RPC calls in multiprocessing"
+            " executor (only applies when TP > 1)."
+        ),
+        category="configuration",
+        declared_default="300",
+        effective_default="300",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # KV Cache layout used throughout vllm.
     # Some common values are:
@@ -4492,40 +12901,102 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Where N=num_blocks, H=num_heads and D=head_size. The default value will
     # leave the layout choice to the backend. Mind that backends may only
     # implement and support a subset of all possible layouts.
-    "VLLM_KV_CACHE_LAYOUT": env_with_choices(
-        "VLLM_KV_CACHE_LAYOUT", None, ["NHD", "HND"]
+    "VLLM_KV_CACHE_LAYOUT": env_var(
+        env_with_choices("VLLM_KV_CACHE_LAYOUT", None, ["NHD", "HND"]),
+        description=(
+            "KV Cache layout used throughout vllm. Some common values are: - "
+            "NHD - HND Where N=num_blocks, H=num_heads and D=head_size. The "
+            "default value will leave the layout choice to the backend. Mind "
+            "that backends may only implement and support a subset of all "
+            "possible layouts."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
     # - DS: (dim, state_len) — TP-sharded dim on dim1,
     #   consistent with SSM temporal state and HND KV cache layout.
-    "VLLM_SSM_CONV_STATE_LAYOUT": env_with_choices(
-        "VLLM_SSM_CONV_STATE_LAYOUT", None, ["SD", "DS"]
+    "VLLM_SSM_CONV_STATE_LAYOUT": env_var(
+        env_with_choices("VLLM_SSM_CONV_STATE_LAYOUT", None, ["SD", "DS"]),
+        description=(
+            "SSM conv state layout used for Mamba models. - SD: (state_len, "
+            "dim) — dim contiguous (default) - DS: (dim, state_len) — "
+            "TP-sharded dim on dim1, consistent with SSM temporal state and "
+            "HND KV cache layout."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Enable checking whether the generated logits contain NaNs,
     # indicating corrupted output. Useful for debugging low level bugs
     # or bad hardware but it may add compute overhead.
-    "VLLM_COMPUTE_NANS_IN_LOGITS": lambda: bool(
-        int(os.getenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0"))
+    "VLLM_COMPUTE_NANS_IN_LOGITS": env_var(
+        lambda: bool(int(os.getenv("VLLM_COMPUTE_NANS_IN_LOGITS", "0"))),
+        description=(
+            "Enable checking whether the generated logits contain NaNs, "
+            "indicating corrupted output. Useful for debugging low level bugs "
+            "or bad hardware but it may add compute overhead."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Controls whether or not emulations are used for NVFP4
     # generations on machines < 100 for compressed-tensors
     # models
     # Deprecated: use --linear-backend emulation instead.
-    "VLLM_USE_NVFP4_CT_EMULATIONS": deprecated_env(
-        "VLLM_USE_NVFP4_CT_EMULATIONS",
-        "v0.23",
-        "Use --linear-backend emulation.",
-        lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0"))),
+    "VLLM_USE_NVFP4_CT_EMULATIONS": env_var(
+        deprecated_env(
+            "VLLM_USE_NVFP4_CT_EMULATIONS",
+            "v0.23",
+            "Use --linear-backend emulation.",
+            lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0"))),
+        ),
+        description=(
+            "Controls whether or not emulations are used for NVFP4 generations"
+            " on machines < 100 for compressed-tensors models Deprecated: use "
+            "--linear-backend emulation instead."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
-    "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
-        os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
+    "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": env_var(
+        lambda: int(os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")),
+        description=(
+            "Timeout (in seconds) for MooncakeConnector in PD disaggregated setup."
+        ),
+        category="configuration",
+        declared_default="480",
+        effective_default="480",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, it means we pre-downloaded cubin files and flashinfer will
     # read the cubin files directly.
-    "VLLM_HAS_FLASHINFER_CUBIN": lambda: bool(
-        int(os.getenv("VLLM_HAS_FLASHINFER_CUBIN", "0"))
+    "VLLM_HAS_FLASHINFER_CUBIN": env_var(
+        lambda: bool(int(os.getenv("VLLM_HAS_FLASHINFER_CUBIN", "0"))),
+        description=(
+            "If set, it means we pre-downloaded cubin files and flashinfer "
+            "will read the cubin files directly."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Supported options:
     # - "flashinfer-cudnn": use flashinfer cudnn GEMM backend
@@ -4538,36 +13009,84 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     GEMM kernels are not available.
     # - <none>: automatically pick an available backend
     # Deprecated: use --linear-backend instead.
-    "VLLM_NVFP4_GEMM_BACKEND": deprecated_env(
-        "VLLM_NVFP4_GEMM_BACKEND",
-        "v0.23",
-        "Use --linear-backend.",
-        env_with_choices(
+    "VLLM_NVFP4_GEMM_BACKEND": env_var(
+        deprecated_env(
             "VLLM_NVFP4_GEMM_BACKEND",
-            None,
-            [
-                "flashinfer-b12x",
-                "flashinfer-cudnn",
-                "flashinfer-trtllm",
-                "flashinfer-cutlass",
-                "cutlass",
-                "marlin",
-                "emulation",
-            ],
+            "v0.23",
+            "Use --linear-backend.",
+            env_with_choices(
+                "VLLM_NVFP4_GEMM_BACKEND",
+                None,
+                [
+                    "flashinfer-b12x",
+                    "flashinfer-cudnn",
+                    "flashinfer-trtllm",
+                    "flashinfer-cutlass",
+                    "cutlass",
+                    "marlin",
+                    "emulation",
+                ],
+            ),
         ),
+        description=(
+            'Supported options: - "flashinfer-cudnn": use flashinfer cudnn '
+            'GEMM backend - "flashinfer-trtllm": use flashinfer trtllm GEMM '
+            'backend - "flashinfer-cutlass": use flashinfer cutlass GEMM '
+            'backend - "marlin": use marlin GEMM backend (for GPUs without '
+            'native FP4 support) - "emulation": use BF16/FP16 GEMM, '
+            "dequantizing weights and running QDQ on activations. This is only"
+            " meant for research purposes to run on devices where NVFP4 GEMM "
+            "kernels are not available. - <none>: automatically pick an "
+            "available backend Deprecated: use --linear-backend instead."
+        ),
+        category="deprecated",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
     # If set to 1, allows GC to run during capture.
-    "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
+    "VLLM_ENABLE_CUDAGRAPH_GC": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))),
+        description=(
+            "Controls garbage collection during CUDA graph capture. If set to "
+            "0 (default), enables GC freezing to speed up capture time. If set"
+            " to 1, allows GC to run during capture."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Used to force set up loopback IP
-    "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
+    "VLLM_LOOPBACK_IP": env_var(
+        lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
+        description="Used to force set up loopback IP",
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Used to set the process name prefix for vLLM processes.
     # This is useful for debugging and monitoring purposes.
     # The default value is "VLLM".
-    "VLLM_PROCESS_NAME_PREFIX": lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+    "VLLM_PROCESS_NAME_PREFIX": env_var(
+        lambda: os.getenv("VLLM_PROCESS_NAME_PREFIX", "VLLM"),
+        description=(
+            "Used to set the process name prefix for vLLM processes. This is "
+            "useful for debugging and monitoring purposes. The default value "
+            'is "VLLM".'
+        ),
+        category="configuration",
+        declared_default="'VLLM'",
+        effective_default="'VLLM'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Allow chunked local attention with hybrid kv cache manager.
     # Currently using the Hybrid KV cache manager with chunked local attention
     # in the Llama4 models (the only models currently using chunked local attn)
@@ -4575,8 +13094,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This flag is used to allow users to enable it if they want to (to save on
     # kv-cache memory usage and enable longer contexts)
     # TODO(lucas): Remove this flag once latency regression is resolved.
-    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE": lambda: bool(
-        int(os.getenv("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "1"))
+    "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "1"))
+        ),
+        description=(
+            "Allow chunked local attention with hybrid kv cache manager. "
+            "Currently using the Hybrid KV cache manager with chunked local "
+            "attention in the Llama4 models (the only models currently using "
+            "chunked local attn) causes a latency regression. For this reason,"
+            " we disable it by default. This flag is used to allow users to "
+            "enable it if they want to (to save on kv-cache memory usage and "
+            "enable longer contexts) TODO(lucas): Remove this flag once "
+            "latency regression is resolved."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Enables support for the "store" option in the OpenAI Responses API.
     # When set to 1, vLLM's OpenAI server will retain the input and output
@@ -4587,153 +13123,441 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #    lost when the vLLM server shuts down.
     # 2. Enabling this option will cause a memory leak, as stored messages are
     #    never removed from memory until the server terminates.
-    "VLLM_ENABLE_RESPONSES_API_STORE": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_RESPONSES_API_STORE", "0"))
+    "VLLM_ENABLE_RESPONSES_API_STORE": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_RESPONSES_API_STORE", "0"))),
+        description=(
+            'Enables support for the "store" option in the OpenAI Responses '
+            "API. When set to 1, vLLM's OpenAI server will retain the input "
+            "and output messages for those requests in memory. By default, "
+            'this is disabled (0), and the "store" option is ignored. '
+            "NOTE/WARNING: 1. Messages are kept in memory only (not persisted "
+            "to disk) and will be lost when the vLLM server shuts down. 2. "
+            "Enabling this option will cause a memory leak, as stored messages"
+            " are never removed from memory until the server terminates."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set, use the fp8 mfma in rocm paged attention.
-    "VLLM_ROCM_FP8_MFMA_PAGE_ATTN": lambda: bool(
-        int(os.getenv("VLLM_ROCM_FP8_MFMA_PAGE_ATTN", "0"))
+    "VLLM_ROCM_FP8_MFMA_PAGE_ATTN": env_var(
+        lambda: bool(int(os.getenv("VLLM_ROCM_FP8_MFMA_PAGE_ATTN", "0"))),
+        description="If set, use the fp8 mfma in rocm paged attention.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind FP8",),
     ),
     # Whether to use pytorch symmetric memory for allreduce
-    "VLLM_ALLREDUCE_USE_SYMM_MEM": lambda: bool(
-        int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))
+    "VLLM_ALLREDUCE_USE_SYMM_MEM": env_var(
+        lambda: bool(int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))),
+        description="Whether to use pytorch symmetric memory for allreduce",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Whether to use FlashInfer allreduce
-    "VLLM_ALLREDUCE_USE_FLASHINFER": lambda: bool(
-        int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))
+    "VLLM_ALLREDUCE_USE_FLASHINFER": env_var(
+        lambda: bool(int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER", "0"))),
+        description="Whether to use FlashInfer allreduce",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
-    "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
-        int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
+    "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))),
+        description=(
+            "Experimental: use this to enable MCP tool calling for non harmony models"
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # User override folder for tuned Triton-kernel configs. Shared by MoE,
     # Mamba SSU, and LoRA. Filenames are distinct so one folder can hold all.
     # Each component first checks this folder, then the configs shipped with
     # vLLM (if any). If no JSON matches, it uses a hard-coded heuristic.
-    "VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),
+    "VLLM_TUNED_CONFIG_FOLDER": env_var(
+        lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),
+        description=(
+            "User override folder for tuned Triton-kernel configs. Shared by "
+            "MoE, Mamba SSU, and LoRA. Filenames are distinct so one folder "
+            "can hold all. Each component first checks this folder, then the "
+            "configs shipped with vLLM (if any). If no JSON matches, it uses a"
+            " hard-coded heuristic."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Valid values are container,code_interpreter,web_search_preview
     # ex VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter
     # If the server_label of your mcp tool is not in this list it will
     # be completely ignored.
-    "VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS": env_set_with_choices(
-        "VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS",
-        default=[],
-        choices=["container", "code_interpreter", "web_search_preview"],
+    "VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS": env_var(
+        env_set_with_choices(
+            "VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS",
+            default=[],
+            choices=["container", "code_interpreter", "web_search_preview"],
+        ),
+        description=(
+            "Valid values are container,code_interpreter,web_search_preview ex"
+            " VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS=container,code_interpreter "
+            "If the server_label of your mcp tool is not in this list it will "
+            "be completely ignored."
+        ),
+        category="configuration",
+        declared_default="set()",
+        effective_default=(
+            "Computed by "
+            "env_set_with_choices('VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS', "
+            "default=[], choices=['container', 'code_interpreter', "
+            "'web_search_preview'])"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Allows harmony instructions to be injected on system messages
-    "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
-        int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
+    "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": env_var(
+        lambda: bool(int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))),
+        description="Allows harmony instructions to be injected on system messages",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Pin the conversation start date injected into the Harmony system
     # message. When unset the current date is used, which introduces
     # non-determinism (different tokens -> different model behaviour at
     # temperature=0). Set to an ISO date string, e.g. "2023-09-12",
     # for reproducible inference or testing.
-    "VLLM_SYSTEM_START_DATE": lambda: os.getenv("VLLM_SYSTEM_START_DATE", None),
+    "VLLM_SYSTEM_START_DATE": env_var(
+        lambda: os.getenv("VLLM_SYSTEM_START_DATE", None),
+        description=(
+            "Pin the conversation start date injected into the Harmony system "
+            "message. When unset the current date is used, which introduces "
+            "non-determinism (different tokens -> different model behaviour at"
+            ' temperature=0). Set to an ISO date string, e.g. "2023-09-12", '
+            "for reproducible inference or testing."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Enable automatic retry when tool call JSON parsing fails
     # If enabled, returns an error message to the model to retry
     # If disabled (default), raises an exception and fails the request
-    "VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY": lambda: bool(
-        int(os.getenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "0"))
+    "VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY": env_var(
+        lambda: bool(int(os.getenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "0"))),
+        description=(
+            "Enable automatic retry when tool call JSON parsing fails If "
+            "enabled, returns an error message to the model to retry If "
+            "disabled (default), raises an exception and fails the request"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # When 1,the model structural tags will be used to enforce the model
     # output conforming to the model's tool-calling format and schema.
     # Default 0 (off).
-    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: bool(
-        int(os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0"))
+    "VLLM_ENFORCE_STRICT_TOOL_CALLING": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0"))),
+        description=(
+            "When 1,the model structural tags will be used to enforce the "
+            "model output conforming to the model's tool-calling format and "
+            "schema. Default 0 (off)."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Add optional custom scopes for profiling, disable to avoid overheads
-    "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(
-        int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))
+    "VLLM_CUSTOM_SCOPES_FOR_PROFILING": env_var(
+        lambda: bool(int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))),
+        description=(
+            "Add optional custom scopes for profiling, disable to avoid overheads"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Add optional nvtx scopes for profiling, disable to avoid overheads
-    "VLLM_NVTX_SCOPES_FOR_PROFILING": lambda: bool(
-        int(os.getenv("VLLM_NVTX_SCOPES_FOR_PROFILING", "0"))
+    "VLLM_NVTX_SCOPES_FOR_PROFILING": env_var(
+        lambda: bool(int(os.getenv("VLLM_NVTX_SCOPES_FOR_PROFILING", "0"))),
+        description=(
+            "Add optional nvtx scopes for profiling, disable to avoid overheads"
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Represent block hashes in KV cache events as 64-bit integers instead of
     # raw bytes. Defaults to True for backward compatibility.
-    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": lambda: bool(
-        int(os.getenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1"))
+    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": env_var(
+        lambda: bool(int(os.getenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1"))),
+        description=(
+            "Represent block hashes in KV cache events as 64-bit integers "
+            "instead of raw bytes. Defaults to True for backward "
+            "compatibility."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".
     # Automatically generates a unique UUID-based name per process tree
     # if not explicitly set.
-    "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": get_env_or_set_default(
-        "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
-        lambda: f"VLLM_OBJECT_STORAGE_SHM_BUFFER_{uuid.uuid4().hex}",
+    "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME": env_var(
+        get_env_or_set_default(
+            "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
+            lambda: f"VLLM_OBJECT_STORAGE_SHM_BUFFER_{uuid.uuid4().hex}",
+        ),
+        description=(
+            "Name of the shared memory buffer used for object storage. Only "
+            'effective when mm_config.mm_processor_cache_type == "shm". '
+            "Automatically generates a unique UUID-based name per process tree"
+            " if not explicitly set."
+        ),
+        category="configuration",
+        declared_default="'VLLM_OBJECT_STORAGE_SHM_BUFFER'",
+        effective_default=(
+            "Computed by "
+            "get_env_or_set_default('VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME', "
+            "lambda: f'VLLM_OBJECT_STORAGE_SHM_BUFFER_{uuid.uuid4().hex}')"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # The size in MB of the buffers (NVL and RDMA) used by DeepEP
-    "VLLM_DEEPEP_BUFFER_SIZE_MB": lambda: int(
-        os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")
+    "VLLM_DEEPEP_BUFFER_SIZE_MB": env_var(
+        lambda: int(os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "1024")),
+        description="The size in MB of the buffers (NVL and RDMA) used by DeepEP",
+        category="configuration",
+        declared_default="1024",
+        effective_default="1024",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Force DeepEP to use intranode kernel for inter-node communication in
     # high throughput mode. This is useful archive higher prefill throughput
     # on system supports multi-node nvlink (e.g GB200).
-    "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE": lambda: bool(
-        int(os.getenv("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE", "0"))
+    "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE", "0"))
+        ),
+        description=(
+            "Force DeepEP to use intranode kernel for inter-node communication"
+            " in high throughput mode. This is useful archive higher prefill "
+            "throughput on system supports multi-node nvlink (e.g GB200)."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Allow DeepEP to use MNNVL (multi-node nvlink) for internode_ll kernel,
     # turn this for better latency on GB200 like system
-    "VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL": lambda: bool(
-        int(os.getenv("VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL", "0"))
+    "VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL", "0"))),
+        description=(
+            "Allow DeepEP to use MNNVL (multi-node nvlink) for internode_ll "
+            "kernel, turn this for better latency on GB200 like system"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # The number of SMs/CUs to allocate for communication kernels when
     # running DBO; the rest will be allocated to compute.
     # Default: 20 on CUDA (SMs), 64 on ROCm (CUs).
-    "VLLM_DBO_COMM_SMS": lambda: int(
-        os.getenv(
-            "VLLM_DBO_COMM_SMS",
-            "64"
-            if hasattr(__import__("torch").version, "hip")
-            and __import__("torch").version.hip is not None
-            else "20",
-        )
+    "VLLM_DBO_COMM_SMS": env_var(
+        lambda: int(
+            os.getenv(
+                "VLLM_DBO_COMM_SMS",
+                "64"
+                if hasattr(__import__("torch").version, "hip")
+                and __import__("torch").version.hip is not None
+                else "20",
+            )
+        ),
+        description=(
+            "The number of SMs/CUs to allocate for communication kernels when "
+            "running DBO; the rest will be allocated to compute. Default: 20 "
+            "on CUDA (SMs), 64 on ROCm (CUs)."
+        ),
+        category="configuration",
+        declared_default="20",
+        effective_default=(
+            "Computed when unset: int('64' if "
+            "hasattr(__import__('torch').version, 'hip') and "
+            "__import__('torch').version.hip is not None else '20')"
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Enable max_autotune & coordinate_descent_tuning in inductor_config
     # to compile static shapes passed from compile_sizes in compilation_config
     # If set to 1, enable max_autotune; By default, this is enabled (1)
-    "VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE", "1"))
+    "VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE": env_var(
+        lambda: bool(int(os.getenv("VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE", "1"))),
+        description=(
+            "Enable max_autotune & coordinate_descent_tuning in "
+            "inductor_config to compile static shapes passed from "
+            "compile_sizes in compilation_config If set to 1, enable "
+            "max_autotune; By default, this is enabled (1)"
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set to 1, enable coordinate_descent_tuning;
     # By default, this is enabled (1)
-    "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING", "1"))
+    "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING", "1"))
+        ),
+        description=(
+            "If set to 1, enable coordinate_descent_tuning; By default, this "
+            "is enabled (1)"
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Flag to enable NCCL symmetric memory allocation and registration
-    "VLLM_USE_NCCL_SYMM_MEM": lambda: bool(
-        int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))
+    "VLLM_USE_NCCL_SYMM_MEM": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))),
+        description="Flag to enable NCCL symmetric memory allocation and registration",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
     ),
     # NCCL header path
-    "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),
+    "VLLM_NCCL_INCLUDE_PATH": env_var(
+        lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),
+        description="NCCL header path",
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+    ),
     # Flag to enable FBGemm kernels on model execution
     # Deprecated: use --linear-backend fbgemm instead.
-    "VLLM_USE_FBGEMM": deprecated_env(
-        "VLLM_USE_FBGEMM",
-        "v0.23",
-        "Use --linear-backend fbgemm.",
-        lambda: bool(int(os.getenv("VLLM_USE_FBGEMM", "0"))),
+    "VLLM_USE_FBGEMM": env_var(
+        deprecated_env(
+            "VLLM_USE_FBGEMM",
+            "v0.23",
+            "Use --linear-backend fbgemm.",
+            lambda: bool(int(os.getenv("VLLM_USE_FBGEMM", "0"))),
+        ),
+        description=(
+            "Flag to enable FBGemm kernels on model execution Deprecated: use "
+            "--linear-backend fbgemm instead."
+        ),
+        category="deprecated",
+        declared_default="False",
+        effective_default=("False"),
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # GC debug config
     # - VLLM_GC_DEBUG=0: disable GC debugger
     # - VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elpased times
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
-    "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+    "VLLM_GC_DEBUG": env_var(
+        lambda: os.getenv("VLLM_GC_DEBUG", ""),
+        description=(
+            "GC debug config - VLLM_GC_DEBUG=0: disable GC debugger - "
+            "VLLM_GC_DEBUG=1: enable GC debugger with gc.collect elpased times"
+            " - VLLM_GC_DEBUG='{\"top_objects\":5}': enable GC debugger with top"
+            " 5 collected objects"
+        ),
+        category="debug",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Debug workspace allocations.
     # logging of workspace resize operations.
-    "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+    "VLLM_DEBUG_WORKSPACE": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+        description=(
+            "Debug workspace allocations. logging of workspace resize operations."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Disables parallel execution of shared_experts via separate cuda stream
-    "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
-        int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    "VLLM_DISABLE_SHARED_EXPERTS_STREAM": env_var(
+        lambda: bool(int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))),
+        description=(
+            "Disables parallel execution of shared_experts via separate cuda stream"
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
-    "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
-        int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": env_var(
+        lambda: int(int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))),
+        description=(
+            "Limits when we run shared_experts in a separate stream. We found "
+            "out that for large batch sizes, the separate stream execution is "
+            "not beneficial (most likely because of the input clone) "
+            "TODO(alexm-redhat): Tune to be more dynamic based on GPU type"
+        ),
+        category="tuning",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
@@ -4743,8 +13567,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the cross-stream sync becomes pure overhead. Set to 0 to disable
     # the multi-stream path entirely. See #PR 41526 for the empirical result
     # for the default value of 1024 tokens.
-    "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": lambda: int(
-        os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")
+    "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": env_var(
+        lambda: int(os.getenv("VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD", "1024")),
+        description=(
+            "Token-count cutoff for multi-stream overlap of the attention "
+            "input GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped "
+            "with indexer weights / kv-score projections in DeepSeek-V4). At "
+            "or below this many tokens the FP8 main GEMM has idle SMs to share"
+            " with the bf16 aux GEMMs and overlap is a 5-45% win; above it the"
+            " FP8 GEMM saturates the device and the cross-stream sync becomes "
+            "pure overhead. Set to 0 to disable the multi-stream path "
+            "entirely. See #PR 41526 for the empirical result for the default "
+            "value of 1024 tokens."
+        ),
+        category="tuning",
+        declared_default="1024",
+        effective_default="1024",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Format for saving torch.compile cache artifacts
     # - "binary": saves as binary file
@@ -4752,176 +13592,2880 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "unpacked": saves as directory structure (for inspection/debugging)
     #     NOT multiprocess safe - race conditions may occur with multiple processes.
     #     Allows viewing and setting breakpoints in Inductor's code output files.
-    "VLLM_COMPILE_CACHE_SAVE_FORMAT": env_with_choices(
-        "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
+    "VLLM_COMPILE_CACHE_SAVE_FORMAT": env_var(
+        env_with_choices(
+            "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
+        ),
+        description=(
+            'Format for saving torch.compile cache artifacts - "binary": saves'
+            " as binary file Safe for multiple vllm serve processes accessing "
+            'the same torch compile cache. - "unpacked": saves as directory '
+            "structure (for inspection/debugging) NOT multiprocess safe - race"
+            " conditions may occur with multiple processes. Allows viewing and"
+            " setting breakpoints in Inductor's code output files."
+        ),
+        category="configuration",
+        declared_default="'binary'",
+        effective_default="'binary'",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
-    "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
-        os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+    "VLLM_USE_V2_MODEL_RUNNER": env_var(
+        lambda: maybe_convert_bool(os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)),
+        description=(
+            "Flag to control the v2 model runner. If unset, use config defaults."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="Computed when unset: maybe_convert_bool(None)",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Run n-gram PLE lookup in a dedicated CPU offload worker. The initial
     # implementation supports ModelRunner V1/V2 and node-local MP DP/TP.
-    "VLLM_PLE_CPU_OFFLOAD": lambda: (
-        os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+    "VLLM_PLE_CPU_OFFLOAD": env_var(
+        lambda: os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1"),
+        description=(
+            "Run n-gram PLE lookup in a dedicated CPU offload worker. The "
+            "initial implementation supports ModelRunner V1/V2 and node-local "
+            "MP DP/TP."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_hybrid_ple_defaults sets "
+                "'1' when owner policy; automatic defaults apply only when the "
+                "environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Retain Qwen4Exp PLE safetensor shards as file-backed mappings instead of
     # copying the complete learned n-gram table into anonymous host memory.
-    "VLLM_PLE_DISK_OFFLOAD": lambda: (
-        os.getenv("VLLM_PLE_DISK_OFFLOAD", "False").lower() in ("true", "1")
+    "VLLM_PLE_DISK_OFFLOAD": env_var(
+        lambda: os.getenv("VLLM_PLE_DISK_OFFLOAD", "False").lower() in ("true", "1"),
+        description=(
+            "Retain Qwen4Exp PLE safetensor shards as file-backed mappings "
+            "instead of copying the complete learned n-gram table into "
+            "anonymous host memory."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:_apply_sm70_qwen38_hybrid_ple_defaults sets "
+                "'1' when owner policy; automatic defaults apply only when the "
+                "environment override is absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Number of cross-shard mmap gather workers. Zero selects a bounded
     # hardware-aware default.
-    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": lambda: int(
-        os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")
+    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": env_var(
+        lambda: int(os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")),
+        description=(
+            "Number of cross-shard mmap gather workers. Zero selects a bounded"
+            " hardware-aware default."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
-    "VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: (
-        os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "False").lower() in ("true", "1")
+    "VLLM_PLE_DISK_OFFLOAD_PROFILE": env_var(
+        lambda: (
+            os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "False").lower() in ("true", "1")
+        ),
+        description=(
+            "vLLM: ple disk offload profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Keep the latency-critical PLE lookup process on the NUMA node local to
     # its first visible GPU. This changes CPU placement only; allocations use
     # a local-first policy with fallback so large tables are not forced into a
     # single NUMA node and swapped out.
-    "VLLM_PLE_OFFLOAD_AUTO_NUMA": lambda: (
-        os.getenv("VLLM_PLE_OFFLOAD_AUTO_NUMA", "True").lower() in ("true", "1")
+    "VLLM_PLE_OFFLOAD_AUTO_NUMA": env_var(
+        lambda: (
+            os.getenv("VLLM_PLE_OFFLOAD_AUTO_NUMA", "True").lower() in ("true", "1")
+        ),
+        description=(
+            "Keep the latency-critical PLE lookup process on the NUMA node "
+            "local to its first visible GPU. This changes CPU placement only; "
+            "allocations use a local-first policy with fallback so large "
+            "tables are not forced into a single NUMA node and swapped out."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Fault PLE table pages back into RAM after GPU workers finish loading.
     # Concurrent checkpoint loading can otherwise leave anonymous table pages
     # in swap while reclaimable checkpoint page cache occupies host memory.
-    "VLLM_PLE_OFFLOAD_PREFAULT": lambda: (
-        os.getenv("VLLM_PLE_OFFLOAD_PREFAULT", "True").lower() in ("true", "1")
+    "VLLM_PLE_OFFLOAD_PREFAULT": env_var(
+        lambda: os.getenv("VLLM_PLE_OFFLOAD_PREFAULT", "True").lower() in ("true", "1"),
+        description=(
+            "Fault PLE table pages back into RAM after GPU workers finish "
+            "loading. Concurrent checkpoint loading can otherwise leave "
+            "anonymous table pages in swap while reclaimable checkpoint page "
+            "cache occupies host memory."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Timeout for PLE weight loading and TP worker registration.
-    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
-        os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": env_var(
+        lambda: float(os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")),
+        description="Timeout for PLE weight loading and TP worker registration.",
+        category="configuration",
+        declared_default="600.0",
+        effective_default="600.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel rank,
     # for the part of the FP8 n-gram table that does not stay in device
     # memory. Unset or "auto": derived from the device headroom left beside
     # the weights and the KV cache of the requested context.
-    "VLLM_QWEN4EXP_PLE_HOST_GIB": lambda: (
-        None
-        if os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "auto").strip().lower()
-        in ("", "auto")
-        else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0"))
+    "VLLM_QWEN4EXP_PLE_HOST_GIB": env_var(
+        lambda: (
+            None
+            if os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "auto").strip().lower()
+            in ("", "auto")
+            else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0"))
+        ),
+        description=(
+            "Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel"
+            " rank, for the part of the FP8 n-gram table that does not stay in"
+            ' device memory. Unset or "auto": derived from the device headroom'
+            " left beside the weights and the KV cache of the requested "
+            "context."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Device memory in GiB the automatic PLE placement keeps free for the
     # activation peak and the CUDA graph pool. Unset: 8 % of the device,
     # at most 4 GiB.
-    "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB": lambda: (
-        None
-        if os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "").strip() == ""
-        else float(os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "0"))
+    "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB": env_var(
+        lambda: (
+            None
+            if os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "").strip() == ""
+            else float(os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "0"))
+        ),
+        description=(
+            "Device memory in GiB the automatic PLE placement keeps free for "
+            "the activation peak and the CUDA graph pool. Unset: 8 % of the "
+            "device, at most 4 GiB."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Host memory in GiB the automatic PLE placement leaves untouched for the
     # engine processes, checkpoint loading and other tenants; the rest is
     # shared equally by the tensor-parallel ranks that pin the table.
     # Unset: 25 % of the physical host memory.
-    "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": lambda: (
-        None
-        if os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "").strip() == ""
-        else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0"))
+    "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": env_var(
+        lambda: (
+            None
+            if os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "").strip() == ""
+            else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0"))
+        ),
+        description=(
+            "Host memory in GiB the automatic PLE placement leaves untouched "
+            "for the engine processes, checkpoint loading and other tenants; "
+            "the rest is shared equally by the tensor-parallel ranks that pin "
+            "the table. Unset: 25 % of the physical host memory."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
-    "VLLM_LOG_MODEL_INSPECTION": lambda: bool(
-        int(os.getenv("VLLM_LOG_MODEL_INSPECTION", "0"))
+    "VLLM_LOG_MODEL_INSPECTION": env_var(
+        lambda: bool(int(os.getenv("VLLM_LOG_MODEL_INSPECTION", "0"))),
+        description=(
+            "Log model inspection after loading. If enabled, logs a "
+            "transformers-style hierarchical view of the model with "
+            "quantization methods and attention backends."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Debug logging for --enable-mfu-metrics
-    "VLLM_DEBUG_MFU_METRICS": lambda: bool(
-        int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
+    "VLLM_DEBUG_MFU_METRICS": env_var(
+        lambda: bool(int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))),
+        description="Debug logging for --enable-mfu-metrics",
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Disable using pytorch's pin memory for CPU offloading.
-    "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
-        int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
+    "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": env_var(
+        lambda: bool(int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))),
+        description="Disable using pytorch's pin memory for CPU offloading.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Disable using UVA (Unified Virtual Addressing) for CPU offloading.
-    "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": lambda: bool(
-        int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", "0"))
+    "VLLM_WEIGHT_OFFLOADING_DISABLE_UVA": env_var(
+        lambda: bool(int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_UVA", "0"))),
+        description=(
+            "Disable using UVA (Unified Virtual Addressing) for CPU offloading."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Disable logging of vLLM logo at server startup time.
-    "VLLM_DISABLE_LOG_LOGO": lambda: bool(int(os.getenv("VLLM_DISABLE_LOG_LOGO", "0"))),
+    "VLLM_DISABLE_LOG_LOGO": env_var(
+        lambda: bool(int(os.getenv("VLLM_DISABLE_LOG_LOGO", "0"))),
+        description="Disable logging of vLLM logo at server startup time.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
-    "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+    "VLLM_LORA_DISABLE_PDL": env_var(
+        lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+        description=(
+            "Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes "
+            "Triton compilation to fail."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Enable CUDA compatibility mode for datacenter GPUs with older
     # driver versions than the CUDA toolkit major version of vLLM.
-    "VLLM_ENABLE_CUDA_COMPATIBILITY": lambda: (
-        os.environ.get("VLLM_ENABLE_CUDA_COMPATIBILITY", "0").strip().lower()
-        in ("1", "true")
+    "VLLM_ENABLE_CUDA_COMPATIBILITY": env_var(
+        lambda: (
+            os.environ.get("VLLM_ENABLE_CUDA_COMPATIBILITY", "0").strip().lower()
+            in ("1", "true")
+        ),
+        description=(
+            "Enable CUDA compatibility mode for datacenter GPUs with older "
+            "driver versions than the CUDA toolkit major version of vLLM."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Path to the CUDA compatibility libraries when CUDA compatibility is enabled.
-    "VLLM_CUDA_COMPATIBILITY_PATH": lambda: os.environ.get(
-        "VLLM_CUDA_COMPATIBILITY_PATH", None
+    "VLLM_CUDA_COMPATIBILITY_PATH": env_var(
+        lambda: os.environ.get("VLLM_CUDA_COMPATIBILITY_PATH", None),
+        description=(
+            "Path to the CUDA compatibility libraries when CUDA compatibility "
+            "is enabled."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Skip model name validation in OpenAI API requests.
     # When set to 1, any model name will be accepted in the 'model' field
     # of API requests. This is useful for proxy/gateway scenarios where
     # the actual model is served but different names may be used in requests.
-    "VLLM_SKIP_MODEL_NAME_VALIDATION": lambda: (
-        os.getenv("VLLM_SKIP_MODEL_NAME_VALIDATION", "0").strip().lower()
-        in ("1", "true")
+    "VLLM_SKIP_MODEL_NAME_VALIDATION": env_var(
+        lambda: (
+            os.getenv("VLLM_SKIP_MODEL_NAME_VALIDATION", "0").strip().lower()
+            in ("1", "true")
+        ),
+        description=(
+            "Skip model name validation in OpenAI API requests. When set to 1,"
+            " any model name will be accepted in the 'model' field of API "
+            "requests. This is useful for proxy/gateway scenarios where the "
+            "actual model is served but different names may be used in "
+            "requests."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether it is a scale up launch engine for elastic EP,
     # Should only be set by EngineCoreClient.
-    "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": lambda: bool(
-        int(os.getenv("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", "0"))
+    "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", "0"))),
+        description=(
+            "Whether it is a scale up launch engine for elastic EP, Should "
+            "only be set by EngineCoreClient."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to wait for all requests to drain before sending the
     # scaling command in elastic EP.
-    "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
-        int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
+    "VLLM_ELASTIC_EP_DRAIN_REQUESTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))),
+        description=(
+            "Whether to wait for all requests to drain before sending the "
+            "scaling command in elastic EP."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set to 1, enable CUDA graph memory estimation during memory profiling.
     # This profiles CUDA graph memory usage to provide more accurate KV cache
     # memory allocation. Enabled by default as of v0.21.0
-    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
-        int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
+    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": env_var(
+        lambda: bool(int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))),
+        description=(
+            "If set to 1, enable CUDA graph memory estimation during memory "
+            "profiling. This profiles CUDA graph memory usage to provide more "
+            "accurate KV cache memory allocation. Enabled by default as of "
+            "v0.21.0"
+        ),
+        category="debug",
+        declared_default="True",
+        effective_default=(
+            "True; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/config/vllm.py:__post_init__ sets '0' when "
+                "sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user "
+                "and current_platform.is_cuda() and "
+                "_any_participating_device_is_capability(self, (7, 0)) and "
+                "envs.VLLM_SM70_FLASH_ATTN_V100 and not self.use_v2_model_runner "
+                "and 'VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS' not in os.environ;"
+                " automatic defaults apply only when the environment override is "
+                "absent."
+            ),
+        ),
+        acceleration_paths=(),
     ),
     # Explicit CUDA graph memory reservation for the V2 GPU model runner,
     # which does not profile graph memory yet. The default preserves upstream
     # behavior. Set this from a measured capture result when sizing a tight KV
     # cache pool.
-    "VLLM_V2_CUDAGRAPH_MEM_MIB": lambda: float(
-        os.getenv("VLLM_V2_CUDAGRAPH_MEM_MIB", "0") or 0
+    "VLLM_V2_CUDAGRAPH_MEM_MIB": env_var(
+        lambda: float(os.getenv("VLLM_V2_CUDAGRAPH_MEM_MIB", "0") or 0),
+        description=(
+            "Explicit CUDA graph memory reservation for the V2 GPU model "
+            "runner, which does not profile graph memory yet. The default "
+            "preserves upstream behavior. Set this from a measured capture "
+            "result when sizing a tight KV cache pool."
+        ),
+        category="configuration",
+        declared_default="0.0",
+        effective_default="0.0",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # NIXL EP environment variables
-    "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
-        os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
+    "VLLM_NIXL_EP_MAX_NUM_RANKS": env_var(
+        lambda: int(os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")),
+        description="NIXL EP environment variables",
+        category="tuning",
+        declared_default="32",
+        effective_default="32",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether enable XPU graph on Intel GPU
-    "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
-        int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
+    "VLLM_XPU_ENABLE_XPU_GRAPH": env_var(
+        lambda: bool(int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))),
+        description="Whether enable XPU graph on Intel GPU",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # whether use xpu specific sample kernel
-    "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
-        int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    "VLLM_XPU_USE_SAMPLER_KERNEL": env_var(
+        lambda: bool(int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))),
+        description="whether use xpu specific sample kernel",
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Enable simple KV offload.
-    "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
-        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+    "VLLM_USE_SIMPLE_KV_OFFLOAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))),
+        description="Enable simple KV offload.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
-    "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
-        int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
+    "VLLM_LORA_ENABLE_DUAL_STREAM": env_var(
+        lambda: bool(int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))),
+        description=(
+            "Whether to enable dual cuda streams for LoRA computation (used by"
+            " both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to overlap the"
+            " base layer compute with the LoRA fast path)."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
-    "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    "VLLM_USE_SPINLOOP_EXT": env_var(
+        lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+        description=(
+            "If set to 1, use Python spinloop extension to poll in a more "
+            "efficient way when using the mp backend."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Legacy 0.0.3 mp broadcast idle-wait knob. Latest upstream replaced the
     # old SpinTimer/SpinSleepTimer split with SpinCondition, which already
     # spins under load and waits on notification while idle. Kept only for
     # command compatibility and inventory closure.
-    "VLLM_SLEEP_WHEN_IDLE": lambda: bool(int(os.getenv("VLLM_SLEEP_WHEN_IDLE", "0"))),
+    "VLLM_SLEEP_WHEN_IDLE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SLEEP_WHEN_IDLE", "0"))),
+        description=(
+            "Legacy 0.0.3 mp broadcast idle-wait knob. Latest upstream "
+            "replaced the old SpinTimer/SpinSleepTimer split with "
+            "SpinCondition, which already spins under load and waits on "
+            "notification while idle. Kept only for command compatibility and "
+            "inventory closure."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
-    "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
+    "VLLM_GPU_NIC_PCIE_MAPPING": env_var(
+        lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
+        description=(
+            "Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection. "
+            "Must be set together with VLLM_NIC_SELECTION_VARS."
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
     # Comma-separated list of env vars to set from the GPU-NIC mapping.
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
-    "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    "VLLM_NIC_SELECTION_VARS": env_var(
+        lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+        description=(
+            "Comma-separated list of env vars to set from the GPU-NIC mapping."
+            " Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to "
+            "RDMA device name). Must be set together with "
+            "VLLM_GPU_NIC_PCIE_MAPPING."
+        ),
+        category="configuration",
+        declared_default="''",
+        effective_default="''",
+        automatic_conditions=(),
+        acceleration_paths=(),
+    ),
+    "VLLM_CPU_CI_ENV": env_var(
+        lambda: os.getenv("VLLM_CPU_CI_ENV"),
+        description="Select the CPU CI platform emulation environment.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'0' at vllm/platforms/cpu.py:check_and_update_config",),
+        acceleration_paths=(),
+    ),
+    "VLLM_CPU_SIM_MULTI_NUMA": env_var(
+        lambda: os.getenv("VLLM_CPU_SIM_MULTI_NUMA"),
+        description="Simulate multiple NUMA nodes in CPU platform checks.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'0' at vllm/utils/ompmultiprocessing.py:__init__",),
+        acceleration_paths=(),
+    ),
+    "VLLM_CUTLASS_SRC_DIR": env_var(
+        lambda: os.getenv("VLLM_CUTLASS_SRC_DIR"),
+        description="Override the CUTLASS source directory used by the local build.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/sm70_sparse_attention.py:spars"
+                "e_extension"
+            ),
+            (
+                "None at "
+                "vllm/model_executor/layers/sm70_attention.py:flashattn_extension"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH"),
+        description=(
+            "DFlash tree verifier: attn compact batch. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_compact_ddtree_accepte"
+                "d_attention_kv"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_CONV_KERNEL": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_CONV_KERNEL"),
+        description=(
+            "Select the convolution implementation used by the DFlash tree verifier."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_dflash_ddtree_conv_kernel_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD"),
+        description=(
+            "DFlash tree verifier: disable gdn fast build. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_gdn_"
+                "fast_build_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE"),
+        description=(
+            "DFlash tree verifier: disable gdn fast build cache. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_gdn_"
+                "fast_build_cache_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD"),
+        description=(
+            "DFlash tree verifier: enable gdn fast build. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_gdn_"
+                "fast_build_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE"),
+        description=(
+            "DFlash tree verifier: enable gdn fast build cache. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_gdn_"
+                "fast_build_cache_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_ENGINE_PROFILE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE"),
+        description=(
+            "DFlash tree verifier: engine profile. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'0' at vllm/v1/engine/core.py:step",
+            "'0' at vllm/v1/engine/core.py:post_step",
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG"),
+        description=(
+            "DFlash tree verifier: fast build debug. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'0' at vllm/v1/attention/backends/gdn_attn.py:_miss",),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT"),
+        description=(
+            "DFlash tree verifier: force mamba compact. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_compact_ddtree_accepte"
+                "d_mamba_state"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON"),
+        description=(
+            "DFlash tree verifier: gdn fast build triton. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_gdn_"
+                "fast_build_triton_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON"),
+        description=(
+            "DFlash tree verifier: gdn shared common. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_gdn_"
+                "shared_common_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_GPU_SAMPLER": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_GPU_SAMPLER"),
+        description=(
+            "DFlash tree verifier: gpu sampler. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'1' at vllm/v1/worker/gpu_model_runner.py:_warmup_sm70_aux_kernels"),
+            "'1' at vllm/v1/worker/gpu_model_runner.py:_sample",
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_LINEAR_GDN": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_LINEAR_GDN"),
+        description=(
+            "DFlash tree verifier: linear gdn. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_dflash_ddtree_linear_gdn_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH"),
+        description=(
+            "DFlash tree verifier: mamba compact batch. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/worker/gpu_model_runner.py:_compact_ddtree_accepte"
+                "d_mamba_state"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_METADATA_PROFILE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE"),
+        description=(
+            "DFlash tree verifier: metadata profile. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_metadata"
+                "_profile_enabled"
+            ),
+            (
+                "'0' at vllm/v1/attention/backends/gdn_attn.py:_dflash_ddtree_meta"
+                "data_profile_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_PATH_PROBE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE"),
+        description=(
+            "DFlash tree verifier: path probe. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_dflash_ddtree_path_probe_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER"),
+        description=(
+            "DFlash tree verifier: path probe layer. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'language_model.model.layers.0.linear_attn' at vllm/model_executo"
+                "r/layers/mamba/gdn/qwen_gdn_linear_attn.py:_dflash_ddtree_path_pr"
+                "obe_layer_matches"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS"),
+        description=(
+            "DFlash tree verifier: path probe max reports. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'32' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_dflash_ddtree_path_probe_max_reports"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT"),
+        description=(
+            "DFlash tree verifier: path probe node limit. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'16' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_dflash_ddtree_path_probe_node_limit"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_PROFILE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_PROFILE"),
+        description=(
+            "DFlash tree verifier: profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at "
+                "vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_profile_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_QLA_GDN": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_QLA_GDN"),
+        description=(
+            "DFlash tree verifier: qla gdn. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_dflash_ddtree_qla_gdn_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_SERIAL_GDN": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_SERIAL_GDN"),
+        description=(
+            "DFlash tree verifier: serial gdn. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_dflash_ddtree_serial_gdn_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT"),
+        description=(
+            "DFlash tree verifier: skip mamba compact. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_compact_ddtree_accepte"
+                "d_mamba_state"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS"),
+        description="Select stochastic top-k logits in the DFlash tree sampler.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_can_use_ddtree_stochas"
+                "tic_topk_tokens"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX"),
+        description=(
+            "DFlash tree verifier: target forward nvtx. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_target_f"
+                "orward_nvtx_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP"),
+        description=(
+            "DFlash tree verifier: target forward profiler step. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_target_f"
+                "orward_profiler_step"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_TRACE_JSONL": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL"),
+        description=(
+            "DFlash tree verifier: trace jsonl. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "None at vllm/v1/spec_decode/ddtree_sampler.py:_ddtree_trace_path",
+            "None at vllm/v1/worker/mamba_utils.py:_ddtree_trace_path",
+            ("None at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_trace_path"),
+            (
+                "None at "
+                "vllm/v1/attention/backends/flash_attn_v100.py:_ddtree_trace_event"
+            ),
+            (
+                "None at vllm/v1/attention/backends/flash_attn_v100.py:_ddtree_tra"
+                "ce_enabled"
+            ),
+            "None at vllm/v1/attention/backends/gdn_attn.py:_ddtree_trace_path",
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF"),
+        description=(
+            "DFlash tree verifier: trace kv cache diff. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/attention/backends/flash_attn_v100.py:_flash_v100_"
+                "ddtree_small_query_prefill_dense"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_TRITON_SAMPLER": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_TRITON_SAMPLER"),
+        description=(
+            "DFlash tree verifier: triton sampler. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/spec_decode/ddtree_sampler.py:warmup_ddtree_single"
+                "_top_token_sampler"
+            ),
+            (
+                "'1' at vllm/v1/spec_decode/ddtree_sampler.py:greedy_sample_ddtree"
+                "_payloads_from_top_tokens_gpu"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE"),
+        description=(
+            "DFlash tree verifier: verify row trace. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/spec_decode/ddtree_sampler.py:_ddtree_verify_row_t"
+                "race_enabled"
+            ),
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_verify_r"
+                "ow_trace_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT"),
+        description=(
+            "DFlash tree verifier: verify row trace context. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'128' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_verify"
+                "_row_trace_context_limit"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK"),
+        description=(
+            "DFlash tree verifier: verify row trace topk. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'8' at vllm/v1/spec_decode/ddtree_sampler.py:_ddtree_verify_row_t"
+                "race_topk"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DDTREE_WORKER_PROFILE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE"),
+        description=(
+            "DFlash tree verifier: worker profile. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/logits_processor.py:_ddtree_wor"
+                "ker_profile_enabled"
+            ),
+            (
+                "'0' at vllm/v1/spec_decode/ddtree_sampler.py:_ddtree_worker_profi"
+                "le_enabled"
+            ),
+            ("'0' at vllm/v1/spec_decode/dflash.py:_ddtree_worker_profile_enabled"),
+            (
+                "'0' at vllm/v1/spec_decode/ddtree_payload.py:build_ddtree_payload"
+                "s_from_logits"
+            ),
+            (
+                "'0' at vllm/v1/spec_decode/ddtree_payload.py:build_ddtree_payload"
+                "s_from_topk"
+            ),
+            (
+                "'0' at vllm/v1/spec_decode/llm_base_proposer.py:_dflash_ddtree_wo"
+                "rker_profile_enabled"
+            ),
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_worker_p"
+                "rofile_enabled"
+            ),
+            (
+                "'0' at vllm/v1/attention/backends/flash_attn_v100.py:_dflash_ddtr"
+                "ee_worker_profile_enabled"
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_COORD_TRACE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE"),
+        description=(
+            "DFlash diagnostic: coord trace. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/sparse_attn_indexer_kpool.py:sp"
+                "arse_attn_indexer_kpool"
+            ),
+            "'0' at vllm/models/glm5next/sm70/sparse.py:module",
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT"),
+        description=(
+            "DFlash diagnostic: pp aux dump limit. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'2' at vllm/models/glm5next/nvidia/model.py:__init__",),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_PROPOSAL_STAGES": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES"),
+        description=(
+            "DFlash diagnostic: proposal stages. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'0' at vllm/models/glm5next/nvidia/model.py:module",
+            "'0' at vllm/models/glm5next/nvidia/kda.py:module",
+            ("'0' at vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:__init__"),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE"),
+        description=(
+            "DFlash diagnostic: target layer trace. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'0' at vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py:module"),
+            "'0' at vllm/models/glm5next/nvidia/model.py:module",
+            "'0' at vllm/models/glm5next/nvidia/kda.py:module",
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_TARGET_LOGITS": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_TARGET_LOGITS"),
+        description=(
+            "DFlash diagnostic: target logits. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'0' at vllm/v1/worker/gpu/model_runner.py:sample",),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION"),
+        description=(
+            "DFlash diagnostic: target trace min position. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'8' at vllm/model_executor/layers/sparse_attn_indexer_kpool.py:sp"
+                "arse_attn_indexer_kpool"
+            ),
+            "'8' at vllm/models/glm5next/nvidia/model.py:module",
+            (
+                "'8' at vllm/models/glm5next/nvidia/model.py:_debug_dump_pp_aux_hi"
+                "dden_states"
+            ),
+            "'8' at vllm/models/glm5next/sm70/sparse.py:forward_mqa",
+            "'8' at vllm/v1/worker/gpu/model_runner.py:sample",
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR"),
+        description=(
+            "DFlash diagnostic: tensor dump dir. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'' at vllm/models/glm5next/nvidia/model.py:__init__",
+            ("'' at vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:__init__"),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT": env_var(
+        lambda: os.getenv("VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT"),
+        description=(
+            "DFlash diagnostic: tensor dump limit. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'2' at vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:__init__"),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_DIST_IDENT": env_var(
+        lambda: os.getenv("VLLM_DIST_IDENT"),
+        description=(
+            "Identify the distributed instance when deriving communication names."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "required at vllm/distributed/device_communicators/cpu_communicato"
+                "r.py:make_group_name"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY"),
+        description=(
+            "Flash-V100 attention: debug route summary. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/attention/backends/flash_attn_v100.py:_route_summa"
+                "ry_enabled"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA"),
+        description=(
+            "Flash-V100 attention: smallq decode use xqa. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/v1/attention/backends/flash_attn_v100.py:__init__",
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN"),
+        description=(
+            "Flash-V100 attention: smallq decode xqa min seq len. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'4096' at vllm/v1/attention/backends/flash_attn_v100.py:_smallq_d"
+                "ecode_xqa_allowed"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN"),
+        description=(
+            "Flash-V100 attention: xqa e4m3 g6 p512 begin. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "str(_SM70_E4M3_B1_WAVE_LONG_CONTEXT_MIN_SEQ_LEN) at "
+                "vllm/v1/cudagraph_dispatcher.py:__init__"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO"),
+        description=(
+            "Flash-V100 attention: xqa e4m3 g6 p64 p256 auto. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/v1/cudagraph_dispatcher.py:__init__",
+            ("'1' at vllm/v1/attention/backends/flash_attn_v100.py:_flash_v100_decode"),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS"),
+        description=(
+            "Flash-V100 attention: xqa e4m3 g6 wave partitions. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/v1/cudagraph_dispatcher.py:__init__",),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA"),
+        description=(
+            "Flash-V100 attention: xqa mtp5 dual cta. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/attention/backends/flash_attn_v100.py:_mtp5_xqa_du"
+                "al_cta_partition_size_hint"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"),
+        description=(
+            "Flash-V100 attention: xqa mtp5 partition size. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1024' at vllm/v1/attention/backends/flash_attn_v100.py:_mtp5_xqa"
+                "_dual_cta_partition_size_hint"
+            ),
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_KPOOL_SKIP_DECODE_WRITE": env_var(
+        lambda: os.getenv("VLLM_KPOOL_SKIP_DECODE_WRITE"),
+        description=(
+            "vLLM: kpool skip decode write. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/sparse_attn_indexer_kpool.py:s"
+                "parse_attn_indexer_kpool"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_KPOOL_SKIP_TAIL_CACHE": env_var(
+        lambda: os.getenv("VLLM_KPOOL_SKIP_TAIL_CACHE"),
+        description=(
+            "vLLM: kpool skip tail cache. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/sparse_attn_indexer_kpool.py:s"
+                "parse_attn_indexer_kpool"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_QWEN35_MTP_KEEP_QUANT": env_var(
+        lambda: os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT"),
+        description="Keep checkpoint quantization on the Qwen3.5 MTP draft layers.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'0' at vllm/model_executor/models/qwen3_5_mtp.py:__init__",
+        ),
+        acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS": env_var(
+        lambda: os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS"),
+        description="Share Qwen3.5 target/draft embedding and output weights.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/model_executor/models/qwen3_5_mtp.py:__init__",
+        ),
+        acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_SM70_DFLASH2_BF16_EMULATION": env_var(
+        lambda: os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION"),
+        description="Opt in to the BF16 emulation route used by DFlash2 on SM70.",
+        category="experimental",
+        declared_default="None",
+        effective_default=(
+            "None; configuration may replace the unset default under the "
+            "automatic conditions below."
+        ),
+        automatic_conditions=(
+            (
+                "'1' at vllm/model_executor/models/qwen3_dflash2.py:_use_sm70_bf16"
+                "_emulation"
+            ),
+            (
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
+                "path sets '1' when name not in os.environ; automatic defaults "
+                "apply only when the environment override is absent."
+            ),
+        ),
+        acceleration_paths=("DFlash2 verifier",),
+    ),
+    "VLLM_SM70_DUMP_AWQ_MOE_BUFFERS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_AWQ_MOE_BUFFERS"),
+        description=(
+            "SM70 diagnostic capture: awq moe buffers. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/quantization/awq_sm70_moe.py:_"
+                "dump_awq_moe_buffer_requested"
+            ),
+        ),
+        acceleration_paths=("MoE AWQ",),
+    ),
+    "VLLM_SM70_DUMP_AWQ_MOE_LABELS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_AWQ_MOE_LABELS"),
+        description=(
+            "SM70 diagnostic capture: awq moe labels. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'' at vllm/model_executor/layers/quantization/awq_sm70_moe.py:_du"
+                "mp_awq_moe_buffer_requested"
+            ),
+        ),
+        acceleration_paths=("MoE AWQ",),
+    ),
+    "VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_DIR"),
+        description=(
+            "SM70 diagnostic capture: compile graph input dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_sm70_dump_compile_gra"
+                "ph_inputs"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS"),
+        description=(
+            "SM70 diagnostic capture: compile graph input steps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_sm70_dump_compile_gra"
+                "ph_inputs"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_GDN_CORE_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR"),
+        description=(
+            "SM70 diagnostic capture: gdn core dir. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_dump_gdn_core_tensor"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: gdn core enable file. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_dump_gdn_core_tensor"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS"),
+        description=(
+            "SM70 diagnostic capture: gdn core layer ids. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_dump_gdn_core_tensor"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS"),
+        description=(
+            "SM70 diagnostic capture: gdn core max dumps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'4' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_sm70_dump_gdn_core_tensor"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS"),
+        description=(
+            "SM70 diagnostic capture: gdn graph buffers. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_graph_buffer_copy_state_slice"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_dump_gdn_core_tensor"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_graph_buffer_copy"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_projection_dump_requested"
+            ),
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
+                "layer_graph_buffers"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR"),
+        description=(
+            "SM70 diagnostic capture: gdn graph dir. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_graph_buffer_copy"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:dump_sm70_gdn_graph_buffers"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_dump_gdn_core_tensor"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_projection_dump_requested"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: gdn graph enable file. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:dump_sm70_gdn_graph_buffers"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_LABELS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LABELS"),
+        description=(
+            "SM70 diagnostic capture: gdn graph labels. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.p"
+                "y:_sm70_gdn_graph_buffer_copy"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS"),
+        description=(
+            "SM70 diagnostic capture: gdn graph layer ids. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_graph_buffer_copy"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_projection_dump_requested"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_METADATA": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_METADATA"),
+        description=(
+            "SM70 diagnostic capture: gdn graph metadata. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_dump_gdn_spec_metadata_graph_buffers"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_SHAPES": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_SHAPES"),
+        description=(
+            "SM70 diagnostic capture: gdn graph shapes. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_graph_buffer_copy"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES"),
+        description=(
+            "SM70 diagnostic capture: gdn graph state indices. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_graph_buffer_copy_state_slice"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_GRAPH_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STEPS"),
+        description=(
+            "SM70 diagnostic capture: gdn graph steps. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:dump_sm70_gdn_graph_buffers"
+            ),
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
+                "layer_graph_buffers"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_PROJ_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR"),
+        description=(
+            "SM70 diagnostic capture: gdn proj dir. The consumer locations and"
+            " unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_projection_dump_impl"
+            ),
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_projection_dump_requested"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: gdn proj enable file. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_projection_dump_impl"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS"),
+        description=(
+            "SM70 diagnostic capture: gdn proj layer ids. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0,1' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_att"
+                "n.py:_sm70_gdn_projection_dump_requested"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS"),
+        description=(
+            "SM70 diagnostic capture: gdn proj max dumps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'4' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_sm70_gdn_projection_dump_impl"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS"),
+        description=(
+            "SM70 diagnostic capture: gdn state table seqs. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at "
+                "vllm/v1/attention/backends/gdn_attn.py:_dump_sm70_gdn_state_table"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_COUNTS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer counts. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_impl"
+            ),
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:dump_sm70_qwen_l"
+                "ayer_graph_buffers"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":dump_sm70_moe_runner_graph_buffers"
+            ),
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
+                "layer_graph_buffers"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR"),
+        description=(
+            "SM70 diagnostic capture: qwen layer dir. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_impl"
+            ),
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:dump_sm70_qwen_l"
+                "ayer_graph_buffers"
+            ),
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_requested"
+            ),
+            (
+                "None at vllm/model_executor/layers/quantization/awq_sm70_moe.py:_"
+                "dump_awq_moe_buffer_requested"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":_sm70_moe_runner_dump_impl"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":dump_sm70_moe_runner_graph_buffers"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":_sm70_moe_runner_dump_requested"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE"),
+        description=(
+            "SM70 diagnostic capture: qwen layer direct save. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer_"
+                "dump_impl"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: qwen layer enable file. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_impl"
+            ),
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:dump_sm70_qwen_l"
+                "ayer_graph_buffers"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer graph buffers. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_impl"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":_sm70_moe_runner_dump_impl"
+            ),
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
+                "layer_graph_buffers"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer graph steps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:dump_sm70_qwen_l"
+                "ayer_graph_buffers"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":dump_sm70_moe_runner_graph_buffers"
+            ),
+            (
+                "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
+                "layer_graph_buffers"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_IDS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer ids. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0,1' at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_laye"
+                "r_dump_requested"
+            ),
+            (
+                "'0,1' at vllm/model_executor/layers/quantization/awq_sm70_moe.py:"
+                "_dump_awq_moe_buffer_requested"
+            ),
+            (
+                "'0,1' at vllm/model_executor/layers/fused_moe/runner/moe_runner.p"
+                "y:_sm70_moe_runner_dump_requested"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_LABELS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer labels. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'' at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer_d"
+                "ump_impl"
+            ),
+            (
+                "'' at vllm/model_executor/layers/fused_moe/runner/moe_runner.py:_"
+                "sm70_moe_runner_dump_requested"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer max dumps. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'4' at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer_"
+                "dump_impl"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS"),
+        description=(
+            "SM70 diagnostic capture: qwen layer max tokens. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_token_count_allowed"
+            ),
+            (
+                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
+                ":_sm70_moe_runner_dump_token_count_allowed"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_MLP_INTERNALS"),
+        description=(
+            "SM70 diagnostic capture: qwen mlp internals. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen2_moe.py:_sm70_dump_qwen_m"
+                "lp_tensor"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE"),
+        description=(
+            "SM70 diagnostic capture: sampler logits enable file. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "None at vllm/v1/sample/sampler.py:_maybe_dump_sm70_sampler_logits",
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS"),
+        description=(
+            "SM70 diagnostic capture: top token margin probe tokens. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/logits_processor.py:_maybe_dum"
+                "p_top_token_margin"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_FLASHQLA_DIRECT_OUTPUT": env_var(
+        lambda: os.getenv("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT"),
+        description=(
+            "SM70: flashqla direct output. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_flashqla_direct_output_enabled"
+            ),
+        ),
+        acceleration_paths=("FlashQLA",),
+    ),
+    "VLLM_SM70_FLASHQLA_INDEXED_PREFILL": env_var(
+        lambda: os.getenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL"),
+        description=(
+            "SM70: flashqla indexed prefill. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_flashqla_indexed_prefill_enabled"
+            ),
+        ),
+        acceleration_paths=("FlashQLA",),
+    ),
+    "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL": env_var(
+        lambda: os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL"),
+        description=(
+            "SM70: flashqla original prefill. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_flashqla_original_prefill_enabled"
+            ),
+            (
+                "None at vllm/v1/attention/backends/gdn_attn.py:_sm70_flashqla_ori"
+                "ginal_prefill_enabled"
+            ),
+        ),
+        acceleration_paths=("FlashQLA",),
+    ),
+    "VLLM_SM70_FP8_BATCH_PRESCALED": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_BATCH_PRESCALED"),
+        description="Allow prescaled FP8 weights in the prepared batch GEMM layout.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/model_executor/layers/quantization/compressed_tensors"
+                "/schemes/compressed_tensors_w8a16_fp8.py:"
+                "process_weights_after_loading"
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE"),
+        description=(
+            "SM70 FP8 MoE: legacy single token compact compare. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'0' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS": env_var(
+        lambda: os.getenv(
+            "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS"
+        ),
+        description=(
+            "SM70 FP8 MoE: legacy single token compact compare reports. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'16' at "
+                "vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED"),
+        description=(
+            "SM70 FP8 MoE: legacy single token compact decomposed. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'0' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT"),
+        description=(
+            "SM70 FP8 MoE: legacy single token compact exact layout. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'1' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE": env_var(
+        lambda: os.getenv(
+            "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE"
+        ),
+        description=(
+            "SM70 FP8 MoE: legacy single token compact native unpermute. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'0' at vllm/model_executor/layers/quantization/fp8_sm70_moe.py:__init__"),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_GDN_PREFILL_PROFILE": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE"),
+        description=(
+            "SM70: gdn prefill profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_gdn_prefill_profile_enabled"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS"),
+        description=(
+            "SM70: gdn prefill profile max logs. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'256' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_att"
+                "n.py:_sm70_gdn_prefill_profile_end"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE"),
+        description=(
+            "SM70: gdn prefill profile max per stage. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'2' at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn."
+                "py:_sm70_gdn_prefill_profile_end"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GDN_STATE_CONTRACT_ASSERT": env_var(
+        lambda: os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT"),
+        description=(
+            "SM70: gdn state contract assert. The consumer locations and unset"
+            " defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/v1/attention/backends/gdn_attn.py:build_gdn_spec_dec"
+                "ode_state_contract"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_GLM53_EXACT_KDA_GEMV": env_var(
+        lambda: os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV"),
+        description="Select the exact GLM-5.3 KDA GEMV implementation.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'1' at vllm/models/glm5next/nvidia/kda.py:_sm70_exact_kda_gemv_enabled"),
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
+    ),
+    "VLLM_SM70_GLM53_FP16_GEMV_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_GLM53_FP16_GEMV_LIBRARY"),
+        description=(
+            "Path to the native library supplying the GLM-5.3 FP16 GEMV operators."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "None at vllm/_sm70_ops.py:_maybe_load_glm53_fp16_gemv_library",
+        ),
+        acceleration_paths=("SM70 FP16 linear",),
+    ),
+    "VLLM_SM70_INDEXER_DECODE_CUBLAS": env_var(
+        lambda: os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS"),
+        description=(
+            "SM70 sparse-attention indexer: decode cublas. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'0' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS": env_var(
+        lambda: os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS"),
+        description=(
+            "SM70 sparse-attention indexer: decode cublas min keys. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1024' at vllm/models/deepseek_v4/sm70/indexer.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_INDEXER_FUSED_LOGITS": env_var(
+        lambda: os.getenv("VLLM_SM70_INDEXER_FUSED_LOGITS"),
+        description=(
+            "SM70 sparse-attention indexer: fused logits. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_INDEXER_PREFILL_CUBLAS": env_var(
+        lambda: os.getenv("VLLM_SM70_INDEXER_PREFILL_CUBLAS"),
+        description=(
+            "SM70 sparse-attention indexer: prefill cublas. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_INDEXER_PREFILL_TILE_MB": env_var(
+        lambda: os.getenv("VLLM_SM70_INDEXER_PREFILL_TILE_MB"),
+        description=(
+            "SM70 sparse-attention indexer: prefill tile mb. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'192' at vllm/models/deepseek_v4/sm70/indexer.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_INDEXER_RELU": env_var(
+        lambda: os.getenv("VLLM_SM70_INDEXER_RELU"),
+        description=(
+            "SM70 sparse-attention indexer: relu. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/deepseek_v4/sm70/indexer.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_KDA_PREFILL_SCHEDULE": env_var(
+        lambda: os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE"),
+        description="Select the KDA prefill scheduling implementation.",
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/model_executor/layers/fla/ops/kda.py:module",
+        ),
+        acceleration_paths=("SM70 prefill",),
+    ),
+    "VLLM_SM70_MTP_DUMP_TENSOR_MAX": env_var(
+        lambda: os.getenv("VLLM_SM70_MTP_DUMP_TENSOR_MAX"),
+        description=(
+            "SM70: mtp dump tensor max. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'512' at vllm/v1/worker/gpu_model_runner.py:_to_cpu",),
+        acceleration_paths=("MTP verifier",),
+    ),
+    "VLLM_SM70_QSA_GROUPED_PAD_FIX": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_GROUPED_PAD_FIX"),
+        description=(
+            "SM70 QSA attention: grouped pad fix. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_GROUPED_PAGE4": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_GROUPED_PAGE4"),
+        description=(
+            "SM70 QSA attention: grouped page4. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_INDEXER_CUBLAS": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS"),
+        description=(
+            "SM70 QSA attention: indexer cublas. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS"),
+        description=(
+            "SM70 QSA attention: indexer cublas min rows. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'512' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS"),
+        description=(
+            "SM70 QSA attention: indexer cublas min score elements. The "
+            "consumer locations and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "str(1024 ** 2) at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB"),
+        description=(
+            "SM70 QSA attention: indexer score tile mb. The consumer locations"
+            " and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'64' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_MTP_TOPK": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_MTP_TOPK"),
+        description=(
+            "SM70 QSA attention: mtp topk. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'0' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_TOPK_LIBRARY": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY"),
+        description=(
+            "SM70 QSA attention: topk library. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "None at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_XQA_PAGE4": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_XQA_PAGE4"),
+        description=(
+            "SM70 QSA attention: xqa page4. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=("'1' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS": env_var(
+        lambda: os.getenv("VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS"),
+        description=(
+            "SM70 QSA attention: xqa page4 min rows. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'64' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",
+        ),
+        acceleration_paths=("QSA sparse attention/indexer",),
+    ),
+    "VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG": env_var(
+        lambda: os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG"),
+        description=(
+            "SM70: qwen38 qpn route debug. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("None at vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py:apply"),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD": env_var(
+        lambda: os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD"),
+        description=(
+            "SM70: qwen gdn assert no active spec standard. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
+                ".py:_sm70_assert_standard_core_not_active_spec"
+            ),
+        ),
+        acceleration_paths=("Gated DeltaNet",),
+    ),
+    "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX": env_var(
+        lambda: os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_NVTX"),
+        description=(
+            "SM70: spec target forward nvtx. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'0' at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_target_f"
+                "orward_profile_scope"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP": env_var(
+        lambda: os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP"),
+        description=(
+            "SM70: spec target forward profiler step. The consumer locations "
+            "and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "os.getenv('VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP', '0')"
+                " at vllm/v1/worker/gpu_model_runner.py:_dflash_ddtree_target_forw"
+                "ard_profiler_step"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR"),
+        description=(
+            "SM70 TurboQuant attention: compare dump dir. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/v1/attention/backends/turboquant_attn.py:_maybe_dump"
+                "_flash_v100_prefill_compare"
+            ),
+            (
+                "None at vllm/v1/attention/backends/turboquant_attn.py:_maybe_dump"
+                "_flash_v100_decode_compare"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH": env_var(
+        lambda: os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH"),
+        description=(
+            "SM70 TurboQuant attention: compare log path. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/v1/attention/backends/turboquant_attn.py:_record_com"
+                "pare_result"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE": env_var(
+        lambda: os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE"),
+        description=(
+            "SM70 TurboQuant attention: flash v100 decode. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/v1/attention/backends/turboquant_attn.py:__init__",
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL": env_var(
+        lambda: os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL"),
+        description=(
+            "SM70 TurboQuant attention: flash v100 prefill. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'1' at vllm/v1/attention/backends/turboquant_attn.py:__init__",
+        ),
+        acceleration_paths=("FlashAttentionV100Backend",),
+    ),
+    "VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE": env_var(
+        lambda: os.getenv("VLLM_SM70_TURBOQUANT_RESERVE_WORKSPACE"),
+        description=(
+            "SM70 TurboQuant attention: reserve workspace. The consumer "
+            "locations and unset defaults are listed below."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "'1' at vllm/v1/attention/backends/turboquant_attn.py:_reserve_con"
+                "tinuation_prefill_workspace"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SPEC_DUMP_ALIGNMENT_DIR": env_var(
+        lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR"),
+        description=(
+            "Speculative-decoding diagnostic: dump alignment dir. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            ("'/tmp' at vllm/v1/sample/rejection_sampler.py:_maybe_dump_alignment"),
+            (
+                "'/tmp' at vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection"
+                ".py:_maybe_dump_selector_alignment"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
+    "VLLM_SPEC_DUMP_ALIGNMENT_TAG": env_var(
+        lambda: os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG"),
+        description=(
+            "Speculative-decoding diagnostic: dump alignment tag. The consumer"
+            " locations and unset defaults are listed below."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            "'' at vllm/v1/sample/rejection_sampler.py:_maybe_dump_alignment",
+            (
+                "'' at vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py:"
+                "_maybe_dump_selector_alignment"
+            ),
+        ),
+        acceleration_paths=(),
+    ),
 }
 
 

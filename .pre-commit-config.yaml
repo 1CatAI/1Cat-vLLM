@@ -252,6 +252,19 @@ repos:
     types: [python]
     files: ^vllm/
     additional_dependencies: [regex]
+  - id: check-env-metadata
+    name: Require complete environment registration metadata
+    entry: python tools/pre_commit/check_env_metadata.py
+    language: python
+    pass_filenames: false
+    always_run: true
+  - id: env-reference
+    name: Check generated environment reference
+    entry: python -m tools.generate_env_reference --check
+    language: python
+    pass_filenames: false
+    additional_dependencies: [regex]
+    files: ^(vllm/envs.*\.py|tools/generate_env_reference\.py|tools/pre_commit/check_env_metadata\.py|docs/configuration/env_var_reference\.md)$
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py
