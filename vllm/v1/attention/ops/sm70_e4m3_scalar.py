@@ -41,8 +41,14 @@ BUILTIN_SCALAR_MANIFEST = {
 @lru_cache(maxsize=1)
 def builtin_scalar_tail_attention():
     try:
+        # The FA2 library loads on first use; resolve it before the lookup.
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            ensure_fa2_library_loaded,
+        )
+
+        ensure_fa2_library_loaded()
         return getattr(torch.ops._vllm_fa2_C, BUILTIN_SCALAR_OP)
-    except AttributeError:
+    except (AttributeError, ImportError):
         return None
 
 

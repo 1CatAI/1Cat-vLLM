@@ -470,6 +470,21 @@ class Fp8LinearMethod(LinearMethodBase):
         if getattr(layer, "sm70_fp8_turbomind", False):
             return
 
+        if self.use_marlin and getattr(layer, "is_bmm", False):
+            # Marlin packs one [N, K] matrix and cannot serve the grouped
+            # matmul of an is_bmm layer (DeepSeek-V4 wo_a on Turing), so the
+            # weight is dequantized once here and applied per group in apply().
+            assert self.block_quant, "is_bmm layers are block-quantized"
+            weight, weight_scale_inv = process_fp8_weight_block_strategy(
+                layer.weight, layer.weight_scale_inv
+            )
+            weight = self._dequantize_block_weight(
+                weight, weight_scale_inv, layer.orig_dtype
+            )
+            replace_parameter(layer, "weight", weight)
+            layer.dequantized_bmm = True
+            return
+
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.
@@ -608,6 +623,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_sm70_dequant_fallback:
             return torch.nn.functional.linear(x, layer.weight, bias)
+
+        if getattr(layer, "dequantized_bmm", False):
+            # x ends in [groups, K]; group g multiplies rows g*R:(g+1)*R.
+            group_count = int(layer.bmm_batch_size)
+            weight = layer.weight.view(group_count, -1, x.shape[-1])
+            out = torch.einsum("...gk,grk->...gr", x, weight)
+            if bias is not None:
+                out.add_(bias.view(group_count, -1))
+            return out
 
         # if batch invariant mode is enabled, prefer direct FP8 path
         # we will use BF16 dequant when direct FP8 is not supported.

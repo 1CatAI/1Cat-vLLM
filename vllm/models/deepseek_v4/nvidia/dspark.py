@@ -135,12 +135,14 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # DSpark's target aux streams can reach O(1e4) before main_proj. The
-        # SM70 W8A16 kernel writes FP16, so the otherwise valid projection can
-        # overflow before the following RMSNorm. A power-of-two input scale is
-        # exact in FP16 and RMSNorm removes it; 2^-6 leaves ample headroom while
-        # preserving the FP32-reference normalized result.
+        # W8A16 kernels on Volta and Turing (TurboMind, Marlin) write FP16, so
+        # the otherwise valid projection can overflow before the following
+        # RMSNorm. A power-of-two input scale is exact in FP16 and RMSNorm
+        # removes it; 2^-6 leaves ample headroom while preserving the
+        # FP32-reference normalized result. On Turing without it, DSpark's
+        # draft acceptance fell to about 6 %.
         self.main_proj_input_scale = (
-            2.0**-6 if current_platform.is_device_capability((7, 0)) else 1.0
+            2.0**-6 if current_platform.is_device_capability_family(70) else 1.0
         )
 
         self.topk_indices_buffer = torch.empty(
@@ -265,7 +267,7 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    if current_platform.is_device_capability((7, 0)):
+    if current_platform.is_device_capability_family(70):
         from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
             sm70_qnorm_rope_kv_fp8_insert,
         )

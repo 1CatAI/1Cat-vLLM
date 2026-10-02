@@ -671,7 +671,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             max_compressed_tokens=active_topk_width,
             fixed_row_stride=(
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and current_platform.is_device_capability_family(70)
             ),
         )
 

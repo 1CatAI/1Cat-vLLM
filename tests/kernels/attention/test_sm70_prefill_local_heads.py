@@ -12,7 +12,10 @@ def test_q8192_multihead_prefill_at_256k(heads, batch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     from vllm.v1.attention.backends.flash_attn_v100 import _run_sm70_gqa_groups
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     torch.manual_seed(7541)
     q_len, length = 8192, 262144
@@ -66,7 +69,10 @@ def test_multihead_prefill_graph_replay_after_other_capture(q_len, heads, batch)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires SM70")
     from vllm.v1.attention.backends.flash_attn_v100 import _run_sm70_gqa_groups
-    from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    # The FA2 library is loaded per device on first use, not at import.
+    load_fa2_library(torch.device("cuda"))
 
     op = (
         torch.ops._vllm_fa2_C.sm70_d256_gqa_architecture_fwd
