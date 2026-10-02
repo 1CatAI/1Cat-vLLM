@@ -6,8 +6,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
+from vllm.v1.structured_output import StructuredOutputManager
 
 from .utils import create_requests, create_scheduler
 
@@ -16,13 +23,19 @@ pytestmark = pytest.mark.cpu_test
 MAMBA_BLOCK_SIZE = 816
 
 
-def _split(request, num_new_tokens: int) -> int:
+def _split(request, num_new_tokens: int, *, interval=None, eagle=False) -> int:
+    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+    coordinator.get_replay_boundaries = lambda request, block: (
+        KVCacheCoordinator.get_replay_boundaries(coordinator, request, block)
+    )
     scheduler = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=16),
         mamba_state_block_size=MAMBA_BLOCK_SIZE,
         max_num_scheduled_tokens=8192,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        use_eagle=False,
+        use_eagle=eagle,
+        mamba_state_retention_interval=interval,
+        kv_cache_manager=SimpleNamespace(coordinator=coordinator),
     )
     return Scheduler._mamba_block_aligned_split(scheduler, request, num_new_tokens)
 
@@ -42,6 +55,41 @@ def test_scheduler_records_mamba_group_block_size() -> None:
     )
 
     assert scheduler.mamba_state_block_size == MAMBA_BLOCK_SIZE
+
+
+@pytest.mark.parametrize("mixed_alignment", [False, True])
+def test_scheduler_only_batches_sparse_compatible_state_groups(mixed_alignment):
+    mamba_spec = MambaSpec(
+        block_size=MAMBA_BLOCK_SIZE,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    original = create_scheduler(block_size=16, num_blocks=16, kv_cache_spec=mamba_spec)
+    config = original.vllm_config
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.enable_prefix_caching = True
+    groups = [KVCacheGroupSpec(["mamba"], mamba_spec)]
+    if mixed_alignment:
+        groups.append(
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=512,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        )
+    scheduler = Scheduler(
+        vllm_config=config,
+        kv_cache_config=KVCacheConfig(16, [], groups),
+        structured_output_manager=StructuredOutputManager(config),
+        block_size=16,
+        hash_block_size=16 if mixed_alignment else MAMBA_BLOCK_SIZE,
+    )
+    assert scheduler.mamba_state_retention_interval == (None if mixed_alignment else 0)
 
 
 def test_chunks_stop_at_every_mamba_state_boundary() -> None:
@@ -96,3 +144,55 @@ def test_repeated_sub_block_chunks_preserve_state_boundaries() -> None:
             boundaries.append(next_boundary)
 
     assert boundaries == [816, 1632]
+
+
+def _chunk_ends(length, *, interval=0, eagle=False, shared=0):
+    request = SimpleNamespace(
+        num_computed_tokens=0,
+        num_prompt_tokens=length,
+        num_tokens=length,
+        shared_prefix_boundary=shared,
+    )
+    ends = []
+    while request.num_computed_tokens < length:
+        remaining = length - request.num_computed_tokens
+        chunk = _split(request, min(8192, remaining), interval=interval, eagle=eagle)
+        assert 0 < chunk <= min(8192, remaining)
+        request.num_computed_tokens += chunk
+        ends.append(request.num_computed_tokens)
+    return ends
+
+
+def test_sparse_mtp_preserves_fine_resend_boundary_with_bulk_prefill():
+    assert _chunk_ends(8192, eagle=True) == [7344, 8192]
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize("length", [8160, 8161, 32768, 131040])
+def test_sparse_keeps_both_replay_boundaries(eagle, length):
+    ends = _chunk_ends(length, eagle=eagle)
+    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+    boundaries = KVCacheCoordinator.get_replay_boundaries(
+        coordinator, SimpleNamespace(num_tokens=length), MAMBA_BLOCK_SIZE
+    )
+    for boundary in boundaries:
+        aligned = boundary // MAMBA_BLOCK_SIZE * MAMBA_BLOCK_SIZE
+        if aligned:
+            assert aligned in ends
+    assert len(ends) <= length // 8000 + 3
+
+
+def test_sparse_keeps_detected_shared_prefix_boundary():
+    assert 4896 in _chunk_ends(32768, eagle=True, shared=4896)
+
+
+def test_periodic_retention_stops_at_all_retained_checkpoints():
+    interval = 5 * MAMBA_BLOCK_SIZE
+    ends = _chunk_ends(32768, eagle=True, interval=interval)
+    assert set(range(interval, 32768, interval)) <= set(ends)
+    assert 31824 in ends
+
+
+def test_dense_retention_still_materializes_every_checkpoint():
+    length = 3 * MAMBA_BLOCK_SIZE + 30
+    assert _chunk_ends(length, interval=None) == [816, 1632, 2448, length]
