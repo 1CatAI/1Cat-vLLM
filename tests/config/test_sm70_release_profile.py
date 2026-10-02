@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,12 @@ import pytest
 from vllm.sm70_profiles.profile import load_profile, profile_argv
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _python_launcher(path):
+    # Moving a symlink to a venv interpreter loses its pyvenv.cfg discovery.
+    path.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    path.chmod(0o755)
 
 
 def test_profile_schema():
@@ -68,7 +75,7 @@ def test_launcher_golden_and_overrides(tmp_path):
     bindir.mkdir()
     script = bindir / "serve_qwen38_27b_nvfp4_v100.sh"
     shutil.copy(ROOT / "scripts" / script.name, script)
-    (bindir / "python").symlink_to(sys.executable)
+    _python_launcher(bindir / "python")
     cli = bindir / "vllm"
     cli.write_text(
         f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n"
@@ -110,7 +117,7 @@ def test_launcher_local_draft_and_override(tmp_path):
     draft.mkdir()
     script = tmp_path / "serve_qwen38_27b_nvfp4_v100.sh"
     shutil.copy(ROOT / "scripts" / script.name, script)
-    (tmp_path / "python").symlink_to(sys.executable)
+    _python_launcher(tmp_path / "python")
     cli = tmp_path / "vllm"
     cli.write_text(
         f"#!{sys.executable}\nimport sys,json\nprint(json.dumps(sys.argv[1:]))\n"
@@ -142,7 +149,7 @@ def test_launcher_local_draft_and_override(tmp_path):
 def test_launcher_rejects_invalid_local_draft(tmp_path, draft_args):
     script = tmp_path / "serve_qwen38_27b_nvfp4_v100.sh"
     shutil.copy(ROOT / "scripts" / script.name, script)
-    (tmp_path / "python").symlink_to(sys.executable)
+    _python_launcher(tmp_path / "python")
     cli = tmp_path / "vllm"
     cli.write_text("#!/bin/sh\nexit 0\n")
     cli.chmod(0o755)
