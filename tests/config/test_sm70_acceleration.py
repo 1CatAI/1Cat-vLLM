@@ -174,6 +174,21 @@ def test_flashnext_report_uses_its_own_required_paths_and_ignores_kv_dtype(
         assert not report["expected_failures"]
 
 
+def test_model_less_component_config_does_not_validate_a_target(config, monkeypatch):
+    config.model_config = None
+    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+
+    def unexpected_probe(_page):
+        raise AssertionError("component configs must not probe target operators")
+
+    monkeypatch.setattr(acc, "_native_capabilities", unexpected_probe)
+    report = acc.log_and_validate(config)
+    assert report["scope"] == "component_config"
+    assert report["expected_acceleration"] == []
+    assert report["expected_failures"] == []
+    assert report["paths"] == {}
+
+
 def test_non_sm70_is_not_applicable(config, monkeypatch):
     monkeypatch.setattr(acc, "_is_sm70", lambda cfg: False)
     report = acc.log_and_validate(config)

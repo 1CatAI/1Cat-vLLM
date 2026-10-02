@@ -117,6 +117,16 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
 
 
 def build_report(cfg: VllmConfig) -> dict[str, Any]:
+    if cfg.model_config is None:
+        # PLE/component processes create a config without a target model.
+        # They must not probe target operators or enforce a serving profile.
+        return {
+            "profile": None,
+            "sm70": _is_sm70(cfg),
+            "scope": "component_config",
+            "expected_acceleration": [],
+            "paths": {},
+        }
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
     from vllm.config.vllm import (
         _SM70_BATCH_GEMM_DEFAULTS,
