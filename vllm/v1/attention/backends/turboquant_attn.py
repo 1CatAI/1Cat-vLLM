@@ -1213,9 +1213,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
                     )
-                else:
-                    # Large continuation: dequant cached K/V and use
-                    # flash_attn for better throughput.
+                elif self.use_flash_attn_prefill:
+                    # Large continuation with flash_attn available: dequant
+                    # cached K/V and use flash_attn for better throughput.
                     out = self._continuation_prefill(
                         layer,
                         q_seq,
@@ -1228,6 +1228,49 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         Pi,
                         centroids,
                     )
+                else:
+                    # SM70 path (no flash_attn): the SDPA fallback in
+                    # _continuation_prefill materializes a (Hq, q_len,
+                    # seq_len) fp32 attention matrix and OOMs on long
+                    # contexts. Sub-chunk through the TQ decode kernel at
+                    # the threshold size instead: per-launch buffers stay
+                    # bounded by B <= _CONTINUATION_DECODE_THRESHOLD and
+                    # row seq_lens are derived from GPU-resident tensors.
+                    out = torch.empty(
+                        q_len, Hq, D, device=query.device, dtype=query.dtype
+                    )
+                    for qs in range(0, q_len, _CONTINUATION_DECODE_THRESHOLD):
+                        qe = min(qs + _CONTINUATION_DECODE_THRESHOLD, q_len)
+                        m = qe - qs
+                        sub_seq_lens = (
+                            attn_metadata.seq_lens[i : i + 1]
+                            - q_len
+                            + 1
+                            + qs
+                            + torch.arange(
+                                m,
+                                device=query.device,
+                                dtype=attn_metadata.seq_lens.dtype,
+                            )
+                        )
+                        sub_bt = attn_metadata.block_table[i : i + 1].expand(m, -1)
+                        out[qs:qe] = triton_turboquant_decode_attention(
+                            query=q_seq[qs:qe],
+                            kv_cache=kv_cache,
+                            block_table=sub_bt,
+                            seq_lens=sub_seq_lens,
+                            Pi=Pi,
+                            centroids=centroids,
+                            scale=self.scale,
+                            mse_bits=self.tq_config.key_mse_bits,
+                            key_packed_size=self.tq_config.key_packed_size,
+                            value_quant_bits=(
+                                self.tq_config.effective_value_quant_bits
+                            ),
+                            key_fp8=self.tq_config.key_fp8,
+                            norm_correction=self.tq_config.norm_correction,
+                            PiT=PiT,
+                        )
                 output[q_start:q_end] = out.to(query.dtype)
 
         return output
