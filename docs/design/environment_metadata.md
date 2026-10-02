@@ -63,3 +63,23 @@ declarations: Ray v2's default is `True`, the DP master IP is `127.0.0.1`, and
 the XGrammar cache is 512 MB. Runtime getters retain their previous values.
 No kernel, numerical precision, experiment default or model qualification is
 changed by this migration.
+
+## Native environment readers
+
+The registration check also covers C/C++/CUDA sources in `csrc`,
+`flash-attention-v100`, `flash_qla`, and bundled `lmdeploy`. It finds literal
+keys and simple constant aliases passed to `getenv` and native env helper
+functions; C/C++ comments and ordinary diagnostic strings are ignored. Dynamic
+name construction still needs an explicit registration for each resulting name.
+
+Native-only registrations return raw `str | None`. They do not parse a native
+boolean, assign an environment value, or replace the native fallback. Their
+metadata distinguishes the raw Python default (`None`) from the native unset
+default, and lists the actual reader locations. Their presence intentionally
+invalidates compilation caches that previously omitted these controls.
+
+For example, `VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH` is default-off
+in the standalone long-attention implementation and default-on in bundled
+Flash-V100. That existing difference is documented per implementation. Changing
+it requires a separate route/quality/performance comparison in the attention
+migration; registration alone preserves both defaults.

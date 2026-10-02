@@ -244,13 +244,13 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
-  # prevent new VLLM_* reads that bypass vllm/envs.py (compile cache key)
+  # Keep Python and native environment reads in the compile cache key.
   - id: check-env-registration
     name: "Prevent unregistered 'VLLM_*' environment reads"
     entry: python tools/pre_commit/check_env_registration.py
     language: python
-    types: [python]
-    files: ^vllm/
+    types: [file]
+    files: ^(vllm/.*\.py|(?:csrc|flash-attention-v100|flash_qla|lmdeploy)/.*\.(?:c|cc|cpp|cu|cuh|h|hpp))$
     additional_dependencies: [regex]
   - id: check-env-metadata
     name: Require complete environment registration metadata

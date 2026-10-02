@@ -77,3 +77,44 @@ def test_import_aliases_cannot_bypass_registration(tmp_path):
 
 def test_keyword_environment_keys_are_checked(tmp_path):
     assert _scan(tmp_path, 'import os\nx = os.getenv(key="VLLM_NOT_A_SWITCH")\n')
+
+
+def test_native_readers_and_constant_aliases(tmp_path):
+    from tools.pre_commit.check_env_registration import native_reads, scan_file
+
+    source = """
+// std::getenv("VLLM_COMMENT");
+/* env_flag_enabled("VLLM_COMMENT_TOO"); */
+const char* key = "VLLM_NATIVE_ALIAS";
+std::getenv(key);
+env_flag_enabled("VLLM_NATIVE_FLAG");
+dispatch_policy_override_from_env("VLLM_NATIVE_POLICY");
+std::puts("VLLM_LOG_ONLY");
+"""
+    assert native_reads(source) == [
+        ("VLLM_NATIVE_ALIAS", 5),
+        ("VLLM_NATIVE_FLAG", 6),
+        ("VLLM_NATIVE_POLICY", 7),
+    ]
+    path = tmp_path / "kernel.cu"
+    path.write_text(source)
+    assert scan_file(str(path), {"VLLM_NATIVE_ALIAS"}) == 1
+    assert (
+        scan_file(
+            str(path), {"VLLM_NATIVE_ALIAS", "VLLM_NATIVE_FLAG", "VLLM_NATIVE_POLICY"}
+        )
+        == 0
+    )
+
+
+def test_native_strings_preserve_comment_markers_and_line_numbers():
+    from tools.pre_commit.check_env_registration import native_reads
+
+    source = """
+const char* url = "https://example.invalid/*this is not a comment*/";
+/* multiple
+   comment lines */
+auto flag = std::getenv(
+    "VLLM_MULTILINE_NATIVE");
+"""
+    assert native_reads(source) == [("VLLM_MULTILINE_NATIVE", 5)]

@@ -979,6 +979,42 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
 
+    # Native-only compatibility controls are raw optional strings.
+    VLLM_CUSTOM_ALLREDUCE_ALGO: str | None = None
+    VLLM_FLASH_V100_E4M3_SCALAR_FAST: str | None = None
+    VLLM_FLASH_V100_PREFILL_CONTIG_FAST: str | None = None
+    VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE: str | None = None
+    VLLM_FLASH_V100_PREFILL_SCALAR_PV: str | None = None
+    VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST: str | None = None
+    VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM: str | None = None
+    VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE: str | None = None
+    VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT: str | None = None
+    VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE: str | None = None
+    VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE: str | None = None
+    VLLM_FLASH_V100_XQA_BLOCK784_INDEX: str | None = None
+    VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE: str | None = None
+    VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN: str | None = None
+    VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE: str | None = None
+    VLLM_FLASH_V100_XQA_G6_P1024_AUTO: str | None = None
+    VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE: str | None = None
+    VLLM_FLASH_V100_XQA_PADDED_SMEM: str | None = None
+    VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE: str | None = None
+    VLLM_SM70_AWQ_MOE_DISPATCH_POLICY: str | None = None
+    VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR: str | None = None
+    VLLM_SM70_AWQ_TP4_QKV_CTA64: str | None = None
+    VLLM_SM70_F16_DENSE_TUNE_MAX_M: str | None = None
+    VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR: str | None = None
+    VLLM_SM70_FP8_MOE_PREPARE_VEC: str | None = None
+    VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH: str | None = None
+    VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS: str | None = None
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS: str | None = None
+    VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS: str | None = None
+
 
 def get_default_cache_root():
     return os.getenv(
@@ -16465,6 +16501,831 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=(),
+    ),
+    # Raw native-only controls; native code retains parsing and defaults.
+    "VLLM_CUSTOM_ALLREDUCE_ALGO": env_var(
+        lambda: os.getenv("VLLM_CUSTOM_ALLREDUCE_ALGO"),
+        description=(
+            "Override the native custom all-reduce algorithm: 1stage/oneshot or "
+            "2stage/twoshot. Unset uses topology and payload selection."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: automatic algorithm "
+            "selection."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:2005; its local operator "
+                "checks determine applicability."
+            ),
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:2024; its local operator "
+                "checks determine applicability."
+            ),
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:2043; its local operator "
+                "checks determine applicability."
+            ),
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:2301; its local operator "
+                "checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
+    ),
+    "VLLM_FLASH_V100_E4M3_SCALAR_FAST": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_E4M3_SCALAR_FAST"),
+        description=(
+            "Enable the native E4M3 scalar decode fast branch where its operator "
+            "checks admit it. When unset, the older TP2-named alias is consulted."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: True when both "
+            "aliases are unset."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:3608; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_PREFILL_CONTIG_FAST": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_PREFILL_CONTIG_FAST"),
+        description=(
+            "Opt into contiguous prefill addressing beyond the page-16 case that "
+            "already enables it automatically."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: False; page-16 "
+            "prefill is already contiguous."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/fused_mha_forward_paged.cu:3224; its "
+                "local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/fused_mha_forward_paged.cu:3453; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 prefill",),
+    ),
+    "VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE"),
+        description=(
+            "Control the flash v100 prefill d256 software pipeline native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/fused_mha_forward_paged.cu:3239; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 prefill",),
+    ),
+    "VLLM_FLASH_V100_PREFILL_SCALAR_PV": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_PREFILL_SCALAR_PV"),
+        description=(
+            "Control the flash v100 prefill scalar pv native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/fused_mha_forward.cu:1086; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 prefill",),
+    ),
+    "VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST"),
+        description=(
+            "Compatibility fallback for E4M3_SCALAR_FAST; read only when the primary "
+            "alias is absent. The native head/layout checks still apply."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: True when both "
+            "aliases are unset."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:3610; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM"),
+        description=(
+            "Control the flash v100 xqa aligned padded smem native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:513; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:513; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:514; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE"),
+        description=(
+            "Trace the flash v100 xqa aligned padded smem native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:520; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:520; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:521; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT"),
+        description=(
+            "Select native page-16 XQA layout mode 1 or 2; all other values select the "
+            "original mode."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 0.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:478; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:478; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:479; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_REQUIRE"),
+        description=(
+            "Control the flash v100 xqa block16 layout require native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:487; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:487; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:488; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK16_LAYOUT_TRACE"),
+        description=(
+            "Trace the flash v100 xqa block16 layout native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:493; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:493; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:494; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_BLOCK784_INDEX": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX"),
+        description=(
+            "Control the flash v100 xqa block784 index native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:500; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:500; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:501; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_BLOCK784_INDEX_TRACE"),
+        description=(
+            "Trace the flash v100 xqa block784 index native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:506; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:506; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:507; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_DUAL_CTA_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 dual-CTA XQA branch; overrides "
+            "clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 32768.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:296; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:296; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:297; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH"),
+        description=(
+            "Control merged-wave launch in the E4M3 G6 XQA implementations. "
+            "Defaults currently differ between the bundled attention extension "
+            "and the standalone long-attention extension."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: False in "
+            "csrc/attention/sm70_grouped_long; True in flash-attention-v100."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:308; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:308; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:309; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P1664_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 P1664 XQA branch; "
+            "overrides clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 196608.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:323; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:323; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:324; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P256_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 P256 XQA branch; "
+            "overrides clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 12288.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:291; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:291; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:292; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO_TRACE"),
+        description=(
+            "Trace the flash v100 xqa e4m3 g6 p64 p256 auto native branch without "
+            "changing its admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:284; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:284; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:285; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P896_BEGIN"),
+        description=(
+            "Sequence-length threshold for the E4M3 G6 P896 XQA branch; "
+            "overrides clamp to at least one."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 98304.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:318; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:318; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:319; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA_DENSE"),
+        description=(
+            "Control the flash v100 xqa g6 dual cta dense native variant. The "
+            "consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:254; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:254; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:255; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_AUTO": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO"),
+        description=(
+            "Control the flash v100 xqa g6 p1024 auto native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:259; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:259; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:260; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_AUTO_TRACE"),
+        description=(
+            "Trace the flash v100 xqa g6 p1024 auto native branch without changing its "
+            "admission."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:265; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:265; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:266; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_PADDED_SMEM": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM"),
+        description=(
+            "Control the flash v100 xqa padded smem native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:149; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:149; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:150; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE": env_var(
+        lambda: os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE_D_TILE"),
+        description=(
+            "Select a supported native split-reduction dimension tile (8, 16 or 32); "
+            "invalid values retain the default."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 8.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu:527; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "csrc/attention/sm70_grouped_long/kernel/scalar-attention.cu:527; "
+                "its local operator checks determine applicability."
+            ),
+            (
+                "Native reader: "
+                "flash-attention-v100/kernel/flash_decode_paged.cu:528; its local "
+                "operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("Flash-V100 XQA attention",),
+    ),
+    "VLLM_SM70_AWQ_MOE_DISPATCH_POLICY": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY"),
+        description=(
+            "Override the AWQ MoE TurboMind dispatch policy with default, reuse or "
+            "measure. An empty or absent value leaves the normal dispatcher in control."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: no dispatch override."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: csrc/sm70_turbomind/ops/awq_sm70_gemm.cu:1246; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("TurboMind AWQ MoE",),
+    ),
+    "VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR"),
+        description=(
+            "Control the sm70 awq mtp m5 fast selector native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/"
+                "gemm.cu:108; its local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("TurboMind AWQ",),
+    ),
+    "VLLM_SM70_AWQ_TP4_QKV_CTA64": env_var(
+        lambda: os.getenv("VLLM_SM70_AWQ_TP4_QKV_CTA64"),
+        description=(
+            "Control the sm70 awq tp4 qkv cta64 native variant. The consuming operator "
+            "retains its hardware, shape and layout checks."
+        ),
+        category="configuration",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: True.",
+        automatic_conditions=(
+            (
+                "Native reader: "
+                "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/"
+                "gemm.cu:102; its local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("TurboMind AWQ",),
+    ),
+    "VLLM_SM70_F16_DENSE_TUNE_MAX_M": env_var(
+        lambda: os.getenv("VLLM_SM70_F16_DENSE_TUNE_MAX_M"),
+        description=(
+            "Maximum M admitted to native FP16 dense GEMM tuning. Negative overrides "
+            "clamp to zero."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 16.",
+        automatic_conditions=(
+            (
+                "Native reader: csrc/sm70_turbomind/ops/awq_sm70_gemm.cu:1255; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("SM70 FP16 GEMM",),
+    ),
+    "VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_0DOT3_DENSE_SELECTOR"),
+        description=(
+            "Control the sm70 fp8 0dot3 dense selector native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: csrc/sm70_turbomind/ops/awq_sm70_gemm.cu:1143; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_PREPARE_VEC": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_MOE_PREPARE_VEC"),
+        description=(
+            "Control the sm70 fp8 moe prepare vec native variant. The consuming "
+            "operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: csrc/sm70_turbomind/ops/awq_sm70_gemm.cu:6245; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH": env_var(
+        lambda: os.getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH"),
+        description=(
+            "Control the sm70 fp8 moe single token per expert dispatch native variant. "
+            "The consuming operator retains its hardware, shape and layout checks."
+        ),
+        category="experimental",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: False.",
+        automatic_conditions=(
+            (
+                "Native reader: csrc/sm70_turbomind/ops/awq_sm70_gemm.cu:1138; its "
+                "local operator checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("TurboMind FP8",),
+    ),
+    "VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS": env_var(
+        lambda: os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS"),
+        description=(
+            "Native fused all-reduce/Gemma RMS thread count; accepts 256, 512 or "
+            "1024 and otherwise retains the compiled default."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None (raw optional string); native unset default: 1024.",
+        automatic_conditions=(
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:215; its local operator "
+                "checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
+    ),
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS": env_var(
+        lambda: os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS"),
+        description=(
+            "Override the TP4 Qwen3.8 batch push all-reduce block count within "
+            "the native minimum/maximum limits."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: payload-dependent block "
+            "count."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:194; its local operator "
+                "checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
+    ),
+    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS": env_var(
+        lambda: os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS"),
+        description=(
+            "Override the hierarchical TP8 push all-reduce block count; native parsing "
+            "validates the supported bounds."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default=(
+            "None (raw optional string); native unset default: 16 above the "
+            "native 64 KiB threshold, otherwise 4."
+        ),
+        automatic_conditions=(
+            (
+                "Native reader: csrc/custom_all_reduce.cuh:277; its local operator "
+                "checks determine applicability."
+            ),
+        ),
+        acceleration_paths=("SM70 collectives",),
     ),
 }
 
