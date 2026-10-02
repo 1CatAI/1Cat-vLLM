@@ -5,13 +5,13 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm.model_executor.layers.quantization.awq import (
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     _SM70_AWQ_PREFILL_DENSE_WORKSPACE_BYTES,
-    _awq_exact_f16_weight,
     _get_sm70_awq_prefill_exact_dense_workspace,
     _is_sm70_awq_prefill_exact_dense_layer,
     _sm70_awq_prefill_dense_workspaces,
 )
+from vllm.model_executor.layers.quantization.awq import _awq_exact_f16_weight
 
 
 def test_awq_exact_f16_weight_matches_half_fma_rounding():
