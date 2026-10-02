@@ -321,6 +321,7 @@ def load_baseline(ref, directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--category", choices=("nvfp4", "fp8-policy"), default="nvfp4")
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--expected-changes",
@@ -338,11 +339,19 @@ def main():
     clean = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_")}
     with patch.dict(os.environ, clean, clear=True):
         envs.disable_envs_cache()
-        result = snapshot()
+        if args.category == "fp8-policy":
+            from tools import sm70_fp8_policy_snapshot as policy
+
+            result = policy.snapshot()
+        else:
+            result = snapshot()
         reference = None
         if args.baseline_ref:
-            with tempfile.TemporaryDirectory() as directory:
-                reference = snapshot(load_baseline(args.baseline_ref, directory))
+            if args.category == "fp8-policy":
+                reference = policy.baseline_snapshot(args.baseline_ref)
+            else:
+                with tempfile.TemporaryDirectory() as directory:
+                    reference = snapshot(load_baseline(args.baseline_ref, directory))
         elif args.check:
             reference = json.loads(args.check.read_text())
         if reference is not None:

@@ -1943,47 +1943,6 @@ class VllmConfig:
         sm70_no_compile_decode_graph_requested = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
         )
-        sm70_fp8_kv_requested = str(self.cache_config.cache_dtype).startswith("fp8")
-
-        if (
-            self.model_config is not None
-            and self.model_config.quantization == "fp8"
-            and self.model_config.is_moe
-            and self.parallel_config.tensor_parallel_size <= 2
-            and sm70_fp8_kv_requested
-            and current_platform.is_cuda()
-            and _any_participating_device_is_capability(self, (7, 0))
-            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
-            and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-            and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
-        ):
-            os.environ["VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK"] = "0"
-            logger.info_once(
-                "Auto-setting VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK=0 for "
-                "SM70 FP8 MoE with explicit FP8 KV cache on TP<=2. This keeps "
-                "dense FP8 TurboMind enabled and uses the native SM70 FP8 MoE "
-                "route to avoid the fp16 expert dequant fallback memory cliff. "
-                "Set VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK explicitly to override."
-            )
-
-        if (
-            self.model_config is not None
-            and self.model_config.quantization == "fp8"
-            and self.model_config.is_moe
-            and current_platform.is_cuda()
-            and _any_participating_device_is_capability(self, (7, 0))
-            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
-            and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
-            and not envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-            and not envs.force_sm70_marlin()
-            and "VLLM_SM70_FP8_TURBOMIND" not in os.environ
-        ):
-            os.environ["VLLM_SM70_FP8_TURBOMIND"] = "0"
-            logger.info_once(
-                "Auto-setting VLLM_SM70_FP8_TURBOMIND=0 for SM70 FP8 MoE "
-                "0.0.3 dense dequant fallback lane. Set "
-                "VLLM_SM70_FP8_TURBOMIND explicitly to override."
-            )
 
         attention_backend = self.attention_config.backend
         attention_backend_name = getattr(attention_backend, "name", attention_backend)

@@ -6423,24 +6423,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="configuration",
         declared_default="True",
-        effective_default=(
-            "True; configuration may replace the unset default under the "
-            "automatic conditions below."
-        ),
-        automatic_conditions=(
-            (
-                "vllm/config/vllm.py:__post_init__ sets '0' when self.model_config"
-                " is not None and self.model_config.quantization == 'fp8' and "
-                "self.model_config.is_moe and current_platform.is_cuda() and "
-                "_any_participating_device_is_capability(self, (7, 0)) and "
-                "envs.VLLM_SM70_FP8_DEQUANT_FALLBACK and "
-                "envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK and (not "
-                "envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)) and (not "
-                "envs.force_sm70_marlin()) and ('VLLM_SM70_FP8_TURBOMIND' not in "
-                "os.environ); automatic defaults apply only when the environment "
-                "override is absent."
-            ),
-        ),
+        effective_default="True",
+        automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
     ),
     # Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It prepares
@@ -6682,25 +6666,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="configuration",
         declared_default="False",
-        effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
-        ),
-        automatic_conditions=(
-            (
-                "vllm/config/vllm.py:__post_init__ sets '0' when self.model_config"
-                " is not None and self.model_config.quantization == 'fp8' and "
-                "self.model_config.is_moe and "
-                "(self.parallel_config.tensor_parallel_size <= 2) and "
-                "sm70_fp8_kv_requested and current_platform.is_cuda() and "
-                "_any_participating_device_is_capability(self, (7, 0)) and "
-                "envs.VLLM_SM70_FP8_DEQUANT_FALLBACK and "
-                "envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND) and "
-                "('VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK' not in os.environ); "
-                "automatic defaults apply only when the environment override is "
-                "absent."
-            ),
-        ),
+        effective_default="False",
+        automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
     ),
     # Default SM70 native FP8 MoE throughput lane. The per-expert dense-stage
