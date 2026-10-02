@@ -6,6 +6,11 @@ it is not target-forward-only latency. Reuse this recorded baseline and run only
 the focused case affected by the next concrete optimization. No more wheel
 packaging, no-MTP baseline sweeps or repeated broad quality matrices are needed.
 
+The [timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md)
+adds a matched capture off/on/off comparison and historical-method target
+timing. Target verification is 21.95-22.24 ms across rank means at 8K;
+the 29.32-ms node-traced target below is not its normal latency.
+
 ## Shared implementation
 
 ### 1.5.1 operator admission
@@ -163,7 +168,7 @@ verifier is a traced measurement only. Rank-0 target kernel busy-time union is
 includes graph gaps and possible tracing/dependency effects; it is not a proven
 CPU bottleneck or an independently removable latency budget.
 
-## Where the GPU time goes
+## Whole-round GPU service
 
 Service durations below can overlap and include collective dependency waits;
 they do not add into the wall table. Rank maxima may come from different ranks.
@@ -194,11 +199,13 @@ split kernels, 12 common FP16 row-GEMV calls, six native HC up/mix and six HC
 down/all-gather calls. The latter GEMV/HC calls have nonzero graph-node IDs.
 PLE is one local pinned gather (0.1144 ms on rank 0), already a small cost.
 
-The next optimization should first attribute the dominant M=5 verifier GEMMs
-to projection shapes/call sites using this retained trace, then test the
-existing common operators' small-batch extension/fusion on those exact shapes.
-Keep the common dispatch and numerical contract; do not clone the single-token
-path or apply M=1 assumptions to M=5. Collective service is strongly skewed
+The target-only decomposition and historical candidate audit are in the
+[timing reconciliation](sm70_flash_next_mtp4_trace_reconciliation.md).
+Ordinary M5 FP16 projection replacements were already screened at only
+0.190 ms weighted microbenchmark savings; do not repeat that campaign merely
+because dense service leads this table. Any new small-batch extension/fusion
+needs a specific component win while preserving common dispatch and the
+numerical contract. Collective service is strongly skewed
 across ranks (1.34-4.78 ms), so isolate readiness waits before blaming transfer
 bandwidth. PLE and another metadata rewrite are not the leading candidates.
 
@@ -218,26 +225,8 @@ The prior 73-75 tok/s no-MTP run used explicit CPU-worker RAM PLE and cannot
 stand in for the historical 97.7-97.9 tok/s hybrid/pinned-UVA baseline. One
 attempt at its 262144 capacity failed before generation: required KV 3.24 GiB,
 available 1.25 GiB. Preserve `baseline_nomtp.log`; do not repeat that experiment
-or claim a new matched 97 tok/s measurement. The owner explicitly narrowed
-further work to shared-path integration, this baseline and its trace.
+or claim a new matched 97 tok/s measurement. Further comparisons retain the shared-path integration and the frozen baseline.
 
-All local evidence is retained under:
-
-```text
-/home/ymzx/桌面/1cat-vllm/worktrees/v100-mtp4-full-defaults-20260926-103036/.artifacts/
-```
-
-- `mtp4_baseline_27_396ms.json`: accepted contract, source-patch/native hashes,
-  raw artifact paths and hashes, metric definition and future comparison rule.
-- `stacked_mtp_graph.json`, `_contract.json`, `_source.patch`, `.log`, `.exit`:
-  endpoint text/tokens/stats, environment, measured source and clean exit.
-- `stacked_mtp_graph_trace.nsys-rep` and `.sqlite`: raw graph-node capture.
-- `stacked_mtp_graph_wall.json`, `_kernels.json`, `_target_busy.json`,
-  `_summary.json`: closed intervals, service attribution and quality/parity.
-- `run_probe.py`, `mtp_probe.py`, `analyze_stacked_trace.py`,
-  `analyze_kernel_trace.py`: exact retained launcher, fixture and analysis.
-
-The completed run command was
-`.venv/bin/python .artifacts/run_probe.py stacked_mtp_graph --ple auto --ple-host-gib 12 --focused-trace`.
-All task-owned model/profiler workers exited. The worktree is retained for
-baseline/trace reuse; unrelated GPU workloads must not be stopped.
+The measurement contract records the source/native hashes, input and output
+tokens, acceptance counters, timing intervals, and analysis method. Reproduce
+comparisons with the same placement, sampling, graph, and tracing settings.
