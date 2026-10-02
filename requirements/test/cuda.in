@@ -80,3 +80,6 @@ datasets>=3.3.0,<=3.6.0
 
 openpyxl # required for perf comparison excel report
 plotly # required for perf comparison html report
+
+# Preserve the currently used decoder API during dependency resolution.
+mbstrdecoder>=1.1.5
