@@ -8,7 +8,8 @@ import pytest
 import torch
 
 from vllm import envs
-from vllm.model_executor.layers.quantization import fp8
+from vllm.config.kernel import Sm70Fp8Config
+from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8 as fp8
 from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces as ws
 
 
@@ -233,7 +234,7 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
     library = _cpu_impl("sm70_fp8_qpn8_dispatch", ws._sm70_fp8_qpn8_dispatch)
     try:
         with patch.object(fp8.sm70_ops, "fp8_qpn8_dispatch_sm70_out", fake_dispatch):
-            out = fp8.Fp8LinearMethod.apply(None, layer, x)
+            out = fp8.TurboMindFp8LinearKernel.apply_weights(None, layer, x)
     finally:
         if library is not None:
             library._destroy()
@@ -258,7 +259,7 @@ def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> No
     layer.orig_dtype = torch.float16
     layer.is_bmm = False
     layer.weight_scale_inv = torch.empty((12, 32), device="meta")
-    method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
+    method = fp8.TurboMindFp8LinearKernel.__new__(fp8.TurboMindFp8LinearKernel)
     method.use_marlin = False
     method.use_sm70_fp8_turbomind = True
     method.weight_block_size = [128, 128]
@@ -297,6 +298,8 @@ def test_pp2_tp4_qpn8_explicit_opt_in_prepares_matching_layer(monkeypatch) -> No
             ),
             patch.object(fp8, "replace_parameter"),
         ):
+            method.policy = Sm70Fp8Config()
+            method.policy.resolve()
             method.process_weights_after_loading(layer)
     finally:
         envs.disable_envs_cache()
@@ -325,7 +328,7 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
     layer.orig_dtype = torch.float16
     layer.is_bmm = False
     layer.weight_scale_inv = torch.empty((8, 32), device="meta")
-    method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
+    method = fp8.TurboMindFp8LinearKernel.__new__(fp8.TurboMindFp8LinearKernel)
     method.use_marlin = False
     method.use_sm70_fp8_turbomind = True
     method.weight_block_size = [128, 128]
@@ -364,6 +367,8 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
             ),
             patch.object(fp8, "replace_parameter"),
         ):
+            method.policy = Sm70Fp8Config()
+            method.policy.resolve()
             method.process_weights_after_loading(layer)
     finally:
         envs.disable_envs_cache()
@@ -399,7 +404,7 @@ def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
     layer.orig_dtype = torch.float16
     layer.is_bmm = False
 
-    method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
+    method = fp8.TurboMindFp8LinearKernel.__new__(fp8.TurboMindFp8LinearKernel)
     method.use_marlin = False
     method.use_sm70_fp8_turbomind = True
     method.weight_block_size = [128, 128]
@@ -441,6 +446,8 @@ def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
             patch.object(fp8.sm70_ops, "fp8_sm70_prepare", side_effect=fake_prepare),
             patch.object(fp8, "replace_parameter"),
         ):
+            method.policy = Sm70Fp8Config()
+            method.policy.resolve()
             method.process_weights_after_loading(layer)
     finally:
         envs.disable_envs_cache()

@@ -6,7 +6,7 @@ import io
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization import fp8
+from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8 as fp8
 from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces as ws
 
 _LAYER = "model.layers.0.mlp.down_proj"

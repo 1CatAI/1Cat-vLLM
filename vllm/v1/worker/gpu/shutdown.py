@@ -23,7 +23,7 @@ def _clear_loaded_gpu_workspaces() -> None:
             "clear_flash_attn_v100_workspaces",
         ),
         (
-            "vllm.model_executor.layers.quantization.fp8",
+            "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8",
             "clear_sm70_fp8_workspaces",
         ),
         (

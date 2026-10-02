@@ -3540,9 +3540,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Expand selected large-M TP4 FP8 projections into one reusable "
             "bounded FP16 workspace before their exact dense GEMM. The "
             "allowlist and M gate keep decode, tails, and numerically unsafe "
-            "QKV projections on TurboMind."
+            "QKV projections on TurboMind. For serialized block-FP8 linear "
+            "layers this is a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.prefill_exact_dense. Shared checkpoint- "
+            "admission, MoE, online and compressed-tensors consumers keep "
+            "their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -3559,9 +3563,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "block-FP8 dense projections. Pure-FP8 checkpoints must opt in. "
             "The Qwen4Exp online route also stays opt-in because it "
             "requantizes checkpoint BF16 attention, GDN, QSA, and mHC weights "
-            "without calibration."
+            "without calibration. For serialized block-FP8 linear layers this "
+            "is a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.qpn8. Shared checkpoint-admission, MoE, "
+            "online and compressed-tensors consumers keep their existing "
+            "compatibility behavior."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default=(
             "False; configuration may replace the unset default under the "
@@ -3870,12 +3878,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_QPN8_PP2_TP4": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "0"))),
         description=(
-            "Experimental QPN8 route for the serialized PP2 x TP4 contract. It"
-            " is default-off after matched model-level quality regressions. An"
-            " explicit opt-in still requires exact operator shapes/layouts, "
-            "B1, no speculative decoding, no DBO, and no explicit ubatching."
+            "Experimental QPN8 route for the serialized PP2 x TP4 contract. "
+            "It is default-off after matched model-level quality regressions. "
+            "An explicit opt-in still requires exact operator shapes/layouts, "
+            "B1, no speculative decoding, no DBO, and no explicit ubatching. "
+            "For serialized block-FP8 linear layers this is a one-version "
+            "deprecated alias; use kernel_config.sm70_fp8.qpn8_pp2_tp4. "
+            "Shared checkpoint-admission, MoE, online and compressed-tensors "
+            "consumers keep their existing compatibility behavior."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -3890,9 +3902,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Experimental non-fused QPN8 route for the exact PP2 x TP4 "
             "shared-expert gate/up tensor. The model-level clamp-SwiGLU "
             "remains external. This numerically sensitive role requires an "
-            "explicit opt-in."
+            "explicit opt-in. For serialized block-FP8 linear layers this is "
+            "a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.qpn8_shared_gate. Shared checkpoint- "
+            "admission, MoE, online and compressed-tensors consumers keep "
+            "their existing compatibility behavior."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -3999,9 +4015,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))),
         description=(
             "SM70: fp8 prefill visible dense mm. The consumer locations and "
-            "unset defaults are listed below."
+            "unset defaults are listed below. For serialized block-FP8 linear "
+            "layers this is a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.prefill_visible_dense_mm. Shared "
+            "checkpoint-admission, MoE, online and compressed-tensors "
+            "consumers keep their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -4367,9 +4387,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))),
         description=(
             "SM70: fp8 prefill prescaled. The consumer locations and unset "
-            "defaults are listed below."
+            "defaults are listed below. For serialized block-FP8 linear "
+            "layers this is a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.prefill_prescaled. Shared checkpoint- "
+            "admission, MoE, online and compressed-tensors consumers keep "
+            "their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -4379,9 +4403,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))),
         description=(
             "SM70: fp8 prescaled m1 decode. The consumer locations and unset "
-            "defaults are listed below."
+            "defaults are listed below. For serialized block-FP8 linear "
+            "layers this is a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.prescaled_decode. Shared checkpoint- "
+            "admission, MoE, online and compressed-tensors consumers keep "
+            "their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -4394,9 +4422,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "Exact prescaled route for the measured PP2 x TP4 shared-expert "
             "gate/up tensor. Missing operators or non-reversible scales fall "
-            "back safely."
+            "back safely. For serialized block-FP8 linear layers this is a "
+            "one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.prescaled_shared_gate. Shared checkpoint- "
+            "admission, MoE, online and compressed-tensors consumers keep "
+            "their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -6449,9 +6481,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "Compatibility fallback for serialized FP8 checkpoints on SM70 "
             "shapes not handled by the TurboMind W8A16 dense kernel: "
-            "dequantize once at load time and run regular fp16 linear."
+            "dequantize once at load time and run regular fp16 linear. For "
+            "serialized block-FP8 linear layers this is a one-version "
+            "deprecated alias; use kernel_config.sm70_fp8.dequant_fallback. "
+            "Shared checkpoint-admission, MoE, online and compressed-tensors "
+            "consumers keep their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -6464,9 +6500,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "V100/SM70 block-FP8 dense path using TurboMind W8A16. Default-on "
             "matches 0.0.3 for SM70 dense FP8; MoE route policy is controlled "
-            "below."
+            "below. For serialized block-FP8 linear layers this is a one- "
+            "version deprecated alias; use kernel_config.sm70_fp8.enabled. "
+            "Shared checkpoint-admission, MoE, online and compressed-tensors "
+            "consumers keep their existing compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -6481,10 +6520,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It "
             "prepares a single interleaved primary layout for gate_up_proj, "
-            "avoiding the older duplicate normal+gated layouts that cost about"
-            " 5.4 GiB/rank on Qwen3.6-27B-FP8 TP2."
+            "avoiding the older duplicate normal+gated layouts that cost "
+            "about 5.4 GiB/rank on Qwen3.6-27B-FP8 TP2. For serialized block- "
+            "FP8 linear layers this is a one-version deprecated alias; use "
+            "kernel_config.sm70_fp8.gated_silu. Shared checkpoint-admission, "
+            "MoE, online and compressed-tensors consumers keep their existing "
+            "compatibility behavior."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),

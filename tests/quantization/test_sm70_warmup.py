@@ -8,7 +8,9 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
-from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+    TurboMindFp8LinearKernel,
+)
 from vllm.model_executor.warmup import awq_sm70_warmup as warmup
 
 
@@ -233,7 +235,7 @@ def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
     )
     x = torch.empty((1, 2, 128), dtype=torch.float16)
 
-    out = object.__new__(Fp8LinearMethod).apply(layer, x)
+    out = object.__new__(TurboMindFp8LinearKernel).apply_weights(layer, x)
 
     assert tuple(out.shape) == (1, 2, 64)
     assert len(calls) == 1
@@ -272,7 +274,7 @@ def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
     )
     x = torch.empty((2, 2, 128), dtype=torch.float16)
 
-    out = object.__new__(Fp8LinearMethod).apply(layer, x)
+    out = object.__new__(TurboMindFp8LinearKernel).apply_weights(layer, x)
 
     assert tuple(out.shape) == (2, 2, 64)
     assert [call[:2] for call in dense_calls] == [

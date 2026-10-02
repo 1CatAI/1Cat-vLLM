@@ -12,22 +12,12 @@ from compressed_tensors.quantization import (
 )
 
 import vllm.envs as envs
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
-    CompressedTensorsLinearMethod,
-)
-from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-    compressed_tensors_w8a16_fp8 as ct_fp8_module,
-)
-from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
-    CompressedTensorsW8A16Fp8,
-    _sm70_channel_fp8_qpn8_config,
-    _sm70_fp8_qpn8_enabled,
-)
-from vllm.model_executor.layers.quantization.fp8 import (
+from vllm.config.kernel import Sm70Fp8Config
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
     _SM70_FP8_EXACT_8K_PREFILL_M,
     _SM70_FP8_PREFILL_DENSE_MIN_M,
     _SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES,
-    Fp8LinearMethod,
+    TurboMindFp8LinearKernel,
     _bind_sm70_fp8_prefill_workspace,
     _get_sm70_fp8_prefill_exact_dense_workspace,
     _is_sm70_fp8_exact_8k_prefill_layer,
@@ -39,6 +29,17 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _sm70_fp8_prefill_visible_dense_mm,
     _try_sm70_fp8_prescaled_decode_scales,
     clear_sm70_fp8_workspaces,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsLinearMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    compressed_tensors_w8a16_fp8 as ct_fp8_module,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
+    CompressedTensorsW8A16Fp8,
+    _sm70_channel_fp8_qpn8_config,
+    _sm70_fp8_qpn8_enabled,
 )
 from vllm.model_executor.layers.quantization.utils import (
     sm70_layer_workspaces as ws_module,
@@ -552,7 +553,7 @@ def test_fp8_prefill_visible_dense_mm_is_long_prefill_only(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "1")
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_sm70_dequantize_out",
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops.fp8_sm70_dequantize_out",
         fake_dequantize,
     )
     envs.disable_envs_cache()
@@ -604,7 +605,7 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
         out.zero_()
 
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops."
         "fp8_gemm_sm70_prefill_dispatch_out",
         fake_dispatch,
     )
@@ -623,7 +624,9 @@ def test_fp8_prefill_dispatch_reaches_runtime_op_for_small_and_large_m(monkeypat
     method = SimpleNamespace()
 
     for m in (1, _SM70_FP8_PREFILL_DENSE_MIN_M):
-        output = Fp8LinearMethod.apply(
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        output = TurboMindFp8LinearKernel.apply_weights(
             method, layer, torch.empty((m, 4), dtype=torch.float16)
         )
         assert output.shape == (m, 6)
@@ -650,11 +653,11 @@ def test_fp8_prefill_prescaled_scales_only_reach_exact_8k_route(monkeypatch):
         out.zero_()
 
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_gemm_sm70_out",
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops.fp8_gemm_sm70_out",
         fake_default,
     )
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops."
         "fp8_gemm_sm70_prefill_prescaled_out",
         fake_prescaled,
     )
@@ -676,15 +679,23 @@ def test_fp8_prefill_prescaled_scales_only_reach_exact_8k_route(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1")
     envs.disable_envs_cache()
     try:
-        Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
-        Fp8LinearMethod.apply(
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        TurboMindFp8LinearKernel.apply_weights(
+            method, layer, torch.empty((1, 4), dtype=torch.float16)
+        )
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        TurboMindFp8LinearKernel.apply_weights(
             method,
             layer,
             torch.empty((_SM70_FP8_EXACT_8K_PREFILL_M, 4), dtype=torch.float16),
         )
         monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "0")
         envs.disable_envs_cache()
-        Fp8LinearMethod.apply(
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        TurboMindFp8LinearKernel.apply_weights(
             method,
             layer,
             torch.empty((_SM70_FP8_EXACT_8K_PREFILL_M, 4), dtype=torch.float16),
@@ -781,11 +792,11 @@ def test_fp8_prescaled_m1_decode_only_handles_m1(monkeypatch):
         out.zero_()
 
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops.fp8_gemm_sm70_out",
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops.fp8_gemm_sm70_out",
         fake_default,
     )
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops."
         "fp8_gemm_sm70_prescaled_m1_out",
         fake_prescaled,
     )
@@ -806,11 +817,23 @@ def test_fp8_prescaled_m1_decode_only_handles_m1(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
     envs.disable_envs_cache()
     try:
-        Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
-        Fp8LinearMethod.apply(method, layer, torch.empty((2, 4), dtype=torch.float16))
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        TurboMindFp8LinearKernel.apply_weights(
+            method, layer, torch.empty((1, 4), dtype=torch.float16)
+        )
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        TurboMindFp8LinearKernel.apply_weights(
+            method, layer, torch.empty((2, 4), dtype=torch.float16)
+        )
         monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "0")
         envs.disable_envs_cache()
-        Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        TurboMindFp8LinearKernel.apply_weights(
+            method, layer, torch.empty((1, 4), dtype=torch.float16)
+        )
     finally:
         envs.disable_envs_cache()
 
@@ -836,7 +859,7 @@ def test_fp8_qpn8_dispatches_small_m_and_workspace_fallback(monkeypatch):
         out.zero_()
 
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops."
         "fp8_qpn8_dispatch_sm70_out",
         fake_dispatch,
     )
@@ -856,7 +879,9 @@ def test_fp8_qpn8_dispatches_small_m_and_workspace_fallback(monkeypatch):
     method = SimpleNamespace()
 
     for m in (1, 9):
-        output = Fp8LinearMethod.apply(
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        output = TurboMindFp8LinearKernel.apply_weights(
             method, layer, torch.empty((m, 4), dtype=torch.float16)
         )
         assert output.shape == (m, 6)
@@ -879,7 +904,7 @@ def test_fp8_qpn8_fused_gate_dispatches_without_intermediate(monkeypatch):
         out.zero_()
 
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.sm70_ops."
+        "vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8.sm70_ops."
         "fp8_qpn8_dispatch_sm70_out",
         fake_dispatch,
     )
@@ -899,7 +924,9 @@ def test_fp8_qpn8_fused_gate_dispatches_without_intermediate(monkeypatch):
     method = SimpleNamespace()
 
     for m in (8, 16):
-        output = Fp8LinearMethod.apply_fused_silu_and_mul(
+        method.policy = Sm70Fp8Config()
+        method.policy.resolve()
+        output = TurboMindFp8LinearKernel.apply_fused_silu_and_mul(
             method, layer, torch.empty((m, 4), dtype=torch.float16)
         )
         assert output is not None
