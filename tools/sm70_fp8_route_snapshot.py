@@ -8,6 +8,8 @@ import itertools
 import json
 import os
 import subprocess
+import sys
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
@@ -42,13 +44,31 @@ def load_baseline(ref, directory):
     spec = importlib.util.spec_from_file_location("baseline_fp8_dispatch", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if not hasattr(module, "clear_sm70_fp8_workspaces"):
+        # After #794, the dispatcher lives in the ordinary linear kernel.
+        # Load that historical implementation too, rather than accidentally
+        # pairing a historical loader with today's kernel/predicates.
+        kernel_path = "vllm/model_executor/kernels/linear/scaled_mm/sm70_fp8.py"
+        kernel_file = Path(directory) / "baseline_sm70_fp8.py"
+        kernel_file.write_text(
+            subprocess.check_output(["git", "show", f"{ref}:{kernel_path}"], text=True)
+        )
+        kernel_name = "vllm.model_executor.kernels.linear.scaled_mm._snapshot_fp8"
+        kernel_spec = importlib.util.spec_from_file_location(kernel_name, kernel_file)
+        kernel_module = importlib.util.module_from_spec(kernel_spec)
+        sys.modules[kernel_name] = kernel_module
+        kernel_spec.loader.exec_module(kernel_module)
+        module._snapshot_kernel = kernel_module
+        for name, value in vars(kernel_module).items():
+            if name in vars(module) and callable(value):
+                setattr(module, name, value)
     return module
 
 
 def probe(module, cfg, role, k, n, *, missing_qpn8=False, workspace=True, bmm=False):
     calls = []
     prepare = []
-    target = sm70_fp8 if module is fp8 else module
+    target = sm70_fp8 if module is fp8 else getattr(module, "_snapshot_kernel", module)
     layer = torch.nn.Module()
     layer.prefix = "model.layers.0." + role
     layer.input_size_per_partition = k
@@ -131,39 +151,76 @@ def probe(module, cfg, role, k, n, *, missing_qpn8=False, workspace=True, bmm=Fa
     )
     saved_environment = dict(os.environ)
     try:
-        with (
-            set_current_vllm_config(cfg),
-            patch.object(module, "current_platform", platform),
-            patch.object(sm70_fp8, "current_platform", platform),
-            patch.object(linear, "current_platform", platform),
-            patch.object(module, "get_current_vllm_config", lambda: cfg),
-            patch.object(target, "get_current_vllm_config", lambda: cfg),
-            patch.object(module, "cutlass_block_fp8_supported", lambda: False),
-            patch.object(_sm70_ops, "fp8_sm70_prepare", native_prepare),
-            patch.object(_sm70_ops, "fp8_qpn8_prepare_sm70", qpn8_prepare),
-            patch.object(
-                target,
-                "_missing_sm70_fp8_qpn8_ops",
-                lambda: ["test_missing"] if missing_qpn8 else [],
-            ),
-            patch.object(
-                target, "_get_sm70_fp8_prefill_exact_dense_workspace", lambda _: scratch
-            ),
-            patch.object(
-                target, "_get_sm70_fp8_qpn8_pp2_tp4_workspace", lambda _: scratch
-            ),
-            patch.object(_sm70_ops, "fp8_gemm_sm70_out", record("turbomind")),
-            patch.object(
-                _sm70_ops, "fp8_gemm_sm70_prescaled_m1_out", record("prescaled_m1")
-            ),
-            patch.object(
-                _sm70_ops,
-                "fp8_gemm_sm70_prefill_prescaled_out",
-                record("prescaled_prefill"),
-            ),
-            patch.object(torch.ops, "_C", native),
-            patch.object(torch.ops, "vllm", opaque),
-        ):
+        with ExitStack() as stack:
+            contexts = (
+                set_current_vllm_config(cfg),
+                patch.object(module, "current_platform", platform),
+                patch.object(sm70_fp8, "current_platform", platform),
+                patch.object(target, "current_platform", platform),
+                patch.object(linear, "current_platform", platform),
+                patch.object(
+                    linear,
+                    "Sm70Fp8LinearLayerConfig",
+                    getattr(
+                        target,
+                        "Sm70Fp8LinearLayerConfig",
+                        sm70_fp8.Sm70Fp8LinearLayerConfig,
+                    ),
+                ),
+                patch.object(
+                    linear,
+                    "TurboMindFp8LinearKernel",
+                    getattr(
+                        target,
+                        "TurboMindFp8LinearKernel",
+                        sm70_fp8.TurboMindFp8LinearKernel,
+                    ),
+                ),
+                patch.dict(
+                    linear._POSSIBLE_FP8_BLOCK_KERNELS,
+                    {
+                        PlatformEnum.CUDA: [
+                            getattr(target, "TurboMindFp8LinearKernel", kernel)
+                            if kernel is sm70_fp8.TurboMindFp8LinearKernel
+                            else kernel
+                            for kernel in linear._POSSIBLE_FP8_BLOCK_KERNELS[
+                                PlatformEnum.CUDA
+                            ]
+                        ]
+                    },
+                ),
+                patch.object(module, "get_current_vllm_config", lambda: cfg),
+                patch.object(target, "get_current_vllm_config", lambda: cfg),
+                patch.object(module, "cutlass_block_fp8_supported", lambda: False),
+                patch.object(_sm70_ops, "fp8_sm70_prepare", native_prepare),
+                patch.object(_sm70_ops, "fp8_qpn8_prepare_sm70", qpn8_prepare),
+                patch.object(
+                    target,
+                    "_missing_sm70_fp8_qpn8_ops",
+                    lambda: ["test_missing"] if missing_qpn8 else [],
+                ),
+                patch.object(
+                    target,
+                    "_get_sm70_fp8_prefill_exact_dense_workspace",
+                    lambda _: scratch,
+                ),
+                patch.object(
+                    target, "_get_sm70_fp8_qpn8_pp2_tp4_workspace", lambda _: scratch
+                ),
+                patch.object(_sm70_ops, "fp8_gemm_sm70_out", record("turbomind")),
+                patch.object(
+                    _sm70_ops, "fp8_gemm_sm70_prescaled_m1_out", record("prescaled_m1")
+                ),
+                patch.object(
+                    _sm70_ops,
+                    "fp8_gemm_sm70_prefill_prescaled_out",
+                    record("prescaled_prefill"),
+                ),
+                patch.object(torch.ops, "_C", native),
+                patch.object(torch.ops, "vllm", opaque),
+            )
+            for context in contexts:
+                stack.enter_context(context)
             quant = module.Fp8Config(True, "dynamic", weight_block_size=[128, 128])
             quant.use_deep_gemm = False
             method = module.Fp8LinearMethod(quant)

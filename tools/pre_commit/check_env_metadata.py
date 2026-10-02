@@ -14,6 +14,7 @@ FIELDS = {
     "effective_default",
     "automatic_conditions",
     "acceleration_paths",
+    "user_visible",
 }
 CATEGORIES = {"configuration", "tuning", "experimental", "debug", "deprecated"}
 
@@ -88,6 +89,18 @@ def read_metadata(source: str) -> tuple[dict[str, dict], list[str]]:
         for field in ("description", "declared_default", "effective_default"):
             if not isinstance(metadata[field], str) or not metadata[field].strip():
                 errors.append(f"{name}: {field} must explain its value")
+        if not isinstance(metadata["user_visible"], bool):
+            errors.append(f"{name}: user_visible must be a literal boolean")
+        if (
+            metadata["user_visible"]
+            and metadata["acceleration_paths"]
+            and "consumer locations" in metadata["description"].lower()
+        ):
+            errors.append(
+                f"{name}: public SM70 descriptions must explain the operation, "
+                "default rationale and reason to override; consumer placeholders "
+                "belong only in the internal migration inventory"
+            )
         if (
             not isinstance(metadata["category"], str)
             or metadata["category"] not in CATEGORIES

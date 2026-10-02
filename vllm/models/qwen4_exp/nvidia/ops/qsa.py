@@ -14,6 +14,10 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
+    SM70_QSA_TUNING,
+    legacy_qsa_tuning,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -48,20 +52,22 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
 _SM70_QSA_MTP_TOPK = os.getenv("VLLM_SM70_QSA_MTP_TOPK", "0") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
-    int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
+    legacy_qsa_tuning(
+        "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", SM70_QSA_TUNING.score_tile_mb
+    )
+    * 1024
+    * 1024
 )
-_SM70_INDEXER_CUBLAS_MIN_ROWS = int(
-    os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS", "512")
+_SM70_INDEXER_CUBLAS_MIN_ROWS = legacy_qsa_tuning(
+    "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS", SM70_QSA_TUNING.cublas_min_rows
 )
-_SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = int(
-    os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS", str(1024**2))
+_SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = legacy_qsa_tuning(
+    "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
+    SM70_QSA_TUNING.cublas_min_score_elements,
 )
 _SM70_QSA_XQA_PAGE4 = os.getenv("VLLM_SM70_QSA_XQA_PAGE4", "1") == "1"
-_SM70_QSA_XQA_PAGE4_MIN_ROWS = int(
-    # Operator crossover on SM70 is around 48 rows for the fixed QSA width.
-    # Use a conservative 64-row workload gate rather than coupling the route
-    # to a particular server's max_num_batched_tokens setting.
-    os.getenv("VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS", "64")
+_SM70_QSA_XQA_PAGE4_MIN_ROWS = legacy_qsa_tuning(
+    "VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS", SM70_QSA_TUNING.xqa_page4_min_rows
 )
 _SM70_QSA_XQA_PAGE4_PARTITION = 1024
 _SM70_QSA_XQA_PAGE4_PAGES = 513
