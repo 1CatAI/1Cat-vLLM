@@ -118,3 +118,13 @@ auto flag = std::getenv(
     "VLLM_MULTILINE_NATIVE");
 """
     assert native_reads(source) == [("VLLM_MULTILINE_NATIVE", 5)]
+
+
+def test_native_alias_uses_the_preceding_binding():
+    from tools.pre_commit.check_env_registration import native_reads
+
+    source = """
+void first() { const char* key = "VLLM_FIRST"; getenv(key); }
+void second() { const char* key = "VLLM_SECOND"; getenv(key); }
+"""
+    assert native_reads(source) == [("VLLM_FIRST", 2), ("VLLM_SECOND", 3)]

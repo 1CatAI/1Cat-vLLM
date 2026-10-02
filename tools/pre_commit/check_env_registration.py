@@ -42,7 +42,7 @@ def native_reads(content: str) -> list[tuple[str, int]]:
         return re.sub(r"[^\n]", " ", token) if token.startswith(("//", "/*")) else token
 
     source = tokens.sub(mask_comments, content)
-    aliases = dict(re.findall(r'\b(\w+)\s*=\s*"(VLLM_[A-Z0-9_]+)"', source))
+    aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(VLLM_[A-Z0-9_]+)"', source))
     calls = re.finditer(
         r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"(VLLM_[A-Z0-9_]+)"|(\w+)\b)',
         source,
@@ -51,7 +51,16 @@ def native_reads(content: str) -> list[tuple[str, int]]:
     for call in calls:
         if "env" not in call[1].lower():
             continue
-        name = call[2] or aliases.get(call[3])
+        name = call[2]
+        if name is None:
+            name = next(
+                (
+                    alias[2]
+                    for alias in reversed(aliases)
+                    if alias[1] == call[3] and alias.start() < call.start()
+                ),
+                None,
+            )
         if name:
             reads.append((name, source.count("\n", 0, call.start()) + 1))
     return reads
