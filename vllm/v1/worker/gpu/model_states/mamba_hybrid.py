@@ -10,6 +10,10 @@ import torch.nn as nn
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
@@ -137,7 +141,9 @@ class MambaHybridModelState(DefaultModelState):
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
         self._use_dflash2_common_gdn_metadata = bool(
-            envs.VLLM_SM70_DFLASH2_VERIFY_FASTPATH
+            sm70_dflash2_enabled(
+                "verify_fastpath", capture_sm70_dflash2_config(vllm_config)
+            )
             and uses_dflash_selector_engine(vllm_config)
         )
         if self._use_dflash2_common_gdn_metadata:
@@ -160,7 +166,9 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._use_dflash2_fused_gdn_metadata = bool(
             self._use_dflash2_common_gdn_metadata
-            and envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
+            and sm70_dflash2_enabled(
+                "fused_gdn_metadata", capture_sm70_dflash2_config(vllm_config)
+            )
             and self.cache_config.mamba_cache_mode in ("none", "align")
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
@@ -177,8 +185,12 @@ class MambaHybridModelState(DefaultModelState):
         self._dflash2_fused_gdn_metadata_logged = False
         self._use_dflash2_grouped_smallq_metadata = bool(
             self._use_dflash2_common_gdn_metadata
-            and envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
-            and envs.VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA
+            and sm70_dflash2_enabled(
+                "fused_smallq_metadata", capture_sm70_dflash2_config(vllm_config)
+            )
+            and sm70_dflash2_enabled(
+                "grouped_smallq_metadata", capture_sm70_dflash2_config(vllm_config)
+            )
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
         )

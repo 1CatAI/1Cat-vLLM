@@ -1275,7 +1275,8 @@ def get_vllm_port() -> int | None:
             raise ValueError(
                 f"VLLM_PORT '{port}' appears to be a URI. "
                 "This may be caused by a Kubernetes service discovery issue,"
-                "check the warning in: https://docs.vllm.ai/en/stable/serving/env_vars.html"
+                "check the warning in: "
+                "https://docs.vllm.ai/en/stable/serving/env_vars.html"
             ) from None
         raise ValueError(f"VLLM_PORT '{port}' must be a valid integer") from err
 
@@ -3741,27 +3742,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_QPN8": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
         description=(
-            "Memory-neutral QPN8 layout for shape- and runtime-gated TP4 "
-            "block-FP8 dense projections. Pure-FP8 checkpoints must opt in. "
-            "The Qwen4Exp online route also stays opt-in because it "
-            "requantizes checkpoint BF16 attention, GDN, QSA, and mHC weights "
-            "without calibration. For serialized block-FP8 linear layers this "
-            "is a one-version deprecated alias; use "
-            "kernel_config.sm70_fp8.qpn8. Shared checkpoint-admission, MoE, "
-            "online and compressed-tensors consumers keep their existing "
-            "compatibility behavior."
+            "Compatibility alias for serialized QPN8 selection through "
+            "kernel_config.sm70_fp8.qpn8 and qualified DFlash2 target "
+            "projection policy through "
+            "speculative_config.sm70_dflash2.target_fp8_qpn8. The getter is "
+            "off by default; supported serialized pipeline and DFlash2 "
+            "configurations may select the layout automatically. Prefer "
+            "configuration to override it. Online weight requantization "
+            "retains its separate opt-in and changes checkpoint precision."
         ),
         category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the compatibility getter; serialized and DFlash2 "
+            "target selection are resolved on their per-engine configurations."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "Serialized FP8 qualification: "
+                "sm70_fp8_serialized_pipeline_qualified in models/config.py. "
+                "DFlash2 qualification: sm70_dflash2_verifier_qualified there. "
+                "Each operator retains its local dtype/layout/native checks."
             ),
         ),
         acceleration_paths=("FP8 QPN8",),
@@ -5395,51 +5396,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_QPN8_RERANK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))),
         description=(
-            "Selects candidate-only QPN8 LM-head screening followed by "
-            "original FP16-row reranking. Default enabled by the qualified "
-            "DFlash2 policy, otherwise off. Set 0 to compare the dense LM head "
-            "when investigating candidate selection; this does not enable "
-            "online weight requantization."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.qpn8_rerank. Unset selects the "
+            "model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.qpn8_rerank; the standalone "
+            "compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
-        user_visible=True,
+        acceleration_paths=("DFlash2 verifier: qpn8_rerank",),
+        user_visible=False,
     ),
     # Explicit precision contract: retain FP32 candidate and dense logits
     # for the SM70 TP4 DFlash2 LM head, including reference fallback.
     "VLLM_SM70_DFLASH2_FP32_LOGITS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FP32_LOGITS", "0"))),
         description=(
-            "Explicit precision contract: retain FP32 candidate and dense "
-            "logits for the SM70 TP4 DFlash2 LM head, including reference "
-            "fallback."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fp32_logits. Unset selects the "
+            "model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fp32_logits; the standalone "
+            "compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fp32_logits",),
         user_visible=False,
     ),
     # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
@@ -5466,25 +5471,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))),
         description=(
-            "Preserve the production full-vocabulary torch.topk tie contract "
-            "by default.  The candidate-order experiment avoids a "
-            "host-blocking SM70 multi-block top-k, but may be enabled only for"
-            " paired quality tests."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.qpn8_dense_order. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="True",
         effective_default=(
-            "True; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "True at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.qpn8_dense_order; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: qpn8_dense_order",),
         user_visible=False,
     ),
     # Candidate-order tie handling is a benchmark-only experiment. Requiring
@@ -5495,24 +5503,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
             int(os.getenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "0"))
         ),
         description=(
-            "Candidate-order tie handling is a benchmark-only experiment. "
-            "Requiring a second opt-in prevents stale deployment scripts from "
-            "silently trading scored quality for a small selector win."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.qpn8_allow_candidate_order. "
+            "Unset selects the model-qualified per-engine policy; operator "
+            "guards still decide dispatch. Prefer configuration when "
+            "overriding; this alias expires after one full released "
+            "compatibility cycle."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.qpn8_allow_candidate_order; "
+            "the standalone compatibility getter retains its declared "
+            "default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'0' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: qpn8_allow_candidate_order",),
         user_visible=False,
     ),
     # Umbrella gate for selector-based DFlash verification optimizations. Keep
@@ -5520,32 +5533,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))),
         description=(
-            "Controls selector-based DFlash2 verifier optimizations. Default "
-            "enabled by the qualified per-engine DFlash2 policy; the "
-            "standalone getter defaults off for other configurations. Set 0 to "
-            "isolate verifier execution when diagnosing an output or latency "
-            "regression."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.verify_fastpath. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.verify_fastpath; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
-            ),
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
-        user_visible=True,
+        acceleration_paths=("DFlash2 verifier: verify_fastpath",),
+        user_visible=False,
     ),
     # Build all selector-based DFlash target GDN state-index metadata with one
     # pointer-table Triton launch. Keep separate from the shared-classification
@@ -5553,30 +5562,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))),
         description=(
-            "Build all selector-based DFlash target GDN state-index metadata "
-            "with one pointer-table Triton launch. Keep separate from the "
-            "shared-classification gate until the fixed-trajectory and "
-            "mixed-batch Graph checks pass."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_metadata. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_metadata; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
-            ),
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_metadata",),
         user_visible=False,
     ),
     # Classify native MTP batches (any draft depth; the MTP4 prefix is
@@ -5657,26 +5664,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))),
         description=(
-            "Selects packed selector-based GDN verification. Default enabled "
-            "by the qualified DFlash2 policy, otherwise off; local shapes "
-            "retain their fallback. Set 0 to compare separate verifier "
-            "operations when investigating output or state updates."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_verify. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_verify; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
-        user_visible=True,
+        acceleration_paths=("DFlash2 verifier: fused_gdn_verify",),
+        user_visible=False,
     ),
     # Independently gated q8/TP2 packed GDN schedule; other shapes retain the
     # accepted recurrent launch geometry.
@@ -5698,24 +5708,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))),
         description=(
-            "Route compatible target GDN output gates through the existing "
-            "one-pass CUDA RMSNormGated implementation. This remains an "
-            "explicit opt-in."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_norm. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_norm; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_norm",),
         user_visible=False,
     ),
     # Fuse compatible nonzero-offset GDN z/b/a materialization into one
@@ -5724,45 +5737,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))),
         description=(
-            "Fuse compatible nonzero-offset GDN z/b/a materialization into one"
-            " copy kernel. This must stay separate from the plain-view path "
-            "because nonzero-offset views are unsafe under the SM70 "
-            "compile/full-graph route."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_split. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_split; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_split",),
         user_visible=False,
     ),
     # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
     "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT", "0"))),
-        description="Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.",
-        category="configuration",
+        description=(
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gdn_combined_split. Unset "
+            "selects the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this alias "
+            "expires after one full released compatibility cycle."
+        ),
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gdn_combined_split; "
+            "the standalone compatibility getter retains its declared "
+            "default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fused_gdn_combined_split",),
         user_visible=False,
     ),
     # Return the existing projection tensor across the GDN opaque boundary.
@@ -5788,31 +5811,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))),
         description=(
-            "Build Flash-V100 small-query verifier rows directly in their "
-            "persistent graph buffers. This replaces four repeat_interleave "
-            "scans per KV group. The matched TP4 trace is token/acceptance "
-            "exact and cuts the synchronized DFlash2 draft-to-target interval "
-            "from 5.720 ms to 1.911 ms on V100."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_smallq_metadata. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_smallq_metadata; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
-            ),
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fused_smallq_metadata",),
         user_visible=False,
     ),
     # Collapse five compatible target small-query metadata launches into one
@@ -5821,30 +5841,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA", "0"))),
         description=(
-            "Collapse five compatible target small-query metadata launches "
-            "into one heterogeneous-width pointer-table kernel. The paired TP4"
-            " node trace is token/acceptance exact and reduces synchronized "
-            "D2T."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.grouped_smallq_metadata. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.grouped_smallq_metadata; "
+            "the standalone compatibility getter retains its declared "
+            "default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
-            ),
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: grouped_smallq_metadata",),
         user_visible=False,
     ),
     # Copy the post-convolution Q/K/V row slices into the recurrent kernel's
@@ -5870,24 +5889,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))),
         description=(
-            "Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix "
-            "used by small DFlash2 verifier graphs. Default-off pending "
-            "numeric/quality gates."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fused_gemma_rms. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fused_gemma_rms; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fused_gemma_rms",),
         user_visible=False,
     ),
     # Fixed 8192/16-warp reduction for the FP16 no-residual and
@@ -5897,26 +5919,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))),
         description=(
-            "Fixed 8192/16-warp reduction for the FP16 no-residual and "
-            "FP16-residual Gemma norms not covered by the existing "
-            "FP32-residual path. Prevents per-rank/startup autotune from "
-            "changing reduction order. Enabled by the SM70 DFlash2 profile; "
-            "explicit zero retains the rollback path."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.fixed_gemma_rms. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.fixed_gemma_rms; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: fixed_gemma_rms",),
         user_visible=False,
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
@@ -5926,31 +5949,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))),
         description=(
-            "Avoid materializing/gathering full-vocabulary target logits when "
-            "the DFlash2 proposal and target sampling distributions both have "
-            "compact top-k support. Default-off until paired output/acceptance"
-            " and end-to-end V100 gates pass; unsupported sampling features "
-            "fall back to dense logits."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.sparse_target_rejection. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.sparse_target_rejection; "
+            "the standalone compatibility getter retains its declared "
+            "default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
-            ),
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '0' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: sparse_target_rejection",),
         user_visible=False,
     ),
     # Compute the compatible 25600->5120 target-hidden projection as four output
@@ -5959,79 +5980,83 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))),
         description=(
-            "Compute the compatible 25600->5120 target-hidden projection as "
-            "four output shards, then all-gather only the 80-KiB block-eight "
-            "result. The global default remains off; audited DFlash2 contracts"
-            " enable it explicitly."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.sharded_context_fc. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.sharded_context_fc; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
-            ),
-            (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '1' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: sharded_context_fc",),
         user_visible=False,
     ),
     "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))),
         description=(
-            "Captures the qualified DFlash2 context-KV preparation graph. "
-            "Default enabled by the verifier policy, otherwise off. Set 0 to "
-            "compare eager context preparation when diagnosing graph or memory "
-            "behavior."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.context_kv_graph. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.context_kv_graph; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
-        user_visible=True,
+        acceleration_paths=("DFlash2 verifier: context_kv_graph",),
+        user_visible=False,
     ),
     "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))),
         description=(
-            "Pipelines DFlash2 draft context preparation. Default enabled by "
-            "the qualified verifier policy, otherwise off. Set 0 to compare "
-            "sequential preparation when investigating draft state or "
-            "scheduling."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.context_pipeline. Unset "
+            "selects the model-qualified per-engine policy; operator guards "
+            "still decide dispatch. Prefer configuration when overriding; "
+            "this alias expires after one full released compatibility "
+            "cycle."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.context_pipeline; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
-        user_visible=True,
+        acceleration_paths=("DFlash2 verifier: context_pipeline",),
+        user_visible=False,
     ),
     # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
     # topology contracts enable it while the global default remains off.
@@ -6312,28 +6337,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QUANT_LM_HEAD", "0"))),
         description=(
-            "Allow DFlash2 candidate TopK when the shared target LM head is "
-            "quantized (e.g. compressed-tensors NVFP4 checkpoints, whose "
-            "unquantized-head guard predates this deployment). The dense-logit"
-            " fallback (quant_method.apply over the full vocabulary) produces "
-            "the candidates instead of the QPN8 fast path. Opt-in because "
-            "draft acceptance may differ from the unquantized baseline; "
-            "quality gates must follow before broad rollout."
+            "Compatibility alias for "
+            "speculative_config.sm70_dflash2.quant_lm_head. Unset selects "
+            "the model-qualified per-engine policy; operator guards still "
+            "decide dispatch. Prefer configuration when overriding; this "
+            "alias expires after one full released compatibility cycle."
         ),
-        category="experimental",
+        category="deprecated",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "False at the standalone compatibility getter. Determined once "
+            "by speculative_config.sm70_dflash2.quant_lm_head; the "
+            "standalone compatibility getter retains its declared default."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_dflash2_verifier_defaults sets "
-                "'1' when env_name not in os.environ; automatic defaults apply "
-                "only when the environment override is absent."
+                "The retained complete-model qualification is defined in "
+                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
+                "per-operator shape/dtype/native checks remain local."
             ),
         ),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("DFlash2 verifier: quant_lm_head",),
         user_visible=False,
     ),
     # Default-on SGLang-style push collective for the validated FP16 80-KiB

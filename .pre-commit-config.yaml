@@ -271,7 +271,7 @@ repos:
     language: python
     additional_dependencies: [regex]
   - id: check-sm70-linear-policy
-    name: Keep migrated SM70 linear policy in configuration
+    name: Keep migrated SM70 policy in configuration
     entry: python tools/pre_commit/check_sm70_linear_policy.py
     language: python
     pass_filenames: false

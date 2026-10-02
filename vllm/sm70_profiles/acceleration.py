@@ -187,7 +187,20 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         ("dflash2_verifier", _SM70_DFLASH2_VERIFIER_DEFAULTS, _dflash_reason(cfg)),
         ("batch_gemm", _SM70_BATCH_GEMM_DEFAULTS, None),
     ):
-        values = _switches(defaults)
+        if name == "dflash2_verifier":
+            from vllm.config.sm70_dflash2 import (
+                SM70_DFLASH2_LEGACY_FIELDS,
+                capture_sm70_dflash2_config,
+                sm70_dflash2_enabled,
+            )
+
+            policy = capture_sm70_dflash2_config(cfg)
+            values = {
+                alias: sm70_dflash2_enabled(field, policy)
+                for alias, field in SM70_DFLASH2_LEGACY_FIELDS.items()
+            }
+        else:
+            values = _switches(defaults)
         paths[name] = _row(
             reason or (None if _switches_match(values, defaults) else "user_override"),
             switches=values,

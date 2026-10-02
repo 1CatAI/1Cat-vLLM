@@ -15,6 +15,10 @@ from vllm.sm70_profiles import acceleration as acc
 @pytest.fixture
 def config(monkeypatch):
     envs.disable_envs_cache()
+    # Other operator tests may monkeypatch a dynamic env attribute. Remove
+    # their restored concrete values so this fixture exercises actual getters.
+    for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
+        monkeypatch.delitem(vars(envs), name, raising=False)
     for name, value in {
         **_SM70_BATCH_GEMM_DEFAULTS,
         **_SM70_DFLASH2_VERIFIER_DEFAULTS,

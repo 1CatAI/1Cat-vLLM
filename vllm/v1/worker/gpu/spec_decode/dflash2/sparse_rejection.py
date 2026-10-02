@@ -12,6 +12,9 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.config.sm70_dflash2 import (
+    sm70_dflash2_enabled,
+)
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
@@ -402,7 +405,9 @@ def try_dflash2_sparse_target_rejection(
     grammar_output: GrammarOutput | None,
 ) -> SamplerOutput | DFlash2LogitsFallback | None:
     """Sample compact supports or retain computed logits for exact fallback."""
-    if not envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION:
+    if not sm70_dflash2_enabled(
+        "sparse_target_rejection", getattr(speculator, "_sm70_dflash2_policy", None)
+    ):
         return None
     if not isinstance(speculator, DFlash2Speculator):
         return None

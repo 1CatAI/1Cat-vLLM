@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Record real serialized FP8 prepare/apply dispatch using meta/native doubles."""
 
+import ast
 import hashlib
 import importlib.util
 import itertools
@@ -62,6 +63,38 @@ def load_baseline(ref, directory):
         for name, value in vars(kernel_module).items():
             if name in vars(module) and callable(value):
                 setattr(module, name, value)
+    config_source = subprocess.check_output(
+        ["git", "show", f"{ref}:vllm/config/vllm.py"], text=True
+    )
+    old_defaults = next(
+        (
+            node.value
+            for node in ast.parse(config_source).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_SM70_DFLASH2_VERIFIER_DEFAULTS"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Dict)
+        ),
+        None,
+    )
+    if old_defaults is None:
+        config_source = subprocess.check_output(
+            ["git", "show", f"{ref}:vllm/config/sm70_dflash2.py"], text=True
+        )
+        old_defaults = next(
+            node.value
+            for node in ast.parse(config_source).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "SM70_DFLASH2_VERIFIER_DEFAULTS"
+                for target in node.targets
+            )
+        )
+    module._snapshot_verifier_defaults = ast.literal_eval(old_defaults)
     return module
 
 
@@ -302,12 +335,19 @@ def snapshot(module=fp8):
         )
         with patch.dict(os.environ, clean, clear=True):
             envs.disable_envs_cache()
-            # The real configuration still provides these compatibility defaults.
             if model == "27b_fp8" and spec == "dflash":
-                from vllm.config.vllm import _apply_sm70_dflash2_verifier_defaults
+                if module is fp8:
+                    from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 
-                _apply_sm70_dflash2_verifier_defaults()
-                envs.disable_envs_cache()
+                    policy = Sm70DFlash2Config()
+                    policy.resolve(qualified=True)
+                    cfg.speculative_config.sm70_dflash2 = policy
+                    cfg.kernel_config.sm70_fp8.qpn8 = policy.target_fp8_qpn8
+                else:
+                    # Replay the actual historical configuration defaults.
+                    for name, value in module._snapshot_verifier_defaults.items():
+                        os.environ.setdefault(name, value)
+                    envs.disable_envs_cache()
             cfg.kernel_config.sm70_fp8.resolve()
             roles = (
                 {role: shape}

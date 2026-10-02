@@ -48961,3 +48961,14 @@ or claiming same-criterion 35B decode parity.
 - Configuration environment writes remain 20; model/TP locks are unchanged in
   this pure cleanup. Default promotions and MTP admission belong to the
   separately validated Flash-Next PR. No GPU speed A/B is needed here.
+
+### DFlash2 verifier policy migration (pending validation)
+
+Per-engine `SpeculativeConfig.sm70_dflash2` replaces the verifier startup ENV
+write and captures decisions through loaded operators and graph capture.
+Retain model quality qualification and parser compatibility. Standard 324 routes
+remain equal; the explicit TP2 combined-copy local-layout edge is the sole
+intentional change. See [design](sm70_dflash2_policy.md) and the checked expected
+change list. GPU copy oracle and focused timing are pending; do not count this
+as a 35B AWQ/FP8 speed baseline. Environment registrations remain 999; public
+SM70 controls 36→31; unchecked reads 0; startup ENV write sites 20→19.

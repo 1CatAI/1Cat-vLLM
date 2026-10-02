@@ -33,3 +33,14 @@ def test_fp8_serialized_loader_and_kernel_cannot_reparse_aliases(tmp_path):
     path = directory / "sm70_fp8.py"
     path.write_text('import os\nx = os.getenv("VLLM_SM70_FP8_QPN8")\n')
     assert len(violations(path)) == 1
+
+
+def test_dflash_verifier_cannot_bypass_its_engine_policy(tmp_path):
+    path = tmp_path / "vllm" / "new_verifier.py"
+    path.parent.mkdir()
+    path.write_text("enabled = envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE\n")
+    assert len(violations(path)) == 1
+    path.write_text('enabled = os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0")\n')
+    assert len(violations(path)) == 1
+    path.write_text('enabled = sm70_dflash2_enabled("context_pipeline", policy)\n')
+    assert not violations(path)
