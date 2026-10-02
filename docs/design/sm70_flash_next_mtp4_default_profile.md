@@ -41,6 +41,10 @@ avoids consuming apparent VRAM headroom before draft loading and graph
 profiling. Users do not need to supply a checkpoint-specific host-size override;
 explicit `VLLM_QWEN4EXP_PLE_HOST_GIB` settings remain supported. A host-memory
 cap can still prevent the requested model/context from fitting and is logged.
+Host-only hybrid placement does not estimate device KV groups while loading
+the table. CSA pages are still provisional at that point; normal cache setup
+resolves their block size and geometry after model loading. Device-based
+placement retains its grouped KV estimate.
 
 Prefix-cache bulk prefill is used when multiple recurrent-state blocks fit in
 the scheduled-token budget. A full-chunk or larger state block keeps dense
