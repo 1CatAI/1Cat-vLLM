@@ -47,13 +47,16 @@ def _is_sm70(cfg: VllmConfig) -> bool:
 
 
 def _native_capabilities(page_size: int) -> dict[str, bool]:
-    # The package import alone does not register the FA2 operators.
+    # Register FA2 operators before probing availability.
     import vllm.vllm_flash_attn._vllm_fa2_C  # noqa: F401
 
-    # The companion package is bundled outside mypy's source package root.
+    # isort: split
+    # Keep the companion import stable with and without extracted build files.
     from flash_attn_v100 import (  # type: ignore[attr-defined]
         flash_attn_grouped_e4m3_fp32_available,
     )
+
+    # isort: split
     from vllm.v1.attention.backends.flash_attn_v100 import (
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
