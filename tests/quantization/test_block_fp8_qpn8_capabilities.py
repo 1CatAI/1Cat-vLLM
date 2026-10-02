@@ -109,16 +109,18 @@ def test_missing_operator_falls_back_with_diagnostic(native_contract, monkeypatc
     cfg = config()
     engine = SimpleNamespace(
         sm70_acceleration_report={},
-        kernel_config=SimpleNamespace(linear_backend="auto"),
+        kernel_config=SimpleNamespace(
+            linear_backend="auto", linear_kernel_selections={}
+        ),
     )
     monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: engine)
     selected = linear.choose_scaled_mm_linear_kernel(
         cfg, linear._POSSIBLE_FP8_BLOCK_KERNELS, compute_capability=70
     )
     assert selected is TurboMindFp8LinearKernel
-    rows = engine.sm70_acceleration_report["linear_kernel_selection"]
+    rows = engine.kernel_config.linear_kernel_selections
     assert len(rows) == 1
-    row = next(iter(rows.values()))
+    row = next(iter(rows.values()))["paths"][QPN8.__name__]
     assert not row["enabled"]
     assert "fp8_qpn8_prefill_sm70_out" in row["reason"]
 
@@ -140,3 +142,14 @@ def test_empty_activation_does_not_launch_native_kernel(monkeypatch):
     )
     assert output.shape == (0, 128)
     assert output.dtype == torch.float16
+
+
+@pytest.mark.parametrize(
+    "field", ["gated_silu", "prefill_prescaled", "prescaled_decode"]
+)
+def test_explicit_existing_variant_keeps_priority(native_contract, field):
+    cfg = config()
+    setattr(cfg.policy, field, True)
+    accepted, reason = QPN8.can_implement(cfg)
+    assert not accepted
+    assert "explicitly configured" in reason
