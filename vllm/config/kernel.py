@@ -246,6 +246,107 @@ class Sm70AwqConfig:
 
 
 @config
+class Sm70Fp8Config:
+    """Per-engine serialized block-FP8 variants; native tuning stays unchanged.
+
+    None preserves the legacy default and override precedence. Resolution is
+    idempotent and never writes process environment. Shared aliases still serve
+    unmigrated online and compressed-tensors FP8 loaders.
+    """
+
+    enabled: bool | None = None
+    """Use TurboMind; auto retains the shared legacy backend preference."""
+    dequant_fallback: bool | None = None
+    """Keep the legacy dense dequantization route available when requested."""
+    qpn8: bool | None = None
+    """Use the retained projection-qualified QPN8 weight layout."""
+    qpn8_pp2_tp4: bool | None = None
+    """Use the measured serialized PP2/TP4 QPN8 pipeline variant."""
+    qpn8_shared_gate: bool | None = None
+    """Enable the measured non-fused shared-expert QPN8 variant."""
+    prescaled_decode: bool | None = None
+    """Use reversible UE8M0 scale shifts in the qualified M1 decode lane."""
+    prescaled_shared_gate: bool | None = None
+    """Allow the qualified shared-expert M1 prescaled variant."""
+    legacy_prefill_fast_selector: bool = Field(default=True, init=False)
+    """Mirror native tuning selection until its host API accepts configuration."""
+    prefill_prescaled: bool | None = None
+    """Prepare the retained exact-8K pre-scaled projection variant."""
+    prefill_exact_dense: bool | None = None
+    """Use the bounded exact-dense prefill workspace."""
+    prefill_visible_dense_mm: bool | None = None
+    """Diagnostic visible dense MM for existing AsyncTP experiments."""
+    legacy_grouped_bmm_decode: bool = Field(default=True, init=False)
+    """Mirror the native shared flag; its host API does not accept config yet."""
+    gated_silu: bool | None = None
+    """Prepare the existing fused gate/up epilogue."""
+    explicit_enables: tuple[str, ...] = Field(default=(), init=False)
+    """Retain the legacy error for an explicit route with missing native ops."""
+    resolved: bool = Field(default=False, init=False)
+    """Whether compatibility values have been frozen for this engine."""
+    force_marlin: bool = Field(default=False, init=False)
+    """Retained legacy backend rollback, resolved alongside enabled."""
+
+    def resolve(self) -> None:
+        from vllm import envs
+
+        if self.resolved:
+            return
+        aliases = {
+            "enabled": "VLLM_SM70_FP8_TURBOMIND",
+            "dequant_fallback": "VLLM_SM70_FP8_DEQUANT_FALLBACK",
+            "qpn8": "VLLM_SM70_FP8_QPN8",
+            "qpn8_pp2_tp4": "VLLM_SM70_FP8_QPN8_PP2_TP4",
+            "qpn8_shared_gate": "VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE",
+            "prescaled_decode": "VLLM_SM70_FP8_PRESCALED_M1_DECODE",
+            "prescaled_shared_gate": "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE",
+            "prefill_prescaled": "VLLM_SM70_FP8_PREFILL_PRESCALED",
+            "prefill_exact_dense": "VLLM_SM70_FP8_PREFILL_EXACT_DENSE",
+            "prefill_visible_dense_mm": "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
+            "gated_silu": "VLLM_SM70_FP8_DENSE_GATED_SILU",
+        }
+        explicit = []
+        generic_is_auto = self.qpn8 is None
+        specific_is_auto = self.qpn8_pp2_tp4 is None
+        generic_override = envs.is_set(aliases["qpn8"])
+        specific_override = envs.is_set(aliases["qpn8_pp2_tp4"])
+        for field, name in aliases.items():
+            if envs.is_set(name):
+                logger.warning_once(
+                    "%s is deprecated for serialized FP8 linear layers; use "
+                    "kernel_config.sm70_fp8.%s. Explicit configuration wins.",
+                    name,
+                    field,
+                )
+            value = getattr(self, field)
+            if value is None:
+                value = getattr(envs, name)
+                if field == "enabled":
+                    value = envs.use_sm70_turbomind(value)
+                setattr(self, field, value)
+                if envs.is_set(name) and value:
+                    explicit.append(field)
+            elif value:
+                explicit.append(field)
+        if specific_is_auto:
+            # An explicit generic rollback wins over a specific legacy enable.
+            if generic_override and not self.qpn8:
+                self.qpn8_pp2_tp4 = False
+            elif (
+                not specific_override
+                and generic_override
+                or not generic_is_auto
+                and not specific_override
+            ):
+                self.qpn8_pp2_tp4 = self.qpn8
+        self.explicit_enables = tuple(explicit)
+        self.force_marlin = envs.force_sm70_marlin()
+        self.legacy_grouped_bmm_decode = envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
+        self.legacy_prefill_fast_selector = envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
+        self.resolved = True
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -305,6 +406,9 @@ class KernelConfig:
     sm70_awq: Sm70AwqConfig = Field(default_factory=Sm70AwqConfig)
     """SM70 dense AWQ policy, resolved per engine."""
 
+    sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
+    """SM70 serialized block-FP8 variant policy, resolved per engine."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -332,6 +436,8 @@ class KernelConfig:
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.
             ignored_factors.add("sm70_awq")
+        if not self.sm70_fp8.resolved:
+            ignored_factors.add("sm70_fp8")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)

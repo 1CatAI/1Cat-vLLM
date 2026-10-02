@@ -2130,6 +2130,10 @@ class VllmConfig:
                         env_name,
                         os.environ[env_name],
                     )
+        if self.model_config is not None and self.model_config.quantization == "fp8":
+            # Resolve after compatibility defaults until the verifier policy migrates.
+            self.kernel_config.sm70_fp8.resolve()
+
         sm70_flash_0dot3_compile_graph = envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         sm70_flash_no_compile_graph = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE

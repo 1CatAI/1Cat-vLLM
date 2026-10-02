@@ -14,6 +14,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_wfp8_a16_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+    _get_sm70_fp8_prefill_exact_dense_workspace,
+    _is_sm70_fp8_qpn8_runtime_contract,
+    _missing_sm70_fp8_qpn8_ops,
+    _try_sm70_fp8_prescaled_decode_scales,
+)
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
@@ -21,12 +27,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     STRATEGY_TO_PARAMETER_TYPE,
     STRATEGY_TO_WEIGHT_QUANT_KEY,
-)
-from vllm.model_executor.layers.quantization.fp8 import (
-    _get_sm70_fp8_prefill_exact_dense_workspace,
-    _is_sm70_fp8_qpn8_runtime_contract,
-    _missing_sm70_fp8_qpn8_ops,
-    _try_sm70_fp8_prescaled_decode_scales,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,

@@ -25,6 +25,25 @@ class VerifyAndUpdateConfig:
         return
 
 
+def sm70_fp8_serialized_pipeline_qualified(vllm_config: "VllmConfig") -> bool:
+    """Retain the measured PP2/TP4 no-spec single-request validation boundary.
+
+    QPN8 and reversible-scale M1 use the same qualification. They do not
+    require this scheduling layout to execute; wider layouts need paired
+    output and concurrent workspace tests before lifting the boundary.
+    """
+    parallel_config = vllm_config.parallel_config
+    scheduler_config = vllm_config.scheduler_config
+    return bool(
+        parallel_config.pipeline_parallel_size == 2
+        and parallel_config.tensor_parallel_size == 4
+        and scheduler_config.max_num_seqs == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
 def sm70_awq_prefill_projection_qualified(prefix: str) -> bool:
     """Retain the measured AWQ exact-dense projection roles.
 

@@ -163,6 +163,10 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+    Sm70Fp8LinearLayerConfig,
+    TurboMindFp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     TritonFp8BlockScaledMMKernel,
     TritonInt8ScaledMMLinearKernel,
@@ -193,6 +197,7 @@ def _get_linear_backend() -> str:
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
         TurboMindAwqLinearKernel,
+        TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
         TurboMindNvFp4LinearKernel,
@@ -313,6 +318,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        TurboMindFp8LinearKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
         CutlassFp8BlockScaledMMKernel,
@@ -434,6 +440,10 @@ _KernelConfigT = TypeVar(
 def is_supported_and_can_implement_kernel(
     kernel: type[_KernelT], config: _KernelConfigT, compute_capability: int | None
 ) -> tuple[bool, str]:
+    if isinstance(config, Sm70Fp8LinearLayerConfig) and not issubclass(
+        kernel, TurboMindFp8LinearKernel
+    ):
+        return False, f"{kernel.__name__} does not consume the SM70 W8A16 layout"
     if kernel.__name__ in envs.VLLM_DISABLED_KERNELS:
         return False, f" {kernel.__name__} is disabled by environment variable"
 
@@ -530,6 +540,41 @@ def choose_scaled_mm_linear_kernel(
     raise ValueError(
         "Failed to find a kernel that can implement the "
         "ScaledMM linear layer. Reasons: \n" + "\n".join(failure_reason_list)
+    )
+
+
+def init_sm70_fp8_linear_kernel(
+    activation_quant_key: QuantKey,
+    weight_quant_key: QuantKey,
+    input_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    weight_shape: tuple[int, int],
+    is_scale_e8m0: bool,
+) -> TurboMindFp8LinearKernel:
+    from vllm.config import get_current_vllm_config
+
+    config = Sm70Fp8LinearLayerConfig(
+        weight_quant_key=weight_quant_key,
+        activation_quant_key=activation_quant_key,
+        input_dtype=input_dtype,
+        out_dtype=out_dtype,
+        weight_shape=weight_shape,
+        is_scale_e8m0=is_scale_e8m0,
+        policy=get_current_vllm_config().kernel_config.sm70_fp8,
+    )
+    kernel_type = choose_scaled_mm_linear_kernel(
+        config=config,
+        possible_kernels=_POSSIBLE_FP8_BLOCK_KERNELS,
+    )
+    assert issubclass(kernel_type, TurboMindFp8LinearKernel)
+    return kernel_type(
+        config,
+        layer_param_names=[
+            "weight",
+            "weight_scale_inv",
+            "input_scale",
+            "input_scale_ub",
+        ],
     )
 
 

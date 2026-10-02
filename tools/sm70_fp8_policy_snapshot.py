@@ -18,6 +18,7 @@ from unittest.mock import patch
 import torch
 
 from vllm import envs
+from vllm.config.kernel import KernelConfig
 from vllm.model_executor.layers.quantization import fp8
 
 POLICY_NAMES = {
@@ -74,6 +75,7 @@ def snapshot(source=None):
 
     def probe(model, kv, tp, spec, concurrency, budget, overrides):
         config = NS(
+            kernel_config=KernelConfig(),
             model_config=NS(
                 quantization=model.rsplit("_", 1)[-1],
                 is_moe=model.startswith("35b"),

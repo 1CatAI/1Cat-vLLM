@@ -20,3 +20,16 @@ def test_awq_runtime_alias_read_is_rejected(tmp_path):
     path.parent.mkdir()
     path.write_text("x = envs.VLLM_SM70_AWQ_MLP_ENGINE\n")
     assert len(violations(path)) == 1
+
+
+def test_fp8_serialized_loader_and_kernel_cannot_reparse_aliases(tmp_path):
+    directory = tmp_path / "vllm"
+    directory.mkdir()
+    path = directory / "fp8.py"
+    path.write_text("class Fp8LinearMethod:\n    policy = envs.VLLM_SM70_FP8_QPN8\n")
+    assert len(violations(path)) == 1
+    path.write_text("class Fp8Config:\n    admission = envs.VLLM_SM70_FP8_TURBOMIND\n")
+    assert not violations(path)
+    path = directory / "sm70_fp8.py"
+    path.write_text('import os\nx = os.getenv("VLLM_SM70_FP8_QPN8")\n')
+    assert len(violations(path)) == 1
