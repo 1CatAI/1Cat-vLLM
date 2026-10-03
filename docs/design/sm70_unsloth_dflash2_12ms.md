@@ -54,10 +54,28 @@ first. No slow edge requiring a butterfly was observed on this host. At this
 base, `CustomAllreduce.sm70_tp4_all_reduce_gemma_rms_norm` is explicitly
 benchmark-only; its existence does not prove model dispatch.
 
-The specified target and draft are not present at the requested destinations.
-Source-host authentication is pending, so the matching model baseline and
-Torch profile have not run. No numerical or runtime routing change has been
-made, and no model performance result is claimed.
+The original unsloth checkpoint has now been downloaded with ModelScope.
+Its `model.safetensors` is exactly 22568192096 bytes and `model_mtp.safetensors`
+is 849400392 bytes. The header identifies `lm_head.weight` as F8_E4M3,
+shape [248320, 5120], with channel BF16 scales. The existing DFlash2 draft
+is retained. The obsolete checkpoint with a replaced BF16 head was removed
+with explicit authorization.
+
+A fresh SM70 wheel build is running from integration source
+`f90026bf77a382559370d54a3661a21fae634b4c`, using a dedicated Python 3.12
+environment and compiler caches. The matching model baseline and Torch
+profile have not run. No numerical or runtime routing change has been made,
+and no model performance result is claimed.
+
+`benchmarks/analyze_sm70_dflash2_round_trace.py` uses CUDA Graph correlation
+IDs to avoid assigning asynchronously executed kernels by CPU timestamps.
+Its sanity check on the retained original-model trace identifies eleven
+complete rounds, with nine compact and two dense-reference rounds. All eleven
+target and draft graphs match the expected prefix collective followed by two
+collectives per layer: 64 target layers and five draft layers. The analyzer
+retains per-kernel duration, preceding gap, grid, block, stream, and collective
+backend. It leaves layer attribution unassigned when this graph structure
+does not match, rather than inventing layer labels.
 
 ## Next evidence required
 
@@ -96,9 +114,10 @@ reduction, and kernel execution are additional costs. The measured push
 chain establishes a practical sub-10-us candidate on this topology; it does
 not establish the absolute communication lower bound.
 
-1. Recover the original model identities and baseline scripts, copy missing
-   artifacts, and pin the complete runtime contract.
-2. Establish the unprofiled baseline and short Torch profile on this host.
+1. Finish and inspect the source-complete wheel, install it into the owned
+   runtime, and pin the complete runtime contract.
+2. Establish the unprofiled baseline and a Torch profile with at least ten
+   complete rounds on this host.
 3. Measure the production push collective and fused norm at the actual
    verifier shapes; prioritize according to the new profile.
 4. Validate each retained change against the numerical and acceptance gates,
