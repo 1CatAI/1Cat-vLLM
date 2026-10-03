@@ -67,6 +67,51 @@ The second M=1 probe had common graph/host scheduling inflation across routes
 under CPU load and is excluded from the table. The harness now captures eight
 device invocations per replay when output has at most ten million elements,
 and divides elapsed time by that count. Larger outputs retain one invocation
-to bound graph-pool memory. Eager timing is unchanged. Full M sweeps, actual
-grouped expert speed, real IQ4_XS coefficient error and normal-wheel validation
-are pending before model integration.
+to bound graph-pool memory. Eager timing is unchanged. Full IQ4_NL sweeps and actual grouped expert speed appear below. Real
+IQ4_XS coefficient error, TP4 shapes and normal-wheel validation remain pending
+before model integration.
+
+## Full operator measurements
+
+Updated graph timings use the repeated-invocation protocol above. All
+routes for each row share that protocol. Times are microseconds.
+
+### Dense expert projection
+
+| M | GGUF | AWQ | MMVQ | MMQ | DQ + cuBLAS |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 8.93 | 9.73 | 8.31 | unavailable | 20.29 |
+| 2 | 8.88 | 9.87 | 9.12 | unavailable | 20.62 |
+| 4 | 9.76 | 9.96 | 10.52 | unavailable | 20.76 |
+| 8 | 9.52 | 11.04 | 11.72 | 18.80 | 20.98 |
+| 16 | 9.59 | 13.68 | unavailable | 21.00 | 21.33 |
+| 32 | 10.82 | 19.50 | unavailable | 27.04 | 23.29 |
+| 64 | 16.10 | 13.17 | unavailable | unavailable | 33.50 |
+| 128 | 19.13 | 14.66 | unavailable | unavailable | 32.94 |
+| 512 | 42.02 | 31.65 | unavailable | unavailable | 55.61 |
+| 2048 | 118.50 | 105.01 | unavailable | unavailable | 188.31 |
+| 8192 | 484.51 | 433.82 | unavailable | unavailable | 697.45 |
+
+### Grouped projection: four distinct experts
+
+| M | GGUF grouped | AWQ grouped | MoE MMVQ | MoE MMQ | DQ + cuBLAS eager |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 14.59 | 9.63 | 9.17 | unavailable | 98.87 |
+| 2 | 14.94 | 10.30 | 10.30 | unavailable | 137.68 |
+| 4 | 15.61 | 11.12 | 12.38 | unavailable | 213.86 |
+| 8 | 16.94 | 13.50 | 17.02 | 28.08 | 213.86 |
+| 16 | 16.95 | 13.70 | 30.59 | 31.34 | 216.17 |
+| 32 | 17.14 | 13.76 | 58.04 | 40.59 | 217.40 |
+| 64 | 17.95 | 17.47 | 112.82 | 57.38 | 277.09 |
+| 128 | 23.33 | 20.22 | 257.61 | 93.62 | 263.83 |
+| 512 | 56.69 | 47.46 | 1028.52 | 187.10 | 224.56 |
+| 2048 | 118.92 | 109.61 | 4118.55 | 686.00 | 364.80 |
+| 8192 | 497.36 | 449.02 | 16443.95 | 2696.35 | 1163.37 |
+
+Grouped rows are already sorted, with one assigned expert per row.
+Router, sorting and the full MoE FFN are excluded. The reference
+grouped dequantization path requires a host sort and cannot be captured;
+its column therefore uses eager timings. Empty experts occur at small M.
+At M=8192, GGUF grouped is 497.36 us versus AWQ grouped 449.02 us,
+MMQ 2696.35 us and MMVQ 16443.95 us. The remaining AWQ difference and
+real IQ4_XS/TP4 shapes must be evaluated before model connection.

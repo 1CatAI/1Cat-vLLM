@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
 from vllm.transformers_utils.gguf_tensor_reader import (
     GGUFReader,
     dequantize,
+    quant_size,
     quant_type_name,
 )
 
@@ -58,6 +59,34 @@ def prepare_projection(projection):
         projection.bits,
         projection.group_size,
     )
+
+
+def partition_source(source, weight_type, size, rank, axis):
+    canonical = transcode_projection(source, weight_type)
+    reference = dequantize(source, weight_type)
+    if size == 1:
+        if rank != 0:
+            raise ValueError("TP rank outside TP size")
+        return canonical, reference, source, None
+    canonical = canonical.tp_slice(rank, size, axis=axis)
+    span = canonical.codes.shape[axis]
+    selection = [slice(None), slice(None)]
+    selection[axis] = slice(rank * span, (rank + 1) * span)
+    reference = np.ascontiguousarray(reference[tuple(selection)])
+    if axis == 0:
+        return (
+            canonical,
+            reference,
+            np.ascontiguousarray(source[tuple(selection)]),
+            None,
+        )
+    block, byte_size = quant_size(weight_type)
+    if span % block:
+        return canonical, reference, None, "tp_slice_cuts_original_gguf_block"
+    raw = source[
+        :, rank * span // block * byte_size : (rank + 1) * span // block * byte_size
+    ]
+    return canonical, reference, np.ascontiguousarray(raw), None
 
 
 def canonical_dense_call(projection, out, x, weight, stats, k_ld, q_ld):
@@ -177,6 +206,15 @@ def main():
     parser.add_argument("--m", type=int, nargs="+", default=M_VALUES)
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--tp-rank", type=int, default=0)
+    parser.add_argument(
+        "--tp-axis",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Logical [N,K] partition axis",
+    )
     args = parser.parse_args()
     if not native_available():
         raise RuntimeError("Packaged GGUF reference extension is required")
@@ -190,6 +228,7 @@ def main():
         "warmup_ms_per_route": 100,
         "graph": args.cuda_graph,
         "graph_inner_invocations": "8 for outputs <= 10000000 elements; otherwise 1",
+        "tp": {"size": args.tp_size, "rank": args.tp_rank, "axis": args.tp_axis},
         "checkpoint": Path(args.gguf).name,
         "tensor_manifest": [
             {
@@ -207,13 +246,18 @@ def main():
         weight_type = int(tensor.tensor_type)
         array = tensor.data[args.expert] if tensor.data.ndim == 3 else tensor.data
         source = np.array(array, copy=True)
-        canonical = transcode_projection(source, weight_type)
-        reference = dequantize(source, weight_type)
+        canonical, reference, raw_source, native_reason = partition_source(
+            source, weight_type, args.tp_size, args.tp_rank, args.tp_axis
+        )
         rounding = reconstruction_error(canonical, reference)
         n, k = canonical.codes.shape
         weight, stats, meta = prepare_projection(canonical)
         k_ld, q_ld = meta.tolist()
-        packed = pad_weight_tail(torch.from_numpy(source).cuda(), weight_type)
+        packed = (
+            pad_weight_tail(torch.from_numpy(raw_source).cuda(), weight_type)
+            if raw_source is not None
+            else None
+        )
         dense = torch.from_numpy(reference).half().cuda()
         awq = awq_comparator(canonical)
         for m in args.m:
@@ -237,18 +281,23 @@ def main():
                 raise AssertionError(
                     f"{name}, M={m}: GGUF canonical error {error.item()}"
                 )
-            capabilities = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
-                packed, x, weight_type, n
+            capabilities = (
+                torch.ops._C_gguf.ggml_dense_upstream_capabilities(
+                    packed, x, weight_type, n
+                )
+                if packed is not None
+                else 0
             )
             routes = {
                 "turbomind_gguf": tm,
-                "dequant_cublas": partial(
-                    torch.ops._C_gguf.ggml_dense_blas, packed, x, weight_type, n
-                ),
                 "cached_fp16_lower_bound": partial(
                     torch.nn.functional.linear, x, dense
                 ),
             }
+            if packed is not None:
+                routes["dequant_cublas"] = partial(
+                    torch.ops._C_gguf.ggml_dense_blas, packed, x, weight_type, n
+                )
             if awq is not None:
                 routes["turbomind_awq_group128"] = partial(awq, out, x)
             for bit, route in ((4, "mmvq"), (8, "mmq")):
@@ -261,6 +310,7 @@ def main():
                         n,
                     )
             row = {
+                "native_unavailable_reason": native_reason,
                 "tensor": name,
                 "type": quant_type_name(weight_type),
                 "expert": args.expert if tensor.data.ndim == 3 else None,
