@@ -234,7 +234,10 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
-    if native_enabled:
+    # Preserve established routes for existing formats. Packaged upstream
+    # operators are fallbacks for missing formats and explicit benchmark
+    # candidates; TurboMind supplies the primary accelerated GGUF routes.
+    if native_enabled and qweight_type not in DEQUANT_TYPES:
         native_result = native_dense(x, qweight, qweight_type, prefill_min_m)
         if native_result is not None:
             return native_result
@@ -250,7 +253,7 @@ def _fused_mul_mat_gguf(
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
         weight = (
             native_dequantize(qweight, qweight_type, *shape, x.dtype)
-            if native_enabled
+            if native_enabled and qweight_type not in DEQUANT_TYPES
             else None
         )
         if weight is None:

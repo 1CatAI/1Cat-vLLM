@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.model_executor.kernels.gguf import admit_moe_fallback
 from vllm.model_executor.layers.quantization.gguf_native import pad_weight_tail
 from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 
@@ -61,6 +62,13 @@ def test_native_dequant_and_dense_projection_against_cpu(weight_type):
         decoded.cpu(), torch.from_numpy(reference), rtol=1e-6, atol=0
     )
     padded = pad_weight_tail(weight, weight_type)
+    bank = pad_weight_tail(torch.stack((weight, weight)), weight_type)
+    admitted = admit_moe_fallback(bank, weight_type, torch.float16)
+    assert admitted.supports_m(1) and admitted.supports_m(8192)
+    if weight_type in (34, 35):
+        assert admitted.operator == "ggml_moe_grouped_dense"
+        assert not admitted.graph_safe
+        assert admitted.reason == "graph_safe_moe_operator_unavailable"
     for m in (1, 8, 32):
         generator = torch.Generator().manual_seed(20261003 + m)
         x = (torch.randn(m, k, generator=generator) * 0.125).half().cuda()
