@@ -3,12 +3,16 @@
 """Prepare independent GGUF projections with the canonical kernel lifecycle."""
 
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, fields, replace
 
 import numpy as np
 import torch
 from torch.nn import Module, Parameter
 
+from vllm.model_executor.kernels.gguf import (
+    GGUFOperatorCapability,
+    dense_fp16_cache_capabilities,
+)
 from vllm.model_executor.kernels.linear import (
     Sm70GgufAffineConfig,
     Sm70GgufLatticeConfig,
@@ -49,6 +53,10 @@ class GGUFPreparedProjection(Module):
         self.enabled = enabled
         self.prefill_min_m = prefill_min_m
         self.kernel = None
+        self.logical_output_size = weight.shape[0]
+        self.output_padding = 0
+        self.cache_capabilities: tuple[GGUFOperatorCapability, ...] = ()
+        self.register_parameter("fp16_cache", None)
         self.rejection_reason = self._prepare(weight, act_dtype)
         if self.kernel is None:
             self.register_parameter(
@@ -87,15 +95,25 @@ class GGUFPreparedProjection(Module):
         if weight.ndim != 2 or weight.shape[1] % size:
             return "incomplete_source_projection"
         n, k = weight.shape[0], weight.shape[1] // size * block
-        if n % 32:
-            return "local_shape_cuts_canonical_group_or_output_pack"
         try:
             canonical = transcode(weight.detach().cpu().numpy(), self.source_type)
         except ValueError as error:
             return f"canonical_transcode_rejected:{error}"
+        padding = -n % 32
+        if padding:
+            canonical = replace(
+                canonical,
+                **{
+                    field.name: np.pad(
+                        getattr(canonical, field.name), ((0, padding), (0, 0))
+                    )
+                    for field in fields(canonical)
+                    if isinstance(getattr(canonical, field.name), np.ndarray)
+                },
+            )
         config = config_class(
             full_weight_shape=(k, n),
-            partition_weight_shape=(k, n),
+            partition_weight_shape=(k, n + padding),
             weight_type=getattr(scalar_types, f"uint{canonical.bits}"),
             act_type=act_dtype,
             group_size=canonical.group_size,
@@ -129,6 +147,16 @@ class GGUFPreparedProjection(Module):
             config, "codes", "stats", "mins" if config.zero_points else None
         )
         self.kernel.process_weights_after_loading(self)
+        self.output_padding = padding
+        self.cache_capabilities = dense_fp16_cache_capabilities(
+            self.source_type, k, n, act_dtype, self.enabled
+        )
+        if any(c.reason is None for c in self.cache_capabilities):
+            cached = canonical.dequantize()[:n].astype(np.float16)
+            self.register_parameter(
+                "fp16_cache",
+                Parameter(torch.from_numpy(cached).to(weight.device), False),
+            )
         return None
 
     def admission(self):
@@ -141,17 +169,35 @@ class GGUFPreparedProjection(Module):
             result["local_weight_shape"] = list(
                 self.kernel.config.partition_weight_shape
             )
+            result["logical_output_size"] = self.logical_output_size
+            result["zero_padded_output_rows"] = self.output_padding
             result["operators"] = [
                 asdict(c)
-                for c in getattr(
-                    self.kernel, "operator_capabilities", (self.kernel.capability,)
+                for c in (
+                    *getattr(
+                        self.kernel,
+                        "operator_capabilities",
+                        (self.kernel.capability,),
+                    ),
+                    *self.cache_capabilities,
                 )
             ]
         return result
 
     def forward(self, x):
         if self.kernel is not None:
-            return self.kernel.apply_weights(self, x)
+            rows = x.numel() // x.shape[-1]
+            if self.fp16_cache is not None and any(
+                c.reason is None and c.supports_m(rows) for c in self.cache_capabilities
+            ):
+                output = torch.mm(x.reshape(-1, x.shape[-1]), self.fp16_cache.T)
+                return output.reshape(*x.shape[:-1], self.logical_output_size)
+            output = self.kernel.apply_weights(self, x)
+            return (
+                output[..., : self.logical_output_size]
+                if self.output_padding
+                else output
+            )
         # Imported lazily because the GGUF method owns fallback dispatch.
         from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf
 

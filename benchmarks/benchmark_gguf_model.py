@@ -69,12 +69,12 @@ def main():
         max_num_seqs=max(args.widths),
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
+        disable_log_stats=False,
+        language_model_only=True,
         enforce_eager=args.eager,
     )
     if args.model.suffix.lower() == ".gguf":
         config["quantization"] = "gguf"
-    else:
-        config["hf_overrides"] = {"language_model_only": True}
     report = {
         "vllm_version": vllm.__version__,
         "vllm_origin": vllm.__file__,

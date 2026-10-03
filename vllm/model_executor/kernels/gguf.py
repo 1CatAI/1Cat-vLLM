@@ -74,6 +74,36 @@ class GGUFOperatorCapability:
         return m >= self.min_m and (self.max_m is None or m <= self.max_m)
 
 
+def dense_fp16_cache_capabilities(
+    source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Measured small-projection cache; unmeasured M retains packed MMA."""
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (source_type, k, n) != (8, 5120, 12):
+        reason = "small_projection_cache_shape_has_no_calibration"
+    elif (
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        or torch.backends.cuda.matmul.allow_fp16_accumulation
+    ):
+        reason = "requires_fp32_matmul_policy"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            "aten.mm",
+            True,
+            min_m=minimum,
+            max_m=maximum,
+            reason=reason,
+        )
+        for minimum, maximum in ((1, 1), (32, 8192))
+    )
+
+
 # Actual TP4 expert sweeps in docs/design/gguf_turbomind_lattice_decode.md.
 # (source, K, N, experts) -> measured vector intervals. Unknown descriptors
 # retain grouped GEMM. The unmeasured gap is deliberately not interpolated.

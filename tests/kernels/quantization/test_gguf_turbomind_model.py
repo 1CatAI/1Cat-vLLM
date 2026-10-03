@@ -109,7 +109,7 @@ def test_mixed_fused_projection_order_layout_bias_and_startup_report():
     torch.testing.assert_close(captured, actual, rtol=0.003, atol=0.003)
 
 
-def test_preparation_preserves_shared_source_and_reports_output_tail():
+def test_preparation_preserves_shared_source():
     layer, method = linear_method()
     data = torch.from_numpy(source(3)).cuda()
     layer.qweight.materialize(data.shape, device="cuda", dtype=torch.uint8)
@@ -119,6 +119,69 @@ def test_preparation_preserves_shared_source_and_reports_output_tail():
     method.process_weights_after_loading(layer)
     assert layer.qweight is not shared and layer.qweight.numel() == 0
     torch.testing.assert_close(shared, data, rtol=0, atol=0)
-    tail = GGUFPreparedProjection(data[:12], 3, torch.float16, True, 8)
-    assert tail.kernel is None
-    assert tail.rejection_reason == "local_shape_cuts_canonical_group_or_output_pack"
+
+
+@pytest.mark.parametrize("weight_type", [3, 8, 20, 18])
+def test_output_tail_padding_preserves_fp16_rows_and_capture(weight_type):
+    torch._dynamo.reset()
+    data = source(weight_type, n=12)
+    tail = GGUFPreparedProjection(
+        torch.from_numpy(data).cuda(), weight_type, torch.float16, True, 8
+    )
+    assert tail.kernel is not None, tail.admission()
+    assert tail.output_padding == 20
+    assert tail.kernel.config.partition_weight_shape == (512, 32)
+    assert tail.admission()["logical_output_size"] == 12
+    dense = oracle(data, weight_type)
+    x = (torch.randn((8, 512), device="cuda") * 0.125).half()
+    expected = x.float() @ dense.float().T
+    actual = tail(x)
+    assert actual.shape == (8, 12)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.003, atol=0.003)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = tail(x)
+    graph.replay()
+    torch.testing.assert_close(captured, actual, rtol=0, atol=0)
+    compiled = torch.compile(tail, backend="eager", fullgraph=True)
+    torch.testing.assert_close(compiled(x), actual, rtol=0.003, atol=0.003)
+
+
+def test_measured_small_fp16_cache_and_packed_intervals(monkeypatch):
+    from vllm.model_executor.kernels.gguf import dense_fp16_cache_capabilities
+
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", False
+    )
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+    torch._dynamo.reset()
+    data = source(8, n=12, k=5120)
+    projection = GGUFPreparedProjection(
+        torch.from_numpy(data).cuda(), 8, torch.float16, True, 8
+    )
+    assert projection.fp16_cache is not None
+    dense = oracle(data, 8)
+    for m in (1, 8, 32):
+        x = (torch.randn((m, 5120), device="cuda") * 0.125).half()
+        expected = x.float() @ dense.float().T
+        actual = projection(x)
+        torch.testing.assert_close(actual.float(), expected, rtol=0.003, atol=0.003)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = projection(x)
+        graph.replay()
+        torch.testing.assert_close(captured, actual, rtol=0, atol=0)
+        compiled = torch.compile(projection, backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(x), actual, rtol=0.003, atol=0.003)
+    admitted = lambda m: any(c.supports_m(m) for c in projection.cache_capabilities)
+    assert admitted(1) and not admitted(4) and admitted(32) and admitted(8192)
+    assert not admitted(8193)
+    unknown = dense_fp16_cache_capabilities(8, 1024, 4, torch.float16)
+    assert all(
+        c.reason == "small_projection_cache_shape_has_no_calibration" for c in unknown
+    )
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", True
+    )
+    unsafe = dense_fp16_cache_capabilities(8, 5120, 12, torch.float16)
+    assert all(c.reason == "requires_fp32_matmul_policy" for c in unsafe)

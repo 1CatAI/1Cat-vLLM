@@ -9,9 +9,9 @@ packed format as another.
 
 The first model workload is Qwen3.8-27B UD-Q4_K_M with TP4. Its mixed FFN
 weights require affine, LUT4 and lattice preparation. Four FFN projections
-use IQ3_S despite the checkpoint's Q4_K_M name. Small output tails and
-unsupported canonical coefficients retain the packaged fallback and report
-their rejection reason. GDN input layout transforms compose with canonical
+use IQ3_S despite the checkpoint's Q4_K_M name. Output tails zero-pad canonical rows to the converter pack size and crop
+the result back to its logical width. Unsupported canonical coefficients
+retain the packaged fallback and report their rejection reason. GDN input layout transforms compose with canonical
 storage. Embedding and packed-row PLE preparation are separate integration
 scopes. Flash-Next stays TP4.
 
@@ -132,3 +132,43 @@ weight error is 0.00005722/0.00005007. Output relative L2 is approximately
 0.000404. The benchmark core fingerprint is
 `5cd0fa29e533f92644e012c57fe7b439293bf360e8988b8d73d7bbef54839f6a`.
 The complete route sweep precedes model throughput measurement.
+
+## Small projection row packs and FP16 cache
+
+TP4 GDN alpha/beta projections have logical N=12/K=5120. All canonical
+families now pad incomplete N32 row packs with zero coefficients and crop
+outputs to the logical width. Integer/index/sign payloads and real rows are
+unchanged. Mixed projections and source parameter sharing retain their
+existing contracts.
+
+For the real Q8_0 alpha projection, the full M sweep shows an inexpensive
+FP16 weight cache beats padded integer GEMM at M=1 and M>=32, while
+cuBLAS transpose algorithms regress at M=2–16. The framework admits the
+measured descriptor at M=1 and M=32–8192; other M retains packed MMA.
+Unmeasured descriptors report `small_projection_cache_shape_has_no_calibration`.
+Cache admission requires FP16 activations and both FP16 reduced reductions
+and FP16 accumulation disabled, otherwise it reports `requires_fp32_matmul_policy`.
+This uses the normal worker precision policy and adds no environment variable.
+
+Real-weight graph timings (us), V100 32GB/CUDA12.8/Torch2.10, 100 ms warmup
+and 100 iterations, eight calls per replay:
+
+| M | N32 packed MMA | Existing Q8 activation route | Cached FP16 |
+| ---: | ---: | ---: | ---: |
+| 1 | 19.04 | 8.39 | 4.47 |
+| 2 | 19.58 | 8.35 | 76.50 |
+| 4 | 16.87 | 7.28 | 72.53 |
+| 8 | 17.44 | 38.62 | 74.51 |
+| 16 | 19.58 | 39.07 | 76.85 |
+| 32 | 18.10 | 39.88 | 7.59 |
+| 64 | 65.31 | 41.08 | 6.46 |
+| 128 | 111.59 | 43.58 | 7.38 |
+| 512 | 111.41 | 72.61 | 14.34 |
+| 2048 | 105.19 | 185.57 | 43.24 |
+| 8192 | 332.61 | 698.26 | 155.16 |
+
+A K-major cache padded to N16 was also measured: M=2–16 remained slower
+than packed MMA (29–30 us), while larger M changed only modestly. Retain
+one simple N-major FP16 cache. The normalized FP16 and cache output relative
+L2 is about 0.00020–0.00029, versus 0.0047–0.0088 for the existing activation
+quantization route in this sweep. No activation precision is reduced.
