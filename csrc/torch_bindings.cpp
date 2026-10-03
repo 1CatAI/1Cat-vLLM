@@ -181,6 +181,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int bits, int num_experts, int group_size=32) -> ()");
   ops.impl("gguf_affine_grouped_gemm_sm70_out", torch::kCUDA,
            &gguf_affine_grouped_gemm_sm70_out);
+  ops.def(
+      "gguf_affine_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "Tensor stats, int bits, int group_size) -> ()");
+  ops.impl("gguf_affine_dequantize_sm70_out", torch::kCUDA,
+           &gguf_affine_dequantize_sm70_out);
+  ops.def(
+      "gguf_affine_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, Tensor(b!) scratch, int group_size) -> ()");
+  ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
+           &gguf_affine_blas_sm70_out);
   ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul_interleaved", torch::kCUDA, &silu_and_mul_interleaved);
 

@@ -100,6 +100,21 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             "gguf_affine_gemm_sm70_out",
             True,
         )
+        self.operator_capabilities = (
+            self.capability,
+            GGUFOperatorCapability(
+                GGUFDecoderFamily.AFFINE,
+                quant_type_name(self.config.source_type),
+                "gguf_affine_blas_sm70_out",
+                True,
+                min_m=512,
+                reason=(
+                    None
+                    if hasattr(torch.ops._C, "gguf_affine_blas_sm70_out")
+                    else "operator_missing:gguf_affine_blas_sm70_out"
+                ),
+            ),
+        )
         layer._gguf_tm_affine_prepared = True
 
     def apply_weights(self, layer, x, bias=None):
