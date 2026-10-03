@@ -13,16 +13,13 @@ from pathlib import Path
 
 import torch
 
-LIMITS = {
-    "mean_kl": 1e-4,
-    "p99_kl": 1e-3,
-    "max_kl": 1e-2,
-    "top1_agreement": 0.995,
-    "high_margin_top1_agreement": 0.999,
-    "max_logit_error": 0.125,
-    "max_centered_logit_error": 0.125,
-    "p99_row_max_logit_error": 0.03125,
-}
+from benchmarks.qwen38_distribution_probe import (
+    DISTRIBUTION_LIMITS as LIMITS,
+)
+from benchmarks.qwen38_distribution_probe import (
+    distribution_metrics,
+    summarize_distribution,
+)
 
 
 def compare_logits(
@@ -34,81 +31,34 @@ def compare_logits(
         raise ValueError("Need positions, at least two vocabulary items and a chunk")
     if not control.is_floating_point() or not candidate.is_floating_point():
         raise ValueError("Logits must be floating point")
-    if not torch.isfinite(control).all() or not torch.isfinite(candidate).all():
-        raise ValueError("Nonfinite teacher-forcing logits")
-
-    kls, agreements, margins, errors, centered_errors, scales = [], [], [], [], [], []
-    for start in range(0, control.shape[0], chunk_rows):
-        left = control[start : start + chunk_rows].to(device="cpu", dtype=torch.float64)
-        right = candidate[start : start + chunk_rows].to(
-            device="cpu", dtype=torch.float64
-        )
-        log_p = left.log_softmax(dim=-1)
-        log_q = right.log_softmax(dim=-1)
-        # Tiny negative roundoff at an identical distribution is not negative KL.
-        kls.append((log_p.exp() * (log_p - log_q)).sum(-1).clamp_min(0))
-        agreements.append(left.argmax(-1) == right.argmax(-1))
-        top2 = left.topk(2, dim=-1).values
-        margins.append(top2[:, 0] - top2[:, 1])
-        delta = right - left
-        errors.append(delta.abs().amax(-1))
-        centered_errors.append((delta - delta.mean(-1, keepdim=True)).abs().amax(-1))
-        scales.append(left.abs().amax(-1))
-    kl = torch.cat(kls)
-    agree = torch.cat(agreements)
-    margin = torch.cat(margins)
-    error = torch.cat(errors)
-    centered = torch.cat(centered_errors)
-    magnitude = torch.cat(scales)
-    high_margin = margin >= 0.1
-    result = {
-        "positions": control.shape[0],
-        "vocabulary": control.shape[1],
-        "control_dtype": str(control.dtype),
-        "candidate_dtype": str(candidate.dtype),
-        "mean_kl": kl.mean().item(),
-        "p99_kl": kl.quantile(0.99).item(),
-        "max_kl": kl.max().item(),
-        "top1_agreement": agree.double().mean().item(),
-        "top1_disagreements": (~agree).sum().item(),
-        "high_margin_positions": high_margin.sum().item(),
-        "high_margin_top1_agreement": (
-            agree[high_margin].double().mean().item() if high_margin.any() else None
-        ),
-        "max_logit_error": error.max().item(),
-        "max_centered_logit_error": centered.max().item(),
-        "p99_row_max_logit_error": error.quantile(0.99).item(),
-        "max_control_logit_magnitude": magnitude.max().item(),
-        "p99_control_logit_magnitude": magnitude.quantile(0.99).item(),
-        "median_top2_margin": margin.median().item(),
-    }
-    result["segments"] = [
+    # Reuse no-MTP's complete-vocabulary FP64 metric, one row at a time.
+    rows = [distribution_metrics(a.cpu(), b.cpu()) for a, b in zip(control, candidate)]
+    result = summarize_distribution(rows)
+    high_margin = [r for r in rows if r["reference_margin"] >= 0.1]
+    result.update(
         {
-            "start": start,
-            "end": end,
-            "mean_kl": kl[start:end].mean().item(),
-            "max_logit_error": error[start:end].max().item(),
-            "top1_agreement": agree[start:end].double().mean().item(),
+            "positions": control.shape[0],
+            "vocabulary": control.shape[1],
+            "control_dtype": str(control.dtype),
+            "candidate_dtype": str(candidate.dtype),
+            "max_centered_logit_error": result["centered_max_logit_error"],
+            "p99_row_max_logit_error": result["p99_logit_error"],
+            "high_margin_positions": len(high_margin),
+            "high_margin_top1_agreement": (
+                sum(r["top1_agreement"] for r in high_margin) / len(high_margin)
+                if high_margin
+                else None
+            ),
         }
+    )
+    result["segments"] = [
+        {"start": start, "end": end, **summarize_distribution(rows[start:end])}
         for start, end in zip(
-            [0, control.shape[0] // 3, 2 * control.shape[0] // 3],
-            [control.shape[0] // 3, 2 * control.shape[0] // 3, control.shape[0]],
+            [0, len(rows) // 3, 2 * len(rows) // 3],
+            [len(rows) // 3, 2 * len(rows) // 3, len(rows)],
         )
         if end > start
     ]
-    checks = {}
-    for name, limit in LIMITS.items():
-        value = result[name]
-        checks[name] = (
-            None
-            if value is None
-            else value >= limit
-            if name.endswith("agreement")
-            else value <= limit
-        )
-    result["limits"] = LIMITS.copy()
-    result["checks"] = checks
-    result["passed"] = all(value is not False for value in checks.values())
     return result
 
 
@@ -124,11 +74,34 @@ def compare_dumps(control: dict, candidate: dict) -> dict:
         raise ValueError("Alignment metadata must have one item per logit row")
     if control["role"] not in ("target", "draft"):
         raise ValueError("Teacher-forcing role must be target or draft")
-    return {
+    result = {
         "prompt_sha256": control["prompt_sha256"],
         "role": control["role"],
         **compare_logits(control["logits"], candidate["logits"]),
     }
+    if "optimized_token_ids" in candidate:
+        # A fused top1 kernel need not materialize its logits. Check the actual
+        # accelerated decision as well as the diagnostic full-head logits.
+        ids = candidate["optimized_token_ids"]
+        if ids.shape != (rows,) or ids.dtype != torch.int64:
+            raise ValueError("Optimized tokens must be one int64 ID per position")
+        if (ids < 0).any() or (ids >= control["logits"].shape[1]).any():
+            raise ValueError("Optimized token outside the full vocabulary")
+        logits = control["logits"].float()
+        top2 = logits.topk(2, dim=-1).values
+        confident = top2[:, 0] - top2[:, 1] >= 0.1
+        agree = ids == logits.argmax(dim=-1)
+        result["optimized_top1_agreement"] = agree.double().mean().item()
+        result["optimized_high_margin_top1_agreement"] = (
+            agree[confident].double().mean().item() if confident.any() else None
+        )
+        result["checks"]["optimized_top1_agreement"] = (
+            result["optimized_top1_agreement"] >= LIMITS["top1_agreement"]
+        )
+        result["passed"] = all(
+            value is not False for value in result["checks"].values()
+        )
+    return result
 
 
 def main() -> None:

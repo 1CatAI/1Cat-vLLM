@@ -13,9 +13,10 @@ state. This authorization does not admit lower-precision weights, KV, or state.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4`; TP4, one request, four
   V100-SXM2-32GB GPUs. Checkpoint expert quantization remains NVFP4.
 - FP16 activations and main KV, FP16 convolution state and FP32 SSM state.
-  PLE stays in host memory under the normal model memory policy.
+  PLE defaults to disk mmap; only bounded results/control buffers are pinned.
 - Exactly 8192 input tokens, four speculative tokens, greedy draft sampling,
   CUDA graphs enabled. Record actual resolved engine configuration and routes.
+- Service maximum remains 262144 tokens.
 - No user-supplied `VLLM_*` optimization/diagnostic variables, profiler,
   private extension overlay, or per-iteration synchronization. Build/cache
   directories and standard CUDA toolchain selection are infrastructure only.
@@ -37,44 +38,20 @@ The historical 21--23-ms results are useful evidence but are not a fresh
 baseline after the intervening configuration/operator changes. Freeze the
 current default baseline before altering production routes.
 
-## Initial numerical gates
+## Shared numerical acceptance
 
-Use the same fixed prompt tokens, continuation tokens, position IDs and
-checkpoint for control and candidate. Evaluate target and draft separately,
-including decode/verification batch shapes; a prefill-only comparison cannot
-qualify a decode-only kernel. Keep complete-vocabulary logits before sampling
-transforms and precision unchanged. Compute metrics offline in FP64 so the
-metric itself does not conceal small changes. Compare at least 2048 positions
-across math, code, Chinese text and retrieval, including late recurrent state.
-Also repeat a control to establish the ordinary numerical noise floor.
+Use the [shared Flash-Next distribution contract](sm70_qwen38_distribution_acceptance.md)
+and `benchmarks/qwen38_distribution_probe.py` for both no-MTP and MTP. That
+single contract defines the mean/p99/maximum KL, top-1 and raw-logit error
+limits; this document maintains no separate threshold or ULP gate. FP16
+calculation and existing FP32 accumulators/state remain unchanged.
 
-| Metric | Initial admission limit |
-| --- | ---: |
-| Mean forward KL from control to candidate, natural logarithms | <=1e-4 |
-| P99 per-position KL | <=1e-3 |
-| Maximum per-position KL | <=1e-2 |
-| Top-1 token agreement | >=99.5% |
-| Top-1 agreement where control top-two margin >=0.1 | >=99.9% |
-| Maximum absolute raw logit error | <=0.125 |
-| Maximum logit error after removing each row's common offset | <=0.125 |
-| P99 of per-position maximum absolute raw logit error | <=0.03125 |
-| Nonfinite logits/state or invalid snapshot writes | Zero |
-
-These are engineering starting limits, frozen before candidate results, not
-universal model-quality constants. Pinsker's inequality gives total variation
-<=sqrt(KL/2): KL 1e-4 permits at most about 0.707% probability-mass movement
-per position at that divergence; mean KL bounds mean total variation through
-concavity, not every individual position. P99/max gates bound the tail.
-FP16 spacing at magnitude 16 is 0.015625, so 0.03125 and 0.125 correspond to
-two and eight ULP there. Actual logit magnitudes, ULP errors and common shifts
-must be recorded; this scale explanation does not excuse passing large errors
-at smaller magnitudes. High-margin top-1 agreement protects confident choices
-while permitting limited changes at near ties. Report margin distributions.
-
-Report errors by prompt and early/middle/late position segments to expose
-recurrent drift. Passing aggregate limits cannot override a NaN, corrupted
-state, unexplained growing tail, or a failed behavioral gate. Any threshold
-revision needs a recorded rationale independent of making a candidate pass.
+Compare complete valid-vocabulary logits on identical frozen teacher-forcing
+prefixes, separately for target and draft. Repeat the default arm to establish
+noise. MTP's alignment adapter reuses the shared row metrics, summarization
+and thresholds; it also checks actual accelerated top-1 decisions. Raw and
+centered error, tail values and high-margin agreement remain visible as
+diagnostics. No forced/capture request qualifies latency or natural acceptance.
 
 ## Behavioral and acceptance gates
 
@@ -105,19 +82,24 @@ sampling/handoff 0.781 ms and preparation 0.652 ms. These numbers belong to
 their original source/runtime and are planning evidence only. Reaching 15 ms
 requires several milliseconds, not a sum of unverified microbenchmark savings.
 
-BV16 GDN is reopened for numerical and timing screening. It previously
-changed a handful of FP16 outputs and many low FP32 state bits through LLVM
-FMA contraction; the old harness stopped before timing because of bit checks.
-Retest the ordinary unpinned arithmetic, including changing acceptance and
-state snapshots. The separately pinned exact BV8/BV16 versions saved only
-about 0.05 ms per 36-layer chain; do not assume the reopened candidate is a
-large full-model speedup.
+The owner-approved implementation order is:
 
-Inspect HC projection/mix fusion, MoE dispatch/materialization and four-step
-draft execution next. Keep the target verifier on batch decode. An optimization
-that merely changes acceptance or shrinks the speculative width does not
-qualify the requested MTP4 latency. Candidate selection belongs in normal
-capability/configuration dispatch; final users must not set tuning variables.
+1. M5 TP4 HC down/inject and up/mix sharding, using the existing FP32-partial
+   fused operator. The logical weight-traffic saving is approximately 1 GB
+   per rank per target round; verify actual dispatch and complete-round gain.
+2. A resident MoE kernel spanning grouping, W13/SwiGLU, W2 and weighted
+   reduction, preserving every selected expert and FP16 arithmetic boundaries.
+3. A reduced draft vocabulary with LM-head work overlapped with drafting,
+   measuring coverage and acceptance separately from target distributions.
+4. Adaptive draft length with actual proposal-width histograms and emitted-token
+   speed, alongside a fixed MTP4 control. Shorter rounds are not relabeled as
+   four-draft verifier measurements.
+
+Reuse PR #831's bounded mapped result staging on disk-backed PLE and prefetch
+future draft positions without publishing speculative results as committed
+rows. Request identity, ngram history, rejection and cancellation remain
+correctness constraints. BV16 and four-warp micro-optimizations are closed;
+retain their negative/small results without repeating them.
 
 ## Worklog
 
@@ -238,3 +220,37 @@ capability/configuration dispatch; final users must not set tuning variables.
   `qwen38-nomtp-20261003` worktree. Preserve that task and wait for its existing
   common TP4 lease before launching this campaign. No current default
   complete-round measurement has passed admission yet.
+
+- Add a default-admitted draft local-argmax candidate for FP16 Qwen4Exp MTP
+  on SM70/TP4, greedy and serial drafts only. An explicit true/false remains
+  authoritative; probabilistic and other model/hardware routes keep full
+  logits. Both legacy and V2 proposers consume the resolved normal config.
+  Existing native LM-head kernels and padded-vocabulary reduction are reused.
+  Candidate selection and graph hash are source-complete, without a new
+  environment variable. Together with HC admission, 49 CPU route tests pass.
+- A fused top1 kernel does not materialize its full logits. The diagnostic
+  records its actual selected token separately and compares it with control
+  full-head top1, using the same overall/high-margin thresholds. Identical
+  diagnostic logits alone cannot qualify a changed accelerated decision.
+  Model numerical, speed, quality and acceptance results remain pending.
+
+- Owner steering on 2026-10-03 supersedes the initial ULP-based thresholds:
+  use the no-MTP distribution document/tool as the sole authority. PLE remains
+  disk mmap by default, reusing PR #831's bounded mapped result transport.
+  The waiting memory-PLE launcher was stopped before it acquired GPUs; no
+  foreign process was stopped. Retain exact pinned allocation for optional
+  resident tables without making whole-table pinning the default.
+- Stop BV16 and four-warp projection work. Prioritize M5 TP4 HC sharding,
+  persistent MoE, reduced draft vocabulary/head overlap and adaptive draft
+  length. Draft width changes need their own speed/acceptance comparison;
+  retain fixed MTP4 complete-round reporting to prevent denominator changes
+  from hiding verifier latency. Extract the HC/argmax admission fixes for
+  the separately authorized main merge while the structural campaign stays
+  draft. PR #831 remains a pending dependency, not a claim of MTP admission.
+
+- Initial shared numerical-tool checks pass 17 cases. Disk default/late IPC
+  initialization passes its focused test. Mapped publication/PLE lifecycle
+  checks pass 39 cases with one skip; one distributed-initialization test
+  fails only under an intentionally empty CUDA-visible GPU set (world-size
+  validation), and is retained rather than counted as a pass. M5/M10 delayed
+  producer graph cases are added; their GPU execution remains pending.

@@ -197,9 +197,7 @@ class PleOffloadConnector:
                 region = None
                 reason = None
                 if mode != "cuda":
-                    if vllm_config.speculative_config is not None:
-                        reason = "speculative_transport_not_qualified"
-                    elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+                    if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
                         reason = "hybrid_local_decode"
                     else:
                         try:
