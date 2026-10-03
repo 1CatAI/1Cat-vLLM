@@ -3636,7 +3636,7 @@ void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                   static_cast<int>(m), static_cast<int>(n),
                                   static_cast<int>(out.stride(0))};
   turbomind::gemm::Operation operation{};
-  // LUT tables use distinct keys in the existing measured cache.
+  // Decoder families use distinct keys in the measured cache.
   // An uncached graph descriptor falls back without measuring in capture.
   operation.dispatch = select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream,
@@ -3711,6 +3711,240 @@ void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
       layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
       out.data_ptr(), d, workspace.workspace, stream);
   TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind grouped GEMM failed");
+}
+
+namespace {
+
+int gguf_lattice_type_index(int type) {
+  switch (type) {
+    case 16:
+      return 0;
+    case 17:
+      return 1;
+    case 18:
+      return 2;
+    case 19:
+      return 3;
+    case 21:
+      return 4;
+    case 22:
+      return 5;
+    case 29:
+      return 6;
+  }
+  TORCH_CHECK(false, "GGUF lattice codebook is unsupported");
+}
+auto gguf_lattice_quant_type(int type) {
+  return static_cast<turbomind::gemm::QuantType>(8 +
+                                                 gguf_lattice_type_index(type));
+}
+bool gguf_lattice_group_supported(int type, int group) {
+  return group == ((type == 17 || type == 22 || type == 29) ? 16 : 32);
+}
+auto gguf_lattice_stat_type(int type) {
+  return type == 18 || type == 21   ? turbomind::kUint64
+         : type == 19 || type == 29 ? turbomind::kUint16
+                                    : turbomind::kUint32;
+}
+auto gguf_lattice_torch_stat_type(int type) {
+  return type == 18 || type == 21   ? torch::kInt64
+         : type == 19 || type == 29 ? torch::kInt16
+                                    : torch::kInt32;
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_lattice_layouts(
+    int n, int k, int source_type, int group_size) {
+  const auto converters =
+      turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF lattice converters unavailable");
+  turbomind::gemm::MatrixLayout w{turbomind::kUint2, converters[0]->order, n, k,
+                                  k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{gguf_lattice_stat_type(source_type),
+                                  converters[1]->order, n, k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is unsupported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device(),
+              "GGUF lattice tensors must share a CUDA device");
+  TORCH_CHECK(
+      codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+          scales.scalar_type() == gguf_lattice_torch_stat_type(source_type) &&
+          scales.dim() == 2,
+      "GGUF lattice expects uint8 codes [N,K], packed metadata [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(
+      n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+          scales.size(0) == n && scales.size(1) == k / group_size &&
+          n <= INT_MAX && k <= INT_MAX,
+      "GGUF lattice requires complete canonical groups and group-32 N packing");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF lattice requires SM70");
+  TORCH_CHECK((codes < 4).all().item<bool>(),
+              "GGUF lattice code exceeds a two-bit carrier");
+  const auto converters =
+      turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = codes.to(torch::kInt16).contiguous();
+  auto weight = torch::empty({k, n / 16}, codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF lattice weight conversion failed");
+  auto coefficients = scales.transpose(0, 1).contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats = torch::empty(
+      {k / group_size, n},
+      codes.options().dtype(gguf_lattice_torch_stat_type(source_type)));
+  TORCH_CHECK(converters[1]->Convert(coefficients.data_ptr(), source_s,
+                                     stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF lattice scale conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF lattice GEMM tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          weight.scalar_type() == torch::kInt32 &&
+          stats.scalar_type() == gguf_lattice_torch_stat_type(source_type) &&
+          input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
+          stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
+          weight.is_contiguous() && stats.is_contiguous(),
+      "GGUF lattice GEMM requires FP16 matrices and prepared U2 carriers "
+      "and packed metadata");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n / 16 && stats.size(0) == k / group_size &&
+                  stats.size(1) == n,
+              "GGUF lattice GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF lattice GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Decoder families use distinct keys in the measured cache.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(source_type)), true,
+      false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lattice_quant_type(source_type),
+                       static_cast<int>(group_size)};
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF lattice TurboMind GEMM failed");
+}
+
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped lattice tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          offsets.scalar_type() == torch::kInt32 &&
+          weight_ptrs.scalar_type() == torch::kUInt8 &&
+          stats_ptrs.scalar_type() == torch::kUInt8 && input.dim() == 2 &&
+          out.dim() == 2 && input.is_contiguous() && out.is_contiguous() &&
+          offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
+          stats_ptrs.is_contiguous(),
+      "GGUF grouped lattice requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped lattice descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lattice_quant_type(source_type),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF lattice TurboMind grouped GEMM failed");
 }
 
 std::vector<torch::Tensor> awq_sm70_prepare_impl(
@@ -6723,6 +6957,31 @@ void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                      int64_t num_experts, int64_t group_size) {
   vllm::awq_sm70::gguf_lut4_grouped_gemm_sm70_out(
       out, input, offsets, weight_ptrs, stats_ptrs, lut_id, num_experts,
+      group_size);
+}
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size) {
+  return vllm::awq_sm70::gguf_lattice_sm70_prepare(codes, scales, source_type,
+                                                   group_size);
+}
+
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size) {
+  vllm::awq_sm70::gguf_lattice_gemm_sm70_out(
+      out, input, weight, stats, source_type, k_ld, q_ld, group_size);
+}
+
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size) {
+  vllm::awq_sm70::gguf_lattice_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, source_type, num_experts,
       group_size);
 }
 

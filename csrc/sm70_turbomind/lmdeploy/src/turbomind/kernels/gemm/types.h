@@ -121,6 +121,13 @@ inline const char* to_string(QuantType q) {
       return "lut4e2m1";
     case QuantType::kCenteredBitPlane3:
       return "centeredbitplane3";
+    case QuantType::kLatticeIQ2XXS: return "lattice_iq2_xxs";
+    case QuantType::kLatticeIQ2XS: return "lattice_iq2_xs";
+    case QuantType::kLatticeIQ3XXS: return "lattice_iq3_xxs";
+    case QuantType::kLatticeIQ1S: return "lattice_iq1_s";
+    case QuantType::kLatticeIQ3S: return "lattice_iq3_s";
+    case QuantType::kLatticeIQ2S: return "lattice_iq2_s";
+    case QuantType::kLatticeIQ1M: return "lattice_iq1_m";
     default:
       return "unknown";
   }

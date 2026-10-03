@@ -38,6 +38,14 @@ class LatticeGGUFProjection:
     def shape(self):
         return self.indices.shape[0], self.indices.shape[1] * self.grid_width
 
+    @property
+    def bits(self):
+        return 2  # Physical operand width; signs/indices also occupy metadata.
+
+    @property
+    def codes(self):
+        return self.mma884_storage()[0]
+
     def dequantize(self) -> np.ndarray:
         values = lattice_grid(self.source_type)[self.indices].reshape(self.shape)
         if self.source_type in (19, 29):

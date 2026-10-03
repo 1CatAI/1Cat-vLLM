@@ -12,11 +12,11 @@ from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
 
-def source(weight_type, scale, n=3, k=768):
+def source(weight_type, scale, n=3, k=768, seed=None):
     block, size = quant_size(weight_type)
-    data = np.random.default_rng(20261003 + weight_type).integers(
-        0, 256, (n * k // block, size), dtype=np.uint8
-    )
+    data = np.random.default_rng(
+        seed if seed is not None else 20261003 + weight_type
+    ).integers(0, 256, (n * k // block, size), dtype=np.uint8)
     half = np.array([scale], dtype="<f2")
     if weight_type == 29:
         bits = half.view("<u2")[0]
