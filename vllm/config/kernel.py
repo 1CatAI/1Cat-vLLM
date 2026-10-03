@@ -470,6 +470,9 @@ class KernelConfig:
     sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
     """SM70 sparse attention policy; admission uses actual tensor capabilities."""
 
+    fused_fp16_aux_gemv: bool = True
+    """Fuse compatible auxiliary projections already using exact FP16 GEMV."""
+
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
