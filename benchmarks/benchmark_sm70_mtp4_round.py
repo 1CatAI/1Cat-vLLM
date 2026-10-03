@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--startup-diagnostics", action="store_true")
     args = parser.parse_args()
     # Importing vLLM applies platform defaults. Audit first to distinguish
     # those framework defaults from user-supplied performance variables.
@@ -106,6 +107,8 @@ def main() -> None:
             "draft_sample_method": "greedy",
         },
     }
+    if args.startup_diagnostics:
+        engine["worker_cls"] = "benchmarks.sm70_startup_worker.StartupStackWorker"
     report = {
         "source": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -115,6 +118,7 @@ def main() -> None:
         "fixtures": fixtures,
         "cases": [],
         "complete": False,
+        "startup_diagnostics": args.startup_diagnostics,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
