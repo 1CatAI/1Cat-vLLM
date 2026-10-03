@@ -7,8 +7,10 @@ from dataclasses import dataclass
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import sm70_turbomind as tm
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
@@ -21,6 +23,8 @@ from .scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
     ScaledMMLinearKernel,
 )
+
+logger = init_logger(__name__)
 
 
 def _turing_supported(compute_capability=None):
@@ -81,6 +85,19 @@ class TuringQpn2NvFp4LinearKernel(NvFp4LinearKernel):
 
     def process_weights_after_loading(self, layer):
         tm.prepare_nvfp4_qpn2_dense_linear(layer)
+        policy = get_current_vllm_config().kernel_config.sm70_nvfp4
+        layer.sm70_nvfp4_qpn2_activation_pack = policy.activation_pack
+        if not policy.activation_pack:
+            logger.info_once("QPN2 activation packing disabled by KernelConfig.")
+        elif not sm70_ops.has_qpn2_activation_pack("nvfp4_qpn2_gemm_sm70_out"):
+            logger.info_once(
+                "QPN2 activation packing unavailable: rebuild the native extension."
+            )
+        else:
+            logger.info_once(
+                "QPN2 activation packing admitted for aligned FP16 tensors; "
+                "small row counts retain the direct path."
+            )
         layer.weight = Parameter(layer.weight.new_empty(0), requires_grad=False)
         layer.weight_scale = Parameter(
             layer.weight_scale.new_empty(0), requires_grad=False
