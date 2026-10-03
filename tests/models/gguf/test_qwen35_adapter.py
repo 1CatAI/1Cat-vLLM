@@ -168,3 +168,46 @@ def test_mixed_float_and_quantized_projections_keep_logical_order(monkeypatch):
     expected = torch.cat([x @ gate.T, x @ up.half().T], dim=-1)
     assert torch.equal(method.apply(layer, x), expected)
     assert calls == [1, 2]
+
+
+def test_inverse_a_log_keeps_the_model_fp32_parameter_contract():
+    import gguf
+    import numpy as np
+
+    tensor = SimpleNamespace(
+        tensor_type=gguf.GGMLQuantizationType.F32,
+        data=-np.exp(np.linspace(-3, 2, 16, dtype=np.float32)),
+    )
+    adapter = Qwen35Adapter(config())
+    name = "model.layers.0.linear_attn.A_log"
+    weights = dict(adapter.weights({"a": tensor}, {"a": name}, torch.float16))
+    expected = adapter.restore(name, torch.from_numpy(tensor.data))
+    assert weights[name].dtype == torch.float32
+    torch.testing.assert_close(weights[name], expected, rtol=0, atol=0)
+
+
+def test_text_model_supplies_three_identical_mrope_position_axes():
+    from vllm.model_executor.models.interfaces import supports_mrope
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM
+
+    model = object.__new__(Qwen3_5ForCausalLM)
+    torch.nn.Module.__init__(model)
+    assert supports_mrope(model)
+    positions, delta = model.get_mrope_input_positions([1, 2, 3, 4], [])
+    assert positions.shape == (3, 4)
+    assert positions.device.type == "cpu" and delta == 0
+    assert torch.equal(positions, torch.arange(4).expand(3, -1))
+
+
+def test_bf16_overflow_is_detected_even_with_an_existing_nan():
+    import gguf
+
+    source = torch.tensor([1e10, float("nan")], dtype=torch.bfloat16)
+    tensor = SimpleNamespace(
+        tensor_type=gguf.GGMLQuantizationType.BF16,
+        data=source.view(torch.uint16).numpy(),
+    )
+    adapter = Qwen35Adapter(config())
+    name = "model.layers.0.input_layernorm.weight"
+    with pytest.raises(ValueError, match="overflow"):
+        list(adapter.weights({"norm": tensor}, {"norm": name}, torch.float16))

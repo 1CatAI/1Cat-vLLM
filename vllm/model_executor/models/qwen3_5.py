@@ -67,6 +67,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
@@ -89,6 +90,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -938,6 +940,7 @@ class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
     Qwen3_5HybridState,
+    SupportsMRoPE,
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
@@ -1026,6 +1029,16 @@ class Qwen3_5ForCausalLMBase(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list[MultiModalFeatureSpec],
+    ) -> tuple[torch.Tensor, int]:
+        if mm_features:
+            raise ValueError("The Qwen3.5 text model does not accept multimodal inputs")
+        positions = torch.arange(len(input_tokens), dtype=torch.long, device="cpu")
+        return positions.unsqueeze(0).expand(3, -1), 0
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)

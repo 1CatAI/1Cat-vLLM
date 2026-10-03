@@ -513,7 +513,10 @@ class GGUFLinearMethod(LinearMethodBase):
             if len(dtype) > 1:
                 order = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
                 layer.gguf_shard_weights = torch.nn.ParameterList(
-                    Parameter(data_container[shard_id_map[index]], requires_grad=False)
+                    Parameter(
+                        data_container[shard_id_map[index]].to(device=qweight.device),
+                        requires_grad=False,
+                    )
                     for index in order
                 )
                 layer.gguf_shard_types = tuple(
