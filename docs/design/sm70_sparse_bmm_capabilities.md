@@ -12,10 +12,17 @@ share one paged gather per request. The gather derives its live bound from the
 row lengths on device, so replay masks unallocated graph-bucket tails. Query
 row counts are not limited to a fixed speculative width; gather and score
 storage must fit the existing indexer workspace budget.
+Eager and piecewise calls use their live host key bound. Full-graph serving
+retains the paged indexer: a captured cuBLAS key bucket otherwise performs the
+same dense work when replayed for a much shorter context. The operator itself
+still supports graph capture, including changed row lengths and masked tails.
 
 Sparse decode accepts the packed 448-dimensional E4M3 component plus
-64 BF16 RoPE values, including padded cache blocks. Small head arrays keep
-the paged split-K path. Prefill uses dense FP16 keys with bounded query passes.
+64 BF16 RoPE values, including padded cache blocks. If paged QK-D is already
+enabled, it retains low-workload shapes where its launch overhead is lower. The
+selector uses the paged kernel's number of independent head/key tiles, including
+its optimized head grouping, rather than a fixed head or query count. Prefill
+uses dense FP16 keys with bounded query passes.
 Neither route depends on a model name, tensor-parallel size, concurrency, or
 speculative token count. Runtime layout rejection is logged with its reason;
 startup reporting includes policy, metadata and hardware rejection.

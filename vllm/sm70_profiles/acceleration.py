@@ -387,7 +387,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "status": "runtime_guarded" if sparse_policy.reason is None else "fallback",
         "reason": sparse_policy.reason,
         "configuration": asdict(sparse_policy),
-        "decode_fallback": "paged split-K for fewer than 16 query heads",
+        "decode_fallback": "retain configured paged QK-D for low query/index workloads",
+        "indexer_graph_fallback": "paged indexer for fixed full-graph key buckets",
         "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
     }
     # Configuration policy is resolved once per engine. Actual kernel selection

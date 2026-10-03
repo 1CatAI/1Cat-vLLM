@@ -38,6 +38,68 @@ def test_indexer_block_table_grouping_handles_empty_and_irregular_metadata(
     assert _block_table_rows_per_request(metadata) == expected
 
 
+@pytest.mark.parametrize(
+    "tokens,heads,width,preferred",
+    [
+        (1, 64, 128, False),
+        (3, 32, 128, False),
+        (13, 16, 128, False),
+        (8, 16, 640, False),
+        (3, 64, 128, True),
+        (13, 16, 640, True),
+        (13, 8, 640, True),
+        (3, 32, 640, True),
+    ],
+)
+def test_sparse_decode_retains_paged_route_for_measured_overhead_cases(
+    tokens, heads, width, preferred
+):
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    q = torch.empty((tokens, heads, 512), dtype=torch.float16)
+    with (
+        patch.object(sparse.current_platform, "is_cuda", return_value=True),
+        patch.object(
+            sparse.current_platform, "is_device_capability_family", return_value=True
+        ),
+    ):
+        reason = sparse._bmm_blocker(
+            q, prefill=False, index_width=width, prefer_paged=True
+        )
+    assert (reason is None) is preferred
+
+
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_indexer_uses_live_bounds_and_rejects_fixed_serving_graph_buckets(full_graph):
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v4.sm70 import indexer
+
+    q = torch.empty((3, 8, 128), dtype=torch.float16)
+    cache = torch.empty((2, 64, 132), dtype=torch.uint8)
+    weights = torch.empty((3, 8), dtype=torch.float32)
+    lengths = torch.ones(3, dtype=torch.int32)
+    table = torch.zeros((1, 16), dtype=torch.int32)
+    context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL if full_graph else CUDAGraphMode.NONE
+    )
+    with (
+        patch.object(indexer, "is_forward_context_available", return_value=True),
+        patch.object(indexer, "get_forward_context", return_value=context),
+        patch.object(indexer.current_platform, "is_cuda", return_value=True),
+        patch.object(
+            indexer.current_platform, "is_device_capability_family", return_value=True
+        ),
+    ):
+        reason = indexer._decode_cublas_blocker(
+            q, cache, weights, lengths, table, 1024, True, 1
+        )
+    assert (reason is not None) is full_graph
+    if full_graph:
+        assert "full-graph" in reason
+
+
 def test_sm70_sparse_backend_contract():
     from vllm.models.deepseek_v4.sm70.sparse import (
         DeepseekV4SM70SparseBackend,

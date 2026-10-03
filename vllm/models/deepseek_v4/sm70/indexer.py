@@ -7,7 +7,8 @@ import os
 
 import torch
 
-from vllm.config import get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32,
@@ -811,6 +812,14 @@ def _decode_cublas_blocker(
     table_rows_per_request: int,
 ) -> str | None:
     """The first requirement of `_decode_logits_cublas` this call misses."""
+    if (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+    ):
+        # cuBLAS processes the whole static key bucket. The paged kernel skips
+        # inactive keys on replay, so keep it for graphs whose live length can
+        # be much shorter than the bucket. Eager/piecewise calls use live bounds.
+        return "a live key bound rather than a fixed full-graph bucket"
     total_rows = q.shape[0]
 
     def num_requests() -> int:
