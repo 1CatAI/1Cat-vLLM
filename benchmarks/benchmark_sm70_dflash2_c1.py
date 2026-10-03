@@ -83,6 +83,7 @@ def run(args, text: str, temperature: float, profile: bool = False) -> dict:
         "temp": temperature,
         "profiled_request": profile,
         "input_fixture_length": args.input_len,
+        "request_start_monotonic_s": started,
         "usage": usage,
         "ttft_ms": (events[0][0] - started) * 1000,
         "tok_s": sum(counts) / (steady[-1][0] - steady[0][0]),
