@@ -6,7 +6,7 @@
 #include <cstdint>
 namespace turbomind::gemm {
 template<int Type> struct LatticeCodebook;
-static __device__ const uint8_t lattice_grid_16[] = {
+static __device__ __align__(16) const uint8_t lattice_grid_16[] = {
   136, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 136, 136, 153, 153, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 136,
   171, 171, 136, 136, 136, 136, 136, 136, 153, 136, 153, 136, 136, 136, 136, 136, 136, 153, 153, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136,
   171, 136, 171, 136, 136, 136, 136, 136, 136, 171, 171, 136, 136, 136, 136, 136, 171, 171, 171, 136, 136, 136, 136, 136, 153, 136, 136, 153, 136, 136, 136, 136,
@@ -76,8 +76,11 @@ template<> struct LatticeCodebook<16> {
   static constexpr int kBytes = 2048;
   static constexpr int kWidth = 8;
   __device__ static uint8_t value(int index) { return lattice_grid_16[index]; }
+  __device__ static uint32_t word(int index) {
+    return reinterpret_cast<const uint32_t*>(lattice_grid_16)[index];
+  }
 };
-static __device__ const uint8_t lattice_grid_17[] = {
+static __device__ __align__(16) const uint8_t lattice_grid_17[] = {
   136, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 136, 136, 153, 153, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 136,
   171, 171, 136, 136, 136, 136, 136, 136, 153, 136, 153, 136, 136, 136, 136, 136, 136, 153, 153, 136, 136, 136, 136, 136, 171, 153, 153, 136, 136, 136, 136, 136,
   153, 171, 153, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 171, 136, 171, 136, 136, 136, 136, 136, 153, 153, 171, 136, 136, 136, 136, 136,
@@ -211,8 +214,11 @@ template<> struct LatticeCodebook<17> {
   static constexpr int kBytes = 4096;
   static constexpr int kWidth = 8;
   __device__ static uint8_t value(int index) { return lattice_grid_17[index]; }
+  __device__ static uint32_t word(int index) {
+    return reinterpret_cast<const uint32_t*>(lattice_grid_17)[index];
+  }
 };
-static __device__ const uint8_t lattice_grid_18[] = {
+static __device__ __align__(16) const uint8_t lattice_grid_18[] = {
   132, 132, 132, 132, 148, 132, 132, 132, 164, 132, 132, 132, 140, 140, 132, 132, 156, 140, 132, 132, 190, 140, 132, 132, 132, 148, 132, 132, 148, 148, 132, 132,
   140, 156, 132, 132, 148, 164, 132, 132, 156, 190, 132, 132, 172, 190, 132, 132, 140, 132, 140, 132, 156, 132, 140, 132, 132, 140, 140, 132, 148, 140, 140, 132,
   140, 148, 140, 132, 172, 148, 140, 132, 132, 156, 140, 132, 148, 156, 140, 132, 140, 164, 140, 132, 164, 172, 140, 132, 132, 190, 140, 132, 132, 132, 148, 132,
@@ -250,8 +256,11 @@ template<> struct LatticeCodebook<18> {
   static constexpr int kBytes = 1024;
   static constexpr int kWidth = 4;
   __device__ static uint8_t value(int index) { return lattice_grid_18[index]; }
+  __device__ static uint32_t word(int index) {
+    return reinterpret_cast<const uint32_t*>(lattice_grid_18)[index];
+  }
 };
-static __device__ const uint8_t lattice_grid_19[] = {
+static __device__ __align__(16) const uint8_t lattice_grid_19[] = {
   127, 127, 127, 127, 127, 127, 127, 127, 129, 127, 127, 127, 127, 127, 127, 127, 128, 128, 127, 127, 127, 127, 127, 127, 127, 129, 127, 127, 127, 127, 127, 127,
   129, 129, 127, 127, 127, 127, 127, 127, 128, 127, 128, 127, 127, 127, 127, 127, 128, 128, 128, 127, 127, 127, 127, 127, 127, 127, 129, 127, 127, 127, 127, 127,
   129, 127, 129, 127, 127, 127, 127, 127, 127, 129, 129, 127, 127, 127, 127, 127, 129, 129, 129, 127, 127, 127, 127, 127, 128, 128, 127, 128, 127, 127, 127, 127,
@@ -769,8 +778,11 @@ template<> struct LatticeCodebook<19> {
   static constexpr int kBytes = 16384;
   static constexpr int kWidth = 8;
   __device__ static uint8_t value(int index) { return lattice_grid_19[index]; }
+  __device__ static uint32_t word(int index) {
+    return reinterpret_cast<const uint32_t*>(lattice_grid_19)[index];
+  }
 };
-static __device__ const uint8_t lattice_grid_21[] = {
+static __device__ __align__(16) const uint8_t lattice_grid_21[] = {
   129, 129, 129, 129, 131, 129, 129, 129, 133, 129, 129, 129, 139, 129, 129, 129, 143, 129, 129, 129, 129, 131, 129, 129, 131, 131, 129, 129, 133, 131, 129, 129,
   137, 131, 129, 129, 141, 131, 129, 129, 129, 133, 129, 129, 131, 133, 129, 129, 139, 133, 129, 129, 135, 135, 129, 129, 129, 137, 129, 129, 133, 137, 129, 129,
   139, 137, 129, 129, 143, 137, 129, 129, 131, 139, 129, 129, 135, 139, 129, 129, 129, 141, 129, 129, 133, 141, 129, 129, 131, 143, 129, 129, 137, 143, 129, 129,
@@ -840,8 +852,11 @@ template<> struct LatticeCodebook<21> {
   static constexpr int kBytes = 2048;
   static constexpr int kWidth = 4;
   __device__ static uint8_t value(int index) { return lattice_grid_21[index]; }
+  __device__ static uint32_t word(int index) {
+    return reinterpret_cast<const uint32_t*>(lattice_grid_21)[index];
+  }
 };
-static __device__ const uint8_t lattice_grid_22[] = {
+static __device__ __align__(16) const uint8_t lattice_grid_22[] = {
   136, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 136, 136, 153, 153, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 136,
   171, 171, 136, 136, 136, 136, 136, 136, 153, 136, 153, 136, 136, 136, 136, 136, 136, 153, 153, 136, 136, 136, 136, 136, 171, 153, 153, 136, 136, 136, 136, 136,
   153, 171, 153, 136, 136, 136, 136, 136, 136, 136, 171, 136, 136, 136, 136, 136, 171, 136, 171, 136, 136, 136, 136, 136, 153, 153, 171, 136, 136, 136, 136, 136,
@@ -1103,6 +1118,9 @@ template<> struct LatticeCodebook<22> {
   static constexpr int kBytes = 8192;
   static constexpr int kWidth = 8;
   __device__ static uint8_t value(int index) { return lattice_grid_22[index]; }
+  __device__ static uint32_t word(int index) {
+    return reinterpret_cast<const uint32_t*>(lattice_grid_22)[index];
+  }
 };
 template<> struct LatticeCodebook<29> : LatticeCodebook<19> {};
 }  // namespace turbomind::gemm

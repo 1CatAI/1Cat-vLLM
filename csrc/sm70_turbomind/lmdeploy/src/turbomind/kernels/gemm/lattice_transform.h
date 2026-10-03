@@ -14,8 +14,10 @@ struct Transform_HMMA_SM70_Lattice {
       Type == 16 ? 0 : Type == 17 ? 1 : Type == 18 ? 2 : Type == 19 ? 3 :
       Type == 21 ? 4 : Type == 22 ? 5 : 6));
   __device__ static void initialize(uint8_t* shared) {
-    for (int i = threadIdx.x; i < kCodebookBytes; i += blockDim.x)
-      shared[i] = Codebook::value(i);
+    static_assert(kCodebookBytes % sizeof(uint32_t) == 0);
+    auto* words = reinterpret_cast<uint32_t*>(shared);
+    for (int i = threadIdx.x; i < kCodebookBytes / sizeof(uint32_t); i += blockDim.x)
+      words[i] = Codebook::word(i);
     __syncthreads();
   }
   template<class F, int Nf, int Mf, int K, class D, int Nd, int Md,
