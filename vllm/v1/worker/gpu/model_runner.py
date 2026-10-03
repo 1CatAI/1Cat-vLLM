@@ -467,6 +467,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_ids_source=self.input_buffers.input_ids,
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
+            sampled_keys_supported=self.is_last_pp_rank,
         )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
@@ -1813,6 +1814,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if self._ple_offload_connector is not None and not input_batch.is_dummy_batch:
+            self._ple_offload_connector.publish_sampled_keys(
+                self.req_states.all_token_ids.gpu,
+                input_batch.idx_mapping[: input_batch.num_reqs],
+                input_batch.seq_lens[: input_batch.num_reqs],
+                sampler_output.sampled_token_ids,
+                num_sampled,
+            )
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_sample", mtp_sample_start
         )

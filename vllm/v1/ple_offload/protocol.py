@@ -33,6 +33,8 @@ class PleOffloadRegistration:
     remote_placements: dict[str, Any] = field(default_factory=dict)
     # Mapped consumers own the H2D graph node; no CUDA output IPC is needed.
     cpu_output_buffers: dict[str, torch.Tensor] | None = None
+    sampled_key_payload: torch.Tensor | None = None
+    sampled_key_flag: torch.Tensor | None = None
 
 
 @dataclass

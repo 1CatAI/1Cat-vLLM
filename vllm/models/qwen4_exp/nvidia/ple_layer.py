@@ -1701,6 +1701,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
+    @classmethod
+    def supports_sampled_row_prefetch(cls) -> bool:
+        return True
+
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Transport quantized lookup results as opaque E4M3FN bytes."""
         embedding = getattr(self, "ngram_embedding", None)
