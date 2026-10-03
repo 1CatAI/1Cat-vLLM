@@ -466,10 +466,19 @@ def load_cached_component(
     """
     targets = _targets(module)
     if not targets or any(
-        is_dtensor(t) or t.is_meta or t.device.type != "cpu" for t in targets.values()
+        is_dtensor(t)
+        or t.is_meta
+        or t.device.type != "cpu"
+        or t.layout != torch.strided
+        or t.is_quantized
+        or t.is_nested
+        or t.is_conj()
+        or t.is_neg()
+        for t in targets.values()
     ):
         logger.info(
-            "H3 %s prepared-weight cache skipped: requires CPU weights", component
+            "H3 %s prepared-weight cache skipped: requires plain strided CPU tensors",
+            component,
         )
         load()
         return None

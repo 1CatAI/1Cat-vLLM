@@ -314,3 +314,48 @@ def test_cli_can_disable_the_prepared_cache(mode):
     assert parser.parse_args(
         ["video", mode, "--disable-prepared-weight-cache"]
     ).disable_prepared_weight_cache
+
+
+def test_loading_controls_do_not_change_served_config_fields():
+    from vllm.model_executor.models.minimax_h3.config import H3Config
+    from vllm.video.engine import _reported_config
+
+    enabled = H3Config()
+    disabled = H3Config(prepared_weight_cache=False, prepared_weight_cache_gib=16)
+    assert _reported_config(enabled) == _reported_config(disabled)
+    assert _reported_config(enabled)["model"] == enabled.model
+    assert "prepared_weight_cache" not in _reported_config(enabled)
+    assert "prepared_weight_cache_gib" not in _reported_config(enabled)
+
+
+@pytest.mark.parametrize("kind", ["meta", "sparse", "quantized", "conjugate"])
+def test_unsupported_storage_keeps_the_ordinary_loader(tmp_path, kind):
+    from vllm.model_executor.models.minimax_h3.prepared_weights import (
+        load_cached_component,
+    )
+
+    if kind == "meta":
+        value = torch.empty(3, device="meta")
+    elif kind == "sparse":
+        value = torch.eye(3).to_sparse()
+    elif kind == "quantized":
+        value = torch.quantize_per_tensor(torch.ones(3), 0.1, 0, torch.qint8)
+    else:
+        value = torch.tensor([1 + 2j]).conj()
+    module = nn.Module()
+    module.register_buffer("weight", value)
+    calls = []
+    assert (
+        load_cached_component(
+            module,
+            lambda: calls.append(1),
+            [],
+            root=tmp_path / "cache",
+            component="text_encoder",
+            rank=0,
+            world_size=1,
+        )
+        is None
+    )
+    assert calls == [1]
+    assert not (tmp_path / "cache").exists()
