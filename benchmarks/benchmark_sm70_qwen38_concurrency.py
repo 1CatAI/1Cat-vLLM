@@ -176,6 +176,9 @@ def main():
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
+    parser.add_argument(
+        "--ple-sample-prefetch", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--input-len", type=int, default=8192)
     parser.add_argument("--output-len", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=2)
@@ -232,6 +235,8 @@ def main():
         **config.get("kernel_config", {}),
         "ple_result_transport": args.ple_result_transport,
     }
+    if args.ple_sample_prefetch is not None:
+        config["kernel_config"]["ple_sample_prefetch"] = args.ple_sample_prefetch
     config["max_num_seqs"] = max(widths)
     config["gpu_memory_utilization"] = args.gpu_memory_utilization
     if args.kv_cache_memory_bytes is not None:

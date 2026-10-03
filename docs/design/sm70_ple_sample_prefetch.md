@@ -48,8 +48,9 @@ The CUDA prototype and repository Triton version both had zero wrong keys;
 the latter observed 197 coherent snapshots per rank. Lost snapshots are allowed
 because publication is advisory. Capture streams are explicit per device; the
 first multi-GPU test reused a default stream and captured empty graphs after
-rank zero. That was corrected before taking these results. An expanded M1–16
-oracle is pending.
+rank zero. That was corrected before taking these results. The expanded M1–16
+oracle also passed, with 200 publications and 199 coherent snapshots per rank,
+zero wrong keys.
 
 A normal source-complete wheel has been built. Installed-runtime integration,
 teacher-forcing/task quality and matched C1/C4/C8/C16 timing remain pending.

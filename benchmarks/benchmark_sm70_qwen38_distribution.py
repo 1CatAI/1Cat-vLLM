@@ -113,7 +113,14 @@ def capture(args):
         enable_prefix_caching=False,
         language_model_only=True,
         speculative_config=None,
-        kernel_config={"ple_result_transport": args.transport},
+        kernel_config={
+            "ple_result_transport": args.transport,
+            **(
+                {"ple_sample_prefetch": args.ple_sample_prefetch}
+                if args.ple_sample_prefetch is not None
+                else {}
+            ),
+        },
         worker_extension_cls=(
             "benchmarks.qwen38_distribution_probe.DistributionProbeWorkerExtension"
         ),
@@ -134,6 +141,7 @@ def capture(args):
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
         "transport": args.transport,
+        "sample_prefetch_requested": args.ple_sample_prefetch,
         "widths": widths,
         "repeats": args.repeats,
         "contract": "TP4 FP16 dense/KV, FP32 accum/state, disk mmap, no MTP",
@@ -354,6 +362,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--widths", default="1,4,8,16")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--ple-sample-prefetch", action=argparse.BooleanOptionalAction, default=None
+    )
     parser.add_argument("--prefill-budget", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--kv-cache-memory-bytes", type=int)

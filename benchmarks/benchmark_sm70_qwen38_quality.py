@@ -188,7 +188,14 @@ def run(args):
         language_model_only=True,
         speculative_config=None,
         disable_log_stats=False,
-        kernel_config={"ple_result_transport": args.ple_result_transport},
+        kernel_config={
+            "ple_result_transport": args.ple_result_transport,
+            **(
+                {"ple_sample_prefetch": args.ple_sample_prefetch}
+                if args.ple_sample_prefetch is not None
+                else {}
+            ),
+        },
     )
     try:
         cfg = llm.llm_engine.vllm_config
@@ -285,6 +292,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
+    )
+    parser.add_argument(
+        "--ple-sample-prefetch", action=argparse.BooleanOptionalAction, default=None
     )
     args = parser.parse_args()
     # Resolve defaults in a fresh process, before importing the runtime.
