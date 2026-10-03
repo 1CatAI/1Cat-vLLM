@@ -78,6 +78,18 @@ A focused C1 teacher-forcing comparison checks MBPP-9, a 32K window and English
 before deciding whether byte transport, distribution or sampling needs further
 investigation. It is diagnostic, not a replacement for the full C1 gate.
 
+That focused diagnostic completes 144 teacher-forcing positions (three repeats
+of MBPP-9, a 32K needle window and English). Both forward/reverse KL and maximum
+raw/centered logit error are zero; top-1 agreement is 100%. Default-repeat noise
+is also zero. These particular prefixes show no distribution change.
+
+Isolated MBPP-9 repeats retain its original seed 4207. Both arms pass three
+times, stop naturally at 758 output tokens and produce identical continuations.
+This does not erase the full-suite failure. A prefix reproduction now includes
+the original 8K timing requests and preceding MBPP cases, then repeats MBPP-9.
+The diagnostic modes preserve original case indices/seeds and label their
+reports as diagnostic-only; ordinary suite execution is unchanged.
+
 Teacher-forcing/task quality and matched timing are accepted at C1 only.
 One short C4 end-to-end smoke is required before merging.
 No end-to-end speedup is claimed yet. This change depends on the mapped result

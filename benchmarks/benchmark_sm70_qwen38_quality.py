@@ -133,11 +133,21 @@ def run(args):
     out.mkdir(parents=True, exist_ok=True)
     model = str(args.model)
     suite = json.loads(args.cases.read_text())
+    matching_indices = [
+        index
+        for index, case in enumerate(suite["cases"])
+        if case["id"] == args.diagnostic_case_id
+    ]
+    diagnostic_end = matching_indices[0] if matching_indices else -1
     case_rows = [
         (index, repeat, case)
         for index, case in enumerate(suite["cases"])
-        if args.diagnostic_case_id is None or case["id"] == args.diagnostic_case_id
-        for repeat in range(args.diagnostic_repeats if args.diagnostic_case_id else 1)
+        if args.diagnostic_case_id is None
+        or case["id"] == args.diagnostic_case_id
+        or (args.diagnostic_prefix and index < diagnostic_end)
+        for repeat in range(
+            args.diagnostic_repeats if case["id"] == args.diagnostic_case_id else 1
+        )
     ]
     if not case_rows or args.diagnostic_repeats < 1:
         raise ValueError("Unknown diagnostic case or invalid repeat count")
@@ -219,7 +229,7 @@ def run(args):
             "get_sm70_acceleration_report", timeout=30
         )
         save()
-        if args.diagnostic_case_id is None:
+        if args.diagnostic_case_id is None or args.diagnostic_prefix:
             chunk = tok.encode(
                 "This fixed benchmark prompt is used to create a deterministic "
                 "tokenized input for single-request decode measurement. ",
@@ -314,6 +324,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--diagnostic-case-id")
     parser.add_argument("--diagnostic-repeats", type=int, default=3)
+    parser.add_argument("--diagnostic-prefix", action="store_true")
     args = parser.parse_args()
     # Resolve defaults in a fresh process, before importing the runtime.
     for key in list(os.environ):
