@@ -58,6 +58,10 @@ from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     Sm70AwqLinearLayerConfig,
     TurboMindAwqLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_fp16 import (
+    Sm70Fp16LinearKernel,
+    Sm70Fp16LinearLayerConfig,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
     Sm70GgufAffineConfig,
     TurboMindGgufAffineKernel,
@@ -256,6 +260,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         MarlinMxFp4LinearKernel,
     },
     "triton": {
+        Sm70Fp16LinearKernel,
         TritonInt8ScaledMMLinearKernel,
         TritonFp8BlockScaledMMKernel,
         TritonW4A16LinearKernel,
@@ -383,6 +388,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        Sm70Fp16LinearKernel,
         TurboMindGgufAffineKernel,
         TurboMindGgufLut4Kernel,
         TurboMindGgufLatticeKernel,
@@ -798,7 +804,13 @@ def choose_mp_linear_kernel(
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
 
-    if isinstance(config, Sm70GgufAffineConfig):
+    if isinstance(config, Sm70Fp16LinearLayerConfig):
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, Sm70Fp16LinearKernel)
+        ]
+    elif isinstance(config, Sm70GgufAffineConfig):
         # Canonical GGUF codes and additive coefficients are not GPTQ/AWQ
         # checkpoint packing. Report admission failures rather than reinterpret.
         platform_kernels = [

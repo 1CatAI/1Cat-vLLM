@@ -145,6 +145,7 @@ def run(args):
     report = {
         "complete": False,
         "runtime": vllm.__version__,
+        "disabled_kernels": args.disable_kernel,
         "runtime_path": vllm.__file__,
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
@@ -287,6 +288,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
+    parser.add_argument(
+        "--disable-kernel",
+        action="append",
+        default=[],
+        help="Use the existing disabled-kernel control for matched A/B",
+    )
     args = parser.parse_args()
     # Resolve defaults in a fresh process, before importing the runtime.
     for key in list(os.environ):
@@ -308,6 +315,8 @@ if __name__ == "__main__":
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
         TORCH_EXTENSIONS_DIR=str(cache / "extensions"),
     )
+    if args.disable_kernel:
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(args.disable_kernel)
     with open("/tmp/gpu0-3.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         import subprocess

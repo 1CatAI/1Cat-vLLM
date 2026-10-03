@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -20,6 +21,18 @@ from benchmarks.qwen38_distribution_probe import (
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def valid_vocabulary(tokenizer, model_vocabulary):
+    """Exclude matrix padding using tokenizer IDs, never probability cutoffs."""
+    ids = set(tokenizer.get_vocab().values())
+    if not ids or min(ids) < 0 or max(ids) >= model_vocabulary:
+        raise ValueError("Tokenizer IDs are outside the model vocabulary")
+    if min(ids) != 0 or len(ids) != max(ids) + 1:
+        raise ValueError(
+            "Noncontiguous tokenizer IDs require an explicit valid-ID mask"
+        )
+    return len(ids)
 
 
 def prepare(args):
@@ -81,7 +94,8 @@ def prepare(args):
     model_config = json.loads((args.model / "config.json").read_text())
     text_config = model_config.get("text_config", model_config)
     manifest = {
-        "vocabulary": text_config["vocab_size"],
+        "vocabulary": valid_vocabulary(tokenizer, text_config["vocab_size"]),
+        "model_vocabulary": text_config["vocab_size"],
         "suite_sha256": digest(args.cases),
         "quality_reference_sha256": digest(args.quality_reference),
         "probes": probes,
@@ -91,6 +105,8 @@ def prepare(args):
 
 
 def capture(args):
+    if args.disable_kernel:
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(args.disable_kernel)
     import torch
 
     import vllm
@@ -121,6 +137,8 @@ def capture(args):
         ),
         disable_log_stats=False,
     )
+    if args.worker_cls:
+        engine_config["worker_cls"] = args.worker_cls
     if args.kv_cache_memory_bytes is not None:
         engine_config["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     llm = LLM(**engine_config)
@@ -132,6 +150,7 @@ def capture(args):
         "speed_acceptance": False,
         "manifest_sha256": digest(args.manifest),
         "runtime": vllm.__version__,
+        "disabled_kernels": args.disable_kernel,
         "runtime_path": vllm.__file__,
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
@@ -366,6 +385,13 @@ if __name__ == "__main__":
     parser.add_argument("--prefill-budget", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
+    parser.add_argument(
+        "--disable-kernel",
+        action="append",
+        default=[],
+        help="Use the existing disabled-kernel control for matched A/B",
+    )
+    parser.add_argument("--worker-cls", help="Qualified diagnostic worker class")
     args = parser.parse_args()
     if args.action == "capture":
         while True:

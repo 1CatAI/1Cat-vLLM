@@ -396,6 +396,47 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._prepare_existing_weights(layer)
+        # A method with its own apply keeps its established provider.
+        if type(self).apply is not UnquantizedLinearMethod.apply:
+            return
+        weight = getattr(layer, "weight", None)
+        if not (
+            current_platform.is_device_capability(70)
+            and isinstance(weight, torch.Tensor)
+            and weight.is_cuda
+            and weight.dtype == torch.float16
+            and weight.ndim == 2
+            and weight.is_contiguous()
+            and not getattr(layer, "_sm70_f16_prepared", False)
+        ):
+            return
+        from vllm.model_executor.kernels.linear import choose_mp_linear_kernel
+        from vllm.model_executor.kernels.linear.mixed_precision.sm70_fp16 import (
+            Sm70Fp16LinearLayerConfig,
+        )
+        from vllm.scalar_type import scalar_types
+
+        shape = (weight.shape[1], weight.shape[0])
+        config = Sm70Fp16LinearLayerConfig(
+            full_weight_shape=shape,
+            partition_weight_shape=shape,
+            weight_type=scalar_types.float16,
+            act_type=torch.float16,
+            group_size=-1,
+            zero_points=False,
+            has_g_idx=False,
+            out_type=torch.float16,
+        )
+        try:
+            implementation = choose_mp_linear_kernel(config)
+        except ValueError:
+            return
+        kernel = implementation(config, "weight", "")
+        kernel.process_weights_after_loading(layer)
+        self.linear_kernel = kernel
+
+    def _prepare_existing_weights(self, layer: torch.nn.Module) -> None:
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
@@ -489,6 +530,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if (kernel := getattr(self, "linear_kernel", None)) is not None:
+            return kernel.apply_weights(layer, x, bias)
         if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (
@@ -506,6 +549,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 envs.VLLM_BATCH_INVARIANT,
             )
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+
+    def apply_fused_silu_and_mul(self, layer, x):
+        kernel = getattr(self, "linear_kernel", None)
+        if kernel is None or envs.VLLM_BATCH_INVARIANT:
+            return None
+        return kernel.apply_fused_silu_and_mul(layer, x)
 
 
 class LinearBase(PluggableLayer):

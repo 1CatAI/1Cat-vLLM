@@ -3,7 +3,10 @@
 import pytest
 import torch
 
-from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
+from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
+    Sm70Fp16GateUpKernel,
+    Sm70Fp16GemvSiluKernel,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
@@ -21,6 +24,10 @@ pytestmark = pytest.mark.skipif(
         (4, 37, 8192, 32, 40),
         (8, 129, 256, 64, 136),
         (16, 33, 64, 32, 40),
+        (1, 2560, 160, 0, 2560),
+        (5, 321, 160, 159, 328),
+        (17, 37, 255, 19, 43),
+        (33, 19, 73, 0, 24),
     ],
 )
 def test_rows_padding_and_changed_graph_inputs(m, n, k, prefix, pad):
@@ -84,3 +91,42 @@ def test_capability_rejects_invalid_ranges_and_layouts():
         for i, v in changes.items():
             args[i] = v
         assert not Sm70Fp16GemvSiluKernel.can_implement(*args)
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 160, 2560), (5, 17, 73), (17, 37, 160), (33, 11, 256)]
+)
+def test_gate_up_materializations_and_graph_replay(m, n, k):
+    torch.manual_seed(512 + m)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    weight = torch.randn(2 * n, k, device="cuda", dtype=torch.float16) * 0.03
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    Sm70Fp16GateUpKernel.apply_out(x, weight, out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        Sm70Fp16GateUpKernel.apply_out(x, weight, out)
+    for scale in (0.0, 0.03, 1.0, 3.0):
+        x.normal_(0, scale)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        projected = (x.cpu().double() @ weight.cpu().double().T).half()
+        silu = torch.nn.functional.silu(projected[:, :n].double()).half()
+        expected = (silu.double() * projected[:, n:].double()).half()
+        torch.testing.assert_close(out.cpu(), expected, atol=0.002, rtol=0.002)
+
+
+def test_gate_up_uses_standard_fp32_silu_for_finite_fp16_inputs():
+    # K=1 removes reduction order from this check. The two FP16 arguments
+    # -2.724609375 and -4.921875 expose sigmoid approximation rounding.
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    values = bits.view(torch.float16)
+    values = values[torch.isfinite(values)].cuda()
+    weight = torch.cat([values, torch.ones_like(values)]).reshape(-1, 1)
+    x = torch.ones(1, 1, device="cuda", dtype=torch.float16)
+    out = torch.empty(1, values.numel(), device="cuda", dtype=torch.float16)
+    expected = torch.empty_like(out)
+    torch.ops._C.silu_and_mul(expected, weight.reshape(1, -1))
+    Sm70Fp16GateUpKernel.apply_out(x, weight, out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
