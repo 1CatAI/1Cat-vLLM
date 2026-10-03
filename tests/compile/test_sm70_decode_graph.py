@@ -303,9 +303,11 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
     ):
         set_lazy_env(monkeypatch, name, None)
     # The isolated worker constructs a model-less engine. It must remain usable
-    # without inheriting admission or changing the process environment.
-    before = dict(os.environ)
+    # without inheriting admission or changing the process environment. On SM70
+    # hosts VllmConfig() itself applies the Flash-V100 baseline defaults, so the
+    # snapshot is taken after it.
     cfg = VllmConfig()
+    before = dict(os.environ)
     assert not _qwen4exp_ple_cascade_requested(cfg)
     assert cfg.kernel_config.ple_disk_cascade_reason == "no PLE layers"
     assert dict(os.environ) == before
