@@ -193,7 +193,7 @@ class Sm70NvFp4Config:
             "prefill": ("VLLM_SM70_NVFP4_QPN2_PREFILL", qualified),
             "shared_weight": ("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", True),
             "shared_scales": ("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True),
-            "prefill_min_m": ("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", 1024),
+            "prefill_min_m": ("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", 256),
         }
         for field, (name, default) in defaults.items():
             if envs.is_set(name):
@@ -511,6 +511,13 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
+    """Select CPU PLE result transport by local operator/resource capability."""
+    ple_result_transports: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed per-layer result transport and small pinned-buffer sizes."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -539,6 +546,7 @@ class KernelConfig:
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
+            "ple_result_transports",
             "qsa_auto_e4m3_reason",
         }
         if not self.sm70_skinny_moe_applicable:

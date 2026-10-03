@@ -18,6 +18,7 @@ import torch
 from benchmark_gguf_turbomind import (
     M_VALUES,
     canonical_grouped_call,
+    core_fingerprint,
     elapsed,
     partition_source,
     prepare_awq_comparator,
@@ -25,6 +26,13 @@ from benchmark_gguf_turbomind import (
 )
 
 from vllm import _custom_ops  # noqa: F401
+from vllm.model_executor.kernels.gguf import (
+    lattice_grouped_capabilities,
+    select_lattice_grouped_capability,
+)
+from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+    LatticeGGUFProjection,
+)
 from vllm.model_executor.layers.quantization.gguf_native import (
     native_available,
     pad_weight_tail,
@@ -104,6 +112,7 @@ def main():
         else 0
     )
     output = {
+        "loaded_core_sha256": core_fingerprint(),
         "checkpoint": Path(args.gguf).name,
         "tp": {"size": args.tp_size, "rank": args.tp_rank, "axis": args.tp_axis},
         "native_unavailable_reason": parts[0][3],
@@ -165,6 +174,40 @@ def main():
             "turbomind_gguf_grouped": (tm, True),
             "cached_fp16_per_expert_lower_bound": (cached_dense, True),
         }
+        if isinstance(projection, LatticeGGUFProjection):
+            declared = lattice_grouped_capabilities(weight_type, k, n, e, x.dtype)
+            selected = select_lattice_grouped_capability(declared, m)
+            routes["turbomind_gguf_grouped_selected"] = (
+                partial(
+                    getattr(torch.ops._C, selected.operator),
+                    out,
+                    x,
+                    offsets,
+                    wp,
+                    sp,
+                    weight_type,
+                    e,
+                    projection.group_size,
+                ),
+                True,
+            )
+        if isinstance(projection, LatticeGGUFProjection) and hasattr(
+            torch.ops._C, "gguf_lattice_grouped_vec_sm70_out"
+        ):
+            routes["turbomind_gguf_grouped_vec"] = (
+                partial(
+                    torch.ops._C.gguf_lattice_grouped_vec_sm70_out,
+                    out,
+                    x,
+                    offsets,
+                    wp,
+                    sp,
+                    projection.source_type,
+                    e,
+                    projection.group_size,
+                ),
+                True,
+            )
         if packed is not None:
             routes.update(
                 {
@@ -207,6 +250,17 @@ def main():
             "routes": {},
         }
         for name, (call, graph_safe) in routes.items():
+            if name in (
+                "turbomind_gguf_grouped_selected",
+                "turbomind_gguf_grouped_vec",
+            ):
+                # Out operators return None. Expose their output to elapsed()
+                # so every small-output route captures eight device calls.
+                def call_with_output(call=call, out=out):
+                    call()
+                    return out
+
+                call = call_with_output
             try:
                 call()
             except RuntimeError as error:
@@ -216,6 +270,12 @@ def main():
                     }
                     continue
                 raise
+            if name == "turbomind_gguf_grouped_vec":
+                vec_error = (out.float() - expected).norm() / expected.norm()
+                if not torch.isfinite(out).all() or vec_error.item() > 0.003:
+                    raise AssertionError(
+                        f"M={m}: grouped vector error {vec_error.item()}"
+                    )
             times = {"eager_us": elapsed(call, args.iterations)}
             if args.cuda_graph and graph_safe:
                 times["graph_us"] = elapsed(call, args.iterations, capture=True)

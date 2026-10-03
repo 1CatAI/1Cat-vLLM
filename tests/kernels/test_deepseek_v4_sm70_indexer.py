@@ -183,7 +183,13 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
     q, weights = _make_queries(rows, num_heads)
 
     actual = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, max_seq_len
+        q,
+        cache,
+        weights,
+        seq_lens,
+        block_table,
+        max_seq_len,
+        indexer_decode_cublas=True,
     )
 
     reference = _reference_index_logits if relu else _reference_factored_logits
@@ -264,7 +270,14 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
 
     monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
     baseline = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, graph_width, table_rows_per_request
+        q,
+        cache,
+        weights,
+        seq_lens,
+        block_table,
+        graph_width,
+        table_rows_per_request,
+        indexer_decode_cublas=True,
     )
 
     static_workspace = (
@@ -301,6 +314,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
             block_table,
             graph_width,
             table_rows_per_request,
+            indexer_decode_cublas=True,
         )
 
     capture_stream = torch.cuda.Stream()
@@ -334,7 +348,14 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
     seq_lens.sub_(127)
     monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
     replay_baseline = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, graph_width, table_rows_per_request
+        q,
+        cache,
+        weights,
+        seq_lens,
+        block_table,
+        graph_width,
+        table_rows_per_request,
+        indexer_decode_cublas=True,
     )
     graph.replay()
     torch.accelerator.synchronize()
@@ -368,10 +389,22 @@ def test_sm70_indexer_decode_valid_logits_do_not_depend_on_workspace_width() -> 
     block_table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
 
     narrow = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, max_seq_len=16
+        q,
+        cache,
+        weights,
+        seq_lens,
+        block_table,
+        max_seq_len=16,
+        indexer_decode_cublas=True,
     )
     wide = sm70_indexer_decode_logits(
-        q, cache, weights, seq_lens, block_table, max_seq_len=64
+        q,
+        cache,
+        weights,
+        seq_lens,
+        block_table,
+        max_seq_len=64,
+        indexer_decode_cublas=True,
     )
 
     assert narrow.shape == (num_queries, 16)

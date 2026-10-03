@@ -343,11 +343,8 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
         reason = "existing explicit PLE placement takes precedence"
     elif cfg.load_config.load_format not in ("auto", "safetensors"):
         reason = "requires file-backed safetensors shards"
-    elif (
-        cfg.parallel_config.prefill_context_parallel_size != 1
-        or cfg.parallel_config.decode_context_parallel_size != 1
-    ):
-        reason = "PLE worker does not yet support context-parallel groups"
+    elif cfg.parallel_config.prefill_context_parallel_size != 1:
+        reason = "PLE worker does not yet support prefill context-parallel groups"
     elif (
         cfg.parallel_config.nnodes != 1
         or cfg.parallel_config.data_parallel_backend != "mp"
@@ -375,13 +372,18 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
             storage = str(getattr(text, "ple_embedding_dtype", "")).removeprefix(
                 "torch."
             )
+            # The model's hf_to_vllm_mapper is applied to the quantization
+            # config only when the model is built, so its layer metadata still
+            # uses checkpoint names here. ple_layer_ids are 1-based: id L is
+            # the PLE module of decoder layer L - 1.
             methods = [
                 _get_ple_embedding_quant_method(
                     cfg.quant_config,
-                    f"model.layers.{index}.ple.ple_embedding.ngram_embedding",
+                    f"model.language_model.layers.{int(layer_id) - 1}"
+                    ".ple.ple_embedding.ngram_embedding",
                     force_fp8_storage=storage == "float8_e4m3fn",
                 )
-                for index in layers
+                for layer_id in layers
             ]
             if any(method is None for method in methods):
                 reason = "checkpoint metadata does not provide raw E4M3 PLE storage"
@@ -3505,14 +3507,10 @@ class VllmConfig:
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
-            assert block_size <= self.scheduler_config.max_num_batched_tokens, (
-                "In Mamba cache align mode, block_size "
-                f"({block_size}) must be <= "
-                "max_num_batched_tokens "
-                f"({self.scheduler_config.max_num_batched_tokens})."
-            )
-            if self.scheduler_config.long_prefill_token_threshold > 0:
-                assert self.scheduler_config.long_prefill_token_threshold >= block_size
+            # A chunk may be shorter than a cache block. The running state is
+            # updated in place, and the scheduler stops at retained boundaries
+            # before moving it to the next block. Only completed boundary states
+            # are eligible for prefix-cache reuse.
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "

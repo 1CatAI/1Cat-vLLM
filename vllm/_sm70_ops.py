@@ -4816,6 +4816,22 @@ if hasattr(torch.ops._C, "gguf_lattice_dequantize_sm70_out"):
         return None
 
 
+if hasattr(torch.ops._C, "gguf_lattice_grouped_vec_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_grouped_vec_sm70_out")
+    def _gguf_lattice_grouped_vec_sm70_out_fake(
+        out,
+        input,
+        offsets,
+        weight_ptrs,
+        stats_ptrs,
+        source_type,
+        num_experts,
+        group_size,
+    ):
+        return None
+
+
 if hasattr(torch.ops._C, "gguf_lattice_blas_sm70_out"):
 
     @register_fake("_C::gguf_lattice_blas_sm70_out")
