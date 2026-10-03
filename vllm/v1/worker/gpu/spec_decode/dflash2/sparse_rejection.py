@@ -428,9 +428,13 @@ def try_dflash2_sparse_target_rejection(
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
     idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
-    # Preserve the small single-request path. The large-vocabulary reference
-    # uses stable radix order; retain the existing fallback for other sorts.
-    retain_ties = idx.size > 1 and getattr(states, "vocab_size", 0) >= 32768
+    # The reference sampler dispatches on logit rows, not request count.
+    # A single q8 verifier has eight rows and uses the same large-vocabulary
+    # radix tie order as a batch. Retain every cutoff tie in that case too.
+    retain_ties = (
+        int(input_batch.cu_num_logits_np[-1]) >= 2
+        and getattr(states, "vocab_size", 0) >= 32768
+    )
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
     if hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
