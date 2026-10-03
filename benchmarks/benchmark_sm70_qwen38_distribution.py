@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -91,6 +92,8 @@ def prepare(args):
 
 
 def capture(args):
+    if args.disable_kernel:
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(args.disable_kernel)
     import torch
 
     import vllm
@@ -132,6 +135,7 @@ def capture(args):
         "speed_acceptance": False,
         "manifest_sha256": digest(args.manifest),
         "runtime": vllm.__version__,
+        "disabled_kernels": args.disable_kernel,
         "runtime_path": vllm.__file__,
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
@@ -366,6 +370,12 @@ if __name__ == "__main__":
     parser.add_argument("--prefill-budget", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
+    parser.add_argument(
+        "--disable-kernel",
+        action="append",
+        default=[],
+        help="Use the existing disabled-kernel control for matched A/B",
+    )
     args = parser.parse_args()
     if args.action == "capture":
         while True:
