@@ -122,7 +122,7 @@ def test_lattice_framework_and_fullgraph_tracing(weight_type):
     config = Sm70GgufLatticeConfig(
         (k, n),
         (k, n),
-        scalar_types.uint4 if p.bits == 4 else scalar_types.uint2,
+        scalar_types.uint2,
         torch.float16,
         p.group_size,
         False,

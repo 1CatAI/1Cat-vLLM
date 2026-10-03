@@ -47,10 +47,7 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
             return False, "source_format_codec_unavailable"
         if config.act_type != torch.float16:
             return False, "requires_fp16_activations"
-        expected_carrier = (
-            scalar_types.uint4 if config.source_type in (18, 21) else scalar_types.uint2
-        )
-        if config.weight_type != expected_carrier:
+        if config.weight_type != scalar_types.uint2:
             return False, "requires_canonical_lattice_carriers"
         expected_group = 16 if config.source_type in (17, 22, 29) else 32
         if config.group_size != expected_group or config.has_g_idx:

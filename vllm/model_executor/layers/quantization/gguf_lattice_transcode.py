@@ -40,7 +40,7 @@ class LatticeGGUFProjection:
 
     @property
     def bits(self):
-        return 4 if self.grid_width == 4 else 2
+        return 2  # Physical operand width; signs/indices also occupy metadata.
 
     @property
     def codes(self):
@@ -61,11 +61,12 @@ class LatticeGGUFProjection:
         ).reshape(self.shape)
 
     def mma884_storage(self) -> tuple[np.ndarray, np.ndarray]:
-        """Operand packets and group scales, without requantizing.
+        """U2 operand stream and scale/sign/index metadata, without requantizing.
 
-        IQ3 uses U4 carriers: each 32-bit packet holds two indices, eight signs
-        and two high index bits, with a separate FP16 group scale. IQ1/IQ2
-        retain U2 packets and scale/delta/high-index metadata.
+        Eight logical U2 codes become one 16-bit MMA packet. IQ2 places the
+        low index byte and sign mask there; IQ3 places two low index bytes.
+        IQ1 stores its full eleven-bit index and delta polarity. Metadata
+        retains high index bits and signs alongside one FP16 group scale.
         """
         n, k = self.shape
         indices = self.indices.astype(np.uint64)
@@ -83,22 +84,20 @@ class LatticeGGUFProjection:
         else:
             pairs = indices.reshape(n, k // 8, 2)
             packets = (pairs[..., 0] & 255) | ((pairs[..., 1] & 255) << 8)
-            packets |= self.signs.astype(np.uint64) << 16
-            packets |= ((pairs[..., 0] >> 8) & 1) << 24
-            packets |= ((pairs[..., 1] >> 8) & 1) << 25
-            metadata = scales.astype(np.uint16)
-        # Invert the adjacent-half pairing in Converter<uint16_t, U2/U4>.
-        shifts = np.array(
-            [0, 16, 4, 20, 8, 24, 12, 28]
-            if self.grid_width == 4
-            else [0, 8, 2, 10, 4, 12, 6, 14],
-            dtype=np.uint64,
-        )
-        codes = (
-            ((packets[..., None] >> shifts) & ((1 << self.bits) - 1))
-            .astype(np.uint8)
-            .reshape(n, k)
-        )
+            sign_groups = self.signs.astype(np.uint64).reshape(
+                n, k // self.group_size, -1
+            )
+            sign_shifts = 16 + 8 * np.arange(sign_groups.shape[-1], dtype=np.uint64)
+            high = (indices >> 8).reshape(n, k // self.group_size, -1)
+            high_shifts = 48 + np.arange(high.shape[-1], dtype=np.uint64)
+            metadata = scales | np.bitwise_or.reduce(
+                sign_groups << sign_shifts, axis=-1
+            )
+            metadata |= np.bitwise_or.reduce(high << high_shifts, axis=-1)
+        # Invert Converter<uint16_t,uint2_t>'s adjacent-half pairing so it
+        # preserves the packet verbatim after operand packing.
+        shifts = np.array([0, 8, 2, 10, 4, 12, 6, 14], dtype=np.uint64)
+        codes = ((packets[..., None] >> shifts) & 3).astype(np.uint8).reshape(n, k)
         return np.ascontiguousarray(codes), np.ascontiguousarray(metadata)
 
     def tp_slice(self, rank: int, size: int, *, axis: int):

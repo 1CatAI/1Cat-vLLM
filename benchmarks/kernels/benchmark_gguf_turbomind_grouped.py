@@ -18,6 +18,7 @@ import torch
 from benchmark_gguf_turbomind import (
     M_VALUES,
     canonical_grouped_call,
+    core_fingerprint,
     elapsed,
     partition_source,
     prepare_awq_comparator,
@@ -111,6 +112,7 @@ def main():
         else 0
     )
     output = {
+        "loaded_core_sha256": core_fingerprint(),
         "checkpoint": Path(args.gguf).name,
         "tp": {"size": args.tp_size, "rank": args.tp_rank, "axis": args.tp_axis},
         "native_unavailable_reason": parts[0][3],

@@ -11,11 +11,9 @@ struct LatticeCanonicalDecoder {
   static constexpr int kGroup =
       Type == 17 || Type == 22 || Type == 29 ? 16 : 32;
   using Transform = turbomind::gemm::Transform_HMMA_SM70_Lattice<Type, kGroup>;
-  using Stats =
-      std::conditional_t<Type == 18 || Type == 21 || Type == 19 || Type == 29,
-                         uint16_t, uint32_t>;
-  using Carrier = std::conditional_t<Type == 18 || Type == 21,
-                                     turbomind::uint4_t, turbomind::uint2_t>;
+  using Stats = std::conditional_t<
+      Type == 18 || Type == 21, uint64_t,
+      std::conditional_t<Type == 19 || Type == 29, uint16_t, uint32_t>>;
 
   __device__ static turbomind::Array<half, 8> fragment(const void* weight,
                                                        const void* stats, int k,
@@ -26,13 +24,18 @@ struct LatticeCanonicalDecoder {
     uint64_t metadata = static_cast<const Stats*>(
         stats)[static_cast<int64_t>(base / kGroup) * n + col];
     const int within = base % kGroup;
-    if constexpr (Type != 18 && Type != 21 && Type != 19 && Type != 29) {
+    if constexpr (Type == 18 || Type == 21) {
+      metadata = (metadata & 65535U) |
+                 (((metadata >> (16 + within)) & 255U) << 16) |
+                 (((metadata >> (48 + within / 4)) & 3U) << 48);
+    } else if constexpr (Type != 19 && Type != 29) {
       metadata = (metadata & 65535U) |
                  (((metadata >> (16 + 2 * (within / 8))) & 3U) << 16);
     }
-    turbomind::Array<Carrier, 8> data[1][1];
+    turbomind::Array<turbomind::uint2_t, 8> data[1][1];
     data[0][0] =
-        reinterpret_cast<const turbomind::Array<Carrier, 8>*>(weight)[packet];
+        reinterpret_cast<const turbomind::Array<turbomind::uint2_t, 8>*>(
+            weight)[packet];
     turbomind::Array<Stats, 1> coefficients[1][1];
     coefficients[0][0][0] = static_cast<Stats>(metadata);
     turbomind::Array<half, 8> decoded[1][1];

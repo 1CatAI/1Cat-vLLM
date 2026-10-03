@@ -47,3 +47,43 @@ the codebook address. The extraction now masks both low indices before adding
 high bits. CPU packet inversion had already masked both bytes; GPU oracle and
 capture checks must pass after rebuilding this correction. No timing from the
 failed attempt is used.
+
+## Matched packet measurements and rejection
+
+After the byte-mask correction, all 40 lattice GEMM, grouped, canonical
+DQ, vector, graph and tracing checks pass. Matched real-weight timing uses
+FP16 activations/FP32 accumulation, V100 32GB, CUDA 12.8, Torch 2.10.0+cu128,
+TP4 N=160/K=2560, 100 ms warmup and 100 graph timing iterations.
+
+| Experts | M | Existing U2 GEMM us | Candidate U4 GEMM us | Candidate vector us | AWQ us |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 8 | 22.52 | 29.78 | 16.50 | 18.38 |
+| 4 | 16 | 24.02 | 29.85 | 27.76 | 16.25 |
+| 4 | 8192 | 300.29 | 305.42 | 17854.88 | 227.80 |
+| 512 | 128 | 138.50 | 126.24 | 77.96 | 72.19 |
+| 512 | 512 | 306.76 | 287.65 | 266.77 | 186.66 |
+| 512 | 8192 | 558.37 | 561.97 | 3973.79 | 352.96 |
+
+IQ3_S dense N=1536/K=2560/M=8192 fused GEMM costs 1136.12 us; canonical
+DQ plus FP32 cuBLAS still costs 770.53 us. The packet does not close the
+large-M grouped gap and regresses small grouped descriptors despite increasing
+storage. The U4 packet representation is rejected; the final candidate restores
+all existing U2/metadata layouts and decoder formulas.
+
+One timing launch initially imported the installed baseline wheel, identified
+by its two-bit carrier report. Those measurements are excluded as candidate
+evidence and retained only as the explicitly labeled installed-base control
+for the table above; both control and candidate use 100 graph iterations. Source timing was repeated with the owned tree explicitly selected.
+Benchmark output now includes the loaded core SHA256 so artifact identity is
+checkable alongside carrier width. The passing source GPU oracle suite was
+retained; only the invalid timing launch was repeated.
+
+## Isolated native grouped tile
+
+The remaining operator candidate registers CTA8/N256/K64 for IQ3 while keeping
+existing canonical weights, metadata and decoders. It is admitted only for
+grouped descriptors with M at least 512, where the shared framework measures
+candidate tactics outside capture. Small-M and dense descriptors retain their
+existing candidates. No new expert-count/shape condition or environment variable
+is added. This isolated candidate requires new GPU and timing checks; the packet
+results above do not establish a speedup for it.

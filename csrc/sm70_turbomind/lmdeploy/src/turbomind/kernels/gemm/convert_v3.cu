@@ -108,10 +108,8 @@ std::array<const LayoutConverter*,2> GetGgufLatticeConverters(int type,int sm) {
     constexpr auto sp = constant<(Pack)(HMMA_884|OPERAND_V|1)>{};
     const auto* weight = W(Sm70{},constant<kRowMajor>{},wp);
     if (type == 18 || type == 21) {
-        constexpr Cvt<uint16_t,uint4_t> W3;
-        constexpr Cvt<uint16_t,uint16_t> S;
-        return {W3(Sm70{},constant<kRowMajor>{},wp),
-                S(Sm70{},constant<kColMajor>{},sp)};
+        constexpr Cvt<uint64_t,uint64_t> S;
+        return {weight,S(Sm70{},constant<kColMajor>{},sp)};
     }
     if (type == 19 || type == 29) {
         constexpr Cvt<uint16_t,uint16_t> S;
