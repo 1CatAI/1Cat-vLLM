@@ -8,7 +8,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from datetime import datetime
@@ -47,6 +47,7 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
+from .sm70_dflash2 import SM70_DFLASH2_VERIFIER_DEFAULTS
 from .speculative import (
     EagleModelTypes,
     NgramGPUTypes,
@@ -81,6 +82,7 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
+_SM70_DFLASH2_VERIFIER_DEFAULTS = SM70_DFLASH2_VERIFIER_DEFAULTS
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
@@ -94,36 +96,6 @@ _SM70_BATCH_GEMM_DEFAULTS = {
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": "64",
 }
 
-_SM70_DFLASH2_VERIFIER_DEFAULTS = {
-    # Match the measured packed verifier and draft context pipeline without
-    # requiring launch-script flags. Operators retain their shape guards.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "1",
-    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": "1",
-    "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": "1",
-    "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "1",
-    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": "1",
-    # Preserve candidate and dense logits in FP32 through sampling.
-    "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
-    # This is the target projection's memory-neutral FP8 layout, not the
-    # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
-    # original layout whenever the exact operator contract is unavailable.
-    "VLLM_SM70_FP8_QPN8": "1",
-    "VLLM_SM70_DFLASH2_QPN8_RERANK": "1",
-    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "1",
-    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "0",
-    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
-    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
-    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
-    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": "1",
-    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
-    # Keep the no-residual/FP16-residual reductions consistent across ranks
-    # and process starts. Autotuning them perturbs the initial GDN state.
-    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": "1",
-    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
-    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
-    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",
-    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
-}
 
 _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
@@ -156,46 +128,10 @@ def _is_sm70_dflash2_verifier_contract(
     speculative_config: Any,
     parallel_config: Any,
 ) -> bool:
-    """Admit the quality-audited Qwen3.8 DFlash2 verifier contract.
+    from vllm.model_executor.models.config import sm70_dflash2_verifier_qualified
 
-    Target quantization, KV dtype, TP degree, and service capacity are
-    intentionally not part of this admission. Each fast operator capability-
-    checks its local weight, cache dtype, and live batch shape, then falls back
-    independently when it cannot handle that contract.
-    """
-    if any(
-        config is None
-        for config in (
-            model_config,
-            speculative_config,
-            parallel_config,
-        )
-    ):
-        return False
-
-    draft_model_config = getattr(speculative_config, "draft_model_config", None)
-    draft_hf_config = getattr(draft_model_config, "hf_config", None)
-    dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
-    selector_top_k = (
-        int(dflash_config.get("selector_top_k", 0) or 0)
-        if isinstance(dflash_config, Mapping)
-        else 0
-    )
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    architectures = set(getattr(model_config, "architectures", ()) or ())
-    return bool(
-        "Qwen3_5ForConditionalGeneration" in architectures
-        and getattr(model_config, "dtype", None) == torch.float16
-        and getattr(hf_text_config, "hidden_size", None) == 5120
-        and getattr(hf_text_config, "num_attention_heads", None) == 24
-        and getattr(hf_text_config, "num_key_value_heads", None) == 4
-        and getattr(hf_text_config, "head_dim", None) == 256
-        and getattr(speculative_config, "method", None) == "dflash"
-        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
-        and selector_top_k == 16
-        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
-        and not getattr(parallel_config, "enable_dbo", False)
-        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    return sm70_dflash2_verifier_qualified(
+        model_config, speculative_config, parallel_config
     )
 
 
@@ -362,16 +298,6 @@ def checkpoint_kv_quant_allowed(cfg: "VllmConfig") -> bool:
     never reaches this policy.
     """
     return not _any_participating_device_is_pre_ampere(cfg)
-
-
-def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
-    """Set quality-audited defaults while preserving every explicit override."""
-    applied = []
-    for env_name, env_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
-        if env_name not in os.environ:
-            os.environ[env_name] = env_value
-            applied.append(env_name)
-    return tuple(applied)
 
 
 def _apply_sm70_qwen38_hybrid_ple_defaults(
@@ -2123,21 +2049,26 @@ class VllmConfig:
                     "dual-compile lane: async disk-mmap prefill plus local "
                     "pinned-UVA decode."
                 )
-            if _is_sm70_dflash2_verifier_contract(
-                self.model_config,
-                self.speculative_config,
-                self.parallel_config,
-            ):
-                for env_name in _apply_sm70_dflash2_verifier_defaults():
-                    logger.info_once(
-                        "Auto-setting %s=%s for the quality-audited SM70 "
-                        "Qwen3.8 DFlash2 verification baseline. "
-                        "Set it explicitly to override.",
-                        env_name,
-                        os.environ[env_name],
+        if self.speculative_config is not None:
+            policy = self.speculative_config.sm70_dflash2
+            policy.resolve(
+                qualified=(
+                    current_platform.is_cuda()
+                    and _any_participating_device_is_capability(self, (7, 0))
+                    and _is_sm70_dflash2_verifier_contract(
+                        self.model_config, self.speculative_config, self.parallel_config
                     )
+                )
+            )
+            if (
+                self.model_config is not None
+                and self.model_config.quantization == "fp8"
+                and self.kernel_config.sm70_fp8.qpn8 is None
+                and (policy.qualified or "target_fp8_qpn8" in policy.explicit_fields)
+            ):
+                self.kernel_config.sm70_fp8.qpn8 = policy.target_fp8_qpn8
         if self.model_config is not None and self.model_config.quantization == "fp8":
-            # Resolve after compatibility defaults until the verifier policy migrates.
+            # Resolve after the per-engine verifier defaults.
             self.kernel_config.sm70_fp8.resolve()
 
         sm70_flash_0dot3_compile_graph = envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH

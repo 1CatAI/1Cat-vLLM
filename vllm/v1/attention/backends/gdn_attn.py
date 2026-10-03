@@ -12,6 +12,10 @@ import torch
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -867,7 +871,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.use_spec_decode
             and (
                 envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
-                or envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
+                or sm70_dflash2_enabled(
+                    "fused_gdn_metadata", capture_sm70_dflash2_config(self.vllm_config)
+                )
                 or (
                     envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
                     and envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
@@ -2269,7 +2275,14 @@ def prepare_dflash2_gdn_group_metadata(
     if enable_mtp4:
         if not envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA:
             return None
-    elif not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
+    elif not sm70_dflash2_enabled(
+        "fused_gdn_metadata",
+        capture_sm70_dflash2_config(
+            getattr(builders_by_group[0][1], "vllm_config", None)
+        )
+        if builders_by_group
+        else None,
+    ):
         return None
     if not builders_by_group or num_actual_tokens <= 0:
         return None

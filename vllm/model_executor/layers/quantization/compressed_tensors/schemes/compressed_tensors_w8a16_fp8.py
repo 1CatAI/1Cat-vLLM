@@ -10,6 +10,9 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.config import get_current_vllm_config
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_wfp8_a16_linear_kernel,
@@ -190,6 +193,13 @@ _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG = (8, 2, False)
 
 def _sm70_fp8_qpn8_enabled(enable_by_default: bool) -> bool:
     """Resolve QPN8 while preserving the validated mixed-NVFP4 default."""
+    policy = capture_sm70_dflash2_config()
+    if (
+        policy is not None
+        and policy.resolved
+        and (policy.qualified or "target_fp8_qpn8" in policy.explicit_fields)
+    ):
+        return bool(policy.target_fp8_qpn8)
     if os.getenv("VLLM_SM70_FP8_QPN8") is None:
         return enable_by_default
     return envs.VLLM_SM70_FP8_QPN8

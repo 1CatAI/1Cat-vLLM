@@ -94,7 +94,7 @@ def loaded_sm70_preparations(model) -> dict[str, Any]:
         flags = {
             key: value
             for key, value in vars(layer).items()
-            if key.startswith("_sm70_") and isinstance(value, bool)
+            if key.startswith(("_sm70_", "enable_sm70_")) and isinstance(value, bool)
         }
         buffers = []
         for key, buffer in layer.named_buffers(recurse=False):
@@ -115,6 +115,13 @@ def loaded_sm70_preparations(model) -> dict[str, Any]:
             variants[name] = {
                 "method": type(method).__name__ if method is not None else None,
                 "flags": flags,
+                "reasons": {
+                    key: value
+                    for key, value in vars(layer).items()
+                    if key.startswith("_sm70_")
+                    and key.endswith("_reason")
+                    and isinstance(value, str)
+                },
                 "prepared_buffers": buffers,
                 "scope": "prepared_runtime_guards",
             }
@@ -406,7 +413,20 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         ("dflash2_verifier", _SM70_DFLASH2_VERIFIER_DEFAULTS, _dflash_reason(cfg)),
         ("batch_gemm", _SM70_BATCH_GEMM_DEFAULTS, None),
     ):
-        values = _switches(defaults)
+        if name == "dflash2_verifier":
+            from vllm.config.sm70_dflash2 import (
+                SM70_DFLASH2_LEGACY_FIELDS,
+                capture_sm70_dflash2_config,
+                sm70_dflash2_enabled,
+            )
+
+            policy = capture_sm70_dflash2_config(cfg)
+            values = {
+                alias: sm70_dflash2_enabled(field, policy)
+                for alias, field in SM70_DFLASH2_LEGACY_FIELDS.items()
+            }
+        else:
+            values = _switches(defaults)
         paths[name] = _row(
             reason or (None if _switches_match(values, defaults) else "user_override"),
             switches=values,

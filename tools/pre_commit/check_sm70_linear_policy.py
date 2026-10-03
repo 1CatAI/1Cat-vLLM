@@ -32,7 +32,20 @@ FP8_NAMES = {
     "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
     "VLLM_SM70_FP8_DENSE_GATED_SILU",
 }
-ALLOWED = {"vllm/envs.py", "vllm/config/kernel.py"}
+ALLOWED = {"vllm/envs.py", "vllm/config/kernel.py", "vllm/config/sm70_dflash2.py"}
+_POLICY = Path(__file__).resolve().parents[2] / "vllm/config/sm70_dflash2.py"
+_POLICY_TREE = ast.parse(_POLICY.read_text())
+DFLASH_NAMES = set(
+    next(
+        ast.literal_eval(node.value)
+        for node in _POLICY_TREE.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "SM70_DFLASH2_LEGACY_FIELDS"
+            for target in node.targets
+        )
+    )
+) - {"VLLM_SM70_FP8_QPN8"}
 
 
 def violations(path: Path) -> list[str]:
@@ -50,12 +63,26 @@ def violations(path: Path) -> list[str]:
                 and candidate.name == "Fp8LinearMethod"
             ):
                 fp8_nodes.update(ast.walk(candidate))
+    legacy_glm_defaults = set()
+    if path.as_posix() == "vllm/config/vllm.py":
+        for assignment in tree.body:
+            if isinstance(assignment, ast.Assign) and any(
+                isinstance(target, ast.Name)
+                and target.id == "_SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS"
+                for target in assignment.targets
+            ):
+                legacy_glm_defaults.update(ast.walk(assignment))
     for node in ast.walk(tree):
         name = None
         if isinstance(node, ast.Attribute):
             name = node.attr
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             name = node.value
+        if name in DFLASH_NAMES and node not in legacy_glm_defaults:
+            errors.append(
+                f"{path}:{node.lineno}: {name} belongs to the compatibility "
+                "adapter; consume speculative_config.sm70_dflash2 instead"
+            )
         if name in NAMES or (node in fp8_nodes and name in FP8_NAMES):
             errors.append(
                 f"{path}:{node.lineno}: {name} belongs to the deprecated compatibility "
