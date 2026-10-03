@@ -11,6 +11,10 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -55,33 +59,43 @@ def _sm70_lm_head_top1_default() -> bool:
     return not _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False)
 
 
-def _sm70_dflash2_qpn8_rerank_enabled() -> bool:
-    return envs.VLLM_SM70_DFLASH2_QPN8_RERANK
+def _sm70_dflash2_option(field: str, layer=None) -> bool:
+    policy = getattr(layer, "_sm70_dflash2_policy", None)
+    if policy is None:
+        policy = capture_sm70_dflash2_config()
+    return sm70_dflash2_enabled(field, policy)
 
 
-def _sm70_dflash2_qpn8_rerank_requested() -> bool:
+def _sm70_dflash2_qpn8_rerank_enabled(layer=None) -> bool:
+    return _sm70_dflash2_option("qpn8_rerank", layer)
+
+
+def _sm70_dflash2_qpn8_rerank_requested(layer=None) -> bool:
     return (
-        _sm70_dflash2_qpn8_rerank_enabled() or envs.VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW
+        _sm70_dflash2_qpn8_rerank_enabled(layer=layer)
+        or envs.VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW
     )
 
 
-def _sm70_lm_head_packed_layout_requested(fp32_logits: bool = False) -> bool:
+def _sm70_lm_head_packed_layout_requested(
+    fp32_logits: bool = False, layer=None
+) -> bool:
     # FP32 dense logits and candidate rerank read the original FP16 parameter.
     # Only an explicitly enabled packed top1 still consumes this layout.
     return _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False) or (
         not fp32_logits
         and (
             _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
-            or _sm70_dflash2_qpn8_rerank_requested()
+            or _sm70_dflash2_qpn8_rerank_requested(layer=layer)
         )
     )
 
 
-def _sm70_dflash2_use_dense_order() -> bool:
+def _sm70_dflash2_use_dense_order(layer=None) -> bool:
     """Keep production on the scored full-vocabulary tie-order contract."""
-    if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
+    if _sm70_dflash2_option("qpn8_dense_order", layer):
         return True
-    if envs.VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER:
+    if _sm70_dflash2_option("qpn8_allow_candidate_order", layer):
         logger.warning_once(
             "Using experimental SM70 DFlash2 QPN8 candidate-order top-k. "
             "This path is not authorized for quality-sensitive serving."
@@ -111,8 +125,8 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
-        or envs.VLLM_SM70_DFLASH2_FP32_LOGITS
-        or _sm70_dflash2_qpn8_rerank_requested()
+        or _sm70_dflash2_option("fp32_logits", layer)
+        or _sm70_dflash2_qpn8_rerank_requested(layer=layer)
     ):
         _trace_sm70_lm_head_skip("disabled")
         return False
@@ -140,7 +154,7 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
 
 
 def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
-    if not _sm70_dflash2_qpn8_rerank_requested():
+    if not _sm70_dflash2_qpn8_rerank_requested(layer=layer):
         return False
     rows, hidden = layer.weight.shape
     if rows < 64 or rows % 32 or hidden <= 0 or hidden % 128:
@@ -150,7 +164,7 @@ def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
             tuple(layer.weight.shape),
         )
         return False
-    if not envs.VLLM_SM70_DFLASH2_FP32_LOGITS and (
+    if not _sm70_dflash2_option("fp32_logits", layer) and (
         rows > _SM70_DFLASH2_QPN8_VOCAB_CHUNK or hidden != 5120
     ):
         # The legacy packed FP16 reranker requires exactly 64 candidates and
@@ -210,7 +224,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     torch.accelerator.empty_cache()
 
     device = weight.device
-    fp32_logits = envs.VLLM_SM70_DFLASH2_FP32_LOGITS
+    fp32_logits = _sm70_dflash2_option("fp32_logits", layer)
     layer._sm70_dflash2_fp32_logits = fp32_logits
     rerank_dtype = torch.float32 if fp32_logits else torch.float16
     max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
@@ -392,7 +406,7 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
         return False
 
     if (
-        envs.VLLM_SM70_DFLASH2_FP32_LOGITS
+        _sm70_dflash2_option("fp32_logits", layer)
         and len(layer.weight.shape) == 2
         and layer.weight.shape[0] > 0
         and layer.weight.shape[1] % 16 == 0
@@ -405,7 +419,7 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
         "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
     )
     packed_layout_requested = _sm70_lm_head_packed_layout_requested(
-        getattr(layer, "_sm70_dflash2_fp32_logits", False)
+        getattr(layer, "_sm70_dflash2_fp32_logits", False), layer=layer
     )
     if raw_top1_requested:
         layer._sm70_f16_raw_top1_ready = True
@@ -567,7 +581,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return shard-local top-k after QPN8 support search and FP16 rerank."""
-    if not _sm70_dflash2_qpn8_rerank_requested():
+    if not _sm70_dflash2_qpn8_rerank_requested(layer=layer):
         return None
     if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
         return None
@@ -575,7 +589,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         return None
     if (
         selector_k == 21
-        and not _sm70_dflash2_use_dense_order()
+        and not _sm70_dflash2_use_dense_order(layer=layer)
         and not getattr(layer, "_sm70_dflash2_fp32_logits", False)
     ):
         return None
@@ -652,7 +666,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     values, _positions, ids = _sm70_dflash2_rerank_output_buffers(
         layer, num_rows, selector_k
     )
-    use_dense_order = fp32_logits or _sm70_dflash2_use_dense_order()
+    use_dense_order = fp32_logits or _sm70_dflash2_use_dense_order(layer=layer)
     if use_dense_order:
         _sm70_dflash2_dense_order_topk(
             layer._sm70_dflash2_rerank_dense_logits[:num_rows],
@@ -946,6 +960,7 @@ class VocabParallelEmbedding(PluggableLayer):
         quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
+        self._sm70_dflash2_policy = capture_sm70_dflash2_config()
         self.prefix = prefix
 
         # Keep the input dimensions.

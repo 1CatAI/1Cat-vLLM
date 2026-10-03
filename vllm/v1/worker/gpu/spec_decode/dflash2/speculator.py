@@ -9,6 +9,10 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -355,6 +359,7 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_compute_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -407,9 +412,8 @@ class DFlash2Speculator(DFlashSpeculator):
             device=device,
         )
         self._cached_candidate_scores = None
-        if (
-            self._draft_logits_init is not None
-            and envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION
+        if self._draft_logits_init is not None and sm70_dflash2_enabled(
+            "sparse_target_rejection", self._sm70_dflash2_policy
         ):
             self._cached_candidate_scores = torch.full(
                 self._cached_candidate_ids.shape,
@@ -451,9 +455,8 @@ class DFlash2Speculator(DFlashSpeculator):
         self._alignment_candidate_ids: torch.Tensor | None = None
         self._alignment_unary_logits: torch.Tensor | None = None
         self._alignment_lattice_scores: torch.Tensor | None = None
-        if (
-            envs.VLLM_SPEC_DUMP_ALIGNMENT
-            and envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION
+        if envs.VLLM_SPEC_DUMP_ALIGNMENT and sm70_dflash2_enabled(
+            "sparse_target_rejection", self._sm70_dflash2_policy
         ):
             packed_shape = (
                 self.max_num_reqs,
@@ -755,8 +758,8 @@ class DFlash2Speculator(DFlashSpeculator):
         super().capture()
         if (
             not (
-                envs.VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH
-                or envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE
+                sm70_dflash2_enabled("context_kv_graph", self._sm70_dflash2_policy)
+                or sm70_dflash2_enabled("context_pipeline", self._sm70_dflash2_policy)
             )
             or self.device.type != "cuda"
             or torch.cuda.get_device_capability(self.device) != (7, 0)
@@ -783,7 +786,7 @@ class DFlash2Speculator(DFlashSpeculator):
         # Capturing a write graph must not race multiple dummy rows into the
         # null KV block. Real accepted slots are refreshed before each replay.
         self._context_slot_mappings.fill_(PAD_SLOT_ID)
-        pipeline = envs.VLLM_SM70_DFLASH2_CONTEXT_PIPELINE
+        pipeline = sm70_dflash2_enabled("context_pipeline", self._sm70_dflash2_policy)
         if pipeline:
             self._context_target_positions = torch.zeros_like(
                 self.context_positions[: max(tokens for _, tokens in shapes)]

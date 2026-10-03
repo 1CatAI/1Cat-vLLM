@@ -17,6 +17,10 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.distributed import (
     divide,
 )
@@ -2455,7 +2459,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV
         )
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY
+            sm70_dflash2_enabled(
+                "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
@@ -2465,22 +2471,46 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
         )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_NORM
+            sm70_dflash2_enabled(
+                "fused_gdn_norm", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_split = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT
+            sm70_dflash2_enabled(
+                "fused_gdn_split", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT
+            sm70_dflash2_enabled(
+                "fused_gdn_combined_split", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
-            and self.tp_size == 4
-            and self.hidden_size == 5120
         )
+        self._sm70_dflash2_combined_split_reason = (
+            None
+            if self.enable_sm70_dflash2_fused_gdn_combined_split
+            else "policy_hardware_or_speculation"
+        )
+        if self.enable_sm70_dflash2_fused_gdn_combined_split:
+            from vllm.model_executor.models.qwen3_5 import (
+                _can_implement_sm70_combined_gdn_split,
+            )
+
+            (
+                self.enable_sm70_dflash2_fused_gdn_combined_split,
+                self._sm70_dflash2_combined_split_reason,
+            ) = _can_implement_sm70_combined_gdn_split(
+                8,
+                torch.float16,
+                (2 * self.key_dim + self.value_dim) // self.tp_size,
+                self.value_dim // self.tp_size,
+                self.num_v_heads // self.tp_size,
+            )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
             and current_platform.is_device_capability(70)

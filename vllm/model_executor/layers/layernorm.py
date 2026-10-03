@@ -11,6 +11,10 @@ import vllm.kernels  # noqa: F401
 from vllm import envs, ir
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
@@ -138,9 +142,10 @@ def _use_sm70_dflash2_fixed_gemma_rms(
     x: torch.Tensor,
     residual: torch.Tensor | None,
     weight: torch.Tensor,
+    policy=None,
 ) -> bool:
     return bool(
-        envs.VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS
+        sm70_dflash2_enabled("fixed_gemma_rms", policy)
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         and _sm70_gemma_long_prefill_available()
         and x.is_cuda
@@ -224,12 +229,13 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     x: torch.Tensor,
     residual: torch.Tensor | None,
     weight: torch.Tensor,
+    policy=None,
 ) -> bool:
     # Keep the dynamic token dimension out of this Python predicate. AOT traces
     # the target once at a large warmup shape; a decode-only row bound would be
     # constant-folded there and would leave the M=8 replay on the decomposed path.
     return bool(
-        envs.VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS
+        sm70_dflash2_enabled("fused_gemma_rms", policy)
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         # Keep the cached platform query out of the AOT fullgraph. The helper
         # below is explicitly constant-foldable by Dynamo.
@@ -499,6 +505,7 @@ class GemmaRMSNorm(CustomOp):
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        self._sm70_dflash2_policy = capture_sm70_dflash2_config()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
@@ -573,11 +580,15 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_fixed_gemma_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             return _sm70_dflash2_fixed_gemma_rms_norm(
                 x, residual, self.weight, self.variance_epsilon
             )
-        if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_gemma_fused_add_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
                 x,
@@ -631,11 +642,15 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_fixed_gemma_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             return _sm70_dflash2_fixed_gemma_rms_norm(
                 x, residual, self.weight, self.variance_epsilon
             )
-        if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
+        if _use_sm70_dflash2_gemma_fused_add_rms(
+            x, residual, self.weight, self._sm70_dflash2_policy
+        ):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
                 x,

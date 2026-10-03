@@ -162,6 +162,23 @@ def _sm70_qwen35_gdn_split_kernel(
     )
 
 
+def _can_implement_sm70_combined_gdn_split(
+    num_tokens: int,
+    dtype: torch.dtype,
+    qkv_size: int,
+    z_size: int,
+    ba_size: int,
+) -> tuple[bool, str | None]:
+    """The measured copy schedule depends on local tails, not model width or TP."""
+    if num_tokens != 8:
+        return False, "query_rows"
+    if dtype != torch.float16:
+        return False, "dtype"
+    if (qkv_size, z_size, ba_size) != (2560, 1536, 12):
+        return False, "local_tail_layout"
+    return True, None
+
+
 def _sm70_materialize_qwen35_gdn_splits(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
@@ -483,9 +500,9 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             mixed_qkv = mixed_qkvzba[..., :qkv_size]
             if (
                 self.enable_sm70_dflash2_fused_gdn_combined_split
-                and num_tokens == 8
-                and mixed_qkvzba.dtype == torch.float16
-                and (qkv_size, z_size, ba_size) == (2560, 1536, 12)
+                and _can_implement_sm70_combined_gdn_split(
+                    num_tokens, mixed_qkvzba.dtype, qkv_size, z_size, ba_size
+                )[0]
             ):
                 # Any combined projection may have a padded QKVZBA allocation.
                 # Copy its three tails together before convolution mutates QKV.
