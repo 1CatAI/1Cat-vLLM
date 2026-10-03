@@ -26,6 +26,11 @@ scheduler ends the chunk, and the next chunk copies that state into a fresh
 running block. Prefix lookup admits completed checkpoint states only.
 Regression tests exercise allocation, worker state movement, boundary snapshot
 immutability, and prefix hits with 560/1024 and 512/8192 token chunks/blocks.
+In a hybrid Mamba/SWA draft cache, the retained sliding window must match the
+replay checkpoint admitted by Mamba, including the speculative lookbehind.
+Expired replay-window blocks keep normal cache priority instead of being
+immediately reused. They remain evictable and do not enlarge the real-held
+sliding-window reservation.
 
 ## Prefill kernels
 
@@ -53,6 +58,53 @@ Resident EOS is disabled to sustain the load; output quality must be checked
 separately with natural completion behavior. There is no prefill/decode barrier
 in this mixed-load measurement.
 
-Matched pure-decode C1/C4/C8 measurements and natural-output checks remain
-required before promotion. Online A/B results and the final default tradeoff
-are pending GPU validation.
+The measured contract used Qwen3.8-27B QUASAR NVFP4, DFlash2 with seven
+speculative tokens, TP4 on four V100 SXM2 32 GB GPUs connected as two NVLink
+pairs, CUDA 12.8, Torch 2.10.0, Python 3.12, FP16 compute, E4M3 KV,
+FLASH_ATTN_V100, a 262144-token maximum length, an 8192-token batch budget,
+16 sequence slots, KV/state blocks of 2048/8192, align prefix caching,
+0.8 memory utilization, and thinking disabled. The candidate was installed
+from a complete wheel in an independent virtual environment and launched
+outside the checkout with a cleared environment. Strict acceleration
+validation passed without manual acceleration overrides.
+
+Two measured warm runs followed one cold run. Medians of the two warm runs:
+
+| Online mixed-load metric | Control | Adaptive 250 ms |
+| --- | ---: | ---: |
+| Resident output during incoming prefill (tokens/s) | 6.88 | 30.78 |
+| Longest resident update gap within prefill (s) | 2.873 | 0.307 |
+| First incoming prompt TTFT (s) | 14.287 | 17.719 |
+| Second incoming prompt TTFT (s) | 20.631 | 34.678 |
+
+This favors decode continuity: resident throughput increased about 4.47 times
+and the longest gap fell about 89%, while the incoming TTFTs increased about
+24% and 68%. The initial cold candidate run measured 32.14 tokens/s, a 0.330 s
+gap, and TTFTs of 17.68/34.75 s. These are online measurements with overlapping
+prefill; they are not pure-decode throughput claims.
+
+For the separate pure-decode check, each cohort used fixed 32768-token IDs,
+a 256-token output cap, temperature/top-p/top-k of 0.7/0.8/20, and fixed seeds.
+One cohort warmed the route; two cohorts were measured. A 1024-token long
+prefill threshold admitted the cohort before the common all-requests-alive
+output window. No new requests arrived inside that window. EOS was disabled
+only for this sustained performance measurement.
+
+| Pure decode (tokens/s) | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| C1 | 184.78 | 185.31 | +0.29% |
+| C4 | 477.39 | 484.88 | +1.57% |
+| C8 | 617.61 | 609.41 | -1.33% |
+
+The control source was b2335687 plus #841. The candidate incorporated main
+1d1d1c9d as well as this work. These results validate the combined candidate;
+they do not isolate the contribution of each kernel or intervening main fix.
+Eight deterministic natural-EOS answer checks passed in both arms. Long
+needle checks also used natural completion; cache-hit validation is recorded
+separately from repeated-prompt answer correctness.
+
+The first dequantization/GEMM fusion candidate was rejected. Communication
+and computation overlap is not implemented in this change. Broad scheduler
+tests that import Llava were unavailable in the test environment because of
+an unrelated Transformers Pixtral import mismatch; focused cache, state,
+scheduling, kernel and packaging tests provide the change's validation.

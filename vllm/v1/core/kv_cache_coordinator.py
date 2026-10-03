@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
 )
 from vllm.v1.request import Request
 
@@ -99,7 +100,9 @@ class KVCacheCoordinator(ABC):
         # SWA must preserve the window at the checkpoint Mamba actually admits,
         # rather than the prompt's final (unrestorable) alignment boundary.
         sparse_mamba = bool(self.eagle_group_ids) and any(
-            m.kv_cache_spec.mamba_cache_mode == "align" and m.block_size == alignment
+            isinstance(m.kv_cache_spec, MambaSpec)
+            and m.kv_cache_spec.mamba_cache_mode == "align"
+            and m.block_size == alignment
             for m in mamba
         )
         for manager in self.single_type_managers:
