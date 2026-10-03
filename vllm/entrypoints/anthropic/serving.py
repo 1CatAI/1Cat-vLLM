@@ -43,6 +43,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     JsonSchemaResponseFormat,
     ResponseFormat,
     StreamOptions,
+    UsageInfo,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 
@@ -54,6 +55,14 @@ logger = logging.getLogger(__name__)
 
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
+
+
+def _cache_usage_fields(usage: UsageInfo | None) -> dict[str, int]:
+    if usage is not None and usage.prompt_tokens_details is not None:
+        cached_tokens = usage.prompt_tokens_details.cached_tokens
+        if cached_tokens is not None:
+            return {"cache_read_input_tokens": cached_tokens}
+    return {}
 
 
 class AnthropicServingMessages(OpenAIServingChat):
@@ -508,6 +517,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             usage=AnthropicUsage(
                 input_tokens=generator.usage.prompt_tokens,
                 output_tokens=generator.usage.completion_tokens,
+                **_cache_usage_fields(generator.usage),
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -664,6 +674,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         if origin_chunk.usage
                                         else 0,
                                         output_tokens=0,
+                                        **_cache_usage_fields(origin_chunk.usage),
                                     ),
                                 ),
                             )
@@ -689,6 +700,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     output_tokens=origin_chunk.usage.completion_tokens
                                     if origin_chunk.usage
                                     else 0,
+                                    **_cache_usage_fields(origin_chunk.usage),
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
