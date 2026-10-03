@@ -81,6 +81,25 @@ constexpr auto operator|(constant<a>, constant<b>)
     return constant<a | b>{};
 }
 
+std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, int sm)
+{
+    if (sm != 70) return {};
+    constexpr Cvt<uint64_t, uint64_t> S;
+    constexpr auto layout = constant<(Pack)(HMMA_884 | OPERAND_V | 1)>{};
+    constexpr auto weight_layout = constant<(Pack)(HMMA_884 | OPERAND_B | 1)>{};
+    if (low_bits == 2) {
+        constexpr Cvt<uint16_t, uint2_t> W;
+        return {W(Sm70{}, constant<kRowMajor>{}, weight_layout),
+                S(Sm70{}, constant<kColMajor>{}, layout)};
+    }
+    if (low_bits == 4) {
+        constexpr Cvt<uint16_t, uint4_t> W;
+        return {W(Sm70{}, constant<kRowMajor>{}, weight_layout),
+                S(Sm70{}, constant<kColMajor>{}, layout)};
+    }
+    return {};
+}
+
 std::array<const LayoutConverter*, 2> GetConverters(DataType data_type,
                                                     DataType weight_type,  //
                                                     DataType input_type,

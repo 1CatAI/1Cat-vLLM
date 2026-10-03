@@ -8,6 +8,7 @@ import torch
 
 from vllm.model_executor.kernels.gguf import GGUFDecoderFamily, GGUFOperatorCapability
 from vllm.model_executor.layers.quantization.gguf_transcode import (
+    AFFINE_BITPLANE_TYPES,
     AFFINE_GROUP32_TYPES,
     AFFINE_U2_TYPES,
 )
@@ -39,18 +40,35 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             return False, "requires_canonical_gguf_affine_storage"
         if not config.enabled:
             return False, "disabled_by_kernel_config"
-        if config.source_type not in AFFINE_GROUP32_TYPES | AFFINE_U2_TYPES:
+        if (
+            config.source_type
+            not in AFFINE_GROUP32_TYPES | AFFINE_U2_TYPES | AFFINE_BITPLANE_TYPES
+        ):
             return False, "source_format_codec_unavailable"
         if config.act_type != torch.float16:
             return False, "requires_fp16_activations"
         expected_type = (
-            scalar_types.uint2
-            if config.source_type in AFFINE_U2_TYPES
-            else (scalar_types.uint8 if config.source_type == 8 else scalar_types.uint4)
+            {
+                6: scalar_types.uint5,
+                7: scalar_types.uint5,
+                11: scalar_types.uint3,
+                13: scalar_types.uint5,
+                14: scalar_types.uint6,
+            }[config.source_type]
+            if config.source_type in AFFINE_BITPLANE_TYPES
+            else (
+                scalar_types.uint2
+                if config.source_type in AFFINE_U2_TYPES
+                else (
+                    scalar_types.uint8
+                    if config.source_type == 8
+                    else scalar_types.uint4
+                )
+            )
         )
         if config.weight_type != expected_type:
             return False, "canonical_integer_width_unavailable"
-        expected_group = 16 if config.source_type == 10 else 32
+        expected_group = 16 if config.source_type in (10, 11, 14) else 32
         if config.group_size != expected_group or config.has_g_idx:
             return False, "canonical_group_or_activation_order_not_supported"
         k, n = config.partition_weight_shape

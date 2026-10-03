@@ -67,7 +67,10 @@ public:
         }
 
         if constexpr (OpV::SmemLayout::kSize > 1) {
-            desc_.quant_b = QuantDesc{QuantType::kDefault, OpV::kGroupSize};
+            constexpr auto quant_type = std::is_same_v<typename OpV::Dtype, uint64_t>
+                                            ? QuantType::kBitPlane
+                                            : QuantType::kDefault;
+            desc_.quant_b = QuantDesc{quant_type, OpV::kGroupSize};
         }
 
         desc_.cta_tile = {Gemm::CTA_M, Gemm::CTA_N, Gemm::CTA_K};

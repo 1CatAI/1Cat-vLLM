@@ -122,6 +122,14 @@ using Config_U8_Affine =
               Operand_B_Pack<uint8_t>, Transform_HMMA_SIMT_B,
               Operand_V_Pack<uint32_t>, kRowMajor, half, raster_order, group_axis>;
 
+template<int LowBits, int HighBits, int GroupSize, Order raster_order,
+         int group_axis = -1>
+using Config_GgufBitPlane =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<std::conditional_t<LowBits == 2, uint2_t, uint4_t>>,
+              Transform_HMMA_SM70_BitPlane<LowBits, HighBits, GroupSize>,
+              Operand_V_Pack<uint64_t>, kRowMajor, half, raster_order, group_axis>;
+
 template <Order raster_order, int group_axis = -1>
 using Config_MXF4 = Sm70_s884<Operand_A<half>,             // A
                               Transform_Default,           // tarnsform A
