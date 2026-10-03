@@ -42,7 +42,6 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -128,18 +127,17 @@ KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
 
 
 def _sm70_moe_backend_requested_explicitly(layer) -> bool:
-    """Use the oracle for explicit choices or an admitted skinny MoE kernel.
+    """True when the run pins an SM70 MoE backend with ``--moe-backend``.
 
-    Unsupported automatic configurations retain the existing TurboMind path.
+    The SM70 ModelOpt NVFP4 MoE otherwise binds to the TurboMind experts,
+    whose tuned prefill paths are gated on the TP4 shapes (num_experts 512,
+    hidden 2560, w13 n=320). At other topologies every fast path falls
+    through to the per-expert dense stage, which re-reads an expert's weights
+    per call. Honouring the user's explicit pick lets that run take the
+    selected backend instead. Without the flag nothing changes.
     """
     moe_config = getattr(layer, "moe_config", None)
     backend = getattr(moe_config, "moe_backend", "auto")
-    if moe_config is not None and backend == "auto":
-        from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
-            skinny_backend_admitted,
-        )
-
-        return skinny_backend_admitted(moe_config)
     return isinstance(backend, str) and backend.lower() not in ("", "auto")
 
 
@@ -1620,8 +1618,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
-        *,
-        allow_skinny: bool = True,
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
@@ -1636,7 +1632,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             config=self.moe,
             weight_key=kNvfp4Static,
             activation_key=None if self.use_a16 else kNvfp4Dynamic,
-            allow_skinny=allow_skinny,
         )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
@@ -1778,42 +1773,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
-
-        if self.nvfp4_backend == NvFp4MoeBackend.SM70_SKINNY:
-            from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
-                nvfp4_skinny_scale_reason,
-            )
-
-            reason = nvfp4_skinny_scale_reason(
-                layer.w13_weight_scale_2, layer.w2_weight_scale_2
-            )
-            if reason is not None:
-                if self.moe.moe_backend != "auto":
-                    raise ValueError(reason)
-                fallback: FusedMoEMethodBase
-                if sm70_tm.is_exact_sm70_cuda_platform():
-                    from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
-                        ModelOptNvFp4SM70MoEMethod,
-                    )
-
-                    fallback = ModelOptNvFp4SM70MoEMethod(self.quant_config, self.moe)
-                else:
-                    fallback = ModelOptNvFp4FusedMoE(
-                        self.quant_config, self.moe, allow_skinny=False
-                    )
-                logger.info_once("Skinny MoE fallback: %s", reason)
-                get_current_vllm_config().kernel_config.moe_kernel_selections[
-                    f"Nvfp4SkinnySm70Experts:{self.moe.hidden_dim}:"
-                    f"{self.moe.intermediate_size_per_partition}"
-                ] = {
-                    "enabled": False,
-                    "reason": reason,
-                    "scope": "loaded_scale_capability",
-                }
-                fallback.process_weights_after_loading(layer)
-                layer._replace_quant_method(fallback)
-                layer.base_quant_method = fallback
-                return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(

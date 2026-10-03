@@ -46,9 +46,6 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_B12X = "FLASHINFER_B12X"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
-    # Skinny QPN kernels for SM70/SM75, fp16 activations. Only on request
-    # (moe_backend="sm70_skinny"), never picked automatically.
-    SM70_SKINNY = "SM70_SKINNY"
     EMULATION = "EMULATION"
 
 
@@ -131,12 +128,6 @@ def backend_to_kernel_cls(
         )
 
         return [MarlinExperts]
-    elif backend == NvFp4MoeBackend.SM70_SKINNY:
-        from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
-            Nvfp4SkinnySm70Experts,
-        )
-
-        return [Nvfp4SkinnySm70Experts]
     elif backend == NvFp4MoeBackend.EMULATION:
         from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
             Nvfp4QuantizationEmulationTritonExperts,
@@ -156,7 +147,6 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
         "marlin": NvFp4MoeBackend.MARLIN,
-        "sm70_skinny": NvFp4MoeBackend.SM70_SKINNY,
         "emulation": NvFp4MoeBackend.EMULATION,
     }
     if backend := mapping.get(runner_backend):
@@ -171,8 +161,6 @@ def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
     activation_key: QuantKey | None,
-    *,
-    allow_skinny: bool = True,
 ) -> tuple[NvFp4MoeBackend, type[mk.FusedMoEExperts]]:
     """
     Select the primary NvFP4 MoE backend
@@ -184,7 +172,6 @@ def select_nvfp4_moe_backend(
     # the upstream CUTLASS SM121 MMA op guard is resolved; use
     # moe_backend="flashinfer_b12x" to opt in explicitly.
     AVAILABLE_BACKENDS = [
-        NvFp4MoeBackend.SM70_SKINNY,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
@@ -196,12 +183,7 @@ def select_nvfp4_moe_backend(
 
     NVFP4_BACKENDS_WITH_CLAMP = {
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
-        # Applies the clamp through the inherited TritonExperts.activation().
-        NvFp4MoeBackend.SM70_SKINNY,
     }
-
-    if not allow_skinny:
-        AVAILABLE_BACKENDS.remove(NvFp4MoeBackend.SM70_SKINNY)
 
     if config.swiglu_limit is not None:
         AVAILABLE_BACKENDS = [
@@ -440,11 +422,6 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale_2=w2_scale_2,
             is_act_and_mul=is_act_and_mul,
         )
-    elif nvfp4_backend == NvFp4MoeBackend.SM70_SKINNY:
-        # No conversion here: the experts permute codes and scales into
-        # fragment order in process_weights_after_loading. Activations stay
-        # fp16, so the input scales are not used.
-        pass
     elif nvfp4_backend == NvFp4MoeBackend.EMULATION:
         # Move the E2M1 lookup table to the device now, because
         # `.to(device)` is not allowed during CUDA graph capture.
@@ -504,19 +481,6 @@ def make_nvfp4_moe_quant_config(
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
-        )
-    elif backend == NvFp4MoeBackend.SM70_SKINNY:
-        # w4a16 like MARLIN's nvfp4_w4a16_moe_quant_config, but with the
-        # SwiGLU clamp carried through (the w4a16 helper has no such
-        # parameter and MARLIN never serves clamp models).
-        return FusedMoEQuantConfig.make(
-            quant_dtype=None,
-            w1_scale=w13_scale,
-            w2_scale=w2_scale,
-            g1_alphas=w13_scale_2,
-            g2_alphas=w2_scale_2,
-            weight_dtype="nvfp4",
-            gemm1_clamp_limit=swiglu_limit,
         )
     elif backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
