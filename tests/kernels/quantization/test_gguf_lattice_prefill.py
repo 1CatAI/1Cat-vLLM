@@ -50,3 +50,71 @@ def test_lattice_dequant_fp32_blas_and_graph(weight_type):
         torch.testing.assert_close(
             compiled().float(), expected, rtol=0.003, atol=0.0002
         )
+
+
+@pytest.mark.parametrize("weight_type", [17, 18, 21])
+def test_calibrated_lattice_routes_share_affine_workspace(weight_type):
+    import numpy as np
+    from test_gguf_lattice_transcode import source
+
+    from vllm.model_executor.kernels.linear import (
+        Sm70GgufLatticeConfig,
+        TurboMindGgufLatticeKernel,
+    )
+    from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+        _get_affine_blas_workspace,
+    )
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        transcode_lattice,
+    )
+    from vllm.scalar_type import scalar_types
+
+    torch._dynamo.reset()
+    n, k = (1536 if weight_type == 21 else 160), 2560
+    p = transcode_lattice(
+        source(weight_type, n=n, k=k, scale=0.0009765625), weight_type
+    )
+    config = Sm70GgufLatticeConfig(
+        (k, n),
+        (k, n),
+        scalar_types.uint2,
+        torch.float16,
+        p.group_size,
+        False,
+        False,
+        source_type=weight_type,
+    )
+    kernel = TurboMindGgufLatticeKernel(config, "codes", "scales")
+    layer = torch.nn.Module()
+    codes, metadata = p.mma884_storage()
+    signed = metadata.view({2: np.int16, 4: np.int32, 8: np.int64}[metadata.itemsize])
+    for name, data in (("codes", codes), ("scales", signed)):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.from_numpy(data).cuda(), requires_grad=False)
+        )
+    kernel.process_weights_after_loading(layer)
+    assert all(c.reason is None for c in kernel.prefill_capabilities)
+    assert (
+        layer.gguf_tm_blas_workspace.data_ptr()
+        == _get_affine_blas_workspace(layer.codes).data_ptr()
+    )
+    boundaries = (1024, 2048) if weight_type == 21 else (4, 8, 1024, 2048, 4096)
+    dense = torch.from_numpy(p.dequantize()).half().cuda()
+    for m in boundaries:
+        admitted = any(c.supports_m(m) for c in kernel.prefill_capabilities)
+        assert admitted == (
+            m >= 2048 if weight_type == 21 else 8 <= m <= 1024 or m >= 4096
+        )
+        x = (torch.randn((m, k), device="cuda") * 0.125).half()
+        expected = x.float() @ dense.float().T
+        run = lambda x: kernel.apply_weights(layer, x)
+        torch.testing.assert_close(run(x).float(), expected, rtol=0.003, atol=0.003)
+        compiled = torch.compile(run, backend="eager", fullgraph=True)
+        torch.testing.assert_close(
+            compiled(x).float(), expected, rtol=0.003, atol=0.003
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run(x)
+        graph.replay()
+        torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.003)

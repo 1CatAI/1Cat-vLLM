@@ -13,6 +13,15 @@ from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+from .sm70_gguf import _get_affine_blas_workspace
+
+# Matched Flash-Next TP4 sweeps; unmeasured descriptors retain fused MMA.
+# The narrow expert crossover is nonmonotonic, so it has two intervals.
+_LATTICE_BLAS_BANDS = {
+    (17, 2560, 160): ((8, 1024), (4096, None)),
+    (18, 2560, 160): ((8, 1024), (4096, None)),
+    (21, 2560, 1536): ((2048, None),),
+}
 
 
 @dataclass
@@ -68,21 +77,32 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
             "gguf_lattice_gemm_sm70_out",
             True,
         )
-        self.operator_capabilities = (
-            self.capability,
+        k, n = self.config.partition_weight_shape
+        bands = _LATTICE_BLAS_BANDS.get((self.source_type, k, n))
+        reason = None
+        if not hasattr(torch.ops._C, "gguf_lattice_blas_sm70_out"):
+            reason = "operator_missing:gguf_lattice_blas_sm70_out"
+        elif bands is None:
+            reason = "local_shape_has_no_prefill_calibration"
+        else:
+            workspace = _get_affine_blas_workspace(weight)
+            if workspace is None:
+                reason = "prefill_workspace_allocation_failed"
+            else:
+                layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
+        self.prefill_capabilities = tuple(
             GGUFOperatorCapability(
                 GGUFDecoderFamily.LATTICE,
-                quant_type_name(self.config.source_type),
+                quant_type_name(self.source_type),
                 "gguf_lattice_blas_sm70_out",
                 True,
-                min_m=128,
-                reason=(
-                    "prefill_selection_pending_measurements"
-                    if hasattr(torch.ops._C, "gguf_lattice_blas_sm70_out")
-                    else "operator_missing:gguf_lattice_blas_sm70_out"
-                ),
-            ),
+                min_m=minimum,
+                max_m=maximum,
+                reason=reason,
+            )
+            for minimum, maximum in (bands or ((128, None),))
         )
+        self.operator_capabilities = (self.capability, *self.prefill_capabilities)
         layer._gguf_tm_lattice_prepared = True
 
     def apply_weights(self, layer, x, bias=None):
@@ -91,16 +111,30 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
         n = self.config.partition_weight_shape[1]
         rows = x.reshape(-1, x.shape[-1]).contiguous()
         output = torch.empty((rows.shape[0], n), dtype=x.dtype, device=x.device)
-        torch.ops._C.gguf_lattice_gemm_sm70_out(
-            output,
-            rows,
-            getattr(layer, self.w_q_name),
-            getattr(layer, self.w_s_name),
-            self.source_type,
-            layer.gguf_tm_k_ld,
-            layer.gguf_tm_q_ld,
-            self.config.group_size,
-        )
+        if any(
+            capability.reason is None and capability.supports_m(rows.shape[0])
+            for capability in self.prefill_capabilities
+        ):
+            torch.ops._C.gguf_lattice_blas_sm70_out(
+                output,
+                rows,
+                getattr(layer, self.w_q_name),
+                getattr(layer, self.w_s_name),
+                self.source_type,
+                layer.gguf_tm_blas_workspace,
+                self.config.group_size,
+            )
+        else:
+            torch.ops._C.gguf_lattice_gemm_sm70_out(
+                output,
+                rows,
+                getattr(layer, self.w_q_name),
+                getattr(layer, self.w_s_name),
+                self.source_type,
+                layer.gguf_tm_k_ld,
+                layer.gguf_tm_q_ld,
+                self.config.group_size,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(*x.shape[:-1], n)

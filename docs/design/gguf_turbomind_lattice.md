@@ -184,8 +184,8 @@ FP16 `[K,N]` scratch, and calls cuBLAS with explicit FP32 accumulation and
 reductions. Output and scratch are caller-owned and graph-safe. All seven
 formats reconstruct canonical FP16 weights elementwise, match the FP32 GEMM
 oracle, and pass graph replay/full-graph tracing. The combined suite passes
-92 GPU checks with one non-SM70 skip. Framework reporting declares this
-candidate; default selection remains pending the complete timing bands.
+92 GPU checks with one non-SM70 skip. Framework reporting declares calibrated M intervals. Unmeasured local
+shapes retain fused MMA with `local_shape_has_no_prefill_calibration`.
 
 | Type | N | K | M | Word fused | Canonical DQ + FP32 GEMM | AWQ |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -214,3 +214,75 @@ must be measured before setting default bands.
 Grouped M=8192 improves from 405.49 to 385.47 us (IQ2_XS) and from 361.99
 to 342.75 us (IQ3_XXS), while AWQ remains about 228.4 us. Grouped continues
 to use the fused operator; dense DQ timing does not claim grouped performance.
+
+## Calibrated dense dispatch
+
+The complete TP4 sweep adds M=256/1024/4096 to the standard M points.
+IQ2_XS and IQ3_XXS at N=160/K=2560 select canonical DQ + FP32 GEMM for
+M=8–1024 and M>=4096. M=2048 remains fused: the IQ2_XS DQ path is slightly
+slower, and the IQ3_XXS difference is small. IQ3_S at N=1536/K=2560 selects
+DQ for M>=2048. No interpolation changes unmeasured descriptors.
+
+Scratch reuses the affine prefill pool, bounded at 178,257,920 bytes per
+device, shared across layers and allocated before graph capture. Its views
+retain the pool lifetime. Missing operators, unmeasured shapes and allocation
+failure have explicit capability reasons and retain fused MMA. Sequential
+layer execution on the device stream is required for shared scratch reuse.
+FP16 activations, FP16 reconstructed weights and explicit FP32 cuBLAS
+accumulation/reductions remain unchanged.
+
+| Type | M | Fused us | Canonical DQ us | AWQ us | Default |
+| --- | --- | --- | --- | --- | --- |
+| IQ2_XS | 1 | 19.76 | 15.97 | 13.77 | Fused |
+| IQ2_XS | 2 | 19.73 | 22.31 | 14.02 | Fused |
+| IQ2_XS | 4 | 19.86 | 22.32 | 14.14 | Fused |
+| IQ2_XS | 8 | 21.38 | 13.69 | 17.14 | DQ |
+| IQ2_XS | 16 | 20.86 | 12.83 | 22.16 | DQ |
+| IQ2_XS | 32 | 21.25 | 12.90 | 32.97 | DQ |
+| IQ2_XS | 64 | 29.00 | 13.38 | 32.92 | DQ |
+| IQ2_XS | 128 | 64.17 | 14.62 | 25.90 | DQ |
+| IQ2_XS | 256 | 64.78 | 17.18 | 25.89 | DQ |
+| IQ2_XS | 512 | 64.49 | 25.31 | 26.27 | DQ |
+| IQ2_XS | 1024 | 68.79 | 39.64 | 45.32 | DQ |
+| IQ2_XS | 2048 | 78.81 | 80.45 | 71.56 | Fused |
+| IQ2_XS | 4096 | 128.85 | 100.90 | 117.35 | DQ |
+| IQ2_XS | 8192 | 257.38 | 161.32 | 239.87 | DQ |
+| IQ3_XXS | 1 | 16.82 | 13.44 | 12.74 | Fused |
+| IQ3_XXS | 2 | 14.82 | 19.72 | 13.09 | Fused |
+| IQ3_XXS | 4 | 15.14 | 19.71 | 13.28 | Fused |
+| IQ3_XXS | 8 | 16.35 | 11.10 | 17.03 | DQ |
+| IQ3_XXS | 16 | 16.32 | 10.22 | 22.23 | DQ |
+| IQ3_XXS | 32 | 16.25 | 10.52 | 32.76 | DQ |
+| IQ3_XXS | 64 | 24.60 | 10.84 | 32.93 | DQ |
+| IQ3_XXS | 128 | 67.47 | 11.96 | 25.78 | DQ |
+| IQ3_XXS | 256 | 67.99 | 14.60 | 26.03 | DQ |
+| IQ3_XXS | 512 | 68.19 | 20.63 | 26.14 | DQ |
+| IQ3_XXS | 1024 | 68.26 | 35.97 | 45.51 | DQ |
+| IQ3_XXS | 2048 | 80.04 | 75.99 | 71.07 | Fused |
+| IQ3_XXS | 4096 | 132.36 | 97.93 | 117.56 | DQ |
+| IQ3_XXS | 8192 | 263.33 | 157.02 | 239.78 | DQ |
+| IQ3_S | 1 | 20.19 | 35.46 | 15.07 | Fused |
+| IQ3_S | 2 | 19.35 | 33.27 | 15.14 | Fused |
+| IQ3_S | 4 | 19.42 | 33.52 | 15.23 | Fused |
+| IQ3_S | 8 | 20.33 | 33.86 | 16.03 | Fused |
+| IQ3_S | 16 | 21.87 | 34.46 | 18.17 | Fused |
+| IQ3_S | 32 | 24.82 | 36.42 | 22.78 | Fused |
+| IQ3_S | 64 | 29.29 | 39.98 | 28.22 | Fused |
+| IQ3_S | 128 | 43.30 | 46.78 | 46.54 | Fused |
+| IQ3_S | 256 | 73.64 | 67.83 | 51.04 | Fused |
+| IQ3_S | 512 | 90.94 | 124.18 | 86.36 | Fused |
+| IQ3_S | 1024 | 193.98 | 200.09 | 167.68 | Fused |
+| IQ3_S | 2048 | 380.63 | 284.38 | 357.31 | DQ |
+| IQ3_S | 4096 | 631.48 | 449.40 | 526.80 | DQ |
+| IQ3_S | 8192 | 1173.04 | 775.53 | 962.25 | DQ |
+
+A narrow grouped tile experiment passed all 21 lattice GPU checks but had
+format-dependent results. IQ2_XS grouped M=8192 improved from 385.47 to
+321.14 us; AWQ was 228.58 us. IQ3_XXS regressed from 342.75 to 487.37 us
+at the same point, so its new narrow candidates were rejected. Only the
+IQ2_XS grouped candidates remain, restricted to N<=256. The final candidate
+set passes 95 GPU checks with one non-SM70 skip, including interval
+boundaries, shared scratch and graph tracing. Installed-wheel validation
+remains pending. Grouped performance still
+needs work before model integration; dense DQ results do not establish full
+MoE or model throughput.

@@ -141,6 +141,13 @@ def test_lattice_framework_and_fullgraph_tracing(weight_type):
         )
     kernel.process_weights_after_loading(layer)
     assert layer.scales.dtype in (torch.int16, torch.int32, torch.int64)
+    if weight_type in (17, 18):
+        assert all(c.reason is None for c in kernel.prefill_capabilities)
+    else:
+        assert all(
+            c.reason == "local_shape_has_no_prefill_calibration"
+            for c in kernel.prefill_capabilities
+        )
     x = (torch.randn((8, k), device="cuda") * 0.125).half()
     expected = x.float() @ torch.from_numpy(p.dequantize()).half().cuda().float().T
     torch.testing.assert_close(
