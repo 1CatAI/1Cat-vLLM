@@ -1209,7 +1209,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     def remote_placement(self) -> PLERemotePlacement | None:
         """The rows of this rank the cascade worker has to serve."""
-        if not self._cascade:
+        # Whole-table offload skips the GPU placeholder's constructor.
+        if not getattr(self, "_cascade", False):
             return None
         embedding = self.ngram_embedding
         if not isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
