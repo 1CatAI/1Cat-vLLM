@@ -90,6 +90,11 @@ class SchedulerConfig:
     and running requests. Only applies when long_prefill_token_threshold is
     nonzero."""
 
+    mixed_prefill_step_latency_ms: float = Field(default=250.0, ge=0)
+    """GPU step latency target when prefill shares a batch with resident decode.
+    The prefill token budget adapts to completed GPU measurements. Pure prefill
+    keeps the normal token budget. Zero disables latency control."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.

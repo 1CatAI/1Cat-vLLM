@@ -5259,8 +5259,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and mixed_qkv is not None
             and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_spec_decodes > 0
-            and attn_metadata.num_prefills == 0
-            and attn_metadata.num_decodes == 0
+            # Prefill chunks and plain decodes may share the batch: the
+            # verifier only touches the speculative requests, whose tokens and
+            # recurrent-state slots are described by the spec_* metadata.
             and attn_metadata.ddtree_parent_ids is None
             and attn_metadata.spec_query_start_loc is not None
             and attn_metadata.spec_state_indices_tensor is not None
@@ -5684,10 +5685,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_non_spec_tokens] = core_attn_out_non_spec.squeeze(0)
             return
 
+        # The speculative rows are the whole batch, or a subset next to prefill
+        # chunks and plain decodes. Verification must not depend on that: its
+        # operands are gathered once, and the result is merged back by token
+        # index like every other mixed-batch output.
+        spec_rows_are_batch = (
+            attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
+        )
+        a_spec, b_spec = a, b
+        if spec_sequence_masks is not None and not spec_rows_are_batch:
+            assert spec_token_indx is not None
+            a_spec = a.index_select(0, spec_token_indx)
+            b_spec = b.index_select(0, spec_token_indx)
         use_dflash2_packed_gdn_verify = self._can_use_dflash2_packed_gdn_verify(
             mixed_qkv=mixed_qkv_spec,
-            a=a,
-            b=b,
+            a=a_spec,
+            b=b_spec,
             core_attn_out=core_attn_out,
             ssm_state=ssm_state,
             attn_metadata=attn_metadata,
@@ -5697,8 +5710,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not use_dflash2_packed_gdn_verify
             and spec_sequence_masks is not None
             and ddtree_parent_ids is None
-            and attn_metadata.num_prefills == 0
-            and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
             and current_platform.is_device_capability(70)
             and self.num_k_heads // self.tp_size == 4
@@ -5820,23 +5831,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                a_spec = a
-                b_spec = b
-            else:
-                assert spec_token_indx is not None
-                a_spec = a.index_select(0, spec_token_indx)
-                b_spec = b.index_select(0, spec_token_indx)
             if use_dflash2_packed_gdn_verify:
                 assert mixed_qkv_spec is not None
                 assert spec_query_start_loc is not None
                 assert spec_state_indices_tensor is not None
                 assert spec_state_slot_selectors is not None
+                # The verifier writes its rows densely from row zero. Beside
+                # other requests those are not the leading rows of the layer
+                # output, so it fills a scratch buffer that is merged below.
+                spec_out = (
+                    core_attn_out
+                    if spec_rows_are_batch
+                    else core_attn_out.new_empty(
+                        (mixed_qkv_spec.shape[0], *core_attn_out.shape[1:])
+                    )
+                )
                 core_attn_out_spec = self._forward_dflash2_packed_gdn_verify(
                     mixed_qkv=mixed_qkv_spec,
                     a=a_spec,
                     b=b_spec,
-                    core_attn_out=core_attn_out,
+                    core_attn_out=spec_out,
                     ssm_state=ssm_state,
                     spec_query_start_loc=spec_query_start_loc,
                     spec_state_indices_tensor=spec_state_indices_tensor,
@@ -5846,6 +5860,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 last_recurrent_state = ssm_state
                 _log_runtime_route_once(
                     "SM70 DFlash2 packed GDN target-verification route hit."
+                    if spec_rows_are_batch
+                    else "SM70 DFlash2 packed GDN target-verification route hit "
+                    "beside prefill/decode rows."
                 )
             elif ddtree_tree_gdn_pure_spec:
                 assert mixed_qkv_spec is not None

@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.platforms import current_platform
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -37,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.mixed_prefill import MixedPrefillBudget
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -121,6 +123,11 @@ class Scheduler(SchedulerInterface):
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        self.mixed_prefill_budget = MixedPrefillBudget(
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.mixed_prefill_step_latency_ms,
+        )
+        self.mixed_prefill_enabled = current_platform.device_type == "cuda"
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -544,6 +551,58 @@ class Scheduler(SchedulerInterface):
             # Do not schedule any requests when paused.
             token_budget = 0
 
+        # Preserve decode capacity even if a running partial prefill precedes a
+        # resident in FCFS order. Replay after preemption counts as prefill too.
+        prefill_remaining = {
+            r.request_id: max(
+                0, max(r.num_prompt_tokens, r.num_tokens - 1) - r.num_computed_tokens
+            )
+            for r in self.running
+        }
+        resident_tokens = {
+            r.request_id: max(
+                0,
+                r.num_tokens_with_spec
+                + r.num_output_placeholders
+                - r.num_computed_tokens,
+            )
+            for r in self.running
+            if prefill_remaining[r.request_id] == 0
+            and r.num_output_tokens > 0
+            and self.current_step >= r.next_decode_eligible_step
+        }
+        resident_tokens = {rid: n for rid, n in resident_tokens.items() if n > 0}
+        control_mixed_prefill = (
+            self.mixed_prefill_enabled
+            and bool(resident_tokens)
+            and self.scheduler_config.mixed_prefill_step_latency_ms > 0
+            and self.scheduler_config.enable_chunked_prefill
+            and not self.scheduler_config.disable_chunked_mm_input
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not self.is_encoder_decoder
+        )
+
+        def limit_prefill(req_id: str, tokens: int) -> int:
+            if not control_mixed_prefill or prefill_remaining.get(req_id, 0) <= 0:
+                return tokens
+            used = sum(
+                min(n, prefill_remaining.get(rid, 0))
+                for rid, n in num_scheduled_tokens.items()
+            )
+            reserve = sum(
+                n
+                for rid, n in resident_tokens.items()
+                if rid not in num_scheduled_tokens
+            )
+            return max(
+                0,
+                min(
+                    tokens,
+                    self.mixed_prefill_budget.tokens - used,
+                    token_budget - reserve,
+                ),
+            )
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -655,6 +714,8 @@ class Scheduler(SchedulerInterface):
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+
+            num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -988,6 +1049,14 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+                    prefill_remaining[request.request_id] = max(
+                        0,
+                        max(request.num_prompt_tokens, request.num_tokens - 1)
+                        - num_computed_tokens,
+                    )
+                    num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
+                    if num_new_tokens == 0:
+                        break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -1214,6 +1283,26 @@ class Scheduler(SchedulerInterface):
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
+            mixed_prefill_tokens=(
+                sum(
+                    min(n, prefill_remaining.get(rid, 0))
+                    for rid, n in num_scheduled_tokens.items()
+                )
+                if control_mixed_prefill
+                else 0
+            ),
+            mixed_decode_tokens=(
+                sum(
+                    n
+                    for rid, n in num_scheduled_tokens.items()
+                    if rid in resident_tokens
+                )
+                if control_mixed_prefill
+                else 0
+            ),
+            mixed_prefill_budget=(
+                self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
+            ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
@@ -1618,6 +1707,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

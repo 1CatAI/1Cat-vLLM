@@ -556,6 +556,7 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
@@ -1435,6 +1436,10 @@ class EngineArgs:
             **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
         )
         # multi-step scheduling has been removed; corresponding arguments
+        scheduler_group.add_argument(
+            "--mixed-prefill-step-latency-ms",
+            **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+        )
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
@@ -2292,6 +2297,7 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
