@@ -63,7 +63,7 @@ def test_compact_score_overflow_recovery_with_changing_graph_inputs(
         device="cuda",
     )
     keys = torch.arange(kv_len, device="cuda")
-    for case in ["overflow", "ordinary"]:
+    for case in ["overflow", "negative_overflow", "ordinary"]:
         q.zero_()
         k.zero_()
         v.zero_()
@@ -76,6 +76,14 @@ def test_compact_score_overflow_recovery_with_changing_graph_inputs(
             q[:, rows, 2, 0] = 256
             k[:, start + 3, :, 0] = 4096
             k[:, start + 5, :, 0] = 4100
+        elif case == "negative_overflow":
+            q[:, rows, 2, 0] = 256
+            q[:, rows, 2, 1] = 16
+            k[..., 0] = -4096
+            k[:, start + 3, :, 1] = 1
+            k[:, start + 5, :, 1] = 2
+            v[:, start + 3, :, 0] = 1000
+            v[:, start + 5, :, 0] = -1000
         else:
             # Clear previous flags as well as maxima and denominators.
             k[:, start + 3, :, 0] = 2
