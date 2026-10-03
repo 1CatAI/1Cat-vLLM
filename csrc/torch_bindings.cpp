@@ -233,6 +233,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int group_size) -> ()");
   ops.impl("gguf_lattice_grouped_gemm_sm70_out", torch::kCUDA,
            &gguf_lattice_grouped_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lattice_grouped_vec_sm70_out", torch::kCUDA,
+           &gguf_lattice_grouped_vec_sm70_out);
   ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul_interleaved", torch::kCUDA, &silu_and_mul_interleaved);
 

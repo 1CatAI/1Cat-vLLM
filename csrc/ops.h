@@ -904,6 +904,13 @@ void gguf_lattice_grouped_gemm_sm70_out(
     torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
     int64_t num_experts, int64_t group_size);
 
+void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor offsets,
+                                       torch::Tensor weight_ptrs,
+                                       torch::Tensor stats_ptrs,
+                                       int64_t source_type, int64_t num_experts,
+                                       int64_t group_size);
+
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
                                       torch::Tensor stats, int64_t source_type,
                                       int64_t group_size);

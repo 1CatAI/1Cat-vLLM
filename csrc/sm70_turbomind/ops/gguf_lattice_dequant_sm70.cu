@@ -7,7 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <climits>
 #include <type_traits>
-#include "src/turbomind/kernels/gemm/lattice_transform.h"
+#include "gguf_lattice_canonical.cuh"
 
 namespace {
 template <int Type>
@@ -16,11 +16,8 @@ constexpr int lattice_group = Type == 17 || Type == 22 || Type == 29 ? 16 : 32;
 template <int Type>
 __global__ void lattice_dequant_kernel(half* output, const void* weight,
                                        const void* stats, int k, int n) {
-  using Transform =
-      turbomind::gemm::Transform_HMMA_SM70_Lattice<Type, lattice_group<Type>>;
-  using S = std::conditional_t<
-      Type == 18 || Type == 21, uint64_t,
-      std::conditional_t<Type == 19 || Type == 29, uint16_t, uint32_t>>;
+  using Decoder = vllm::sm70_gguf::LatticeCanonicalDecoder<Type>;
+  using Transform = typename Decoder::Transform;
   __shared__ __align__(16) uint8_t grid[Transform::kCodebookBytes];
   Transform::initialize(grid);
   const int64_t fragment =
@@ -30,28 +27,10 @@ __global__ void lattice_dequant_kernel(half* output, const void* weight,
   const int64_t tile = fragment / 32;
   const int base = (tile % (k / 8)) * 8;
   const int col = (tile / (k / 8)) * 32 + lane;
-  const int64_t stat_index =
-      static_cast<int64_t>(base / lattice_group<Type>) * n + col;
-  uint64_t metadata = static_cast<const S*>(stats)[stat_index];
-  const int within = base % lattice_group<Type>;
-  if constexpr (Type == 18 || Type == 21) {
-    metadata = (metadata & 65535U) |
-               (((metadata >> (16 + within)) & 255U) << 16) |
-               (((metadata >> (48 + within / 4)) & 3U) << 48);
-  } else if constexpr (Type != 19 && Type != 29) {
-    metadata = (metadata & 65535U) |
-               (((metadata >> (16 + 2 * (within / 8))) & 3U) << 16);
-  }
-  turbomind::Array<turbomind::uint2_t, 8> data[1][1];
-  data[0][0] = reinterpret_cast<const turbomind::Array<turbomind::uint2_t, 8>*>(
-      weight)[fragment];
-  turbomind::Array<S, 1> coefficients[1][1];
-  coefficients[0][0][0] = static_cast<S>(metadata);
-  turbomind::Array<half, 8> decoded[1][1];
-  Transform::apply(decoded, 0, data, coefficients, 1, grid);
+  const auto decoded = Decoder::fragment(weight, stats, k, n, col, base, grid);
 #pragma unroll
   for (int i = 0; i < 8; ++i)
-    output[static_cast<int64_t>(base + i) * n + col] = decoded[0][0][i];
+    output[static_cast<int64_t>(base + i) * n + col] = decoded[i];
 }
 
 int expected_group(int type) {
