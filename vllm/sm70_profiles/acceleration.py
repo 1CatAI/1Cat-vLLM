@@ -381,6 +381,16 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": cfg.kernel_config.ple_disk_cascade_reason,
         "scope": "configuration_capability",
     }
+    sparse_policy = cfg.kernel_config.sm70_sparse
+    report["sparse_kernel_policy"] = {
+        "scope": "indexed_sparse_attention",
+        "status": "runtime_guarded" if sparse_policy.reason is None else "fallback",
+        "reason": sparse_policy.reason,
+        "configuration": asdict(sparse_policy),
+        "decode_fallback": "retain configured paged QK-D for low query/index workloads",
+        "indexer_graph_fallback": "paged indexer for fixed full-graph key buckets",
+        "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
+    }
     # Configuration policy is resolved once per engine. Actual kernel selection
     # still needs each loaded layer's local layout and native capabilities.
     policy = getattr(cfg.kernel_config, "sm70_nvfp4", None)

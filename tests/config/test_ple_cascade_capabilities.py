@@ -106,7 +106,8 @@ def test_multiple_engines_keep_independent_policy(config):
 
 
 @pytest.mark.parametrize("active", [False, True])
-def test_hf_config_clone_preserves_policy_ownership(tmp_path, active):
+@pytest.mark.parametrize("policy", ["ple", "sparse"])
+def test_hf_config_clone_preserves_policy_ownership(tmp_path, active, policy):
     from transformers import Qwen3Config
 
     hf = Qwen3Config(
@@ -129,8 +130,15 @@ def test_hf_config_clone_preserves_policy_ownership(tmp_path, active):
         max_model_len=64,
     )
     parent = VllmConfig(model_config=model)
-    parent.kernel_config.ple_disk_cascade_active = active
+    if policy == "ple":
+        parent.kernel_config.ple_disk_cascade_active = active
+    else:
+        parent.kernel_config.sm70_sparse.active = active
     child = parent.with_hf_config(copy.deepcopy(hf))
     assert (child.kernel_config is parent.kernel_config) is not active
-    assert parent.kernel_config.ple_disk_cascade_active is active
+    if policy == "ple":
+        assert parent.kernel_config.ple_disk_cascade_active is active
+    else:
+        assert parent.kernel_config.sm70_sparse.active is active
+        assert not child.kernel_config.sm70_sparse.active
     assert not child.kernel_config.ple_disk_cascade_active

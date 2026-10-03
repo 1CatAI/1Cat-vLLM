@@ -351,6 +351,22 @@ class Sm70Fp8Config:
 
 
 @config
+class Sm70SparseConfig:
+    """Per-engine sparse attention policy; individual operators guard layouts."""
+
+    indexer_decode_cublas: bool = True
+    """Share paged index keys between query heads and rows when eligible."""
+    decode_bmm: bool = True
+    """Gather packed FP8 keys for eligible FP16 sparse decode matmuls."""
+    prefill_bmm: bool = True
+    """Use bounded batched matmuls for eligible FP16 sparse prefill."""
+    active: bool = Field(default=False, init=False)
+    """Whether the engine's metadata describes sparse indexed attention."""
+    reason: str | None = Field(default=None, init=False)
+    """Startup capability rejection; individual calls also check tensor layouts."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -430,6 +446,9 @@ class KernelConfig:
     sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
     """SM70 serialized block-FP8 variant policy, resolved per engine."""
 
+    sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
+    """SM70 sparse attention policy; admission uses actual tensor capabilities."""
+
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
@@ -483,6 +502,8 @@ class KernelConfig:
             ignored_factors.add("sm70_awq")
         if not self.sm70_fp8.resolved:
             ignored_factors.add("sm70_fp8")
+        if not self.sm70_sparse.active:
+            ignored_factors.add("sm70_sparse")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
@@ -497,7 +518,23 @@ class KernelConfig:
 
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
+        import torch
+
         from vllm.platforms import current_platform
+
+        model = vllm_config.model_config
+        text = getattr(model, "hf_text_config", None)
+        self.sm70_sparse.active = bool(getattr(text, "index_head_dim", None))
+        self.sm70_sparse.reason = (
+            "no indexed sparse-attention metadata"
+            if not self.sm70_sparse.active
+            else (
+                "requires CUDA compute capability 7.x"
+                if not current_platform.is_cuda()
+                or not current_platform.is_device_capability_family(70)
+                else ("requires FP16 queries" if model.dtype != torch.float16 else None)
+            )
+        )
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(

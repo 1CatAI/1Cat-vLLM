@@ -1394,9 +1394,11 @@ class VllmConfig:
             kernel_config.ple_disk_cascade_active
             or getattr(self.model_config.hf_text_config, "ple_layer_ids", None)
             or getattr(hf_config.get_text_config(), "ple_layer_ids", None)
+            or kernel_config.sm70_sparse.active
+            or getattr(hf_config.get_text_config(), "index_head_dim", None)
         ):
-            # PLE admission is model-specific; a draft must not reset its parent's
-            # storage placement. Keep existing sharing for models without PLE.
+            # Model-local admission must not be reset by a derived draft config.
+            # Keep existing sharing for unrelated models.
             kernel_config = copy.deepcopy(kernel_config)
 
         return replace(
