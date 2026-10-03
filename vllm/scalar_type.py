@@ -326,6 +326,7 @@ class ScalarType:
 
 class scalar_types:
     int4 = ScalarType.int_(4, None)
+    uint2 = ScalarType.uint(2, None)
     uint4 = ScalarType.uint(4, None)
     int8 = ScalarType.int_(8, None)
     uint8 = ScalarType.uint(8, None)

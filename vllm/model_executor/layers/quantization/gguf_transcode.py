@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import gguf
 import numpy as np
 
+from vllm.transformers_utils.gguf_tensor_reader import quant_size
+
 
 @dataclass(frozen=True)
 class AffineGGUFProjection:
@@ -63,6 +65,73 @@ AFFINE_GROUP32_TYPES = frozenset(
         gguf.GGMLQuantizationType.Q4_K,
     )
 )
+
+AFFINE_U2_TYPES = frozenset((10, 34, 35, 41, 42))
+
+
+def transcode_affine(data: np.ndarray, weight_type: int) -> AffineGGUFProjection:
+    """Normalize affine and ternary blocks without quantizing code values.
+
+    Small source blocks expand to group32 so TP4 K=160 does not cut Q2_0's
+    original 64-value blocks. Q2_K retains its group16 subblock boundaries.
+    Ternary formats use the same unsigned two-bit decoder and additive bias.
+    """
+    if weight_type in AFFINE_GROUP32_TYPES:
+        return transcode_affine_group32(data, weight_type)
+    if weight_type not in AFFINE_U2_TYPES:
+        raise ValueError(f"GGUF type {weight_type} has no affine codec")
+    block, size = quant_size(weight_type)
+    if data.dtype != np.uint8 or data.ndim != 2 or data.shape[1] % size:
+        raise ValueError("GGUF projection needs complete packed rows [N,bytes]")
+    rows, width = data.shape
+    k = width // size * block
+    blocks = np.ascontiguousarray(data).reshape(-1, size)
+    if weight_type == 10:  # Q2_K: affine metadata for each 16-value subblock.
+        d = blocks[:, 80:82].copy().view("<f2").astype(np.float32)
+        dmin = blocks[:, 82:84].copy().view("<f2").astype(np.float32)
+        scales = d * (blocks[:, :16] & 15).astype(np.float32)
+        mins = -dmin * (blocks[:, :16] >> 4).astype(np.float32)
+        shifts = np.arange(0, 8, 2, dtype=np.uint8).reshape(1, 1, 4, 1)
+        codes = (blocks[:, 16:80].reshape(-1, 2, 1, 32) >> shifts) & 3
+        group = 16
+    else:
+        group = 32
+        if weight_type in (41, 42):
+            d = blocks[:, :2].copy().view("<f2").astype(np.float32)
+            shifts = np.arange(0, 8, 1 if weight_type == 41 else 2, dtype=np.uint8)
+            codes = (blocks[:, 2:, None] >> shifts) & (1 if weight_type == 41 else 3)
+            if weight_type == 41:
+                # Codes 0/2 avoid doubling the FP16 scale at its range limit.
+                codes = codes * 2
+        else:
+            d = blocks[:, -2:].copy().view("<f2").astype(np.float32)
+            if weight_type == 35:
+                shifts = np.arange(0, 8, 2, dtype=np.uint8).reshape(1, 1, 4, 1)
+                codes = (blocks[:, :64].reshape(-1, 2, 1, 32) >> shifts) & 3
+            else:
+                # TQ1's base-3 lanes wrap in uint8, followed by floor(3*x/256).
+                # This is an integer storage conversion, including zero scales.
+                powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
+                sections = []
+                for payload, lane_width, factors in (
+                    (blocks[:, :32], 32, powers),
+                    (blocks[:, 32:48], 16, powers),
+                    (blocks[:, 48:52], 4, powers[:4]),
+                ):
+                    lanes = payload.reshape(-1, 1, lane_width) * factors[None, :, None]
+                    sections.append(lanes.reshape(-1, lane_width * len(factors)))
+                wrapped = np.concatenate(sections, axis=1)
+                codes = ((wrapped.astype(np.uint16) * 3) >> 8).astype(np.uint8)
+        scales = np.repeat(d, block // group, axis=1)
+        mins = -scales
+    return AffineGGUFProjection(
+        weight_type,
+        2,
+        group,
+        np.ascontiguousarray(codes.reshape(rows, k)),
+        _fp16_coefficients(scales.reshape(rows, k // group), "scale"),
+        _fp16_coefficients(mins.reshape(rows, k // group), "min"),
+    )
 
 
 def _fp16_coefficients(value: np.ndarray, name: str) -> np.ndarray:

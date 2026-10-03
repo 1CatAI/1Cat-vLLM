@@ -475,6 +475,13 @@ class KernelConfig:
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
+    qsa_auto_e4m3: bool = True
+    """Default eligible calibrated QSA caches to E4M3 without speculation."""
+    qsa_auto_e4m3_active: bool = Field(default=False, init=False)
+    """Whether automatic calibrated QSA storage was selected."""
+    qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
+    """Startup reason when calibrated automatic storage cannot be selected."""
+
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False
@@ -517,7 +524,10 @@ class KernelConfig:
             "linear_kernel_selections",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "qsa_auto_e4m3_reason",
         }
+        if not self.qsa_auto_e4m3_active:
+            ignored_factors.update({"qsa_auto_e4m3", "qsa_auto_e4m3_active"})
         if not self.ple_disk_cascade_active:
             ignored_factors.update(
                 {

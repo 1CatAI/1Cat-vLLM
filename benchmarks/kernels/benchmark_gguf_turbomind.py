@@ -12,7 +12,6 @@ import json
 from functools import partial
 from pathlib import Path
 
-import gguf
 import numpy as np
 import torch
 
@@ -22,11 +21,14 @@ from vllm.model_executor.layers.quantization.gguf_native import (
     pad_weight_tail,
 )
 from vllm.model_executor.layers.quantization.gguf_transcode import (
-    AFFINE_GROUP32_TYPES,
     reconstruction_error,
-    transcode_affine_group32,
+    transcode_affine,
 )
-from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, quant_type_name
+from vllm.transformers_utils.gguf_tensor_reader import (
+    GGUFReader,
+    dequantize,
+    quant_type_name,
+)
 
 M_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 512, 2048, 8192)
 
@@ -74,7 +76,7 @@ def elapsed(call, iterations, capture=False):
     return start.elapsed_time(end) * 1000 / iterations
 
 
-def awq_comparator(canonical):
+def prepare_awq_comparator(canonical):
     n, k = canonical.codes.shape
     if k % 128:
         return None
@@ -87,7 +89,14 @@ def awq_comparator(canonical):
     zero = torch.full(
         (k // 128, n // 8), -2004318072, dtype=torch.int32, device="cuda"
     )  # 0x88888888
-    weight, stats, meta = torch.ops._C.awq_sm70_prepare(packed, scale, zero, 128, False)
+    return torch.ops._C.awq_sm70_prepare(packed, scale, zero, 128, False)
+
+
+def awq_comparator(canonical):
+    prepared = prepare_awq_comparator(canonical)
+    if prepared is None:
+        return None
+    weight, stats, meta = prepared
     k_ld, q_ld = meta.tolist()
 
     def run(out, x):
@@ -133,14 +142,10 @@ def main():
     for name in args.tensor:
         tensor = tensors[name]
         weight_type = int(tensor.tensor_type)
-        if weight_type not in AFFINE_GROUP32_TYPES:
-            raise ValueError(f"{name}: canonical affine codec unavailable")
         array = tensor.data[args.expert] if tensor.data.ndim == 3 else tensor.data
         source = np.array(array, copy=True)
-        canonical = transcode_affine_group32(source, weight_type)
-        reference = gguf.quants.dequantize(
-            source, gguf.GGMLQuantizationType(weight_type)
-        )
+        canonical = transcode_affine(source, weight_type)
+        reference = dequantize(source, weight_type)
         rounding = reconstruction_error(canonical, reference)
         n, k = canonical.codes.shape
         weight, stats, meta = torch.ops._C.gguf_affine_sm70_prepare(
@@ -148,6 +153,7 @@ def main():
             torch.from_numpy(canonical.scales).cuda(),
             torch.from_numpy(canonical.mins).cuda(),
             canonical.bits,
+            canonical.group_size,
         )
         k_ld, q_ld = meta.tolist()
         packed = pad_weight_tail(torch.from_numpy(source).cuda(), weight_type)
@@ -166,9 +172,10 @@ def main():
                 bits=canonical.bits,
                 k_ld=k_ld,
                 q_ld=q_ld,
+                group_size=canonical.group_size,
             ):
                 torch.ops._C.gguf_affine_gemm_sm70_out(
-                    out, x, weight, stats, bits, k_ld, q_ld
+                    out, x, weight, stats, bits, k_ld, q_ld, group_size
                 )
                 return out
 
@@ -207,6 +214,8 @@ def main():
                 "m": m,
                 "n": n,
                 "k": k,
+                "canonical_bits": canonical.bits,
+                "canonical_group": canonical.group_size,
                 "coefficient_rounding": rounding,
                 "output_relative_l2": error.item(),
                 "routes": {},

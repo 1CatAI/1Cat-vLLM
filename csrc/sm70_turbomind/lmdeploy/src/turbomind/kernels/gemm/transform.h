@@ -117,6 +117,22 @@ struct Transform_HMMA_SIMT_B {
             cvt_f16x2x2_u8_trans<true>((const Array<uint8_t, 4>&)data[i]);
       }
       return decoded;
+    } else if constexpr (std::is_same_v<D, uint2_t> && std::is_same_v<F, half>) {
+      static_assert(N % 8 == 0);
+      Array<F, N> decoded;
+      constexpr uint32_t magic = 0x64006400U;
+      PRAGMA_UNROLL
+      for (int i = 0; i < N; i += 8) {
+        const uint32_t packed = (const uint16_t&)data[i];
+        PRAGMA_UNROLL
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t lanes = (packed >> (j * 2)) & 0x0303U;
+          uint32_t halves = __byte_perm(lanes, magic, 0x7170);
+          (half2&)decoded[i + j * 2] =
+              __hsub2((const half2&)halves, (const half2&)magic);
+        }
+      }
+      return decoded;
     } else {
       return ConvertKvCache<D, F>::convert(data);
     }

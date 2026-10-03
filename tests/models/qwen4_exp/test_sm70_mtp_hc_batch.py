@@ -114,12 +114,15 @@ def test_mtp_contract_rejects_other_modes(config, monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_hc_loader_tags_only_when_admitted(config, monkeypatch, enabled):
+@pytest.mark.parametrize("reduced", [False, True])
+def test_hc_loader_tags_only_when_admitted(config, monkeypatch, enabled, reduced):
     monkeypatch.setenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     monkeypatch.setenv("VLLM_SM70_MTP_HC_BATCH", str(int(enabled)))
     monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     monkeypatch.setattr(hc.current_platform, "is_device_capability", lambda _: True)
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced
     module = torch.nn.Module()
     module.use_combine, module.lora_rank = True, 320
     module.hc_count, module.hidden_size = 4, 2560
@@ -133,6 +136,7 @@ def test_hc_loader_tags_only_when_admitted(config, monkeypatch, enabled):
         assert hasattr(layer, "_sm70_qwen38_hc_batch_role") == enabled
         if enabled:
             assert layer._sm70_qwen38_hc_batch_role == role
+            assert layer._sm70_qwen38_hc_batch_concurrent == (not reduced)
             assert isinstance(layer.quant_method, gemv.Qwen38SM70FP16LinearMethod)
         else:
             assert type(layer.quant_method) is UnquantizedLinearMethod

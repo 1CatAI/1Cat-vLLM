@@ -98,6 +98,40 @@ struct Array {
 };
 
 template<int N>
+struct Array<uint2_t, N> {
+    static_assert(N % 8 == 0);
+    using value_type = detail::__uint2_t;
+    using size_type = int;
+    using difference_type = int;
+    using reference = value_type&;
+    using const_reference = const value_type&;
+    using pointer = SubBytePtr<uint2_t>;
+    using const_pointer = SubBytePtr<const uint2_t>;
+
+    detail::__uint2_t __a[N / 8];
+
+    TM_HOST_DEVICE constexpr reference operator[](size_type i) noexcept {
+        return __a[i / 8];
+    }
+    TM_HOST_DEVICE constexpr const_reference operator[](size_type i) const noexcept {
+        return __a[i / 8];
+    }
+    TM_HOST_DEVICE static constexpr std::integral_constant<int, N> size() noexcept {
+        return {};
+    }
+    TM_HOST_DEVICE static constexpr std::false_type empty() noexcept {
+        return {};
+    }
+    TM_HOST_DEVICE constexpr pointer data() noexcept {
+        return {(char*)&__a[0]};
+    }
+};
+
+static_assert(sizeof(Array<uint2_t, 8>) == 2);
+static_assert(sizeof(Array<uint2_t, 16>) == 4);
+static_assert(sizeof(Array<uint2_t, 32>) == 8);
+
+template<int N>
 struct Array<uint4_t, N> {
     using value_type      = detail::__uint4_t;
     using size_type       = int;
