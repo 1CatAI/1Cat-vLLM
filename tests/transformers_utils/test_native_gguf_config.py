@@ -15,6 +15,20 @@ from vllm.transformers_utils.gguf_config import (
 from vllm.transformers_utils.gguf_files import gguf_shard_paths, gguf_tensor_index
 
 
+@pytest.mark.parametrize("model", ["org/repo/model.gguf", "org/repo:IQ3_XXS"])
+def test_speculators_probe_does_not_use_transformers_for_gguf(monkeypatch, model):
+    from vllm.transformers_utils.config import maybe_override_with_speculators
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("GGUF must not enter the Transformers config parser")
+
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", forbidden)
+    speculative = {"method": "mtp", "num_speculative_tokens": 1}
+    assert maybe_override_with_speculators(
+        model, None, False, vllm_speculative_config=speculative
+    ) == (model, None, speculative)
+
+
 def write_fixture(path, arch="qwen35", *, extra=None, tensor="token_embd.weight"):
     w = gguf.GGUFWriter(path, arch)
     w.add_embedding_length(256)
