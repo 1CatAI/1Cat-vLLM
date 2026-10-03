@@ -107,8 +107,8 @@ def capture(args):
         mamba_ssm_cache_dtype="float32",
         kv_cache_dtype="float16",
         max_model_len=262144,
-        max_num_batched_tokens=8192,
-        max_num_seqs=max(widths),
+        max_num_batched_tokens=args.prefill_budget,
+        max_num_seqs=args.max_num_seqs or max(widths),
         gpu_memory_utilization=0.94,
         enable_prefix_caching=False,
         language_model_only=True,
@@ -119,6 +119,8 @@ def capture(args):
         ),
         disable_log_stats=False,
     )
+    if args.kv_cache_memory_bytes is not None:
+        engine_config["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     llm = LLM(**engine_config)
     import vllm._C as native
 
@@ -352,6 +354,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--widths", default="1,4,8,16")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--prefill-budget", type=int, default=8192)
+    parser.add_argument("--max-num-seqs", type=int)
+    parser.add_argument("--kv-cache-memory-bytes", type=int)
     args = parser.parse_args()
     if args.action == "capture":
         with open("/tmp/gpu0-3.lock", "a") as lock:
