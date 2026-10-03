@@ -14557,11 +14557,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
-    # Unmap the checkpoint pages the PLE offload worker read, after every
-    # disk gather (disk lane and cascade disk tier). The pages stay in the page
-    # cache, but no longer count as the worker's: on a host with little RAM the
-    # kernel otherwise keeps them and swaps other processes out. Off keeps them
-    # mapped, which saves the re-mapping on repeated reads.
     # Keep the latency-critical PLE lookup process on the NUMA node local to
     # its first visible GPU. This changes CPU placement only; allocations use
     # a local-first policy with fallback so large tables are not forced into a
@@ -14680,12 +14675,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
-    # Qwen4Exp PLE overflow cascade: let the rows beyond the device and
-    # pinned-host tiers be read from the mapped checkpoint on disk. Setting it
-    # starts the PLE offload worker next to the resident tables; the compute
-    # ranks wait for its rows inside their CUDA graphs. Without it such a
-    # remainder fails the startup. The disk tier needs no budget: it reads the
-    # checkpoint in place, nothing is copied.
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
