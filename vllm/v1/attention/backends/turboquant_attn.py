@@ -90,6 +90,28 @@ _tq_continuation_workspace_reserved_bytes = 0
 _CONTINUATION_DECODE_THRESHOLD = 128
 
 
+def _continuation_sdpa(query, key, value, cached_len, scale):
+    """Bound SDPA query working memory without requantizing the current chunk."""
+    q_len, num_heads, _ = query.shape
+    k_t = key.transpose(0, 1).unsqueeze(0)
+    v_t = value.transpose(0, 1).unsqueeze(0)
+    k_pos = torch.arange(key.shape[0], device=query.device).unsqueeze(0)
+    output = torch.empty_like(query)
+    for start in range(0, q_len, _CONTINUATION_DECODE_THRESHOLD):
+        end = min(start + _CONTINUATION_DECODE_THRESHOLD, q_len)
+        q_pos = torch.arange(start, end, device=query.device).unsqueeze(1) + cached_len
+        out = F.scaled_dot_product_attention(
+            query[start:end].transpose(0, 1).unsqueeze(0),
+            k_t,
+            v_t,
+            attn_mask=k_pos <= q_pos,
+            scale=scale,
+            enable_gqa=(key.shape[1] < num_heads),
+        )
+        output[start:end] = out[0].transpose(0, 1)
+    return output
+
+
 def _flash_attn_varlen_supported_on_device() -> bool:
     if not _HAS_FLASH_ATTN:
         return False
@@ -1356,24 +1378,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
             )
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+            return _continuation_sdpa(query, k_full, v_full, cached_len, self.scale)
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
