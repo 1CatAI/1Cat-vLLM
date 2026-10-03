@@ -28,6 +28,7 @@ def _fp16_gemv_silu_ranges_kernel(
     M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     ROWS: tl.constexpr,
+    COMPENSATED: tl.constexpr,
 ):
     tiles: tl.constexpr = triton.cdiv(OUTPUT_N, ROWS)
     token, tile = tl.program_id(0) // tiles, tl.program_id(0) % tiles
@@ -36,6 +37,8 @@ def _fp16_gemv_silu_ranges_kernel(
     wr = tl.where(row < PREFIX, PREFIX_START + row, SUFFIX_START + row - PREFIX)
     offset = tl.arange(0, BLOCK_K)
     accum = tl.zeros((ROWS, BLOCK_K), tl.float32)
+    if COMPENSATED:
+        low = tl.zeros((ROWS, BLOCK_K), tl.float32)
     for start in tl.static_range(0, K, BLOCK_K):
         col = start + offset
         a = tl.load(x + token * K + col, col < K, 0, eviction_policy="evict_last")
@@ -45,8 +48,16 @@ def _fp16_gemv_silu_ranges_kernel(
             0,
             eviction_policy="evict_first",
         )
-        accum += a[None, :].to(tl.float32) * b.to(tl.float32)
-    value = tl.sum(accum, 1).to(tl.float16).to(tl.float32)
+        product = a[None, :].to(tl.float32) * b.to(tl.float32)
+        if COMPENSATED:
+            accum, low = _fp32_pair_sum(accum, low, product, 0.0)
+        else:
+            accum += product
+    if COMPENSATED:
+        high, low = tl.reduce((accum, low), 1, _fp32_pair_sum)
+        value = (high + low).to(tl.float16).to(tl.float32)
+    else:
+        value = tl.sum(accum, 1).to(tl.float16).to(tl.float32)
     scaled = value / DIVISOR
     value = tl.where(row < PREFIX, scaled * tl.sigmoid(scaled), value)
     tl.store(
@@ -119,6 +130,7 @@ class Sm70Fp16GemvSiluKernel:
         prefix_start: int = 0,
         suffix_start: int = 0,
         divisor: float = 1.0,
+        compensated: bool = False,
     ) -> None:
         if not cls.can_implement(
             x,
@@ -160,8 +172,21 @@ class Sm70Fp16GemvSiluKernel:
             M=m,
             BLOCK_K=block_k,
             ROWS=rows,
+            COMPENSATED=compensated,
             num_warps=warps,
         )
+
+
+@triton.jit
+def _fp32_pair_sum(ah, al, bh, bl):
+    # Error-free addition of the high components, then FP32 renormalization.
+    # Both components stay FP32; there is no FP64 arithmetic or weight change.
+    total = ah + bh
+    bv = total - ah
+    error = (ah - (total - bv)) + (bh - bv)
+    low = (al + bl) + error
+    high = total + low
+    return high, low - (high - total)
 
 
 @triton.jit
@@ -181,6 +206,8 @@ def _fp16_gate_up_kernel(
     offsets = tl.arange(0, BLOCK_K)
     gate = tl.zeros((ROWS, BLOCK_K), tl.float32)
     up = tl.zeros((ROWS, BLOCK_K), tl.float32)
+    gate_low = tl.zeros((ROWS, BLOCK_K), tl.float32)
+    up_low = tl.zeros((ROWS, BLOCK_K), tl.float32)
     for start in tl.static_range(0, K, BLOCK_K):
         cols = start + offsets
         a = tl.load(x + token * K + cols, cols < K, 0).to(tl.float32)
@@ -197,10 +224,12 @@ def _fp16_gate_up_kernel(
             0,
             eviction_policy="evict_first",
         ).to(tl.float32)
-        gate += a[None, :] * g
-        up += a[None, :] * u
-    g = tl.sum(gate, 1).to(tl.float16).to(tl.float32)
-    u = tl.sum(up, 1).to(tl.float16).to(tl.float32)
+        gate, gate_low = _fp32_pair_sum(gate, gate_low, a[None, :] * g, 0.0)
+        up, up_low = _fp32_pair_sum(up, up_low, a[None, :] * u, 0.0)
+    gh, gl = tl.reduce((gate, gate_low), 1, _fp32_pair_sum)
+    uh, ul = tl.reduce((up, up_low), 1, _fp32_pair_sum)
+    g = (gh + gl).to(tl.float16).to(tl.float32)
+    u = (uh + ul).to(tl.float16).to(tl.float32)
     # Retain the activation's FP16 materialization before multiplication.
     # Use the native activation's FP32 exp/div arithmetic rather than a
     # sigmoid approximation before the FP16 materialization.
@@ -239,3 +268,15 @@ class Sm70Fp16GateUpKernel:
             ROWS=rows,
             num_warps=4,
         )
+
+
+class Sm70Fp16CompensatedGemvKernel(Sm70Fp16GemvSiluKernel):
+    """Measured linear candidate with FP32 error compensation.
+
+    The existing range/SiLU provider retains its original accumulation mode.
+    """
+
+    @classmethod
+    def apply_out(cls, *args, **kwargs):
+        kwargs["compensated"] = True
+        return super().apply_out(*args, **kwargs)

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
+    Sm70Fp16CompensatedGemvKernel,
     Sm70Fp16GateUpKernel,
     Sm70Fp16GemvSiluKernel,
 )
@@ -130,3 +131,24 @@ def test_gate_up_uses_standard_fp32_silu_for_finite_fp16_inputs():
     torch.ops._C.silu_and_mul(expected, weight.reshape(1, -1))
     Sm70Fp16GateUpKernel.apply_out(x, weight, out)
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m", [1, 5])
+def test_compensated_fp32_sum_preserves_small_term_between_cancellations(m):
+    x = torch.ones(m, 768, device="cuda", dtype=torch.float16)
+    weight = torch.zeros(34, 768, device="cuda", dtype=torch.float16)
+    weight[:17, 0] = 65504
+    weight[:17, 256] = 2**-16
+    weight[:17, 512] = -65504
+    weight[17:, 0] = 1
+    projected = (x.double() @ weight.double().t()).half()
+    out = torch.empty(m, 34, device="cuda", dtype=torch.float16)
+    Sm70Fp16CompensatedGemvKernel.apply_out(x, weight, out, 34, 0)
+    torch.testing.assert_close(out, projected, rtol=0, atol=0)
+    fused = torch.empty(m, 17, device="cuda", dtype=torch.float16)
+    Sm70Fp16GateUpKernel.apply_out(x, weight, fused)
+    expected = (
+        torch.nn.functional.silu(projected[:, :17].double()).half().double()
+        * projected[:, 17:].double()
+    ).half()
+    torch.testing.assert_close(fused, expected, rtol=0, atol=0)

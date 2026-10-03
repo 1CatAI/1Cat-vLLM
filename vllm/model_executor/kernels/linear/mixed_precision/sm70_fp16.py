@@ -9,8 +9,8 @@ from dataclasses import dataclass
 import torch
 
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
+    Sm70Fp16CompensatedGemvKernel,
     Sm70Fp16GateUpKernel,
-    Sm70Fp16GemvSiluKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
     MPLinearKernel,
@@ -49,7 +49,7 @@ def _candidate(x, weight, out, gated):
     if gated:
         Sm70Fp16GateUpKernel.apply_out(x, weight, out)
     else:
-        Sm70Fp16GemvSiluKernel.apply_out(x, weight, out, out.shape[1], 0)
+        Sm70Fp16CompensatedGemvKernel.apply_out(x, weight, out, out.shape[1], 0)
 
 
 def _dispatch(
@@ -117,11 +117,15 @@ def _measure(weight, width, gated):
                 end.synchronize()
                 timings[arm].append(start.elapsed_time(end) * 1000)
         medians = [statistics.median(t) for t in timings]
-        accepted = medians[1] < medians[0]
+        # An overlap is insufficient evidence for replacing the vendor path.
+        # This also avoids unstable admission for marginal short projections.
+        quartiles = [statistics.quantiles(t, n=4) for t in timings]
+        accepted = quartiles[1][2] < quartiles[0][0]
         return {
             "accepted": accepted,
             "reason": None if accepted else "cold_probe_not_faster",
             "cold_probe_including_flush_us": medians,
+            "cold_probe_interquartile_us": [[q[0], q[2]] for q in quartiles],
         }
 
 
