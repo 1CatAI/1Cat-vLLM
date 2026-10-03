@@ -567,6 +567,9 @@ class QSAForwardMetadata(AttentionMetadata):
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
+    # Host copy of query_start_loc. It lets QSA selection split a mixed batch
+    # by request without a device synchronization.
+    query_start_loc_cpu: torch.Tensor | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -717,6 +720,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
         )
 
 
