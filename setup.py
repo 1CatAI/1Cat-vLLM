@@ -899,6 +899,7 @@ class precompiled_wheel_utils:
                         {
                             "vllm/_C.abi3.so",
                             "vllm/_C_stable_libtorch.abi3.so",
+                            "vllm/_C_gguf.abi3.so",
                             "vllm/_moe_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
