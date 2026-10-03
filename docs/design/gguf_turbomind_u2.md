@@ -112,3 +112,48 @@ M=8192 now approach AWQ; M=64–512 still need further analysis.
 | 512 | 42.04 | 33.64 | unavailable | unavailable | 50.48 | 29.75 |
 | 2048 | 113.77 | 107.01 | unavailable | unavailable | 178.69 | 90.21 |
 | 8192 | 455.01 | 432.95 | unavailable | unavailable | 681.16 | 350.41 |
+
+### Initial grouped comparison (microseconds)
+
+These three points use the initial tile set, before the prefill change.
+
+| Total rows | GGUF graph | AWQ graph | MMVQ graph | MMQ graph | DQ + cuBLAS eager |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 15.05 | 10.50 | 9.73 | unavailable | 123.24 |
+| 8 | 17.36 | 14.39 | 15.16 | 26.83 | 276.48 |
+| 512 | 48.64 | 48.44 | unavailable | unavailable | 308.07 |
+
+### Complete grouped graph comparison after the tile change
+
+All eleven points preserve approximately 2.1e-4 output relative L2 error.
+The explicit MoE wrappers chunk large batches; reference MMQ rejects M=1.
+At M=2048 and M=8192 the grouped U2 operator is near AWQ. Small grouped
+workloads retain a gap and need further decode/batch work.
+
+| Total rows | GGUF graph | AWQ graph | MMVQ graph | MMQ graph | DQ + cuBLAS eager |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 14.95 | 10.44 | 9.22 | unavailable | 136.65 |
+| 2 | 14.69 | 11.01 | 10.29 | unavailable | 137.78 |
+| 4 | 15.16 | 11.93 | 11.72 | unavailable | 214.84 |
+| 8 | 17.31 | 14.23 | 15.05 | 26.62 | 209.87 |
+| 16 | 17.46 | 14.34 | 26.62 | 30.21 | 214.73 |
+| 32 | 17.51 | 14.54 | 48.84 | 39.37 | 214.32 |
+| 64 | 17.31 | 18.07 | 94.05 | 56.32 | 280.99 |
+| 128 | 23.40 | 20.94 | 185.45 | 90.62 | 258.71 |
+| 512 | 52.07 | 48.18 | 757.15 | 188.21 | 230.50 |
+| 2048 | 108.75 | 110.54 | 3517.44 | 684.85 | 338.53 |
+| 8192 | 461.06 | 448.31 | 14033.41 | 2682.88 | 1146.78 |
+
+## Packaged artifact validation
+
+The normal wheel installs in a separate Python 3.12 environment and passes
+13 CPU and 31 GPU checks (one skipped fixture), including framework tracing
+and CUDA graph replay. The run uses installed package imports without source
+overrides or private library preloads. The core extension has no RPATH and
+its hash matches the CMake-installed core stored in the wheel.
+
+- Wheel SHA256: `21b030bbb0cc544429afd792ae1efdf895f1b0bf1dec67956f80389cb0e8aebc`.
+- Core extension SHA256: `1f307a975ab90fad13156762ffd3462969696166013386a95ed984d02434fdcb`.
+- Reference extension SHA256: `74ed944b8abb0f8679757a4e1bf0acef453f4a9803002f2c47b35b47f39d163f`.
+- Wheel version/source: `1.5.2.dev216+g543bd12b2.precompiled`. Later changes
+  record documentation and benchmark reference admission only.
