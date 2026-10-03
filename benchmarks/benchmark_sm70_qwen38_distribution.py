@@ -218,40 +218,9 @@ def capture(args):
         llm.llm_engine.engine_core.shutdown()
 
 
-def compare(args):
-    ref = json.loads((args.reference / "capture.json").read_text())
-    cand = json.loads((args.output / "capture.json").read_text())
-    if not ref["complete"] or not cand["complete"]:
-        raise ValueError("Both capture arms must be complete")
-    if ref["manifest_sha256"] != cand["manifest_sha256"]:
-        raise ValueError("Teacher-forcing manifests differ")
-    for field in ("captures", "widths", "repeats", "contract", "engine"):
-        if ref[field] != cand[field]:
-            raise ValueError(f"Capture contract differs: {field}")
-    rows = []
-    for cohort in cand["captures"]:
-        relative = Path(str(cohort["width"])) / str(cohort["repeat"]) / cohort["id"]
-        for step in range(cohort["rows"]):
-            filename = f"{step:04d}"
-            metadata = json.loads(
-                (args.output / relative / (filename + ".json")).read_text()
-            )
-            expected = json.loads(
-                (args.reference / relative / (filename + ".json")).read_text()
-            )
-            if metadata != expected:
-                raise ValueError("Probe prefix, vocabulary or next-token IDs differ")
-            if metadata["active_width"] != cohort["width"]:
-                raise ValueError(
-                    "Teacher-forcing probe did not sustain its active width"
-                )
-            metrics = distribution_metrics(
-                np.load(args.reference / relative / (filename + ".npy")),
-                np.load(args.output / relative / (filename + ".npy")),
-            )
-            rows.append({**cohort, "step": step, **metrics})
+def summarize_groups(rows, widths):
     groups = {}
-    for width in cand["widths"]:
+    for width in widths:
         for category in ["all"] + sorted({r["category"] for r in rows}):
             selected = [
                 r
@@ -292,15 +261,80 @@ def compare(args):
                 and summary["max_logit_error"] <= 0.5
             )
             groups[f"C{width}/{category}"] = summary
+    return groups
+
+
+def compare(args):
+    ref = json.loads((args.reference / "capture.json").read_text())
+    cand = json.loads((args.output / "capture.json").read_text())
+    if not ref["complete"] or not cand["complete"]:
+        raise ValueError("Both capture arms must be complete")
+    if ref["manifest_sha256"] != cand["manifest_sha256"]:
+        raise ValueError("Teacher-forcing manifests differ")
+    for field in ("captures", "widths", "repeats", "contract", "engine"):
+        if ref[field] != cand[field]:
+            raise ValueError(f"Capture contract differs: {field}")
+    rows = []
+    for cohort in cand["captures"]:
+        relative = Path(str(cohort["width"])) / str(cohort["repeat"]) / cohort["id"]
+        for step in range(cohort["rows"]):
+            filename = f"{step:04d}"
+            metadata = json.loads(
+                (args.output / relative / (filename + ".json")).read_text()
+            )
+            expected = json.loads(
+                (args.reference / relative / (filename + ".json")).read_text()
+            )
+            if metadata != expected:
+                raise ValueError("Probe prefix, vocabulary or next-token IDs differ")
+            if metadata["active_width"] != cohort["width"]:
+                raise ValueError(
+                    "Teacher-forcing probe did not sustain its active width"
+                )
+            metrics = distribution_metrics(
+                np.load(args.reference / relative / (filename + ".npy")),
+                np.load(args.output / relative / (filename + ".npy")),
+            )
+            rows.append({**cohort, "step": step, **metrics})
+    groups = summarize_groups(rows, cand["widths"])
+    noise_rows = []
+    for cohort in ref["captures"]:
+        if cohort["repeat"] == 0:
+            continue
+        first = Path(str(cohort["width"])) / "0" / cohort["id"]
+        other = Path(str(cohort["width"])) / str(cohort["repeat"]) / cohort["id"]
+        for step in range(cohort["rows"]):
+            filename = f"{step:04d}"
+            left = args.reference / first / filename
+            right = args.reference / other / filename
+            if json.loads(left.with_suffix(".json").read_text()) != json.loads(
+                right.with_suffix(".json").read_text()
+            ):
+                raise ValueError("Default repeats have different probe prefixes")
+            noise_rows.append(
+                {
+                    **cohort,
+                    "step": step,
+                    **distribution_metrics(
+                        np.load(left.with_suffix(".npy")),
+                        np.load(right.with_suffix(".npy")),
+                    ),
+                }
+            )
+    noise = summarize_groups(noise_rows, ref["widths"]) if noise_rows else {}
     result = {
         "distribution_passed": all(g["passed"] for g in groups.values()),
+        "default_noise_passed": (
+            all(g["passed"] for g in noise.values()) if noise else None
+        ),
+        "default_noise": noise,
         "quality_acceptance": "requires separate fixed task suite",
         "groups": groups,
         "rows": rows,
     }
     (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(groups, indent=2))
-    if not result["distribution_passed"]:
+    if not result["distribution_passed"] or result["default_noise_passed"] is False:
         raise SystemExit("Distribution thresholds exceeded")
 
 
