@@ -383,5 +383,5 @@ the full source build. The matched normal-wheel C1 arms measured:
 Both arms' 36 task outputs reach natural EOS and have nonempty final answers,
 zero replacement characters and no token-cap failures. Current-artifact C1
 teacher-forcing distribution and the short C4 smoke remain required before
-PR PR #831 merge. The 16.0% TPOT reduction is transport-specific and does not include
+PR #831 merge. The 16.0% TPOT reduction is transport-specific and does not include
 a dense 8-bit arm or establish the 7.5-ms target.
