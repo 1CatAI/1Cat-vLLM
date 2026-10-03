@@ -83,3 +83,24 @@ def test_failed_dump_restores_runner(tmp_path, monkeypatch):
         runner.speculator._sample_draft,
     )
     assert not hasattr(runner, "_mtp15_forcing")
+
+
+def test_forcing_keeps_dynamic_vocab_tail_updates(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    runner = GPUModelRunner()
+    seen = []
+    runner.speculator.greedy_draft_vocab = SimpleNamespace(
+        observe_target_logits=lambda logits, prefill: seen.append(
+            (logits.clone(), prefill)
+        )
+    )
+    worker = SimpleNamespace(model_runner=runner)
+    install(worker, list(range(32)), 8, "frozen", str(tmp_path))
+    batch = SimpleNamespace(
+        positions=torch.tensor([7]),
+        logits_indices=torch.tensor([0]),
+        num_draft_tokens=0,
+    )
+    runner.sample(torch.zeros(1, 4), batch, None)
+    assert len(seen) == 1 and seen[0][1]
+    flush(worker, discard=True)

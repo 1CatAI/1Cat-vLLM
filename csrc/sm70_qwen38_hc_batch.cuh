@@ -284,7 +284,7 @@ __global__ void gather(RankData buffers, const void* input, half* output,
 
 // The same arithmetic and half+tag transport as the four-launch path.
 // All CTAs reside together; grid barriers close only local data dependencies.
-template <bool FullUnroll>
+template <bool FullUnroll, bool RoundPartials = true>
 __global__ __launch_bounds__(32, 4) void hc_cooperative(
     RankData buffers, int rank, const half* input, const half* packed_down,
     const half* packed_up, float* partials, half* lora, half* local_output,
@@ -292,7 +292,8 @@ __global__ __launch_bounds__(32, 4) void hc_cooperative(
   const int block = blockIdx.x, groups = (rows + 7) / 8;
   auto grid = cooperative_groups::this_grid();
   if (block < 60 * groups)
-    hc_down_partials_body<false, 1, false, 96, true, FullUnroll ? 32 : 4>(
+    hc_down_partials_body<false, 1, false, 96, RoundPartials,
+                          FullUnroll ? 32 : 4>(
         input, packed_down, partials, rows, block % 3, (block / 3) % groups,
         block / (3 * groups));
   grid.sync();
@@ -528,15 +529,16 @@ inline void launch(RankData buffers, int rank, const half* input,
     return;
   }
   if (cooperative) {
-    TORCH_CHECK(round_partials,
-                "Cooperative HC requires the MTP FP16 contract");
     void* args[] = {&buffers,   &rank,      &input, &packed_down,
                     &packed_up, &partials,  &lora,  &local_output,
                     &output,    &injection, &rows};
-    CUDACHECK(cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(full_unroll ? hc_cooperative<true>
-                                            : hc_cooperative<false>),
-        dim3(80 * ((rows + 7) / 8)), dim3(32), args, 0, stream));
+    auto kernel = round_partials ? (full_unroll ? hc_cooperative<true, true>
+                                                : hc_cooperative<false, true>)
+                                 : (full_unroll ? hc_cooperative<true, false>
+                                                : hc_cooperative<false, false>);
+    CUDACHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(kernel),
+                                          dim3(80 * ((rows + 7) / 8)), dim3(32),
+                                          args, 0, stream));
     return;
   }
   if (round_partials) {

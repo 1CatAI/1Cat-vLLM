@@ -62,6 +62,10 @@ class Sm70GreedyDraftVocab:
             torch.cat((base, tail), dim=-1),
             torch.cat((base_ids, runtime.local_tail_token_ids)),
         )
+        # Reuse the same admitted IPC reduction as the normal full head.
+        custom = runtime.logits_processor._maybe_custom_top1_argmax(pair)
+        if custom is not None:
+            return custom
         # Same compact value/ID transport as full-vocabulary local argmax.
         gathered = tensor_model_parallel_all_gather(pair, dim=-1).reshape(
             hidden_states.shape[0], -1, 2

@@ -68,6 +68,10 @@ def install(worker, token_ids, prompt_length, prompt_sha256, folder):
         if grammar is not None:
             raise ValueError("Grammar transforms are not teacher-forcing logits")
         logits = runner.model.compute_logits(hidden[batch.logits_indices])
+        vocab = getattr(draft, "greedy_draft_vocab", None)
+        if vocab is not None:
+            # Preserve ordinary dynamic-tail maintenance under forced sampling.
+            vocab.observe_target_logits(logits, prefill=batch.num_draft_tokens == 0)
         record("target", positions, logits, tape[positions])
         next_ids = tape[positions + 1].view(1, -1).to(torch.int32)
         count = torch.full(

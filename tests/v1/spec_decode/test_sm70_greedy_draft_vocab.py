@@ -41,6 +41,7 @@ def test_greedy_head_merges_base_and_shard_tail_without_dense_gather(monkeypatch
     )
     bridge = Sm70GreedyDraftVocab.__new__(Sm70GreedyDraftVocab)
     bridge.runtime = SimpleNamespace(
+        logits_processor=SimpleNamespace(_maybe_custom_top1_argmax=lambda _: None),
         lm_head=head,
         local_tail_weight=torch.tensor([[4.0, 0.0], [0.0, 8.0], [99.0, 99.0]]),
         local_tail_token_ids=torch.tensor([3, 20, -1]),

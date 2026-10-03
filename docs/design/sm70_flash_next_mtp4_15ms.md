@@ -349,3 +349,22 @@ retain their negative/small results without repeating them.
 - CUDA initialization resolves the optional pinned smoke's is_pinned check;
   remote normal-source UVA size/lifetime smoke passes with exactly 3 MiB.
   The failed uninitialized smoke is retained. No native workaround needed.
+
+- Corrected forcing control completed all sixteen cases on the remote machine
+  with forced outputs matching the frozen tapes. No speed cases were rerun.
+- Reduced-vocabulary first model screen completed fifteen unprofiled cases:
+  synthetic 20.704--21.333 ms, natural 24.685--25.049 ms. Acceptance length
+  and output token counts match the prior default arm. Natural rounds regress
+  rather than improve, so no default admission. The bridge used ordinary
+  all-gather instead of the existing compact custom top1 IPC; reuse that
+  transport before any further model speed screen. Full-model root attribution
+  of the regression remains pending; do not ascribe it solely to head size.
+- The first greedy forcing capture bypassed ordinary dynamic-tail maintenance.
+  Preserve it as `greedy_candidate_logits_stale_tail`; it cannot admit actual
+  dynamic proposals. The observer now calls the same tail-refresh helper as
+  ordinary sampling. Observer plus greedy bridge checks pass seven CPU cases.
+- The ordinary native HC extension now supports cooperative execution with
+  FP32 partials as an explicit existing-API option. Accumulators and state stay
+  FP32, inputs/intermediate/output stay FP16. Normal source build succeeds;
+  no default dispatch change yet. The TP4 M5/M10 real-weight micro screen must
+  pass before choosing this schedule; full model gates follow. No private DSO.
