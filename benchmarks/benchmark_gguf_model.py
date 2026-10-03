@@ -171,7 +171,11 @@ def main():
                     return output
 
                 client.get_output = observed
-                capture = args.cuda_profiler_capture and repeat == 0
+                capture = (
+                    args.cuda_profiler_capture
+                    and width == args.widths[0]
+                    and repeat == 0
+                )
                 try:
                     if capture:
                         torch.accelerator.synchronize()
