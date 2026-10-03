@@ -41,7 +41,7 @@ template<class Gemm>
 class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return desc.n <= 256 && KernelImpl<Gemm>::is_feasible(desc);
+    return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) && KernelImpl<Gemm>::is_feasible(desc);
   }
 };
 

@@ -280,9 +280,42 @@ A narrow grouped tile experiment passed all 21 lattice GPU checks but had
 format-dependent results. IQ2_XS grouped M=8192 improved from 385.47 to
 321.14 us; AWQ was 228.58 us. IQ3_XXS regressed from 342.75 to 487.37 us
 at the same point, so its new narrow candidates were rejected. Only the
-IQ2_XS grouped candidates remain, restricted to N<=256. The final candidate
+IQ2_XS grouped candidates remain, restricted to N<=256 and M<=64 or M>=512. At M=128 the new IQ2_XS
+candidate costs 36.17 us versus the previous 32.12 us, so intermediate M
+retains the existing candidates. The final candidate
 set passes 95 GPU checks with one non-SM70 skip, including interval
 boundaries, shared scratch and graph tracing. Installed-wheel validation
 remains pending. Grouped performance still
 needs work before model integration; dense DQ results do not establish full
 MoE or model throughput.
+
+### Grouped sweep before the intermediate-M exclusion
+
+The table uses the same four distinct experts and all standard M values.
+Only IQ2_XS received new narrow candidates. The M=128 regression motivates
+excluding them for M=65–511; that final exclusion requires revalidation.
+
+| Type | M | GGUF us | AWQ us | MoE MMVQ us | MoE MMQ us |
+| --- | --- | --- | --- | --- | --- |
+| IQ2_XS | 1 | 23.72 | 15.18 | 8.99 | unavailable |
+| IQ2_XS | 2 | 22.83 | 15.36 | 10.81 | unavailable |
+| IQ2_XS | 4 | 22.91 | 16.33 | 12.19 | unavailable |
+| IQ2_XS | 8 | 23.03 | 18.42 | 12.35 | 26.67 |
+| IQ2_XS | 16 | 23.39 | 16.28 | 22.18 | 29.82 |
+| IQ2_XS | 32 | 25.38 | 17.45 | 40.76 | 36.07 |
+| IQ2_XS | 64 | 27.52 | 21.68 | 78.57 | 50.66 |
+| IQ2_XS | 128 | 36.17 | 28.06 | 164.86 | 92.55 |
+| IQ2_XS | 512 | 40.15 | 28.20 | 765.42 | 232.31 |
+| IQ2_XS | 2048 | 93.07 | 71.99 | 3032.98 | 829.88 |
+| IQ2_XS | 8192 | 322.27 | 228.83 | 12116.46 | 2228.01 |
+| IQ3_XXS | 1 | 21.11 | 16.81 | 9.75 | unavailable |
+| IQ3_XXS | 2 | 20.33 | 15.40 | 10.58 | unavailable |
+| IQ3_XXS | 4 | 20.38 | 16.35 | 11.35 | unavailable |
+| IQ3_XXS | 8 | 20.49 | 18.39 | 12.42 | 26.43 |
+| IQ3_XXS | 16 | 23.97 | 16.61 | 22.16 | 29.66 |
+| IQ3_XXS | 32 | 24.72 | 17.46 | 40.50 | 35.83 |
+| IQ3_XXS | 64 | 37.61 | 21.91 | 78.62 | 50.07 |
+| IQ3_XXS | 128 | 28.15 | 28.36 | 164.35 | 91.94 |
+| IQ3_XXS | 512 | 36.97 | 28.22 | 758.71 | 226.34 |
+| IQ3_XXS | 2048 | 94.59 | 71.97 | 3024.26 | 800.68 |
+| IQ3_XXS | 8192 | 342.03 | 228.77 | 11967.08 | 2195.65 |
