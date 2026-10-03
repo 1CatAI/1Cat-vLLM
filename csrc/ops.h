@@ -281,6 +281,18 @@ void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               double global_scale, int64_t split_k,
                               int64_t accumulator_chains);
 
+torch::Tensor skinny_qpn_gemm_sm70(torch::Tensor x, torch::Tensor qcodes,
+                                   torch::Tensor qscales, double gscale,
+                                   int64_t n);
+
+void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+                         torch::Tensor qscales, torch::Tensor gscales,
+                         torch::Tensor perm, torch::Tensor gids,
+                         torch::Tensor goff, int64_t topk,
+                         torch::Tensor y_slots, bool x_slot_major,
+                         int64_t num_tokens, int64_t splitk, int64_t nacc,
+                         int64_t scale_mode);
+
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
                                double global_scale, int64_t split_k,
