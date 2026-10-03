@@ -159,3 +159,45 @@ def test_lattice_framework_and_fullgraph_tracing(weight_type):
     torch.testing.assert_close(
         compiled(x), kernel.apply_weights(layer, x), rtol=0, atol=0
     )
+
+
+def test_grouped_uncached_graph_then_eager_tuning():
+    # A distinct expert count keeps this descriptor out of earlier test caches.
+    e, m, n, k = 3, 768, 160, 2560
+    canonical = [projection(18, expert=i) for i in range(e)]
+    prepared = [prepare(p) for p in canonical]
+    w = torch.stack([p[0] for p in prepared])
+    s = torch.stack([p[1] for p in prepared])
+    wp, sp = torch.ops._C.awq_moe_build_strided_ptrs(w, s, *prepared[0][2:], e)
+    offsets = torch.tensor([0, 256, 256, m], dtype=torch.int32, device="cuda")
+    x = (torch.randn((m, k), device="cuda") * 0.125).half()
+    out = torch.empty((m, n), dtype=torch.float16, device="cuda")
+    expected = torch.empty((m, n), device="cuda")
+    for expert, (start, end) in enumerate(zip([0, 256, 256], [256, 256, m])):
+        if start < end:
+            dense = torch.from_numpy(canonical[expert].dequantize()).half().cuda()
+            expected[start:end] = x[start:end].float() @ dense.float().T
+
+    def run():
+        torch.ops._C.gguf_lattice_grouped_gemm_sm70_out(
+            out, x, offsets, wp, sp, 18, e, 32
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Allocate the stream workspace using a different, untuned descriptor.
+        warm_offsets = torch.tensor([0, 0, 0, 1], dtype=torch.int32, device="cuda")
+        torch.ops._C.gguf_lattice_grouped_gemm_sm70_out(
+            out[:1], x[:1], warm_offsets, wp, sp, 18, e, 32
+        )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    graph.replay()
+    torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.003)
+    run()  # First eager call may measure and populate the dispatch cache.
+    torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.003)
+    graph.replay()  # The previously captured launch remains valid.
+    torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.003)
