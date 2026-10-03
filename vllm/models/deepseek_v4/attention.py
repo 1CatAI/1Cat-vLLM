@@ -51,7 +51,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
-from vllm.models.deepseek_v4.sm70.gemv import maybe_sm70_dsv4_fp16_gemv
+from vllm.models.deepseek_v4.sm70.gemv import (
+    can_use_sm70_dsv4_fused_fp16_aux_gemv,
+    maybe_sm70_dsv4_fp16_gemv,
+    maybe_sm70_dsv4_fused_fp16_aux_gemv,
+    prepare_sm70_dsv4_fused_fp16_aux_weight,
+    sm70_fused_fp16_aux_reason,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
@@ -315,6 +321,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
                 validity_cache_prefix=self.swa_cache_layer.prefix,
             )
+        self._fused_fp16_aux_kernel_config = mla_modules.vllm_config.kernel_config
+        self._fused_fp16_aux_policy = (
+            mla_modules.vllm_config.kernel_config.fused_fp16_aux_gemv
+        )
+        self._sm70_fused_fp16_aux_enabled = False
+        self._sm70_fused_fp16_aux_rows = (0, 0, 0)
+        self._sm70_fused_fp16_aux_reason = "not_prepared"
+        self.register_buffer(
+            "_sm70_fused_fp16_aux_packed_weight", None, persistent=False
+        )
 
     def forward(
         self,
@@ -400,6 +416,38 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         return self.wo_b(z.flatten(1))
 
+    def prepare_sm70_fused_fp16_aux_weight(self) -> None:
+        """Fuse existing exact projections without changing their reduction."""
+        reason: str | None = "requires_compressor_and_indexer"
+        self._buffers["_sm70_fused_fp16_aux_packed_weight"] = None
+        self._sm70_fused_fp16_aux_rows = (0, 0, 0)
+        if self.compressor is not None and self.indexer is not None:
+            weights = (
+                self.compressor.fused_wkv_wgate.weight,
+                self.indexer.compressor.fused_wkv_wgate.weight,
+                self.indexer.weights_proj.weight,
+            )
+            # Capability is independent of the user policy. Otherwise the
+            # disabled arm could alias a graph compiled with fusion enabled.
+            applicable = sm70_fused_fp16_aux_reason(weights, enabled=True) is None
+            if applicable:
+                self._fused_fp16_aux_kernel_config.fused_fp16_aux_gemv_applicable = True
+            reason = sm70_fused_fp16_aux_reason(
+                weights, enabled=self._fused_fp16_aux_policy
+            )
+            if reason is None:
+                packed = prepare_sm70_dsv4_fused_fp16_aux_weight(
+                    weights, enabled=self._fused_fp16_aux_policy
+                )
+                assert packed is not None
+                self._buffers["_sm70_fused_fp16_aux_packed_weight"] = packed
+                self._sm70_fused_fp16_aux_rows = tuple(w.shape[0] for w in weights)
+        self._sm70_fused_fp16_aux_enabled = reason is None
+        self._sm70_fused_fp16_aux_reason = reason or "admitted"
+        logger.info_once(
+            "SM70 exact FP16 auxiliary fusion: %s", self._sm70_fused_fp16_aux_reason
+        )
+
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
@@ -483,6 +531,31 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             # MergedColumnParallelLinear returns (output, bias); bias is None.
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
+
+        fused_aux_weight = self._sm70_fused_fp16_aux_packed_weight
+        if aux_streams is not None and can_use_sm70_dsv4_fused_fp16_aux_gemv(
+            hidden_states, fused_aux_weight, self._sm70_fused_fp16_aux_rows
+        ):
+
+            def fused_fp16_aux() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                result = maybe_sm70_dsv4_fused_fp16_aux_gemv(
+                    hidden_states, fused_aux_weight, self._sm70_fused_fp16_aux_rows
+                )
+                assert result is not None
+                return result
+
+            qr_kv, fused_results = execute_in_parallel(
+                fused_wqa_wkv,
+                [fused_fp16_aux],
+                self.ln_events[0],
+                [self.ln_events[1]],
+                [aux_streams[0]],
+                enable=True,
+            )
+            fused_result = fused_results[0]
+            assert fused_result is not None
+            kv_score, indexer_kv_score, indexer_weights = fused_result
+            return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
