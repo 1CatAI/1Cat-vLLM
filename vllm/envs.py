@@ -3910,6 +3910,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1"))),
         description=(
+            "Automatic packing is qualified for ordinary decode and MTP; "
+            "other proposers retain explicit opt-in. "
             "Enables lossless packed GDN input projections for M2..16. Default "
             "on after #703/#704 qualification. Set 0 together with "
             "QWEN38_BATCH_FASTPATH=0 to recover the packed-weight memory "

@@ -220,7 +220,8 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     # Different local geometries are checked by their weight loaders; omit an
     # estimate rather than assuming that they allocate the TP4 reference packs.
     reference_layout = (
-        tp == 4
+        sm70_flash_next_batch_qualified(cfg)
+        and tp == 4
         and getattr(text, "hidden_size", None) == 2560
         and getattr(text, "hc_count", None) == 4
         and getattr(text, "hc_lowrank", None) == 320
@@ -246,7 +247,7 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
             "scope": "estimated_additional_bytes_per_rank",
             "reason": None
             if reference_layout
-            else "estimate_requires_reference_layout",
+            else "estimate_requires_qualified_reference_layout",
             "components": copies,
             "total_bytes": sum(copies.values()) if reference_layout else None,
             "excludes": "allocator overhead, graphs, temporary workspaces and KV cache",

@@ -70,20 +70,56 @@ M8 and the measured small router rows remain admitted. An explicit request for
 FP16 accumulation also keeps its original dispatch. No global precision flags
 are changed for MTP.
 
-## Promotion validation remains open
+## Recorded promotion validation
 
-The earlier candidate passed MBPP 12/12, 32K retrieval 3/3 and Chinese QA 6/6
-with 17/21 exact token sequences. A matched 1-GiB-KV configuration improved
-C1 throughput by 13.24%; its long C4 sample lacked four simultaneous decoders
-and is excluded. A valid four-request profile at 32K capacity, 4K inputs and
-1024 outputs, TP4/MTP4, FP16 KV, 1.5 GiB KV/rank and prefill budget 4096
-initially regressed by 3.85%. The same KV budget with prefill budget 8192
-exhausted memory. Packed weights added about 1.25 GiB/rank at load; manually
-specified KV bytes do not automatically shrink to reserve peak workspace.
+The final ordinary-wheel source pair is control `cf2a1285e40c09ae498ab8bee5443fb2a147199d`
+and candidate `c2b819954378573b3742a8d0aa272c665a7472d0`. All 15 native library
+hashes are identical. Hardware/software: four Tesla V100-SXM2-32GB on GPUs 0–3,
+Torch 2.10.0+cu128, CUDA 12.8, Flash-Next NVFP4, TP4, FP16 activations/KV,
+MTP4 with greedy draft, greedy target temperature 0/top-p 1/top-k -1,
+32K capacity, concurrency limit 4, prefix cache, V2 runner, FULL_AND_PIECEWISE
+graphs, prefill budget 4096, 1.5 GiB explicit KV/rank, memory utilization 0.95.
+These settings are shared by both arms.
 
-The small-row routing follow-up measured C4 at 220.410 versus 222.553 token/s
-(0.96% lower), while its warmup was about 1% faster. These adjacent values do
-not prove that the guard repaired the earlier performance regression: control
-throughput also changed across runs. A single-switch dense-batch diagnostic is
-queued. The current final artifact still requires paired quality and target
-speed validation before promotion. PR #796 remains draft.
+| Measurement | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| C1 pure decode, 31744 input / 256 output | 79.832 tok/s | 92.199 tok/s | +15.49% |
+| C1 TTFT, reported separately | 6.721 s | 6.606 s | -1.70% |
+| C4 pure decode, four 4096 / 1024 requests | 225.400 tok/s | 227.778 tok/s | +1.05% |
+
+C1 excludes one warmup and uses the median of two measurements. C4 excludes
+one warmup and uses three measurements; each has four simultaneous decoding
+requests and zero preemption. C4 timing counts returned tokens only while all
+four are decoding, with no new admission/prefill. The small C4 improvement is
+within the observed run variation; the evidence supports no material slowdown,
+not a strong C4 speedup claim. C4 uses 32K *capacity*, not four 32K input prompts.
+
+All 21 paired quality requests have exactly matching token sequences. Both
+arms score MBPP 12/12, 32K retrieval 3/3 and Chinese QA 6/6, with natural stopping.
+This is a paired subset qualification, not a general accuracy or 35B speed claim.
+
+A subsequent loader-only scope correction restores the historical fallback for
+36 unvalidated Flash-Next/DFlash proposer matrix rows, retaining explicit legacy
+opt-in. All 288 other matrix rows, including every measured ordinary/MTP row,
+are unchanged against the tested artifact, and all 28 GEMV/GDN operator function
+ASTs are identical. The correction and reporting changes introduce no new
+measured-route or numerical change.
+
+## Retained rejected evidence and capacity limits
+
+The earlier pre-guard candidate passed all subset scores but had only 17/21
+exact token pairs. Its matched 1-GiB-KV profile improved 8K C1 by 13.24%; its long
+C4 sample lacked four simultaneous decoders and is excluded. A valid C4 profile
+at the final 1.5-GiB KV/prefill-4096 settings initially regressed by 3.85%.
+The small-row follow-up later measured 220.410 versus 222.553 tok/s (-0.96%),
+with its warmup about 1% faster. A one-switch dense-batch-off diagnostic reached
+221.970 tok/s, only 0.7% above the adjacent enabled candidate. These samples do
+not alone prove that the guard repaired the initial regression; final repeated
+matched measurements and paired output are the acceptance evidence.
+
+With 1.5-GiB KV/rank and prefill budget 8192, the earlier candidate exhausted
+memory during a 448-MiB PLE temporary allocation. Packed copies added about
+1.25 GiB/rank at load. Manual KV byte budgets do not automatically shrink to
+reserve temporary/graph peaks. Startup status reports this limitation and the
+packed-copy off switches; the supported 4096 profile does not establish that
+8192 fits. No automatic KV-budget or prefill routing change is made here.

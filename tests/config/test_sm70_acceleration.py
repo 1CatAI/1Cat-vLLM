@@ -352,7 +352,7 @@ def test_flash_next_memory_does_not_guess_other_tp_layout(config):
     config.parallel_config.tensor_parallel_size = 2
     memory = acc.build_report(config)["flash_next_batch"]["packed_weight_memory"]
     assert memory["total_bytes"] is None
-    assert memory["reason"] == "estimate_requires_reference_layout"
+    assert memory["reason"] == "estimate_requires_qualified_reference_layout"
 
 
 @pytest.mark.parametrize("format_name", ("sm70_awq", "sm70_fp8"))
