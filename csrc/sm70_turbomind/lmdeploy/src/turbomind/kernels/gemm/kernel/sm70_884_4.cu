@@ -71,6 +71,42 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 
 void Registry::sm70_884_4() {
   {
+    // Two-bit affine weights share the FP16 MMA pipeline and coefficient
+    // carrier. Keep separate dense/grouped descriptors for group16/group32.
+    using C = Config_U2_Affine<kColMajor>;
+    using G = Config_U2_Affine<kColMajor, 0>;
+    // Keep the native prefill tile repertoire: the source code width does
+    // not require halving N or doubling the MMA K tile.
+    Add<C::Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1, 16, 128, 128>>();
+    Add<C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>>();
+    Add<C::Type<64, 128, 16, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>>();
+    Add<G::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>>();
+    Add<C::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 16>>();
+    Add<C::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<C::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<C::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<C::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<G::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 16>>();
+    Add<G::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<G::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<G::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<G::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16>>();
+    Add<C::Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1, 32, 128, 128>>();
+    Add<C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>>();
+    Add<C::Type<64, 128, 16, 1, 4, 1, D, S, 2, true, 1, 32, 32, 128>>();
+    Add<G::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>>();
+    Add<C::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<G::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 32>>();
+    Add<G::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<G::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<G::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<G::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+  }
+  {
     // Canonical GGUF u4 uses per-group scale plus additive bias, in the
     // existing affine metadata layout. Dense group-32 tiles complement the
     // grouped group-32 kernels below; they retain the same mma884 arithmetic.
