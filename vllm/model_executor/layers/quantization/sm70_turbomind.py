@@ -812,6 +812,7 @@ def apply_prepared_linear(
             reshaped_x.shape[1],
             state.split_k,
             state.accumulator_chains,
+            activation_pack=getattr(layer, "sm70_nvfp4_qpn2_activation_pack", True),
         )
     else:
         raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
