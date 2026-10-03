@@ -23,4 +23,17 @@ route check, greedy/logit distribution comparisons and model quality checks.
 Model timings must separate prefill from steady decode and report C1/C4/C8/C16
 and 8K/32K prompts. Operator timings are not model throughput evidence.
 
-Integration results will be recorded here after the model path is connected.
+## Layer checks
+
+Fifteen GPU checks pass on V100 32GB, CUDA 12.8 and Torch 2.10.0+cu128.
+Independent affine, LUT4 and all seven lattice formats match official
+dequantization with FP32 accumulation (relative L2 below 0.003), including
+graph replay and full-graph tracing. Mixed affine/LUT4/lattice/FP16 projections
+retain their logical order when loaded in a different file order; GDN input
+tiling and bias compose with those projections. Preparation preserves shared
+source parameters and reports incomplete output packs explicitly.
+
+All 13 existing Qwen3.5 adapter tests also pass. The first layer check uses
+the normal main operator artifact with SHA256
+`4910c47ab1aaed253001d5950bf44dd40a350b2b087202a8ea2b13f2c5457782`.
+Installed-wheel and model-level results remain pending.
