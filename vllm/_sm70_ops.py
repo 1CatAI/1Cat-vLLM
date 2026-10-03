@@ -317,6 +317,7 @@ if hasattr(torch.ops._C, "gguf_affine_gemm_sm70_out"):
         bits: int,
         k_ld: int,
         q_ld: int,
+        group_size: int = 32,
     ) -> None:
         return None
 
@@ -332,6 +333,7 @@ if hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out"):
         stats_ptrs: torch.Tensor,
         bits: int,
         num_experts: int,
+        group_size: int = 32,
     ) -> None:
         return None
 

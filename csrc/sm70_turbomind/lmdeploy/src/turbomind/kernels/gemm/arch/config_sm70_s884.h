@@ -111,6 +111,12 @@ using Config_U4_g = Sm70_s884<Operand_A<half>,           // A
                               raster_order, 0>;
 
 template <Order raster_order, int group_axis = -1>
+using Config_U2_Affine =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint2_t>, Transform_HMMA_SIMT_B,
+              Operand_V_Pack<uint32_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
 using Config_U8_Affine =
     Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
               Operand_B_Pack<uint8_t>, Transform_HMMA_SIMT_B,
