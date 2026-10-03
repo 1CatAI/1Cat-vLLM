@@ -580,7 +580,10 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        # Read by the indexer op, which runs outside the config context.
+        self.sm70_sparse = vllm_config.kernel_config.sm70_sparse
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self

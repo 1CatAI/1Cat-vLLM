@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
@@ -41,6 +40,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadat
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
+    from vllm.config.kernel import Sm70SparseConfig
     from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
@@ -51,12 +51,12 @@ logger = init_logger(__name__)
 
 def _bmm_blocker(
     q: torch.Tensor,
+    policy: "Sm70SparseConfig",
     *,
     prefill: bool,
     index_width: int = 0,
     prefer_paged: bool = False,
 ) -> str | None:
-    policy = get_current_vllm_config().kernel_config.sm70_sparse
     if not (policy.prefill_bmm if prefill else policy.decode_bmm):
         return "disabled by KernelConfig.sm70_sparse"
     if (
@@ -261,6 +261,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         )
         bmm_reason = _bmm_blocker(
             q,
+            layer.sm70_sparse,
             prefill=False,
             index_width=main_width + extra_width,
             prefer_paged=use_splitk and use_qk_dsplit,
@@ -386,7 +387,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
     ) -> list[tuple[tuple[int, ...], torch.dtype]]:
         """Batched-matmul prefill buffers; they share the workspace request
         with the gathered KV so that the manager does not alias them."""
-        reason = _bmm_blocker(q, prefill=True)
+        reason = _bmm_blocker(q, layer.sm70_sparse, prefill=True)
         if reason is not None:
             logger.info_once(
                 "SM70 sparse prefill: gathered fallback because %s.", reason
