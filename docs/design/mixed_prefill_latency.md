@@ -72,14 +72,14 @@ Two measured warm runs followed one cold run. Medians of the two warm runs:
 
 | Online mixed-load metric | Control | Adaptive 250 ms |
 | --- | ---: | ---: |
-| Resident output during incoming prefill (tokens/s) | 6.88 | 30.78 |
-| Longest resident update gap within prefill (s) | 2.873 | 0.307 |
-| First incoming prompt TTFT (s) | 14.287 | 17.719 |
-| Second incoming prompt TTFT (s) | 20.631 | 34.678 |
+| Resident output during incoming prefill (tokens/s) | 6.88 | 30.34 |
+| Longest resident update gap within prefill (s) | 2.873 | 0.310 |
+| First incoming prompt TTFT (s) | 14.287 | 17.994 |
+| Second incoming prompt TTFT (s) | 20.631 | 35.491 |
 
-This favors decode continuity: resident throughput increased about 4.47 times
+This favors decode continuity: resident throughput increased about 4.41 times
 and the longest gap fell about 89%, while the incoming TTFTs increased about
-24% and 68%. The initial cold candidate run measured 32.14 tokens/s, a 0.330 s
+26% and 72%. The initial cold candidate run measured 32.14 tokens/s, a 0.330 s
 gap, and TTFTs of 17.68/34.75 s. These are online measurements with overlapping
 prefill; they are not pure-decode throughput claims.
 
