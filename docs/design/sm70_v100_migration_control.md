@@ -1,5 +1,10 @@
 # SM70/V100 Migration Control
 
+2026-10-03: The [mixed NVFP4 DFlash2 latency campaign](sm70_unsloth_dflash2_12ms.md)
+records the new complete-round <12 ms acceptance contract and the initial
+fully connected V100 peer-store measurements. The model baseline is pending
+checkpoint transfer; no runtime optimization or speedup is accepted yet.
+
 Date: 2026-05-30
 
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
