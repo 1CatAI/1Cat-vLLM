@@ -370,3 +370,47 @@ both controls and each candidate with the same compilation/capture context
 and persistent attention metadata. It requires bitwise original/recaptured
 control agreement before measuring candidates and saves mismatch tensors if
 that prerequisite fails. No model KL or proposal-quality pass is claimed yet.
+
+### Fixed-prefix results and route correction
+
+The revised audit completes 24 identical prefixes per context, with 168 draft
+head rows at each length. The original and recaptured control snapshots agree
+bitwise before candidate execution. The first revised script assumed eight
+selector positions; draft7 has seven. That harness error is corrected before
+collecting the results below. TP replicas inspect the same prefixes and are
+not counted as independent samples.
+
+| Arm / context | Mean KL | p99 KL | Max KL | Top-1 agreement | Max logit difference |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP32 head / 1K | 0.00000518 | 0.00001637 | 0.00001720 | 100% | 0.007811 |
+| FP32 head / 8K | 0.00000478 | 0.00001266 | 0.00001520 | 99.40% | 0.007805 |
+| Sliding split / 1K | 0.00009085 | 0.00073245 | 0.00136171 | 100% | 0.546875 |
+| Sliding split / 8K | 0.00007801 | 0.00050586 | 0.00175952 | 99.40% | 0.421875 |
+
+The sliding arm fails the 0.5 maximum-logit bound at 1K, in addition to its
+earlier acceptance/concurrency failure. Its default dispatch and native changes
+are withdrawn. The FP32 head passes these observed numerical thresholds, but
+changes some proposal supports; acceptance, target-head coverage and concurrent
+serving remain separate gates.
+
+The FP16 projection arm reports identical hidden states and selector outputs.
+That is not an admitted fast-kernel gate: an existing guard-free AOT backbone
+does not revisit Python experiment flags. The projection's Python M8 test can
+also disappear from a dynamic prefill trace. Runtime row dispatch is moved
+inside the native operator, with the original matrix product outside M8 and
+the original preparation retained for other paths. A dedicated dynamic-trace
+test and captured kernel-name checks are required after a complete build.
+
+A separate NVFP4 quadpair experiment keeps every column's HMMA/accumulator
+sequence and FP16 rounding, but shares gate/up across quadpairs to produce
+272 CTAs of 256 threads instead of 136 CTAs of 512. All 384 original-shard
+cases match bits across four ranks, eight layers, M1/M7/M8 and changing inputs.
+The eight-layer working set nevertheless regresses: rank-zero M8 means are
+43.746→45.714 us per projection, and every rank/row shape loses. No production
+NVFP4 route is changed from this experiment.
+
+Both Torch and direct PyNccl all-gather captures contain event-wait, kernel,
+event-record nodes. Both fail conditional-graph instantiation on every rank,
+before replay. Kernel-name inspection confirms the same NCCL ring kernel.
+The next isolated probe removes only that exact three-node collective bridge,
+letting parent/body dependencies supply ordering. It has no serving admission.
