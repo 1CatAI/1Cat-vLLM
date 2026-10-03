@@ -414,3 +414,36 @@ event-record nodes. Both fail conditional-graph instantiation on every rank,
 before replay. Kernel-name inspection confirms the same NCCL ring kernel.
 The next isolated probe removes only that exact three-node collective bridge,
 letting parent/body dependencies supply ordering. It has no serving admission.
+
+### Conditional collective bridge follow-up
+
+The isolated three-node NCCL probe completes eight changing IF/ELSE replays
+on each of four ranks after removing only its event-wait/event-record bridge.
+Every gathered output matches the original values. This is research evidence
+for a single collective without intervening work; it does not admit a model
+sampler graph or establish ordering for a larger body.
+
+The runtime-row-dispatch wheel builds through normal CMake/package targets
+and passes the release artifact check. Its SHA256 is
+`a02f5a8dfb6552bfe60e5630abc00bf87b510a004eb0753b865b1b2f02b76a0e`.
+The first installation command stops because that environment has no `pip`
+module. An owned `uv` installation/test controller is started, but its unit
+results and installed artifact identity are not yet verified. Do not infer
+successful installation or dynamic-trace dispatch from the completed build.
+
+The next sampler integration keeps both existing rejection algorithms and
+captures a device-side choice between them. Request-slot metadata must have
+persistent storage: the runner allocates new expanded mappings each round.
+A graph-local mapping update and independent returned output storage preserve
+changing slots and asynchronous output-copy lifetimes. The collective bridge
+helper accepts only identified NCCL all-gather bridges and preserves explicit
+predecessor/successor edges; unknown event structures retain the existing path.
+This implementation has passed source checks but has not been built or admitted.
+Its next four-rank gate includes two collectives with intervening kernels and
+a collective in the prefix, compared bitwise with the original captured graph.
+
+The revised FP16 model audit gives the candidate an independent AOT callable,
+requires thirty native projection nodes, and leaves the original B1 attention
+route unchanged. Original/recaptured control agreement remains a prerequisite.
+Neither this pending audit nor the pending sampler integration closes the
+complete-round performance, target-head quality, or concurrency gates.
