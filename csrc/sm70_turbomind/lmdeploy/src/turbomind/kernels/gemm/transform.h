@@ -9,6 +9,7 @@
 #include "src/turbomind/kernels/core/meta.h"
 #include "src/turbomind/kernels/gemm/smem_copy.h"
 #include "src/turbomind/kernels/gemm/tiled_mma.h"
+#include "src/turbomind/kernels/gemm/types.h"
 
 namespace turbomind::gemm {
 
@@ -183,6 +184,97 @@ struct Transform_HMMA_SIMT_B {
     auto s1 = __ushort_as_half(s[0]);
     x[0] = __hmul(x[0], s1);
     x[1] = __hmul(x[1], s1);
+  }
+};
+
+// High code bits travel with one group's affine coefficient pair. Metadata
+// uses an aligned 64-bit carrier: low 32 bits are scale/min, high 32 bits are
+// little-endian high codes. Tiles must start at a complete metadata group.
+template<int LowBits, int HighBits, int GroupSize>
+struct Transform_HMMA_SM70_BitPlane {
+  template<class F, int Nf, int Mf, int K, class D, int Nd, int Md,
+           class S, int Ns, int Ms, int Ks>
+  __device__ static void apply(Array<F, Nf> (&frag)[K][Mf], int k,
+                               Array<D, Nd> (&data)[K][Md],
+                               Array<S, Ns> (&stat)[Ks][Ms], int div) {
+    static_assert(std::is_same_v<F, half> && std::is_same_v<S, uint64_t>);
+    static_assert(Nd == 8 && Nf == 8 && Mf == Md);
+    static_assert(GroupSize * HighBits <= 32);
+    auto& frag_k = reinterpret_cast<Array<F, Nd> (&)[Md]>(frag[k]);
+    auto& stat_k = reinterpret_cast<Array<S, 1> (&)[Ns * Ms]>(stat[k / div]);
+    const int base_k = (k * Nd) % GroupSize;
+    PRAGMA_UNROLL
+    for (int m = 0; m < Md; ++m) {
+      const uint64_t metadata = stat_k[m][0];
+      const uint32_t high = metadata >> 32;
+      const uint32_t packed = LowBits == 2 ? (const uint16_t&)data[k][m]
+                                           : (const uint32_t&)data[k][m];
+      Array<F, Nd> decoded;
+      constexpr uint32_t magic = 0x64006400U;
+      Array<uint32_t, 1> coefficients;
+      coefficients[0] = static_cast<uint32_t>(metadata);
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 2) {
+        uint32_t halves;
+        if constexpr (LowBits == 2) {
+          const uint32_t lanes = (packed >> (i / 2 * 2)) & 0x0303U;
+          halves = __byte_perm(lanes, magic, 0x7170);
+        }
+        else {
+          halves = ((packed >> (i / 2 * 4)) & 0x000F000FU) | magic;
+        }
+        const uint32_t upper = high >> ((base_k + i) * HighBits);
+        constexpr uint32_t mask = (1U << HighBits) - 1;
+        const uint32_t pair = (upper & mask) | (((upper >> HighBits) & mask) << 16);
+        halves |= pair << LowBits;
+        // All combined codes are exact integers below 64. The FP16 1024
+        // mantissa trick restores them without eight integer conversions.
+        (half2&)decoded[i] = __hsub2((const half2&)halves, (const half2&)magic);
+      }
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 2) {
+        Transform_HMMA_SIMT_B::dequant((Array<F, 2>&)decoded[i], coefficients);
+      }
+      frag_k[m] = decoded;
+    }
+  }
+};
+
+// Q3's exact centered form omits a redundant min and the unused 16 high bits.
+// Preparation requires min == -4 * scale; otherwise the caller must fall back.
+struct Transform_HMMA_SM70_CenteredBitPlane3 {
+  static constexpr auto kQuantType = QuantType::kCenteredBitPlane3;
+
+  template <class F, int Nf, int Mf, int K, class D, int Nd, int Md, class S,
+            int Ns, int Ms, int Ks>
+  __device__ static void apply(Array<F, Nf> (&frag)[K][Mf], int k,
+                               Array<D, Nd> (&data)[K][Md],
+                               Array<S, Ns> (&stat)[Ks][Ms], int div) {
+    static_assert(std::is_same_v<D, uint2_t> && std::is_same_v<F, half>);
+    static_assert(std::is_same_v<S, uint32_t> && Nd == 8 && Nf == 8 && Mf == Md);
+    auto& dst = reinterpret_cast<Array<F, Nd> (&)[Md]>(frag[k]);
+    auto& stats = reinterpret_cast<Array<S, 1> (&)[Ns * Ms]>(stat[k / div]);
+    const int base_k = (k * Nd) % 16;
+    PRAGMA_UNROLL
+    for (int m = 0; m < Md; ++m) {
+      const uint32_t metadata = stats[m][0];
+      const uint32_t high = metadata >> 16;
+      const uint32_t packed = (const uint16_t&)data[k][m];
+      constexpr uint32_t magic = 0x64006400U;
+      constexpr uint32_t bias = 0x64046404U;  // 1024 + center 4
+      const uint32_t scale = (metadata & 65535U) | (metadata << 16);
+      Array<F, Nd> decoded;
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 2) {
+        const uint32_t lanes = (packed >> (i / 2 * 2)) & 0x0303U;
+        uint32_t halves = __byte_perm(lanes, magic, 0x7170);
+        const uint32_t upper = high >> (base_k + i);
+        halves |= ((upper & 1U) | (((upper >> 1) & 1U) << 16)) << 2;
+        const half2 centered = __hsub2((const half2&)halves, (const half2&)bias);
+        (half2&)decoded[i] = __hmul2(centered, (const half2&)scale);
+      }
+      dst[m] = decoded;
+    }
   }
 };
 
