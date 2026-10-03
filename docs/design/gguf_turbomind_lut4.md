@@ -179,3 +179,10 @@ core hashes match.
 
 - Wheel SHA256: `7ed9e273c45b3a0c398296b7e8a74ef43c8537a5b4f9fd2eb990753272f3ff67`
 - Core SHA256: `f28920f322669081343e3bf207401123b44e5c35bbe985667f52b289d10d3948`
+
+After integrating main revision `d582b816e6`, the normal build and wheel
+were regenerated. The installed LUT4 checks pass again (12 tests); the
+GGUF decoder source is unchanged by that integration.
+
+- Updated wheel SHA256: `b16a437f38ad7a58fb6d465e5e2df4a1c62319f256ac0c4dfc906eb88636cc6b`
+- Updated core SHA256: `8c811b451b8f1853abe5846640ca27fdbde7934f0d9c7eab11e19fa2dfbf7d62`
