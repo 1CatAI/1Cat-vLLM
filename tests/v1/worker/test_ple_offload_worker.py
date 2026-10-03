@@ -617,6 +617,7 @@ def test_ple_offload_requires_ple_layers(
     assert worker._has_ple_layers() is expected
 
 
+@pytest.mark.parametrize("decode_context_parallel_size", [1, 2, 4])
 @pytest.mark.parametrize("pipeline_parallel_size", [1, 4])
 @pytest.mark.parametrize(
     ("architecture", "enable_expert_parallel"),
@@ -631,6 +632,7 @@ def test_ple_offload_uses_capability_not_model_identity(
     architecture: str,
     enable_expert_parallel: bool,
     pipeline_parallel_size: int,
+    decode_context_parallel_size: int,
 ) -> None:
     worker = Worker.__new__(Worker)
     worker.use_v2_model_runner = True
@@ -642,7 +644,7 @@ def test_ple_offload_uses_capability_not_model_identity(
         data_parallel_size=1,
         pipeline_parallel_size=pipeline_parallel_size,
         prefill_context_parallel_size=1,
-        decode_context_parallel_size=1,
+        decode_context_parallel_size=decode_context_parallel_size,
         enable_expert_parallel=enable_expert_parallel,
         use_ubatching=False,
     )
@@ -651,6 +653,37 @@ def test_ple_offload_uses_capability_not_model_identity(
     monkeypatch.setattr(gpu_worker_module.current_platform, "is_cuda", lambda: True)
 
     worker._validate_ple_offload_config()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "weight_transfer", "reason"),
+    [
+        ({"prefill_context_parallel_size": 2}, None, "PCP=2"),
+        ({"nnodes": 2}, None, "nnodes=2"),
+        ({"data_parallel_size": 2}, None, "non-local DP"),
+        ({"use_ubatching": True}, None, "ubatching/DBO"),
+        ({}, object(), "weight transfer"),
+    ],
+)
+def test_ple_dcp_keeps_unsupported_transport_guards(
+    monkeypatch, overrides, weight_transfer, reason
+):
+    worker = Worker.__new__(Worker)
+    settings = dict(
+        nnodes=1,
+        data_parallel_backend="mp",
+        data_parallel_size_local=1,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=2,
+        use_ubatching=False,
+    )
+    settings.update(overrides)
+    worker.parallel_config = SimpleNamespace(**settings)
+    worker.vllm_config = SimpleNamespace(weight_transfer_config=weight_transfer)
+    monkeypatch.setattr(gpu_worker_module.current_platform, "is_cuda", lambda: True)
+    with pytest.raises(ValueError, match=reason):
+        worker._validate_ple_offload_config()
 
 
 @pytest.mark.parametrize(
@@ -1256,6 +1289,12 @@ import ctypes, multiprocessing, os, signal, sys
 import psutil
 import torch
 from multiprocessing.reduction import ForkingPickler
+
+import vllm.platforms
+from vllm.platforms.cpu import CpuPlatform
+
+# This is a CPU shared-storage regression, including in spawned senders.
+vllm.platforms._current_platform = CpuPlatform()
 
 from vllm.v1.ple_offload.connector import _dump_registration
 from vllm.v1.ple_offload.protocol import PleOffloadRegistration

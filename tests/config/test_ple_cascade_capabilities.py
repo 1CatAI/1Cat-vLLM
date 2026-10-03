@@ -63,7 +63,7 @@ def test_default_admission_and_engine_local_activation(config):
         ("storage", "E4M3"),
         ("format", "safetensors"),
         ("missing", "no PLE"),
-        ("dcp", "context-parallel"),
+        ("pcp", "prefill context-parallel"),
     ],
 )
 def test_capability_rejections(config, case, reason):
@@ -79,9 +79,20 @@ def test_capability_rejections(config, case, reason):
     elif case == "missing":
         config.model_config.hf_text_config.ple_layer_ids = []
     else:
-        config.parallel_config.decode_context_parallel_size = 2
+        config.parallel_config.prefill_context_parallel_size = 2
     assert not config_module._qwen4exp_ple_cascade_requested(config)
     assert reason in config.kernel_config.ple_disk_cascade_reason
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4])
+def test_decode_context_parallel_preserves_cascade_admission(config, dcp_size):
+    config.parallel_config.tensor_parallel_size = 4
+    config.parallel_config.decode_context_parallel_size = dcp_size
+    before = dict(os.environ)
+    assert config_module._qwen4exp_ple_cascade_requested(config)
+    assert config.kernel_config.ple_disk_cascade_active
+    assert config.parallel_config.decode_context_parallel_size == dcp_size
+    assert dict(os.environ) == before
 
 
 @pytest.mark.parametrize("table_layer,admitted", [(1, True), (2, False)])
