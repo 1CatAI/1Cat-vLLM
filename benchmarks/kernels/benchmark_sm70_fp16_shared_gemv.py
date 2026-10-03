@@ -27,15 +27,23 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--kernel-source", type=Path)
+    parser.add_argument("--fused-gate-up", action="store_true")
     args = parser.parse_args()
-    global Sm70Fp16GemvSiluKernel
     if args.kernel_source:
         spec = importlib.util.spec_from_file_location(
             "research_fp16_kernel", args.kernel_source
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        Sm70Fp16GemvSiluKernel = module.Sm70Fp16GemvSiluKernel
+        gemv_kernel = module.Sm70Fp16GemvSiluKernel
+        gate_up_kernel = module.Sm70Fp16GateUpKernel
+    else:
+        from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
+            Sm70Fp16GateUpKernel as gate_up_kernel,
+        )
+        from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
+            Sm70Fp16GemvSiluKernel as gemv_kernel,
+        )
     lock_fd = os.open("/tmp/gpu0-3.lock", os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     pids = subprocess.check_output(
@@ -60,7 +68,7 @@ def main():
     ]
     global_weights = []
     names = []
-    for layer in range(16):
+    for layer in range(48):
         weights = []
         for part in ("gate", "up", "down"):
             stem = f"model.language_model.layers.{layer}.mlp.shared_expert"
@@ -85,7 +93,7 @@ def main():
         cases=[],
     )
     for rank in range(4):
-        for projection in ("gate_up", "down"):
+        for projection in ("gate_up",) if args.fused_gate_up else ("gate_up", "down"):
             weights = []
             for gate, up, down in global_weights:
                 width = gate.shape[0] // 4
@@ -96,7 +104,8 @@ def main():
                     else down[:, lo:hi].contiguous()
                 )
                 weights.append(weight.cuda())
-            n, k = weights[0].shape
+            full_n, k = weights[0].shape
+            n = full_n // 2 if args.fused_gate_up else full_n
             torch.manual_seed(3800 + rank)
             xs = [
                 torch.randn(1, k, device="cuda", dtype=torch.float16) for _ in weights
@@ -106,17 +115,27 @@ def main():
                 for _ in range(2)
             ]
 
-            def launch(arm, x, w, out, n=n):
+            def launch(arm, x, w, out, n=n, full_n=full_n):
                 if arm == 0:
-                    torch.mm(x, w.t(), out=out)
+                    if args.fused_gate_up:
+                        projected = x.new_empty((x.shape[0], full_n))
+                        torch.mm(x, w.t(), out=projected)
+                        torch.ops._C.silu_and_mul(out, projected)
+                    else:
+                        torch.mm(x, w.t(), out=out)
+                elif args.fused_gate_up:
+                    gate_up_kernel.apply_out(x, w, out)
                 else:
-                    Sm70Fp16GemvSiluKernel.apply_out(x, w, out, n, 0)
+                    gemv_kernel.apply_out(x, w, out, n, 0)
 
             checks = []
             for m in (1, 5, 7, 17, 33):
                 for scale in (0.03, 1.0, 3.0):
                     x = torch.randn(m, k, device="cuda", dtype=torch.float16) * scale
                     ref = (x.cpu().double() @ weights[0].cpu().double().t()).half()
+                    if args.fused_gate_up:
+                        activated = torch.nn.functional.silu(ref[:, :n].double()).half()
+                        ref = (activated.double() * ref[:, n:].double()).half()
                     errors = []
                     for arm in range(2):
                         out = torch.empty(m, n, device="cuda", dtype=torch.float16)
@@ -149,10 +168,12 @@ def main():
                     graphs[arm].replay()
                     end.record()
                     end.synchronize()
-                    times[arm].append(start.elapsed_time(end) * 1000 / 256)
+                    times[arm].append(
+                        start.elapsed_time(end) * 1000 / (16 * len(weights))
+                    )
             case = dict(
                 rank=rank,
-                projection=projection,
+                projection=projection + ("_silu_mul" if args.fused_gate_up else ""),
                 shape=[n, k],
                 rotating_weight_bytes=sum(w.numel() * 2 for w in weights),
                 checks=checks,

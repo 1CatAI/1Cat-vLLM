@@ -3,7 +3,10 @@
 import pytest
 import torch
 
-from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
+from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
+    Sm70Fp16GateUpKernel,
+    Sm70Fp16GemvSiluKernel,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
@@ -88,3 +91,27 @@ def test_capability_rejects_invalid_ranges_and_layouts():
         for i, v in changes.items():
             args[i] = v
         assert not Sm70Fp16GemvSiluKernel.can_implement(*args)
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 160, 2560), (5, 17, 73), (17, 37, 160), (33, 11, 256)]
+)
+def test_gate_up_materializations_and_graph_replay(m, n, k):
+    torch.manual_seed(512 + m)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    weight = torch.randn(2 * n, k, device="cuda", dtype=torch.float16) * 0.03
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    Sm70Fp16GateUpKernel.apply_out(x, weight, out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        Sm70Fp16GateUpKernel.apply_out(x, weight, out)
+    for scale in (0.0, 0.03, 1.0, 3.0):
+        x.normal_(0, scale)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        projected = (x.cpu().double() @ weight.cpu().double().T).half()
+        silu = torch.nn.functional.silu(projected[:, :n].double()).half()
+        expected = (silu.double() * projected[:, n:].double()).half()
+        torch.testing.assert_close(out.cpu(), expected, atol=0.002, rtol=0.002)

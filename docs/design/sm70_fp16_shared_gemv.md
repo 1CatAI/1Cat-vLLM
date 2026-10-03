@@ -22,27 +22,25 @@ and prefix SiLU retains its FP16 projection boundary and FP32 arithmetic.
 
 ## C1 operator measurements
 
-The benchmark rotates 16 checkpoint layers to exceed L2 capacity. It measures
-each of the four TP4 rank mappings on one V100 SXM2 32-GB GPU, using 256 nodes
-per graph and five alternating repeats. CUDA is 12.8 and Torch is 2.10. FP16
-reduced-precision reduction and accumulation are disabled in both arms.
-These are operator results, not a four-GPU model run.
+The benchmark rotates all 48 checkpoint layers before reusing weights. It
+measures each of the four TP4 rank mappings on one V100 SXM2 32-GB GPU,
+using 768 nodes per plain projection graph and five alternating repeats.
+The fused baseline includes cuBLAS gate/up and native SiLU-and-multiply.
+CUDA is 12.8 and Torch is 2.10. FP16 reduced-precision reduction and
+accumulation are disabled in both arms. These are operator results, not a
+four-GPU model run.
 
-| Rank mapping | Projection | cuBLAS us | Candidate us |
-|---:|---|---:|---:|
-| 0 | Gate/up 320x2560 | 9.364 | 4.192 |
-| 1 | Gate/up 320x2560 | 8.756 | 3.988 |
-| 2 | Gate/up 320x2560 | 8.388 | 3.832 |
-| 3 | Gate/up 320x2560 | 8.348 | 3.832 |
-| 0 | Down 2560x160 | 4.280 | 2.984 |
-| 1 | Down 2560x160 | 4.292 | 2.964 |
-| 2 | Down 2560x160 | 4.104 | 2.808 |
-| 3 | Down 2560x160 | 4.100 | 2.864 |
+| Projection | Median across four rank mappings, baseline us | Candidate us |
+|---|---:|---:|
+| Gate/up 320x2560 | 8.320 | 4.131 |
+| Gate/up + SiLU-and-multiply | 10.713 | 5.123 |
+| Down 2560x160 | 4.646 | 3.241 |
 
-Median across rank mappings is 8.572 to 3.910 us for gate/up and 4.192 to
-2.914 us for down. The original one-row generic kernel made down slower,
-measuring 5.292–6.220 us versus cuBLAS 4.112–4.568 us. Four-row scheduling
-resolves that local regression. It is not evidence of a full-model delta.
+The earlier 16-layer rotating result was gate/up 8.572 to 3.910 us and down
+4.192 to 2.914 us. The 48-layer result above replaces it for the revised
+cold-L2 criterion. The original one-row generic kernel made down slower;
+four-row scheduling resolves that local regression. Neither result proves
+an endpoint delta.
 
 Independent FP64 references pass for real weights at M1/5/7/17/33 and three
 input scales. Maximum absolute error is 0.001953125 across both arms. Eleven
@@ -79,13 +77,31 @@ validation omits `--kernel-source`:
   --model MODEL --out shared-gemv.json
 ```
 
-## Integration status
+## Framework integration and pending acceptance
 
-This change extends the existing operator; it does not yet move the shared
-expert linears from their cuBLAS loading/dispatch adapter. It does not claim
-96 launches removed, a measured new per-layer budget or a model speedup.
-Default routing needs capability-based selection and startup qualification
-in the normal framework, then the installed source-complete artifact's C1
-distribution/task gates and one short C4 end-to-end smoke. The 6-ms/token
-target remains outstanding. The model's actual DRAM-byte and pure peer-wait
-columns also remain unmeasured; logical weight sizes do not fill them.
+The unpacked FP16 adapter uses the existing `MPLinearKernel` registry and
+post-load lifecycle. It admits SM70 FP16 input/weight matrices with the
+existing FP32 accumulation policy, without model or TP predicates. Methods
+with their own `apply` retain their established provider. Startup checks
+compare the candidate with the vendor path and measure captured operations
+with a 16-MiB L2 flush before each operation. Flush cost is included equally
+in both arms and is not reported as projection latency. The existing startup
+kernel report exposes accepted graph widths, numerical failures and timings.
+
+Plain projection and fused gate/up use functional opaque operations with
+fake implementations for compilation. M is a positive template parameter;
+widths without a successful measurement use the vendor route. The decision
+is per loaded matrix and measured width, rather than a batch-size cutoff.
+Deterministic startup inputs do not consume model or sampler RNG state.
+
+Gate/up accumulates both projections in FP32, materializes each as FP16,
+computes SiLU in FP32, materializes it as FP16, then multiplies by the FP16 up
+projection. It replaces gate/up plus activation with one kernel. Down uses
+one projection kernel. No dense quantization or new environment variable is
+introduced. The existing disabled-kernel control can select the A/B baseline.
+
+Installed source-complete wheel route selection, C1 teacher-forcing and task
+gates, full-model timing, and one short C4 smoke remain required before merge.
+The operator result is not a claim of 96 launches removed or an endpoint
+speedup. First-phase 7.5-ms/token and second-phase 6-ms/token targets remain
+outstanding.

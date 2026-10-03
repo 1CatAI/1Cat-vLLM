@@ -162,3 +162,78 @@ class Sm70Fp16GemvSiluKernel:
             ROWS=rows,
             num_warps=warps,
         )
+
+
+@triton.jit
+def _fp16_gate_up_kernel(
+    x,
+    weight,
+    out,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    tiles: tl.constexpr = triton.cdiv(N, ROWS)
+    token, tile = tl.program_id(0) // tiles, tl.program_id(0) % tiles
+    rows = tile * ROWS + tl.arange(0, ROWS)
+    offsets = tl.arange(0, BLOCK_K)
+    gate = tl.zeros((ROWS, BLOCK_K), tl.float32)
+    up = tl.zeros((ROWS, BLOCK_K), tl.float32)
+    for start in tl.static_range(0, K, BLOCK_K):
+        cols = start + offsets
+        a = tl.load(x + token * K + cols, cols < K, 0).to(tl.float32)
+        mask = (rows[:, None] < N) & (cols[None, :] < K)
+        g = tl.load(
+            weight + rows[:, None] * K + cols[None, :],
+            mask,
+            0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        u = tl.load(
+            weight + (rows[:, None] + N) * K + cols[None, :],
+            mask,
+            0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        gate += a[None, :] * g
+        up += a[None, :] * u
+    g = tl.sum(gate, 1).to(tl.float16).to(tl.float32)
+    u = tl.sum(up, 1).to(tl.float16).to(tl.float32)
+    # Retain the activation's FP16 materialization before multiplication.
+    silu = (g * tl.sigmoid(g)).to(tl.float16).to(tl.float32)
+    tl.store(out + token * N + rows, silu * u, (rows < N) & (token < M))
+
+
+class Sm70Fp16GateUpKernel:
+    """Split contiguous gate/up rows, FP32 reductions and FP16 boundaries."""
+
+    @staticmethod
+    def can_implement(x, weight, out) -> bool:
+        return bool(
+            weight.ndim == out.ndim == 2
+            and weight.shape[0] == 2 * out.shape[1]
+            and Sm70Fp16GemvSiluKernel.can_implement(
+                x, weight, out, out.shape[1], 0, 0, 0, 1.0
+            )
+        )
+
+    @classmethod
+    def apply_out(cls, x, weight, out) -> None:
+        if not cls.can_implement(x, weight, out):
+            raise ValueError("Unsupported SM70 FP16 gate/up layout")
+        m, k = x.shape
+        n = out.shape[1]
+        rows = 4 if k <= 256 and n * m >= 4 * _sm_count(x.device) else 1
+        _fp16_gate_up_kernel[(m * triton.cdiv(n, rows),)](
+            x,
+            weight,
+            out,
+            M=m,
+            K=k,
+            N=n,
+            BLOCK_K=256,
+            ROWS=rows,
+            num_warps=4,
+        )
