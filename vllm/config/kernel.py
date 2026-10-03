@@ -484,6 +484,11 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_draft_prefetch: bool = True
+    """Warm bounded disk PLE rows while the remaining MTP draft runs."""
+    ple_draft_prefetch_cache_bytes: int = Field(default=8 * 1024**2, ge=0)
+    """Maximum raw FP8 row bytes cached per offloaded PLE layer."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -517,6 +522,8 @@ class KernelConfig:
             "linear_kernel_selections",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "ple_draft_prefetch",
+            "ple_draft_prefetch_cache_bytes",
         }
         if not self.ple_disk_cascade_active:
             ignored_factors.update(

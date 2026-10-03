@@ -42,6 +42,9 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Optional immutable row warming, never a model computation request.
+    prefetch_ids: list[int] | None = None
+    prefetch_context: list[list[int]] | None = None
 
 
 _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)

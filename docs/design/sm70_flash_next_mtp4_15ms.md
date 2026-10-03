@@ -230,7 +230,8 @@ retain their negative/small results without repeating them.
   environment variable. Together with HC admission, 49 CPU route tests pass.
 - A fused top1 kernel does not materialize its full logits. The diagnostic
   records its actual selected token separately and compares it with control
-  full-head top1, using the same overall/high-margin thresholds. Identical
+  full-head top1, using the shared 99% threshold. High-margin agreement
+  is diagnostic only. Identical
   diagnostic logits alone cannot qualify a changed accelerated decision.
   Model numerical, speed, quality and acceptance results remain pending.
 
@@ -254,3 +255,63 @@ retain their negative/small results without repeating them.
   fails only under an intentionally empty CUDA-visible GPU set (world-size
   validation), and is retained rather than counted as a pass. M5/M10 delayed
   producer graph cases are added; their GPU execution remains pending.
+
+- The separately authorized HC FP32-partial admission and greedy draft local
+  argmax defaults merged via PR #832, main merge
+  `a692497bc9fe2dd89173044cfe7a41b1a50ae754`. CI passed after preserving the
+  legacy proposer's resolved boolean type. This does not admit the remaining
+  structural candidates or claim a current complete-round latency.
+- Disk draft-prefix prefetch implementation: after the second proposed token,
+  stage the accepted ngram context, bonus seed and two drafts into a separate
+  tiny asynchronous D2H ring. No compute-stream host wait. The CPU worker
+  serves available demand requests first, then warms immutable raw FP8 rows
+  in a cache capped at 8 MiB per PLE layer. Wrong drafts cannot publish
+  results, modify sequence history, or reset completion flags. Old demand
+  messages remain compatible; refresh clears cached checkpoint rows.
+  Seven focused CPU cases pass (including eager/FULL draft callback timing);
+  combined mapped transport/worker/prefetch
+  checks: 44 passed, two skipped (GPU cases), one distributed-init case
+  deselected because CUDA devices were intentionally hidden. GPU prefix and
+  complete-model quality/performance qualification remain pending.
+- A research-only cooperative resident MoE prototype compiles with 64
+  registers/thread and no register spills. It combines integer route planning,
+  W13/SwiGLU, W2 and ordered FP32 top-k reduction. Preserve FP16 stage
+  boundaries. This library is not loaded by model/default benchmarks and has
+  not yet passed real-checkpoint M5/M10 numerical or speed screening; no
+  production kernel adoption is justified by compilation alone.
+- Remote control remains frozen at `dc226604a7`. Its first lease waiter exited
+  on residual foreign GPU owners without starting model workers. The replacement
+  `.artifacts/mtp15/launch_baseline_idle.py` releases all acquired locks and
+  retries while any foreign owner remains. The local resident-MoE screen also
+  waits for the common GPU lease. Preserve both machines' foreign jobs.
+
+- Resident MoE first real-weight screen (layer 0, rank 0, M5, six alternating
+  graph-replay batches): control median 0.0672747 ms, cooperative prototype
+  median 0.0685547 ms, about 1.9% slower. Intermediate and output are equal
+  in this case. This is a single-layer hot-cache diagnostic, not full-model
+  distribution or latency evidence. Reject this schedule as a default. M10
+  then failed because the grouped-batch-reduce control operator only admits
+  M5/M8/M16; retain this harness failure and use the actual M10 production
+  dispatch for any later comparison. Artifacts: `.artifacts/mtp15/`
+  `resident_screen.{log,json}`. Next resident design must remove the global
+  W13-to-W2 barrier and overlap projections within an expert work item, rather
+  than repeat the same all-grid phase schedule.
+
+- Local prefix/stream and eager/FULL callback checks now pass all eight cases
+  on GPU0. The CPU-only numerical/raw-row suite used hidden GPUs; the actual
+  prefix GPU gate came from the leased research-screen process.
+- Per-expert resident MoE pipeline removes the W13 grid barrier but regresses:
+  layer-0 M5 control median 0.0672533 ms versus pipeline 0.0929920 ms (about
+  38.3% slower), with equal intermediate/output for that case. Reduced CTA
+  coverage is consistent with this schedule's regression; do not use it as
+  a default. The next-layer harness then failed because its timing-loop
+  index shadowed the checkpoint index dictionary. This failure and the
+  completed first-layer measurements remain in
+  `.artifacts/mtp15/resident_pipeline_screen.{log,json}`. Do not spend a
+  model reload fixing this already-rejected schedule's remaining screen.
+- Remote frozen-source delayed producer M5/M10 mapped-result GPU gate passes
+  both uint8 and FP16 cases (2 passed). The optional pinned-allocation smoke
+  next fails its combined pinned/size assertion before model startup. The
+  replacement smoke explicitly initializes CUDA as model workers do; this
+  hypothesis is pending, not an admitted repair. Keep the original failure
+  under `remote_pinned_gpu_gate.log` and do not repeat the passed mapped gate.

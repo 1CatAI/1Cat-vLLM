@@ -91,6 +91,7 @@ class PleOffloadConnector:
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
         self._layers = self._setup_layers(vllm_config, model)
+        self.draft_prefetcher = None
 
         # Both runner paths stage into the same shared buffers. TP0 registers
         # them with CUDA so MRV2 can use asynchronous D2H copies.
@@ -158,6 +159,23 @@ class PleOffloadConnector:
                         for _ in range(vllm_config.max_concurrent_batches):
                             self._d2h_event_pool.put_nowait(torch.cuda.Event())
                 self._start_request_thread(ipc_addr)
+                speculative = vllm_config.speculative_config
+                if (
+                    self._uses_cuda_inputs
+                    and envs.VLLM_PLE_DISK_OFFLOAD
+                    and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                    and vllm_config.kernel_config.ple_draft_prefetch
+                    and vllm_config.kernel_config.ple_draft_prefetch_cache_bytes > 0
+                    and speculative is not None
+                    and speculative.method == "mtp"
+                    and speculative.num_speculative_tokens >= 2
+                ):
+                    from vllm.v1.ple_offload.prefetch import DraftPlePrefetcher
+
+                    self.draft_prefetcher = DraftPlePrefetcher(
+                        vllm_config, device, ipc_addr, self.dp_rank
+                    )
+                    logger.info("Disk PLE draft-prefix row prefetch enabled")
         except Exception:
             self.close()
             raise
@@ -524,6 +542,9 @@ class PleOffloadConnector:
 
     def close(self) -> None:
         """Stop request transport and release host registrations."""
+        prefetcher = getattr(self, "draft_prefetcher", None)
+        if prefetcher is not None:
+            prefetcher.close()
         request_thread = self._request_thread
         if request_thread is not None and request_thread.is_alive():
             try:

@@ -71,6 +71,9 @@ class EagleSpeculator:
         assert speculative_config is not None
         self.speculative_config: SpeculativeConfig = speculative_config
         self.method = self.speculative_config.method
+        self.ple_draft_prefetch: (
+            Callable[[InputBatch, torch.Tensor, torch.Tensor], None] | None
+        ) = None
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
 
@@ -437,6 +440,7 @@ class EagleSpeculator:
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
+        draft_prefetch: Callable[[], None] | None = None,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
@@ -481,6 +485,10 @@ class EagleSpeculator:
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+            if step == 1 and draft_prefetch is not None:
+                # Outside CUDA capture: copy the completed prefix while the
+                # final two serial draft steps run on the compute stream.
+                draft_prefetch()
 
     def generate_draft(
         self,
@@ -746,6 +754,12 @@ class EagleSpeculator:
         )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
+        draft_prefetch: Callable[[], None] | None = None
+        prefetch = self.ple_draft_prefetch
+        if prefetch is not None and not dummy_run and not is_profile:
+            draft_prefetch = lambda: prefetch(
+                input_batch, num_sampled, self.draft_tokens[:num_reqs]
+            )
         self._mtp_decode_begin()
         try:
             self.multi_step_decode(
@@ -753,6 +767,7 @@ class EagleSpeculator:
                 dummy_run and skip_attn_for_dummy_run,
                 decode_batch_desc,
                 num_tokens_across_dp,
+                draft_prefetch=draft_prefetch,
             )
         finally:
             self._mtp_decode_end()

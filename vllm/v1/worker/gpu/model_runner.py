@@ -468,6 +468,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
         )
+        prefetcher = self._ple_offload_connector.draft_prefetcher
+        from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+
+        if prefetcher is not None and isinstance(self.speculator, EagleSpeculator):
+            self.speculator.ple_draft_prefetch = lambda batch, sampled, drafts: (
+                prefetcher.enqueue(batch, self.req_states, sampled, drafts)
+            )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()

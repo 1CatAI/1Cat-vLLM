@@ -945,7 +945,11 @@ class PleOffloadRunner:
     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
         """Run requests layer-first so each DP rank can resume promptly."""
         requests_by_dp: dict[int, PleOffloadRequest] = {}
+        prefetches = []
         for request in requests:
+            if request.prefetch_ids is not None:
+                prefetches.append(request)
+                continue
             if request.dp_rank not in self._worker_targets:
                 logger.warning(
                     "No PLE output targets for dp_rank=%d; skipping request.",
@@ -1044,3 +1048,25 @@ class PleOffloadRunner:
                         with torch.cuda.stream(target.copy_stream):
                             destination.copy_(result, non_blocking=True)
                             target.sem.signal(target.copy_stream)
+
+        # Prediction cannot delay a demand already in this batch or change
+        # its buffers, history or completion flags. Keep the latest per DP.
+        for request in {r.dp_rank: r for r in prefetches}.values():
+            if request.dp_rank not in self._worker_targets:
+                continue
+            ids = request.prefetch_ids
+            context = request.prefetch_context
+            if ids is None or context is None or len(ids) != 3 * len(context):
+                continue
+            if (
+                not context
+                or len(context) > self.vllm_config.scheduler_config.max_num_seqs
+            ):
+                continue
+            input_ids = torch.tensor(ids, dtype=torch.int32)
+            starts = torch.arange(len(context) + 1, dtype=torch.int32) * 3
+            ngram_context = torch.tensor(context, dtype=torch.int32)
+            for layer in self._layers.values():
+                prefetch = getattr(layer, "prefetch_rows", None)
+                if prefetch is not None:
+                    prefetch(input_ids, starts, ngram_context)
