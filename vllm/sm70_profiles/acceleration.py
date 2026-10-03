@@ -91,6 +91,9 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
                 capability = getattr(kernel, "capability", None)
                 if capability is not None and is_dataclass(capability):
                     row["operator_admission"] = asdict(capability)
+                capabilities = getattr(kernel, "operator_capabilities", ())
+                if capabilities:
+                    row["operator_candidates"] = [asdict(c) for c in capabilities]
     return result
 
 
@@ -286,6 +289,7 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
     # Keep the companion import stable with and without extracted build files.
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
 
+    # isort: split
     from flash_attn_v100 import (  # type: ignore[attr-defined]
         flash_attn_grouped_e4m3_fp32_available,
     )
@@ -421,6 +425,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
+    report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections
     report["ple_disk_cascade"] = {
         "enabled": cfg.kernel_config.ple_disk_cascade_active,
         "reason": cfg.kernel_config.ple_disk_cascade_reason,

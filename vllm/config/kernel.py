@@ -130,6 +130,7 @@ MoEBackend = Literal[
     "flashinfer_cutedsl",
     "flashinfer_b12x",
     "marlin",
+    "sm70_skinny",
     "humming",
     "triton_unfused",
     "aiter",
@@ -411,6 +412,8 @@ class KernelConfig:
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "marlin": Use Marlin kernels (weight-only quantization)
+    - "sm70_skinny": Use the skinny QPN kernels for NVFP4 and MXFP4 on SM70/SM75
+      (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)
@@ -470,6 +473,23 @@ class KernelConfig:
     sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
     """SM70 sparse attention policy; admission uses actual tensor capabilities."""
 
+    sm70_skinny_moe: bool = True
+    """Admit compatible NVFP4/MXFP4 skinny MoE kernels on SM70/SM75."""
+
+    sm70_skinny_moe_applicable: bool = Field(default=False, init=False)
+    """Whether a loaded MoE family consults the skinny kernel policy."""
+
+    moe_kernel_selections: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed MoE capability decisions, excluded from compilation hashing."""
+
+    fused_fp16_aux_gemv: bool = True
+    """Fuse compatible auxiliary projections already using exact FP16 GEMV."""
+
+    fused_fp16_aux_gemv_applicable: bool = Field(default=False, init=False)
+    """Whether loaded auxiliary projections admit the exact GEMV fusion."""
+
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
@@ -522,10 +542,17 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
+            "moe_kernel_selections",
+            "sm70_skinny_moe_applicable",
+            "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "qsa_auto_e4m3_reason",
         }
+        if not self.sm70_skinny_moe_applicable:
+            ignored_factors.add("sm70_skinny_moe")
+        if not self.fused_fp16_aux_gemv_applicable:
+            ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:
             ignored_factors.update({"qsa_auto_e4m3", "qsa_auto_e4m3_active"})
         if not self.ple_disk_cascade_active:

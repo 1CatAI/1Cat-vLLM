@@ -99,6 +99,11 @@ class VideoSubcommand(CLISubcommand):
             )
             mode.add_argument("--host-memory-directory")
             mode.add_argument(
+                "--disable-prepared-weight-cache",
+                action="store_true",
+                help="Load text encoder checkpoints without reusable CPU snapshots",
+            )
+            mode.add_argument(
                 "--video-encoder",
                 choices=("libx264", "h264_nvenc"),
                 default="libx264",
@@ -169,6 +174,7 @@ class VideoSubcommand(CLISubcommand):
             weight_offload=args.weight_offload,
             host_memory_mode=args.host_memory_mode,
             host_memory_directory=args.host_memory_directory,
+            prepared_weight_cache=not args.disable_prepared_weight_cache,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve
