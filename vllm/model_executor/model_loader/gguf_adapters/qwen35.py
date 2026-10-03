@@ -176,7 +176,11 @@ class Qwen35Adapter:
                 weight = torch.from_numpy(tensor.data.copy())
             weight = self.restore(name, weight)
             if not quantized or dense_fallback or not self.is_linear(name):
-                converted = weight.to(dtype)
+                # The model keeps A_log in FP32 even under --dtype half.
+                # Preserve inverse-log precision rather than rounding through
+                # FP16 before the destination parameter copies it back to FP32.
+                target_dtype = torch.float32 if name.endswith(".A_log") else dtype
+                converted = weight.to(target_dtype)
                 if torch.isfinite(weight).all() and not torch.isfinite(converted).all():
                     raise ValueError(
                         f"GGUF {raw}: values overflow {dtype}; use --dtype float32"

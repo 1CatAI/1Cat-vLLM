@@ -131,8 +131,9 @@ The real first-shard directory has 1,223 tensors and GGML type counts:
 F32=292, F16=1, BF16=484, Q4_K=45, Q5_K=15, Q6_K=71,
 IQ2_XXS=18, IQ2_XS=20, IQ2_S=20, IQ3_XXS=12, IQ3_S=82,
 IQ4_NL=58, IQ4_XS=67, Q2_0=38. The remaining tensor is the IQ4_NL
-PLE table (320,001,536 rows of dimension 160), requiring sparse mmap lookup
-rather than whole-table FP16 materialization.
+PLE table (320,001,536 rows of dimension 160), requiring packed sparse lookup.
+GPU vocabulary partitions or host mmap must retain the quantized rows; never
+materialize the complete table in FP16.
 
 Actual metadata: qwen4exp, 48 layers, H=2560, 24 Q / 2 KV attention heads,
 head_dim=256, 512 experts, top-k=10, expert K=640, 16 GDN key / 48 value
@@ -144,12 +145,16 @@ are aligned. Final EP/conversion admission remains pending.
 
 ### Loading validation and open gates
 
-17 metadata/tokenizer/split tests and 10 dense adapter/TP/mixed-storage
+17 metadata/tokenizer/split tests and 12 dense adapter/TP/mixed-storage
 tests pass on CPU. All four tiny-model ranks loaded their weights, but the
 GPU forward gate remains open: earlier failures localized missing runtime
 dependencies, unaligned K-quant FFN storage, missing hybrid state traits,
-and KV-head replication when TP exceeds KV heads. The last three have
-source fixes and focused CPU coverage; an additional GPU run is required.
+and KV-head replication when TP exceeds KV heads. Those have source fixes;
+alignment and replication have focused CPU coverage. A later run completed
+engine initialization and GPU prefill warmup, then rejected the text-only
+class's missing MRoPE position interface. That interface is now implemented
+and tested on CPU. Inverse A_log loading preserves its FP32 parameter contract
+even with FP16 model dtype. Fresh GPU/logits validation remains required.
 
 These are implementation-localization results, not primary-model quality
 or speed acceptance. GPU 0-3 are occupied by other tasks; hold the shared
