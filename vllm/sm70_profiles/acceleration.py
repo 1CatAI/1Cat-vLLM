@@ -52,6 +52,13 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
         ):
             if holder is None:
                 continue
+            if (admission := getattr(holder, "native_admission", None)) is not None:
+                result[f"GGUF:{name}"] = {
+                    "kernel": type(holder).__name__,
+                    "layers": [name],
+                    "operator_admission": admission,
+                    "scope": "prepared_gguf_operator_capability",
+                }
             for attribute in (
                 "kernel",
                 "fp8_linear",

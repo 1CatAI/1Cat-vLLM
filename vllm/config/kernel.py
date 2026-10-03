@@ -351,6 +351,24 @@ class Sm70Fp8Config:
 
 
 @config
+class Sm70GgufConfig:
+    """Operation-level policy for native GGUF storage on Volta."""
+
+    enabled: bool = True
+    """Admit the packaged native extension when the operator supports the format."""
+
+    prefill_min_m: int = 8
+    """Use dequantization plus tensor-core FP16 GEMM from this token count."""
+
+    @field_validator("prefill_min_m")
+    @classmethod
+    def _positive_prefill_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("GGUF prefill_min_m must be positive")
+        return value
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -429,6 +447,9 @@ class KernelConfig:
 
     sm70_fp8: Sm70Fp8Config = Field(default_factory=Sm70Fp8Config)
     """SM70 serialized block-FP8 variant policy, resolved per engine."""
+
+    sm70_gguf: Sm70GgufConfig = Field(default_factory=Sm70GgufConfig)
+    """Native GGUF admission and Volta tensor-core prefill policy."""
 
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
