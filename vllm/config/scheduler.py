@@ -79,7 +79,16 @@ class SchedulerConfig:
 
     long_prefill_token_threshold: int = 0
     """For chunked prefill, a request is considered long if the prompt is
-    longer than this number of tokens."""
+    longer than this number of tokens.
+
+    The cap is not applied when the request is the only one in the batch,
+    since there is no other request for it to starve."""
+
+    long_prefill_token_threshold_adaptive: bool = False
+    """Floor the effective long prefill token threshold at a fair share of
+    the per-step token budget: the budget divided by the number of queued
+    and running requests. Only applies when long_prefill_token_threshold is
+    nonzero."""
 
     mixed_prefill_step_latency_ms: float = Field(default=250.0, ge=0)
     """GPU step latency target when prefill shares a batch with resident decode.
