@@ -47,12 +47,6 @@ def _get_sm70_dsv4_decode_context_buckets(
     env_name = "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
     if env_name in os.environ:
         return _get_sm70_context_buckets(env_name)
-    # Speculative graphs cover multiple query rows and require a separate
-    # end-to-end long-context gate. They remain available through the explicit
-    # environment override above.
-    if vllm_config.speculative_config is not None:
-        return ()
-
     model_config = vllm_config.model_config
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability_family(70)
