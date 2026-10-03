@@ -7,7 +7,10 @@ from dataclasses import dataclass
 import torch
 
 from vllm.model_executor.kernels.gguf import GGUFDecoderFamily, GGUFOperatorCapability
-from vllm.model_executor.layers.quantization.gguf_transcode import AFFINE_GROUP32_TYPES
+from vllm.model_executor.layers.quantization.gguf_transcode import (
+    AFFINE_GROUP32_TYPES,
+    AFFINE_U2_TYPES,
+)
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
@@ -36,16 +39,22 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             return False, "requires_canonical_gguf_affine_storage"
         if not config.enabled:
             return False, "disabled_by_kernel_config"
-        if config.source_type not in AFFINE_GROUP32_TYPES:
+        if config.source_type not in AFFINE_GROUP32_TYPES | AFFINE_U2_TYPES:
             return False, "source_format_codec_unavailable"
         if config.act_type != torch.float16:
             return False, "requires_fp16_activations"
-        if config.weight_type not in (scalar_types.uint4, scalar_types.uint8):
+        expected_type = (
+            scalar_types.uint2
+            if config.source_type in AFFINE_U2_TYPES
+            else (scalar_types.uint8 if config.source_type == 8 else scalar_types.uint4)
+        )
+        if config.weight_type != expected_type:
             return False, "canonical_integer_width_unavailable"
-        if config.group_size != 32 or config.has_g_idx:
-            return False, "requires_group32_without_activation_order"
+        expected_group = 16 if config.source_type == 10 else 32
+        if config.group_size != expected_group or config.has_g_idx:
+            return False, "canonical_group_or_activation_order_not_supported"
         k, n = config.partition_weight_shape
-        if k <= 0 or n <= 0 or k % 32 or n % 32:
+        if k <= 0 or n <= 0 or k % config.group_size or n % 32:
             return False, "local_shape_cuts_canonical_group_or_output_pack"
         for name in ("gguf_affine_sm70_prepare", "gguf_affine_gemm_sm70_out"):
             if not hasattr(torch.ops._C, name):
@@ -57,9 +66,9 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             return
         codes, scales, mins, _ = self._get_weight_params(layer)
         assert mins is not None
-        bits = 4 if self.config.weight_type == scalar_types.uint4 else 8
+        bits = self.config.weight_type.size_bits
         weight, stats, meta = torch.ops._C.gguf_affine_sm70_prepare(
-            codes, scales, mins, bits
+            codes, scales, mins, bits, self.config.group_size
         )
         replace_parameter(layer, self.w_q_name, weight)
         replace_parameter(layer, self.w_s_name, stats)
@@ -89,6 +98,7 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             self.bits,
             layer.gguf_tm_k_ld,
             layer.gguf_tm_q_ld,
+            self.config.group_size,
         )
         if bias is not None:
             output.add_(bias)

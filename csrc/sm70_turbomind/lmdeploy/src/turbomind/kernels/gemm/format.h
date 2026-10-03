@@ -56,6 +56,26 @@ struct Converter<uint16_t, uint4_t> {
 };
 
 template<>
+struct Converter<uint16_t, uint2_t> {
+    template<int N>
+    __device__ Array<uint2_t, N> operator()(const Array<uint16_t, N>& x) {
+        static_assert(N % 8 == 0);
+        Array<uint2_t, N> output;
+        PRAGMA_UNROLL
+        for (int i = 0; i < N; i += 8) {
+            uint16_t packed = 0;
+            PRAGMA_UNROLL
+            for (int j = 0; j < 8; ++j) {
+                const int position = j / 2 + (j % 2) * 4;
+                packed |= (x[i + j] & 3) << (position * 2);
+            }
+            (uint16_t&)output[i] = packed;
+        }
+        return output;
+    }
+};
+
+template<>
 struct Converter<uint16_t, uint8_t> {
     template<int N>
     __device__ Array<uint8_t, N> operator()(const Array<uint16_t, N>& x)
