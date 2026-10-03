@@ -277,6 +277,11 @@ def main():
         dense = torch.from_numpy(reference).half().cuda()
         awq = awq_comparator(canonical)
         nvfp4 = nvfp4_comparator(canonical) if awq is None else None
+        blas_scratch = (
+            None
+            if isinstance(canonical, Lut4GGUFProjection)
+            else torch.empty((k, n), device="cuda", dtype=torch.float16)
+        )
         for m in args.m:
             torch.manual_seed(20261003 + m)
             x = (torch.randn((m, k), device="cuda") * 0.125).half()
@@ -311,6 +316,35 @@ def main():
                     torch.nn.functional.linear, x, dense
                 ),
             }
+            blas_error = None
+            if blas_scratch is not None:
+
+                def canonical_blas(
+                    out=out,
+                    x=x,
+                    canonical=canonical,
+                    weight=weight,
+                    stats=stats,
+                    scratch=blas_scratch,
+                ):
+                    torch.ops._C.gguf_affine_blas_sm70_out(
+                        out,
+                        x,
+                        weight,
+                        stats,
+                        canonical.bits,
+                        scratch,
+                        canonical.group_size,
+                    )
+                    return out
+
+                canonical_blas()
+                blas_error = ((out.float() - expected).norm() / expected.norm()).item()
+                if not torch.isfinite(out).all() or blas_error > 0.003:
+                    raise AssertionError(
+                        f"{name}, M={m}: canonical BLAS error {blas_error}"
+                    )
+                routes["turbomind_canonical_blas_fp32"] = canonical_blas
             if packed is not None:
                 routes["dequant_cublas"] = partial(
                     torch.ops._C_gguf.ggml_dense_blas, packed, x, weight_type, n

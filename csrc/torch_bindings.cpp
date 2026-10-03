@@ -182,6 +182,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_affine_grouped_gemm_sm70_out", torch::kCUDA,
            &gguf_affine_grouped_gemm_sm70_out);
   ops.def(
+      "gguf_affine_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "Tensor stats, int bits, int group_size) -> ()");
+  ops.impl("gguf_affine_dequantize_sm70_out", torch::kCUDA,
+           &gguf_affine_dequantize_sm70_out);
+  ops.def(
+      "gguf_affine_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, Tensor(b!) scratch, int group_size) -> ()");
+  ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
+           &gguf_affine_blas_sm70_out);
+  ops.def(
       "gguf_lut4_sm70_prepare(Tensor codes, Tensor scales, int lut_id, "
       "int group_size) -> Tensor[]");
   ops.impl("gguf_lut4_sm70_prepare", torch::kCUDA, &gguf_lut4_sm70_prepare);

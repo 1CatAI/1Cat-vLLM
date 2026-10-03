@@ -91,6 +91,9 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
                 capability = getattr(kernel, "capability", None)
                 if capability is not None and is_dataclass(capability):
                     row["operator_admission"] = asdict(capability)
+                capabilities = getattr(kernel, "operator_capabilities", ())
+                if capabilities:
+                    row["operator_candidates"] = [asdict(c) for c in capabilities]
     return result
 
 
@@ -284,10 +287,12 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
 
     # isort: split
     # Keep the companion import stable with and without extracted build files.
+    from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+    # isort: split
     from flash_attn_v100 import (  # type: ignore[attr-defined]
         flash_attn_grouped_e4m3_fp32_available,
     )
-    from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
 
     # isort: split
     from vllm.v1.attention.backends.flash_attn_v100 import (

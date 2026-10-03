@@ -116,6 +116,13 @@ void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor stats_ptrs, int64_t bits,
                                        int64_t num_experts, int64_t group_size);
 
+void gguf_affine_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
+                                     torch::Tensor stats, int64_t bits,
+                                     int64_t group_size);
+void gguf_affine_blas_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, torch::Tensor scratch,
+                               int64_t group_size);
 std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
                                                   torch::Tensor scales,
                                                   int64_t lut_id,
