@@ -66,11 +66,6 @@ def test_select_default_backend_by_platform(
         patch.object(current_platform, "is_xpu", return_value=False),
         patch.object(current_platform, "is_tpu", return_value=False),
         patch.object(current_platform, "is_out_of_tree", return_value=False),
-        patch.object(
-            current_platform,
-            "is_cuda_alike",
-            return_value=platform_method in ("is_cuda", "is_rocm"),
-        ),
         patch.object(current_platform, platform_method, return_value=True),
     ):
         moe_config = make_dummy_moe_config()

@@ -420,7 +420,6 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
-    report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections
     report["ple_disk_cascade"] = {
         "enabled": cfg.kernel_config.ple_disk_cascade_active,
         "reason": cfg.kernel_config.ple_disk_cascade_reason,
