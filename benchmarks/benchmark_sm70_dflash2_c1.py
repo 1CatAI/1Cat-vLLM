@@ -30,6 +30,9 @@ def run(args, text: str, temperature: float, profile: bool = False) -> dict:
         "chat_template_kwargs": {"enable_thinking": False},
         "cache_salt": f"c1-{time.time_ns()}",
     }
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        body["seed"] = seed
     events = []
     usage = None
     profile_thread = None
@@ -81,6 +84,7 @@ def run(args, text: str, temperature: float, profile: bool = False) -> dict:
     ordered = sorted(gaps)
     return {
         "temp": temperature,
+        "seed": seed,
         "profiled_request": profile,
         "input_fixture_length": args.input_len,
         "request_start_monotonic_s": started,
@@ -117,6 +121,9 @@ def main() -> None:
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--max-tokens", type=int, default=600)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--seed", type=int, help="Fix request RNG for paired comparisons"
+    )
     parser.add_argument("--skip-greedy", action="store_true")
     parser.add_argument("--skip-profile", action="store_true")
     args = parser.parse_args()
