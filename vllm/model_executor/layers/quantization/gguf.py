@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
 
-import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -34,6 +34,14 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.gguf_native import (
+    NATIVE_TYPES,
+    dense_admission,
+    native_available,
+    native_dense,
+    native_dequantize,
+    pad_weight_tail,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -41,6 +49,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -196,7 +205,11 @@ MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
 def _fused_mul_mat_gguf(
-    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    qweight_type: int,
+    native_enabled: bool = True,
+    prefill_min_m: int = 8,
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
@@ -209,6 +222,13 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    # Preserve established routes for existing formats. Packaged upstream
+    # operators are fallbacks for missing formats and explicit benchmark
+    # candidates; TurboMind supplies the primary accelerated GGUF routes.
+    if native_enabled and qweight_type not in DEQUANT_TYPES:
+        native_result = native_dense(x, qweight, qweight_type, prefill_min_m)
+        if native_result is not None:
+            return native_result
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
@@ -216,17 +236,27 @@ def _fused_mul_mat_gguf(
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
-    elif qweight_type in DEQUANT_TYPES:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    elif qweight_type in DEQUANT_TYPES or qweight_type in NATIVE_TYPES:
+        block_size, type_size = quant_size(qweight_type)
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        weight = (
+            native_dequantize(qweight, qweight_type, *shape, x.dtype)
+            if native_enabled and qweight_type not in DEQUANT_TYPES
+            else None
+        )
+        if weight is None:
+            if qweight_type not in DEQUANT_TYPES:
+                raise ValueError(
+                    f"No admitted native GGUF route for {quant_type_name(qweight_type)}"
+                )
+            weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
         y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
         # Might be useful if llama.cpp adds a new quantization type.
         # Wrap to GGMLQuantizationType IntEnum to make sure it's a valid type.
-        qweight_type = WeightType(qweight_type)
-        raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+        type_name = quant_type_name(qweight_type)
+        raise NotImplementedError(f"Unsupported GGUF quantization type: {type_name}")
     return y
 
 
@@ -234,6 +264,8 @@ def _fused_mul_mat_gguf_fake(
     x: torch.Tensor,
     qweight: torch.Tensor,
     qweight_type: int,
+    native_enabled: bool = True,
+    prefill_min_m: int = 8,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
 
@@ -387,17 +419,24 @@ def _apply_gguf_embedding(
     qweight_type: int,
     hidden_size: int,
     dtype: torch.dtype | None = None,
+    native_enabled: bool = True,
 ) -> torch.Tensor:
     if qweight_type in UNQUANTIZED_TYPES:
         return torch.embedding(qweight, x)
-    elif qweight_type in DEQUANT_TYPES:
-        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    elif qweight_type in DEQUANT_TYPES or qweight_type in NATIVE_TYPES:
+        block_size, type_size = quant_size(qweight_type)
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
-        dequant = ops.ggml_dequantize(
-            quant, qweight_type, hidden_size, x_flat.shape[0], dtype
+        dequant = (
+            native_dequantize(quant, qweight_type, x_flat.shape[0], hidden_size, dtype)
+            if native_enabled
+            else None
         )
+        if dequant is None:
+            dequant = ops.ggml_dequantize(
+                quant, qweight_type, hidden_size, x_flat.shape[0], dtype
+            )
         return dequant.view(*x.shape, hidden_size)
     else:
         qweight_type = WeightType(qweight_type)
@@ -410,6 +449,7 @@ def _apply_gguf_embedding_fake(
     qweight_type: int,
     hidden_size: int,
     dtype: torch.dtype | None = None,
+    native_enabled: bool = True,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], hidden_size, dtype=dtype, device=x.device)
 
@@ -435,6 +475,11 @@ class GGUFLinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        config = get_current_vllm_config_or_none()
+        policy = config.kernel_config.sm70_gguf if config is not None else None
+        self.native_enabled = policy.enabled if policy is not None else True
+        self.prefill_min_m = policy.prefill_min_m if policy is not None else 8
+        self.native_prepared = False
 
     def create_weights(
         self,
@@ -483,8 +528,86 @@ class GGUFLinearMethod(LinearMethodBase):
         layer.register_parameter("qweight_type", qweight_type)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        ready = self.native_enabled and native_available()
+        self.native_admission: dict[str, Any] = {
+            "enabled": self.native_enabled,
+            "extension_available": native_available(),
+            "prefill_min_m": self.prefill_min_m,
+            "reason": (
+                "disabled_by_kernel_config"
+                if not self.native_enabled
+                else "native_extension_missing"
+                if not native_available()
+                else "device_not_cuda"
+                if layer.qweight.device.type != "cuda"
+                else None
+            ),
+        }
+        types = layer.qweight_type.shard_weight_type.values() or (
+            layer.qweight_type.weight_type,
+        )
+        for weight_type in types:
+            if weight_type not in UNQUANTIZED_TYPES | DEQUANT_TYPES and not (
+                ready and weight_type in NATIVE_TYPES
+            ):
+                raise ValueError(
+                    f"GGUF {quant_type_name(weight_type)} requires an admitted "
+                    "packaged native operator; check kernel_config.sm70_gguf "
+                    "and the _C_gguf extension"
+                )
+        if (
+            ready
+            and layer.qweight.device.type == "cuda"
+            and not isinstance(self, GGUFEmbeddingMethod)
+        ):
+            qweight = layer.qweight
+            if qweight.data_container:
+                ids = (
+                    ["q", "k", "v"]
+                    if "q" in qweight.shard_id
+                    else sorted(qweight.shard_id)
+                )
+                layer.gguf_native_shard_weights = torch.nn.ParameterList(
+                    Parameter(
+                        pad_weight_tail(
+                            qweight.data_container[qweight.shard_id_map[index]].to(
+                                device=qweight.device
+                            ),
+                            layer.qweight_type.shard_weight_type[index],
+                        ),
+                        requires_grad=False,
+                    )
+                    for index in ids
+                )
+                layer.gguf_native_shard_types = tuple(
+                    layer.qweight_type.shard_weight_type[index] for index in ids
+                )
+                qweight.data_container.clear()
+                qweight.materialize((0,), dtype=self.params_dtype)
+            else:
+                qweight.data = pad_weight_tail(
+                    qweight.data, layer.qweight_type.weight_type
+                )
+            self.native_prepared = True
+            if hasattr(layer, "gguf_native_shard_weights"):
+                prepared = list(
+                    zip(layer.gguf_native_shard_weights, layer.gguf_native_shard_types)
+                )
+            else:
+                prepared = [(qweight, layer.qweight_type.weight_type)]
+            self.native_admission["projections"] = [
+                dense_admission(
+                    weight, weight_type, self.params_dtype, self.prefill_min_m
+                )
+                for weight, weight_type in prepared
+            ]
+            return
         qweight_type = layer.qweight_type.weight_type
-        if not (qweight_type in UNQUANTIZED_TYPES or qweight_type in DEQUANT_TYPES):
+        if not (
+            qweight_type in UNQUANTIZED_TYPES
+            or qweight_type in DEQUANT_TYPES
+            or (ready and qweight_type in NATIVE_TYPES)
+        ):
             qweight_type = WeightType(qweight_type)
             raise ValueError(
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
@@ -533,6 +656,19 @@ class GGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if hasattr(layer, "gguf_native_shard_weights"):
+            out = torch.cat(
+                [
+                    fused_mul_mat_gguf(
+                        x, weight, weight_type, self.native_enabled, self.prefill_min_m
+                    )
+                    for weight, weight_type in zip(
+                        layer.gguf_native_shard_weights, layer.gguf_native_shard_types
+                    )
+                ],
+                dim=-1,
+            )
+            return out if bias is None else out + bias
         shard_id = layer.qweight.shard_id
 
         if shard_id:
@@ -545,14 +681,20 @@ class GGUFLinearMethod(LinearMethodBase):
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
                 result.append(
                     fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
+                        x,
+                        qweight[start:end, :offset].contiguous(),
+                        qweight_type,
+                        self.native_enabled,
+                        self.prefill_min_m,
                     )
                 )
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
-            out = fused_mul_mat_gguf(x, qweight, qweight_type)
+            out = fused_mul_mat_gguf(
+                x, qweight, qweight_type, self.native_enabled, self.prefill_min_m
+            )
         if bias is not None:
             out.add_(bias)
         return out
@@ -680,7 +822,12 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         hidden_size = qweight.tensor_shape[1]
 
         return apply_gguf_embedding(
-            x, qweight, qweight_type, hidden_size, dtype=self.params_dtype
+            x,
+            qweight,
+            qweight_type,
+            hidden_size,
+            dtype=self.params_dtype,
+            native_enabled=self.native_enabled,
         )
 
 
