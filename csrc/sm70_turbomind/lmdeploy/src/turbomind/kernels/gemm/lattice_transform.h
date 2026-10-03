@@ -9,7 +9,8 @@ namespace turbomind::gemm {
 template<int Type, int GroupSize>
 struct Transform_HMMA_SM70_Lattice {
   using Codebook = LatticeCodebook<Type>;
-  static constexpr int kCodebookBytes = Codebook::kBytes;
+  static constexpr int kReplicas = Type == 18 ? 8 : 1;
+  static constexpr int kCodebookBytes = Codebook::kBytes * kReplicas;
   static constexpr auto kQuantType = static_cast<QuantType>(8 + (
       Type == 16 ? 0 : Type == 17 ? 1 : Type == 18 ? 2 : Type == 19 ? 3 :
       Type == 21 ? 4 : Type == 22 ? 5 : 6));
@@ -17,7 +18,7 @@ struct Transform_HMMA_SM70_Lattice {
     static_assert(kCodebookBytes % sizeof(uint32_t) == 0);
     auto* words = reinterpret_cast<uint32_t*>(shared);
     for (int i = threadIdx.x; i < kCodebookBytes / sizeof(uint32_t); i += blockDim.x)
-      words[i] = Codebook::word(i);
+      words[i] = Codebook::word(i / kReplicas);
     __syncthreads();
   }
   template<class F, int Nf, int Mf, int K, class D, int Nd, int Md,
@@ -50,8 +51,11 @@ struct Transform_HMMA_SM70_Lattice {
       } else {
         const int first = (packet & 255) | (((metadata >> (48+base/4)) & 1) << 8);
         const int second = (packet >> 8) | (((metadata >> (49+base/4)) & 1) << 8);
-        const uint32_t low = *reinterpret_cast<const uint32_t*>(grid+first*4);
-        const uint32_t high = *reinterpret_cast<const uint32_t*>(grid+second*4);
+        const int replica = threadIdx.x % kReplicas;
+        const uint32_t low = *reinterpret_cast<const uint32_t*>(
+            grid+(first*kReplicas+replica)*4);
+        const uint32_t high = *reinterpret_cast<const uint32_t*>(
+            grid+(second*kReplicas+replica)*4);
         table_values = low | (static_cast<uint64_t>(high) << 32);
       }
       Array<F,8> decoded;
