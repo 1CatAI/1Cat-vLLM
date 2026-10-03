@@ -20,6 +20,9 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
     TurboMindFp8LinearKernel,
 )
@@ -154,6 +157,8 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if QPN8Fp8BlockScaledMMLinearKernel.is_supported()[0]:
+            return 70
         if (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
@@ -470,7 +475,15 @@ class Fp8LinearMethod(LinearMethodBase):
         if getattr(layer, "sm70_fp8_turbomind", False):
             return
 
-        if self.use_marlin and getattr(layer, "is_bmm", False):
+        if (
+            self.use_marlin
+            or (
+                not self.use_sm70_fp8_turbomind
+                and isinstance(
+                    getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
+                )
+            )
+        ) and getattr(layer, "is_bmm", False):
             # Marlin packs one [N, K] matrix and cannot serve the grouped
             # matmul of an is_bmm layer (DeepSeek-V4 wo_a on Turing), so the
             # weight is dequantized once here and applied per group in apply().
@@ -483,6 +496,14 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             replace_parameter(layer, "weight", weight)
             layer.dequantized_bmm = True
+            if isinstance(
+                getattr(self, "fp8_linear", None), QPN8Fp8BlockScaledMMLinearKernel
+            ):
+                logger.info_once(
+                    "Block FP8 QPN8 unavailable: grouped BMM uses the "
+                    "existing dequantized grouped implementation."
+                )
+                del self.fp8_linear
             return
 
         if self.use_marlin:
@@ -503,6 +524,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 out_dtype=self.out_dtype,
                 weight_shape=tuple(layer.weight.shape),
                 is_scale_e8m0=self.is_scale_e8m0,
+                is_bmm=getattr(layer, "is_bmm", False),
             )
             self.fp8_linear.process_weights_after_loading(layer)
             return

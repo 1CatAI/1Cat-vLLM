@@ -165,6 +165,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
@@ -203,6 +206,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
         TuringQpn2NvFp4LinearKernel,
         TuringQpn8Fp8LinearKernel,
+        QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindAwqLinearKernel,
         TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
@@ -326,6 +330,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindFp8LinearKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
@@ -606,6 +611,7 @@ def init_sm70_fp8_linear_kernel(
     out_dtype: torch.dtype,
     weight_shape: tuple[int, int],
     is_scale_e8m0: bool,
+    is_bmm: bool = False,
 ) -> TurboMindFp8LinearKernel:
     from vllm.config import get_current_vllm_config
 
@@ -616,6 +622,7 @@ def init_sm70_fp8_linear_kernel(
         out_dtype=out_dtype,
         weight_shape=weight_shape,
         is_scale_e8m0=is_scale_e8m0,
+        is_bmm=is_bmm,
         policy=get_current_vllm_config().kernel_config.sm70_fp8,
     )
     kernel_type = choose_scaled_mm_linear_kernel(
