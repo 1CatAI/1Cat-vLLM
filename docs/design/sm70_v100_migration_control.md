@@ -48988,6 +48988,16 @@ change list. Six GPU bitwise/graph oracle cases passed; combined-copy graph repl
 as a 35B AWQ/FP8 speed baseline. Environment registrations remain 999; public
 SM70 controls 36→31; unchecked reads 0; startup ENV write sites 20→19.
 
+### Verifier diagnostics through the unified debug entry
+
+Two further aliases map to `VLLM_SM70_DEBUG`: greedy LM-head skip traces use
+`trace`; the eager DFlash2 selector shadow oracle uses the separate `selector`
+channel. Unset unified configuration preserves the old integer parser and
+production defaults. Explicit unified channels, including empty, take
+precedence. These are compatibility aliases for one full released cycle;
+registrations and public control counts do not decrease in this step. Native
+arithmetic, forwarding code and the scored selector remain unchanged.
+
 ### Retire DFlash2 candidate-order research override
 
 Remove the failed candidate-order environment registration and both typed

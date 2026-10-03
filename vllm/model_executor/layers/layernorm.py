@@ -15,6 +15,7 @@ from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
@@ -731,6 +732,13 @@ class RMSNormGated(CustomOp):
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        cfg = get_current_vllm_config_or_none()
+        resolved = cfg.kernel_config.sm70_rmsnorm_gated_exact if cfg else None
+        self._sm70_rmsnorm_gated_exact = (
+            bool(resolved)
+            if resolved is not None
+            else bool(envs.VLLM_SM70_RMSNORM_GATED_EXACT)
+        )
         self.eps = eps
         self.activation = activation
         self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
@@ -797,7 +805,7 @@ class RMSNormGated(CustomOp):
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         if (
-            envs.VLLM_SM70_RMSNORM_GATED_EXACT
+            self._sm70_rmsnorm_gated_exact
             and not envs.VLLM_BATCH_INVARIANT
             and x.is_cuda
             and _sm70_gated_norm_device_supported(x.device.index)

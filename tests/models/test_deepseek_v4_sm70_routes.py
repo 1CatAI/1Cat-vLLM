@@ -6,7 +6,98 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.platforms.interface import DeviceCapability
+
+
+@pytest.fixture(autouse=True)
+def sparse_engine_config():
+    cfg = VllmConfig()
+    with set_current_vllm_config(cfg):
+        yield cfg
+
+
+@pytest.mark.parametrize(
+    "requests,rows,uniform,expected",
+    [(0, 0, True, 1), (2, 6, True, 3), (2, 5, True, 1), (2, 6, False, 1)],
+)
+def test_indexer_block_table_grouping_handles_empty_and_irregular_metadata(
+    requests, rows, uniform, expected
+):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        _block_table_rows_per_request,
+    )
+
+    metadata = SimpleNamespace(
+        per_req_decode_lens=torch.empty(requests),
+        block_table=torch.empty((rows, 4)),
+        decode_is_uniform=uniform,
+    )
+    assert _block_table_rows_per_request(metadata) == expected
+
+
+@pytest.mark.parametrize(
+    "tokens,heads,width,preferred",
+    [
+        (1, 64, 128, False),
+        (3, 32, 128, False),
+        (13, 16, 128, False),
+        (8, 16, 640, False),
+        (3, 64, 128, True),
+        (13, 16, 640, True),
+        (13, 8, 640, True),
+        (3, 32, 640, True),
+    ],
+)
+def test_sparse_decode_retains_paged_route_for_measured_overhead_cases(
+    tokens, heads, width, preferred
+):
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    q = torch.empty((tokens, heads, 512), dtype=torch.float16)
+    with (
+        patch.object(sparse.current_platform, "is_cuda", return_value=True),
+        patch.object(
+            sparse.current_platform, "is_device_capability_family", return_value=True
+        ),
+    ):
+        reason = sparse._bmm_blocker(
+            q, prefill=False, index_width=width, prefer_paged=True
+        )
+    assert (reason is None) is preferred
+
+
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_indexer_uses_live_bounds_and_rejects_fixed_serving_graph_buckets(full_graph):
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v4.sm70 import indexer
+
+    q = torch.empty((3, 8, 128), dtype=torch.float16)
+    cache = torch.empty((2, 64, 132), dtype=torch.uint8)
+    weights = torch.empty((3, 8), dtype=torch.float32)
+    lengths = torch.ones(3, dtype=torch.int32)
+    table = torch.zeros((1, 16), dtype=torch.int32)
+    context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.FULL if full_graph else CUDAGraphMode.NONE
+    )
+    with (
+        patch.object(indexer, "is_forward_context_available", return_value=True),
+        patch.object(indexer, "get_forward_context", return_value=context),
+        patch.object(indexer.current_platform, "is_cuda", return_value=True),
+        patch.object(
+            indexer.current_platform, "is_device_capability_family", return_value=True
+        ),
+    ):
+        reason = indexer._decode_cublas_blocker(
+            q, cache, weights, lengths, table, 1024, True, 1
+        )
+    assert (reason is not None) is full_graph
+    if full_graph:
+        assert "full-graph" in reason
 
 
 def test_sm70_sparse_backend_contract():
@@ -325,3 +416,73 @@ def test_v4_c128_metadata_keeps_upstream_packed_layout_by_default():
 
     assert global_decode.stride() == (128, 1)
     assert prefill_local.stride() == (128, 1)
+
+
+def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    q = torch.empty((6, 64, 512), dtype=torch.float16)
+    output = torch.empty_like(q)
+    layer = MagicMock()
+    layer.compress_ratio = 1
+    layer.swa_cache_layer.kv_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
+    layer.scale = 512**-0.5
+    layer.attn_sink = torch.zeros(64, dtype=torch.float32)
+
+    metadata = MagicMock()
+    metadata.num_decode_tokens = 6
+    metadata.decode_swa_indices = torch.zeros((6, 1, 128), dtype=torch.int32)
+    metadata.decode_swa_lens = torch.full((6,), 128, dtype=torch.int32)
+
+    workspace_manager = MagicMock()
+    workspace_manager.get_simultaneous.side_effect = lambda *specs: tuple(
+        torch.empty(shape, dtype=dtype) for shape, dtype in specs
+    )
+    with (
+        patch.object(sparse, "_bmm_blocker", return_value=None),
+        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", True),
+        patch.object(
+            sparse, "current_workspace_manager", return_value=workspace_manager
+        ),
+        patch.object(sparse, "sparse_attn_decode_bmm") as bmm,
+        patch.object(sparse, "sm70_sparse_attention_paged_fp8_splitk") as splitk,
+        patch.object(sparse, "sm70_sparse_attention_paged_fp8") as paged,
+    ):
+        sparse.DeepseekV4SM70SparseImpl._forward_decode(
+            layer=layer,
+            q=q,
+            compressed_cache=None,
+            output=output,
+            sparse_metadata=None,
+            swa_metadata=metadata,
+            swa_only=True,
+        )
+
+    splitk.assert_not_called()
+    paged.assert_not_called()
+    bmm.assert_called_once()
+    keys, scores, logits, probs = bmm.call_args.args[-4:]
+    assert keys.shape == (6, 128, 512)
+    assert scores.shape == (6, 64, 128)
+    assert logits.shape == probs.shape == (6, 64, 129)
+
+
+def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    layer = MagicMock()
+    layer.max_num_batched_tokens = 2048
+    q = torch.empty((1, 64, 512), dtype=torch.float16)
+    impl = sparse.DeepseekV4SM70SparseImpl
+
+    with patch.object(sparse, "_bmm_blocker", return_value="disabled by policy"):
+        assert impl._prefill_bmm_workspace_specs(layer, q, 640) == []
+    with patch.object(sparse, "_bmm_blocker", return_value=None):
+        specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
+    # One pass holds at most MAX_TOKENS_PER_PASS tokens, whatever the batch.
+    assert [shape for shape, _ in specs] == [
+        (128, 640, 512),
+        (128, 64, 640),
+        (128, 64, 641),
+        (128, 64, 641),
+    ]

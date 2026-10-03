@@ -258,6 +258,8 @@ class Sm70Fp8Config:
 
     enabled: bool | None = None
     """Use TurboMind; auto retains the shared legacy backend preference."""
+    block_qpn8: bool = True
+    """Use native weight-only block QPN8 when its kernel capabilities match."""
     dequant_fallback: bool | None = None
     """Keep the legacy dense dequantization route available when requested."""
     qpn8: bool | None = None
@@ -367,6 +369,22 @@ class Sm70GgufConfig:
 
 
 @config
+class Sm70SparseConfig:
+    """Per-engine sparse attention policy; individual operators guard layouts."""
+
+    indexer_decode_cublas: bool = True
+    """Share paged index keys between query heads and rows when eligible."""
+    decode_bmm: bool = True
+    """Gather packed FP8 keys for eligible FP16 sparse decode matmuls."""
+    prefill_bmm: bool = True
+    """Use bounded batched matmuls for eligible FP16 sparse prefill."""
+    active: bool = Field(default=False, init=False)
+    """Whether the engine's metadata describes sparse indexed attention."""
+    reason: str | None = Field(default=None, init=False)
+    """Startup capability rejection; individual calls also check tensor layouts."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -420,6 +438,23 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    sm70_rmsnorm_gated_exact: bool | None = None
+    """Native gated norm; auto follows the Flash-Next model quality boundary."""
+
+    def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
+        if self.sm70_rmsnorm_gated_exact is not None:
+            return
+        import os
+
+        from vllm import envs
+
+        name = "VLLM_SM70_RMSNORM_GATED_EXACT"
+        self.sm70_rmsnorm_gated_exact = (
+            bool(envs.environment_variables[name]())
+            if name in os.environ
+            else qualified
+        )
+
     sm70_nvfp4: Sm70NvFp4Config = Field(default_factory=Sm70NvFp4Config)
     """SM70 compressed-tensors NVFP4 policy, resolved per engine."""
 
@@ -432,10 +467,22 @@ class KernelConfig:
     sm70_gguf: Sm70GgufConfig = Field(default_factory=Sm70GgufConfig)
     """Native GGUF admission and Volta tensor-core prefill policy."""
 
+    sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
+    """SM70 sparse attention policy; admission uses actual tensor capabilities."""
+
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
+
+    ple_disk_cascade: bool = True
+    """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
+    ple_disk_release_pages: bool = False
+    """Release file-backed PLE mappings after gathers to reduce resident RAM."""
+    ple_disk_cascade_active: bool = Field(default=False, init=False)
+    """Resolved FP8 storage, dtype and pipeline capability admission."""
+    ple_disk_cascade_reason: str | None = Field(default=None, init=False)
+    """Startup reason when the disk cascade cannot serve this configuration."""
 
     @field_validator("moe_backend", mode="before")
     @classmethod
@@ -461,12 +508,23 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
+            "ple_disk_cascade_reason",
         }
+        if not self.ple_disk_cascade_active:
+            ignored_factors.update(
+                {
+                    "ple_disk_cascade",
+                    "ple_disk_release_pages",
+                    "ple_disk_cascade_active",
+                }
+            )
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.
             ignored_factors.add("sm70_awq")
         if not self.sm70_fp8.resolved:
             ignored_factors.add("sm70_fp8")
+        if not self.sm70_sparse.active:
+            ignored_factors.add("sm70_sparse")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
@@ -481,7 +539,23 @@ class KernelConfig:
 
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
+        import torch
+
         from vllm.platforms import current_platform
+
+        model = vllm_config.model_config
+        text = getattr(model, "hf_text_config", None)
+        self.sm70_sparse.active = bool(getattr(text, "index_head_dim", None))
+        self.sm70_sparse.reason = (
+            "no indexed sparse-attention metadata"
+            if not self.sm70_sparse.active
+            else (
+                "requires CUDA compute capability 7.x"
+                if not current_platform.is_cuda()
+                or not current_platform.is_device_capability_family(70)
+                else ("requires FP16 queries" if model.dtype != torch.float16 else None)
+            )
+        )
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(

@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -63,7 +64,10 @@ class UniProcExecutor(Executor):
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
 
-        if envs.VLLM_PLE_CPU_OFFLOAD and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if (
+            ple_offload_enabled(self.vllm_config)
+            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        ):
             self.driver_worker.spawn_ple_offload()
         elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.driver_worker.prepare_ple_offload_spawn()
@@ -74,7 +78,7 @@ class UniProcExecutor(Executor):
             self.driver_worker.load_model()
         if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.driver_worker.spawn_ple_offload()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if ple_offload_enabled(self.vllm_config):
             self.driver_worker.wait_ple_offload_ready()
         current_platform.update_block_size_for_backend(self.vllm_config)
 
