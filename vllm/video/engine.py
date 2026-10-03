@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from vllm.media.progress import DeviceProgress, ProgressCallback, reporting
 from vllm.model_executor.models.minimax_h3.config import H3Config, H3Request
@@ -267,7 +267,7 @@ class H3Engine:
             result = {
                 "engine_session_id": self.session_id,
                 "request_index": self.request_index,
-                "config": asdict(self.config),
+                "config": _reported_config(self.config),
                 "request": asdict(request),
                 "gpus": self.gpu_ids,
                 "ranks": ranks,
@@ -309,3 +309,11 @@ class H3Engine:
 
     def __exit__(self, *_):
         self.close()
+
+
+def _reported_config(config: H3Config) -> dict[str, Any]:
+    # Preserve the served configuration schema when adding loading controls.
+    result = asdict(config)
+    result.pop("prepared_weight_cache")
+    result.pop("prepared_weight_cache_gib")
+    return result
