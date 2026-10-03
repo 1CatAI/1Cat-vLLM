@@ -446,6 +446,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "indexer_graph_fallback": "paged indexer for fixed full-graph key buckets",
         "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
     }
+    report["ple_result_transports"] = cfg.kernel_config.ple_result_transports
     # Configuration policy is resolved once per engine. Actual kernel selection
     # still needs each loaded layer's local layout and native capabilities.
     policy = getattr(cfg.kernel_config, "sm70_nvfp4", None)

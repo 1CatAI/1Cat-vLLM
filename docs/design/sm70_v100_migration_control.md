@@ -49007,3 +49007,25 @@ for one released cycle. Historical quality evidence is recorded in the
 remain equal; one explicit failed-experiment edge intentionally changes.
 Registrations 999→998; public SM70 controls remain 31; unchecked reads 0;
 startup ENV write sites remain 19. Native numerical functions stay unchanged.
+
+### Flash-Next no-MTP: mapped result transport and distribution gates
+
+The decode acceptance contract now permits FP32 reassociation while retaining
+FP16 dense weights/activations and FP32 accumulators/state. Greedy equality is
+only diagnostic. The initial full-vocabulary teacher-forcing limits and task
+checks are recorded in
+[the acceptance design](sm70_qwen38_distribution_acceptance.md).
+
+The mapped transport registers only bounded result/flag buffers; the ngram
+weights remain disk-backed mmap. The normal installed-wheel C1 pair measured
+13.117008 versus 11.082492 ms/token (six separate-arm samples), with 36/36 tasks
+and natural stops in both arms. A 64-position English capture had zero KL/logit
+error. Concurrent timings, complete distribution/noise checks and fresh graph
+budget attribution remain pending; these numbers are not complete admission.
+
+Do not repeat the scalar-projection cooperative GDN segment: it regressed C16
+by about 113%. Keeping native batched projection reduced the loss to about 7%
+but regressed every measured width. Neither variant is admitted. The next
+structural prototype must remove synchronization/phase overhead or include a
+larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
+separate and disabled in these arms.
