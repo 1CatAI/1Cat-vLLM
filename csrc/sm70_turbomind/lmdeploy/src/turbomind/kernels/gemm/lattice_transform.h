@@ -9,13 +9,18 @@ namespace turbomind::gemm {
 template<int Type, int GroupSize>
 struct Transform_HMMA_SM70_Lattice {
   using Codebook = LatticeCodebook<Type>;
-  static constexpr int kCodebookBytes = Codebook::kBytes;
+  static constexpr bool kHalfCodebook = Codebook::kWidth == 4;
+  static constexpr int kCodebookBytes = Codebook::kBytes * (kHalfCodebook ? 2 : 1);
   static constexpr auto kQuantType = static_cast<QuantType>(8 + (
       Type == 16 ? 0 : Type == 17 ? 1 : Type == 18 ? 2 : Type == 19 ? 3 :
       Type == 21 ? 4 : Type == 22 ? 5 : 6));
   __device__ static void initialize(uint8_t* shared) {
-    for (int i = threadIdx.x; i < kCodebookBytes; i += blockDim.x)
-      shared[i] = Codebook::value(i);
+    for (int i = threadIdx.x; i < Codebook::kBytes; i += blockDim.x) {
+      if constexpr (kHalfCodebook)
+        reinterpret_cast<half*>(shared)[i] = __int2half_rn(static_cast<int>(Codebook::value(i)) - 128);
+      else
+        shared[i] = Codebook::value(i);
+    }
     __syncthreads();
   }
   template<class F, int Nf, int Mf, int K, class D, int Nd, int Md,
@@ -41,6 +46,7 @@ struct Transform_HMMA_SM70_Lattice {
       // Fetch the row as aligned words once, then unpack FP16 pairs in
       // registers instead of repeatedly reading adjacent shared halfwords.
       uint64_t table_values;
+      uint64_t table_values_high = 0;
       if constexpr (Codebook::kWidth == 8) {
         const int index = Type == 19 || Type == 29 ? packet & 2047 :
             (packet & 255) | (((metadata >> (16+2*(base/8))) & 3) << 8);
@@ -48,18 +54,24 @@ struct Transform_HMMA_SM70_Lattice {
       } else {
         const int first = (packet & 255) | (((metadata >> (48+base/4)) & 1) << 8);
         const int second = (packet >> 8) | (((metadata >> (49+base/4)) & 1) << 8);
-        const uint32_t low = *reinterpret_cast<const uint32_t*>(grid+first*4);
-        const uint32_t high = *reinterpret_cast<const uint32_t*>(grid+second*4);
-        table_values = low | (static_cast<uint64_t>(high) << 32);
+        table_values = *reinterpret_cast<const uint64_t*>(grid+first*8);
+        table_values_high = *reinterpret_cast<const uint64_t*>(grid+second*8);
       }
       Array<F,8> decoded;
       PRAGMA_UNROLL
       for (int i = 0; i < 8; i += 2) {
         constexpr uint32_t magic = 0x64006400U;
         constexpr uint32_t bias = 0x64806480U;
-        const uint32_t bytes = static_cast<uint32_t>(table_values >> (i*8));
-        const uint32_t pair = __byte_perm(bytes,magic,0x7170);
-        half2 values = __hsub2((const half2&)pair,(const half2&)bias);
+        half2 values;
+        if constexpr (kHalfCodebook) {
+          const uint64_t row = i < 4 ? table_values : table_values_high;
+          const uint32_t pair = static_cast<uint32_t>(row >> ((i % 4)*16));
+          values = (const half2&)pair;
+        } else {
+          const uint32_t bytes = static_cast<uint32_t>(table_values >> (i*8));
+          const uint32_t pair = __byte_perm(bytes,magic,0x7170);
+          values = __hsub2((const half2&)pair,(const half2&)bias);
+        }
         if constexpr (Type == 19 || Type == 29) {
           const half delta = __float2half((packet & 32768) ? -0.125f : 0.125f);
           values = __hadd2(values,__halves2half2(delta,delta));
