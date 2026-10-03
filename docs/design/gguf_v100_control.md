@@ -141,7 +141,7 @@ heads, 128-dimensional GDN heads, HC count=4/rank=320. PLE keys include
 exact int64 multipliers, offsets and prime vocabulary sizes. GGUF PLE layer
 index 1 maps to HF layer ID 2. Q2_0 uses K blocks of 64, so expert down
 local K=160 still cannot be byte-sliced under TP4; IQ4_NL K blocks of 32
-are aligned. Final EP/conversion admission remains pending.
+are aligned. Flash-Next retains TP4. Canonical group32 reblocking now supports Q2_0 K=160 shards in the TurboMind operator layer; the model adapter connection remains pending.
 
 ### Loading validation and open gates
 
@@ -172,3 +172,29 @@ from apply_chat_template by default; it now requests return_dict=False.
 These are implementation-localization results, not primary-model quality
 or speed acceptance. Hold the shared GPU flock and do not terminate other
 tasks. No accepted whole-model throughput is recorded.
+
+### Chinese greedy divergence localization
+
+A controlled 20-token run uses the same tiny checkpoint, prompt token IDs,
+TP4, FP16, eager execution and no MTP. Single-request legacy inference
+chooses token 96617 at step 13 and matches all 20 CPU llama.cpp tokens.
+The original three-request batch is reproducible: it chooses token 103911
+at step 13. The competing-logit margin (96617 minus 103911) changes from
++0.09375 in the single request to -0.0625 in the batch.
+
+The CPU reference also matches all 20 tokens after exact F32 reconstruction
+of every GGUF weight, so CPU activation quantization alone does not explain
+the divergence. Replacing the batch's quantized linear calls with the packaged
+FP16 dequantization plus GEMM reference restores all 20 reference tokens;
+its step-13 margin is +0.203125. Worker dispatch logs confirm this replacement
+for Q4_K, Q8_0 and Q6_K. This localizes the correction to the linear numerical
+path; a finer separation of activation quantization, weight rounding and
+accumulation remains pending. It supports the FP16-activation TurboMind
+direction without changing loader mappings.
+
+The first precision-hook attempt patched the Python implementation after
+the custom operator had already been registered, so it did not replace the
+actual caller. Its outputs are excluded. A separate launch used system CUDA
+12.0 for Tilelang and failed before generation; subsequent runs explicitly
+use CUDA 12.8. Neither failure is quality evidence. The wider quality suite
+and primary-model comparisons are still pending.
