@@ -360,7 +360,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
-    parser.add_argument("--widths", default="1,4,8,16")
+    parser.add_argument("--widths", default="1")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
         "--ple-sample-prefetch", action=argparse.BooleanOptionalAction, default=None

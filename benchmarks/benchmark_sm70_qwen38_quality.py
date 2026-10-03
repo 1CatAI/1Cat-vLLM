@@ -180,6 +180,7 @@ def run(args):
         tensor_parallel_size=4,
         dtype="half",
         kv_cache_dtype="float16",
+        mamba_ssm_cache_dtype="float32",
         max_model_len=262144,
         max_num_batched_tokens=8192,
         max_num_seqs=1,
