@@ -203,6 +203,13 @@ def capture(args):
                         raise RuntimeError("Incomplete teacher-forcing cohort")
                     if len(list(destinations[0].glob("*.npy"))) != count:
                         raise RuntimeError("Missing teacher-forcing logit row")
+                    if any(
+                        json.loads(p.read_text())["active_width"] != width
+                        for p in destinations[0].glob("*.json")
+                    ):
+                        raise RuntimeError(
+                            "Teacher-forcing cohort lost its active width"
+                        )
                     report["captures"].append(
                         {
                             "width": width,
@@ -352,7 +359,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
-    parser.add_argument("--widths", default="1,4,8,16")
+    parser.add_argument("--widths", default="1")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-budget", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int)

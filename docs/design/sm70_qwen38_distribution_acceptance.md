@@ -57,10 +57,12 @@ Freeze prompt token IDs, tokenizer revision, reference continuation IDs,
 probe positions and hashes before evaluating a candidate. Start with the
 existing 36-case quality manifest (12 MBPP, 12 GSM8K, eight Chinese QA and four
 needle contexts), add four English prose prompts, and probe at least 16
-teacher-forced decode positions per case. Include needle contexts at 8192,
-32768, 131072 and 258048 tokens. Save per-prefix summaries; compute whole-vocab
+teacher-forced decode positions per case. Subsequent gates retain one or two
+258K windows rather than repeating the entire long-context set. Preserve the
+previously collected windows and their hashes. Save per-prefix summaries; compute whole-vocab
 metrics one row at a time so evaluation does not retain all logits in RAM.
-Run C1 and C4/C8/C16 using the same prefixes and exact active batch ordering.
+Run the distribution gate at C1 only. Concurrent distribution collection is
+stopped; previously collected data remains historical evidence.
 Task continuations are frozen from the recorded default FP16 quality arm;
 the four additional English prose continuations are authored and identified
 separately. Both capture arms use the same frozen IDs. Capture
@@ -80,10 +82,20 @@ screen, not a claim about all model capabilities.
 Use ordinary installed source-complete wheels, the same model revision, GPUs,
 TP, graph, KV/state dtype, prompts, sequence lengths, disk placement and
 sampling contract in paired arms. Report decode separately from TTFT/prefill.
-At least five interleaved steady-state samples per arm and concurrency point;
-report median, range and paired ratios, not a best run. A C1 gain cannot excuse
-a repeatable C4/C8/C16 regression above 2%. Report end-to-end throughput and
-per-step latency because batch throughput is not reciprocal single-token TPOT.
+Use at least five steady-state C1 samples per arm; interleave matched samples
+where feasible and report median, range and ratios, not a best run. C1 speed
+and its single-step bottleneck determine performance admission. Before merging,
+run one short C4 end-to-end smoke and check normal execution/output health.
+Slower concurrent execution is not a rejection condition. Do not run dedicated
+C2–C16 throughput, distribution or budget campaigns. Kernels must remain correct
+at arbitrary supported batch widths, including M=5. Use shape capability and
+measurement for admission, never a hardcoded batch-width fallback rule.
+
+The next endpoint target is 6 ms/token with TP4, 262144 startup capacity,
+8192 input tokens, disk-mapped ngrams, FP16 dense/activations and FP32
+accumulation/state. Initial component targets are 95 us per GDN layer,
+150 us per QSA layer and 0.45 ms for LM head plus sampling. These are planning
+budgets, not measured results.
 
 ## Current budget and required updates
 
@@ -103,11 +115,21 @@ runtime. Recalculate from actual selected layouts and measured device bandwidth.
 | Sample-triggered PLE prefetch | pending | pending | pending | pending | pending |
 | First reduction-segment fusion | pending | pending | pending | pending | pending |
 
-Recorded HC gain is about 1.2% with overlapping sample ranges. C4/C8/C16 budgets
-are pending matched measurements; no extrapolated values are substituted.
-Each admitted change must update C1/C4/C8/C16 rows, actual per-layer graph
+Recorded HC gain is about 1.2% with overlapping sample ranges. Retain the old
+concurrent measurements without extending them. Each admitted change updates
+C1 endpoint time, actual per-layer graph
 counts/times, cross-card synchronization boundaries, PLE residual wait and
 traffic floor. Communication kernel count is not the number of global syncs.
+
+Step 0 uses one new graph-node trace with mapped result transport. For each
+layer report measured DRAM-read bytes divided by 750 GB/s, the remaining kernel
+duration, gaps on the dependency path, and cross-GPU flag waits. Nsight Systems
+does not measure DRAM bytes or separate spinning from useful work: populate those
+fields only from Nsight Compute or explicit instrumented measurements. Mark
+logical-weight estimates separately and avoid adding overlapping service sums
+as if they closed endpoint time. Also measure a cross-GPU flag round trip and
+a dependent-kernel boundary inside a CUDA graph. Attribute the old approximately
+97 cuBLAS GEMV launches before replacing them.
 
 ## Implementation order
 
@@ -117,21 +139,29 @@ traffic floor. Communication kernel count is not the number of global syncs.
    fresh-cache audit checked all 65 prefill/decode copies per request, zero bad
    bytes, and three greedy continuations identical to the baseline. Equality
    is supporting diagnosis, not the new quality contract.
-2. Publish sampled token IDs and a sequence/version doorbell directly into
-   mapped staging memory. CPU lookup starts after sampling; only the layer-2
-   consumer waits. Handle request identity, accepted-token count, ngram history,
-   prefill, batch reordering and cancellation explicitly. Keep the ngram table
-   on disk with mmap; registered memory is bounded result/control staging only.
-3. Prototype GDN or MoE from one TP reduction boundary to the next. HC combine,
+2. First prototype MoE from one TP reduction boundary to the next. CTA work is
+   selected expert by intermediate slice: W13, SiLU, corresponding W2 columns
+   and FP32 partials. Include router/top-k/softmax and independent shared-expert
+   work; finish with weighted reduction and peer push. Prefetch weights before
+   waiting for inputs, using a common compute skeleton with FP16 and NVFP4
+   weight readers. Use generation-numbered per-operation/tile flags rather
+   than grid-wide synchronization; do not repeat the grid.sync/scalar-projection
+   GDN prototype. Small-M templates must remain correct, including M=5, without
+   a dedicated small-M speed campaign.
+3. HC combine,
    grouped norm and down/inject belong to the previous reduction tail; up and
-   gate-mix belong to the next projection head. Target three to four kernels
-   and at most two cross-card synchronization boundaries per decoder layer.
+   gate-mix prefetch weights before waiting for the down result. Producer
+   epilogues push peer data and generation flags; consumer prologues overlap
+   weight reads with those waits. Follow with GDN, QSA and LM head/sampling,
+   redoing the Step 0 C1 budget after each retained change.
    Measure before extending the primitive to more layers. Kernel primitives
    admit by dtype/layout/hardware capability, never TP4 or model size alone.
-4. Fuse push reduction with projection tails and reduce+RMSNorm with consumers;
-   admit partial-NVLink topology paths by measured topology/capability and fix
-   C16 scheduling before default selection. QSA follows the same boundary rule.
-5. Investigate dense-8-bit scale/outlier/sensitive-tensor causes independently.
+4. Finish the existing sampled-token PLE prefetch work, but measure residual
+   PLE wait after mapped transport first. If it is below 0.2 ms, park further
+   investment. Keep the ngram table on disk with mmap, with bounded result/key
+   staging only.
+5. Admit communication choices by topology/capability and investigate dense-
+   8-bit scale/outlier/sensitive-tensor causes independently.
 
 Do not narrow `_is_sm70_qwen38_decode_compile_contract` by TP or exact shape.
 Use the existing kernel configuration and startup capability report. New scattered
@@ -147,8 +177,10 @@ The delayed producer GPU oracle remains required after capability admission.
 
 The standard installed wheel passed the delayed CPU-producer GPU oracle on all
 four V100s: 40 changing-width graph replays per dtype, uint8 and FP16, exact
-results and acknowledgements. No research DSO or runtime source overlay was
-used. A first current-main baseline startup failed before profiling because the
+results and acknowledgements. The corrected oracle supplies an explicit capture
+stream on each device; its initial default-stream reuse had produced empty
+graphs on secondary devices. The corrected rerun passed both dtypes in 12.17 s.
+No research DSO or runtime source overlay was used. A first baseline startup failed before profiling because the
 whole-table GPU placeholder lacks `_cascade` after its guarded constructor.
 The independent fix was merged in PR #818; it does not change model arithmetic.
 The paired transport measurements below include this startup fix.
@@ -171,8 +203,8 @@ Standard-package C1 smoke (same installed source, TP4/no-MTP/FP16 KV, disk mmap,
 94% memory budget, 8192 input and 65 output tokens): CUDA transport measured
 13.49959/12.73089/12.79927 ms; mapped transport 11.90525/11.41047/11.36301 ms.
 The median difference is 10.85% lower TPOT. These three short samples are
-preliminary, not the five-sample paired performance gate; full task/distribution
-and concurrency acceptance remain pending. All repeats within each arm matched
+preliminary, not the five-sample performance gate. Subsequent task/distribution
+results are recorded below; concurrency acceptance is no longer required. All repeats within each arm matched
 greedily, supporting diagnosis only. The worker capability RPC now includes the
 per-layer transport decision and bounded registered-memory size.
 
@@ -190,15 +222,16 @@ long-line count one. Full continuations matched for all 36 pairs (diagnostic).
 Six 8192/513-token timing samples: CUDA median 13.117008 ms, range
 12.903743–13.175692; mapped median 11.082492 ms, range 10.952298–11.197272.
 Observed TPOT decrease is 15.51%, equivalent throughput increase 18.36%.
-These are separate-arm samples; interleaved and concurrent timings, teacher-
-forced distributions and graph budget attribution are still required before
-claiming complete admission. Dense 8-bit remains disabled.
+These are separate-arm samples. C1 teacher-forced distributions have since
+passed; fresh installed-runtime integration, graph budget attribution and a
+short C4 smoke remain before merge. Dense 8-bit remains disabled.
 
 Five complete engine-interval samples per arm and width have now completed
 with atomic cohorts, 8192 input / 513 output tokens and the same installed
 source. The first sample of each new width includes initial cache/JIT effects;
 it is retained rather than silently dropped. The final four samples agree on
-the direction, but five fully warmed and interleaved samples are still pending.
+the direction. These concurrent samples are retained as historical data;
+there will be no further concurrent timing qualification.
 
 | Width | CUDA median step ms | Mapped median step ms | CUDA aggregate tok/s | Mapped aggregate tok/s |
 | ---: | ---: | ---: | ---: | ---: |
@@ -216,11 +249,20 @@ changes. The PR is now rebased onto main and a new normal wheel was built from
 matching standard native sources, including the new GGUF target; fresh runtime
 validation of that integration artifact remains pending.
 
+The full C1 comparison is now complete: 3648 positions per arm across three
+repeats, including Chinese, English, GSM8K, MBPP and needle retrieval. Forward
+and reverse KL, raw and centered logit errors are zero; top-1 agreement is 100%
+globally and in every stratum. Default-repeat noise is also zero. The data is
+pinned to the original paired installed source. C1 subsets were validated and
+preserved from the stopped wider collection; the subset retains two 258K
+windows per repeat. Concurrent collection and all remaining concurrent work
+were stopped when the admission contract changed.
+
 The first teacher-forcing smoke captured 64 English C1 positions through the
 current model runner in both installed-package arms. Mean/p99/max KL and
 maximum logit error were zero; top-1 agreement was 100%. This checks the capture
 plumbing and small-result transport, not the complete multilingual/long-context
-distribution gate. Full captures and C1/C2/C4/C8/C16 timing are in progress.
+distribution gate. Dedicated concurrent timing/capture is no longer required.
 
 The cooperative GDN research segment retained FP16 inputs and FP32 state,
 passed the FP64 small-shape oracle, and reduced C1 conv/update/norm/projection
