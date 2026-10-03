@@ -87,9 +87,6 @@ class Mxfp4MoeBackend(Enum):
     EMULATION = "EMULATION"
     # Humming
     HUMMING = "HUMMING"
-    # Skinny QPN kernels in their E8M0 scale mode for SM70/SM75. Only on
-    # request (moe_backend="sm70_skinny"), never picked automatically.
-    SM70_SKINNY = "SM70_SKINNY"
 
 
 # AITER backends group
@@ -225,13 +222,6 @@ def backend_to_kernel_cls(
 
         return [OCP_MXQuantizationEmulationTritonExperts]
 
-    elif backend == Mxfp4MoeBackend.SM70_SKINNY:
-        from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
-            Mxfp4SkinnySm70Experts,
-        )
-
-        return [Mxfp4SkinnySm70Experts]
-
     else:
         raise ValueError(f"Unknown MXFP4 MoE backend: {backend.value}")
 
@@ -268,7 +258,6 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "xpu": [Mxfp4MoeBackend.XPU],
         "cpu": [Mxfp4MoeBackend.CPU],
         "emulation": [Mxfp4MoeBackend.EMULATION],
-        "sm70_skinny": [Mxfp4MoeBackend.SM70_SKINNY],
     }
     if backends := mapping.get(runner_backend):
         return backends
@@ -282,7 +271,6 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
     """Available backends in priority order, BF16-act variant before
     activation-quantized variant within each vendor family."""
     _AVAILABLE_BACKENDS = [
-        Mxfp4MoeBackend.SM70_SKINNY,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
@@ -312,7 +300,6 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     if current_platform.is_xpu():
         return [Mxfp4MoeBackend.XPU]
     _AVAILABLE_BACKENDS = [
-        Mxfp4MoeBackend.SM70_SKINNY,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.DEEPGEMM_MXFP4,
         # TRITON_UNFUSED has bug with MTP support
@@ -1538,34 +1525,6 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
-    elif mxfp4_backend == Mxfp4MoeBackend.SM70_SKINNY:
-        from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
-            rebase_e8m0_for_fp16,
-        )
-
-        # The experts permute codes and scales into fragment order later;
-        # here only the E8M0 exponents move into the window the kernels'
-        # fp16 decode covers, with the exact inverse as each expert's global
-        # scale.
-        rebase_e8m0_for_fp16(w13_weight_scale.data, dry_run=True)
-        rebase_e8m0_for_fp16(w2_weight_scale.data, dry_run=True)
-        w13_global = rebase_e8m0_for_fp16(w13_weight_scale.data)
-        w2_global = rebase_e8m0_for_fp16(w2_weight_scale.data)
-        for name, value in (
-            ("w13_weight_scale_2", w13_global),
-            ("w2_weight_scale_2", w2_global),
-        ):
-            layer.register_parameter(
-                name, torch.nn.Parameter(value, requires_grad=False)
-            )
-        return (
-            w13_weight.data,
-            w2_weight.data,
-            w13_weight_scale.data,
-            w2_weight_scale.data,
-            w13_bias,
-            w2_bias,
-        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
@@ -1670,17 +1629,6 @@ def make_mxfp4_moe_quant_config(
             w2_scale=w2_scale,
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
-            gemm1_clamp_limit=swiglu_limit,
-        )
-    elif mxfp4_backend == Mxfp4MoeBackend.SM70_SKINNY:
-        assert layer is not None
-        return FusedMoEQuantConfig.make(
-            quant_dtype=None,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            g1_alphas=layer.w13_weight_scale_2,
-            g2_alphas=layer.w2_weight_scale_2,
-            weight_dtype="mxfp4",
             gemm1_clamp_limit=swiglu_limit,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.HUMMING:

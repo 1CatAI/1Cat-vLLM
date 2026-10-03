@@ -1291,7 +1291,6 @@ class FusedMoEConfig:
     has_bias: bool = False
     is_act_and_mul: bool = True
     is_lora_enabled: bool = False
-    apply_router_weight_on_input: bool = False
 
     # SwiGLU clamp limit. When set, backends that do not implement the clamp
     # are filtered out by `FusedMoEExperts.is_supported_config` so the oracle
