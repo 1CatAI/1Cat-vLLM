@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
@@ -43,6 +44,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
     ):
         super().__init__(moe)
         self.group_size = 16
+        self.use_a16 = use_a16
 
         # Select experts implementation.
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
@@ -172,6 +174,35 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+        if self.nvfp4_backend == NvFp4MoeBackend.SM70_SKINNY:
+            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+                nvfp4_skinny_scale_reason,
+            )
+
+            reason = nvfp4_skinny_scale_reason(
+                1.0 / layer.w13_weight_global_scale,
+                1.0 / layer.w2_weight_global_scale,
+            )
+            if reason is not None:
+                if self.moe.moe_backend != "auto":
+                    raise ValueError(reason)
+                self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
+                    self.moe,
+                    kNvfp4Static,
+                    None if self.use_a16 else kNvfp4Dynamic,
+                    allow_skinny=False,
+                )
+                logger.info_once("Skinny MoE fallback: %s", reason)
+                get_current_vllm_config().kernel_config.moe_kernel_selections[
+                    f"Nvfp4SkinnySm70Experts:{self.moe.hidden_dim}:"
+                    f"{self.moe.intermediate_size_per_partition}"
+                ] = {
+                    "enabled": False,
+                    "reason": reason,
+                    "scope": "loaded_scale_capability",
+                }
+
         # NOTE(rob): wN_weight_packed -> wN_weight is because ModularKernelMethod
         # requires this naming convention. However, the name change breaks
         # reloading because the state dict no longer matches disk. Once we
