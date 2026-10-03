@@ -627,32 +627,14 @@ __global__ void nvfp4_qpn2_pack_rows_kernel(const half* __restrict__ x,
 
 // Where the pack pays end to end: from M=7 on Turing (64 KB L1; measured on
 // Qwen3.8-27B with MTP, M=5 and 6 neutral, M=7 +1.9 %, M=8 +3.7 %), from
-// M=8 on Volta (128 KB L1). Below that its own launch costs more than the
-// row spread saves. VLLM_SM70_NVFP4_QPN2_PACK=0 disables it, =1 forces it
-// from M=1 (both for A/B runs); "auto" or unset takes the threshold.
+// M=8 on Volta and M=7 on Turing amortize the packing launch.
 int qpn2_pack_min_rows() {
   const cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
   return (prop->major == 7 && prop->minor == 5) ? 7 : 8;
 }
 
-bool qpn2_pack_enabled(int m) {
-  const char* value = std::getenv("VLLM_SM70_NVFP4_QPN2_PACK");
-  bool enabled;
-  if (value != nullptr && value[0] == '0' && value[1] == '\0') {
-    enabled = false;
-  } else if (value != nullptr && value[0] == '1' && value[1] == '\0') {
-    enabled = true;
-  } else {
-    enabled = m >= qpn2_pack_min_rows();
-  }
-  if (enabled) {
-    static std::once_flag pack_log_once;
-    std::call_once(pack_log_once, []() {
-      std::fprintf(stderr,
-                   "INFO SM70 NVFP4 QPN2 block-packed activations enabled.\n");
-    });
-  }
-  return enabled;
+bool qpn2_pack_enabled(int m, bool activation_pack) {
+  return activation_pack && m >= qpn2_pack_min_rows();
 }
 
 // Rows of the packed buffer: m rounded up to whole 8-row tiles.
@@ -791,7 +773,8 @@ template <bool TurboMindLayout>
 void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
                                double global_scale, int64_t split_k,
-                               int64_t accumulator_chains) {
+                               int64_t accumulator_chains,
+                               bool activation_pack) {
   check_qpn2_tensors(out, input, codes, scales, false);
   TORCH_CHECK(split_k == 8 || split_k == 16 || split_k == 32,
               "NVFP4 QPN2 split_k must be 8, 16, or 32");
@@ -839,7 +822,7 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
   }
 
-  const bool packed = qpn2_pack_enabled(m);
+  const bool packed = qpn2_pack_enabled(m, activation_pack);
   const int packed_rows = packed ? qpn2_packed_rows(m) : 0;
   torch::Tensor xb;
   if (packed) {
@@ -891,7 +874,8 @@ template <bool TurboMindLayout>
 void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
                                 torch::Tensor codes, torch::Tensor scales,
                                 double global_scale, int64_t split_k,
-                                int64_t accumulator_chains) {
+                                int64_t accumulator_chains,
+                                bool activation_pack) {
   check_qpn2_tensors(out, input, codes, scales, true);
   TORCH_CHECK(split_k == 8 || split_k == 16,
               "NVFP4 QPN2 gated split_k must be 8 or 16");
@@ -938,7 +922,7 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
   }
 
-  const bool packed = qpn2_pack_enabled(m);
+  const bool packed = qpn2_pack_enabled(m, activation_pack);
   const int packed_rows = packed ? qpn2_packed_rows(m) : 0;
   torch::Tensor xb;
   if (packed) {
@@ -980,17 +964,21 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
 void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
                               double global_scale, int64_t split_k,
-                              int64_t accumulator_chains) {
+                              int64_t accumulator_chains,
+                              bool activation_pack) {
   nvfp4_qpn2_gemm_sm70_impl<false>(out, input, codes, scales, global_scale,
-                                   split_k, accumulator_chains);
+                                   split_k, accumulator_chains,
+                                   activation_pack);
 }
 
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
                                double global_scale, int64_t split_k,
-                               int64_t accumulator_chains) {
+                               int64_t accumulator_chains,
+                               bool activation_pack) {
   nvfp4_qpn2_gated_sm70_impl<false>(out, input, codes, scales, global_scale,
-                                    split_k, accumulator_chains);
+                                    split_k, accumulator_chains,
+                                    activation_pack);
 }
 
 #ifndef VLLM_NVFP4_QPN2_STANDALONE
@@ -1044,21 +1032,21 @@ void nvfp4_qpn2_compact_tm_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 }
 
 template <bool TurboMindLayout>
-void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
-                                   torch::Tensor codes, torch::Tensor scales,
-                                   double global_scale, int64_t split_k,
-                                   int64_t accumulator_chains,
-                                   torch::Tensor tm_weight,
-                                   torch::Tensor tm_scales,
-                                   int64_t tm_group_size, int64_t tm_k_ld,
-                                   int64_t tm_q_ld, bool gated_silu) {
+void nvfp4_qpn2_dispatch_sm70_impl(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu, bool activation_pack) {
   if (input.size(0) <= kQpn2DispatchMaxRows) {
     if (gated_silu) {
       nvfp4_qpn2_gated_sm70_impl<TurboMindLayout>(
-          out, input, codes, scales, global_scale, split_k, accumulator_chains);
+          out, input, codes, scales, global_scale, split_k, accumulator_chains,
+          activation_pack);
     } else {
       nvfp4_qpn2_gemm_sm70_impl<TurboMindLayout>(
-          out, input, codes, scales, global_scale, split_k, accumulator_chains);
+          out, input, codes, scales, global_scale, split_k, accumulator_chains,
+          activation_pack);
     }
     return;
   }
@@ -1092,17 +1080,16 @@ void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
   silu_and_mul(out, gate_up);
 }
 
-void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor codes, torch::Tensor scales,
-                                  double global_scale, int64_t split_k,
-                                  int64_t accumulator_chains,
-                                  torch::Tensor tm_weight,
-                                  torch::Tensor tm_scales,
-                                  int64_t tm_group_size, int64_t tm_k_ld,
-                                  int64_t tm_q_ld, bool gated_silu) {
-  nvfp4_qpn2_dispatch_sm70_impl<false>(
-      out, input, codes, scales, global_scale, split_k, accumulator_chains,
-      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+void nvfp4_qpn2_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu, bool activation_pack) {
+  nvfp4_qpn2_dispatch_sm70_impl<false>(out, input, codes, scales, global_scale,
+                                       split_k, accumulator_chains, tm_weight,
+                                       tm_scales, tm_group_size, tm_k_ld,
+                                       tm_q_ld, gated_silu, activation_pack);
 }
 
 // Internal entry for the shared-layout dispatcher, also used with prefill off.
@@ -1111,10 +1098,11 @@ void nvfp4_qpn2_shared_decode_sm70_out(
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_weight,
     torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
-    int64_t tm_q_ld, bool gated_silu) {
-  nvfp4_qpn2_dispatch_sm70_impl<true>(
-      out, input, codes, scales, global_scale, split_k, accumulator_chains,
-      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+    int64_t tm_q_ld, bool gated_silu, bool activation_pack) {
+  nvfp4_qpn2_dispatch_sm70_impl<true>(out, input, codes, scales, global_scale,
+                                      split_k, accumulator_chains, tm_weight,
+                                      tm_scales, tm_group_size, tm_k_ld,
+                                      tm_q_ld, gated_silu, activation_pack);
 }
 #endif
 
@@ -1131,12 +1119,12 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
-      "int accumulator_chains) -> ()");
+      "int accumulator_chains, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_gemm_sm70_out", torch::kCUDA, &nvfp4_qpn2_gemm_sm70_out);
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
-      "int accumulator_chains) -> ()");
+      "int accumulator_chains, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_gated_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_gated_sm70_out);
 }
@@ -1150,11 +1138,13 @@ TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
   ops.impl("prepare", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
   ops.def(
       "gemm(Tensor(a!) out, Tensor input, Tensor codes, Tensor scales, "
-      "float global_scale, int split_k, int accumulator_chains) -> ()");
+      "float global_scale, int split_k, int accumulator_chains, bool "
+      "activation_pack=False) -> ()");
   ops.impl("gemm", torch::kCUDA, &nvfp4_qpn2_gemm_sm70_out);
   ops.def(
       "gated(Tensor(a!) out, Tensor input, Tensor codes, Tensor scales, "
-      "float global_scale, int split_k, int accumulator_chains) -> ()");
+      "float global_scale, int split_k, int accumulator_chains, bool "
+      "activation_pack=False) -> ()");
   ops.impl("gated", torch::kCUDA, &nvfp4_qpn2_gated_sm70_out);
 }
 #endif
