@@ -239,3 +239,28 @@ artifact, including changed-input graphs, finite FP16 activation inputs and
 the M1/M5 cancellation regressions. The focused C1 distribution comparison is
 pending. Do not carry forward the earlier artifact's task or timing results
 as its qualification.
+
+## Compensated model gate: rejected
+
+The installed artifact passes its 20 GPU regressions but fails the focused
+32-position C1 distribution gate. All cases use the same fixed English and
+Chinese prefixes and the unchanged thresholds.
+
+| Candidate scope | Mean KL | Top-1 agreement | Maximum raw-logit error |
+|---|---:|---:|---:|
+| All measured FP16 adapters | 0.00039775 | 100% | 1.18262 |
+| Shared expert adapters only | 0.00114149 | 96.875% | 0.76624 |
+| Paired gate/up fusion only; ordinary linears unchanged | 0.00065785 | 96.875% | 2.20096 |
+
+The full-adapter case passes its KL and top-1 checks but fails the 0.5 raw
+logit-error limit. The isolated cases also fail their per-stratum checks.
+Greater same-input arithmetic accuracy therefore does not qualify the model
+path. No full quality/timing campaign, C4 smoke or final trace is repeated
+for this revision. The PR is closed without merging; code and failed results
+are retained for comparison. Do not relax thresholds or promote this path.
+
+The next priority is router/shared-gate fusion that retains the current dot
+product trees. A separate hierarchical top-k diagnostic selects identical
+IDs at M1/5/17/33, including tied and degenerate rows, but takes 48.880 versus
+47.888 us when an equal L2 flush is included in each arm. It is slower and
+remains research-only. Those values are not standalone projection times.
