@@ -143,9 +143,9 @@ def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
     os.environ[disabled] = "0"
     applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
     assert disabled not in applied and os.environ[disabled] == "0"
-    assert len(applied) == 5
+    assert len(applied) == 4
     assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
-    assert os.environ["VLLM_SM70_RMSNORM_GATED_EXACT"] == "1"
+    assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in os.environ
     assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True) == ()
     assert "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8" not in os.environ
     assert "VLLM_SM70_NVFP4_QPN2" not in os.environ
@@ -300,32 +300,20 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
         "VLLM_PLE_CPU_OFFLOAD",
         "VLLM_PLE_DISK_OFFLOAD",
         "VLLM_SM70_QWEN38_HYBRID_PLE",
-        "VLLM_QWEN4EXP_PLE_DISK",
     ):
         set_lazy_env(monkeypatch, name, None)
-    model_config = SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[1]))
-
-    assert not _qwen4exp_ple_cascade_requested(model_config)
-    # The disk tier starts the cascade.
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
-    assert _qwen4exp_ple_cascade_requested(model_config)
-    with pytest.raises(ValueError, match="no PLE layers"):
-        _qwen4exp_ple_cascade_requested(
-            SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[]))
-        )
-    # Regression (first cascade boot, 2026-09-15): the PLE offload worker
-    # builds a model-less VllmConfig for its isolated world while the variable
-    # is inherited; that config must not be refused.
-    VllmConfig()
-    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", "1")
-    with pytest.raises(ValueError, match="cannot be combined"):
-        _qwen4exp_ple_cascade_requested(model_config)
-    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
+    # The isolated worker constructs a model-less engine. It must remain usable
+    # without inheriting admission or changing the process environment.
+    before = dict(os.environ)
+    cfg = VllmConfig()
+    assert not _qwen4exp_ple_cascade_requested(cfg)
+    assert cfg.kernel_config.ple_disk_cascade_reason == "no PLE layers"
+    assert dict(os.environ) == before
 
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""
     _apply_qwen4exp_ple_cascade_defaults(parallel_config)
-    assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
+    assert dict(os.environ) == before
     assert parallel_config._ple_offload_ipc_path.startswith("ipc://")
 
 
