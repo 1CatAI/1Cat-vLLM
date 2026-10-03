@@ -345,3 +345,28 @@ This permits investigation of a device-side compact/reference decision without
 the per-round CPU probe copy. The native graph attachment primitive and its
 captured-child tests are being built; model integration and sampler distribution
 equivalence remain required before any timing claim.
+
+The installed complete conditional-graph wheel has SHA256
+`d1de404720ace79fbbbd04a5ae0f43521d16c5f74ffac311e42dcd9fb257ee90`.
+Both basic live-flag tests pass. Two additional tests run the actual compact
+and dense rejection kernels over the full 248320-token vocabulary. Each uses
+twenty changing replays with FP32 or FP64 RNG, changing seeds and positions,
+top-p 0.9/1.0, and cutoff ties of 21/24/63/64/80 tokens. A truncated tie in the
+bonus row switches the whole request. Valid emitted tokens and counts match
+the dense reference exactly. These are sampler operator gates, not serving
+integration or performance evidence.
+
+The four-rank Torch NCCL all-gather probe fails before any successful replay:
+attachment returns zero, but graph instantiation/replay reports an invalid
+argument on all ranks. Retaining those graph references also delays collective
+teardown until the owned timeout. Conditional bodies have stricter node-type
+requirements than ordinary graphs; inspect captured collective nodes and
+release graph references before communicator teardown. Do not admit conditional
+communication from the passing single-device sampler tests.
+
+The first fixed-prefix model audit stops before any candidate arm because
+eager and captured control hidden states differ. The revised audit captures
+both controls and each candidate with the same compilation/capture context
+and persistent attention metadata. It requires bitwise original/recaptured
+control agreement before measuring candidates and saves mismatch tensors if
+that prerequisite fails. No model KL or proposal-quality pass is claimed yet.
