@@ -12,14 +12,12 @@ FP16 coefficients. A block initializes one codebook, handles sixteen output
 columns, and partitions K among sixteen thread groups. Empty experts return
 before table initialization. Offset/pointer inputs stay on the GPU for capture.
 
-The initial operator is a measurement candidate. Existing grouped GEMM remains
-the default until real TP4 timing establishes a useful interval. Tests cover
-all formats, empty/distinct experts, FP32 reference output, CUDA graph replay
-and full-graph tracing. The source build passes 39 GPU checks, covering all seven formats,
-canonical dequantization, graph replay, tracing and grouped dispatch. Actual
-checkpoint timing is pending. Static compilation uses 39 registers for IQ2/3
-and 48 for IQ1, with no stack/local memory reported; those counts are not
-runtime performance evidence.
+The kernel framework enables vector decode only for measured descriptors and
+M intervals. Other descriptors retain grouped GEMM with an explicit admission
+reason. Tests cover all formats, empty/distinct experts, FP32 reference output,
+CUDA graph replay and full-graph tracing. Static compilation uses 39 registers
+for IQ2/3 and 48 for IQ1, with no stack/local memory reported; those counts are
+not runtime performance evidence.
 
 ## Initial real-weight comparison
 
@@ -88,4 +86,34 @@ Four experts have a clear crossover: vector decode wins through M=8 but
 repeats weight work as each expert receives more rows. With 512 experts,
 empty or single-row experts benefit throughout the measured small-M range.
 These distributions exclude routing and do not establish model throughput.
-Final selected-route and ordinary installed-wheel validation remain pending.
+The ordinary installed wheel passes 104 GPU checks with one non-SM70 skip,
+covering affine, bitplane, LUT and lattice operators, exact canonical
+dequantization, graph replay and capability selection. Source, packaged and
+installed core SHA256 values match, with no RPATH/RUNPATH; dependency checking
+passes for all 210 installed packages.
+
+## Installed selected-route measurements
+
+The fresh environment imports vLLM from its installed wheel, outside the source
+tree, using Python 3.12.3, Torch 2.10.0+cu128 and CUDA 12.8.
+Wheel SHA256:
+`bbdaa23d631a87b7f991a3a6cb15d38b9e90b1d615b0e5a7294f6084678ff3da`.
+Core SHA256:
+`913608cd66cf22ea9f670b046d3f582dab5317cf907dae5c28c52ac579f6f5bc`.
+
+All timings below use actual IQ3_XXS TP4 N=160/K=2560 expert matrices and
+CUDA graph replay; times are microseconds. These points use 100 ms warmup and
+20 iterations, with eight device invocations per graph replay.
+
+| Experts | M | Selected | Selected us | Direct vector us | Grouped GEMM us | AWQ us |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 | 16 | GEMM | 24.63 | 27.75 | 24.00 | 16.22 |
+| 512 | 128 | Vector | 78.23 | 78.18 | 135.91 | 72.37 |
+| 512 | 512 | Vector | 264.24 | 264.50 | 307.40 | 184.63 |
+
+The E4/M=8 selected route measured 311.35 us once, while the identical direct
+vector call measured 16.54 us. This inconsistent point is excluded from route
+calibration and awaits a targeted replay check. E512 selected and direct calls
+agree, but M=512 remains about 43% slower than AWQ. Output relative L2 is
+0.00040–0.00041. These projection results exclude routing and the full FFN;
+model throughput and quality remain unmeasured.
