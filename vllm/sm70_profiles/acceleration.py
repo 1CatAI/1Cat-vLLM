@@ -194,6 +194,15 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
         if "Flash-Next qualified batch"
         in cast(EnvVar, getter).metadata.acceleration_paths
     }
+    from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
+
+    if (
+        not sm70_flash_next_batch_qualified(cfg)
+        and "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" not in envs.os.environ
+    ):
+        controls["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"].update(
+            enabled=False, reason="speculation_not_quality_qualified"
+        )
     norm = cfg.kernel_config.sm70_rmsnorm_gated_exact
     if norm is not None:
         controls["VLLM_SM70_RMSNORM_GATED_EXACT"].update(

@@ -61,3 +61,21 @@ def test_loaded_norm_keeps_its_engine_policy(monkeypatch):
             layers.append(RMSNormGated(128))
     monkeypatch.setenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0")
     assert [layer._sm70_rmsnorm_gated_exact for layer in layers] == [False, True]
+
+
+@pytest.mark.parametrize("legacy_opt_in", (None, "1"))
+def test_unqualified_proposer_requires_explicit_gdn_opt_in(monkeypatch, legacy_opt_in):
+    from tools.sm70_flash_next_route_snapshot import collect
+
+    name = "VLLM_SM70_QWEN38_GDN_INPUT_BATCH"
+    if legacy_opt_in is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, legacy_opt_in)
+    envs.disable_envs_cache()
+    routes = collect()
+    assert routes["flash_next/fp16/tp4/dflash/c4/p4096"]["gdn_packed"] is (
+        legacy_opt_in is not None
+    )
+    for method in ("none", "mtp"):
+        assert routes[f"flash_next/fp16/tp4/{method}/c4/p4096"]["gdn_packed"]

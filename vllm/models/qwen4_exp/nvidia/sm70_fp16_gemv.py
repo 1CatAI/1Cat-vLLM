@@ -11,6 +11,7 @@ linear path.
 
 from __future__ import annotations
 
+import os
 from types import MethodType
 from typing import NamedTuple
 
@@ -759,10 +760,15 @@ def enable_qwen38_sm70_fp16_gemv(
             ):
                 continue
             child.sm70_qwen38_fp16_fused_input = True
-            if envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or (
-                envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
-                and _batch_runtime_contract(vllm_config)
-            ):
+            # Automatic promotion covers ordinary decode and MTP. Retain an
+            # explicit legacy opt-in for other proposers; they need paired
+            # quality before this default can be widened.
+            batch_qualified = _batch_runtime_contract(vllm_config)
+            explicit_gdn_batch = "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" in os.environ
+            if (
+                envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
+                and (batch_qualified or explicit_gdn_batch)
+            ) or (envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and batch_qualified):
                 assert qkvz is not None and ba is not None
                 qkvz._sm70_qwen38_prepare_gdn_batch = True
                 ba._sm70_qwen38_prepare_gdn_batch = True

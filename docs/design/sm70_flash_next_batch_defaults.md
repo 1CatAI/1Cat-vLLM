@@ -4,6 +4,8 @@ Flash-Next's small-batch FP16 path admits MTP verifier and draft projections
 through the same local geometry, layout and alignment checks as ordinary decode.
 The numerical policy remains unchanged: the MTP HC schedule retains its FP16
 K512 partial boundaries, whereas ordinary concurrent HC keeps FP32 partials.
+Automatic GDN packing also stays within that boundary; an explicit legacy
+GDN batch opt-in is retained for controlled tests of another proposer.
 Other speculative methods remain outside the batch quality qualification in
 `vllm/model_executor/models/config.py`. Microbatching and batch-invariant mode
 retain their existing fallbacks. Native arithmetic and weight precision are
