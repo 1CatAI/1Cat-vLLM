@@ -61,6 +61,41 @@ made, and no model performance result is claimed.
 
 ## Next evidence required
 
+### Hardware and communication follow-up
+
+The measurement host has one Xeon E5-2680 v4 socket (14 cores/28 threads),
+one NUMA node, 64 GB nominal system RAM, and four V100-SXM2-32GB GPUs. Software
+is Ubuntu 24.04.2, NVIDIA driver 580.173.02, CUDA toolkit 12.8.93, Python
+3.12.14, Torch 2.10.0+cu128, NCCL 2.27.5, Triton 3.6.0, and Transformers
+5.17.0. Each GPU has six active NVLink links, reported at 25.781 GB/s each;
+each peer pair has two links. ECC is enabled.
+
+The original 185 W GPU power caps were explicitly raised to the 300 W hardware
+default before the following tests. Preserve 300 W for the forthcoming model
+baseline. GPU ownership locks covered both tests, and their processes exited.
+
+| Model-free test, 81920 bytes per call | Mean for 140 calls | Amortized call |
+| --- | ---: | ---: |
+| NCCL, four processes, captured graph | 4.340 ms | 31.003 us |
+| Existing push kernel, 80 blocks, captured graph | 0.913 ms | 6.524 us |
+| Existing push kernel, 40 blocks, captured graph | 0.909 ms | 6.495 us |
+
+The push probe directly instantiates the unchanged kernel from this source
+base using one host process and four CUDA devices. It validates every output
+element on every rank while changing the input markers between graph replays.
+It does not validate multi-process IPC setup or model dispatch. The NCCL probe
+uses separate processes, checks eager and captured sums, and reports the
+critical rank's event interval. These different harnesses are diagnostic
+evidence; their difference is not an accepted end-to-end speedup. A single
+collective per graph is dominated by rank launch skew and is not used to infer
+communication limits.
+
+The approximately 1.6 us needed to serialize 81920 bytes at the reported
+two-link rate is only an ideal wire-time floor. Synchronization, protocol,
+reduction, and kernel execution are additional costs. The measured push
+chain establishes a practical sub-10-us candidate on this topology; it does
+not establish the absolute communication lower bound.
+
 1. Recover the original model identities and baseline scripts, copy missing
    artifacts, and pin the complete runtime contract.
 2. Establish the unprofiled baseline and short Torch profile on this host.
