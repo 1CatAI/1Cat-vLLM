@@ -1,0 +1,17 @@
+Native GGUF operators
+=====================
+llama.cpp: https://github.com/ggml-org/llama.cpp
+commit: 002a12ad25503a93501b2e188c360029830a241a
+license: MIT (LICENSE.llama.cpp)
+
+Torch bridge: https://github.com/vllm-project/vllm-gguf-plugin/pull/141
+commit: aa09d6522f29325d64d999d7d7c794f79836de07
+license: Apache-2.0 (LICENSE.vllm-gguf-plugin)
+
+Changes in 1Cat-vLLM: CMake/package integration, native-only bindings,
+operation-specific ternary admission, TQ1_0/TQ2_0 CUDA dequantization,
+KernelConfig dispatch without separate GGML environment switches,
+and explicit FP32 BLAS precision. The vendored llama.cpp source remains
+unmodified; csrc/quantization/gguf_upstream/source_manifest.json records
+its checksums and the original bridge checksums.
+

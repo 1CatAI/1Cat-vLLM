@@ -62,7 +62,7 @@ def test_real_selector_records_reasons_without_extra_probes(shape, monkeypatch):
 
 def test_policies_are_discovered_from_existing_configuration():
     policies = linear_policy_report(KernelConfig())
-    assert set(policies) == {"sm70_nvfp4", "sm70_awq", "sm70_fp8"}
+    assert set(policies) == {"sm70_nvfp4", "sm70_awq", "sm70_fp8", "sm70_gguf"}
     assert all(row["status"] == "runtime_guarded" for row in policies.values())
 
 

@@ -1450,7 +1450,9 @@ def multi_thread_pt_weights_iterator(
 def get_gguf_extra_tensor_names(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> list[str]:
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    reader = GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
@@ -1463,9 +1465,11 @@ def get_gguf_weight_type_map(
     """
     Return GGUF mapped weight's name and its quant type
     """
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, quant_type_name
+
+    reader = GGUFReader(gguf_file)
     return {
-        gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
+        gguf_to_hf_name_map[tensor.name]: quant_type_name(tensor.tensor_type)
         for tensor in reader.tensors
         if tensor.name in gguf_to_hf_name_map
     }
@@ -1483,7 +1487,9 @@ def gguf_quant_weights_iterator(
     layer with different quant types.
     """
 
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    reader = GGUFReader(gguf_file)
 
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
@@ -1527,7 +1533,9 @@ def gguf_quant_weights_iterator_multi(
     before yielding any weights data to avoid issues with packed layers
     that have different quant types.
     """
-    readers = [gguf.GGUFReader(f) for f in gguf_files]
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    readers = [GGUFReader(f) for f in gguf_files]
 
     # First pass: yield all weight types across all shards
     for reader in readers:
