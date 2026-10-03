@@ -12,6 +12,9 @@ from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config import vllm as config_module
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+)
 from vllm.models.qwen4_exp.common.ple import ple_cascade_configured
 
 
@@ -79,6 +82,31 @@ def test_capability_rejections(config, case, reason):
         config.parallel_config.decode_context_parallel_size = 2
     assert not config_module._qwen4exp_ple_cascade_requested(config)
     assert reason in config.kernel_config.ple_disk_cascade_reason
+
+
+@pytest.mark.parametrize("table_layer,admitted", [(1, True), (2, False)])
+def test_modelopt_mixed_storage_uses_checkpoint_layer_names(
+    config, table_layer, admitted
+):
+    # ModelOpt mixed-precision checkpoints declare the FP8 PLE table per layer
+    # under checkpoint names instead of setting ple_embedding_dtype. PLE id 2
+    # is the PLE module of decoder layer 1.
+    config.model_config.hf_text_config.ple_layer_ids = [2]
+    config.model_config.hf_text_config.ple_embedding_dtype = ""
+    config.quant_config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "ignore": ["lm_head", "model.language_model.embed_tokens"],
+            "quantized_layers": {
+                f"model.language_model.layers.{table_layer}"
+                ".ple.ple_embedding.ngram_embedding": {"quant_algo": "FP8"},
+            },
+        }
+    )
+    assert config_module._qwen4exp_ple_cascade_requested(config) is admitted
+    if not admitted:
+        assert "E4M3" in config.kernel_config.ple_disk_cascade_reason
 
 
 def test_pp_admission_uses_layer_layout(config):
