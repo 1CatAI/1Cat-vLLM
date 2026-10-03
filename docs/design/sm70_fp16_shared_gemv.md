@@ -152,3 +152,34 @@ Ablation must separate those routes from shared gate/up and down before the
 fusion can be admitted. Do not credit the measured 1.16% endpoint difference
 as an accepted production gain. C4 and final trace jobs were gated on this
 comparison and have not run. The PR remains unmerged; thresholds are unchanged.
+
+## Focused distribution diagnosis
+
+Two frozen prefixes (English and Chinese, 16 positions each) isolate shared
+gate/up and down using the supported worker-class hook before compilation.
+Other measured FP16 adapters are removed in these diagnostic arms. All arms
+use the same installed artifact and teacher-forced input tokens. The reduced
+default control matches the retained full-suite default rows exactly, so
+changing the probe order does not explain the failure.
+
+| Enabled shared projection | Mean KL | Top-1 agreement | Maximum logit error |
+|---|---:|---:|---:|
+| None, default control | 0 | 100% | 0 |
+| Gate/up only | 0.00273880 | 93.75% | 2.625 |
+| Down only | 0.00161387 | 93.75% | 1.60791 |
+| Gate/up and down | 0.00411570 | 90.625% | 2.47656 |
+
+All three candidate arms fail the existing thresholds. Their step-zero
+prefill logits match the control exactly; deviations appear during decode.
+A separate diagnostic preserves the original prefill call path and enables
+the adapter only in the existing decode compilation context. Its result is
+pending. Neither a prefill defect nor a faulty transfer is established by
+these observations. Kernel PTX contains FP32 multiply-accumulate operations,
+and the fused activation retains the native FP16 SiLU boundary; there is no
+evidence of reduced accumulation precision.
+
+The tokenizer has 248077 valid contiguous IDs, including added tokens, while
+the model matrix has 248320 rows. New manifests exclude the 243 padding rows.
+Recomputing the retained 768-position comparison over valid IDs leaves the
+failure unchanged. The worst raw-logit error belongs to valid token 622, so
+padding was a probe bug but does not explain this candidate's failure.
