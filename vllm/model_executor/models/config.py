@@ -707,7 +707,9 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             raise ValueError("Qwen4Exp requires hc_count > 1")
 
         parallel_config = vllm_config.parallel_config
-        if parallel_config.decode_context_parallel_size > 1:
+        if parallel_config.decode_context_parallel_size > 1 and getattr(
+            text_config, "indexer_n_heads", 0
+        ):
             # One all-to-all per QSA layer replaces all-gather(LSE) plus
             # reduce-scatter(output); on TP4/DCP2 V100 decode the combine drops
             # from 31.9 to 19.9 us per layer. An explicit user choice still wins.
