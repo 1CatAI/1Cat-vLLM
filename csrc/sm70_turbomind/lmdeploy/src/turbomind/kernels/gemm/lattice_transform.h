@@ -6,10 +6,11 @@
 #include "src/turbomind/kernels/core/array.h"
 namespace turbomind::gemm {
 
-template<int Type, int GroupSize>
+template<int Type, int GroupSize, int Replicas = 1>
 struct Transform_HMMA_SM70_Lattice {
   using Codebook = LatticeCodebook<Type>;
-  static constexpr int kReplicas = Type == 18 ? 8 : 1;
+  static constexpr int kReplicas = Replicas;
+  static_assert(kReplicas == 1 || (Codebook::kWidth == 4 && kReplicas == 8));
   static constexpr int kCodebookBytes = Codebook::kBytes * kReplicas;
   static constexpr auto kQuantType = static_cast<QuantType>(8 + (
       Type == 16 ? 0 : Type == 17 ? 1 : Type == 18 ? 2 : Type == 19 ? 3 :
