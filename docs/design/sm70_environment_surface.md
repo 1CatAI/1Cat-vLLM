@@ -22,7 +22,7 @@ shadowing; dynamically constructed names still require a separate audit.
 
 ## Debug compatibility
 
-`VLLM_SM70_DEBUG` accepts comma-separated `trace`, `mtp`, `events` and `routing`.
+`VLLM_SM70_DEBUG` accepts comma-separated `trace`, `mtp`, `events`, `routing` and `selector`.
 It defaults to empty, so observation adds no work. Set only the channels needed
 for an investigation; timing with observers is not ordinary throughput.
 An explicitly set unified entry, including an empty value, takes precedence
@@ -31,12 +31,20 @@ unchanged and use of an alias produces a deprecation warning.
 
 | Old variable | Replacement |
 | --- | --- |
+| `VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE` | `VLLM_SM70_DEBUG=trace` |
+| `VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW` | `VLLM_SM70_DEBUG=selector` |
 | `VLLM_SM70_PROFILE_TRACE` | `VLLM_SM70_DEBUG=trace` |
 | `VLLM_SM70_DECODE_TILE_PROFILE` | `VLLM_SM70_DEBUG=trace` |
 | `VLLM_SM70_MTP_PROFILE` | `VLLM_SM70_DEBUG=mtp` |
 | `VLLM_SM70_DECODE_EVENT_TRACE` | `VLLM_SM70_DEBUG=events` |
 | `VLLM_FLASH_V100_ROUTE_SUMMARY` | `VLLM_SM70_DEBUG=routing` |
 | `VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY` | `VLLM_SM70_DEBUG=routing` |
+
+The `selector` channel runs the existing eager QPN8/rerank shadow oracle,
+compares it with dense top-k, and returns the original dense result. It retains
+the eager-only guard and its synchronization/duplicate-work cost; enabling
+ordinary trace does not run this oracle. The greedy trace channel reports
+why the LM-head acceleration was skipped. All channels default off.
 
 These aliases remain for one full released compatibility version and are
 removed in the following version. The cycle starts with the first release
