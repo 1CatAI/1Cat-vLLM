@@ -125,5 +125,46 @@ capability/configuration dispatch; final users must not set tuning variables.
   complete-round campaign; existing QSA request-splitting and PLE placeholder
   PRs have separate scope. All four visible GPUs were idle at preflight.
 - Created an isolated worktree and task-specific compiler caches. Native
-  source build is in progress using Torch 2.10.0+cu128 and CUDA 12.8; no wheel
+  source build uses Torch 2.10.0+cu128 and CUDA 12.8; no wheel
   packaging is requested. All speed/quality admission remains pending.
+
+- Reopened ordinary BV16 recurrence component (M5/M10, 36-layer chain):
+  0.643029 -> 0.633856 ms and 0.777557 -> 0.762027 ms. Finite FP16 output
+  and FP32 state, maximum observed output error 7.6294e-6 and state error
+  1.9074e-6 on this synthetic changing-state screen. Differences are allowed
+  to proceed numerically, but only 0.009/0.016-ms savings do not justify a
+  model promotion or a new quality run. This is not teacher-forcing evidence.
+- Real-checkpoint projection screen uses eight pairs (two layers x four TP
+  slices), seven input scales and alternating graph timings. Splitting QKV
+  K2560 across four warps gives M5 1.139328 -> 1.095840 ms per 36-layer chain,
+  but M10 1.171104 -> 1.277600 ms. Reject as a performance candidate. The
+  task-local research DSO is not loaded by the model/default benchmark.
+- Native build completes after materializing the task's Triton source directory;
+  the first install attempt failed copying a directory symlink. Preserve both
+  build logs. Optional Rust build is unavailable; CUDA/Python model inference
+  uses the normally built native extensions. No wheel was packaged.
+- The first benchmark attempt exits before engine construction because its
+  environment audit ran after platform import, which sets two framework
+  defaults. Commit `fd39475e8d` moves the audit before vLLM imports. The launch
+  contract has zero supplied VLLM variables; framework defaults are retained.
+- Current default engine startup proceeds on leased GPU0--3 with MTP4 and V2,
+  FULL_AND_PIECEWISE graphs and an exact M5 capture shape. Actual speed remains
+  pending; do not report configuration diagnostics as measured request hits.
+
+- Default post-capture warmup stalls before any request timing. All four CPU
+  stacks stop at `GPUModelRunner.sample`'s hidden-state indexing. The PLE
+  cascade implementation unconditionally waits for remote rows whenever
+  `_is_cpu_offloaded` is set, including hybrid decode's complete local table.
+  FULL replay deliberately submits no hybrid offload request: after prefill
+  resets the semaphore, decode cannot proceed. Restrict the remote merge to
+  cascade placement; hybrid decode gathers locally. Two focused behavior
+  tests pass, covering both local decode and preserved remote cascade waits.
+  Full native/default startup validation is pending. Both failed engines were
+  stopped by verified task PID/cwd/start time; no foreign service was stopped.
+- Current visible GPU0--3 topology has NV1/NV2 links but two SYS pairs. The
+  custom all-reduce topology guard disables CUSTOM and selects PYNCCL. This
+  is not the previous fully interconnected four-card benchmark topology;
+  record it with new timings rather than comparing old wall times as matched.
+- The next default run isolates vLLM's compile cache through the normal
+  `CompilationConfig.cache_dir` infrastructure setting, in addition to owned
+  Inductor/Triton/extension caches. No user performance environment flags.

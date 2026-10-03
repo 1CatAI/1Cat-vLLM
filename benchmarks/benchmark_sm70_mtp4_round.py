@@ -101,6 +101,9 @@ def main() -> None:
         "kv_cache_memory_bytes": 4 * 1024**3,
         "enable_prefix_caching": True,
         "language_model_only": True,
+        "compilation_config": {
+            "cache_dir": str(args.out.parent.resolve() / "compile_cache"),
+        },
         "speculative_config": {
             "method": "mtp",
             "num_speculative_tokens": 4,
