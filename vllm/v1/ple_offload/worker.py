@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
@@ -334,6 +334,11 @@ class PleOffloadWorkerHandle:
 
 def _init_offload_distributed() -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
+    # The worker builds its model in the PP1 world configured below, but it
+    # inherits the GPU workers' environment: a VLLM_PP_LAYER_PARTITION written
+    # for the real pipeline makes get_pp_indices() refuse the single stage
+    # ("len(partitions) != pp_size") while the meta model is constructed.
+    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     if dist.is_initialized():
         return
 
@@ -579,6 +584,13 @@ class PleOffloadRunner:
         """
         model_config = self.vllm_config.model_config
         load_config = self.vllm_config.load_config
+        if load_config.safetensors_load_strategy == "direct":
+            # This process needs only the PLE tensors, and the disk tier serves
+            # them from the mapped checkpoint (file-backed shards). O_DIRECT
+            # would copy the tables into anonymous memory and read every other
+            # tensor of the checkpoint only to drop it; the lazy mapping reads
+            # just the PLE pages.
+            load_config = replace(load_config, safetensors_load_strategy="lazy")
 
         # Step 1: build complete structure, while only PLE subtrees allocate CPU
         # memory. All transformer, MoE, and vision parameters remain on meta.
@@ -619,16 +631,19 @@ class PleOffloadRunner:
         mapper = getattr(model, "hf_to_vllm_mapper", None)
         matched_checkpoint_tensors = 0
 
+        def is_offload_weight(weight_name: str) -> bool:
+            mapped_name: str | None = weight_name
+            if mapper is not None:
+                mapped_names = mapper.apply_list([weight_name])
+                mapped_name = mapped_names[0] if mapped_names else None
+            return mapped_name is not None and mapped_name.startswith(offload_prefixes)
+
         def offload_only_iter(
             weights: Iterable[tuple[str, torch.Tensor]],
         ) -> Iterable[tuple[str, torch.Tensor]]:
             nonlocal matched_checkpoint_tensors
             for weight_name, tensor in weights:
-                mapped_name: str | None = weight_name
-                if mapper is not None:
-                    mapped_names = mapper.apply_list([weight_name])
-                    mapped_name = mapped_names[0] if mapped_names else None
-                if mapped_name is not None and mapped_name.startswith(offload_prefixes):
+                if is_offload_weight(weight_name):
                     matched_checkpoint_tensors += 1
                     yield weight_name, tensor
 
@@ -641,7 +656,14 @@ class PleOffloadRunner:
             for layer in offload_layers.values():
                 initialize_dummy_weights(layer, model_config)
         elif isinstance(loader, DefaultModelLoader):
-            all_weights = loader.get_all_weights(model_config, model)
+            # Skip the rest before it is touched: handing out even a mapped
+            # tensor reads it with readahead, which made this process read the
+            # whole checkpoint through the page cache (2026-09-29, Flash-Next).
+            all_weights = loader.get_all_weights(
+                model_config,
+                model,
+                skip_weight=lambda name: not is_offload_weight(name),
+            )
             loaded_params = model.load_weights(offload_only_iter(all_weights))
             if matched_checkpoint_tensors == 0:
                 raise RuntimeError(
@@ -773,6 +795,7 @@ class PleOffloadRunner:
                 "TP rank zero did not register PLE input buffers for every DP "
                 f"rank: expected={set(range(dp_size))}, got={set(self._input_bufs)}"
             )
+        self._bind_remote_placements(registrations, dp_size, tp_size)
 
         config = self.vllm_config.model_config.hf_text_config
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -800,6 +823,50 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+
+    def _bind_remote_placements(
+        self,
+        registrations: list[PleOffloadRegistration],
+        dp_size: int,
+        tp_size: int,
+    ) -> None:
+        """Hand each tiered layer the row geometry of every tensor-parallel rank."""
+        by_layer: dict[str, dict[int, dict[int, Any]]] = {}
+        for registration in registrations:
+            for layer_name, placement in registration.remote_placements.items():
+                by_layer.setdefault(layer_name, {}).setdefault(
+                    registration.dp_rank, {}
+                )[registration.tp_rank] = placement
+        for layer_name, by_dp in by_layer.items():
+            layer = self._layers.get(layer_name)
+            if layer is None:
+                raise RuntimeError(
+                    f"PLE remote placement for unknown layer {layer_name}"
+                )
+            expected = {dp_rank: set(range(tp_size)) for dp_rank in range(dp_size)}
+            received = {dp_rank: set(ranks) for dp_rank, ranks in by_dp.items()}
+            if received != expected:
+                raise RuntimeError(
+                    f"PLE layer {layer_name}: every rank must register its remote "
+                    f"placement, expected {expected}, got {received}"
+                )
+            # The tensor-parallel geometry is the same in every data-parallel
+            # replica, so one placement list per layer serves all of them.
+            placements = [by_dp[0][tp_rank] for tp_rank in range(tp_size)]
+            for dp_rank in range(1, dp_size):
+                replica = [by_dp[dp_rank][tp_rank] for tp_rank in range(tp_size)]
+                if replica != placements:
+                    raise RuntimeError(
+                        f"PLE layer {layer_name}: remote placements differ "
+                        "between data-parallel ranks"
+                    )
+            layer.bind_remote_placements(placements)
+            logger.info(
+                "PLE layer %s: remote placements of %d tensor-parallel rank(s): %s",
+                layer_name,
+                tp_size,
+                placements,
+            )
 
     @torch.inference_mode()
     def busy_loop(

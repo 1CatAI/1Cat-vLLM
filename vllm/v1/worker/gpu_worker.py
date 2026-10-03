@@ -46,6 +46,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -166,17 +167,17 @@ class Worker(WorkerBase):
         self._ple_offload_spawn_config: VllmConfig | None = None
         if envs.VLLM_SM70_QWEN38_HYBRID_PLE and not (
             envs.VLLM_SM70_QWEN38_DUAL_COMPILE
-            and envs.VLLM_PLE_CPU_OFFLOAD
+            and ple_offload_enabled(self.vllm_config)
             and envs.VLLM_PLE_DISK_OFFLOAD
         ):
             raise ValueError(
                 "VLLM_SM70_QWEN38_HYBRID_PLE requires dual compilation plus "
                 "PLE CPU and disk offload"
             )
-        if envs.VLLM_PLE_DISK_OFFLOAD and not envs.VLLM_PLE_CPU_OFFLOAD:
+        if envs.VLLM_PLE_DISK_OFFLOAD and not ple_offload_enabled(self.vllm_config):
             raise ValueError("VLLM_PLE_DISK_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1")
         self._ple_offload_enabled = self._has_ple_layers()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if ple_offload_enabled(self.vllm_config):
             if self._ple_offload_enabled:
                 self._validate_ple_offload_config()
             elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
@@ -191,7 +192,7 @@ class Worker(WorkerBase):
         self._pp_send_work: list[Handle] = []
 
     def _has_ple_layers(self) -> bool:
-        if not envs.VLLM_PLE_CPU_OFFLOAD:
+        if not ple_offload_enabled(getattr(self, "vllm_config", None)):
             return False
         return bool(getattr(self.model_config.hf_text_config, "ple_layer_ids", None))
 
@@ -213,8 +214,10 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+        # Pipeline parallelism is fine: the PLE table sits on the first
+        # stage only (check_ple_layers_on_first_pp_rank refuses a layout that
+        # puts PLE layers anywhere else), and ranks without a PleOffloadLayer
+        # do not create a connector.
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
@@ -521,11 +524,18 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
+        # Compilation and lazy workspaces have very different lifetimes. Avoid
+        # pinning large split segments behind small persistent allocations on
+        # SM70, then restore the serving allocator before measuring its peak.
+        warmup_allocator = (
+            self._scoped_allocator_max_split(20)
+            if current_platform.is_cuda() and current_platform.is_device_capability(70)
+            else nullcontext()
+        )
+        with warmup_allocator:
             self.model_runner.profile_run()
 
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
@@ -551,7 +561,6 @@ class Worker(WorkerBase):
         # keeps allocated still counts: non-torch is measured against the
         # init snapshot, and torch memory the warm-up left behind beyond the
         # weights is added below as warmup_torch_residual.
-        self.model_runner.profile_run()
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(

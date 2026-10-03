@@ -24,12 +24,13 @@ not the operator's implementation limits. KV dtype, quantization, and TP are
 not added to this qualification.
 
 Qualified configurations retain their former automatic options, including FP32
-logits, reranking, and dense tie ordering. Candidate-only ordering stays off.
+logits, reranking, and dense tie ordering. Dense tie ordering is mandatory; the candidate-only experiment is retired.
+See [retirement evidence](sm70_dflash2_retired_candidate_order.md).
 Other configurations retain the registered legacy defaults. Explicit typed
 fields take precedence over legacy environment aliases. No default changes or
 online weight requantization promotions occur in this migration.
 
-The 19 DFlash-specific environment names remain readable, emit deprecation
+The 18 retained DFlash-specific environment names remain readable, emit deprecation
 warnings, and map to the corresponding fields. Keep compatibility for one
 released version containing this migration, then remove the names in the
 following release. The shared `VLLM_SM70_FP8_QPN8` alias also serves the existing

@@ -333,12 +333,15 @@ class ParallelConfig:
     and will be deprecated when PCP is fully supported.
 
     """
-    dcp_comm_backend: DCPCommBackend = "ag_rs"
+    dcp_comm_backend: DCPCommBackend | None = None
     """Communication backend for Decode Context Parallel (DCP).
-    - "ag_rs": AllGather + ReduceScatter (default, existing behavior)
+    - "ag_rs": AllGather + ReduceScatter (existing behavior)
     - "a2a": All-to-All exchange of partial outputs + LSE, then
       combine with Triton kernel. Reduces NCCL calls from 3 to 2
       per layer for MLA models.
+
+    `None` selects the model default, which is "ag_rs" unless the model
+    overrides it via [`set_dcp_defaults`][vllm.config.ParallelConfig.set_dcp_defaults].
     """
 
     cp_kv_cache_interleave_size: int = 1
@@ -505,6 +508,15 @@ class ParallelConfig:
         """Initialize the shared PLE endpoint after late config defaults."""
         if not self._ple_offload_ipc_path:
             self._ple_offload_ipc_path = get_open_zmq_ipc_path()
+
+    def set_dcp_defaults(self, comm_backend: DCPCommBackend = "ag_rs") -> None:
+        """Fill in the DCP options the user left unset.
+
+        Models can set their preferred DCP settings by calling this from their
+        `verify_and_update_config` hook; an explicit user setting always wins.
+        """
+        if self.dcp_comm_backend is None:
+            self.dcp_comm_backend = comm_backend
 
     @property
     def world_size_across_dp(self) -> int:

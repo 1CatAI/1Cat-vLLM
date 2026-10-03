@@ -407,9 +407,13 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_dequant_sm70.cu")
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
@@ -806,6 +810,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    include(csrc/quantization/gguf_upstream/CMakeLists.txt)
+  endif()
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)
   #

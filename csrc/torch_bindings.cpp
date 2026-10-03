@@ -166,6 +166,73 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // conditionally compiled so impl registrations are in source file
 
   #ifdef ENABLE_SM70_TURBOMIND
+  ops.def(
+      "gguf_affine_sm70_prepare(Tensor codes, Tensor scales, Tensor mins, "
+      "int bits, int group_size=32) -> Tensor[]");
+  ops.impl("gguf_affine_sm70_prepare", torch::kCUDA, &gguf_affine_sm70_prepare);
+  ops.def(
+      "gguf_affine_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, int k_ld, int q_ld, int group_size=32) -> ()");
+  ops.impl("gguf_affine_gemm_sm70_out", torch::kCUDA,
+           &gguf_affine_gemm_sm70_out);
+  ops.def(
+      "gguf_affine_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, "
+      "int bits, int num_experts, int group_size=32) -> ()");
+  ops.impl("gguf_affine_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_affine_grouped_gemm_sm70_out);
+  ops.def(
+      "gguf_affine_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "Tensor stats, int bits, int group_size) -> ()");
+  ops.impl("gguf_affine_dequantize_sm70_out", torch::kCUDA,
+           &gguf_affine_dequantize_sm70_out);
+  ops.def(
+      "gguf_affine_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, Tensor(b!) scratch, int group_size) -> ()");
+  ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
+           &gguf_affine_blas_sm70_out);
+  ops.def(
+      "gguf_lattice_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "Tensor stats, int source_type, int group_size) -> ()");
+  ops.impl("gguf_lattice_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int source_type, Tensor(b!) scratch, int group_size) -> "
+      "()");
+  ops.impl("gguf_lattice_blas_sm70_out", torch::kCUDA,
+           &gguf_lattice_blas_sm70_out);
+  ops.def(
+      "gguf_lut4_sm70_prepare(Tensor codes, Tensor scales, int lut_id, "
+      "int group_size) -> Tensor[]");
+  ops.impl("gguf_lut4_sm70_prepare", torch::kCUDA, &gguf_lut4_sm70_prepare);
+  ops.def(
+      "gguf_lut4_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int lut_id, int k_ld, int q_ld, int group_size) -> ()");
+  ops.impl("gguf_lut4_gemm_sm70_out", torch::kCUDA, &gguf_lut4_gemm_sm70_out);
+  ops.def(
+      "gguf_lut4_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int lut_id, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lut4_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_lut4_grouped_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_sm70_prepare(Tensor codes, Tensor scales, int source_type, "
+      "int group_size) -> Tensor[]");
+  ops.impl("gguf_lattice_sm70_prepare", torch::kCUDA,
+           &gguf_lattice_sm70_prepare);
+  ops.def(
+      "gguf_lattice_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int source_type, int k_ld, int q_ld, int group_size) -> "
+      "()");
+  ops.impl("gguf_lattice_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lattice_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_grouped_gemm_sm70_out);
   ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul_interleaved", torch::kCUDA, &silu_and_mul_interleaved);
 
@@ -390,6 +457,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains) -> ()");
   ops.impl("nvfp4_qpn2_gemm_sm70_out", torch::kCUDA, &nvfp4_qpn2_gemm_sm70_out);
+
+  // Skinny QPN GEMM and grouped NVFP4/MXFP4 MoE (SM70/SM75), weights
+  // prepacked in mma.m8n8k4 fragment order.
+  ops.def(
+      "skinny_qpn_gemm_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
+      "float gscale, int n) -> Tensor");
+  ops.impl("skinny_qpn_gemm_sm70", torch::kCUDA, &skinny_qpn_gemm_sm70);
+
+  ops.def(
+      "skinny_moe_qpn_sm70(Tensor x, Tensor qcodes, Tensor qscales, "
+      "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
+      "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
+      "int nacc, int scale_mode) -> ()");
+  ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
 
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "

@@ -8,12 +8,20 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    sparse_attn_decode_bmm,
+    sparse_attn_prefill_bmm,
+    sparse_decode_bmm_workspace_specs,
+    sparse_prefill_bmm_workspace_specs,
+)
+from vllm.models.deepseek_v4.common.ops.sparse_decode_bmm import (
+    sparse_decode_bmm_blocker,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLASparseBackend,
@@ -25,6 +33,7 @@ from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_paged_fp8_splitk,
     sm70_sparse_attention_paged_fp8_splitk_qk_dsplit,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import AttentionBackend
@@ -38,6 +47,47 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _bmm_blocker(
+    q: torch.Tensor,
+    *,
+    prefill: bool,
+    index_width: int = 0,
+    prefer_paged: bool = False,
+) -> str | None:
+    policy = get_current_vllm_config().kernel_config.sm70_sparse
+    if not (policy.prefill_bmm if prefill else policy.decode_bmm):
+        return "disabled by KernelConfig.sm70_sparse"
+    if (
+        not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(70)
+    ):
+        return "requires CUDA compute capability 7.x"
+    if q.ndim != 3 or q.dtype != torch.float16 or not q.is_contiguous():
+        return "requires contiguous FP16 queries [tokens, heads, dimensions]"
+    if min(q.shape) <= 0:
+        return "requires nonempty query dimensions"
+    if not prefill and q.shape[-1] != 512:
+        return "packed cache requires 448 FP8 and 64 RoPE dimensions"
+    if not prefill and prefer_paged:
+        # Compare the work the paged route would launch, including its actual
+        # head grouping. This admits larger matrices without tying selection to
+        # a request count, TP size or speculative width.
+        paged_blocks = (
+            q.shape[0]
+            * (
+                (q.shape[1] + _qk_dsplit_block_h(q.shape[1]) - 1)
+                // _qk_dsplit_block_h(q.shape[1])
+            )
+            * ((index_width + 15) // 16)
+        )
+        head_groups = (
+            q.shape[1] + _qk_dsplit_block_h(q.shape[1]) - 1
+        ) // _qk_dsplit_block_h(q.shape[1])
+        if paged_blocks < (480 if head_groups <= 2 else 192):
+            return "paged split-K has lower overhead for this query/index workload"
+    return None
 
 
 def _qk_dsplit_block_h(num_heads: int) -> int:
@@ -114,6 +164,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ),
                 ((layer.max_num_batched_tokens, combined_topk), torch.int32),
                 ((layer.max_num_batched_tokens,), torch.int32),
+                *cls._prefill_bmm_workspace_specs(layer, q, combined_topk),
             )
             output.zero_()
             return
@@ -201,6 +252,53 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128
             )
         )
+        use_qk_dsplit = envs.VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT
+        main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
+        extra_width = (
+            0
+            if topk_indices is None
+            else topk_indices.reshape(num_decode_tokens, -1).shape[1]
+        )
+        bmm_reason = _bmm_blocker(
+            q,
+            prefill=False,
+            index_width=main_width + extra_width,
+            prefer_paged=use_splitk and use_qk_dsplit,
+        )
+        if bmm_reason is None:
+            bmm_reason = sparse_decode_bmm_blocker(
+                q, layer.swa_cache_layer.kv_cache, compressed_cache
+            )
+        if bmm_reason is None:
+            keys, scores, logits, probs = current_workspace_manager().get_simultaneous(
+                *sparse_decode_bmm_workspace_specs(
+                    num_decode_tokens,
+                    q.shape[1],
+                    q.shape[2],
+                    main_width,
+                    extra_width,
+                    q.dtype,
+                )
+            )
+            logger.info_once("DeepSeek V4 SM70 sparse MLA decode: batched matmul.")
+            sparse_attn_decode_bmm(
+                q,
+                layer.swa_cache_layer.kv_cache,
+                swa_indices,
+                swa_lens,
+                compressed_cache,
+                topk_indices,
+                topk_lens,
+                layer.scale,
+                layer.attn_sink[: q.shape[1]],
+                output,
+                keys,
+                scores,
+                logits,
+                probs,
+            )
+            return
+        logger.info_once("SM70 sparse decode: paged fallback because %s.", bmm_reason)
         if use_splitk:
             main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
             extra_width = (
@@ -209,7 +307,6 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 else topk_indices.reshape(num_decode_tokens, -1).shape[1]
             )
             num_partials = (main_width + 15) // 16 + (extra_width + 15) // 16
-            use_qk_dsplit = envs.VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT
             workspace_specs = [
                 ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
                 ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
@@ -283,6 +380,26 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 extra_lengths=topk_lens,
             )
 
+    @staticmethod
+    def _prefill_bmm_workspace_specs(
+        layer: "DeepseekV4MLAAttention", q: torch.Tensor, combined_topk: int
+    ) -> list[tuple[tuple[int, ...], torch.dtype]]:
+        """Batched-matmul prefill buffers; they share the workspace request
+        with the gathered KV so that the manager does not alias them."""
+        reason = _bmm_blocker(q, prefill=True)
+        if reason is not None:
+            logger.info_once(
+                "SM70 sparse prefill: gathered fallback because %s.", reason
+            )
+            return []
+        return sparse_prefill_bmm_workspace_specs(
+            layer.max_num_batched_tokens,
+            q.shape[1],
+            q.shape[-1],
+            combined_topk,
+            torch.float16,
+        )
+
     @classmethod
     def _forward_prefill(
         cls,
@@ -338,8 +455,10 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ((current_chunk, chunk_M, q.shape[-1]), torch.float16),
                 ((layer.max_num_batched_tokens, combined_topk), torch.int32),
                 ((layer.max_num_batched_tokens,), torch.int32),
+                *cls._prefill_bmm_workspace_specs(layer, q, combined_topk),
             )
-            kv_workspace, combined_indices_out, combined_lens_out = workspace
+            kv_workspace, combined_indices_out, combined_lens_out = workspace[:3]
+            bmm_buffers = workspace[3:]
             if not swa_only:
                 assert sparse_metadata is not None and compressed_cache is not None
                 dequantize_and_gather_k_cache(
@@ -388,14 +507,26 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 chunk_N,
                 out=(combined_indices_out, combined_lens_out),
             )
-            sm70_sparse_attention_gathered(
-                q[query_start:query_end],
-                kv_workspace[:current_chunk],
-                combined_indices,
-                combined_lens,
-                layer.scale,
-                layer.attn_sink[: q.shape[1]],
-                output[query_start:query_end],
-            )
+            if bmm_buffers:
+                sparse_attn_prefill_bmm(
+                    q[query_start:query_end],
+                    kv_workspace[:current_chunk].reshape(-1, q.shape[-1]),
+                    combined_indices,
+                    combined_lens,
+                    layer.scale,
+                    layer.attn_sink[: q.shape[1]],
+                    output[query_start:query_end],
+                    *bmm_buffers,
+                )
+            else:
+                sm70_sparse_attention_gathered(
+                    q[query_start:query_end],
+                    kv_workspace[:current_chunk],
+                    combined_indices,
+                    combined_lens,
+                    layer.scale,
+                    layer.attn_sink[: q.shape[1]],
+                    output[query_start:query_end],
+                )
 
         logger.debug_once("DeepSeek V4 SM70 FP16 sparse attention route active.")

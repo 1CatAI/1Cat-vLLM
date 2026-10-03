@@ -87,6 +87,49 @@ def test_e5m2_reason(config):
     assert paths["dflash2_verifier"]["enabled"]
 
 
+@pytest.mark.parametrize("page", [16, 784, 816, 896, 1024, 2048])
+def test_bm32_report_admits_aligned_pages(config, monkeypatch, page):
+    config.cache_config.cache_dtype = "auto"
+    config.cache_config.block_size = page
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1")
+    row = acc._bm32_paged_prefill_report(config, {"bm32_aligned_pages": True})
+    assert row["enabled"]
+    assert row["scope"] == "configured_native_capability"
+    assert "at least 32 query rows" in row["runtime_guards"]
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"cache_dtype": "fp8_e4m3"}, "kv_dtype"),
+        ({"dtype": torch.bfloat16}, "kv_dtype"),
+        ({"head_dim": 128}, "head_dim"),
+        ({"block_size": 815}, "page_alignment"),
+        ({"block_size": 0}, "page_alignment"),
+        ({"native": False}, "operator_missing:aligned_bm32_paged_prefill"),
+        ({"phase": "0"}, "user_override"),
+        ({"low_smem": "0"}, "user_override"),
+    ],
+)
+def test_bm32_report_explains_fallback(config, monkeypatch, change, reason):
+    config.cache_config.cache_dtype = change.get("cache_dtype", "auto")
+    config.cache_config.block_size = change.get("block_size", 816)
+    config.model_config.dtype = change.get("dtype", torch.float16)
+    config.model_config.hf_text_config.head_dim = change.get("head_dim", 256)
+    monkeypatch.setenv(
+        "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", change.get("low_smem", "1")
+    )
+    monkeypatch.setenv(
+        "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", change.get("phase", "1")
+    )
+    row = acc._bm32_paged_prefill_report(
+        config, {"bm32_aligned_pages": change.get("native", True)}
+    )
+    assert not row["enabled"]
+    assert row["reason"] == reason
+
+
 def test_tp2_reason(config):
     config.parallel_config.tensor_parallel_size = 2
     assert acc.build_report(config)["paths"]["profile_hardware"]["reason"] == (
@@ -319,6 +362,40 @@ def test_unqualified_linear_default_reports_reason(config):
     assert row["default_qualification_reason"] == (
         "draft_selector_state_contract_not_quality_qualified"
     )
+
+
+def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
+    config.model_config.architectures = ["Qwen4ExpForCausalLM"]
+    config.speculative_config = NS(method="mtp", num_speculative_tokens=4)
+    config.model_config.hf_text_config = NS(
+        hidden_size=2560,
+        hc_count=4,
+        hc_lowrank=320,
+        num_hidden_layers=48,
+        mtp_num_hidden_layers=1,
+        layer_types=["linear_attention"] * 36 + ["full_attention"] * 12,
+    )
+    report = acc.build_report(config)["flash_next_batch"]
+    memory = report["packed_weight_memory"]
+    assert memory["components"]["gdn_input"] == int(725.625 * 1024**2)
+    assert memory["components"]["hc_target"] == 330 * 1024**2
+    assert memory["components"]["hc_draft"] == int(6.875 * 1024**2)
+    assert memory["components"]["router"] == int(122.5 * 1024**2)
+    assert memory["components"]["shared_expert"] == int(76.5625 * 1024**2)
+    assert len(report["controls"]) == 14
+    for name in report["controls"]:
+        monkeypatch.setenv(name, "0")
+    report = acc.build_report(config)["flash_next_batch"]
+    assert report["packed_weight_memory"]["total_bytes"] == 0
+    assert all(row["reason"] == "user_override" for row in report["controls"].values())
+
+
+def test_flash_next_memory_does_not_guess_other_tp_layout(config):
+    config.model_config.architectures = ["Qwen4ExpForCausalLM"]
+    config.parallel_config.tensor_parallel_size = 2
+    memory = acc.build_report(config)["flash_next_batch"]["packed_weight_memory"]
+    assert memory["total_bytes"] is None
+    assert memory["reason"] == "estimate_requires_qualified_reference_layout"
 
 
 @pytest.mark.parametrize("format_name", ("sm70_awq", "sm70_fp8"))

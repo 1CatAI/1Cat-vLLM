@@ -101,6 +101,42 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             int64_t group_size,
                                             bool interleave_gated_silu);
 
+std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
+                                                    torch::Tensor scales,
+                                                    torch::Tensor mins,
+                                                    int64_t bits,
+                                                    int64_t group_size);
+void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, int64_t k_ld, int64_t q_ld,
+                               int64_t group_size);
+void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor offsets,
+                                       torch::Tensor weight_ptrs,
+                                       torch::Tensor stats_ptrs, int64_t bits,
+                                       int64_t num_experts, int64_t group_size);
+
+void gguf_affine_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
+                                     torch::Tensor stats, int64_t bits,
+                                     int64_t group_size);
+void gguf_affine_blas_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, torch::Tensor scratch,
+                               int64_t group_size);
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size);
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size);
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size);
+
 std::vector<torch::Tensor> awq_sm70_prepare_compact(
     torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros,
     int64_t group_size, bool interleave_gated_silu);
@@ -265,6 +301,18 @@ void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
                               double global_scale, int64_t split_k,
                               int64_t accumulator_chains);
+
+torch::Tensor skinny_qpn_gemm_sm70(torch::Tensor x, torch::Tensor qcodes,
+                                   torch::Tensor qscales, double gscale,
+                                   int64_t n);
+
+void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
+                         torch::Tensor qscales, torch::Tensor gscales,
+                         torch::Tensor perm, torch::Tensor gids,
+                         torch::Tensor goff, int64_t topk,
+                         torch::Tensor y_slots, bool x_slot_major,
+                         int64_t num_tokens, int64_t splitk, int64_t nacc,
+                         int64_t scale_mode);
 
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
@@ -842,3 +890,24 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_allreduce_rms_qk(
     int64_t const q_size, int64_t const kv_size, int64_t const rank,
     int64_t const nranks, double const eps);
 #endif
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size);
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size);
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size);
+
+void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
+                                      torch::Tensor stats, int64_t source_type,
+                                      int64_t group_size);
+void gguf_lattice_blas_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, torch::Tensor scratch,
+                                int64_t group_size);

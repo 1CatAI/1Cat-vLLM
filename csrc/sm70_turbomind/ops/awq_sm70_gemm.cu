@@ -915,6 +915,14 @@ enum class TuneKeyKind : int {
   kNvfp4Dense = 7,
   kMxfp4Moe = 8,
   kNvfp4Moe = 9,
+  kGgufAffineU4 = 10,
+  kGgufAffineU8 = 11,
+  kGgufAffineU2 = 12,
+  kGgufBitPlane3 = 13,
+  kGgufBitPlane5 = 14,
+  kGgufBitPlane6 = 15,
+  kGgufLut4IQ = 16,
+  kGgufLut4E2M1 = 17,
 };
 
 struct DenseTuneKey {
@@ -3174,6 +3182,775 @@ __global__ void compact_awq_stats_kernel(uint8_t* compact,
     compact[idx * 3 + 1] = static_cast<uint8_t>(value >> 8);
     compact[idx * 3 + 2] = static_cast<uint8_t>(value >> 16);
   }
+}
+
+namespace {
+
+bool gguf_uses_bitplanes(int bits) {
+  return bits == 3 || bits == 5 || bits == 6;
+}
+
+auto gguf_affine_quant_type(int bits) {
+  return bits == 3 ? turbomind::gemm::QuantType::kCenteredBitPlane3
+                   : (gguf_uses_bitplanes(bits)
+                          ? turbomind::gemm::QuantType::kBitPlane
+                          : turbomind::gemm::QuantType::kK);
+}
+
+int gguf_low_bits(int bits) {
+  return bits == 3 ? 2 : ((bits == 5 || bits == 6) ? 4 : bits);
+}
+
+bool gguf_affine_group_supported(int bits, int group_size) {
+  if (gguf_uses_bitplanes(bits)) return group_size == (bits == 5 ? 32 : 16);
+  return group_size == 32 || (bits == 2 && group_size == 16);
+}
+
+auto gguf_affine_weight_type(int bits) {
+  const int low_bits = gguf_low_bits(bits);
+  TORCH_CHECK(low_bits == 2 || low_bits == 4 || low_bits == 8,
+              "GGUF affine canonical code width is unsupported");
+  return low_bits == 2
+             ? turbomind::kUint2
+             : (low_bits == 4 ? turbomind::kUint4 : turbomind::kUint8);
+}
+
+auto gguf_affine_converters(int bits) {
+  if (gguf_uses_bitplanes(bits)) {
+    return turbomind::gemm::GetGgufBitPlaneConverters(gguf_low_bits(bits), 70);
+  }
+  return turbomind::gemm::GetConverters(turbomind::kHalf,
+                                        gguf_affine_weight_type(bits),
+                                        turbomind::kHalf, true, 70);
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_affine_layouts(
+    int n, int k, int bits, int group_size) {
+  const auto weight_type = gguf_affine_weight_type(bits);
+  const auto converters = gguf_affine_converters(bits);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF affine TurboMind converters unavailable");
+  turbomind::gemm::MatrixLayout w{weight_type, converters[0]->order, n, k, k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{gguf_uses_bitplanes(bits) && bits != 3
+                                      ? turbomind::kUint64
+                                      : turbomind::kUint32,
+                                  converters[1]->order, n, k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+template <class T>
+__global__ void gguf_bitplane_metadata_kernel(T* metadata, const uint8_t* codes,
+                                              const uint16_t* scales,
+                                              const uint16_t* mins, int n,
+                                              int k, int group, int low_bits,
+                                              int high_bits) {
+  const int64_t index =
+      blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  const int groups = k / group;
+  if (index >= static_cast<int64_t>(n) * groups) return;
+  const int row = index / groups;
+  const int g = index % groups;
+  uint32_t high = 0;
+  for (int i = 0; i < group; ++i) {
+    high |=
+        static_cast<uint32_t>(
+            codes[static_cast<int64_t>(row) * k + g * group + i] >> low_bits)
+        << (i * high_bits);
+  }
+  if constexpr (sizeof(T) == 4) {
+    metadata[static_cast<int64_t>(g) * n + row] =
+        static_cast<uint32_t>(scales[index]) | (high << 16);
+  } else {
+    const uint32_t affine = static_cast<uint32_t>(scales[index]) |
+                            (static_cast<uint32_t>(mins[index]) << 16);
+    metadata[static_cast<int64_t>(g) * n + row] =
+        affine | (static_cast<uint64_t>(high) << 32);
+  }
+}
+
+std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
+                                                    torch::Tensor scales,
+                                                    torch::Tensor mins,
+                                                    int64_t bits,
+                                                    int64_t group_size) {
+  const auto weight_type = gguf_affine_weight_type(bits);
+  TORCH_CHECK(gguf_affine_group_supported(bits, group_size),
+              "GGUF affine canonical group is not supported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device() &&
+                  mins.device() == codes.device(),
+              "GGUF affine coefficients must be on the codes' CUDA device");
+  TORCH_CHECK(
+      codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+          scales.scalar_type() == torch::kFloat16 &&
+          mins.scalar_type() == torch::kFloat16 && scales.dim() == 2 &&
+          mins.sizes() == scales.sizes(),
+      "GGUF affine expects uint8 codes [N,K], FP16 scale/min [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  scales.size(0) == n && scales.size(1) == k / group_size,
+              "GGUF affine requires complete canonical K groups and group-32 N "
+              "packing");
+  TORCH_CHECK(n <= INT_MAX && k <= INT_MAX, "GGUF affine shape exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF affine TurboMind operators require SM70");
+  if (bits < 8) {
+    TORCH_CHECK((codes < (1 << bits)).all().item<bool>(),
+                "GGUF affine code exceeds canonical width");
+  }
+  if (bits == 3) {
+    TORCH_CHECK(
+        (mins == scales.mul(-4)).all().item<bool>(),
+        "GGUF centered Q3 scale/min mismatch requires the reference fallback");
+  }
+  const auto converters = gguf_affine_converters(bits);
+  auto layouts = gguf_affine_layouts(n, k, bits, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = (gguf_uses_bitplanes(bits)
+                            ? codes.bitwise_and((1 << gguf_low_bits(bits)) - 1)
+                            : codes)
+                           .to(torch::kInt16)
+                           .contiguous();
+  auto weight = torch::empty({k, n * gguf_low_bits(bits) / 32},
+                             codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF affine weight layout conversion failed");
+  // Store scale and additive bias directly. Dividing min by scale would add
+  // rounding and make a zero-scale constant block undefined.
+  auto coefficients =
+      torch::stack({scales.transpose(0, 1), mins.transpose(0, 1)}, -1)
+          .contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats =
+      torch::empty({k / group_size, n},
+                   codes.options().dtype(gguf_uses_bitplanes(bits) && bits != 3
+                                             ? torch::kInt64
+                                             : torch::kInt32));
+  torch::Tensor raw_metadata;
+  if (gguf_uses_bitplanes(bits)) {
+    raw_metadata = torch::empty_like(stats);
+    auto contiguous_codes = codes.contiguous();
+    auto contiguous_scales = scales.contiguous();
+    auto contiguous_mins = mins.contiguous();
+    const int64_t count = n * (k / group_size);
+    if (bits == 3) {
+      gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+          reinterpret_cast<uint32_t*>(raw_metadata.data_ptr<int32_t>()),
+          contiguous_codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_scales.data_ptr<at::Half>()),
+          nullptr, n, k, group_size, gguf_low_bits(bits),
+          bits - gguf_low_bits(bits));
+    } else {
+      gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+          reinterpret_cast<uint64_t*>(raw_metadata.data_ptr<int64_t>()),
+          contiguous_codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_scales.data_ptr<at::Half>()),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_mins.data_ptr<at::Half>()),
+          n, k, group_size, gguf_low_bits(bits), bits - gguf_low_bits(bits));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  TORCH_CHECK(converters[1]->Convert(
+                  gguf_uses_bitplanes(bits) ? raw_metadata.data_ptr()
+                                            : coefficients.data_ptr(),
+                  source_s, stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF affine coefficient layout conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, int64_t k_ld, int64_t q_ld,
+                               int64_t group_size) {
+  gguf_affine_weight_type(bits);
+  TORCH_CHECK(gguf_affine_group_supported(bits, group_size),
+              "GGUF affine canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF affine GEMM tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          weight.scalar_type() == torch::kInt32 &&
+          stats.scalar_type() == (gguf_uses_bitplanes(bits) && bits != 3
+                                      ? torch::kInt64
+                                      : torch::kInt32) &&
+          input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
+          stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
+          weight.is_contiguous() && stats.is_contiguous(),
+      "GGUF affine GEMM requires FP16 matrices and prepared int32 storage");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n * gguf_low_bits(bits) / 32 &&
+                  stats.size(0) == k / group_size && stats.size(1) == n,
+              "GGUF affine GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF affine GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_affine_layouts(n, k, bits, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Canonical affine types use distinct keys and the existing measured cache.
+  // Never inherit AWQ's opt-in tuning gate or alias u4 and u8 tuning state.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      bits == 3
+          ? TuneKeyKind::kGgufBitPlane3
+          : (bits == 5
+                 ? TuneKeyKind::kGgufBitPlane5
+                 : (bits == 6
+                        ? TuneKeyKind::kGgufBitPlane6
+                        : (bits == 2
+                               ? TuneKeyKind::kGgufAffineU2
+                               : (bits == 4 ? TuneKeyKind::kGgufAffineU4
+                                            : TuneKeyKind::kGgufAffineU8)))),
+      true, false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_affine_quant_type(bits),
+                       static_cast<int>(group_size)};
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF affine TurboMind GEMM failed");
+}
+
+void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor offsets,
+                                       torch::Tensor weight_ptrs,
+                                       torch::Tensor stats_ptrs, int64_t bits,
+                                       int64_t num_experts,
+                                       int64_t group_size) {
+  gguf_affine_weight_type(bits);
+  TORCH_CHECK(gguf_affine_group_supported(bits, group_size),
+              "GGUF affine canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped affine tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          offsets.scalar_type() == torch::kInt32 &&
+          weight_ptrs.scalar_type() == torch::kUInt8 &&
+          stats_ptrs.scalar_type() == torch::kUInt8 && input.dim() == 2 &&
+          out.dim() == 2 && input.is_contiguous() && out.is_contiguous() &&
+          offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
+          stats_ptrs.is_contiguous(),
+      "GGUF grouped affine requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped affine descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_affine_layouts(n, k, bits, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_affine_quant_type(bits),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF affine TurboMind grouped GEMM failed");
+}
+
+namespace {
+
+auto gguf_lut4_quant_type(int lut_id) {
+  TORCH_CHECK(lut_id == 0 || lut_id == 1, "GGUF LUT4 table is unsupported");
+  return lut_id == 0 ? turbomind::gemm::QuantType::kLut4IQ
+                     : turbomind::gemm::QuantType::kLut4E2M1;
+}
+
+bool gguf_lut4_group_supported(int lut_id, int group_size) {
+  return group_size == 32 || (lut_id == 1 && group_size == 16);
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_lut4_layouts(int n, int k,
+                                                               int group_size) {
+  const auto converters = turbomind::gemm::GetGgufLut4Converters(70);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF LUT4 converters unavailable");
+  turbomind::gemm::MatrixLayout w{turbomind::kUint4, converters[0]->order, n, k,
+                                  k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{turbomind::kUint16, converters[1]->order, n,
+                                  k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is unsupported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device(),
+              "GGUF LUT4 tensors must share a CUDA device");
+  TORCH_CHECK(codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+                  scales.scalar_type() == torch::kFloat16 && scales.dim() == 2,
+              "GGUF LUT4 expects uint8 codes [N,K], FP16 scales [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(
+      n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+          scales.size(0) == n && scales.size(1) == k / group_size &&
+          n <= INT_MAX && k <= INT_MAX,
+      "GGUF LUT4 requires complete canonical groups and group-32 N packing");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF LUT4 requires SM70");
+  TORCH_CHECK((codes < 16).all().item<bool>(),
+              "GGUF LUT4 code exceeds a nibble");
+  const auto converters = turbomind::gemm::GetGgufLut4Converters(70);
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = codes.to(torch::kInt16).contiguous();
+  auto weight = torch::empty({k, n / 8}, codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF LUT4 weight conversion failed");
+  auto coefficients = scales.transpose(0, 1).contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats =
+      torch::empty({k / group_size, n}, codes.options().dtype(torch::kInt16));
+  TORCH_CHECK(converters[1]->Convert(coefficients.data_ptr(), source_s,
+                                     stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF LUT4 scale conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF LUT4 GEMM tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kInt32 &&
+                  stats.scalar_type() == torch::kInt16 && input.dim() == 2 &&
+                  out.dim() == 2 && weight.dim() == 2 && stats.dim() == 2 &&
+                  input.stride(1) == 1 && out.stride(1) == 1 &&
+                  weight.is_contiguous() && stats.is_contiguous(),
+              "GGUF LUT4 GEMM requires FP16 matrices and prepared U4 weights "
+              "and FP16 scale storage");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n / 8 && stats.size(0) == k / group_size &&
+                  stats.size(1) == n,
+              "GGUF LUT4 GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF LUT4 GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Decoder families use distinct keys in the measured cache.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      lut_id == 0 ? TuneKeyKind::kGgufLut4IQ : TuneKeyKind::kGgufLut4E2M1, true,
+      false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lut4_quant_type(lut_id),
+                       static_cast<int>(group_size)};
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind GEMM failed");
+}
+
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped LUT4 tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  offsets.scalar_type() == torch::kInt32 &&
+                  weight_ptrs.scalar_type() == torch::kUInt8 &&
+                  stats_ptrs.scalar_type() == torch::kUInt8 &&
+                  input.dim() == 2 && out.dim() == 2 && input.is_contiguous() &&
+                  out.is_contiguous() && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
+              "GGUF grouped LUT4 requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped LUT4 descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lut4_quant_type(lut_id),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind grouped GEMM failed");
+}
+
+namespace {
+
+int gguf_lattice_type_index(int type) {
+  switch (type) {
+    case 16:
+      return 0;
+    case 17:
+      return 1;
+    case 18:
+      return 2;
+    case 19:
+      return 3;
+    case 21:
+      return 4;
+    case 22:
+      return 5;
+    case 29:
+      return 6;
+  }
+  TORCH_CHECK(false, "GGUF lattice codebook is unsupported");
+}
+auto gguf_lattice_quant_type(int type) {
+  return static_cast<turbomind::gemm::QuantType>(8 +
+                                                 gguf_lattice_type_index(type));
+}
+bool gguf_lattice_group_supported(int type, int group) {
+  return group == ((type == 17 || type == 22 || type == 29) ? 16 : 32);
+}
+auto gguf_lattice_stat_type(int type) {
+  return type == 18 || type == 21   ? turbomind::kUint64
+         : type == 19 || type == 29 ? turbomind::kUint16
+                                    : turbomind::kUint32;
+}
+auto gguf_lattice_torch_stat_type(int type) {
+  return type == 18 || type == 21   ? torch::kInt64
+         : type == 19 || type == 29 ? torch::kInt16
+                                    : torch::kInt32;
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_lattice_layouts(
+    int n, int k, int source_type, int group_size) {
+  const auto converters =
+      turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF lattice converters unavailable");
+  turbomind::gemm::MatrixLayout w{turbomind::kUint2, converters[0]->order, n, k,
+                                  k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{gguf_lattice_stat_type(source_type),
+                                  converters[1]->order, n, k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is unsupported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device(),
+              "GGUF lattice tensors must share a CUDA device");
+  TORCH_CHECK(
+      codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+          scales.scalar_type() == gguf_lattice_torch_stat_type(source_type) &&
+          scales.dim() == 2,
+      "GGUF lattice expects uint8 codes [N,K], packed metadata [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(
+      n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+          scales.size(0) == n && scales.size(1) == k / group_size &&
+          n <= INT_MAX && k <= INT_MAX,
+      "GGUF lattice requires complete canonical groups and group-32 N packing");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF lattice requires SM70");
+  TORCH_CHECK((codes < 4).all().item<bool>(),
+              "GGUF lattice code exceeds a two-bit carrier");
+  const auto converters =
+      turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = codes.to(torch::kInt16).contiguous();
+  auto weight = torch::empty({k, n / 16}, codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF lattice weight conversion failed");
+  auto coefficients = scales.transpose(0, 1).contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats = torch::empty(
+      {k / group_size, n},
+      codes.options().dtype(gguf_lattice_torch_stat_type(source_type)));
+  TORCH_CHECK(converters[1]->Convert(coefficients.data_ptr(), source_s,
+                                     stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF lattice scale conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF lattice GEMM tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          weight.scalar_type() == torch::kInt32 &&
+          stats.scalar_type() == gguf_lattice_torch_stat_type(source_type) &&
+          input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
+          stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
+          weight.is_contiguous() && stats.is_contiguous(),
+      "GGUF lattice GEMM requires FP16 matrices and prepared U2 carriers "
+      "and packed metadata");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n / 16 && stats.size(0) == k / group_size &&
+                  stats.size(1) == n,
+              "GGUF lattice GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF lattice GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // Decoder families use distinct keys in the measured cache.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(source_type)), true,
+      false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lattice_quant_type(source_type),
+                       static_cast<int>(group_size)};
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF lattice TurboMind GEMM failed");
+}
+
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size) {
+  gguf_lattice_quant_type(source_type);
+  TORCH_CHECK(gguf_lattice_group_supported(source_type, group_size),
+              "GGUF lattice canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped lattice tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          offsets.scalar_type() == torch::kInt32 &&
+          weight_ptrs.scalar_type() == torch::kUInt8 &&
+          stats_ptrs.scalar_type() == torch::kUInt8 && input.dim() == 2 &&
+          out.dim() == 2 && input.is_contiguous() && out.is_contiguous() &&
+          offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
+          stats_ptrs.is_contiguous(),
+      "GGUF grouped lattice requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped lattice descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  // Measure these grouped descriptors before capture and reuse the shared
+  // dispatch cache. Capture without an existing entry retains the heuristic.
+  operation.dispatch = select_moe_dispatch_policy_impl(
+      device, m, n, k, num_experts, group_size, stream,
+      static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(source_type)),
+      m >= 512, 8192);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lattice_quant_type(source_type),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF lattice TurboMind grouped GEMM failed");
 }
 
 std::vector<torch::Tensor> awq_sm70_prepare_impl(
@@ -6162,6 +6939,85 @@ turbomind::gemm::DispatchPolicy select_awq_moe_dispatch_policy(
 
 }  // namespace awq_sm70
 }  // namespace vllm
+
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size) {
+  return vllm::awq_sm70::gguf_lut4_sm70_prepare(codes, scales, lut_id,
+                                                group_size);
+}
+
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size) {
+  vllm::awq_sm70::gguf_lut4_gemm_sm70_out(out, input, weight, stats, lut_id,
+                                          k_ld, q_ld, group_size);
+}
+
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size) {
+  vllm::awq_sm70::gguf_lut4_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, lut_id, num_experts,
+      group_size);
+}
+
+std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
+                                                     torch::Tensor scales,
+                                                     int64_t source_type,
+                                                     int64_t group_size) {
+  return vllm::awq_sm70::gguf_lattice_sm70_prepare(codes, scales, source_type,
+                                                   group_size);
+}
+
+void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                torch::Tensor weight, torch::Tensor stats,
+                                int64_t source_type, int64_t k_ld, int64_t q_ld,
+                                int64_t group_size) {
+  vllm::awq_sm70::gguf_lattice_gemm_sm70_out(
+      out, input, weight, stats, source_type, k_ld, q_ld, group_size);
+}
+
+void gguf_lattice_grouped_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
+    int64_t num_experts, int64_t group_size) {
+  vllm::awq_sm70::gguf_lattice_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, source_type, num_experts,
+      group_size);
+}
+
+std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
+                                                    torch::Tensor scales,
+                                                    torch::Tensor mins,
+                                                    int64_t bits,
+                                                    int64_t group_size) {
+  return vllm::awq_sm70::gguf_affine_sm70_prepare(codes, scales, mins, bits,
+                                                  group_size);
+}
+
+void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor stats,
+                               int64_t bits, int64_t k_ld, int64_t q_ld,
+                               int64_t group_size) {
+  vllm::awq_sm70::gguf_affine_gemm_sm70_out(out, input, weight, stats, bits,
+                                            k_ld, q_ld, group_size);
+}
+
+void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor offsets,
+                                       torch::Tensor weight_ptrs,
+                                       torch::Tensor stats_ptrs, int64_t bits,
+                                       int64_t num_experts,
+                                       int64_t group_size) {
+  vllm::awq_sm70::gguf_affine_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, bits, num_experts,
+      group_size);
+}
 
 std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             torch::Tensor _scaling_factors,

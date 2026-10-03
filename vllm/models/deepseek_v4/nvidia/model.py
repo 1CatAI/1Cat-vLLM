@@ -1292,6 +1292,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 .sum(dim=1)
             )
 
+    def finalize_sm70_fused_aux_weights(self) -> None:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.attn.mla_attn.prepare_sm70_fused_fp16_aux_weight()
+
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     if expert_dtype == "fp4":
@@ -1406,6 +1411,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        self.model.finalize_sm70_fused_aux_weights()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

@@ -98,6 +98,7 @@ except ModuleNotFoundError as exc:
         del module, dtype
 
 
+from ..common.ple import is_ple_checkpoint_shard
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
@@ -195,7 +196,12 @@ def _validate_qsa_e4m3_scale_load(
 
 
 def _finalize_qsa_e4m3_scale_load(
-    model: nn.Module, loaded: set[str], cache_dtype: str
+    model: nn.Module,
+    loaded: set[str],
+    cache_dtype: str,
+    *,
+    require_calibrated_speculative_draft: bool = False,
+    require_calibrated_target: bool = False,
 ) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return
@@ -212,6 +218,23 @@ def _finalize_qsa_e4m3_scale_load(
     required_scales = {
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
+    missing_scales = required_scales - loaded
+    if require_calibrated_target and missing_scales:
+        raise ValueError(
+            "Automatically selected QSA E4M3 requires complete calibrated "
+            "K/V scales; refusing to start. Missing: "
+            + ", ".join(sorted(missing_scales))
+        )
+    if require_calibrated_speculative_draft and missing_scales:
+        raise ValueError(
+            "QSA E4M3 speculative draft scale overlay is incomplete; refusing "
+            "to use unit scales after qualification showed invalid proposals. "
+            "Provide calibrated draft K/V scales or keep the draft cache in "
+            "FP16. Loaded "
+            f"{len(required_scales) - len(missing_scales)}/"
+            f"{len(required_scales)} draft K/V scales. Missing: "
+            + ", ".join(sorted(missing_scales))
+        )
     missing_scales = _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
     if not missing_scales:
         logger.info_once(
@@ -292,6 +315,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         layer_type: str,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        dcp_local_indices_buffer: torch.Tensor | None = None,
+        dcp_partial_output_buffer: torch.Tensor | None = None,
+        dcp_partial_lse_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -347,6 +373,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
                     topk_indices_buffer=topk_indices_buffer,
+                    dcp_local_indices_buffer=dcp_local_indices_buffer,
+                    dcp_partial_output_buffer=dcp_partial_output_buffer,
+                    dcp_partial_lse_buffer=dcp_partial_lse_buffer,
                 )
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
@@ -543,6 +572,9 @@ class Qwen4ExpModel(nn.Module):
             and getattr(config, "indexer_n_heads", None) is not None
         )
         topk_indices_buffer: torch.Tensor | None = None
+        dcp_local_indices_buffer: torch.Tensor | None = None
+        dcp_partial_output_buffer: torch.Tensor | None = None
+        dcp_partial_lse_buffer: torch.Tensor | None = None
         if self._qsa_layer_ids:
             topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
@@ -553,6 +585,28 @@ class Qwen4ExpModel(nn.Module):
             # before the next layer overwrites them, so one model-level
             # workspace is sufficient for every QSA layer.
             self.topk_indices_buffer = topk_indices_buffer
+            if vllm_config.parallel_config.decode_context_parallel_size == 2:
+                max_tokens, width = topk_indices_buffer.shape
+                dcp_local_indices_buffer = torch.empty(
+                    max_tokens, width, dtype=torch.int32
+                )
+                gathered_heads = (
+                    int(config.num_attention_heads)
+                    // vllm_config.parallel_config.tensor_parallel_size
+                    * 2
+                )
+                dcp_partial_output_buffer = torch.empty(
+                    max_tokens,
+                    gathered_heads,
+                    int(config.head_dim),
+                    dtype=torch.float32,
+                )
+                dcp_partial_lse_buffer = torch.empty(
+                    max_tokens, gathered_heads, dtype=torch.float32
+                )
+                self.dcp_local_indices_buffer = dcp_local_indices_buffer
+                self.dcp_partial_output_buffer = dcp_partial_output_buffer
+                self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
@@ -562,6 +616,9 @@ class Qwen4ExpModel(nn.Module):
                 layer_type=config.layer_types[layer_idx],
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                dcp_local_indices_buffer=dcp_local_indices_buffer,
+                dcp_partial_output_buffer=dcp_partial_output_buffer,
+                dcp_partial_lse_buffer=dcp_partial_lse_buffer,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -1016,6 +1073,12 @@ class Qwen4ExpForCausalLM(
         }
 
     @classmethod
+    def get_kv_block_size_multiple(cls, vllm_config: VllmConfig) -> int:
+        """Each DCP rank holds ``block_size // dcp`` slots of the sharded main
+        K/V, so the block size must keep that share kernel-block aligned."""
+        return vllm_config.parallel_config.decode_context_parallel_size
+
+    @classmethod
     def get_mamba_specs_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
@@ -1055,6 +1118,12 @@ class Qwen4ExpForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    def map_checkpoint_weight(self, name: str) -> bool:
+        # Under direct I/O the PLE table (47 GiB for Flash-Next) would be read
+        # whole into anonymous memory, though each rank uses only its rows and
+        # the disk tier serves the rest from the mapped checkpoint.
+        return is_ple_checkpoint_shard(name)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1063,7 +1132,14 @@ class Qwen4ExpForCausalLM(
         )
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         if self._qsa_scale_gate_at_this_level:
-            _finalize_qsa_e4m3_scale_load(self, loaded, self.model._kv_cache_dtype)
+            _finalize_qsa_e4m3_scale_load(
+                self,
+                loaded,
+                self.model._kv_cache_dtype,
+                require_calibrated_target=(
+                    self.vllm_config.kernel_config.qsa_auto_e4m3_active
+                ),
+            )
         return loaded
 
 
@@ -1259,6 +1335,12 @@ class Qwen4ExpForConditionalGeneration(
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
 
+    def map_checkpoint_weight(self, name: str) -> bool:
+        # Under direct I/O the PLE table (47 GiB for Flash-Next) would be read
+        # whole into anonymous memory, though each rank uses only its rows and
+        # the disk tier serves the rest from the mapped checkpoint.
+        return is_ple_checkpoint_shard(name)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1268,7 +1350,12 @@ class Qwen4ExpForConditionalGeneration(
         )
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         _finalize_qsa_e4m3_scale_load(
-            self, loaded, self.language_model.model._kv_cache_dtype
+            self,
+            loaded,
+            self.language_model.model._kv_cache_dtype,
+            require_calibrated_target=(
+                self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
+            ),
         )
         return loaded
 
@@ -1304,6 +1391,10 @@ class Qwen4ExpForConditionalGeneration(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
         return Qwen4ExpForCausalLM.get_mamba_specs_from_config(vllm_config)
+
+    @classmethod
+    def get_kv_block_size_multiple(cls, vllm_config: VllmConfig) -> int:
+        return Qwen4ExpForCausalLM.get_kv_block_size_multiple(vllm_config)
 
 
 __all__ = [

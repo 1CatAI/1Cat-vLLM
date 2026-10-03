@@ -197,11 +197,13 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
-    use_local_argmax_reduction: bool = False
+    use_local_argmax_reduction: bool | None = None
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
-    non-tree speculation."""
+    non-tree speculation. ``None`` automatically enables the SM70
+    FP16 Qwen4Exp TP4 MTP route with greedy drafts. Explicit booleans override
+    automatic selection; other routes retain full-logits selection."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -382,7 +384,9 @@ class SpeculativeConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        factors: list[Any] = []
+        factors: list[Any] = [
+            ("use_local_argmax_reduction", self.use_local_argmax_reduction)
+        ]
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
@@ -1086,7 +1090,28 @@ class SpeculativeConfig:
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
             )
+        self._resolve_local_argmax_reduction()
         return self
+
+    def _resolve_local_argmax_reduction(self) -> None:
+        if self.use_local_argmax_reduction is not None:
+            return
+        import torch
+
+        from vllm.platforms import current_platform
+
+        draft_config = self.draft_model_config
+        self.use_local_argmax_reduction = bool(
+            self.method == "mtp"
+            and self.draft_sample_method == "greedy"
+            and not self.parallel_drafting
+            and draft_config is not None
+            and draft_config.hf_config.architectures == ["Qwen4ExpMTP"]
+            and draft_config.dtype == torch.float16
+            and self.draft_parallel_config.tensor_parallel_size == 4
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
 
     def _verify_dspark_final_stage_ownership(self) -> None:
         """Validate the layer contract for a final-stage-local drafter."""

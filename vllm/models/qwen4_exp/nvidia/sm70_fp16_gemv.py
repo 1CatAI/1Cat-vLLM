@@ -11,6 +11,7 @@ linear path.
 
 from __future__ import annotations
 
+import os
 from types import MethodType
 from typing import NamedTuple
 
@@ -407,6 +408,15 @@ def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bo
     return bool(
         envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
         and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        # With reduced-precision reductions allowed, cuBLAS uses FP16 partials
+        # for the small output projections. Retain that baseline schedule;
+        # the native FP32 kernel differs at M2/M4/M5 in the operator oracle.
+        and not (
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+            and tuple(weight.shape) == (2560, 1536)
+            and x.shape[0] < 8
+        )
         and _is_packed_row_major(x)
         and _is_packed_row_major(weight)
         and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))
@@ -634,9 +644,13 @@ def _batch_runtime_contract(vllm_config=None) -> bool:
     if not _exact_runtime_contract(vllm_config) or envs.VLLM_BATCH_INVARIANT:
         return False
     config = vllm_config or get_current_vllm_config()
-    return bool(
-        config.speculative_config is None
-        and not getattr(config.parallel_config, "use_ubatching", False)
+    from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
+
+    # Verifier and draft projections obey the same local shape/layout checks.
+    # Speculation is not an operator capability. HC retains its separate
+    # split-K numerical policy, selected in its loader.
+    return sm70_flash_next_batch_qualified(config) and not getattr(
+        config.parallel_config, "use_ubatching", False
     )
 
 
@@ -746,10 +760,15 @@ def enable_qwen38_sm70_fp16_gemv(
             ):
                 continue
             child.sm70_qwen38_fp16_fused_input = True
-            if envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or (
-                envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
-                and _batch_runtime_contract(vllm_config)
-            ):
+            # Automatic promotion covers ordinary decode and MTP. Retain an
+            # explicit legacy opt-in for other proposers; they need paired
+            # quality before this default can be widened.
+            batch_qualified = _batch_runtime_contract(vllm_config)
+            explicit_gdn_batch = "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" in os.environ
+            if (
+                envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
+                and (batch_qualified or explicit_gdn_batch)
+            ) or (envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and batch_qualified):
                 assert qkvz is not None and ba is not None
                 qkvz._sm70_qwen38_prepare_gdn_batch = True
                 ba._sm70_qwen38_prepare_gdn_batch = True

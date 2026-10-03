@@ -497,7 +497,7 @@ class EngineArgs:
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
-    dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
+    dcp_comm_backend: DCPCommBackend | None = ParallelConfig.dcp_comm_backend
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
     data_parallel_size: int = ParallelConfig.data_parallel_size
@@ -2493,6 +2493,15 @@ class EngineArgs:
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
+        )
+
+        # Checked here, once before any worker starts, and not in
+        # VllmConfig.__post_init__: model construction rebuilds the config in
+        # every worker while the first stage may already pin its tables.
+        from vllm.models.qwen4_exp.common.ple import check_ple_host_share
+
+        check_ple_host_share(
+            model_config.hf_text_config, parallel_config.tensor_parallel_size
         )
 
         return config
