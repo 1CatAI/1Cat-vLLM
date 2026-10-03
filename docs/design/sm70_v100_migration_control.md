@@ -1,9 +1,12 @@
 # SM70/V100 Migration Control
 
-2026-10-03: The [mixed NVFP4 DFlash2 latency campaign](sm70_unsloth_dflash2_12ms.md)
-records the new complete-round <12 ms acceptance contract and the initial
-fully connected V100 peer-store measurements. The model baseline is pending
-checkpoint transfer; no runtime optimization or speedup is accepted yet.
+2026-10-04: The [mixed NVFP4 DFlash2 latency campaign](sm70_unsloth_dflash2_12ms.md)
+freezes a source-complete same-host baseline: 18.425 ms at 1K and 20.198 ms
+at 8K, with original FP8 head and 256K maximum length. All 140 reductions
+already use push; do not count a NCCL-to-push gain again. The short captures
+contain seven/four dense-reference rounds out of fifteen at 1K/8K. Draft
+projection and noncausal sliding attention remain major costs. Window-relative
+split-KV is the first experimental candidate; no runtime speedup is accepted yet.
 
 Date: 2026-05-30
 

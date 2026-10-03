@@ -61,11 +61,12 @@ shape [248320, 5120], with channel BF16 scales. The existing DFlash2 draft
 is retained. The obsolete checkpoint with a replaced BF16 head was removed
 with explicit authorization.
 
-A fresh SM70 wheel build is running from integration source
+A fresh SM70 wheel was built from integration source
 `f90026bf77a382559370d54a3661a21fae634b4c`, using a dedicated Python 3.12
-environment and compiler caches. The matching model baseline and Torch
-profile have not run. No numerical or runtime routing change has been made,
-and no model performance result is claimed.
+environment and compiler caches. The complete artifact and dependency checks
+pass. Its SHA256 is
+`6d15681e321b21ca6fe4274103bc4cd7c275c96a384c4066d06ad67773d932f3`.
+The baseline uses this installed wheel without private libraries or overlays.
 
 `benchmarks/analyze_sm70_dflash2_round_trace.py` uses CUDA Graph correlation
 IDs to avoid assigning asynchronously executed kernels by CPU timestamps.
@@ -85,7 +86,7 @@ The measurement host has one Xeon E5-2680 v4 socket (14 cores/28 threads),
 one NUMA node, 64 GB nominal system RAM, and four V100-SXM2-32GB GPUs. Software
 is Ubuntu 24.04.2, NVIDIA driver 580.173.02, CUDA toolkit 12.8.93, Python
 3.12.14, Torch 2.10.0+cu128, NCCL 2.27.5, Triton 3.6.0, and Transformers
-5.17.0. Each GPU has six active NVLink links, reported at 25.781 GB/s each;
+5.18.0. Each GPU has six active NVLink links, reported at 25.781 GB/s each;
 each peer pair has two links. ECC is enabled.
 
 The original 185 W GPU power caps were explicitly raised to the 300 W hardware
@@ -114,11 +115,64 @@ reduction, and kernel execution are additional costs. The measured push
 chain establishes a practical sub-10-us candidate on this topology; it does
 not establish the absolute communication lower bound.
 
-1. Finish and inspect the source-complete wheel, install it into the owned
-   runtime, and pin the complete runtime contract.
-2. Establish the unprofiled baseline and a Torch profile with at least ten
-   complete rounds on this host.
-3. Measure the production push collective and fused norm at the actual
-   verifier shapes; prioritize according to the new profile.
-4. Validate each retained change against the numerical and acceptance gates,
-   then validate the complete installed artifact before promotion.
+## Frozen model baseline, 2026-10-04
+
+The installed profile uses TP4, FP16 transport, E4M3 target KV, automatic
+draft KV, Flash-V100 attention, seven probabilistic draft tokens, maximum
+length 262144, maximum four sequences, and full/piecewise CUDA Graphs.
+Sampling is temperature 0.7, top-p 0.9, checkpoint top-k 20, thinking off,
+and 600 output tokens. The retained speed methodology uses `ignore_eos`;
+natural stopping and text quality need separate checks before promotion.
+All four compute GPUs have a verified 300 W limit. The display GPU is excluded.
+
+The 1024-token fixture is unchanged. The 8192-token fixture takes the prefix
+and question suffix of the retained 32768-token input and is checked against
+the checkpoint chat template: all four rendered prompts have exactly 8192
+tokens. The combined fixture SHA256 is
+`d12fad131e8b1807d704c4f974c4749d969367fa667669a500975d9c1c86624f`.
+
+| Unprofiled request | Mean streamed round interval | Emitted tokens per round | TTFT |
+| --- | ---: | ---: | ---: |
+| 1K, run 1 | 18.486 ms | 2.823 | 354.8 ms |
+| 1K, run 2 | 18.382 ms | 3.962 | 354.8 ms |
+| 1K, run 3 | 18.407 ms | 2.765 | 354.1 ms |
+| 8K, run 1 | 20.198 ms | 3.297 | 2039.3 ms |
+
+The first twenty stream events are excluded. The 1K mean across three
+requests is 18.425 ms. These are client-observed complete-round intervals,
+not synchronized worker-only graph times. Acceptance varies between requests;
+changes need matching seeded comparisons in addition to this speed contract.
+Greedy 1K requests measure 16.981–16.989 ms per round.
+
+Each context has four rank traces with sixteen target graphs and fifteen
+complete rounds. All rank ledgers match 64 target and five draft layers.
+All fifteen rounds include eight compact/seven dense-reference rounds at
+1K and eleven compact/four dense-reference rounds at 8K. Excluding the two
+edge rounds gives six compact/seven dense and nine compact/four dense,
+respectively. These fractions describe the short capture, not all requests.
+
+The logs and kernel ledgers show that all 140 allreduces already use the
+SM70 push kernel. Rank-zero collective service is about 1.2 ms per round;
+the NCCL microbenchmark improvement must not be counted again as a potential
+model gain. Residual/norm remains separate. Target kernel service is about
+13.4–13.8 ms, and the five draft layer service sums are about 2.59 ms at 1K
+and 2.92 ms at 8K. Profiling overhead makes these diagnostic service sums
+different from the unprofiled complete-round interval.
+
+Draft sliding attention launches eight CTAs and takes about 105 us per layer
+at 1K and 171 us at 8K. Draft projection and split-K reduction service is
+about 334 us per layer. GDN delta-rule service remains about 20 us per layer.
+The retained JSON ledgers include every layer's kernel names, duration,
+preceding gap, grid, block, and backend on every rank.
+
+The C4 baseline measures 412.40 tok/s at 1K and 387.45 tok/s at 8K in the
+common steady decode window. This excludes prefill, each request's first
+twenty events, and partial edge intervals, and stops when the first request
+finishes.
+
+The first candidate splits the D128 noncausal draft window using the existing
+FP32 partial-state machinery. Partitions start at the live window origin so
+the captured grid does not grow with historical context. This candidate is
+under construction and is not an accepted speedup. Preserve the baseline
+artifact and compare exact inputs, graph replay with changing lengths,
+model logits, emitted-token behavior, and C4 performance before promotion.
