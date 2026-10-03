@@ -303,7 +303,6 @@ def test_sm70_dflash2_verifier_defaults_preserve_overrides(
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     names = (
         "VLLM_SM70_DFLASH2_QPN8_RERANK",
-        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
         "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
         "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
         "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW",
@@ -1719,21 +1718,11 @@ def test_qpn8_rerank_restores_dense_vocab_tie_order():
     assert torch.equal(actual_ids, expected_ids + vocab_start)
 
 
-def test_qpn8_candidate_order_requires_explicit_experimental_opt_in(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", False)
-    monkeypatch.setattr(
-        envs,
-        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
-        False,
-    )
+def test_qpn8_candidate_order_is_retired(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "0")
+    # Stale benchmark launch files cannot re-enable the failed experiment.
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "1")
     assert _sm70_dflash2_use_dense_order()
-
-    monkeypatch.setattr(
-        envs,
-        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
-        True,
-    )
-    assert not _sm70_dflash2_use_dense_order()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

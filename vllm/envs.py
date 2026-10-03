@@ -391,7 +391,6 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FP32_LOGITS: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
     VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
-    VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
     VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
@@ -5465,69 +5464,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("DFlash2 verifier",),
         user_visible=False,
     ),
-    # Preserve the production full-vocabulary torch.topk tie contract by
-    # default.  The candidate-order experiment avoids a host-blocking SM70
-    # multi-block top-k, but may be enabled only for paired quality tests.
+    # Compatibility-only: the scored dense vocabulary tie order is mandatory.
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))),
         description=(
-            "Compatibility alias for "
-            "speculative_config.sm70_dflash2.qpn8_dense_order. Unset "
-            "selects the model-qualified per-engine policy; operator guards "
-            "still decide dispatch. Prefer configuration when overriding; "
-            "this alias expires after one full released compatibility "
-            "cycle."
+            "Deprecated compatibility name for dense vocabulary tie ordering. "
+            "Ordering is always enabled after retiring the failed candidate-order "
+            "experiment; setting 0 no longer changes the selector. No replacement "
+            "switch is needed. The name remains for one full released cycle."
         ),
         category="deprecated",
         declared_default="True",
         effective_default=(
-            "True at the standalone compatibility getter. Determined once "
-            "by speculative_config.sm70_dflash2.qpn8_dense_order; the "
-            "standalone compatibility getter retains its declared default."
+            "True at the compatibility getter; production always uses dense "
+            "tie ordering, including when this obsolete alias is set to 0."
         ),
-        automatic_conditions=(
-            (
-                "The retained complete-model qualification is defined in "
-                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
-                "per-operator shape/dtype/native checks remain local."
-            ),
-        ),
+        automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier: qpn8_dense_order",),
         user_visible=False,
     ),
     # Candidate-order tie handling is a benchmark-only experiment. Requiring
     # a second opt-in prevents stale deployment scripts from silently trading
     # scored quality for a small selector win.
-    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": env_var(
-        lambda: bool(
-            int(os.getenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "0"))
-        ),
-        description=(
-            "Compatibility alias for "
-            "speculative_config.sm70_dflash2.qpn8_allow_candidate_order. "
-            "Unset selects the model-qualified per-engine policy; operator "
-            "guards still decide dispatch. Prefer configuration when "
-            "overriding; this alias expires after one full released "
-            "compatibility cycle."
-        ),
-        category="deprecated",
-        declared_default="False",
-        effective_default=(
-            "False at the standalone compatibility getter. Determined once "
-            "by speculative_config.sm70_dflash2.qpn8_allow_candidate_order; "
-            "the standalone compatibility getter retains its declared "
-            "default."
-        ),
-        automatic_conditions=(
-            (
-                "The retained complete-model qualification is defined in "
-                "vllm/model_executor/models/config.py:sm70_dflash2_verifier_qualified; "
-                "per-operator shape/dtype/native checks remain local."
-            ),
-        ),
-        acceleration_paths=("DFlash2 verifier: qpn8_allow_candidate_order",),
-        user_visible=False,
-    ),
     # Umbrella gate for selector-based DFlash verification optimizations. Keep
     # this default-off while each stage is checked against the unchanged path.
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": env_var(

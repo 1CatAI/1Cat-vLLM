@@ -22,8 +22,6 @@ SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
     "VLLM_SM70_FP8_QPN8": "1",
     "VLLM_SM70_DFLASH2_QPN8_RERANK": "1",
-    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "1",
-    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "0",
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
@@ -45,8 +43,6 @@ SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "fp32_logits",
     "VLLM_SM70_FP8_QPN8": "target_fp8_qpn8",
     "VLLM_SM70_DFLASH2_QPN8_RERANK": "qpn8_rerank",
-    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "qpn8_dense_order",
-    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "qpn8_allow_candidate_order",
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "verify_fastpath",
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "fused_gdn_metadata",
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "fused_gdn_norm",
@@ -92,12 +88,6 @@ class Sm70DFlash2Config:
     qpn8_rerank: bool | None = None
     """Policy for qpn8 rerank; None retains automatic qualification."""
 
-    qpn8_dense_order: bool | None = None
-    """Policy for qpn8 dense order; None retains automatic qualification."""
-
-    qpn8_allow_candidate_order: bool | None = None
-    """Policy for qpn8 allow candidate order; None retains automatic qualification."""
-
     verify_fastpath: bool | None = None
     """Policy for verify fastpath; None retains automatic qualification."""
 
@@ -138,6 +128,13 @@ class Sm70DFlash2Config:
     """Explicit configuration or legacy settings, used by mixed-format defaults."""
 
     def resolve(self, *, qualified: bool) -> None:
+        if "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER" in os.environ:
+            logger.warning_once(
+                "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER is deprecated and ignored: "
+                "dense tie ordering is mandatory after retiring the failed "
+                "candidate-order experiment. No replacement switch is needed. "
+                "The alias remains for one full released compatibility cycle."
+            )
         if self.resolved:
             return
         explicit = []
