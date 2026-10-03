@@ -92,3 +92,16 @@ happens before graph capture. Missing operators, uncalibrated dimensions and
 allocation failures each appear as capability reasons; failure retains fused
 MMA. No runtime environment variables or lower accumulation precision are
 introduced. Grouped MoE continues to use the native grouped operator.
+
+## Installed artifact validation
+
+The normal wheel from revision `1c6a5f8d68` passes 23 CPU and nine GPU
+checks in a fresh environment without preload or private libraries. The
+installed Q3_K TP4 projection measures M=512 at 362.82 us including DQ,
+versus AWQ 467.94 us, and M=8192 at 4104.45 us versus AWQ 5258.14 us.
+After integrating main revision `d582b816e6`, the normal core and wheel
+were rebuilt and the nine installed GPU checks pass again. Core RPATH
+is empty; dependencies are standard CUDA, Torch and system libraries.
+
+- Wheel SHA256: `0b22a8be69e69fff96921a3390cd7c969a454783f7fce3c499910ebd766fab2f`
+- Core SHA256: `207fc91f918992324a4f4030d8fc7067cec4bba11a0e3d3fcce20319ae3f8203`
