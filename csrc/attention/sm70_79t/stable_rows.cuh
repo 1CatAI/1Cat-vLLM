@@ -13,20 +13,12 @@ __device__ int* g_79t_score_recovery = nullptr;
 // Reuse centered/scaled V and restore only after FP32 normalization.
 constexpr float kStableCompactScoreLimit = 128.0f;
 constexpr int kStableRecoveryRows = 64 * 6;
-// The complete tail maximum and prefix repair make a safety margin redundant.
-// An extra positive shift pushes useful probabilities into FP16 subnormals.
-constexpr float kStableScoreMargin = 0.0f;
+// Keep the established normal-range shift and V scaling. Recovery corrects
+// unsafe tiles without changing these rounding choices for unaffected tiles.
+constexpr float kStableScoreMargin = 4.0f;
 constexpr float kStableValueCenterThreshold = 0.05f;
 constexpr float kStableMaxExpInput = 10.0f;
-#if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
-// Prefix partials cannot overflow FP32 at the supported block widths. The
-// complete tail maximum bounds each tail weight by exp(-margin), so even
-// 8192 unit-magnitude values fit FP16. Extra headroom would only discard small
-// residuals and amplify tail-numerator rounding during restoration.
-constexpr float kStableValueHeadroom = 1.0f;
-#else
 constexpr float kStableValueHeadroom = 64.0f;
-#endif
 
 #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
 using StablePrefixPartial = float;

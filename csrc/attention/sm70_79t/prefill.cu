@@ -5947,16 +5947,12 @@ struct Sm70GqaHalf2Runtime {
                   "create SM70 half2 prefix cuBLAS handle failed");
       TORCH_CHECK(cublasCreate(&tail_cublas) == CUBLAS_STATUS_SUCCESS,
                   "create SM70 half2 tail cuBLAS handle failed");
-      // FP16 output storage must not permit FP16 intermediate reductions.
-      constexpr auto math_mode = static_cast<cublasMath_t>(
-          CUBLAS_TENSOR_OP_MATH |
-          CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION);
-      TORCH_CHECK(
-          cublasSetMathMode(prefix_cublas, math_mode) == CUBLAS_STATUS_SUCCESS,
-          "enable SM70 half2 prefix tensor-op math failed");
-      TORCH_CHECK(
-          cublasSetMathMode(tail_cublas, math_mode) == CUBLAS_STATUS_SUCCESS,
-          "enable SM70 half2 tail tensor-op math failed");
+      TORCH_CHECK(cublasSetMathMode(prefix_cublas, CUBLAS_TENSOR_OP_MATH) ==
+                      CUBLAS_STATUS_SUCCESS,
+                  "enable SM70 half2 prefix tensor-op math failed");
+      TORCH_CHECK(cublasSetMathMode(tail_cublas, CUBLAS_TENSOR_OP_MATH) ==
+                      CUBLAS_STATUS_SUCCESS,
+                  "enable SM70 half2 tail tensor-op math failed");
     } catch (...) {
       release();
       throw;

@@ -10,6 +10,7 @@ storage guard marks 64-query tiles whose logits exceed the compact range and
 recomputes them from original Q/K with FP32 scores. Recovery retains the
 centered/scaled V representation and restores outputs after FP32 normalization.
 This changes results in exceptional ranges rather than saturating outputs.
+The established score margin, V headroom and cuBLAS math mode are retained.
 
 Flags are cleared on every call and CUDA Graph replay. Completed prefix
 workspace is reused for recovery. No model, tensor-parallel or concurrency
