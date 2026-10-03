@@ -18,12 +18,20 @@ selected experts. QSA affine weights and PLE norms were verified against the
 cached generated decode source. GDN bias is FP16 and A_log FP32, confirmed by
 the instantiated trace template.
 
+The four previously unresolved `triton_poi_fused_0` families are now attributed
+using their cached decode source and Triton IR. Grids 16/32 gather one
+2560-element FP16 embedding row and zero a 1536-element activation buffer.
+The embedding load precedes the rank mask, so every rank reads either the
+selected row or row zero. Grids 46/92 combine three 10240-element residual
+inputs and zero 1536 activation elements; they read no learned weights.
+These byte counts describe addressed parameters, including a cached row-zero
+load, rather than asserting that every byte reaches DRAM on every token.
+
 The attributed graph weights total 2.407 GB/card/token. Adding the FP16
 317.850-MB local LM-head matrix gives 2.725 GB/card/token and a 3.633-ms
-weight-only floor at 750 GB/s. Rank-masked embedding aliases remain pending
-input-to-node attribution. The
-complete actual-DRAM table and effective bandwidth require counters in the
-model; this weight audit does not substitute estimates for those counters.
+weight-only floor at 750 GB/s. The complete actual-DRAM table and effective
+bandwidth require counters in the model; this weight audit does not substitute
+estimates for those counters.
 The [acceptance document](sm70_qwen38_distribution_acceptance.md) records
 component priorities, isolated counters and current endpoint qualification.
 
@@ -85,14 +93,14 @@ component priorities, isolated counters and current endpoint qualification.
 | `_qwen38_ple_m1_short_conv_kernel` | [40, 1, 1] | 1.0 | 81920 | 3.328 | 0.109 | 3.366 | 3.257 |
 | `_hc_silu_kernel` | [1, 1, 1] | 1.0 | 0 | 2.704 | 0.000 | 2.699 | 2.699 |
 | `triton_poi_fused_copy__3` | [10, 1, 1] | 0.75 | 0 | 2.400 | 0.000 | 1.794 | 1.794 |
+| `triton_poi_fused_0` | [46, 1, 1] | 0.75 | 0 | 2.336 | 0.000 | 1.749 | 1.749 |
 | `triton_poi_fused_zeros_like_2` | [80, 1, 1] | 0.75 | 0 | 2.208 | 0.000 | 1.648 | 1.648 |
+| `triton_poi_fused_0` | [32, 1, 1] | 0.5 | 5120 | 3.456 | 0.003 | 1.624 | 1.621 |
+| `triton_poi_fused_0` | [16, 1, 1] | 0.5 | 5120 | 3.104 | 0.003 | 1.536 | 1.533 |
 | `triton_poi_fused__to_copy_add_mean_mul_pow_rsqrt_view_1` | [40, 1, 1] | 0.5 | 20480 | 2.592 | 0.014 | 1.314 | 1.300 |
 | `triton_poi_fused__to_copy_add_mean_mul_pow_rsqrt_view_1` | [80, 1, 1] | 0.5 | 20480 | 2.480 | 0.014 | 1.245 | 1.231 |
 | `triton_poi_fused_repeat_1` | [80, 1, 1] | 0.5 | 0 | 2.400 | 0.000 | 1.178 | 1.178 |
 | `triton_poi_fused_repeat_1` | [40, 1, 1] | 0.5 | 0 | 2.208 | 0.000 | 1.107 | 1.107 |
+| `triton_poi_fused_0` | [92, 1, 1] | 0.25 | 0 | 2.496 | 0.000 | 0.624 | 0.624 |
 | `triton_poi_fused_copy__3` | [20, 1, 1] | 0.25 | 0 | 2.400 | 0.000 | 0.602 | 0.602 |
 | `triton_poi_fused_zeros_like_2` | [40, 1, 1] | 0.25 | 0 | 1.952 | 0.000 | 0.488 | 0.488 |
-| `triton_poi_fused_0` | [32, 1, 1] | 0.5 | pending | 3.456 | pending | 1.624 | pending |
-| `triton_poi_fused_0` | [92, 1, 1] | 0.25 | pending | 2.496 | pending | 0.624 | pending |
-| `triton_poi_fused_0` | [16, 1, 1] | 0.5 | pending | 3.104 | pending | 1.536 | pending |
-| `triton_poi_fused_0` | [46, 1, 1] | 0.75 | pending | 2.336 | pending | 1.749 | pending |
