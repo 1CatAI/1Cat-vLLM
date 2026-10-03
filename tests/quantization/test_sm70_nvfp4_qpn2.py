@@ -28,7 +28,7 @@ def test_nvfp4_qpn2_is_default_off_with_explicit_on(monkeypatch):
     try:
         assert not envs.VLLM_SM70_NVFP4_QPN2
         assert not envs.VLLM_SM70_NVFP4_QPN2_PREFILL
-        assert envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M == 1024
+        assert envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M == 256
         monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "1")
         monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "1")
         monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "9")

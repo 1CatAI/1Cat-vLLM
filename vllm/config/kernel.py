@@ -193,7 +193,7 @@ class Sm70NvFp4Config:
             "prefill": ("VLLM_SM70_NVFP4_QPN2_PREFILL", qualified),
             "shared_weight": ("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", True),
             "shared_scales": ("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True),
-            "prefill_min_m": ("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", 1024),
+            "prefill_min_m": ("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", 256),
         }
         for field, (name, default) in defaults.items():
             if envs.is_set(name):

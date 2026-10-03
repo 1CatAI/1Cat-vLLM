@@ -11,6 +11,7 @@
   #include <ATen/core/dispatch/Dispatcher.h>
   #include <ATen/core/stack.h>
 #endif
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
@@ -689,6 +690,29 @@ void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
                                          use_scale_code);
 }
 
+void nvfp4_prefill_fp32_mm_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight) {
+  const c10::cuda::CUDAGuard guard(input.device());
+  const int m = input.size(0), k = input.size(1), n = weight.size(1);
+  auto handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasMath_t saved_math;
+  TORCH_CUDABLAS_CHECK(cublasGetMathMode(handle, &saved_math));
+  TORCH_CUDABLAS_CHECK(cublasSetMathMode(
+      handle, static_cast<cublasMath_t>(
+                  CUBLAS_TENSOR_OP_MATH |
+                  CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
+  const float alpha = 1.f, beta = 0.f;
+  // Row-major X[M,K] * W[K,N] is column-major W[N,K] * X[K,M].
+  // Preserve FP32 accumulation without changing process-global Torch flags.
+  const auto status = cublasGemmEx(
+      handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, weight.data_ptr(),
+      CUDA_R_16F, n, input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
+      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  const auto restored = cublasSetMathMode(handle, saved_math);
+  TORCH_CUDABLAS_CHECK(status);
+  TORCH_CUDABLAS_CHECK(restored);
+}
+
 template <bool TurboMindLayout>
 void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
                                   torch::Tensor input, torch::Tensor codes,
@@ -696,6 +720,8 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
                                   bool use_scale_code, bool gated_silu) {
   TORCH_CHECK(input.is_cuda() && out.is_cuda(),
               "nvfp4_qpn4_prefill_sm70_out: input and output must be CUDA");
+  TORCH_CHECK(out.get_device() == input.get_device(),
+              "NVFP4 prefill input and output must share one device");
   TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
                   out.scalar_type() == torch::kFloat16,
               "nvfp4_qpn4_prefill_sm70_out: input and output must be FP16");
@@ -723,11 +749,20 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
   nvfp4_qpn4_dequantize_sm70_impl<TurboMindLayout>(
       dense_weight, codes, scales, global_scale, use_scale_code, m <= 1024);
   if (!gated_silu) {
-    at::mm_out(out, input, dense_weight);
+    if (m <= 1024) {
+      nvfp4_prefill_fp32_mm_out(out, input, dense_weight);
+    } else {
+      at::mm_out(out, input, dense_weight);
+    }
     return;
   }
 
-  auto gate_up = at::mm(input, dense_weight);
+  auto gate_up = torch::empty({m, n}, input.options());
+  if (m <= 1024) {
+    nvfp4_prefill_fp32_mm_out(gate_up, input, dense_weight);
+  } else {
+    at::mm_out(gate_up, input, dense_weight);
+  }
   constexpr int kThreads = 256;
   nvfp4_qpn4_silu_and_mul_sm70_kernel<<<static_cast<int>(m), kThreads, 0,
                                         at::cuda::getCurrentCUDAStream()>>>(

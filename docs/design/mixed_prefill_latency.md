@@ -33,7 +33,9 @@ The mixed attention/GDN routes incorporate the work in #841. Mixed-row plans
 copy pinned host metadata asynchronously rather than creating device tensors
 from pageable host lists. The NVFP4 small-prefill dequantization candidate uses
 shared memory to transpose the original FP16 values into aligned vector stores;
-it keeps the existing scale arithmetic and cuBLAS GEMM. Large prefill chunks
+it keeps the existing scale arithmetic and cuBLAS GEMM. Small prefills use
+FP32 accumulation without reduced-precision partial reductions. The dense
+prefill threshold is 256 rows; smaller batches retain TurboMind. Large chunks
 and the small-row decode kernels retain their previous dispatch.
 
 A first fused WMMA dequantization/GEMM candidate was rejected: on the screened

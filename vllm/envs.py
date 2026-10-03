@@ -347,7 +347,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
-    VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
+    VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 256
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
@@ -4418,7 +4418,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": env_var(
-        lambda: int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")),
+        lambda: int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "256")),
         description=(
             "Deprecated alias for kernel_config.sm70_nvfp4.prefill_min_m. "
             "SM70: nvfp4 qpn2 prefill min m. The consumer locations and unset "
