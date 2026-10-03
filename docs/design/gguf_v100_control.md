@@ -160,17 +160,30 @@ the primary-model forward and quality gates are still pending.
 
 ### Loading validation and open gates
 
-17 metadata/tokenizer/split tests and 12 dense adapter/TP/mixed-storage
-tests pass on CPU. All four tiny-model ranks loaded their weights, but the
-GPU forward gate remains open: earlier failures localized missing runtime
+17 metadata/tokenizer/split tests and 13 dense adapter/TP/mixed-storage
+tests pass on CPU. Earlier failures localized missing runtime
 dependencies, unaligned K-quant FFN storage, missing hybrid state traits,
 and KV-head replication when TP exceeds KV heads. Those have source fixes;
 alignment and replication have focused CPU coverage. A later run completed
 engine initialization and GPU prefill warmup, then rejected the text-only
 class's missing MRoPE position interface. That interface is now implemented
 and tested on CPU. Inverse A_log loading preserves its FP32 parameter contract
-even with FP16 model dtype. Fresh GPU/logits validation remains required.
+even with FP16 model dtype.
+
+The corrected TP4 tiny Qwen3.5-0.8B Q4_K_M run completed GPU inference on
+2026-10-03 with FP16, eager execution, max length 2048, no MTP, FP16 KV,
+Flash-V100 attention and FlashQLA GDN. Three raw prompts generated 64 greedy
+tokens each. The English and arithmetic sequences matched llama.cpp for all
+64 tokens; the Chinese sequence matched its first 13 tokens and then diverged.
+First-token full-vocabulary logits have RMSE 0.1243/0.1408/0.1656, maximum
+absolute error 0.6073/0.8044/0.8116 and relative L2 0.02949/0.04647/0.06349.
+All three top-1 tokens match. The reference is CPU llama.cpp at
+`bed0a856606ee4a24a164066f73d2379447033f5`, using identical token IDs.
+These numeric differences and the Chinese divergence remain an open quality
+gate; a completed inference smoke does not establish adapter correctness.
+The following chat harness failed because Transformers 5 returns a dict
+from apply_chat_template by default; it now requests return_dict=False.
 
 These are implementation-localization results, not primary-model quality
-or speed acceptance. GPU 0-3 are occupied by other tasks; hold the shared
-flock and do not terminate them. No uncontaminated throughput is recorded.
+or speed acceptance. Hold the shared GPU flock and do not terminate other
+tasks. No accepted whole-model throughput is recorded.
