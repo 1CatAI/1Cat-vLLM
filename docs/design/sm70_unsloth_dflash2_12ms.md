@@ -427,9 +427,10 @@ The runtime-row-dispatch wheel builds through normal CMake/package targets
 and passes the release artifact check. Its SHA256 is
 `a02f5a8dfb6552bfe60e5630abc00bf87b510a004eb0753b865b1b2f02b76a0e`.
 The first installation command stops because that environment has no `pip`
-module. An owned `uv` installation/test controller is started, but its unit
-results and installed artifact identity are not yet verified. Do not infer
-successful installation or dynamic-trace dispatch from the completed build.
+module. Installation through the owned `uv` binary is subsequently verified:
+the installed archive URL identifies that wheel, six FP16 projection tests
+pass (including one dynamic prefill/decode trace), and five existing sampler
+branch tests pass. Model compilation and quality remain separate gates.
 
 The next sampler integration keeps both existing rejection algorithms and
 captures a device-side choice between them. Request-slot metadata must have
@@ -447,3 +448,38 @@ requires thirty native projection nodes, and leaves the original B1 attention
 route unchanged. Original/recaptured control agreement remains a prerequisite.
 Neither this pending audit nor the pending sampler integration closes the
 complete-round performance, target-head quality, or concurrency gates.
+
+### Stream dependencies and persistent sampler inputs
+
+A larger native collective probe initially rejects legitimate captured
+structure. Driver kernel names include C++ mangling; the captured NCCL stream
+has one initial wait and a record after each collective, alongside direct
+producer/consumer kernel dependencies. The revised helper validates those
+anchors, preserves ordinary edges, and replaces record dependencies before
+removing the supported events. Unknown events retain the existing path.
+
+On a separate four-V100 host, both Torch NCCL and direct NCCL ABI probes pass
+24 changing conditional replays per rank, including two collectives with
+intervening computation and a collective in the prefix. Outputs match the
+original captured graph bitwise; branch counters are 8/16. An unsupported
+external event rejects both normalization and attachment without changing the
+parent's replay. This uses CUDA 12.8.93, NCCL 2.27.5 and Torch 2.9.1; it is
+research-only evidence, not target-runtime or model performance admission.
+
+Sampler graph inputs now use private storage and logical cache keys, avoiding
+capture disagreement caused by per-rank allocator lifetimes. A single input
+kernel refreshes hidden states, token IDs, positions, request mapping and
+sparse proposals. The reference child copies only the active dense proposal
+into one private slot; a zero-stride request view preserves the original
+request-indexed rejection code. Compact rounds need no dense proposal copy.
+Capture-time CPU consensus selects fallback on every rank if any rank rejects
+preparation, attachment or instantiation. LoRA retains the existing sampler.
+
+The actual input kernels pass changing-pointer/slot checks and captured
+indirect-copy checks, including all 65536 FP16 storage patterns and unchanged
+shared proposal state. Four GLOO ranks also pass asymmetric capability-failure
+checks under inference mode. Complete installed sampler integration is pending.
+The first model audit's copied backbone shares compilation state and encounters
+a cached partition argument mismatch. A subsequent audit must retain FX cache:
+the framework rejects disabling it. Isolated configuration and cache namespaces
+are used for the next audit, with unchanged numerical compilation settings.
