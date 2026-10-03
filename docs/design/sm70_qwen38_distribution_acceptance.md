@@ -91,7 +91,8 @@ C2–C16 throughput, distribution or budget campaigns. Kernels must remain corre
 at arbitrary supported batch widths, including M=5. Use shape capability and
 measurement for admission, never a hardcoded batch-width fallback rule.
 
-The next endpoint target is 6 ms/token with TP4, 262144 startup capacity,
+The first endpoint target is at most 7.5 ms/token, followed by 6 ms/token,
+with TP4, 262144 startup capacity,
 8192 input tokens, disk-mapped ngrams, FP16 dense/activations and FP32
 accumulation/state. Initial component targets are 95 us per GDN layer,
 150 us per QSA layer and 0.45 ms for LM head plus sampling. These are planning
@@ -202,35 +203,29 @@ a dependent-kernel boundary inside a CUDA graph. Attribute the old approximately
 
 ## Implementation order
 
-1. Complete mapped small-result transport using consumer graph H2D and host
-   release/acquire flags. Keep exact row/byte/timing tests. The prior mismatch
-   came from functionalization cloning the output before the wait; the fixed
-   fresh-cache audit checked all 65 prefill/decode copies per request, zero bad
-   bytes, and three greedy continuations identical to the baseline. Equality
-   is supporting diagnosis, not the new quality contract.
-2. First prototype MoE from one TP reduction boundary to the next. CTA work is
-   selected expert by intermediate slice: W13, SiLU, corresponding W2 columns
-   and FP32 partials. Include router/top-k/softmax and independent shared-expert
-   work; finish with weighted reduction and peer push. Prefetch weights before
-   waiting for inputs, using a common compute skeleton with FP16 and NVFP4
-   weight readers. Use generation-numbered per-operation/tile flags rather
-   than grid-wide synchronization; do not repeat the grid.sync/scalar-projection
-   GDN prototype. Small-M templates must remain correct, including M=5, without
-   a dedicated small-M speed campaign.
-3. HC combine,
-   grouped norm and down/inject belong to the previous reduction tail; up and
-   gate-mix prefetch weights before waiting for the down result. Producer
-   epilogues push peer data and generation flags; consumer prologues overlap
-   weight reads with those waits. Follow with GDN, QSA and LM head/sampling,
-   redoing the Step 0 C1 budget after each retained change.
-   Measure before extending the primitive to more layers. Kernel primitives
-   admit by dtype/layout/hardware capability, never TP4 or model size alone.
-4. Finish the existing sampled-token PLE prefetch work, but measure residual
-   PLE wait after mapped transport first. If it is below 0.2 ms, park further
-   investment. Keep the ngram table on disk with mmap, with bounded result/key
-   staging only.
-5. Admit communication choices by topology/capability and investigate dense-
-   8-bit scale/outlier/sensitive-tensor causes independently.
+Rank interventions only by measured kernel service minus the weight-read floor
+at 750 GB/s. Operator A/B rotates all 48 real checkpoint layers or flushes L2
+between operations. Hot-L2 results do not admit or reject a kernel; a full-model
+A/B is preferred. Keep in_proj, out_proj and LM head outside this campaign's
+optimization scope because their current paths approach their weight floors.
+
+1. Finish independent C1 qualification and merge #831 and #859. Shared expert
+   and router come first: fold shared gate into router row 513, use at least
+   80 router CTAs and parallel top-k, fuse gate/up with SiLU, and use one down
+   kernel. Each fusion has its own PR and is merged after its C1 gate rather
+   than accumulating research drafts.
+2. Decompose PLE publish, lookup, writeback and flag times. Then use a bounded
+   pinned hot-row cache accessed through GPU UVA, with CPU-worker misses.
+   Keep the full ngram table on disk with mmap.
+3. Expand QSA sparse attention to at least 300 CTAs, use multi-CTA top-k and
+   fuse merge.
+4. Fuse GDN conv, recurrence and gated norm per head. Do not use cooperative
+   launch or grid-wide synchronization for this segment.
+5. Improve routed-expert W13/W2 tile parallelism and NVFP4 lookup decode;
+   target 550 GB/s. Recheck historical negative operators with cold L2.
+6. Revisit HC/all-reduce segments after those items; prefetch weights before
+   waiting on generation flags. Communication choices admit by topology and
+   capability. Dense 8-bit remains a separately evaluated precision decision.
 
 Do not narrow `_is_sm70_qwen38_decode_compile_contract` by TP or exact shape.
 Use the existing kernel configuration and startup capability report. New scattered
@@ -342,3 +337,51 @@ paired screen, but remained slower at every measured width. Both prototypes
 remain outside default dispatch. Their negative result is a scheduling and
 synchronization issue, not a bit-identity gate failure. The screen covers only
 part of a reduction segment and is not an end-to-end decode claim.
+
+## Revised Step 0 priority audit and current qualification
+
+The selected graph retains 1349 nodes/rank. Source and loaded tensor layouts
+now attribute prepared parameter bytes to the major kernel families. These
+bytes count weights actually addressed by the operator, including the FP16
+NVFP4 block scales, rather than the whole checkpoint tensor or padding. They
+are not NCU DRAM bytes. Weight floors exclude KV, recurrence state, activations
+and transfers; a zero-weight operation still has memory traffic. The detailed
+67-family table also records grid and block sizes. Rank-masked embedding gather
+aliases still need input-to-node attribution, and full-model DRAM counters
+remain pending. Do not relabel this audit as a complete DRAM budget.
+
+| Priority component | Trace service ms/step | Weight floor at 750 GB/s, ms | Service minus weight floor, ms |
+|---|---:|---:|---:|
+| Shared expert + router + shared gate | 2.3928 | 0.3254 | 2.0674 |
+| HC regular layers | 2.1276 | 0.4247 | 1.7029 |
+| QSA attention chain, excluding projections | 1.2558 | 0.000025 | 1.2558 |
+| PLE combine-to-dequant bracket | 0.9884 | not a weight-read operation | 0.9884 bracket |
+| Routed experts | 1.1960 | 0.4915 | 0.7045 |
+| GDN core, excluding projections | 0.5500 | 0.0010 | 0.5490 |
+
+The routed-expert floor is higher than the earlier 0.42-ms estimate because
+runtime block scales are FP16: selected W13 packed weights plus scales read
+5.12 MB/layer, W2 plus scales 2.56 MB/layer, across 48 layers. Isolated cold NCU
+reads total 7.714208 MB/layer, implying 0.4937 ms across 48 layers. This supports
+the prepared-layout accounting but does not measure whole-model DRAM traffic.
+
+The five single-CTA families consume 1.518 ms summed service: router top-k
+0.3840, shared gate 0.2507, activation 0.2029, HC down gather 0.4843, and QSA
+top-k 0.1975 ms. Router GEMV alone averages 9.91 us in this trace; the router
+GEMV plus top-k chain averages 17.92 us. Distinguish the chain from a standalone
+hot-L2 GEMV timing. Service sums can overlap and are not endpoint savings.
+
+Current qualification uses a full current-main native source build at
+6bd9925ff8, packaged with Python head 6bbffc5bf6. All 16 native hashes match
+the full source build. The matched normal-wheel C1 arms measured:
+
+| Transport | Median ms/token, six 8192-input/513-output samples | MBPP | GSM8K | Chinese | Needle |
+|---|---:|---:|---:|---:|---:|
+| CUDA copy | 13.07986 | 12/12 | 12/12 | 8/8 | 4/4 |
+| Mapped result | 10.98609 | 12/12 | 12/12 | 8/8 | 4/4 |
+
+Both arms' 36 task outputs reach natural EOS and have nonempty final answers,
+zero replacement characters and no token-cap failures. Current-artifact C1
+teacher-forcing distribution and the short C4 smoke remain required before
+PR PR #831 merge. The 16.0% TPOT reduction is transport-specific and does not include
+a dense 8-bit arm or establish the 7.5-ms target.

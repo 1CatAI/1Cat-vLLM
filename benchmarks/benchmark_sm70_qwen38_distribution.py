@@ -6,6 +6,8 @@ import argparse
 import fcntl
 import hashlib
 import json
+import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -366,8 +368,23 @@ if __name__ == "__main__":
     parser.add_argument("--kv-cache-memory-bytes", type=int)
     args = parser.parse_args()
     if args.action == "capture":
-        with open("/tmp/gpu0-3.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            capture(args)
+        while True:
+            with open("/tmp/gpu0-3.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                consumers = subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "-i",
+                        "0,1,2,3",
+                        "--query-compute-apps=pid",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                ).strip()
+                if not consumers:
+                    capture(args)
+                    break
+            print("GPU 0-3 occupied; released lock and waiting", flush=True)
+            time.sleep(10)
     else:
         {"prepare": prepare, "compare": compare}[args.action](args)
