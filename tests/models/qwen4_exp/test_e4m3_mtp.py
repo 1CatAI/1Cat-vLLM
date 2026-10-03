@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Phase-2 CPU tests: E4M3 QSA main KV cache together with MTP speculative
-decoding (D1 gate opt-in + D2 strict draft-side scale finalization + D3 draft
-scale visibility). All tests are CPU-only; the live SM70 kernel/selection path
-is exercised in the W3 GPU window and by tests/models/qwen4_exp/test_qsa_e4m3.py.
+"""CPU coverage for calibrated E4M3 cache with MTP.
+
+Native attention and capture controls live in the neighboring GPU suites.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from torch import nn
 
 from vllm import envs
 from vllm.models.qwen4_exp.nvidia import model as model_mod
-from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
 from vllm.models.qwen4_exp.nvidia.model import (
     _finalize_qsa_e4m3_scale_load,
     _validate_qsa_e4m3_scale_load,
@@ -42,64 +40,62 @@ def _configs(*, dtype=torch.float16, tp=4, spec=_MTP_SPEC):
     return vllm_config, model_config, cache_config
 
 
-def _force_sm70(monkeypatch):
+@pytest.mark.parametrize(
+    "capability,dtype",
+    [
+        (70, torch.float16),
+        (75, torch.float16),
+        (80, torch.bfloat16),
+        (90, torch.float16),
+    ],
+)
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("spec", [None, _MTP_SPEC])
+def test_e4m3_admission_uses_operator_capability(
+    monkeypatch, capability, dtype, tp, spec
+):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as ops
+
     monkeypatch.setattr(
-        qsa_mod,
+        ops,
         "current_platform",
-        SimpleNamespace(is_device_capability=lambda cap: cap == 70),
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            has_device_capability=lambda minimum: capability >= minimum,
+        ),
     )
+    vc, mc, cc = _configs(dtype=dtype, tp=tp, spec=spec)
+    _verify_e4m3_kv_requirements(vc, mc, cc)
 
 
-# --------------------------------------------------------------------------- #
-# D1: the MTP0 gate is opt-in; default keeps the phase-1 error verbatim.
-# --------------------------------------------------------------------------- #
-def test_gate_default_off_rejects_e4m3_plus_mtp(monkeypatch):
-    _force_sm70(monkeypatch)
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_MTP", False)
-    vllm_config, model_config, cache_config = _configs(spec=object())
-    with pytest.raises(NotImplementedError, match="requires MTP0"):
-        _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
+@pytest.mark.parametrize(
+    "capability,dtype",
+    [
+        (60, torch.float16),
+        (70, torch.bfloat16),
+        (75, torch.bfloat16),
+        (80, torch.float32),
+    ],
+)
+def test_e4m3_unsupported_tensor_core_dtype_reports_reason(
+    monkeypatch, capability, dtype
+):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as ops
 
-
-def test_gate_switch_on_allows_e4m3_plus_mtp(monkeypatch):
-    _force_sm70(monkeypatch)
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_MTP", True)
-    vllm_config, model_config, cache_config = _configs(spec=object())
-    # Must not raise: MTP is permitted when the opt-in is set.
-    _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
-
-
-def test_gate_switch_on_without_spec_is_unaffected(monkeypatch):
-    _force_sm70(monkeypatch)
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_MTP", False)
-    vllm_config, model_config, cache_config = _configs(spec=None)
-    _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
-
-
-def test_gate_opt_in_does_not_loosen_sm70_fp16_tp4(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_MTP", True)
-    # Non-SM70 still rejected even with the opt-in on.
     monkeypatch.setattr(
-        qsa_mod,
+        ops,
         "current_platform",
-        SimpleNamespace(is_device_capability=lambda cap: False),
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            has_device_capability=lambda minimum: capability >= minimum,
+        ),
     )
-    vc, mc, cc = _configs()
-    with pytest.raises(NotImplementedError, match="requires SM70"):
-        _verify_e4m3_kv_requirements(vc, mc, cc)
-    _force_sm70(monkeypatch)
-    # Non-FP16 rejected.
-    vc, mc, cc = _configs(dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="FP16 activations"):
-        _verify_e4m3_kv_requirements(vc, mc, cc)
-    # TP != 4 rejected.
-    vc, mc, cc = _configs(tp=2)
-    with pytest.raises(NotImplementedError, match="requires TP4"):
+    vc, mc, cc = _configs(dtype=dtype)
+    with pytest.raises(NotImplementedError, match="QSA E4M3 cache unavailable"):
         _verify_e4m3_kv_requirements(vc, mc, cc)
 
 
-def test_gate_non_e4m3_cache_is_noop(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_MTP", False)
+def test_e4m3_gate_non_e4m3_cache_is_noop():
     vc, mc, _ = _configs(spec=object())
     _verify_e4m3_kv_requirements(vc, mc, SimpleNamespace(cache_dtype="auto"))
 
