@@ -92,3 +92,23 @@ in eager mode and records its graph rejection reason explicitly.
 | 512 | 40.76 | 32.87 | unavailable | unavailable | 50.12 | 29.24 |
 | 2048 | 163.17 | 107.72 | unavailable | unavailable | 179.20 | 91.49 |
 | 8192 | 761.45 | 436.02 | unavailable | unavailable | 679.73 | 351.64 |
+
+### Dense graph after restoring native prefill tiles (microseconds)
+
+The added tile candidates pass 31 GPU checks (one skipped raw fixture),
+including U2 framework preparation and full-graph tracing. M=2048 and
+M=8192 now approach AWQ; M=64–512 still need further analysis.
+
+| M | GGUF U2 | AWQ | MMVQ | MMQ | DQ + cuBLAS | Cached FP16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 8.96 | 10.29 | 8.29 | unavailable | 14.85 | 6.04 |
+| 2 | 8.65 | 10.60 | 9.32 | unavailable | 15.00 | 6.30 |
+| 4 | 8.70 | 10.60 | 12.44 | unavailable | 15.26 | 6.35 |
+| 8 | 9.11 | 11.83 | 12.90 | 18.64 | 15.36 | 6.50 |
+| 16 | 9.93 | 14.49 | unavailable | 20.63 | 16.33 | 7.22 |
+| 32 | 10.80 | 20.07 | unavailable | 26.78 | 17.92 | 8.40 |
+| 64 | 16.59 | 13.93 | unavailable | unavailable | 28.57 | 11.32 |
+| 128 | 22.27 | 15.36 | unavailable | unavailable | 26.93 | 12.65 |
+| 512 | 42.04 | 33.64 | unavailable | unavailable | 50.48 | 29.75 |
+| 2048 | 113.77 | 107.01 | unavailable | unavailable | 178.69 | 90.21 |
+| 8192 | 455.01 | 432.95 | unavailable | unavailable | 681.16 | 350.41 |
