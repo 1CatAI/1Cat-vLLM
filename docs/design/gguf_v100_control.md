@@ -232,3 +232,22 @@ Embedded chat-template generation with thinking disabled returns `Paris`,
 `4` and `你好` for the three fixed short prompts. These checks establish
 installed loader/tokenizer operation; broader distribution/quality checks and
 primary-model speed remain pending. No model-level TurboMind speed is claimed.
+
+## Current-main loader check
+
+The loader was synchronized with main `48a66d2838` without changing other
+SM70 routes. All 19 metadata and 13 adapter tests pass from source and a fresh
+ordinary wheel installation. The installed tiny-model run uses the same TP4,
+FP16/eager/no-MTP contract above: English and arithmetic match 64/64 greedy
+tokens; Chinese matches 23 tokens before divergence. First-logit RMSE is
+0.128859/0.148466/0.165342, relative L2 is 0.030586/0.049015/0.063375,
+and all first-logit top-1 values match. Embedded chat results remain `Paris`,
+`4`, and `你好`. Broader quality work remains pending.
+
+The normal packaged `_C` matches the main operator artifact,
+`4910c47ab1aaed253001d5950bf44dd40a350b2b087202a8ea2b13f2c5457782`.
+Wheel `1cat_vllm-1.5.2.dev406+g7285a28e6.precompiled-cp312-cp312-linux_x86_64.whl`
+has SHA256 `17a06f4c462608c07006aaf1fb71d902dc1362380a7df0b7d7339d310873345e`;
+all 210 installed dependencies are compatible. The subsequent main sync adds
+the independently validated IQ3_XXS grouped-vector codebook layout; that
+operator is not used by the tiny dense model in this check.
