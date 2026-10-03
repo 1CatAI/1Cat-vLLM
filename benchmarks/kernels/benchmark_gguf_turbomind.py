@@ -8,6 +8,7 @@ equivalence to a separately quantized checkpoint. No model forward is involved.
 """
 
 import argparse
+import hashlib
 import json
 from functools import partial
 from pathlib import Path
@@ -156,6 +157,13 @@ def canonical_grouped_call(projection, out, x, offsets, wp, sp, experts):
     return partial(op, out, x, offsets, wp, sp, decoder, experts, projection.group_size)
 
 
+def core_fingerprint():
+    """Record the actual loaded extension, independent of interpreter cwd."""
+    import vllm._C as core
+
+    return hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest()
+
+
 def elapsed(call, iterations, capture=False):
     # Let short decode operators reach steady GPU clocks after CPU transcoding.
     # Synchronize batches rather than time Python launch latency as warmup.
@@ -280,6 +288,7 @@ def main():
     reader = GGUFReader(args.gguf)
     tensors = {tensor.name: tensor for tensor in reader.tensors}
     output = {
+        "loaded_core_sha256": core_fingerprint(),
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
