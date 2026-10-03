@@ -411,9 +411,7 @@ class TestCudagraphDispatcher:
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
 
-    def test_dsv4_context_bucket_requires_explicit_override_for_mtp_on_sm70(
-        self, monkeypatch
-    ):
+    def test_dsv4_context_buckets_are_derived_for_mtp_on_sm70(self, monkeypatch):
         monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
         monkeypatch.delenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", raising=False)
         comp_config = CompilationConfig(
@@ -432,11 +430,10 @@ class TestCudagraphDispatcher:
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
         ):
-            default_dispatcher = CudagraphDispatcher(config)
-        assert not default_dispatcher.has_attention_context_buckets
-
-        monkeypatch.setenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", "2048")
-        dispatcher = CudagraphDispatcher(config)
+            dispatcher = CudagraphDispatcher(config)
+        # Speculative graphs bucket like single-row decode: the sparse indexer
+        # needs a bounded key length to take its cuBLAS route under full graphs.
+        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048,)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
             uniform_decode_query_len=8,
