@@ -18,6 +18,7 @@ import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
+from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS, Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
     _get_dflash2_checkpoint_draft_tokens,
@@ -25,7 +26,6 @@ from vllm.config.speculative import (
 from vllm.config.vllm import (
     _SM70_DFLASH2_VERIFIER_DEFAULTS,
     _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS,
-    _apply_sm70_dflash2_verifier_defaults,
     _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path,
     _configure_sm70_glm5_dflash_tp4_push_allreduce,
     _configure_sm70_glm5_dflash_tp8_pp1_verifier_path,
@@ -288,14 +288,16 @@ def test_sm70_dflash2_verifier_defaults_preserve_overrides(
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(overridden_name, "0")
 
-    applied = _apply_sm70_dflash2_verifier_defaults()
-
-    assert overridden_name not in applied
-    assert os.environ[overridden_name] == "0"
+    before = dict(os.environ)
+    policy = Sm70DFlash2Config()
+    policy.resolve(qualified=True)
+    assert dict(os.environ) == before
+    assert not getattr(policy, SM70_DFLASH2_LEGACY_FIELDS[overridden_name])
     for name, expected_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
         if name != overridden_name:
-            assert name in applied
-            assert os.environ[name] == expected_value
+            assert getattr(policy, SM70_DFLASH2_LEGACY_FIELDS[name]) == bool(
+                int(expected_value)
+            )
 
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
@@ -916,7 +918,7 @@ def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(
         return SimpleNamespace()
 
     monkeypatch.setattr(
-        dflash2_model.envs,
+        envs,
         "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
         True,
     )
@@ -961,7 +963,7 @@ def test_sharded_context_projection_falls_back_outside_exact_contract(
     )
     sentinel = object()
     monkeypatch.setattr(
-        dflash2_model.envs,
+        envs,
         "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
         enabled,
     )

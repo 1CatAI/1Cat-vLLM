@@ -322,7 +322,9 @@ def load_baseline(ref, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--category", choices=("nvfp4", "awq", "fp8-policy", "fp8"), default="nvfp4"
+        "--category",
+        choices=("nvfp4", "awq", "fp8-policy", "fp8", "dflash2"),
+        default="nvfp4",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -343,6 +345,9 @@ def main():
     elif args.category == "fp8":
         from tools.sm70_fp8_route_snapshot import load_baseline as load_fn
         from tools.sm70_fp8_route_snapshot import snapshot as snapshot_fn
+    elif args.category == "dflash2":
+        from tools.sm70_dflash2_route_snapshot import load_baseline as load_fn
+        from tools.sm70_dflash2_route_snapshot import snapshot as snapshot_fn
     # Explicit test sandbox: an interactive shell's production knobs must not
     # leak into the reproducible defaults matrix.
     clean = {k: v for k, v in os.environ.items() if not k.startswith("VLLM_")}
