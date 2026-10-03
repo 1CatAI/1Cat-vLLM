@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Canonical GGUF affine weights in the shared mixed-precision lifecycle."""
 
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -17,6 +18,37 @@ from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+# Calibrated physical layouts, (bits, group, K, N) -> minimum prefill M.
+# The values come from the matched full/TP4 projection sweeps in
+# docs/design/gguf_turbomind_prefill.md. Unmeasured layouts retain fused MMA.
+_AFFINE_BLAS_MIN_M = {
+    (3, 16, 5120, 17408): 512,
+    (3, 16, 5120, 4352): 512,
+    (4, 32, 5120, 4352): 512,
+    (5, 32, 5120, 6144): 2048,
+    (5, 32, 5120, 1536): 2048,
+    (6, 16, 6144, 5120): 2048,
+    (6, 16, 1536, 5120): 2048,
+}
+_AFFINE_BLAS_WORKSPACE_ELEMENTS = max(k * n for _, _, k, n in _AFFINE_BLAS_MIN_M)
+_affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
+def _get_affine_blas_workspace(weight: torch.Tensor) -> torch.Tensor | None:
+    key = (weight.device, torch.float16)
+    workspace = _affine_blas_workspaces.get(key)
+    if workspace is None:
+        try:
+            workspace = torch.empty(
+                _AFFINE_BLAS_WORKSPACE_ELEMENTS,
+                dtype=torch.float16,
+                device=weight.device,
+            )
+        except torch.OutOfMemoryError:
+            return None
+        _affine_blas_workspaces[key] = workspace
+    return workspace
 
 
 @dataclass
@@ -100,21 +132,28 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             "gguf_affine_gemm_sm70_out",
             True,
         )
-        self.operator_capabilities = (
-            self.capability,
-            GGUFOperatorCapability(
-                GGUFDecoderFamily.AFFINE,
-                quant_type_name(self.config.source_type),
-                "gguf_affine_blas_sm70_out",
-                True,
-                min_m=512,
-                reason=(
-                    None
-                    if hasattr(torch.ops._C, "gguf_affine_blas_sm70_out")
-                    else "operator_missing:gguf_affine_blas_sm70_out"
-                ),
-            ),
+        k, n = self.config.partition_weight_shape
+        minimum_m = _AFFINE_BLAS_MIN_M.get((bits, self.config.group_size, k, n))
+        reason = None
+        if not hasattr(torch.ops._C, "gguf_affine_blas_sm70_out"):
+            reason = "operator_missing:gguf_affine_blas_sm70_out"
+        elif minimum_m is None:
+            reason = "local_shape_has_no_prefill_calibration"
+        else:
+            workspace = _get_affine_blas_workspace(weight)
+            if workspace is None:
+                reason = "prefill_workspace_allocation_failed"
+            else:
+                layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
+        self.prefill_capability = GGUFOperatorCapability(
+            GGUFDecoderFamily.AFFINE,
+            quant_type_name(self.config.source_type),
+            "gguf_affine_blas_sm70_out",
+            True,
+            min_m=minimum_m or 512,
+            reason=reason,
         )
+        self.operator_capabilities = (self.capability, self.prefill_capability)
         layer._gguf_tm_affine_prepared = True
 
     def apply_weights(self, layer, x, bias=None):
@@ -123,16 +162,30 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
         n = self.config.partition_weight_shape[1]
         rows = x.reshape(-1, x.shape[-1]).contiguous()
         output = torch.empty((rows.shape[0], n), dtype=x.dtype, device=x.device)
-        torch.ops._C.gguf_affine_gemm_sm70_out(
-            output,
-            rows,
-            getattr(layer, self.w_q_name),
-            getattr(layer, self.w_s_name),
-            self.bits,
-            layer.gguf_tm_k_ld,
-            layer.gguf_tm_q_ld,
-            self.config.group_size,
-        )
+        if (
+            self.prefill_capability.reason is None
+            and self.prefill_capability.supports_m(rows.shape[0])
+        ):
+            torch.ops._C.gguf_affine_blas_sm70_out(
+                output,
+                rows,
+                getattr(layer, self.w_q_name),
+                getattr(layer, self.w_s_name),
+                self.bits,
+                layer.gguf_tm_blas_workspace,
+                self.config.group_size,
+            )
+        else:
+            torch.ops._C.gguf_affine_gemm_sm70_out(
+                output,
+                rows,
+                getattr(layer, self.w_q_name),
+                getattr(layer, self.w_s_name),
+                self.bits,
+                layer.gguf_tm_k_ld,
+                layer.gguf_tm_q_ld,
+                self.config.group_size,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(*x.shape[:-1], n)

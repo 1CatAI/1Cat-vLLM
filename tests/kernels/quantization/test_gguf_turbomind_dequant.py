@@ -45,7 +45,11 @@ def test_canonical_prefill_capability_is_reported():
     ]
     blas = next(c for c in candidates if c["operator"] == "gguf_affine_blas_sm70_out")
     assert blas["source_type"] == "Q4_1" and blas["family"] == "affine_integer"
-    assert blas["min_m"] == 512 and blas["graph_safe"] and blas["reason"] is None
+    assert (
+        blas["min_m"] == 512
+        and blas["graph_safe"]
+        and blas["reason"] == "local_shape_has_no_prefill_calibration"
+    )
 
 
 @pytest.mark.parametrize(
@@ -102,3 +106,60 @@ def test_canonical_dequant_blas_and_graph(bits, group):
         torch.testing.assert_close(
             compiled().float(), expected, rtol=0.003, atol=0.0002
         )
+
+
+def test_calibrated_prefill_framework_routes_and_shared_workspace():
+    torch._dynamo.reset()
+    k, n = 5120, 1536
+    config = Sm70GgufAffineConfig(
+        (k, n),
+        (k, n),
+        scalar_types.uint5,
+        torch.float16,
+        32,
+        True,
+        False,
+        source_type=13,
+    )
+    layers, kernels = [], []
+    for _ in range(2):
+        layer = torch.nn.Module()
+        kernel = TurboMindGgufAffineKernel(config, "codes", "scales", "mins")
+        for name, data in {
+            "codes": torch.zeros((n, k), dtype=torch.uint8, device="cuda"),
+            "scales": torch.ones((n, k // 32), dtype=torch.float16, device="cuda"),
+            "mins": torch.full(
+                (n, k // 32), 0.00390625, dtype=torch.float16, device="cuda"
+            ),
+        }.items():
+            layer.register_parameter(
+                name, torch.nn.Parameter(data, requires_grad=False)
+            )
+        kernel.process_weights_after_loading(layer)
+        assert kernel.prefill_capability.min_m == 2048
+        assert kernel.prefill_capability.reason is None
+        layers.append(layer)
+        kernels.append(kernel)
+    assert (
+        layers[0].gguf_tm_blas_workspace.data_ptr()
+        == layers[1].gguf_tm_blas_workspace.data_ptr()
+    )
+    for m in (512, 2048):
+        x = (torch.randn((m, k), device="cuda") * 0.125).half()
+        expected = (x.float().sum(-1, keepdim=True) * 0.00390625).expand(m, n)
+        run = lambda x: kernels[0].apply_weights(layers[0], x)
+        torch.testing.assert_close(run(x).float(), expected, rtol=0.003, atol=0.0002)
+        compiled = torch.compile(run, backend="eager", fullgraph=True)
+        torch.testing.assert_close(
+            compiled(x).float(), expected, rtol=0.003, atol=0.0002
+        )
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(x)
+        torch.cuda.current_stream().wait_stream(stream)
+        with torch.cuda.graph(graph, stream=stream):
+            out = run(x)
+        graph.replay()
+        torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.0002)
