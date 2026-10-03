@@ -48,3 +48,31 @@ def test_grouped_lattice_vec_fp32_oracle_empty_and_graph(weight_type):
         torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.003)
         compiled = torch.compile(run, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled().float(), expected, rtol=0.003, atol=0.003)
+
+
+def test_grouped_lattice_capability_bands_and_reasons():
+    from vllm.model_executor.kernels.gguf import (
+        lattice_grouped_capabilities,
+        select_lattice_grouped_capability,
+    )
+
+    for source in (17, 18):
+        for e, cases in (
+            (4, ((8, True), (16, False))),
+            (512, ((128, True), (256, False), (512, True), (8192, False))),
+        ):
+            caps = lattice_grouped_capabilities(source, 2560, 160, e, torch.float16)
+            for m, vector in cases:
+                chosen = select_lattice_grouped_capability(caps, m)
+                assert ("_vec_" in chosen.operator) == vector
+    unknown = lattice_grouped_capabilities(18, 2560, 160, 8, torch.float16)
+    assert unknown[1].reason == "grouped_vector_shape_has_no_calibration"
+    assert "_gemm_" in select_lattice_grouped_capability(unknown, 1).operator
+    disabled = lattice_grouped_capabilities(
+        18, 2560, 160, 512, torch.float16, enabled=False
+    )
+    assert all(c.reason == "disabled_by_kernel_config" for c in disabled)
+    with pytest.raises(ValueError, match="No prepared lattice"):
+        select_lattice_grouped_capability(disabled, 1)
+    bad_dtype = lattice_grouped_capabilities(18, 2560, 160, 512, torch.bfloat16)
+    assert all(c.reason == "requires_fp16_activations" for c in bad_dtype)
