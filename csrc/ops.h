@@ -116,6 +116,20 @@ void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor stats_ptrs, int64_t bits,
                                        int64_t num_experts, int64_t group_size);
 
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size);
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size);
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size);
+
 std::vector<torch::Tensor> awq_sm70_prepare_compact(
     torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros,
     int64_t group_size, bool interleave_gated_silu);

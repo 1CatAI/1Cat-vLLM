@@ -27,6 +27,7 @@ std::array<const LayoutConverter*, 2> GetConverters(DataType data_type,
                                                     int      sm);
 
 std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, int sm);
+std::array<const LayoutConverter*, 2> GetGgufLut4Converters(int sm);
 
 // Free with `cudaFree`
 void* MakeStridedPtrs(const std::vector<std::pair<void*, int>>& ptrs, cudaStream_t stream);
