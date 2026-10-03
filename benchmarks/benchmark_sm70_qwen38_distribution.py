@@ -124,6 +124,8 @@ def capture(args):
         ),
         disable_log_stats=False,
     )
+    if args.worker_cls:
+        engine_config["worker_cls"] = args.worker_cls
     if args.kv_cache_memory_bytes is not None:
         engine_config["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
     llm = LLM(**engine_config)
@@ -376,6 +378,7 @@ if __name__ == "__main__":
         default=[],
         help="Use the existing disabled-kernel control for matched A/B",
     )
+    parser.add_argument("--worker-cls", help="Qualified diagnostic worker class")
     args = parser.parse_args()
     if args.action == "capture":
         while True:

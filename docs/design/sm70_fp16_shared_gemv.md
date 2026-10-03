@@ -136,3 +136,19 @@ The installed GPU loader smoke selected M1 plain/fused gate-up and plain down,
 reported their numerical/cold admission through the existing framework, and
 passed changed-input graph replay against independent FP64 references.
 C1 teacher-forcing distribution and the short C4 smoke remain pending.
+
+## Distribution gate failure: do not merge
+
+The 768-position C1 comparison failed despite both 36-task suites passing.
+Default-repeat noise is zero. Global mean KL is 0.00033248 and top-1 agreement
+99.21875%, but the English stratum has mean KL 0.00186869 and top-1 agreement
+96.875%; Chinese top-1 agreement is 97.9167%. Maximum raw-logit error is
+4.2421875, above the unchanged 0.5 limit. All three repeats reproduce the
+same affected prefixes. This is a distribution-gate failure, not rejection
+because greedy continuations differ.
+
+The generic adapter also admitted PLE key/value and final HC down projections.
+Ablation must separate those routes from shared gate/up and down before the
+fusion can be admitted. Do not credit the measured 1.16% endpoint difference
+as an accepted production gain. C4 and final trace jobs were gated on this
+comparison and have not run. The PR remains unmerged; thresholds are unchanged.
