@@ -1364,11 +1364,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DEBUG": env_var(
         env_set_with_choices(
-            "VLLM_SM70_DEBUG", [], ["trace", "mtp", "events", "routing"]
+            "VLLM_SM70_DEBUG", [], ["trace", "mtp", "events", "routing", "selector"]
         ),
         description=(
             "Select comma-separated SM70 diagnostics: trace logs, MTP phase "
-            "timing, decode events or attention routing. Default empty to "
+            "timing, decode events, attention routing or eager selector shadow "
+            "checks (selector). Default empty to "
             "avoid logging and observer overhead. Use only to diagnose "
             "a route or latency issue; explicit channels override old aliases."
         ),
@@ -5450,18 +5451,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local top-k, and return the dense result so the baseline trajectory is
     # unchanged.  This intentionally synchronizes for diagnostics.
     "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", "0"))),
-        description=(
-            "Audit-only eager mode: execute QPN8+rerank, compare it with the "
-            "dense local top-k, and return the dense result so the baseline "
-            "trajectory is unchanged.  This intentionally synchronizes for "
-            "diagnostics."
+        deprecated_env(
+            "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=selector.",
+            lambda: sm70_debug_enabled(
+                "selector", "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW"
+            ),
         ),
-        category="debug",
+        description=(
+            "Runs eager DFlash2 QPN8/rerank diagnostics against dense top-k "
+            "and returns the dense result. Default off because it "
+            "synchronizes and duplicates work. Use VLLM_SM70_DEBUG=selector "
+            "with eager execution for an oracle audit; this legacy alias "
+            "remains for one full released cycle."
+        ),
+        category="deprecated",
         declared_default="False",
-        effective_default="False",
+        effective_default="False; explicit unified channels take precedence.",
         automatic_conditions=(),
-        acceleration_paths=("DFlash2 verifier",),
+        acceleration_paths=("SM70 verifier diagnostics",),
         user_visible=False,
     ),
     # Compatibility-only: the scored dense vocabulary tie order is mandatory.
@@ -6495,16 +6504,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))),
-        description=(
-            "SM70: greedy token fastpath trace. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
+            "the release following one full compatibility release",
+            "Use VLLM_SM70_DEBUG=trace.",
+            lambda: sm70_debug_enabled(
+                "trace", "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE"
+            ),
         ),
-        category="debug",
+        description=(
+            "Logs why SM70 greedy LM-head acceleration is skipped. Default "
+            "off to avoid trace overhead. Use VLLM_SM70_DEBUG=trace when "
+            "diagnosing selection; this legacy integer alias remains for "
+            "one full released cycle."
+        ),
+        category="deprecated",
         declared_default="False",
-        effective_default="False",
+        effective_default="False; explicit unified channels take precedence.",
         automatic_conditions=(),
-        acceleration_paths=("SM70 runtime/kernel policy",),
+        acceleration_paths=("SM70 verifier diagnostics",),
         user_visible=False,
     ),
     # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
@@ -7739,7 +7757,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Compatibility alias for VLLM_SM70_DEBUG=trace. Unset stays "
-            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "disabled. Existing parsing is preserved for one full released cycle; "
             "migrate explicit debugging to the unified channel."
         ),
         category="deprecated",
@@ -7758,7 +7776,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Compatibility alias for VLLM_SM70_DEBUG=events. Unset stays "
-            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "disabled. Existing parsing is preserved for one full released cycle; "
             "migrate explicit debugging to the unified channel."
         ),
         category="deprecated",
@@ -7803,7 +7821,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Compatibility alias for VLLM_SM70_DEBUG=mtp. Unset stays "
-            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "disabled. Existing parsing is preserved for one full released cycle; "
             "migrate explicit debugging to the unified channel."
         ),
         category="deprecated",
@@ -8294,7 +8312,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Compatibility alias for VLLM_SM70_DEBUG=trace. Unset stays "
-            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "disabled. Existing parsing is preserved for one full released cycle; "
             "migrate explicit debugging to the unified channel."
         ),
         category="deprecated",
@@ -8313,7 +8331,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Compatibility alias for VLLM_SM70_DEBUG=routing. Unset stays "
-            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "disabled. Existing parsing is preserved for one full released cycle; "
             "migrate explicit debugging to the unified channel."
         ),
         category="deprecated",
@@ -15827,7 +15845,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         description=(
             "Compatibility alias for VLLM_SM70_DEBUG=routing. Unset stays "
-            "disabled. Existing parsing is preserved until removal in 1.5.2; "
+            "disabled. Existing parsing is preserved for one full released cycle; "
             "migrate explicit debugging to the unified channel."
         ),
         category="deprecated",
