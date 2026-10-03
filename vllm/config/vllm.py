@@ -343,11 +343,8 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
         reason = "existing explicit PLE placement takes precedence"
     elif cfg.load_config.load_format not in ("auto", "safetensors"):
         reason = "requires file-backed safetensors shards"
-    elif (
-        cfg.parallel_config.prefill_context_parallel_size != 1
-        or cfg.parallel_config.decode_context_parallel_size != 1
-    ):
-        reason = "PLE worker does not yet support context-parallel groups"
+    elif cfg.parallel_config.prefill_context_parallel_size != 1:
+        reason = "PLE worker does not yet support prefill context-parallel groups"
     elif (
         cfg.parallel_config.nnodes != 1
         or cfg.parallel_config.data_parallel_backend != "mp"
