@@ -104,6 +104,24 @@ struct Transform_HMMA_16816 {
 
 // Used by SM70 MMA
 struct Transform_HMMA_SIMT_B {
+  template <class F, class D, int N>
+  __device__ static auto decode(const Array<D, N>& data) {
+    if constexpr (std::is_same_v<D, uint8_t> && std::is_same_v<F, half>) {
+      // Converter<uint16_t,uint8_t> interleaves the middle two bytes for
+      // packed MMA operands. KV-cache uint8 storage has a different order.
+      static_assert(N % 4 == 0);
+      Array<F, N> decoded;
+      PRAGMA_UNROLL
+      for (int i = 0; i < N; i += 4) {
+        (Array<F, 4>&)decoded[i] =
+            cvt_f16x2x2_u8_trans<true>((const Array<uint8_t, 4>&)data[i]);
+      }
+      return decoded;
+    } else {
+      return ConvertKvCache<D, F>::convert(data);
+    }
+  }
+
   template <class F, int Nf, int Mf, int K, class D, int Nd, int Md, class S,
             int Ns, int Ms, int Ks>
   __device__ static void apply(Array<F, Nf> (&frag)[K][Mf], int k,
@@ -120,7 +138,7 @@ struct Transform_HMMA_SIMT_B {
 
     PRAGMA_UNROLL
     for (int m = 0; m < Md; ++m) {
-      auto tmp = ConvertKvCache<D, F>::convert(data_k[m]);
+      auto tmp = decode<F>(data_k[m]);
       PRAGMA_UNROLL
       for (int i = 0; i < Nd; i += 2) {
         dequant((Array<F, 2>&)tmp[i], stat_k[(m * Nd + i) / Nf]);
