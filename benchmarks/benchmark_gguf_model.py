@@ -20,14 +20,18 @@ import vllm._C as core
 import vllm
 from vllm import LLM, SamplingParams
 
-# Allow this script to run outside the checkout against an installed wheel.
-# Appending the benchmark root keeps the already imported vllm authoritative.
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from benchmarks.benchmark_sm70_model_tokens import _request_metrics_dict  # noqa: E402
-from benchmarks.benchmark_sm70_qwen38_concurrency import (  # noqa: E402
-    generate_cohort,
-    summarize,
-)
+# The shared helpers add source paths for their standalone entrypoints. Restore
+# the caller's search path so spawned workers use the same installed packages.
+_original_path = sys.path.copy()
+try:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from benchmarks.benchmark_sm70_model_tokens import _request_metrics_dict
+    from benchmarks.benchmark_sm70_qwen38_concurrency import (
+        generate_cohort,
+        summarize,
+    )
+finally:
+    sys.path[:] = _original_path
 
 
 def main():
