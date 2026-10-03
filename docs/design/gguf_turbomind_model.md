@@ -172,3 +172,42 @@ than packed MMA (29–30 us), while larger M changed only modestly. Retain
 one simple N-major FP16 cache. The normalized FP16 and cache output relative
 L2 is about 0.00020–0.00029, versus 0.0047–0.0088 for the existing activation
 quantization route in this sweep. No activation precision is reduced.
+
+## Installed graph model measurement
+
+The dense integration runs with the normal packaged CUDA extensions. Benchmark
+helper imports restore the caller's module search path before spawning workers;
+otherwise their standalone source setup can shadow the installed Flash-V100
+package. The previous failed graph startup came from that source-path shadowing,
+not missing wheel extensions. Both Flash-V100 extensions import from the installed
+package, and worker logs confirm Flash-V100 attention and FlashQLA GDN dispatch.
+
+Qwen3.8-27B UD-Q4_K_M, V100 SXM2 32GB x4, TP4, CUDA 12.8, Torch 2.10,
+FP16 activations/KV, no MTP, prefix caching disabled, maximum length 33024,
+batch budget 8192, maximum 16 sequences, GPU memory utilization 0.7,
+FULL_AND_PIECEWISE graphs with captures 1/2/4/8/16:
+
+| Concurrent requests | Aggregate pure decode (tok/s) | Mean step (ms) |
+| ---: | ---: | ---: |
+| 1 | 47.51 | 21.05 |
+| 4 | 178.38 | 22.42 |
+| 8 | 319.63 | 25.03 |
+| 16 | 555.05 | 28.83 |
+
+Each point averages two fixed-length runs after warmup: 1024 input tokens,
+128 generated tokens, greedy/ignore-EOS synthetic timing, complete atomic cohorts.
+Pure decode excludes prefill and the first/last eight eligible engine intervals.
+Separate natural greedy checks retain EOS: all four complete normally, including
+the Chinese lunar explanation matching the earlier llama.cpp reference.
+
+| Input tokens | Prefill (s) | TTFT (s) |
+| ---: | ---: | ---: |
+| 8192 | 2.5154 | 2.5186 |
+| 32768 | 10.6431 | 10.6538 |
+
+Prefill averages two runs with one generated token after warmup. These results
+exclude startup: weight preparation took about 237 seconds and initial graph
+capture about 240 seconds. The packaged core fingerprint remains
+`5cd0fa29e533f92644e012c57fe7b439293bf360e8988b8d73d7bbef54839f6a`.
+The native NVFP4 comparison and common quality set are still pending; this table
+does not establish native-path performance parity or full quality validation.
