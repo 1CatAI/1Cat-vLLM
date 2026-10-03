@@ -222,3 +222,19 @@ capability/configuration dispatch; final users must not set tuning variables.
   when reduced reductions are enabled. Loader/dispatch CPU gates pass 26
   tests. Full-model numerical, quality, acceptance and speed gates are pending;
   this candidate is separate from the startup/memory repair.
+
+- Add post-speed teacher-forcing capture in the same engine, preserving the
+  target M5 graph and running only the diagnostic draft eagerly. Restore
+  original runner methods even when a dump fails. Two alignment/restoration
+  CPU tests pass; real-model capture remains pending.
+- Freeze sixteen 8K teacher-forcing prompts (four GSM8K, four HumanEval,
+  four Chinese explanations, four exact-key retrieval cases), each with
+  160 reference continuation tokens plus padding. Reference tapes are
+  independent of model-generated outputs. Manifest SHA256:
+  `44ccb3ad6bea479c6b6c33d3c2bc44985283039e04ec41d2de05006fafeb4062`. Retain it under
+  `.artifacts/mtp15/teacher_forcing_manifest.json`; never use forced requests
+  for latency or natural acceptance.
+- Remote GPUs were subsequently acquired by another task in the
+  `qwen38-nomtp-20261003` worktree. Preserve that task and wait for its existing
+  common TP4 lease before launching this campaign. No current default
+  complete-round measurement has passed admission yet.

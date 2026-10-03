@@ -25,6 +25,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--startup-diagnostics", action="store_true")
+    parser.add_argument("--teacher-forcing-manifest", type=Path)
+    parser.add_argument("--quality-manifest", type=Path)
     args = parser.parse_args()
     # Importing vLLM applies platform defaults. Audit first to distinguish
     # those framework defaults from user-supplied performance variables.
@@ -220,10 +222,85 @@ def main() -> None:
                     ),
                     flush=True,
                 )
-        report["complete"] = True
+        report["speed_complete"] = True
         report["latency_passed"] = all(
             row["complete_round_ms"] <= 15 for row in report["cases"]
         )
+        save()
+        # Diagnostics follow the completed unprofiled speed report and use no
+        # timing or acceptance counters from their forced requests.
+        if args.teacher_forcing_manifest:
+            from benchmarks.sm70_mtp_teacher_forcing import flush, install
+
+            tapes = json.loads(args.teacher_forcing_manifest.read_text())
+            report["teacher_forcing"] = []
+            for tape in tapes:
+                llm.reset_prefix_cache()
+                folder = args.out.parent / "teacher_forcing" / tape["id"]
+                llm.collective_rpc(
+                    install,
+                    args=(
+                        tape["token_ids"],
+                        tape["prompt_length"],
+                        tape["prompt_sha256"],
+                        str(folder),
+                    ),
+                )
+                succeeded = False
+                try:
+                    output = llm.generate(
+                        [
+                            {
+                                "prompt_token_ids": tape["token_ids"][
+                                    : tape["prompt_length"]
+                                ]
+                            }
+                        ],
+                        SamplingParams(
+                            temperature=0,
+                            ignore_eos=True,
+                            max_tokens=tape["output_length"],
+                        ),
+                        use_tqdm=False,
+                    )[0]
+                    expected = tape["token_ids"][
+                        tape["prompt_length"] : tape["prompt_length"]
+                        + tape["output_length"]
+                    ]
+                    if list(output.outputs[0].token_ids) != expected:
+                        raise RuntimeError(
+                            "Teacher-forcing output differs from frozen tape"
+                        )
+                    succeeded = True
+                finally:
+                    result = llm.collective_rpc(
+                        flush, kwargs={"discard": not succeeded}
+                    )
+                report["teacher_forcing"].append({"id": tape["id"], "workers": result})
+                save()
+        if args.quality_manifest:
+            report["quality"] = []
+            for case in json.loads(args.quality_manifest.read_text()):
+                llm.reset_prefix_cache()
+                before = _metric_snapshot(llm)
+                output = llm.generate(
+                    [{"prompt_token_ids": case["prompt_token_ids"]}],
+                    SamplingParams(**case["sampling"]),
+                    use_tqdm=False,
+                )[0]
+                report["quality"].append(
+                    {
+                        "id": case["id"],
+                        "token_ids": list(output.outputs[0].token_ids),
+                        "text": output.outputs[0].text,
+                        "finish_reason": output.outputs[0].finish_reason,
+                        "spec_decoding": _spec_decoding_delta(
+                            before, _metric_snapshot(llm)
+                        ),
+                    }
+                )
+                save()
+        report["complete"] = True
         save()
     except BaseException:
         import traceback
