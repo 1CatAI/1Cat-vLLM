@@ -260,3 +260,43 @@ proposal probabilities despite improving local reference error. Require a
 fixed-prefix full-head and selector comparison before model timing. Source
 integration and native artifact tests are in progress; no private extension
 is eligible as a serving dependency or performance result.
+
+### Matched seeded sliding-window comparison
+
+The frozen source-complete control and sliding-only wheel now have matching
+seeded results. Each context uses three fixtures at temperature 0.7 and zero,
+request seed 123, and distinct C4 seeds 123–126. Settings and input fixtures
+are unchanged from the baseline above.
+
+| Matched result | Frozen control | Sliding split |
+| --- | ---: | ---: |
+| 1K temperature-0.7 complete interval, three fixtures | 18.523–18.684 ms | 18.180–18.205 ms |
+| 8K temperature-0.7 complete interval, three fixtures | 19.054–19.189 ms | 18.580–18.666 ms |
+| 1K fixture 2, emitted tokens per round | 2.924 | 2.057 |
+| C4 1K common steady window | 441.44 tok/s | 344.32 tok/s |
+| C4 8K common steady window | 406.62 tok/s | 394.23 tok/s |
+
+All six greedy token sequences match; stochastic sequences match only one
+fixture per context. Three separate natural-EOS questions match complete
+responses and stopping, with 156, 206 and 98 emitted tokens. Neither those
+short quality matches nor the small operator error qualify the sliding split:
+the seeded acceptance loss and roughly 22%/3% C4 regressions reject promotion.
+Use identical prefixes to compare full draft-head logits and proposal support
+before another performance run. Repeating response-dependent benchmarks alone
+would not localize this failure.
+
+The combined native wheel builds through normal CMake, passes clean-artifact
+and dependency checks, and passes all five FP16 M8 operator/graph tests. Its
+SHA256 is
+`15ee5d31004bd109c85d239f886f112a1a4bf4a2f3c34f8139fd5e06e238b52d`.
+The FP32-head tests fail exact agreement with the old FP16-rounded output at
+both M1 and M8; the dispatch cache does include output dtype. Diagnose selected
+kernel geometry and compare an independent numerical reference before admitting
+that path. These failures are preserved, not waived as a precision improvement.
+
+A new greedy compact route reuses the reference prefix-accept loop and exact
+TP-local argmax pairs, including vocabulary ties and the bonus row. Seventeen
+CPU sampling-contract tests pass. GPU graph/rejection equivalence and installed
+model validation remain required. A normal Python packaging build includes
+this source while retaining all sixteen native libraries byte for byte from
+the owned complete build; it is not a serving overlay.

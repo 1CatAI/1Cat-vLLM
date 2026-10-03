@@ -49011,6 +49011,19 @@ precedence. These are compatibility aliases for one full released cycle;
 registrations and public control counts do not decrease in this step. Native
 arithmetic, forwarding code and the scored selector remain unchanged.
 
+### Original unsloth DFlash2 latency admission: seeded control
+
+The new V100 TP4 host uses the original FP8-head unsloth checkpoint, max length
+262144, 1K/8K inputs and the same frozen source-complete control. Matched seeds
+show that the sliding-window split saves 0.35–0.54 ms per single-request round,
+but one 1K fixture loses tokens/round from 2.924 to 2.057. C4 common-window
+throughput drops 441.44→344.32 tok/s at 1K and 406.62→394.23 at 8K. Reject default
+promotion pending a fixed-prefix full-head and proposal audit. All six greedy
+token sequences and three natural-EOS responses match; those do not erase the
+acceptance or concurrency failure. See the
+[latency design](sm70_unsloth_dflash2_12ms.md) for artifact identity and full
+criteria. This experiment does not establish 35B AWQ/FP8 migration parity.
+
 ### Retire DFlash2 candidate-order research override
 
 Remove the failed candidate-order environment registration and both typed
