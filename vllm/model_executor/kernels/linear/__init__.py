@@ -58,6 +58,10 @@ from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     Sm70AwqLinearLayerConfig,
     TurboMindAwqLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+    Sm70GgufAffineConfig,
+    TurboMindGgufAffineKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -208,6 +212,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         TuringQpn8Fp8LinearKernel,
         QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindAwqLinearKernel,
+        TurboMindGgufAffineKernel,
         TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
@@ -368,6 +373,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TurboMindGgufAffineKernel,
         TurboMindAwqLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
@@ -780,7 +786,15 @@ def choose_mp_linear_kernel(
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
 
-    if isinstance(config, Sm70AwqLinearLayerConfig):
+    if isinstance(config, Sm70GgufAffineConfig):
+        # Canonical GGUF codes and additive coefficients are not GPTQ/AWQ
+        # checkpoint packing. Report admission failures rather than reinterpret.
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindGgufAffineKernel)
+        ]
+    elif isinstance(config, Sm70AwqLinearLayerConfig):
         # Other MP kernels accept GPTQ packing, not the legacy AWQ GEMM
         # checkpoint packing. The format adapter retains its Triton fallback.
         platform_kernels = [
@@ -1237,6 +1251,8 @@ __all__ = [
     "TritonInt8ScaledMMLinearKernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
+    "Sm70GgufAffineConfig",
+    "TurboMindGgufAffineKernel",
     "AllSparkLinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",

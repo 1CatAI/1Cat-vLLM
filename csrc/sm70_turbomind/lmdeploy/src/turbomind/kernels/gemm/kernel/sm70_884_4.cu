@@ -71,6 +71,26 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 
 void Registry::sm70_884_4() {
   {
+    // Canonical GGUF u4 uses per-group scale plus additive bias, in the
+    // existing affine metadata layout. Dense group-32 tiles complement the
+    // grouped group-32 kernels below; they retain the same mma884 arithmetic.
+    using C = Config_U4_d<kColMajor>;
+    // Match the established dense affine tile repertoire. The metadata group
+    // width is a decoding contract, not a reason to force narrower N tiles.
+    Add<C::Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1, 32, 128, 128>>();
+    Add<C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>>();
+    Add<C::Type<64, 128, 16, 1, 4, 1, D, S, 2, true, 1, 32, 32, 128>>();
+    Add<C::Type<32, 256, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<16, 256, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<8, 256, 64, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    Add<C::Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+  }
+  {
     using B = Config_QuantizedBatch<fp4_e2m1_t, kColMajor>;
     using Rows32 = B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>;
     using Full64 =

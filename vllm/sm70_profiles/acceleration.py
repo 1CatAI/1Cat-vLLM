@@ -88,6 +88,9 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
                 )
                 if name not in row["layers"]:
                     row["layers"].append(name)
+                capability = getattr(kernel, "capability", None)
+                if capability is not None and is_dataclass(capability):
+                    row["operator_admission"] = asdict(capability)
     return result
 
 
