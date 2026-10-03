@@ -85,8 +85,14 @@ is also zero. These particular prefixes show no distribution change.
 
 Isolated MBPP-9 repeats retain its original seed 4207. Both arms pass three
 times, stop naturally at 758 output tokens and produce identical continuations.
-This does not erase the full-suite failure. A prefix reproduction now includes
+This does not erase the full-suite failure. The prefix reproduction includes
 the original 8K timing requests and preceding MBPP cases, then repeats MBPP-9.
+Both arms pass all nine diagnostic calls. Each MBPP-9 repeat again ends at
+758 tokens with natural EOS; all paired continuations match. The original
+full-suite capped output has not been reproduced or explained, so it remains
+an unresolved health-gate failure. The diagnostics do not establish a wrong
+row or erase that result. Given the measured 0.180-ms benefit, this line is
+parked pending a justified full qualification rather than further blind runs.
 The diagnostic modes preserve original case indices/seeds and label their
 reports as diagnostic-only; ordinary suite execution is unchanged.
 
