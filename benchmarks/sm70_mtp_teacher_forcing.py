@@ -22,6 +22,8 @@ def install(worker, token_ids, prompt_length, prompt_sha256, folder):
         raise ValueError("This observer requires the V2 MTP runner")
     if hasattr(runner, "_mtp15_forcing"):
         raise ValueError("Observer already installed")
+    if any(type(token) is not int for token in token_ids):
+        raise ValueError("Teacher forcing expects integer token IDs")
     if len(token_ids) <= prompt_length + 8:
         raise ValueError("Need a continuation and final draft padding")
     tape = torch.tensor(token_ids, device=runner.device, dtype=torch.int64)

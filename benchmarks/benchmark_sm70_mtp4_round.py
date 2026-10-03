@@ -27,7 +27,17 @@ def main() -> None:
     parser.add_argument("--startup-diagnostics", action="store_true")
     parser.add_argument("--teacher-forcing-manifest", type=Path)
     parser.add_argument("--quality-manifest", type=Path)
+    parser.add_argument("--diagnostics-only", action="store_true")
+    parser.add_argument(
+        "--greedy-draft-vocab",
+        action="store_true",
+        help="Screen development candidate; no default admission claim",
+    )
     args = parser.parse_args()
+    if args.diagnostics_only and not (
+        args.teacher_forcing_manifest or args.quality_manifest
+    ):
+        parser.error("diagnostics-only requires forcing or quality cases")
     # Importing vLLM applies platform defaults. Audit first to distinguish
     # those framework defaults from user-supplied performance variables.
     supplied = {
@@ -55,6 +65,13 @@ def main() -> None:
         add_special_tokens=False,
     )
     fixed = (piece * (8192 // len(piece) + 1))[:8192]
+    tapes = None
+    if args.teacher_forcing_manifest:
+        from benchmarks.sm70_teacher_forcing_metrics import validate_manifest
+
+        tapes = validate_manifest(
+            json.loads(args.teacher_forcing_manifest.read_text()), len(tokenizer)
+        )
     fixtures = [{"id": "fixed8k", "prompt_token_ids": fixed, "natural": False}]
     for index, question in enumerate(
         (
@@ -115,6 +132,8 @@ def main() -> None:
             "draft_sample_method": "greedy",
         },
     }
+    if args.greedy_draft_vocab:
+        engine["kernel_config"] = {"sm70_mtp_greedy_draft_vocab": True}
     if args.teacher_forcing_manifest:
         engine["worker_extension_cls"] = (
             "benchmarks.sm70_mtp_admission_worker.MtpAdmissionExtension"
@@ -147,7 +166,7 @@ def main() -> None:
         llm = LLM(**copy.deepcopy(engine))
         report["load_seconds"] = time.monotonic() - started
         report["resolved_engine"] = str(llm.llm_engine.vllm_config)
-        for fixture in fixtures:
+        for fixture in [] if args.diagnostics_only else fixtures:
             sampling = (
                 {
                     "temperature": 1.0,
@@ -226,15 +245,15 @@ def main() -> None:
                     ),
                     flush=True,
                 )
-        report["speed_complete"] = True
-        report["latency_passed"] = all(
+        report["speed_complete"] = not args.diagnostics_only
+        report["latency_passed"] = not args.diagnostics_only and all(
             row["complete_round_ms"] <= 15 for row in report["cases"]
         )
         save()
         # Diagnostics follow the completed unprofiled speed report and use no
         # timing or acceptance counters from their forced requests.
         if args.teacher_forcing_manifest:
-            tapes = json.loads(args.teacher_forcing_manifest.read_text())
+            assert tapes is not None
             report["teacher_forcing"] = []
             for tape in tapes:
                 llm.reset_prefix_cache()

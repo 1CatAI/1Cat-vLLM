@@ -122,3 +122,34 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def validate_manifest(tapes, vocabulary):
+    """Reject malformed forcing data before expensive model initialization."""
+    import hashlib
+    import json
+
+    if not isinstance(tapes, list) or not tapes:
+        raise ValueError("Teacher-forcing manifest must contain cases")
+    seen = set()
+    for case in tapes:
+        ids = case["token_ids"]
+        prompt = case["prompt_length"]
+        output = case["output_length"]
+        if not isinstance(ids, list) or any(type(t) is not int for t in ids):
+            raise ValueError(
+                "Teacher-forcing token_ids must be integers, not tokenizer mapping keys"
+            )
+        if any(t < 0 or t >= vocabulary for t in ids):
+            raise ValueError("Teacher-forcing token IDs outside vocabulary")
+        if prompt != 8192 or output <= 0 or len(ids) < prompt + output + 8:
+            raise ValueError(
+                "Teacher-forcing requires 8K prompt and continuation padding"
+            )
+        actual = hashlib.sha256(json.dumps(ids[:prompt]).encode()).hexdigest()
+        if actual != case["prompt_sha256"]:
+            raise ValueError("Teacher-forcing prompt SHA mismatch")
+        if case["id"] in seen:
+            raise ValueError("Duplicate teacher-forcing case ID")
+        seen.add(case["id"])
+    return tapes

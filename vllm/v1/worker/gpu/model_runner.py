@@ -1375,6 +1375,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         top_ids[:, 0].tolist(),
                         (top_values[:, 0] - top_values[:, 1]).tolist(),
                     )
+            draft_vocab = getattr(self.speculator, "greedy_draft_vocab", None)
+            if draft_vocab is not None and logits is not None:
+                draft_vocab.observe_target_logits(
+                    logits, prefill=input_batch.num_draft_tokens == 0
+                )
             if grammar_output is not None:
                 # Apply grammar bitmask to the logits in-place.
                 assert self.structured_outputs_worker is not None

@@ -315,3 +315,37 @@ retain their negative/small results without repeating them.
   replacement smoke explicitly initializes CUDA as model workers do; this
   hypothesis is pending, not an admitted repair. Keep the original failure
   under `remote_pinned_gpu_gate.log` and do not repeat the passed mapped gate.
+
+- First frozen default-disk complete-round control (remote full-NV2 TP4,
+  185-W cap, FP16, max length 262144, fixed 8192 input, no supplied VLLM
+  variables and no profiler): synthetic greedy round 22.085/22.169/22.134 ms;
+  four natural prompts span 23.932--24.407 ms. Natural steady decode spans
+  144.82--172.46 tokens/s, mean acceptance length 3.524--4.190 and acceptance
+  per proposed draft token 63.10--79.75%. Synthetic AL is 1.646 (16.16%);
+  do not use that repetitive fixture as a natural acceptance gate. Every
+  repeat has identical tokens. Two natural fixtures reach their 512-token
+  budget; correctness/long-output admission remains pending. All fifteen
+  speed cases completed before the later forcing failure. This baseline is
+  not <=15 ms. Raw local copies: `.artifacts/mtp15/remote_disk_baseline.*`.
+- The original forcing manifest is invalid: chat-template BatchEncoding keys
+  were mistakenly iterated as tokens. No numerical rows were accepted. Keep
+  invalid SHA `44ccb3ad6bea479c6b6c33d3c2bc44985283039e04ec41d2de05006fafeb4062`
+  as a rejected manifest. Corrected sixteen unique 8K prompts use the frozen
+  dataset input IDs and integer continuations; new SHA is
+  `989bc2fc544afe89b63d1c4eab012ff85dd72e4a6bd178dc4fa9cd95eeb5d66c`.
+  The shared MTP alignment tool validates integer IDs, vocabulary, prompt SHA
+  and padding before model initialization. Diagnostics-only operation avoids
+  rerunning completed speed cases. Seven preflight checks pass.
+- First reduced greedy draft bridge reuses existing GPU LRU, packaged TP4
+  ranking and tail refresh operators. Base 98304 plus 512 tail rows/rank;
+  gather only a value/ID pair, preserving original-ID ties. Do not retrain
+  using forcing/quality references. Four CPU selection/bootstrap/transport
+  cases pass. Development config is disabled pending actual proposal top-1,
+  natural acceptance, quality and full-round benefit; final automatic default
+  remains a required admission step. Raw full logits stay on the ordinary
+  head for shared numerical comparison, with actual reduced decisions
+  separately observed. Head overlap and adaptive width are not implemented
+  or counted as speed improvements yet.
+- CUDA initialization resolves the optional pinned smoke's is_pinned check;
+  remote normal-source UVA size/lifetime smoke passes with exactly 3 MiB.
+  The failed uninitialized smoke is retained. No native workaround needed.

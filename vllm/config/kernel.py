@@ -484,6 +484,9 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    sm70_mtp_greedy_draft_vocab: bool = False
+    """Develop reduced greedy MTP proposals; numerical/acceptance gates pending."""
+
     ple_draft_prefetch: bool = True
     """Warm bounded disk PLE rows while the remaining MTP draft runs."""
     ple_draft_prefetch_cache_bytes: int = Field(default=8 * 1024**2, ge=0)

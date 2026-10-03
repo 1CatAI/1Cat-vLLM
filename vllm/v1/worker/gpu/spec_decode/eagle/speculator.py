@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -37,6 +37,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     PrefillEagleCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+
+if TYPE_CHECKING:
+    from vllm.v1.spec_decode.sm70_greedy_draft_vocab import Sm70GreedyDraftVocab
 
 logger = init_logger(__name__)
 
@@ -93,6 +96,7 @@ class EagleSpeculator:
         self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
+        self.greedy_draft_vocab: Sm70GreedyDraftVocab | None = None
         self.use_local_argmax_reduction = (
             self.speculative_config.use_local_argmax_reduction
         )
@@ -190,6 +194,8 @@ class EagleSpeculator:
 
         self.model = load_eagle_model(target_model, self.vllm_config)
         self._validate_local_argmax_reduction()
+        if self.vllm_config.kernel_config.sm70_mtp_greedy_draft_vocab:
+            self._initialize_sm70_greedy_draft_vocab()
 
         draft_hf_config = self.draft_model_config.hf_config
         self.share_mtp_topk_indices = (
@@ -207,6 +213,38 @@ class EagleSpeculator:
         ).keys()
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
+        )
+
+    def _initialize_sm70_greedy_draft_vocab(self) -> None:
+        from vllm.v1.spec_decode.sm70_greedy_draft_vocab import Sm70GreedyDraftVocab
+
+        head = getattr(self.model, "lm_head", None)
+        if not (
+            self.method == "mtp"
+            and self.use_local_argmax_reduction
+            and self.num_speculative_steps == 4
+            and self.max_num_reqs == 1
+            and self.vllm_config.parallel_config.tensor_parallel_size == 4
+            and current_platform.is_device_capability(70)
+            and self.draft_model_config.architecture == "Qwen4ExpMTP"
+            and head is not None
+            and head.weight.dtype == torch.float16
+            and head.num_embeddings_padded == 248320
+            and head.num_added_embeddings == 0
+            and head.shard_indices.num_org_vocab_padding == 0
+        ):
+            raise ValueError(
+                "Reduced SM70 greedy draft vocabulary configuration unsupported"
+            )
+        self.greedy_draft_vocab = Sm70GreedyDraftVocab(
+            head, self.device, tp_size=4, size=98304
+        )
+        # Full raw logits remain available for the shared distribution observer;
+        # actual proposal decisions go through the same observed model method.
+        self.model.get_top_tokens = self.greedy_draft_vocab.get_top_tokens
+        logger.info(
+            "SM70 greedy MTP draft vocabulary selected: base=98304, "
+            "tail=512/rank; acceptance admission pending"
         )
 
     def set_attn(
