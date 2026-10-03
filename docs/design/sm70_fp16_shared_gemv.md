@@ -194,3 +194,46 @@ the model matrix has 248320 rows. New manifests exclude the 243 padding rows.
 Recomputing the retained 768-position comparison over valid IDs leaves the
 failure unchanged. The worst raw-logit error belongs to valid token 622, so
 padding was a probe bug but does not explain this candidate's failure.
+
+## FP32 compensation candidate
+
+Same-input arithmetic snapshots cover four ranks and 48 layers at the first
+English decode position. The instrumented default's two logit rows match the
+retained default exactly. The first shared-output difference is 1.90735e-6
+at layer zero on rank two; the next layer's shared input differs by 0.00146484.
+These observations locate the first change but do not assign the amplification
+to a particular subsequent operation. The baseline is not multiplying in
+FP16: a half-rounded-product hypothesis disagrees with 203869 down elements,
+versus 156 for the exact-product reference, across 491520 elements.
+
+The fused SiLU expression also differed from the native FP32 exp/div at two
+of 63488 finite FP16 arguments. Standard exp and round-to-nearest division
+match all native results in that diagnostic. The installed-source regression
+uses K=1 to isolate activation arithmetic from reduction order.
+
+The new candidate accumulates a high and correction component, both FP32,
+and compensates its reduction. Weights, inputs, projection materializations
+and final outputs stay FP16. It uses no FP64 arithmetic. On the 192 retained
+gate/up snapshots, all 30720 output elements match the independently computed
+FP64 reference after FP16 materialization; the earlier candidate differs at
+18 elements and the vendor route at 32. This operator result is not the
+model distribution gate. An explicit cancellation regression checks that a
+small term between positive and negative large terms survives at M1 and M5.
+
+Cold measurements rotate all 48 checkpoint layers with five alternating
+samples on each TP4 rank mapping. Median projection times across the four
+rank mappings are:
+
+| Projection | Vendor us | Compensated candidate us |
+|---|---:|---:|
+| Gate/up + SiLU-and-multiply | 10.746 | 6.407 |
+| Plain gate/up | 8.350 | 5.299 |
+| Down | 4.666 | 4.784 |
+
+The compensated down does not win this measurement. Startup admission now
+requires the candidate's upper quartile to be below the vendor's lower
+quartile; an overlap retains the vendor. The existing range/SiLU provider
+keeps its original accumulation mode, and only the measured linear candidate
+opts into compensation. Source-complete installed GPU tests and the focused
+C1 distribution comparison are pending for the new artifact. Do not carry
+forward the earlier artifact's task or timing results as its qualification.
