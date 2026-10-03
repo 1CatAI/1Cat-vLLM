@@ -1596,6 +1596,9 @@ class VllmConfig:
             self.cache_config.cache_dtype_from_checkpoint = False
 
         self.try_verify_and_update_config()
+        # Models may have supplied their own DCP defaults above; anything still
+        # unset falls back to the stock ones.
+        self.parallel_config.set_dcp_defaults()
 
         from vllm.model_executor.models.config import (
             sm70_dflash2_nvfp4_qualified,

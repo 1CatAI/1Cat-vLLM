@@ -293,18 +293,40 @@ def test_only_qsa_main_cache_scales_move_to_the_merged_owner(
     assert _remap_qsa_cache_scale_name(checkpoint_name, frozenset({0})) == model_name
 
 
-def test_qsa_e4m3_loader_requires_all_24_scales() -> None:
+def test_qsa_e4m3_loader_requires_all_24_scales(monkeypatch) -> None:
+    """An incomplete E4M3 scale overlay is reported, and fatal only in strict mode.
+
+    The default is a warning plus the missing-scale set, so an uncalibrated
+    checkpoint still serves on unit scales. Production opts into the hard
+    failure with VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1. This test pins both
+    halves: the earlier version only asserted the strict branch while leaving
+    the env unset, so it never exercised either one.
+    """
     required = {
         f"layers.{layer}.self_attn.{kind}_scale"
         for layer in range(12)
         for kind in ("k", "v")
     }
-    _validate_qsa_e4m3_scale_load(required, required, "fp8_e4m3")
+    incomplete = required - {next(iter(required))}
+
+    monkeypatch.setattr(
+        qwen4_exp_model.envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", False
+    )
+    assert _validate_qsa_e4m3_scale_load(required, required, "fp8_e4m3") == set()
+    # Non-strict: the caller gets the missing names back instead of an error.
+    assert _validate_qsa_e4m3_scale_load(required, incomplete, "fp8") == (
+        required - incomplete
+    )
+
+    monkeypatch.setattr(
+        qwen4_exp_model.envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", True
+    )
+    assert _validate_qsa_e4m3_scale_load(required, required, "fp8_e4m3") == set()
     with pytest.raises(ValueError, match="Loaded 23/24"):
-        _validate_qsa_e4m3_scale_load(
-            required, required - {next(iter(required))}, "fp8"
-        )
-    _validate_qsa_e4m3_scale_load(required, set(), "float16")
+        _validate_qsa_e4m3_scale_load(required, incomplete, "fp8")
+
+    # A non-FP8 cache never consults the overlay in either mode.
+    assert _validate_qsa_e4m3_scale_load(required, set(), "float16") == set()
 
 
 def test_qsa_e4m3_uses_sentinel_not_unit_value_as_load_signal() -> None:
