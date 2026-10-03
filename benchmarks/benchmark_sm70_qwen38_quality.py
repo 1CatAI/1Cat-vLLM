@@ -133,6 +133,14 @@ def run(args):
     out.mkdir(parents=True, exist_ok=True)
     model = str(args.model)
     suite = json.loads(args.cases.read_text())
+    case_rows = [
+        (index, repeat, case)
+        for index, case in enumerate(suite["cases"])
+        if args.diagnostic_case_id is None or case["id"] == args.diagnostic_case_id
+        for repeat in range(args.diagnostic_repeats if args.diagnostic_case_id else 1)
+    ]
+    if not case_rows or args.diagnostic_repeats < 1:
+        raise ValueError("Unknown diagnostic case or invalid repeat count")
     import torch
     from transformers import AutoTokenizer
 
@@ -144,6 +152,7 @@ def run(args):
 
     report = {
         "complete": False,
+        "diagnostic_only": args.diagnostic_case_id is not None,
         "runtime": vllm.__version__,
         "runtime_path": vllm.__file__,
         "torch": str(torch.__version__),
@@ -159,6 +168,7 @@ def run(args):
             "tp": 4,
             "dtype": "float16",
             "kv": "float16",
+            "ssm_state": "float32",
             "max_len": 262144,
             "max_num_seqs": 1,
             "budget": 8192,
@@ -209,34 +219,35 @@ def run(args):
             "get_sm70_acceleration_report", timeout=30
         )
         save()
-        chunk = tok.encode(
-            "This fixed benchmark prompt is used to create a deterministic "
-            "tokenized input for single-request decode measurement. ",
-            add_special_tokens=False,
-        )
-        ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
-        llm.generate(
-            [{"prompt_token_ids": ids}],
-            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
-            use_tqdm=False,
-        )
-        for i in range(6):
-            o = llm.generate(
+        if args.diagnostic_case_id is None:
+            chunk = tok.encode(
+                "This fixed benchmark prompt is used to create a deterministic "
+                "tokenized input for single-request decode measurement. ",
+                add_special_tokens=False,
+            )
+            ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
+            llm.generate(
                 [{"prompt_token_ids": ids}],
-                SamplingParams(
-                    temperature=0,
-                    top_p=1,
-                    top_k=-1,
-                    seed=0,
-                    max_tokens=513,
-                    ignore_eos=True,
-                ),
+                SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                 use_tqdm=False,
-            )[0]
-            report["timing"].append(metrics(o))
-            save()
-            print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
-        for i, case in enumerate(suite["cases"]):
+            )
+            for i in range(6):
+                o = llm.generate(
+                    [{"prompt_token_ids": ids}],
+                    SamplingParams(
+                        temperature=0,
+                        top_p=1,
+                        top_k=-1,
+                        seed=0,
+                        max_tokens=513,
+                        ignore_eos=True,
+                    ),
+                    use_tqdm=False,
+                )[0]
+                report["timing"].append(metrics(o))
+                save()
+                print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
+        for i, repeat, case in case_rows:
             prompt_ids = prompt_token_ids(case, tok)
             o = llm.generate(
                 [{"prompt_token_ids": prompt_ids}],
@@ -248,6 +259,8 @@ def run(args):
             record = {
                 "id": case["id"],
                 "category": case["category"],
+                "seed": 4201 + i,
+                "repeat": repeat,
                 "input_tokens": len(prompt_ids),
                 "prompt_token_sha256": hashlib.sha256(
                     json.dumps(prompt_ids).encode()
@@ -277,8 +290,10 @@ def run(args):
             }
             for category in ("mbpp", "gsm8k", "chinese", "needle")
         }
-        report["median_tpot_ms"] = statistics.median(
-            r["tpot_ms"] for r in report["timing"]
+        report["median_tpot_ms"] = (
+            statistics.median(r["tpot_ms"] for r in report["timing"])
+            if report["timing"]
+            else None
         )
         report["complete"] = True
         save()
@@ -297,6 +312,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ple-sample-prefetch", action=argparse.BooleanOptionalAction, default=None
     )
+    parser.add_argument("--diagnostic-case-id")
+    parser.add_argument("--diagnostic-repeats", type=int, default=3)
     args = parser.parse_args()
     # Resolve defaults in a fresh process, before importing the runtime.
     for key in list(os.environ):
