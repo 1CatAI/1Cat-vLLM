@@ -300,3 +300,48 @@ CPU sampling-contract tests pass. GPU graph/rejection equivalence and installed
 model validation remain required. A normal Python packaging build includes
 this source while retaining all sixteen native libraries byte for byte from
 the owned complete build; it is not a serving overlay.
+
+### Head and sampler operator closure
+
+The first FP32-head discrepancy was a dispatch change: at M1 the FP16 head
+selected an 8x128x64 tile with fourteen K splits, while the only FP32 candidate
+used 8x128x32 with ten. At M8 the corresponding choices were 8x256x64 with
+sixteen splits and 8x128x32 with four. Output dtype was present in the cache;
+the missing counterpart geometries changed the reduction tree.
+
+The correction dispatches against the original FP16 descriptor and replaces
+only its output-store kernel, preserving tile, swizzle and K partition.
+Thirteen ordinary channel-FP8 configurations have counterparts outside the
+ordinary tuning registry. The complete corrected wheel SHA256 is
+`9eaa142567499df8440d12b6ab6f2b27b95c7dcf91c29523d70319792115230c`.
+Both M1/M8 changing-input graph tests now pass exact FP16-rounded agreement.
+Actual model logits, proposal support and the quality thresholds remain open.
+
+The greedy specialization initially still type-checked the dense LSE branch
+against integer dummy pointers. A constexpr short circuit removes that branch.
+All four graph/rejection tests pass both as source units and from the installed
+complete wheel, comparing valid tokens and counts with the frozen dense
+implementation. They cover each rejection position, the bonus row, ragged
+requests, vocabulary-block/shard ties and FP16/FP32 logits. This closes operator
+equivalence, not complete model performance or all sampling contracts.
+
+The first direct-push collective/norm experiment passes exact residual and
+one-ULP normalized-output checks, but loses latency: FP16-weight critical means
+are 10.680→15.323 us and FP32-weight means are 10.021→14.031 us. Its source
+changes are withdrawn; keep the ordinary push plus norm. No decode fusion
+pattern is registered from this result.
+
+The PRMT/LUT decoder prototype matches every E2M1 code against all 65536 half
+scale bit patterns and a million mixed packed words, including exceptional
+values. Original-layout, original-shard M8 outputs match bitwise across changing
+graph inputs. The warmed gate/up operator nevertheless regresses 38.619→40.846
+us, while down improves only 20.430→20.146 us. Reject broad promotion; warmed
+operator timings are not whole-model bandwidth evidence. The first harness
+passed int32 TurboMind storage to a byte-code interface; the corrected byte
+view changes no values. Both harness outcomes are retained.
+
+A CUDA 12.8 conditional-graph probe passes changing IF/ELSE inputs on SM70.
+This permits investigation of a device-side compact/reference decision without
+the per-round CPU probe copy. The native graph attachment primitive and its
+captured-child tests are being built; model integration and sampler distribution
+equivalence remain required before any timing claim.
