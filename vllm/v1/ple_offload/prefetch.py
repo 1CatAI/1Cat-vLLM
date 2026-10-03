@@ -45,6 +45,9 @@ class SampledKeyReader:
         self._load = functions[1]
         self._payload_load = functions[1]
         self._payload = payload
+        # The registration message is temporary. Keep the shared storage alive
+        # for every atomic read, just as we do for the payload below.
+        self._flag = flag
         self._flag_pointer = flag.data_ptr()
         self._seen = 0
 

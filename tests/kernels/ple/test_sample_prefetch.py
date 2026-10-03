@@ -1,10 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
+import weakref
+
 import pytest
 import torch
 
 from vllm.v1.ple_offload.prefetch import ExactRowPrefetchCache, SampledKeyReader
+
+
+def test_mailbox_owns_flag_after_registration_is_released():
+    payload = torch.tensor([[1, 7, 8, 9]], dtype=torch.int32).share_memory_()
+    flag = torch.full((16,), 2, dtype=torch.int32).share_memory_()
+    flag_reference = weakref.ref(flag)
+    reader = SampledKeyReader(payload, flag)
+    del payload, flag
+    gc.collect()
+    # Check ownership before dereferencing: an unowned address may segfault.
+    assert flag_reference() is not None
+    assert reader.read() == [(7, 8, 9)]
+    del reader
+    gc.collect()
+    assert flag_reference() is None
 
 
 def test_reordered_reused_request_slots_preserve_owned_exact_rows():
