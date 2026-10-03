@@ -4425,9 +4425,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "defaults are listed below."
         ),
         category="deprecated",
-        declared_default="1024",
+        declared_default="256",
         effective_default=(
-            "1024; the selected prefill dispatcher also checks its runtime M "
+            "256; the selected prefill dispatcher also checks its runtime M "
             "and layout."
         ),
         automatic_conditions=(),
