@@ -40,3 +40,10 @@ IQ3_S and 10,066,329,600 IQ3_XXS values. Uniform TP4 slicing adds an estimated
 502,804,480 bytes (about 480 MiB) of packed weights and coefficients per rank
 relative to the previous canonical representation. This is a storage estimate,
 not a measured model memory peak; PLE and runtime workspaces are excluded.
+
+The first GPU attempt aborted in IQ3 GEMM while IQ2 checks passed. The widened
+packet's second low-index extraction lacked its byte mask, so sign bits entered
+the codebook address. The extraction now masks both low indices before adding
+high bits. CPU packet inversion had already masked both bytes; GPU oracle and
+capture checks must pass after rebuilding this correction. No timing from the
+failed attempt is used.

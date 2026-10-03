@@ -52,7 +52,7 @@ struct Transform_HMMA_SM70_Lattice {
         table_values = *reinterpret_cast<const uint64_t*>(grid+index*8);
       } else {
         const int first = (packet & 255) | (((packet >> 24) & 1) << 8);
-        const int second = (packet >> 8) | (((packet >> 25) & 1) << 8);
+        const int second = ((packet >> 8) & 255) | (((packet >> 25) & 1) << 8);
         const uint32_t low = *reinterpret_cast<const uint32_t*>(grid+first*4);
         const uint32_t high = *reinterpret_cast<const uint32_t*>(grid+second*4);
         table_values = low | (static_cast<uint64_t>(high) << 32);
