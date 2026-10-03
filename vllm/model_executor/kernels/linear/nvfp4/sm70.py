@@ -258,7 +258,10 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             logger.info_once(
                 "QPN2 activation packing unavailable: rebuild the native extension."
             )
-        elif hasattr(torch.ops._C, "nvfp4_qpn2_activation_pack_reason_sm70") and (
+        elif (
+            getattr(layer, sm70_tm.STATE_ATTR).weight.is_cuda
+            and hasattr(torch.ops._C, "nvfp4_qpn2_activation_pack_reason_sm70")
+        ) and (
             reason := torch.ops._C.nvfp4_qpn2_activation_pack_reason_sm70(
                 getattr(layer, sm70_tm.STATE_ATTR).weight, k, n, split_k
             )
