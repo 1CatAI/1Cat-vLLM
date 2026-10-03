@@ -484,6 +484,13 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
+    """Select CPU PLE result transport by local operator/resource capability."""
+    ple_result_transports: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed per-layer result transport and small pinned-buffer sizes."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -509,6 +516,7 @@ class KernelConfig:
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "ple_disk_cascade_reason",
+            "ple_result_transports",
         }
         if not self.ple_disk_cascade_active:
             ignored_factors.update(
