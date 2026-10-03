@@ -239,11 +239,6 @@ def _apply_sm70_qwen38_decode_defaults(
         # Keep M=1 draft graphs independently of the verifier query width.
         # Otherwise the prepared single-token operators never reach capture.
         defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
-    elif cfg.speculative_config is None:
-        # Pin the native FP32 gated-norm arithmetic across independently
-        # compiled C1/batch graphs. Tiny fusion-dependent rounding differences
-        # can change an MoE route and ultimately flip an EOS token.
-        defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
@@ -1504,8 +1499,19 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
 
-        from vllm.model_executor.models.config import sm70_dflash2_nvfp4_qualified
+        from vllm.model_executor.models.config import (
+            sm70_dflash2_nvfp4_qualified,
+            sm70_flash_next_batch_qualified,
+        )
 
+        self.kernel_config.resolve_sm70_rmsnorm_gated(
+            qualified=(
+                _is_sm70_qwen38_decode_compile_contract(
+                    self.model_config, self.speculative_config, self.parallel_config
+                )
+                and sm70_flash_next_batch_qualified(self)
+            )
+        )
         self.kernel_config.sm70_nvfp4.resolve(
             qualified=sm70_dflash2_nvfp4_qualified(self)
         )

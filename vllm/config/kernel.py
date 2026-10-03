@@ -404,6 +404,23 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    sm70_rmsnorm_gated_exact: bool | None = None
+    """Native gated norm; auto follows the Flash-Next model quality boundary."""
+
+    def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
+        if self.sm70_rmsnorm_gated_exact is not None:
+            return
+        import os
+
+        from vllm import envs
+
+        name = "VLLM_SM70_RMSNORM_GATED_EXACT"
+        self.sm70_rmsnorm_gated_exact = (
+            bool(envs.environment_variables[name]())
+            if name in os.environ
+            else qualified
+        )
+
     sm70_nvfp4: Sm70NvFp4Config = Field(default_factory=Sm70NvFp4Config)
     """SM70 compressed-tensors NVFP4 policy, resolved per engine."""
 
