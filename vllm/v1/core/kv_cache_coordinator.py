@@ -96,6 +96,14 @@ class KVCacheCoordinator(ABC):
                 "in this backport"
             )
         alignment = getattr(self, "lcm_block_size", mamba[0].block_size)
+        # SWA must preserve the window at the checkpoint Mamba actually admits,
+        # rather than the prompt's final (unrestorable) alignment boundary.
+        sparse_mamba = bool(self.eagle_group_ids) and any(
+            m.kv_cache_spec.mamba_cache_mode == "align" and m.block_size == alignment
+            for m in mamba
+        )
+        for manager in self.single_type_managers:
+            manager.mamba_replay_lookbehind = sparse_mamba
         if interval < 0 or interval % alignment:
             raise ValueError(
                 f"prefix_cache_retention_interval ({interval}) must be a non-negative "

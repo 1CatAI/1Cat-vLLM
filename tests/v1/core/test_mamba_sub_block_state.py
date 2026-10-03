@@ -107,3 +107,65 @@ def test_partial_chunks_keep_running_state_and_immutable_prefix_snapshots(
     )[0]
     assert len(hit) == 3
     assert state_blocks[hit[-1].block_id] == snapshots[3 * block_size][1]
+
+
+@pytest.mark.parametrize("length", [16383, 16384, 16385, 32767, 32768, 32769])
+@pytest.mark.parametrize("eagle", [False, True])
+def test_small_chunks_preserve_hybrid_resend_window(length, eagle):
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+        SlidingWindowSpec,
+    )
+
+    specs = [
+        FullAttentionSpec(
+            block_size=2048, num_kv_heads=1, head_size=1, dtype=torch.float16
+        ),
+        MambaSpec(
+            block_size=8192,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+        SlidingWindowSpec(
+            block_size=1024,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float16,
+            sliding_window=2048,
+        ),
+    ]
+    config = KVCacheConfig(
+        200,
+        [],
+        [
+            KVCacheGroupSpec([str(i)], spec, is_eagle_group=eagle and i == 2)
+            for i, spec in enumerate(specs)
+        ],
+    )
+    cache = KVCacheManager(
+        config, 262144, 8, use_eagle=eagle, prefix_cache_retention_interval=0
+    )
+    request = _request("hybrid-resend", length)
+    for start in range(0, length, 512):
+        end = min(start + 512, length)
+        for manager in cache.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start, length)
+            manager.allocate_new_blocks(request.request_id, end, end)
+        cache.coordinator.cache_blocks(request, end)
+        swa = cache.coordinator.single_type_managers[2]
+        real_blocks = sum(
+            not block.is_null for block in swa.req_to_blocks[request.request_id]
+        )
+        assert real_blocks <= specs[2].max_admission_blocks_per_request(512, 262144)
+    cache.coordinator.free(request.request_id)
+    _, hit = cache.get_computed_blocks(request)
+    expected = (length // 8192 - 1) * 8192 if eagle else (length - 1) // 8192 * 8192
+    assert hit == max(expected, 0)

@@ -4427,8 +4427,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="256",
         effective_default=(
-            "256; the selected prefill dispatcher also checks its runtime M "
-            "and layout."
+            "256; the selected prefill dispatcher also checks its runtime M and layout."
         ),
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
