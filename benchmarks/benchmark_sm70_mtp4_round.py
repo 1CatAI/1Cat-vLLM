@@ -115,6 +115,10 @@ def main() -> None:
             "draft_sample_method": "greedy",
         },
     }
+    if args.teacher_forcing_manifest:
+        engine["worker_extension_cls"] = (
+            "benchmarks.sm70_mtp_admission_worker.MtpAdmissionExtension"
+        )
     if args.startup_diagnostics:
         engine["worker_cls"] = "benchmarks.sm70_startup_worker.StartupStackWorker"
     report = {
@@ -230,15 +234,13 @@ def main() -> None:
         # Diagnostics follow the completed unprofiled speed report and use no
         # timing or acceptance counters from their forced requests.
         if args.teacher_forcing_manifest:
-            from benchmarks.sm70_mtp_teacher_forcing import flush, install
-
             tapes = json.loads(args.teacher_forcing_manifest.read_text())
             report["teacher_forcing"] = []
             for tape in tapes:
                 llm.reset_prefix_cache()
                 folder = args.out.parent / "teacher_forcing" / tape["id"]
                 llm.collective_rpc(
-                    install,
+                    "install_mtp_teacher_forcing",
                     args=(
                         tape["token_ids"],
                         tape["prompt_length"],
@@ -274,7 +276,7 @@ def main() -> None:
                     succeeded = True
                 finally:
                     result = llm.collective_rpc(
-                        flush, kwargs={"discard": not succeeded}
+                        "flush_mtp_teacher_forcing", kwargs={"discard": not succeeded}
                     )
                 report["teacher_forcing"].append({"id": tape["id"], "workers": result})
                 save()
