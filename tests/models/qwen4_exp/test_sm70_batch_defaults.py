@@ -44,3 +44,20 @@ def test_norm_policy_is_per_engine_and_hashed(monkeypatch):
     disabled = KernelConfig()
     disabled.resolve_sm70_rmsnorm_gated(qualified=True)
     assert disabled.sm70_rmsnorm_gated_exact is False
+
+
+def test_loaded_norm_keeps_its_engine_policy(monkeypatch):
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.kernel import KernelConfig
+    from vllm.model_executor.layers.layernorm import RMSNormGated
+
+    layers = []
+    for enabled in (False, True):
+        cfg = VllmConfig(
+            device_config=DeviceConfig(device="cpu"),
+            kernel_config=KernelConfig(sm70_rmsnorm_gated_exact=enabled),
+        )
+        with set_current_vllm_config(cfg):
+            layers.append(RMSNormGated(128))
+    monkeypatch.setenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0")
+    assert [layer._sm70_rmsnorm_gated_exact for layer in layers] == [False, True]
