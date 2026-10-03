@@ -52,8 +52,17 @@ def test_lattice_dequant_fp32_blas_and_graph(weight_type):
         )
 
 
-@pytest.mark.parametrize("weight_type", [17, 18, 21])
-def test_calibrated_lattice_routes_share_affine_workspace(weight_type):
+@pytest.mark.parametrize(
+    "weight_type,n,k,minimum",
+    [
+        (17, 160, 2560, 8),
+        (18, 160, 2560, 8),
+        (21, 1536, 2560, 2048),
+        (21, 4352, 5120, 512),
+        (21, 5120, 4352, 512),
+    ],
+)
+def test_calibrated_lattice_routes_share_affine_workspace(weight_type, n, k, minimum):
     import numpy as np
     from test_gguf_lattice_transcode import source
 
@@ -70,7 +79,6 @@ def test_calibrated_lattice_routes_share_affine_workspace(weight_type):
     from vllm.scalar_type import scalar_types
 
     torch._dynamo.reset()
-    n, k = (1536 if weight_type == 21 else 160), 2560
     p = transcode_lattice(
         source(weight_type, n=n, k=k, scale=0.0009765625), weight_type
     )
@@ -98,12 +106,18 @@ def test_calibrated_lattice_routes_share_affine_workspace(weight_type):
         layer.gguf_tm_blas_workspace.data_ptr()
         == _get_affine_blas_workspace(layer.codes).data_ptr()
     )
-    boundaries = (1024, 2048) if weight_type == 21 else (4, 8, 1024, 2048, 4096)
+    boundaries = (
+        (128, 512)
+        if minimum == 512
+        else (1024, 2048)
+        if weight_type == 21
+        else (4, 8, 1024, 2048, 4096)
+    )
     dense = torch.from_numpy(p.dequantize()).half().cuda()
     for m in boundaries:
         admitted = any(c.supports_m(m) for c in kernel.prefill_capabilities)
         assert admitted == (
-            m >= 2048 if weight_type == 21 else 8 <= m <= 1024 or m >= 4096
+            m >= minimum if weight_type == 21 else 8 <= m <= 1024 or m >= 4096
         )
         x = (torch.randn((m, k), device="cuda") * 0.125).half()
         expected = x.float() @ dense.float().T

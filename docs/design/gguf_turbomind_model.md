@@ -72,3 +72,63 @@ the common quality set and C1/C4/C8/C16 plus 8K/32K performance comparisons
 are still pending. The 27B IQ3_S gate/down TP4 shapes additionally require
 prefill crossover measurements; the existing Flash-Next calibration does
 not establish their crossover.
+
+## 27B IQ3_S operator crossovers
+
+Real `blk.11.ffn_gate.weight` and `blk.14.ffn_down.weight` use IQ3_S.
+TP4 yields gate N=4352/K=5120 and down N=5120/K=4352. The existing shared
+FP16 scratch fits both shapes. Canonical dequantization retains FP16 weight
+reconstruction and explicit FP32 cuBLAS accumulation; no activation quantization
+or reduced-precision reduction is introduced. The full M sweep below uses
+V100 32GB, CUDA 12.8, Torch 2.10.0+cu128, 100 ms warmup per route and 100
+CUDA graph timing iterations. All columns are microseconds.
+
+Small outputs capture eight invocations per replay; outputs above ten million
+elements capture one. Each route returns its output so this rule applies
+consistently. Raw DQ uses the original GGUF reader/operator; canonical DQ uses
+the expanded FP16 coefficients. AWQ is a same-shape comparator, not a claim
+that both checkpoints have identical quantized values.
+
+### Gate
+
+| M | TM fused | Canonical DQ+FP32 BLAS | AWQ | llama MMVQ/MMQ | Raw DQ+cuBLAS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32.15 | 195.44 | 27.46 | 30.57 | 343.33 |
+| 2 | 31.80 | 172.44 | 27.54 | 32.48 | 370.08 |
+| 4 | 32.03 | 173.20 | 27.72 | 40.69 | 365.12 |
+| 8 | 33.11 | 174.38 | 28.56 | 67.35 | 359.68 |
+| 16 | 39.55 | 175.36 | 35.56 | 77.21 | 357.00 |
+| 32 | 55.80 | 174.74 | 45.28 | 101.26 | 358.70 |
+| 64 | 92.89 | 191.95 | 75.37 | 141.96 | 399.98 |
+| 128 | 130.69 | 230.94 | 111.50 | 236.39 | 430.35 |
+| 512 | 497.03 | 367.42 | 463.58 | 780.07 | 568.65 |
+| 2048 | 1660.44 | 1228.45 | 1388.76 | 2981.29 | 1471.85 |
+| 8192 | 6371.06 | 4221.96 | 5191.27 | 11812.26 | 4819.49 |
+
+### Down
+
+| M | TM fused | Canonical DQ+FP32 BLAS | AWQ | llama MMVQ/MMQ | Raw DQ+cuBLAS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 33.37 | 199.41 | 40.89 | 31.92 | 344.19 |
+| 2 | 30.82 | 173.32 | 40.97 | 35.40 | 355.00 |
+| 4 | 31.04 | 174.85 | 41.00 | 44.49 | 355.51 |
+| 8 | 34.12 | 177.58 | 25.84 | 64.20 | 356.65 |
+| 16 | 37.89 | 182.43 | 31.61 | 71.78 | 358.35 |
+| 32 | 50.09 | 189.61 | 40.01 | 96.12 | 354.47 |
+| 64 | 83.20 | 181.79 | 64.99 | 134.18 | 397.91 |
+| 128 | 116.04 | 226.38 | 103.10 | 218.82 | 430.23 |
+| 512 | 378.01 | 353.93 | 303.20 | 729.35 | 548.57 |
+| 2048 | 1522.90 | 1110.55 | 1230.97 | 2897.73 | 1395.33 |
+| 8192 | 6445.07 | 4151.62 | 5069.11 | 11497.36 | 4746.95 |
+
+At M=128, fusion remains faster than canonical DQ. At M=512 and above,
+canonical DQ is faster in both measured shapes, so capability bands admit
+those IQ3_S descriptors for M>=512. Other descriptors retain their existing
+calibration or fused fallback. M=8192 saves about 34–36% relative to fusion,
+and is faster than the same-shape AWQ comparator.
+
+Gate/down expanded-scale relative L2 is 0.0002040/0.0002030; max absolute
+weight error is 0.00005722/0.00005007. Output relative L2 is approximately
+0.000404. The benchmark core fingerprint is
+`5cd0fa29e533f92644e012c57fe7b439293bf360e8988b8d73d7bbef54839f6a`.
+The complete route sweep precedes model throughput measurement.
