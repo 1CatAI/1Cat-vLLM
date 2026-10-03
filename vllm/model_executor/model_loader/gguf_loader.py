@@ -8,7 +8,6 @@ import gguf
 import regex as re
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -26,7 +25,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     gguf_quant_weights_iterator_multi,
 )
 from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
-from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 if TYPE_CHECKING:
@@ -56,12 +54,14 @@ class GGUFModelLoader(BaseModelLoader):
             return model_name_or_path
         # repo id/filename.gguf
         if "/" in model_name_or_path and model_name_or_path.endswith(".gguf"):
-            repo_id, filename = model_name_or_path.rsplit("/", 1)
-            return hf_api().hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                revision=model_config.revision,
-                cache_dir=self.load_config.download_dir,
+            from vllm.transformers_utils.gguf_files import resolve_gguf_file
+
+            return str(
+                resolve_gguf_file(
+                    model_name_or_path,
+                    revision=model_config.revision,
+                    cache_dir=self.load_config.download_dir,
+                )
             )
         # repo_id:quant_type
         elif "/" in model_name_or_path and ":" in model_name_or_path:
@@ -89,21 +89,9 @@ class GGUFModelLoader(BaseModelLoader):
         E.g. ``*-00001-of-00005.gguf`` → all 5 shards,
              ``*-01-of-15.gguf`` → all 15 shards.
         """
-        match = re.search(r"-(\d+)-of-(\d+)\.gguf$", model_path)
-        if not match:
-            return [model_path]
-        total = int(match.group(2))
-        num_digits = len(match.group(1))
-        prefix = model_path[: match.start(1)]
-        suffix = model_path[match.end(2) :]
-        files = []
-        for i in range(1, total + 1):
-            shard_path = f"{prefix}{i:0{num_digits}d}-of-{total:0{num_digits}d}{suffix}"
-            if os.path.isfile(shard_path):
-                files.append(shard_path)
-        if files:
-            logger.info("Discovered %d GGUF shard files", len(files))
-        return files if files else [model_path]
+        from vllm.transformers_utils.gguf_files import gguf_shard_paths
+
+        return [str(path) for path in gguf_shard_paths(model_path)]
 
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
@@ -115,6 +103,22 @@ class GGUFModelLoader(BaseModelLoader):
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
         config = model_config.hf_config
+        from vllm.transformers_utils.gguf_files import (
+            gguf_shard_paths,
+            gguf_tensor_index,
+        )
+
+        from .gguf_adapters import get_gguf_adapter
+
+        if (
+            adapter := get_gguf_adapter(
+                config, tp_size=getattr(self, "_gguf_tp_size", 1)
+            )
+        ) is not None:
+            local = self._prepare_weights(model_config)
+            self._native_adapter = adapter
+            self._native_tensors = gguf_tensor_index(gguf_shard_paths(local))
+            return adapter.build_name_map(self._native_tensors)
         # Get text config to handle both nested (multimodal) and flat
         # (text-only) config structures. For multimodal models like
         # Gemma3Config, this returns config.text_config. For text-only
@@ -216,6 +220,8 @@ class GGUFModelLoader(BaseModelLoader):
             vision_name_map = gguf.get_tensor_name_map(mm_proj_arch, vision_num_layers)
         else:
             vision_name_map = None
+
+        from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 
         # Create dummy model to extract parameter names
         # For multimodal: use AutoModelForImageTextToText to get
@@ -384,6 +390,11 @@ class GGUFModelLoader(BaseModelLoader):
         Yields:
             Tuples of (parameter_name, tensor) for all model weights
         """
+        if (adapter := getattr(self, "_native_adapter", None)) is not None:
+            yield from adapter.weights(
+                self._native_tensors, gguf_to_hf_name_map, model_config.dtype
+            )
+            return
         hf_config = model_config.hf_config
         is_multimodal = hasattr(hf_config, "vision_config")
 
@@ -419,6 +430,7 @@ class GGUFModelLoader(BaseModelLoader):
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         device_config = vllm_config.device_config
+        self._gguf_tp_size = vllm_config.parallel_config.tensor_parallel_size
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
@@ -433,11 +445,22 @@ class GGUFModelLoader(BaseModelLoader):
             model_config, local_model_path, gguf_weights_map
         )
         # filter out unquantized modules to skip
+        adapter = getattr(self, "_native_adapter", None)
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
-            if weight_type in ("F32", "F16", "BF16") and name.endswith(".weight")
+            if weight_type in ("F32", "F16", "BF16")
+            and name.endswith(".weight")
+            and (adapter is None or not adapter.is_linear(name))
         ]
+        if adapter is not None:
+            quant_config = cast("GGUFConfig", vllm_config.quant_config)
+            for raw, name in gguf_weights_map.items():
+                adapter.needs_dense_fallback(name, self._native_tensors[raw])
+            quant_config.fallback_reasons = adapter.fallback_reasons
+            quant_config.linear_layouts = adapter.linear_layouts(gguf_weights_map)
+            if "output.weight" not in self._native_tensors:
+                model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)
         if TYPE_CHECKING:
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)

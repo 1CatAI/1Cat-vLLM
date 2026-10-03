@@ -275,6 +275,10 @@ def resolve_chat_template(
         # so that downstream kwargs detection can parse template variables.
         return tokenizer.get_chat_template(chat_template, tools=tools)
 
+    # Standalone GGUF embeds its own template and has no HF processor to query.
+    if getattr(tokenizer, "_vllm_gguf_metadata", False):
+        return tokenizer.get_chat_template(chat_template, tools=tools)
+
     # 2nd priority: AutoProcessor chat template, unless tool calling is enabled
     if tools is None:
         chat_template = _try_get_processor_chat_template(

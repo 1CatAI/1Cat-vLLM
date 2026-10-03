@@ -927,6 +927,7 @@ class Worker(WorkerBase):
     def get_sm70_acceleration_report(self) -> dict:
         """Read local selector decisions without rerunning capability probes."""
         from vllm.sm70_profiles.acceleration import (
+            loaded_gguf_layers,
             loaded_linear_kernels,
             loaded_sm70_preparations,
         )
@@ -937,6 +938,7 @@ class Worker(WorkerBase):
             "scope": "loaded_layer_selection",
             "linear_kernel_selections": selections,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
+            "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
         }
 

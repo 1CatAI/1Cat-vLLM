@@ -667,8 +667,35 @@ def get_config(
     hf_overrides_fn: Callable[[PretrainedConfig], PretrainedConfig] | None = None,
     **kwargs,
 ) -> PretrainedConfig:
-    # Separate model folder from file path for GGUF models
+    # Native GGUF metadata parsing precedes HF repository/config discovery.
+    # Explicit --hf-config-path reaches this function as a normal HF reference.
+    from .gguf_config import (
+        _ARCHITECTURES,
+        gguf_config_from_metadata,
+        read_gguf_metadata,
+    )
+    from .gguf_files import resolve_gguf_file
 
+    _is_gguf = is_gguf(model)
+    if _is_gguf:
+        local_gguf = resolve_gguf_file(
+            model,
+            revision=revision,
+            cache_dir=kwargs.get("cache_dir"),
+            token=kwargs.get("token"),
+        )
+        metadata = read_gguf_metadata(local_gguf)
+        if metadata.get("general.architecture") in _ARCHITECTURES:
+            config = gguf_config_from_metadata(metadata)
+            if hf_overrides_kw:
+                config.update(hf_overrides_kw)
+            if hf_overrides_fn:
+                config = hf_overrides_fn(config)
+            patch_rope_parameters(config)
+            patch_rope_parameters(config.get_text_config())
+            return config
+
+    # Preserve legacy config handling for architectures awaiting native adapters.
     _is_gguf = is_gguf(model)
     _is_remote_gguf = is_remote_gguf(model)
     if _is_gguf:
