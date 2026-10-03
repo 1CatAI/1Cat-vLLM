@@ -62,7 +62,21 @@ and no replacement characters. Its six-run median decode time was 11.075 ms.
 The first enabled run exposed a mailbox flag lifetime bug: the CPU lookup
 process exited with SIGSEGV and GPU workers waited during startup. A regression
 test fails before the ownership fix and passes after it. This failed run is not
-a speed or quality result; installed-runtime retesting remains pending.
+a speed or quality result.
+
+The rebuilt installed wheel keeps all 16 native library hashes unchanged and
+passes startup. With sampled prefetch enabled, six-run median C1 decode time
+is 10.895 ms versus 11.075 ms disabled: 0.180 ms, or 1.62%, lower. This is an
+isolated prefetch delta; dense precision remains unchanged.
+
+The enabled task run passes 35/36 cases. MBPP-9 reaches the 4096-token cap while
+still thinking and repeats several lines; its final code is missing. The other
+cases, including the 258K needle, pass. The disabled control passes 36/36 with
+natural EOS. The enabled path therefore fails the task/health gate and is not
+ready to merge. Different sampled continuations alone are not rejection grounds.
+A focused C1 teacher-forcing comparison checks MBPP-9, a 32K window and English
+before deciding whether byte transport, distribution or sampling needs further
+investigation. It is diagnostic, not a replacement for the full C1 gate.
 
 Teacher-forcing/task quality and matched timing are accepted at C1 only.
 One short C4 end-to-end smoke is required before merging.
