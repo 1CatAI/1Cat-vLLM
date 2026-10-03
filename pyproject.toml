@@ -51,8 +51,8 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 # no extra settings needed, presence enables setuptools-scm
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["vllm*", "flash_qla*"]
+where = [".", "flash-attention-v100"]
+include = ["vllm*", "flash_qla*", "flash_attn_v100*"]
 
 [tool.ruff.lint.per-file-ignores]
 "flash_qla/**" = ["ALL"]

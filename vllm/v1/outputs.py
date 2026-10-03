@@ -232,6 +232,14 @@ class ECConnectorOutput:
     finished_recving: set[str] | None = None
 
 
+@dataclass
+class MixedPrefillTiming:
+    prefill_tokens: int
+    decode_tokens: int
+    budget_tokens: int
+    elapsed_ms: float
+
+
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
@@ -283,6 +291,9 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    # Completed GPU timing only; CUDA events never cross process boundaries.
+    mixed_prefill_timing: MixedPrefillTiming | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

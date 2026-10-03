@@ -3642,8 +3642,11 @@ class _MixedDecodeRowsPlan:
         self.max_seq_len_hint = max_seq_len
         self.num_groups = len(group_req)
         packed = torch.tensor(
-            src + req + delta + dst + group_req, dtype=torch.int64, device=device
-        )
+            src + req + delta + dst + group_req,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        ).to(device, non_blocking=True)
         n = len(src)
         self.src_idx = packed[:n]
         self.token_req = packed[n : 2 * n]
@@ -3697,7 +3700,7 @@ def _mixed_decode_rows_plan(
     """
     cached = getattr(attn_metadata, _MIXED_ROWS_PLAN_ATTR, False)
     if cached is not False:
-        return cached
+        return cast(_MixedDecodeRowsPlan | None, cached)
     num_seqs = len(query_start_loc) - 1
     qsl = query_start_loc[: num_seqs + 1].tolist()
     seq_lens_host = seq_lens[:num_seqs].tolist()
