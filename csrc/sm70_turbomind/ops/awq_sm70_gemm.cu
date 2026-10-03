@@ -3935,6 +3935,12 @@ void gguf_lattice_grouped_gemm_sm70_out(
   a.num = d.num = num_experts;
   a.offsets = d.offsets = offsets.data_ptr<int>();
   turbomind::gemm::Operation operation{};
+  // Measure these grouped descriptors before capture and reuse the shared
+  // dispatch cache. Capture without an existing entry retains the heuristic.
+  operation.dispatch = select_moe_dispatch_policy_impl(
+      device, m, n, k, num_experts, group_size, stream,
+      static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(source_type)),
+      m >= 512, 8192);
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   operation.quant_b = {gguf_lattice_quant_type(source_type),
                        static_cast<int>(group_size)};
