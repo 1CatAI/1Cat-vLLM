@@ -1,8 +1,8 @@
 # Packaged native GGUF operators on SM70
 
-This change extends format coverage and replaces the Volta prefill selector.
-It is not a completed model throughput or quality acceptance. The standalone
-architecture adapters and EP expert storage are separate review scopes.
+This change packages fallback and reference operators for GGUF formats.
+TurboMind canonical-format operators are the performance path. Standalone
+architecture adapters and TP expert storage are separate review scopes.
 
 ## Sources and runtime contract
 
@@ -17,8 +17,11 @@ architecture adapters and EP expert storage are separate review scopes.
 
 `KernelConfig.sm70_gguf` defaults to enabled. Each prepared projection reports
 its operator capabilities, local shape, format, and rejected-route reason.
-On Volta, M >= `prefill_min_m` (default 8) selects dequantization followed by
-cuBLAS before dp4a MMQ. Smaller batches use admitted MMVQ, otherwise BLAS.
+Existing formats retain their previous production operators. Formats absent
+from those operators use the new fallback. Its explicit reference selector
+uses dequantization followed by cuBLAS for M >= `prefill_min_m` (default 8),
+and admitted MMVQ for smaller batches, otherwise BLAS. This threshold is not
+a TurboMind default or evidence that the fallback wins at those shapes.
 FP32 activations retain FP32 BLAS compute; they are not narrowed through FP16.
 Mixed projections retain separate logical types, GPU allocations and storage
 tails. Padding guards do not change the logical K dimension.
@@ -53,7 +56,9 @@ There is no model TP, attention, sampling, MTP or KV-cache workload here.
 Extension SHA256:
 `74ed944b8abb0f8679757a4e1bf0acef453f4a9803002f2c47b35b47f39d163f`.
 Wheel SHA256:
-`efe87c4331792b29e82a5d871974714a2c5d2b37a1d9953f5eba04bf3406a563`.
+`2539b29895ec139a2044c16e211f5dbb7ec520118e07f7651e84efbca582ee86`.
+The wheel includes the prepared MoE capability declarations and preservation
+of existing format routes, and passes ten tests in a fresh installed runtime.
 The extension has no RPATH/RUNPATH; NEEDED entries are standard CUDA/cuBLAS,
 Torch and system libraries. Torch supplies its own standard library loading.
 
@@ -105,6 +110,6 @@ flock /tmp/gpu0-3.lock env CUDA_VISIBLE_DEVICES=0 \
 
 New raw MoE operators are packaged but the existing Python GGUFMoEMethod is
 still the legacy implementation. Independent gate/up/down type storage,
-EP mapping and reduction, quantized PLE lookup, full model logits/greedy
+TP storage and reduction, quantized PLE lookup, full model logits/greedy
 comparison, common quality sets, and model C1/C4/C8/C16 plus 8K/32K prefill
 are not completed by this kernel PR.
