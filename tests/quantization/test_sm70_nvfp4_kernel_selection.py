@@ -147,3 +147,37 @@ def test_old_native_and_batch_layout_fallbacks(shared_native, version, batch):
     assert result["shared"] == shared_native
     assert result["compact_scales"] == (shared_native and version >= 1 and not batch)
     assert result["batch_prescale"] == (shared_native and batch)
+
+
+def test_activation_pack_policy_is_default_and_engine_local():
+    enabled = KernelConfig()
+    disabled = KernelConfig(sm70_nvfp4=Sm70NvFp4Config(activation_pack=False))
+    assert enabled.sm70_nvfp4.activation_pack
+    assert not disabled.sm70_nvfp4.activation_pack
+    assert enabled.compute_hash() != disabled.compute_hash()
+
+
+@pytest.mark.parametrize("native_argument", [False, True])
+def test_activation_pack_preserves_old_native_abi(monkeypatch, native_argument):
+    from types import SimpleNamespace
+
+    names = ["out", "input", "codes"]
+    if native_argument:
+        names.append("activation_pack")
+    op = SimpleNamespace(
+        default=SimpleNamespace(
+            _schema=SimpleNamespace(
+                arguments=[SimpleNamespace(name=name) for name in names]
+            )
+        )
+    )
+    monkeypatch.setattr(sm70.torch.ops._C, "qpn2_pack_abi_test", op, raising=False)
+    assert (
+        sm70.sm70_ops.has_qpn2_activation_pack("qpn2_pack_abi_test") == native_argument
+    )
+    assert sm70.sm70_ops._qpn2_pack_args("qpn2_pack_abi_test", True) == (
+        [True] if native_argument else []
+    )
+    assert sm70.sm70_ops._qpn2_pack_args("qpn2_pack_abi_test", False) == (
+        [False] if native_argument else []
+    )
