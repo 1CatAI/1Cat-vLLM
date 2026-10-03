@@ -176,3 +176,39 @@ the captured grid does not grow with historical context. This candidate is
 under construction and is not an accepted speedup. Preserve the baseline
 artifact and compare exact inputs, graph replay with changing lengths,
 model logits, emitted-token behavior, and C4 performance before promotion.
+
+## Candidate decisions and negative evidence
+
+The single-request tie guard incorrectly used request count to choose the
+wide probe, while the dense sampler dispatches on logit rows. A q8 request
+already meets the eight-row reference contract. The candidate uses that
+row count and retains the existing 64-candidate support, vocabulary tie
+order, truncation guard, and numerical-boundary fallback. Fifteen focused
+GPU unit tests pass against the installed baseline operators: 21/24/63-way
+cutoff ties preserve sampled tokens and acceptance counts for the tested
+random streams; 64/80-way ties still fall back. This is source unit evidence,
+not complete installed-candidate model validation. Head logits are unchanged.
+
+An exact-state GDN geometry probe compares BV8/4/2/1 with one warp and two
+two-warp variants, using the production q8/H4/Hv12/K128/V128 shape and strided
+QKV rows. Single-request BV8 measures 18.575 us versus 14.118 us for BV2 in a
+140-node graph, with bitwise identical output and all stored state snapshots.
+At four requests, BV8/4 are about 38.4 us and BV2/1 regress to 41.7/43.2 us.
+Two-warp variants both regress and change state bits; reject them. Only the
+single-request FP32-state/precomputed-gating contract is a candidate for BV2.
+The full source wrapper and installed model still need validation.
+
+NCU confirms the exact shared-layout M8 NVFP4 gate/up and down kernels. The
+gate/up grid is 136 blocks of 512 threads; down has 160 blocks. DRAM throughput
+is about 63% of the measured peak, with 0.49–0.51 issued warps per scheduler
+per cycle. Roughly half the sampled stall cycles wait on L1/TEX scoreboard
+dependencies; theoretical occupancy is limited to 50% by registers and shared
+memory. This does not establish unpacking ALU as the sole bottleneck. Compare
+exact decoding and software weight prefetch before choosing a change. These
+are profiler counters with uncontrolled caches/clocks, not accepted speed deltas.
+
+The first root profiler invocation could not truncate user-owned lock files
+in the protected temporary directory. Keep ownership locks in a user parent
+process while invoking the privileged profiler child; do not alter shared lock
+permissions. The corrected counter captures complete. GPU probes wait when
+another task owns the shared GPU lock; a busy lock is not a numerical failure.

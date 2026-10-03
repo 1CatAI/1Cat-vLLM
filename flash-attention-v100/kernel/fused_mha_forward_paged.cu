@@ -352,7 +352,7 @@ template <int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
           bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32, bool SPLIT_KV,
           bool IS_CAUSAL, int KV_DTYPE, bool D256_OUTPUT_STRIDE_268 = false,
           bool D256_SW_PIPELINE_QK = false, bool D256_SW_PIPELINE_PV = false,
-          bool ANCHORED_SWA = false>
+          bool ANCHORED_SWA = false, bool WINDOW_RELATIVE_SPLIT = false>
 __global__ void __launch_bounds__(
     KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                  D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
@@ -723,7 +723,11 @@ __global__ void __launch_bounds__(
   if constexpr (SPLIT_KV) {
     const int partition_id = blockIdx.y;
     const int tiles_per_partition = split_kv_tiles > 1 ? split_kv_tiles : 1;
-    first_n_tile = partition_id * tiles_per_partition;
+    // Window-relative partitions keep the captured grid independent of the
+    // growing context. The device sequence length still determines the exact
+    // window origin and every per-query mask remains unchanged.
+    const int origin = WINDOW_RELATIVE_SPLIT ? min_key_pos / BLOCK_N : 0;
+    first_n_tile = origin + partition_id * tiles_per_partition;
     last_n_tile = min(num_n_tiles, first_n_tile + tiles_per_partition);
   }
   if constexpr (!ANCHORED_SWA) {
@@ -1903,15 +1907,13 @@ void launcher_flash_attention_forward_paged_impl(
   }
 }
 
-template <int D>
+template <int D, int BLOCK_M = BLOCK_M_256_LOW_SMEM>
 __global__ void flash_attention_forward_paged_splitkv_merge_kernel(
     const float* __restrict__ split_tmp_out,
     const float* __restrict__ split_tmp_row_max,
     const float* __restrict__ split_tmp_row_sum, __half* __restrict__ Out,
     float* __restrict__ softmax_lse, const int B, const int H, const int M,
     const int num_partitions) {
-  static_assert(D == 256, "split-KV paged prefill merge is D=256 only");
-  constexpr int BLOCK_M = BLOCK_M_256_LOW_SMEM;
   constexpr int THREADS = 512;
   const float NEG_INF = -1e30f;
 
@@ -1982,7 +1984,7 @@ __global__ void flash_attention_forward_paged_splitkv_merge_kernel(
 }
 
 template <int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
-          bool LOW_SMEM_SCALAR_QK>
+          bool LOW_SMEM_SCALAR_QK, bool WINDOW_RELATIVE_SPLIT = false>
 void launcher_flash_attention_forward_paged_splitkv_impl(
     const torch::Tensor& Q, const torch::Tensor& K_cache,
     const torch::Tensor& V_cache, torch::Tensor& Out,
@@ -1992,7 +1994,7 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
     float softmax_scale, bool is_causal, float k_scale, float v_scale,
     int window_size_left, int window_size_right, int split_kv_tokens,
     int max_seq_len_hint, cudaStream_t stream) {
-  static_assert(D == 256, "split-KV paged prefill is D=256 only");
+  static_assert(D == 128 || D == 256);
   static_assert(LOW_SMEM || !LOW_SMEM_CONTIG_FAST,
                 "contiguous low-smem loads require LOW_SMEM");
   static_assert(LOW_SMEM || !LOW_SMEM_SCALAR_QK,
@@ -2016,6 +2018,11 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
   const int64_t v_head_stride = V_cache.stride(2);
 
   split_kv_tokens = std::max(split_kv_tokens, Config::BLOCK_N);
+  if constexpr (WINDOW_RELATIVE_SPLIT) {
+    // Include the possible partial first tile. This bound covers every live
+    // sequence without reading a device length back to the host.
+    max_seq_len_hint = window_size_left + M + Config::BLOCK_N - 1;
+  }
   max_seq_len_hint = std::max(max_seq_len_hint, 1);
   const int split_kv_tiles =
       std::max(1, (split_kv_tokens + Config::BLOCK_N - 1) / Config::BLOCK_N);
@@ -2041,17 +2048,19 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
   auto kernel = is_causal
                     ? (void*)flash_attention_forward_kernel_paged<
                           D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK,
-                          false, true, true, KV_DTYPE>
+                          false, true, true, KV_DTYPE, false, false, false,
+                          false, WINDOW_RELATIVE_SPLIT>
                     : (void*)flash_attention_forward_kernel_paged<
                           D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK,
-                          false, true, false, KV_DTYPE>;
+                          false, true, false, KV_DTYPE, false, false, false,
+                          false, WINDOW_RELATIVE_SPLIT>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        smem);
 
   if (is_causal) {
-    flash_attention_forward_kernel_paged<D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
-                                         LOW_SMEM_SCALAR_QK, false, true, true,
-                                         KV_DTYPE>
+    flash_attention_forward_kernel_paged<
+        D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false, true,
+        true, KV_DTYPE, false, false, false, false, WINDOW_RELATIVE_SPLIT>
         <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()), K_cache.data_ptr(),
             V_cache.data_ptr(), reinterpret_cast<__half*>(Out.data_ptr()),
@@ -2064,9 +2073,9 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             split_tmp_row_max.data_ptr<float>(),
             split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
   } else {
-    flash_attention_forward_kernel_paged<D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
-                                         LOW_SMEM_SCALAR_QK, false, true, false,
-                                         KV_DTYPE>
+    flash_attention_forward_kernel_paged<
+        D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, false, true,
+        false, KV_DTYPE, false, false, false, false, WINDOW_RELATIVE_SPLIT>
         <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()), K_cache.data_ptr(),
             V_cache.data_ptr(), reinterpret_cast<__half*>(Out.data_ptr()),
@@ -2082,7 +2091,8 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
 
   const dim3 merge_grid(grid_x, 1, B * H);
   const dim3 merge_block(512);
-  flash_attention_forward_paged_splitkv_merge_kernel<D>
+  flash_attention_forward_paged_splitkv_merge_kernel<
+      D, D == 128 ? Config::BLOCK_M : BLOCK_M_256_LOW_SMEM>
       <<<merge_grid, merge_block, 0, stream>>>(
           split_tmp_out.data_ptr<float>(), split_tmp_row_max.data_ptr<float>(),
           split_tmp_row_sum.data_ptr<float>(),
@@ -3610,6 +3620,29 @@ at::Tensor flash_attention_prefill_paged(
   auto props = at::cuda::getCurrentDeviceProperties();
   bool sm70 = props->major == 7 && props->minor == 0;
   TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
+
+  // Small noncausal draft queries have too few query tiles to occupy SM70.
+  // Split only the active sliding window, preserving FP16 Q/K/V and FP32
+  // numerator/max/sum partials. Other attention contracts keep their route.
+  if (D == 128 && B <= 4 && H == 8 && num_kv_heads == 2 && M == 8 &&
+      !is_causal && !use_anchored && window_size_left == 2047 &&
+      window_size_right == 2047 &&
+      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
+    using Config = KernelConfig<128>;
+    const int span = window_size_left + M + Config::BLOCK_N - 1;
+    const int partitions = (span + Config::BLOCK_N - 1) / Config::BLOCK_N;
+    auto options = torch::dtype(torch::kFloat32).device(q.device());
+    auto partial_out = torch::empty({B, H, partitions, M, D}, options);
+    auto partial_max = torch::empty({B, H, partitions, M}, options);
+    auto partial_sum = torch::empty({B, H, partitions, M}, options);
+    launcher_flash_attention_forward_paged_splitkv_impl<
+        128, flash_v100::KV_CACHE_DTYPE_FP16, false, false, false, true>(
+        q, k_cache, v_cache, out_fp16, softmax_lse, partial_out, partial_max,
+        partial_sum, block_table, seq_lens, softmax_scale, false, k_scale,
+        v_scale, window_size_left, window_size_right, Config::BLOCK_N, span,
+        stream);
+    return out_fp16;
+  }
 
 #define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                           \
   launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(            \
