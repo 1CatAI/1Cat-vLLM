@@ -16,6 +16,11 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops  # noqa: F401
+from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+    LATTICE_TYPES,
+    LatticeGGUFProjection,
+    transcode_lattice,
+)
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
     LUT4_TYPES,
     Lut4GGUFProjection,
@@ -40,12 +45,26 @@ M_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 512, 2048, 8192)
 
 
 def transcode_projection(data, weight_type):
+    if weight_type in LATTICE_TYPES:
+        return transcode_lattice(data, weight_type)
     if weight_type in LUT4_TYPES:
         return transcode_lut4(data, weight_type)
     return transcode_affine(data, weight_type)
 
 
 def prepare_projection(projection):
+    if isinstance(projection, LatticeGGUFProjection):
+        codes, metadata = projection.mma884_storage()
+        signed = metadata.view(
+            {2: np.int16, 4: np.int32, 8: np.int64}[metadata.itemsize]
+        )
+        return torch.ops._C.gguf_lattice_sm70_prepare(
+            torch.from_numpy(codes).cuda(),
+            torch.from_numpy(signed).cuda(),
+            projection.source_type,
+            projection.group_size,
+        )
+
     codes = torch.from_numpy(projection.codes).cuda()
     scales = torch.from_numpy(projection.scales).cuda()
     if isinstance(projection, Lut4GGUFProjection):
@@ -90,6 +109,18 @@ def partition_source(source, weight_type, size, rank, axis):
 
 
 def canonical_dense_call(projection, out, x, weight, stats, k_ld, q_ld):
+    if isinstance(projection, LatticeGGUFProjection):
+        return partial(
+            torch.ops._C.gguf_lattice_gemm_sm70_out,
+            out,
+            x,
+            weight,
+            stats,
+            projection.source_type,
+            k_ld,
+            q_ld,
+            projection.group_size,
+        )
     is_lut = isinstance(projection, Lut4GGUFProjection)
     op = (
         torch.ops._C.gguf_lut4_gemm_sm70_out
@@ -103,6 +134,18 @@ def canonical_dense_call(projection, out, x, weight, stats, k_ld, q_ld):
 
 
 def canonical_grouped_call(projection, out, x, offsets, wp, sp, experts):
+    if isinstance(projection, LatticeGGUFProjection):
+        return partial(
+            torch.ops._C.gguf_lattice_grouped_gemm_sm70_out,
+            out,
+            x,
+            offsets,
+            wp,
+            sp,
+            projection.source_type,
+            experts,
+            projection.group_size,
+        )
     is_lut = isinstance(projection, Lut4GGUFProjection)
     op = (
         torch.ops._C.gguf_lut4_grouped_gemm_sm70_out
@@ -282,6 +325,19 @@ def main():
             if isinstance(canonical, Lut4GGUFProjection)
             else torch.empty((k, n), device="cuda", dtype=torch.float16)
         )
+        # The native capability API includes llama.cpp's preferred-dispatch
+        # policy, which chooses BLAS at large M on Volta. Explicit MMQ remains
+        # a reference candidate there; probe format support at M=8.
+        mmq_supported = bool(
+            packed is not None
+            and torch.ops._C_gguf.ggml_dense_upstream_capabilities(
+                packed,
+                torch.empty((8, k), dtype=torch.float16, device="cuda"),
+                weight_type,
+                n,
+            )
+            & 8
+        )
         for m in args.m:
             torch.manual_seed(20261003 + m)
             x = (torch.randn((m, k), device="cuda") * 0.125).half()
@@ -327,12 +383,18 @@ def main():
                     stats=stats,
                     scratch=blas_scratch,
                 ):
-                    torch.ops._C.gguf_affine_blas_sm70_out(
+                    is_lattice = isinstance(canonical, LatticeGGUFProjection)
+                    op = (
+                        torch.ops._C.gguf_lattice_blas_sm70_out
+                        if is_lattice
+                        else torch.ops._C.gguf_affine_blas_sm70_out
+                    )
+                    op(
                         out,
                         x,
                         weight,
                         stats,
-                        canonical.bits,
+                        canonical.source_type if is_lattice else canonical.bits,
                         scratch,
                         canonical.group_size,
                     )
@@ -354,7 +416,7 @@ def main():
             elif nvfp4 is not None:
                 routes["turbomind_nvfp4_group16"] = partial(nvfp4, out, x)
             for bit, route in ((4, "mmvq"), (8, "mmq")):
-                if capabilities & bit:
+                if capabilities & bit or (bit == 8 and mmq_supported and m >= 8):
                     routes[f"llama_{route}"] = partial(
                         getattr(torch.ops._C_gguf, f"ggml_dense_{route}"),
                         packed,
@@ -364,6 +426,10 @@ def main():
                     )
             row = {
                 "native_unavailable_reason": native_reason,
+                "native_preferred_capabilities": capabilities,
+                "reference_mmq_forced": bool(
+                    mmq_supported and m >= 8 and not capabilities & 8
+                ),
                 "tensor": name,
                 "type": quant_type_name(weight_type),
                 "expert": args.expert if tensor.data.ndim == 3 else None,

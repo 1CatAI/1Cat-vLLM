@@ -412,7 +412,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
     list(APPEND VLLM_SM70_TURBOMIND_SRCS
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu")
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_dequant_sm70.cu")
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
