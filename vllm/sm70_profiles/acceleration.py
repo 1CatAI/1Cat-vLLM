@@ -389,7 +389,6 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "configuration": asdict(sparse_policy),
         "decode_fallback": "paged split-K for fewer than 16 query heads",
         "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
-
     }
     # Configuration policy is resolved once per engine. Actual kernel selection
     # still needs each loaded layer's local layout and native capabilities.
