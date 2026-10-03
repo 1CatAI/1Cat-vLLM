@@ -25,6 +25,9 @@ from benchmark_gguf_turbomind import (
 )
 
 from vllm import _custom_ops  # noqa: F401
+from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+    LatticeGGUFProjection,
+)
 from vllm.model_executor.layers.quantization.gguf_native import (
     native_available,
     pad_weight_tail,
@@ -165,6 +168,23 @@ def main():
             "turbomind_gguf_grouped": (tm, True),
             "cached_fp16_per_expert_lower_bound": (cached_dense, True),
         }
+        if isinstance(projection, LatticeGGUFProjection) and hasattr(
+            torch.ops._C, "gguf_lattice_grouped_vec_sm70_out"
+        ):
+            routes["turbomind_gguf_grouped_vec"] = (
+                partial(
+                    torch.ops._C.gguf_lattice_grouped_vec_sm70_out,
+                    out,
+                    x,
+                    offsets,
+                    wp,
+                    sp,
+                    projection.source_type,
+                    e,
+                    projection.group_size,
+                ),
+                True,
+            )
         if packed is not None:
             routes.update(
                 {
@@ -216,6 +236,12 @@ def main():
                     }
                     continue
                 raise
+            if name == "turbomind_gguf_grouped_vec":
+                vec_error = (out.float() - expected).norm() / expected.norm()
+                if not torch.isfinite(out).all() or vec_error.item() > 0.003:
+                    raise AssertionError(
+                        f"M={m}: grouped vector error {vec_error.item()}"
+                    )
             times = {"eager_us": elapsed(call, args.iterations)}
             if args.cuda_graph and graph_safe:
                 times["graph_us"] = elapsed(call, args.iterations, capture=True)
