@@ -42,4 +42,14 @@ it does not close the grouped large-M gap. Output relative L2 remains
 loaded normal core digest before reading the checkpoint. The measured core
 SHA256 is
 `4910c47ab1aaed253001d5950bf44dd40a350b2b087202a8ea2b13f2c5457782`.
-Ordinary installed-wheel checks remain pending.
+The ordinary installed wheel passes the same 40 GPU oracle/graph/tracing
+checks from a fresh process outside the source tree. All 210 installed
+dependencies pass compatibility checking. Source-built, packaged and installed
+core hashes match, with no RPATH/RUNPATH. Installed E512 M=128/8192 selected
+routing reproduces at 76.27/555.25 us versus AWQ 72.53/352.08 us. The grouped
+large-M gap remains open.
+
+Wheel SHA256:
+`b50536fc57bf481287e1aac10277137a9a840e1080d35b9ca298cf31734fcf1f`.
+The wheel source is `e2dfbb949e5b1acfc46ae898161445b4945d4774`; subsequent
+changes add measurements to this document only.
