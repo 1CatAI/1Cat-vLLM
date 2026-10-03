@@ -77,7 +77,7 @@ def test_calibrated_lattice_routes_share_affine_workspace(weight_type):
     config = Sm70GgufLatticeConfig(
         (k, n),
         (k, n),
-        scalar_types.uint2,
+        scalar_types.uint4 if p.bits == 4 else scalar_types.uint2,
         torch.float16,
         p.group_size,
         False,

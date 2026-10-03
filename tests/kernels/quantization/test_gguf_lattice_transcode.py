@@ -59,7 +59,10 @@ def test_mma884_carriers_preserve_indices_signs_and_delta(weight_type):
     codes, meta = p.mma884_storage()
     n, k = p.shape
     logical = codes.reshape(n, k // 8, 8).astype(np.uint64)
-    shifts = np.array([0, 8, 2, 10, 4, 12, 6, 14], np.uint64)
+    shifts = np.array(
+        [0, 16, 4, 20, 8, 24, 12, 28] if p.bits == 4 else [0, 8, 2, 10, 4, 12, 6, 14],
+        np.uint64,
+    )
     packets = np.bitwise_or.reduce(logical << shifts, axis=-1)
     metadata = meta.astype(np.uint64)
     np.testing.assert_array_equal(
@@ -76,14 +79,12 @@ def test_mma884_carriers_preserve_indices_signs_and_delta(weight_type):
         np.testing.assert_array_equal((packets & 255) | (high << 8), p.indices)
         np.testing.assert_array_equal(packets >> 8, p.signs)
     else:
-        count = p.group_size // 4
-        low = np.stack((packets & 255, packets >> 8), axis=-1).reshape(n, k // 4)
-        high = (
-            (metadata[..., None] >> (48 + np.arange(count, dtype=np.uint64))) & 1
-        ).reshape(n, k // 4)
-        signs = (
-            (metadata[..., None] >> (16 + 8 * np.arange(count // 2, dtype=np.uint64)))
-            & 255
-        ).reshape(n, k // 8)
+        low = np.stack((packets & 255, (packets >> 8) & 255), axis=-1).reshape(
+            n, k // 4
+        )
+        high = np.stack(((packets >> 24) & 1, (packets >> 25) & 1), axis=-1).reshape(
+            n, k // 4
+        )
+        signs = (packets >> 16) & 255
         np.testing.assert_array_equal(low | (high << 8), p.indices)
         np.testing.assert_array_equal(signs, p.signs)

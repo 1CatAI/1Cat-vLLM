@@ -40,9 +40,8 @@ int expected_group(int type) {
   return type == 17 || type == 22 || type == 29 ? 16 : 32;
 }
 auto expected_stats(int type) {
-  return type == 18 || type == 21   ? torch::kInt64
-         : type == 19 || type == 29 ? torch::kInt16
-                                    : torch::kInt32;
+  return type == 18 || type == 21 || type == 19 || type == 29 ? torch::kInt16
+                                                              : torch::kInt32;
 }
 void validate_lattice_dequant(const torch::Tensor& out, const torch::Tensor& w,
                               const torch::Tensor& s, int type, int group) {
@@ -61,8 +60,8 @@ void validate_lattice_dequant(const torch::Tensor& out, const torch::Tensor& w,
   const int64_t k = out.size(0), n = out.size(1);
   TORCH_CHECK(k > 0 && n > 0 && k <= INT_MAX && n <= INT_MAX &&
                   k % group == 0 && n % 32 == 0 && w.size(0) == k &&
-                  w.size(1) == n / 16 && s.size(0) == k / group &&
-                  s.size(1) == n,
+                  w.size(1) == n / (type == 18 || type == 21 ? 8 : 16) &&
+                  s.size(0) == k / group && s.size(1) == n,
               "GGUF lattice dequant descriptor shape mismatch");
   TORCH_CHECK(
       out.data_ptr() != w.data_ptr() && out.data_ptr() != s.data_ptr(),

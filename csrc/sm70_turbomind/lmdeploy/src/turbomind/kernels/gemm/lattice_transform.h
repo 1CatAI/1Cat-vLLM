@@ -24,9 +24,10 @@ struct Transform_HMMA_SM70_Lattice {
                               Array<D,Nd> (&data)[K][Md],
                               Array<S,Ns> (&stat)[Ks][Ms], int div,
                               const uint8_t* grid) {
-    static_assert(std::is_same_v<D,uint2_t> && std::is_same_v<F,half>);
+    using Carrier = std::conditional_t<Codebook::kWidth == 4,uint4_t,uint2_t>;
+    static_assert(std::is_same_v<D,Carrier> && std::is_same_v<F,half>);
     static_assert(Nd == 8 && Nf == 8 && Mf == Md);
-    static_assert(sizeof(S) == (Codebook::kWidth == 4 ? 8 :
+    static_assert(sizeof(S) == (Codebook::kWidth == 4 ? 2 :
                   (Type == 19 || Type == 29 ? 2 : 4)));
     auto& dst = reinterpret_cast<Array<F,Nd> (&)[Md]>(frag[k]);
     auto& stats = reinterpret_cast<Array<S,1> (&)[Ns*Ms]>(stat[k/div]);
@@ -34,7 +35,11 @@ struct Transform_HMMA_SM70_Lattice {
     PRAGMA_UNROLL
     for (int m = 0; m < Md; ++m) {
       const uint64_t metadata = stats[m][0];
-      const uint16_t packet = (const uint16_t&)data[k][m];
+      uint32_t packet;
+      if constexpr (Codebook::kWidth == 4)
+        packet = (const uint32_t&)data[k][m];
+      else
+        packet = (const uint16_t&)data[k][m];
       uint32_t scale = metadata & 65535U;
       scale |= scale << 16;
       // A lattice row is exactly four/eight consecutive biased bytes.
@@ -46,8 +51,8 @@ struct Transform_HMMA_SM70_Lattice {
             (packet & 255) | (((metadata >> (16+2*(base/8))) & 3) << 8);
         table_values = *reinterpret_cast<const uint64_t*>(grid+index*8);
       } else {
-        const int first = (packet & 255) | (((metadata >> (48+base/4)) & 1) << 8);
-        const int second = (packet >> 8) | (((metadata >> (49+base/4)) & 1) << 8);
+        const int first = (packet & 255) | (((packet >> 24) & 1) << 8);
+        const int second = (packet >> 8) | (((packet >> 25) & 1) << 8);
         const uint32_t low = *reinterpret_cast<const uint32_t*>(grid+first*4);
         const uint32_t high = *reinterpret_cast<const uint32_t*>(grid+second*4);
         table_values = low | (static_cast<uint64_t>(high) << 32);
@@ -65,7 +70,7 @@ struct Transform_HMMA_SM70_Lattice {
           values = __hadd2(values,__halves2half2(delta,delta));
         } else {
           const uint32_t signs = Codebook::kWidth == 8 ? packet >> 8 :
-                                 metadata >> (16+base);
+                                 packet >> 16;
           uint32_t sign_mask = ((signs >> i) & 1) << 15;
           sign_mask |= ((signs >> (i+1)) & 1) << 31;
           (uint32_t&)values ^= sign_mask;

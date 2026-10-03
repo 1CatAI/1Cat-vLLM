@@ -3742,14 +3742,13 @@ bool gguf_lattice_group_supported(int type, int group) {
   return group == ((type == 17 || type == 22 || type == 29) ? 16 : 32);
 }
 auto gguf_lattice_stat_type(int type) {
-  return type == 18 || type == 21   ? turbomind::kUint64
-         : type == 19 || type == 29 ? turbomind::kUint16
-                                    : turbomind::kUint32;
+  return type == 18 || type == 21 || type == 19 || type == 29
+             ? turbomind::kUint16
+             : turbomind::kUint32;
 }
 auto gguf_lattice_torch_stat_type(int type) {
-  return type == 18 || type == 21   ? torch::kInt64
-         : type == 19 || type == 29 ? torch::kInt16
-                                    : torch::kInt32;
+  return type == 18 || type == 21 || type == 19 || type == 29 ? torch::kInt16
+                                                              : torch::kInt32;
 }
 
 std::array<turbomind::gemm::MatrixLayout, 2> gguf_lattice_layouts(
@@ -3758,8 +3757,9 @@ std::array<turbomind::gemm::MatrixLayout, 2> gguf_lattice_layouts(
       turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
   TORCH_CHECK(converters[0] && converters[1],
               "GGUF lattice converters unavailable");
-  turbomind::gemm::MatrixLayout w{turbomind::kUint2, converters[0]->order, n, k,
-                                  k};
+  const bool iq3 = source_type == 18 || source_type == 21;
+  turbomind::gemm::MatrixLayout w{iq3 ? turbomind::kUint4 : turbomind::kUint2,
+                                  converters[0]->order, n, k, k};
   std::swap(w.rows, w.cols);
   w.order = ~w.order;
   w.pack = converters[0]->pack;
@@ -3798,8 +3798,9 @@ std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "GGUF lattice requires SM70");
-  TORCH_CHECK((codes < 4).all().item<bool>(),
-              "GGUF lattice code exceeds a two-bit carrier");
+  const int pack = source_type == 18 || source_type == 21 ? 8 : 16;
+  TORCH_CHECK((codes < (32 / pack == 4 ? 16 : 4)).all().item<bool>(),
+              "GGUF lattice code exceeds its carrier");
   const auto converters =
       turbomind::gemm::GetGgufLatticeConverters(source_type, 70);
   auto layouts = gguf_lattice_layouts(n, k, source_type, group_size);
@@ -3807,7 +3808,8 @@ std::vector<torch::Tensor> gguf_lattice_sm70_prepare(torch::Tensor codes,
   source_w.type = turbomind::kHalf;
   source_w.pack = 0;
   auto numeric_codes = codes.to(torch::kInt16).contiguous();
-  auto weight = torch::empty({k, n / 16}, codes.options().dtype(torch::kInt32));
+  auto weight =
+      torch::empty({k, n / pack}, codes.options().dtype(torch::kInt32));
   TORCH_CHECK(
       converters[0]->Convert(numeric_codes.data_ptr(), source_w,
                              weight.data_ptr(), layouts[0], stream) == 0,
@@ -3846,13 +3848,14 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
           input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
           stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
           weight.is_contiguous() && stats.is_contiguous(),
-      "GGUF lattice GEMM requires FP16 matrices and prepared U2 carriers "
+      "GGUF lattice GEMM requires FP16 matrices and prepared carriers "
       "and packed metadata");
   const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
   TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
                   out.size(0) == m && weight.size(0) == k &&
-                  weight.size(1) == n / 16 && stats.size(0) == k / group_size &&
-                  stats.size(1) == n,
+                  weight.size(1) ==
+                      n / (source_type == 18 || source_type == 21 ? 8 : 16) &&
+                  stats.size(0) == k / group_size && stats.size(1) == n,
               "GGUF lattice GEMM shape mismatch");
   TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
                   q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
