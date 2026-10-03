@@ -7,6 +7,7 @@ import os
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32,
@@ -66,11 +67,10 @@ _EPILOGUE_BLOCK_H = 8
 # FP32 output is deliberate: an FP16 score intermediate produced rare top-k
 # set changes at 16K/64K compressed tokens. Short and generic shapes retain the
 # fused paged kernel, whose launch overhead is lower there.
-_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "0") == "1"
+_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "1") == "1"
 _DECODE_CUBLAS_MIN_KEYS = int(
     os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS", "1024")
 )
-_DECODE_CUBLAS_MAX_ROWS = 8
 # Measured on V100: with 6 verifier rows and a 16384-key graph bucket the cuBLAS
 # route costs a flat 0.13 ms, the paged kernel 0.04-0.68 ms as the live length
 # goes from 256 to 16384 keys, same top-512 set.
@@ -769,7 +769,7 @@ def _score_request_cublas(
         max_seq_len,
         total_rows,
         head_dim=head_dim,
-        MAX_ROWS=_DECODE_CUBLAS_MAX_ROWS,
+        MAX_ROWS=triton.next_power_of_2(total_rows),
         BLOCK_N=block_n,
         num_warps=4,
     )
@@ -821,9 +821,9 @@ def _decode_cublas_blocker(
 
     requirements = (
         (
-            "a CUDA Volta device",
+            "a CUDA pre-Ampere device",
             lambda: current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0)),
+            and current_platform.is_device_capability_family(70),
         ),
         (
             f"a key bound of at least {_DECODE_CUBLAS_MIN_KEYS}",
@@ -832,15 +832,15 @@ def _decode_cublas_blocker(
         (
             "whole requests in the block table",
             lambda: table_rows_per_request > 0
+            and block_table.ndim == 2
+            and block_table.shape[0] > 0
             and block_table.shape[0] % table_rows_per_request == 0
             and total_rows % (block_table.shape[0] // table_rows_per_request) == 0,
         ),
         (
-            f"1 to {_DECODE_CUBLAS_MAX_ROWS} verifier rows per request that share "
-            "one gather (one request, or several with more than one row each)",
+            "query rows that share one gather per request",
             lambda: (native_rows or total_rows == 1 or table_rows_per_request > 1)
-            and 0 < rows_per_request() <= _DECODE_CUBLAS_MAX_ROWS
-            and (num_requests() == 1 or rows_per_request() > 1),
+            and rows_per_request() > 0,
         ),
         (
             f"float16 q [rows, heads % {_EPILOGUE_BLOCK_H} == 0, {_INDEX_HEAD_DIM}]",
@@ -855,6 +855,12 @@ def _decode_cublas_blocker(
             lambda: weights.ndim == 2
             and weights.shape == q.shape[:2]
             and weights.dtype == torch.float32,
+        ),
+        (
+            "shared gather and FP32 scores within the indexer workspace budget",
+            lambda: max_seq_len
+            * (_INDEX_HEAD_DIM * 2 + rows_per_request() * q.shape[1] * 4)
+            <= _PREFILL_TILE_MB * 2**20,
         ),
         (
             f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
@@ -926,7 +932,8 @@ def sm70_indexer_decode_logits(
     max_seq_len = max(1, int(max_seq_len))
     total_rows = weighted_q.shape[0]
 
-    if _RELU_LOGITS and _DECODE_CUBLAS:
+    policy = get_current_vllm_config().kernel_config.sm70_sparse
+    if _RELU_LOGITS and _DECODE_CUBLAS and policy.indexer_decode_cublas:
         blocker = _decode_cublas_blocker(
             q,
             cache,

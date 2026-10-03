@@ -485,8 +485,6 @@ if TYPE_CHECKING:
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
-    VLLM_SM70_DSV4_SPARSE_MLA_BMM: bool = False
-    VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -7165,17 +7163,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
-    ),
-    # Sparse MLA decode as one dequantizing gather per token and two batched
-    # matmuls. Wins over the split-K routes from about 16 heads per rank with
-    # speculative decoding; slower at 8 heads per rank (TP8). Opt-in.
-    "VLLM_SM70_DSV4_SPARSE_MLA_BMM": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_BMM", "0"))
-    ),
-    # Sparse MLA prefill as one gather per token and two batched matmuls over
-    # the gathered FP16 KV; 1.3x to 7x over the gathered Triton kernel on V100.
-    "VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL", "0"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and

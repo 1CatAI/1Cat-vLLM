@@ -90,7 +90,12 @@ def _block_table_rows_per_request(decode_metadata) -> int:
     verifier length when a uniform speculative decode was flattened to one row
     per token, 1 otherwise."""
     per_request = decode_metadata.per_req_decode_lens
-    if per_request is None or not decode_metadata.decode_is_uniform:
+    if (
+        per_request is None
+        or per_request.shape[0] == 0
+        or not decode_metadata.decode_is_uniform
+        or decode_metadata.block_table.shape[0] % per_request.shape[0]
+    ):
         return 1
     return max(1, decode_metadata.block_table.shape[0] // per_request.shape[0])
 

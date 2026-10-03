@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
@@ -19,6 +20,9 @@ from vllm.models.deepseek_v4.common.ops import (
     sparse_decode_bmm_workspace_specs,
     sparse_prefill_bmm_workspace_specs,
 )
+from vllm.models.deepseek_v4.common.ops.sparse_decode_bmm import (
+    sparse_decode_bmm_blocker,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLASparseBackend,
     DeepseekV4SparseMLAAttentionImpl,
@@ -29,6 +33,7 @@ from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_paged_fp8_splitk,
     sm70_sparse_attention_paged_fp8_splitk_qk_dsplit,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import AttentionBackend
@@ -42,6 +47,26 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _bmm_blocker(q: torch.Tensor, *, prefill: bool) -> str | None:
+    policy = get_current_vllm_config().kernel_config.sm70_sparse
+    if not (policy.prefill_bmm if prefill else policy.decode_bmm):
+        return "disabled by KernelConfig.sm70_sparse"
+    if (
+        not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(70)
+    ):
+        return "requires CUDA compute capability 7.x"
+    if q.ndim != 3 or q.dtype != torch.float16 or not q.is_contiguous():
+        return "requires contiguous FP16 queries [tokens, heads, dimensions]"
+    if min(q.shape) <= 0:
+        return "requires nonempty query dimensions"
+    if not prefill and q.shape[-1] != 512:
+        return "packed cache requires 448 FP8 and 64 RoPE dimensions"
+    if not prefill and q.shape[1] < 16:
+        return "paged split-K is faster for fewer than 16 query heads"
+    return None
 
 
 def _qk_dsplit_block_h(num_heads: int) -> int:
@@ -198,7 +223,12 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None and swa_lens is not None
-        if envs.VLLM_SM70_DSV4_SPARSE_MLA_BMM:
+        bmm_reason = _bmm_blocker(q, prefill=False)
+        if bmm_reason is None:
+            bmm_reason = sparse_decode_bmm_blocker(
+                q, layer.swa_cache_layer.kv_cache, compressed_cache
+            )
+        if bmm_reason is None:
             main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
             extra_width = (
                 0
@@ -233,6 +263,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 probs,
             )
             return
+        logger.info_once("SM70 sparse decode: paged fallback because %s.", bmm_reason)
         use_splitk = (
             (swa_only and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA)
             or (layer.compress_ratio == 4 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4)
@@ -329,7 +360,11 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
     ) -> list[tuple[tuple[int, ...], torch.dtype]]:
         """Batched-matmul prefill buffers; they share the workspace request
         with the gathered KV so that the manager does not alias them."""
-        if not envs.VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL:
+        reason = _bmm_blocker(q, prefill=True)
+        if reason is not None:
+            logger.info_once(
+                "SM70 sparse prefill: gathered fallback because %s.", reason
+            )
             return []
         return sparse_prefill_bmm_workspace_specs(
             layer.max_num_batched_tokens,

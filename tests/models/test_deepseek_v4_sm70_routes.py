@@ -6,7 +6,36 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.platforms.interface import DeviceCapability
+
+
+@pytest.fixture(autouse=True)
+def sparse_engine_config():
+    cfg = VllmConfig()
+    with set_current_vllm_config(cfg):
+        yield cfg
+
+
+@pytest.mark.parametrize(
+    "requests,rows,uniform,expected",
+    [(0, 0, True, 1), (2, 6, True, 3), (2, 5, True, 1), (2, 6, False, 1)],
+)
+def test_indexer_block_table_grouping_handles_empty_and_irregular_metadata(
+    requests, rows, uniform, expected
+):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.sparse_attn_indexer import (
+        _block_table_rows_per_request,
+    )
+
+    metadata = SimpleNamespace(
+        per_req_decode_lens=torch.empty(requests),
+        block_table=torch.empty((rows, 4)),
+        decode_is_uniform=uniform,
+    )
+    assert _block_table_rows_per_request(metadata) == expected
 
 
 def test_sm70_sparse_backend_contract():
@@ -348,7 +377,7 @@ def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
         torch.empty(shape, dtype=dtype) for shape, dtype in specs
     )
     with (
-        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_BMM", True),
+        patch.object(sparse, "_bmm_blocker", return_value=None),
         patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", True),
         patch.object(
             sparse, "current_workspace_manager", return_value=workspace_manager
@@ -384,9 +413,9 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
     q = torch.empty((1, 64, 512), dtype=torch.float16)
     impl = sparse.DeepseekV4SM70SparseImpl
 
-    with patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL", False):
+    with patch.object(sparse, "_bmm_blocker", return_value="disabled by policy"):
         assert impl._prefill_bmm_workspace_specs(layer, q, 640) == []
-    with patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL", True):
+    with patch.object(sparse, "_bmm_blocker", return_value=None):
         specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
     # One pass holds at most MAX_TOKENS_PER_PASS tokens, whatever the batch.
     assert [shape for shape, _ in specs] == [

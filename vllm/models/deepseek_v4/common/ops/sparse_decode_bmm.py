@@ -30,6 +30,28 @@ _TOKEN_DATA_BYTES = _NOPE_DIM + 2 * _ROPE_DIM
 _TOKEN_SCALE_BYTES = 8
 
 
+def sparse_decode_bmm_blocker(
+    q: torch.Tensor, main_cache: torch.Tensor, extra_cache: torch.Tensor | None
+) -> str | None:
+    """Admission for the actual packed gather layout, including padded blocks."""
+    if q.ndim != 3 or q.dtype != torch.float16 or q.shape[-1] != _HEAD_DIM:
+        return "requires FP16 queries with 448 FP8 + 64 RoPE dimensions"
+    for cache in (main_cache, extra_cache):
+        if cache is None:
+            continue
+        if (
+            cache.ndim != 3
+            or cache.dtype != torch.uint8
+            or min(cache.shape[:2]) <= 0
+            or cache.shape[2] != _TOKEN_DATA_BYTES + _TOKEN_SCALE_BYTES
+            or cache.stride(1) != cache.shape[2]
+            or cache.stride(2) != 1
+            or cache.device != q.device
+        ):
+            return "requires device-local packed FP8 cache with contiguous block bytes"
+    return None
+
+
 @triton.jit
 def _dequant_gather_rows_kernel(
     out_ptr,
@@ -127,7 +149,7 @@ def sparse_decode_bmm_workspace_specs(
     width = main_width + extra_width
     return [
         ((num_tokens, width, head_dim), dtype),
-        ((num_tokens, num_heads, width), dtype),
+        ((num_tokens, num_heads, width), torch.float32),
         ((num_tokens, num_heads, width + 1), torch.float32),
         ((num_tokens, num_heads, width + 1), torch.float32),
     ]

@@ -81,3 +81,27 @@ def test_sparse_attn_prefill_bmm_matches_reference(
     assert not output[1].any()  # no keys: the sink takes all the weight
     assert buffers[0].shape[0] == min(num_tokens + 9, MAX_TOKENS_PER_PASS)
     torch.testing.assert_close(output.double(), expected, atol=1e-3, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_prefill_retains_fp32_scores_before_softmax():
+    # Finite FP16 inputs can produce scaled QK scores beyond FP16 range. The
+    # existing attention softmax consumes FP32 scores and returns finite values.
+    q = torch.full((1, 8, HEAD_DIM), 64.0, device="cuda", dtype=torch.float16)
+    kv = torch.full((2, HEAD_DIM), 64.0, device="cuda", dtype=torch.float16)
+    indices = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([2], device="cuda", dtype=torch.int32)
+    sink = torch.zeros(8, device="cuda", dtype=torch.float32)
+    buffers = [
+        torch.empty(shape, device="cuda", dtype=dtype)
+        for shape, dtype in sparse_prefill_bmm_workspace_specs(
+            1, 8, HEAD_DIM, 2, q.dtype
+        )
+    ]
+    output = torch.empty_like(q)
+    sparse_attn_prefill_bmm(
+        q, kv, indices, lengths, HEAD_DIM**-0.5, sink, output, *buffers
+    )
+    assert buffers[1].dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert torch.equal(output, torch.full_like(output, 64.0))

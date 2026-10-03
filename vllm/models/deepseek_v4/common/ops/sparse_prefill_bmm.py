@@ -33,7 +33,7 @@ def sparse_prefill_bmm_workspace_specs(
     num_tokens = min(num_tokens, MAX_TOKENS_PER_PASS)
     return [
         ((num_tokens, width, head_dim), dtype),
-        ((num_tokens, num_heads, width), dtype),
+        ((num_tokens, num_heads, width), torch.float32),
         ((num_tokens, num_heads, width + 1), torch.float32),
         ((num_tokens, num_heads, width + 1), torch.float32),
     ]
@@ -114,10 +114,15 @@ def attend_gathered_keys(
     # the workspace held before may be NaN. Its weight is zero below, but
     # 0 * NaN is NaN.
     keys.masked_fill_(unused[:, :, None], 0)
-    torch.baddbmm(scores, q, keys.transpose(1, 2), beta=0, alpha=scale, out=scores)
+    # Preserve the existing FP32 QK score boundary before softmax. Rounding
+    # scores to FP16 here can overflow even when the final attention is finite.
+    torch.bmm(q, keys.transpose(1, 2), out=scores, out_dtype=torch.float32)
+    scores.mul_(scale)
     logits[..., :width].copy_(scores)
     logits[..., :width].masked_fill_(unused[:, None, :], float("-inf"))
     logits[..., width] = attn_sink
     torch.softmax(logits, dim=-1, out=probs)
-    scores.copy_(probs[..., :width])
-    torch.bmm(scores, keys, out=output)
+    # Existing HMMA attention also converts probabilities to the key dtype
+    # before PV; keep that precision boundary rather than narrowing QK.
+    probabilities = probs[..., :width].to(keys.dtype)
+    torch.bmm(probabilities, keys, out=output)

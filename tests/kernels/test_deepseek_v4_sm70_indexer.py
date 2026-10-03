@@ -4,12 +4,20 @@
 import pytest
 import torch
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.deepseek_v4.sm70 import indexer as sm70_indexer
 from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_decode_logits,
     sm70_indexer_prefill_logits,
 )
 from vllm.utils.torch_utils import current_stream
+
+
+@pytest.fixture(autouse=True)
+def indexer_engine_config():
+    with set_current_vllm_config(VllmConfig()):
+        yield
+
 
 requires_sm70 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7,
@@ -200,13 +208,14 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 # speculative decode with more than two verifier tokens arrives as, one
 # block-table row and one length per token. two_requests: the same, twice.
 @pytest.mark.parametrize("layout", ["native", "flattened", "two_requests"])
+@pytest.mark.parametrize("num_rows", [3, 8, 13])
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
-    monkeypatch, padded_blocks, layout
+    monkeypatch, padded_blocks, layout, num_rows
 ):
     torch.manual_seed(20260824)
     generator = torch.Generator().manual_seed(20260824)
-    num_rows, num_heads = 8, 64
+    num_heads = 64
     live_seq_len = 1017
     graph_width = 2048
     blocks = (live_seq_len + _BLOCK_SIZE - 1) // _BLOCK_SIZE
