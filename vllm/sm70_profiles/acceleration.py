@@ -289,6 +289,7 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
     # Keep the companion import stable with and without extracted build files.
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
 
+    # isort: split
     from flash_attn_v100 import (  # type: ignore[attr-defined]
         flash_attn_grouped_e4m3_fp32_available,
     )
