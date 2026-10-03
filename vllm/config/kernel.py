@@ -258,6 +258,8 @@ class Sm70Fp8Config:
 
     enabled: bool | None = None
     """Use TurboMind; auto retains the shared legacy backend preference."""
+    block_qpn8: bool = True
+    """Use native weight-only block QPN8 when its kernel capabilities match."""
     dequant_fallback: bool | None = None
     """Keep the legacy dense dequantization route available when requested."""
     qpn8: bool | None = None

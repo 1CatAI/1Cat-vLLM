@@ -69,3 +69,51 @@ def test_marlin_bmm_apply_multiplies_each_group_by_its_rows(num_tokens) -> None:
         torch.testing.assert_close(
             out[:, group].float(), expected, rtol=2e-3, atol=2e-2
         )
+
+
+def test_late_grouped_turing_metadata_discards_dense_qpn8_selection():
+    from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+        QPN8Fp8BlockScaledMMLinearKernel,
+    )
+
+    layer, reference = _grouped_layer()
+    method = _marlin_method()
+    method.use_marlin = False
+    method.use_sm70_fp8_turbomind = False
+    method.fp8_linear = QPN8Fp8BlockScaledMMLinearKernel.__new__(
+        QPN8Fp8BlockScaledMMLinearKernel
+    )
+    method.process_weights_after_loading(layer)
+    assert layer.dequantized_bmm
+    assert torch.equal(layer.weight, reference.half())
+    assert not hasattr(method, "fp8_linear")
+
+
+def test_late_grouped_volta_metadata_reselects_grouped_kernel(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+        QPN8Fp8BlockScaledMMLinearKernel,
+    )
+
+    layer, _ = _grouped_layer()
+    method = _marlin_method()
+    method.use_marlin = False
+    method.use_sm70_fp8_turbomind = True
+    method.activation_quant_key = None
+    method.weight_quant_key = None
+    method.input_dtype = method.out_dtype = torch.float16
+    method.is_scale_e8m0 = True
+    method.fp8_linear = QPN8Fp8BlockScaledMMLinearKernel.__new__(
+        QPN8Fp8BlockScaledMMLinearKernel
+    )
+    seen: list[torch.nn.Module] = []
+
+    def select(**kwargs):
+        assert kwargs["is_bmm"]
+        return SimpleNamespace(process_weights_after_loading=seen.append)
+
+    monkeypatch.setattr(fp8, "init_sm70_fp8_linear_kernel", select)
+    method.process_weights_after_loading(layer)
+    assert seen == [layer]
+    assert not getattr(layer, "dequantized_bmm", False)

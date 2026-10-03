@@ -6,6 +6,8 @@ import pytest
 from vllm import envs
 
 ALIASES = {
+    "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": "trace",
+    "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": "selector",
     "VLLM_SM70_PROFILE_TRACE": "trace",
     "VLLM_SM70_DECODE_TILE_PROFILE": "trace",
     "VLLM_SM70_MTP_PROFILE": "mtp",
@@ -32,7 +34,17 @@ def test_legacy_debug_parser_is_preserved_and_warns(name, value, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "channels", ("", "trace", "mtp", "events", "routing", "trace,mtp")
+    "channels",
+    (
+        "",
+        "trace",
+        "mtp",
+        "events",
+        "routing",
+        "selector",
+        "trace,mtp",
+        "trace,selector",
+    ),
 )
 def test_channels_enable_only_requested_diagnostics(channels, monkeypatch):
     monkeypatch.setenv("VLLM_SM70_DEBUG", channels)
