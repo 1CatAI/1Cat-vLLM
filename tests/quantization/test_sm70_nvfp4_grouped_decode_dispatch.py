@@ -45,10 +45,10 @@ def test_grouped_mtp5_preserves_direct_admission(monkeypatch, tokens):
     assert not moe._use_grouped_mtp5(layer, x, ids)
 
 
-def test_grouped_mtp5_defaults_off(monkeypatch):
+def test_grouped_mtp5_defaults_on(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", raising=False)
     envs.disable_envs_cache()
-    assert not envs.VLLM_SM70_NVFP4_MOE_GROUPED_MTP5
+    assert envs.VLLM_SM70_NVFP4_MOE_GROUPED_MTP5
 
 
 def test_grouped_mtp5_unprepared_layer_falls_back():

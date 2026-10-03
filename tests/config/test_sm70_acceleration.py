@@ -321,6 +321,40 @@ def test_unqualified_linear_default_reports_reason(config):
     )
 
 
+def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
+    config.model_config.architectures = ["Qwen4ExpForCausalLM"]
+    config.speculative_config = NS(method="mtp", num_speculative_tokens=4)
+    config.model_config.hf_text_config = NS(
+        hidden_size=2560,
+        hc_count=4,
+        hc_lowrank=320,
+        num_hidden_layers=48,
+        mtp_num_hidden_layers=1,
+        layer_types=["linear_attention"] * 36 + ["full_attention"] * 12,
+    )
+    report = acc.build_report(config)["flash_next_batch"]
+    memory = report["packed_weight_memory"]
+    assert memory["components"]["gdn_input"] == int(725.625 * 1024**2)
+    assert memory["components"]["hc_target"] == 330 * 1024**2
+    assert memory["components"]["hc_draft"] == int(6.875 * 1024**2)
+    assert memory["components"]["router"] == int(122.5 * 1024**2)
+    assert memory["components"]["shared_expert"] == int(76.5625 * 1024**2)
+    assert len(report["controls"]) == 14
+    for name in report["controls"]:
+        monkeypatch.setenv(name, "0")
+    report = acc.build_report(config)["flash_next_batch"]
+    assert report["packed_weight_memory"]["total_bytes"] == 0
+    assert all(row["reason"] == "user_override" for row in report["controls"].values())
+
+
+def test_flash_next_memory_does_not_guess_other_tp_layout(config):
+    config.model_config.architectures = ["Qwen4ExpForCausalLM"]
+    config.parallel_config.tensor_parallel_size = 2
+    memory = acc.build_report(config)["flash_next_batch"]["packed_weight_memory"]
+    assert memory["total_bytes"] is None
+    assert memory["reason"] == "estimate_requires_qualified_reference_layout"
+
+
 @pytest.mark.parametrize("format_name", ("sm70_awq", "sm70_fp8"))
 def test_quantized_models_report_their_policy_without_claiming_nvfp4_profile(
     config, format_name

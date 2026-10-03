@@ -17,7 +17,14 @@ def clear_env_cache(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    backend = torch.backends.cuda.matmul
+    old_reduction = backend.allow_fp16_reduced_precision_reduction
+    old_accumulation = backend.allow_fp16_accumulation
+    backend.allow_fp16_reduced_precision_reduction = False
+    backend.allow_fp16_accumulation = False
     yield
+    backend.allow_fp16_reduced_precision_reduction = old_reduction
+    backend.allow_fp16_accumulation = old_accumulation
     envs.disable_envs_cache()
 
 
@@ -94,3 +101,18 @@ def test_dense_permission_survives_fake_export():
         if node.target == torch.ops.vllm.qwen38_sm70_fp16_gemv.default
     ]
     assert len(calls) == 1 and calls[0].args[-1] is True
+
+
+@pytest.mark.parametrize("rows", (2, 4, 5, 8))
+def test_reduced_precision_output_keeps_baseline_schedule(rows):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    assert gemv._can_use_dense_batch(
+        tensor_descriptor(rows, 1536),
+        tensor_descriptor(2560, 1536),
+        "layers.0.linear_attn.out_proj",
+    ) == (rows == 8)
+    assert gemv._can_use_dense_batch(
+        tensor_descriptor(4, 2560),
+        tensor_descriptor(512, 2560),
+        "layers.0.mlp.gate",
+    )

@@ -139,7 +139,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS: str | None = None
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
     VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB: str | None = None
-    VLLM_SM70_QSA_MTP_TOPK: str | None = None
+    VLLM_SM70_QSA_MTP_TOPK: bool = True
     VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
@@ -320,16 +320,16 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = True
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
-    VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = False
-    VLLM_SM70_MTP_HC_BATCH: bool = False
-    VLLM_SM70_MTP_HC_COOPERATIVE: bool = False
-    VLLM_SM70_MTP_HC_FULL_UNROLL: bool = False
-    VLLM_SM70_MTP_ROUTER_TOP16: bool = False
-    VLLM_SM70_MTP_ROUTER_BATCH: bool = False
-    VLLM_SM70_MTP_SHARED_BATCH: bool = False
-    VLLM_SM70_MTP_PLE_CONV: bool = False
+    VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = True
+    VLLM_SM70_MTP_HC_BATCH: bool = True
+    VLLM_SM70_MTP_HC_COOPERATIVE: bool = True
+    VLLM_SM70_MTP_HC_FULL_UNROLL: bool = True
+    VLLM_SM70_MTP_ROUTER_TOP16: bool = True
+    VLLM_SM70_MTP_ROUTER_BATCH: bool = True
+    VLLM_SM70_MTP_SHARED_BATCH: bool = True
+    VLLM_SM70_MTP_PLE_CONV: bool = True
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
-    VLLM_SM70_QWEN38_BATCH_FASTPATH: bool = False
+    VLLM_SM70_QWEN38_BATCH_FASTPATH: bool = True
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
@@ -355,7 +355,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
-    VLLM_SM70_NVFP4_MOE_GROUPED_MTP5: bool = False
+    VLLM_SM70_NVFP4_MOE_GROUPED_MTP5: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
@@ -748,7 +748,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GDN_QPN8_BA_SPLIT: bool = False
     VLLM_SM70_GDN_RMSNORM_ONEPASS: bool = False
-    VLLM_SM70_RMSNORM_GATED_EXACT: bool = False
+    VLLM_SM70_RMSNORM_GATED_EXACT: bool = True
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
@@ -760,14 +760,14 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_DECODE_FLASHQLA: bool = True
     VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG: bool = False
     VLLM_SM70_FLASHQLA_DECODE_WARMUP: bool = True
-    VLLM_SM70_FUSED_SIGMOID_MIXED_QKV: bool = False
+    VLLM_SM70_FUSED_SIGMOID_MIXED_QKV: bool = True
     VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE: bool = False
     VLLM_SM70_GDN_EMPTY_CORE_OUT: bool = False
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
     VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = True
-    VLLM_SM70_MTP_MOE_FP16_EXACT: bool = False
+    VLLM_SM70_MTP_MOE_FP16_EXACT: bool = True
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -3908,114 +3908,157 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qualified M2..16 input chain. Keep opt-in because its packed weights
     # consume another 725.625 MiB/rank in the Flash-Next TP4 configuration.
     "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1"))),
         description=(
-            "Qualified M2..16 input chain. Keep opt-in because its packed "
-            "weights consume another 725.625 MiB/rank in the Flash-Next TP4 "
-            "configuration."
+            "Automatic packing is qualified for ordinary decode and MTP; "
+            "other proposers retain explicit opt-in. "
+            "Enables lossless packed GDN input projections for M2..16. Default "
+            "on after #703/#704 qualification. Set 0 together with "
+            "QWEN38_BATCH_FASTPATH=0 to recover the packed-weight memory "
+            "(725.625 MiB per Flash-Next TP4 target rank)."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("Gated DeltaNet",),
+        acceleration_paths=("Gated DeltaNet", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # TP4 MTP4 batch HC, sharing the concurrent-decode packed MMA/gather
     # implementation while preserving the current FP16 split-K boundaries.
     "VLLM_SM70_MTP_HC_BATCH": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_BATCH", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_BATCH", "1"))),
         description=(
-            "TP4 MTP4 batch HC, sharing the concurrent-decode packed "
-            "MMA/gather implementation while preserving the current FP16 "
-            "split-K boundaries."
+            "Enables qualified M5/M10 HC projection and gather kernels with "
+            "the existing FP16 split-K boundaries. Default on after #703 "
+            "qualification. Set 0 to recover HC packed weights when "
+            "QWEN38_BATCH_FASTPATH is also 0 (330 MiB per Flash-Next TP4 "
+            "target rank)."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Join the admitted HC phases with cooperative grid barriers, keeping
     # the same per-projection arithmetic and communicator-owned packets.
     "VLLM_SM70_MTP_HC_COOPERATIVE": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_COOPERATIVE", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_COOPERATIVE", "1"))),
         description=(
-            "Join the admitted HC phases with cooperative grid barriers, "
-            "keeping the same per-projection arithmetic and communicator-owned"
-            " packets."
+            "Combines admitted HC projection and gather phases with "
+            "cooperative barriers. Default on after #703 quality and complete- "
+            "round qualification. Set 0 to compare the separate-phase "
+            "implementation when diagnosing HC performance."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Exact cooperative HC schedule; opt in pending same-engine comparison.
     "VLLM_SM70_MTP_HC_FULL_UNROLL": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_FULL_UNROLL", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_HC_FULL_UNROLL", "1"))),
         description=(
-            "Exact cooperative HC schedule; opt in pending same-engine comparison."
+            "Selects the qualified fully unrolled cooperative HC schedule. "
+            "Default on after #703 complete-round qualification. Set 0 to "
+            "compare the partial-unroll schedule when diagnosing performance."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Select only the first 16 lossless keys before the unchanged top-10 norm.
     "VLLM_SM70_MTP_ROUTER_TOP16": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "1"))),
         description=(
-            "Select only the first 16 lossless keys before the unchanged top-10 norm."
+            "Selects lossless top-16 router keys before the unchanged top-10 "
+            "normalization. Default on after #703 qualification. Set 0 to "
+            "diagnose routing with the original full-key selection."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Fused four-partition FP32 reduction for the MTP4 FP16 router projection.
     "VLLM_SM70_MTP_ROUTER_BATCH": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ROUTER_BATCH", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ROUTER_BATCH", "1"))),
         description=(
-            "Fused four-partition FP32 reduction for the MTP4 FP16 router projection."
+            "Enables the exact M5/M10 FP16 router projection with four ordered "
+            "FP32 splits. Default on after #703 qualification. Set 0 to "
+            "recover packed router copies (122.5 MiB per Flash-Next TP4 target "
+            "rank)."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues.
     "VLLM_SM70_MTP_SHARED_BATCH": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_SHARED_BATCH", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_SHARED_BATCH", "1"))),
         description=(
-            "Exact MTP4 shared-expert projection/SiLU and sigmoid/multiply epilogues."
+            "Enables exact M5/M10 shared-expert projection and SiLU fusion. "
+            "Default on after #703 qualification. Set 0 to recover packed "
+            "shared-expert copies (76.5625 MiB per Flash-Next TP4 target "
+            "rank)."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "1"))),
         description=(
-            "Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit."
+            "Fuses qualified MTP4 PLE rollback, ordered convolution taps, SiLU "
+            "and state commit. Default on after #703 exact state and model "
+            "qualification. Set 0 to diagnose PLE state updates with the "
+            "separate operations."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
@@ -4048,17 +4091,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One admission gate for exact small-batch HC/GDN/gate/TP4 candidates.
     # Keep opt-in until their combined same-build model quality gate passes.
     "VLLM_SM70_QWEN38_BATCH_FASTPATH": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1"))),
         description=(
-            "One admission gate for exact small-batch HC/GDN/gate/TP4 "
-            "candidates. Keep opt-in until their combined same-build model "
-            "quality gate passes."
+            "Enables the qualified small-batch dense, GDN and TP4 HC routes. "
+            "Default on after #704 quality and throughput qualification. Set 0 "
+            "to trade speed for KV capacity; Flash-Next TP4 packed copies add "
+            "up to 1055.625 MiB per rank."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("SM70 runtime/kernel policy",),
+        acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
@@ -4827,17 +4874,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Reuse the batched expert grouping for the exact TP4 MTP4 verifier.
     # Preserve its W13 split4 and ordered FP16 W2/FP32 weighted reduction.
     "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "1"))),
         description=(
-            "Reuse the batched expert grouping for the exact TP4 MTP4 "
-            "verifier. Preserve its W13 split4 and ordered FP16 W2/FP32 "
-            "weighted reduction."
+            "Reuses expert grouping for the qualified NVFP4 MTP5 route without "
+            "changing W13 split order. Default on after #703 quality and "
+            "complete-round qualification. Set 0 to compare the direct expert "
+            "dispatch."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("TurboMind NVFP4",),
+        acceleration_paths=("TurboMind NVFP4", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
@@ -11282,15 +11333,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_RMSNORM_GATED_EXACT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0"))),
         description=(
-            "Fuse the native FP32 N128 gated RMSNorm chain without changing "
-            "its vector4 mean reduction, sigmoid/SiLU, or FP16 output "
-            "boundary."
+            "Uses native FP32 gated RMSNorm for supported SM70 layouts. "
+            "Default on after #703/#704 quality qualification to preserve "
+            "arithmetic across compiled graph contexts. Other models remain off "
+            "until qualified. Set 0 only to diagnose "
+            "the original normalization route."
         ),
         category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("SM70 runtime/kernel policy",),
+        effective_default=(
+            "False at the compatibility getter; resolved per engine to True for "
+            "qualified Flash-Next ordinary/MTP configurations. Operator "
+            "dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
+        automatic_conditions=(
+            "Flash-Next ordinary decode or MTP quality qualification",
+        ),
+        acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
@@ -11490,17 +11550,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM70 fused MTP verifier. Model routing remains default-off until its
     # token/quality/throughput gates pass.
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "1"))),
         description=(
-            "Experimental packed-QKV GDN decode loader, also reused by the "
-            "small SM70 fused MTP verifier. Model routing remains default-off "
-            "until its token/quality/throughput gates pass."
+            "Fuses sigmoid and multiply for supported mixed-QKV layouts "
+            "without changing FP32 recurrent state. Default on after #703 "
+            "quality qualification. Set 0 to diagnose the separate epilogue."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("SM70 runtime/kernel policy",),
+        acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": env_var(
@@ -11608,17 +11671,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
     # BM2 Triton accumulation order, original weights, and FP16 boundaries.
     "VLLM_SM70_MTP_MOE_FP16_EXACT": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "1"))),
         description=(
-            "Opt-in exact FP16 Flash-Next TP4 draft projections; retains the "
-            "tuned BM2 Triton accumulation order, original weights, and FP16 "
-            "boundaries."
+            "Uses exact native M1/M5 FP16 draft MoE kernels with the original "
+            "accumulation order. Default on after #703 qualification. Set 0 to "
+            "compare the original Triton MoE implementation."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier",),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
@@ -17259,18 +17325,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_SM70_QSA_MTP_TOPK": env_var(
-        lambda: os.getenv("VLLM_SM70_QSA_MTP_TOPK"),
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_MTP_TOPK", "1"))),
         description=(
-            "Controls qualified M5/M10 QSA top-k compaction with the original "
-            "scorer. Default off in the legacy MTP policy until its qualified "
-            "group is promoted. Set 1 to reproduce the #703 MTP4 "
-            "qualification; use 0 for the full-row selector diagnostic."
+            "Enables the qualified M5/M10 QSA top-k compaction while retaining "
+            "the original scorer. Default on after #703 qualification. Set 0 "
+            "to compare full-row top-k when diagnosing selector output."
         ),
         category="configuration",
-        declared_default="None",
-        effective_default=("None"),
-        automatic_conditions=("'0' at vllm/models/qwen4_exp/nvidia/ops/qsa.py:module",),
-        acceleration_paths=("QSA sparse attention/indexer",),
+        declared_default="True",
+        effective_default=(
+            "True; operator dtype, geometry, numerical policy and native "
+            "availability checks still apply."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=(
+            "QSA sparse attention/indexer",
+            "Flash-Next qualified batch",
+        ),
         user_visible=True,
     ),
     "VLLM_SM70_QSA_TOPK_LIBRARY": env_var(

@@ -10,6 +10,7 @@ import os
 import regex as re
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
@@ -50,7 +51,7 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 
 
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
-_SM70_QSA_MTP_TOPK = os.getenv("VLLM_SM70_QSA_MTP_TOPK", "0") == "1"
+_SM70_QSA_MTP_TOPK = envs.VLLM_SM70_QSA_MTP_TOPK
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     legacy_qsa_tuning(
         "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", SM70_QSA_TUNING.score_tile_mb
