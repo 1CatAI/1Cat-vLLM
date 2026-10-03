@@ -677,6 +677,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS: str | None = None
     VLLM_QSA_KV_CALIBRATION_DIR: str | None = None
     VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD: str | None = None
+    # Opt-in (phase 2): allow the Qwen4Exp QSA E4M3 main KV cache together with
+    # MTP speculative decoding. Default 0 keeps the phase-1 MTP0 gate exactly.
     VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS: str | None = None
     VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE: str = "stream"
     VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS: str | None = None
