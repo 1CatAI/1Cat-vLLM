@@ -220,8 +220,9 @@ class Worker(WorkerBase):
         # do not create a connector.
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
-        if parallel_config.decode_context_parallel_size != 1:
-            unsupported.append(f"DCP={parallel_config.decode_context_parallel_size}")
+        # DCP shards attention KV, not the hidden/input tokens replicated over
+        # TP. PLE still computes once per DP rank and fans out to the same TP
+        # output buffers. Attention kernels validate their own DCP layouts.
         if parallel_config.use_ubatching:
             unsupported.append("ubatching/DBO")
         if self.vllm_config.weight_transfer_config is not None:
