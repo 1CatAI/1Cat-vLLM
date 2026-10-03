@@ -23,6 +23,18 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def valid_vocabulary(tokenizer, model_vocabulary):
+    """Exclude matrix padding using tokenizer IDs, never probability cutoffs."""
+    ids = set(tokenizer.get_vocab().values())
+    if not ids or min(ids) < 0 or max(ids) >= model_vocabulary:
+        raise ValueError("Tokenizer IDs are outside the model vocabulary")
+    if min(ids) != 0 or len(ids) != max(ids) + 1:
+        raise ValueError(
+            "Noncontiguous tokenizer IDs require an explicit valid-ID mask"
+        )
+    return len(ids)
+
+
 def prepare(args):
     from transformers import AutoTokenizer
 
@@ -82,7 +94,8 @@ def prepare(args):
     model_config = json.loads((args.model / "config.json").read_text())
     text_config = model_config.get("text_config", model_config)
     manifest = {
-        "vocabulary": text_config["vocab_size"],
+        "vocabulary": valid_vocabulary(tokenizer, text_config["vocab_size"]),
+        "model_vocabulary": text_config["vocab_size"],
         "suite_sha256": digest(args.cases),
         "quality_reference_sha256": digest(args.quality_reference),
         "probes": probes,

@@ -114,3 +114,17 @@ def test_default_repeat_noise_blocks_an_identical_candidate(tmp_path):
     result = json.loads((candidate / "comparison.json").read_text())
     assert result["distribution_passed"]
     assert not result["default_noise_passed"]
+
+
+def test_valid_vocabulary_includes_added_ids_and_excludes_matrix_padding():
+    from types import SimpleNamespace
+
+    from benchmarks.benchmark_sm70_qwen38_distribution import valid_vocabulary
+
+    tokenizer = SimpleNamespace(get_vocab=lambda: {"base": 0, "word": 1, "special": 2})
+    assert valid_vocabulary(tokenizer, 8) == 3
+    with pytest.raises(ValueError, match="outside"):
+        valid_vocabulary(tokenizer, 2)
+    sparse = SimpleNamespace(get_vocab=lambda: {"base": 0, "gap": 2})
+    with pytest.raises(ValueError, match="Noncontiguous"):
+        valid_vocabulary(sparse, 8)
