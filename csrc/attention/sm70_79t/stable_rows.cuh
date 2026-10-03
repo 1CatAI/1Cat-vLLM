@@ -142,6 +142,7 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
     base = int64_t(tile_rows) * tile_tokens * tile * (tile + 1) / 2;
   }
   float2 maximum = {-CUDART_INF_F, -CUDART_INF_F};
+  float2 sampled = {-CUDART_INF_F, -CUDART_INF_F};
   int end = min(width, int(blockIdx.y + 1) * 8192);
   // Tail numerators are stored in FP16, so their shift always uses every key.
   // Prefix PV detects missed peaks while reading all scores; flagged tiles are
@@ -153,10 +154,21 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
         scores + base + int64_t(col) * stride + local_row));
     maximum.x = fmaxf(maximum.x, value.x);
     maximum.y = fmaxf(maximum.y, value.y);
+    if constexpr (Tail) {
+      if (col % 8 == 0) {
+        sampled.x = fmaxf(sampled.x, value.x);
+        sampled.y = fmaxf(sampled.y, value.y);
+      }
+    }
   }
   int64_t offset = int64_t(blockIdx.y) * rows + row;
   partials[offset] = maximum.x;
   partials[offset + 1] = maximum.y;
+  if constexpr (Tail) {
+    int64_t sample_offset = int64_t(gridDim.y + blockIdx.y) * rows + row;
+    partials[sample_offset] = sampled.x;
+    partials[sample_offset + 1] = sampled.y;
+  }
 }
 
 template <bool Tail, bool Repair = false>
@@ -170,7 +182,17 @@ __global__ void stable_finish_max(float const* partials, float* maxima,
   float value = -CUDART_INF_F;
   for (int tile = 0; tile < tiles; ++tile)
     value = fmaxf(value, partials[int64_t(tile) * rows + row]);
-  maxima[row] = value + kStableScoreMargin;
+  float shift_value = value;
+  if constexpr (Tail) {
+    float sampled = -CUDART_INF_F;
+    for (int tile = 0; tile < tiles; ++tile)
+      sampled = fmaxf(sampled, partials[int64_t(tiles + tile) * rows + row]);
+    // Preserve the existing shift when the sampled maximum and its margin
+    // already bound every tail score. Correct only a genuinely missed peak.
+    if (isfinite(sampled) && value <= sampled + kStableScoreMargin)
+      shift_value = sampled;
+  }
+  maxima[row] = shift_value + kStableScoreMargin;
   // A prefix sample can miss a peak by at most kStableMaxExpInput without
   // triggering the complete-max repair. Reserve that gap in the admission
   // bound; the repair and tail scans already see the complete maximum.

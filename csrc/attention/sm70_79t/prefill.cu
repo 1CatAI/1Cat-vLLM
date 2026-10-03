@@ -6186,6 +6186,8 @@ struct Sm70GqaHalf2Workspace {
     prefix_max = at::empty({kRows}, fp32);
     prefix_accumulator = at::empty({kRows, kHeadDim}, fp32);
     max_partials = at::empty({16, kRows}, fp32);
+    // Tail scans need two planes (complete and sampled maxima).
+    static_assert(2 * ((kQuery + 8191) / 8192) <= 16);
     tail_max_partials = at::empty({16, kRows}, fp32);
     prefix_outliers = at::empty(
         {(kRows + PVThreadblockShape::kM - 1) / PVThreadblockShape::kM},
