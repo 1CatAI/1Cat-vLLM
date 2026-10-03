@@ -1404,6 +1404,8 @@ if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
     if _is_cuda() or _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
+    if _is_cuda():
+        ext_modules.append(CMakeExtension(name="vllm._C_gguf"))
 
 package_data = {
     "flash_qla": [
@@ -1450,6 +1452,13 @@ if PRECOMPILED_RUST_FRONTEND_PATH.exists():
     vllm_files = package_data.setdefault("vllm", [])
     if "vllm-rs" not in vllm_files:
         vllm_files.append("vllm-rs")
+
+# A focused CMake source build may prepare the new GGUF extension while the
+# unchanged base operators come from a precompiled wheel. Ship that normally
+# installed module in the final wheel, rather than a task-cache sidecar.
+if USE_PRECOMPILED_EXTENSIONS and (ROOT_DIR / "vllm/_C_gguf.abi3.so").is_file():
+    package_data.setdefault("vllm", []).append("_C_gguf.abi3.so")
+package_data.setdefault("vllm", []).append("third_party/gguf_native/*")
 
 if _no_device():
     ext_modules = []

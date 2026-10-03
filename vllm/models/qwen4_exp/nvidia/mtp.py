@@ -645,6 +645,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     ) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target again only for load_weights to drop
+        # everything but the MTP tensors.
+        return _remap_mtp_weight_name(name) is None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:

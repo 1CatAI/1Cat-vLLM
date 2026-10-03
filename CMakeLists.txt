@@ -806,6 +806,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    include(csrc/quantization/gguf_upstream/CMakeLists.txt)
+  endif()
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)
   #

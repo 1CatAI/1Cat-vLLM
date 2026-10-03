@@ -71,6 +71,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import (
+    PLE_SHARD_PREFIX,
     auto_ple_host_budget_bytes,
     available_host_bytes,
     cap_host_budget_bytes,
@@ -1568,7 +1569,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         }
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
-        shard_prefix = "ngram_embedding.shard_"
+        shard_prefix = PLE_SHARD_PREFIX
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]

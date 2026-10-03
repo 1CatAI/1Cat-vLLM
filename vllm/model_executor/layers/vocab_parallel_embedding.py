@@ -92,20 +92,7 @@ def _sm70_lm_head_packed_layout_requested(
 
 
 def _sm70_dflash2_use_dense_order(layer=None) -> bool:
-    """Keep production on the scored full-vocabulary tie-order contract."""
-    if _sm70_dflash2_option("qpn8_dense_order", layer):
-        return True
-    if _sm70_dflash2_option("qpn8_allow_candidate_order", layer):
-        logger.warning_once(
-            "Using experimental SM70 DFlash2 QPN8 candidate-order top-k. "
-            "This path is not authorized for quality-sensitive serving."
-        )
-        return False
-    logger.warning_once(
-        "Ignoring VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER=0 without the explicit "
-        "benchmark-only VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER=1; "
-        "using the scored dense-order path."
-    )
+    """Dense vocabulary tie order is the validated selector contract."""
     return True
 
 
