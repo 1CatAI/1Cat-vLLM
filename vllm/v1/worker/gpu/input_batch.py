@@ -97,6 +97,8 @@ class InputBatch:
     # Model-specific runners may use this to omit work whose outputs cannot be
     # consumed until a later chunk. None is equivalent to all False.
     is_incomplete_prefilling_np: np.ndarray | None = None
+    # Dummy profiling and graph-capture inputs must never write KV slots.
+    is_dummy_batch: bool = False
 
     @classmethod
     def make_dummy(
@@ -173,6 +175,7 @@ class InputBatch:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
+            is_dummy_batch=True,
         )
 
 

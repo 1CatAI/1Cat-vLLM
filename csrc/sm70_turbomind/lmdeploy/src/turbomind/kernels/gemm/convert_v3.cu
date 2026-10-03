@@ -136,6 +136,12 @@ std::array<const LayoutConverter*, 2> GetConverters(DataType data_type,
         }
     }
 
+    if (weight_type == kUint8 && sm >= 70 && sm < 75) {
+        constexpr Cvt<uint16_t, uint8_t> W;
+        constexpr Cvt<uint32_t, uint32_t> S;
+        return {W(sm70, kRow, s884h | B | _1), S(sm70, kCol, s884h | V | _1)};
+    }
+
     if (weight_type == kFloat4_e2m1) {
         constexpr Cvt<uint16_t, uint4_t> W;  // e2m1  weight
         constexpr Cvt<uint8_t, uint8_t>  S;  // ue8m0 scales

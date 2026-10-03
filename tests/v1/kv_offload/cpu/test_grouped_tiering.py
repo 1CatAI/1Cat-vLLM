@@ -232,6 +232,39 @@ def test_group_routing_forwards_all_lifecycle_hooks():
         child.shutdown.assert_called_once_with()
 
 
+def test_tiering_shared_rows_accept_mixed_gpu_block_sizes():
+    """Distinct group keys may share the tier's fixed-size worker rows."""
+    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+    spec = object.__new__(TieringOffloadingSpec)
+    spec.partition_by_group = False
+    spec.gpu_block_size = (3200, 1600)
+    spec._manager = None
+    spec.vllm_config = SimpleNamespace(
+        instance_id=f"mixed-tier-test-{uuid.uuid4().hex}",
+        parallel_config=SimpleNamespace(world_size=2),
+        kv_events_config=None,
+    )
+    spec.cpu_page_size_per_worker = 64
+    spec.num_blocks = 4
+    spec.eviction_policy = "lru"
+    spec.secondary_tier_configs = []
+    spec.extra_config = {}
+    manager = spec.get_manager()
+    try:
+        keys = [_key(0, 1), _key(1, 1)]
+        prepared = manager.prepare_store(keys, CTX)
+        assert prepared is not None
+        assert set(prepared.keys_to_store) == set(keys)
+        manager.complete_store(keys, CTX)
+        assert all(manager.lookup(key, CTX) is True for key in keys)
+    finally:
+        manager.shutdown()
+        spec._manager = None
+        assert spec._scheduler_mmap is not None
+        spec._scheduler_mmap.cleanup()
+
+
 def test_spec_group_regions_share_geometry_and_cleanup_partial_failure(monkeypatch):
     import vllm.v1.kv_offload.tiering.spec as spec_module
 
@@ -313,8 +346,10 @@ def test_spec_tier_creation_failure_closes_all_regions(tmp_path, monkeypatch):
         assert not Path(region.mmap_path).exists()
 
 
-@pytest.mark.parametrize("invalid", [None, "backend", "pipeline", "nodes"])
-def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, invalid):
+@pytest.mark.parametrize(
+    "topology", [None, "decode_cp", "backend", "pipeline", "prefill_cp", "nodes"]
+)
+def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, topology):
     import vllm.v1.kv_offload.tiering.spec as spec_module
 
     def parent_init(self, config, cache):
@@ -325,13 +360,14 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, inva
     monkeypatch.setattr(spec_module.CPUOffloadingSpec, "__init__", parent_init)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=2 if invalid == "pipeline" else 1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-            nnodes=2 if invalid == "nodes" else 1,
+            pipeline_parallel_size=2 if topology == "pipeline" else 1,
+            prefill_context_parallel_size=2 if topology == "prefill_cp" else 1,
+            # DCP ranks are ordinary single-node workers with their own rows.
+            decode_context_parallel_size=2 if topology == "decode_cp" else 1,
+            nnodes=2 if topology == "nodes" else 1,
         ),
         attention_config=SimpleNamespace(
-            backend=None if invalid == "backend" else "FLASH_ATTN_V100"
+            backend=None if topology == "backend" else "FLASH_ATTN_V100"
         ),
         model_config=SimpleNamespace(revision="fixed-model-revision"),
         compute_hash=lambda: "configuration-hash",
@@ -340,7 +376,7 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, inva
         num_blocks=2,
         kv_cache_tensors=[SimpleNamespace(size=8192, shared_by=["a", "b"])],
     )
-    if invalid:
+    if topology not in (None, "decode_cp"):
         with pytest.raises(ValueError, match="Grouped tiering"):
             spec_module.TieringOffloadingSpec(config, cache)
         return

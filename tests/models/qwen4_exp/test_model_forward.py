@@ -82,11 +82,17 @@ def test_qsa_model_shares_one_topk_indices_buffer(monkeypatch) -> None:
             layer_type: str,
             prefix: str = "",
             topk_indices_buffer: torch.Tensor | None = None,
+            dcp_local_indices_buffer: torch.Tensor | None = None,
+            dcp_partial_output_buffer: torch.Tensor | None = None,
+            dcp_partial_lse_buffer: torch.Tensor | None = None,
         ) -> None:
             super().__init__()
             self.layer_type = layer_type
             self.prefix = prefix
             self.topk_indices_buffer = topk_indices_buffer
+            self.dcp_local_indices_buffer = dcp_local_indices_buffer
+            self.dcp_partial_output_buffer = dcp_partial_output_buffer
+            self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
 
     def fake_make_layers(num_layers, get_layer, prefix):
         layers = nn.ModuleList(
@@ -122,6 +128,8 @@ def test_qsa_model_shares_one_topk_indices_buffer(monkeypatch) -> None:
         indexer_n_heads=4,
         indexer_budget=8,
         indexer_compress_ratio=4,
+        num_attention_heads=8,
+        head_dim=16,
     )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -129,7 +137,9 @@ def test_qsa_model_shares_one_topk_indices_buffer(monkeypatch) -> None:
             dtype=torch.float16,
         ),
         parallel_config=SimpleNamespace(
-            eplb_config=SimpleNamespace(num_redundant_experts=0)
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+            decode_context_parallel_size=1,
+            tensor_parallel_size=4,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         cache_config=SimpleNamespace(cache_dtype="float16"),
@@ -147,4 +157,19 @@ def test_qsa_model_shares_one_topk_indices_buffer(monkeypatch) -> None:
     assert len(qsa_layers) == 2
     assert all(
         layer.topk_indices_buffer is model.topk_indices_buffer for layer in qsa_layers
+    )
+
+    vllm_config.parallel_config.decode_context_parallel_size = 2
+    dcp_model = Qwen4ExpModel(vllm_config=vllm_config)
+    dcp_layers = [
+        layer for layer in dcp_model.layers if layer.layer_type == "full_attention"
+    ]
+    assert dcp_model.dcp_local_indices_buffer.shape == (16, 11)
+    assert dcp_model.dcp_partial_output_buffer.shape == (16, 4, 16)
+    assert dcp_model.dcp_partial_lse_buffer.shape == (16, 4)
+    assert all(
+        layer.dcp_local_indices_buffer is dcp_model.dcp_local_indices_buffer
+        and layer.dcp_partial_output_buffer is dcp_model.dcp_partial_output_buffer
+        and layer.dcp_partial_lse_buffer is dcp_model.dcp_partial_lse_buffer
+        for layer in dcp_layers
     )

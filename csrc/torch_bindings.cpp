@@ -169,6 +169,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // conditionally compiled so impl registrations are in source file
 
   #ifdef ENABLE_SM70_TURBOMIND
+  ops.def(
+      "gguf_affine_sm70_prepare(Tensor codes, Tensor scales, Tensor mins, "
+      "int bits) -> Tensor[]");
+  ops.impl("gguf_affine_sm70_prepare", torch::kCUDA, &gguf_affine_sm70_prepare);
+  ops.def(
+      "gguf_affine_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int bits, int k_ld, int q_ld) -> ()");
+  ops.impl("gguf_affine_gemm_sm70_out", torch::kCUDA,
+           &gguf_affine_gemm_sm70_out);
+  ops.def(
+      "gguf_affine_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, "
+      "int bits, int num_experts) -> ()");
+  ops.impl("gguf_affine_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_affine_grouped_gemm_sm70_out);
   ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul_interleaved", torch::kCUDA, &silu_and_mul_interleaved);
 
