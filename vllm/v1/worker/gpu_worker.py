@@ -935,10 +935,12 @@ class Worker(WorkerBase):
         )
 
         selections = self.vllm_config.kernel_config.linear_kernel_selections
+        transports = self.vllm_config.kernel_config.ple_result_transports
         return {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
             "linear_kernel_selections": selections,
+            "ple_result_transports": transports,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
         }
