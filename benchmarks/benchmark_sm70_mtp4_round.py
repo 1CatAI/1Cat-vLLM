@@ -18,13 +18,6 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from benchmarks.benchmark_sm70_model_tokens import (
-    _metric_snapshot,
-    _request_metrics_dict,
-    _spec_decoding_delta,
-)
-from vllm import LLM, SamplingParams
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -32,6 +25,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
+    # Importing vLLM applies platform defaults. Audit first to distinguish
+    # those framework defaults from user-supplied performance variables.
     supplied = {
         key: value for key, value in os.environ.items() if key.startswith("VLLM_")
     }
@@ -41,6 +36,13 @@ def main() -> None:
         )
     if args.repeats < 3:
         raise ValueError("At least three measured repetitions are required")
+    from benchmarks.benchmark_sm70_model_tokens import (
+        _metric_snapshot,
+        _request_metrics_dict,
+        _spec_decoding_delta,
+    )
+    from vllm import LLM, SamplingParams
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     piece = tokenizer.encode(
         "This fixed benchmark prompt is used to create a deterministic "
