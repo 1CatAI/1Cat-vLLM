@@ -259,33 +259,34 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_scales, int64_t tm_group_size,
     int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
-    bool prescaled_scales = false);
+    bool prescaled_scales = false, bool activation_pack = false);
 
 void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
                               double global_scale, int64_t split_k,
-                              int64_t accumulator_chains);
+                              int64_t accumulator_chains,
+                              bool activation_pack = false);
 
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,
                                double global_scale, int64_t split_k,
-                               int64_t accumulator_chains);
+                               int64_t accumulator_chains,
+                               bool activation_pack = false);
 
-void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor codes, torch::Tensor scales,
-                                  double global_scale, int64_t split_k,
-                                  int64_t accumulator_chains,
-                                  torch::Tensor tm_weight,
-                                  torch::Tensor tm_scales,
-                                  int64_t tm_group_size, int64_t tm_k_ld,
-                                  int64_t tm_q_ld, bool gated_silu);
+void nvfp4_qpn2_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu, bool activation_pack = false);
 
 void nvfp4_qpn2_prefill_dispatch_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor codes,
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_weight,
     torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
-    int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m);
+    int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
+    bool activation_pack = false);
 
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,

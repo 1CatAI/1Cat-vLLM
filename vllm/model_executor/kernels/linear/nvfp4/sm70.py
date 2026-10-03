@@ -244,6 +244,25 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             layer.register_buffer("sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False)
         layer.register_buffer("sm70_nvfp4_qpn2_scales", qpn2_scales, persistent=False)
         layer.sm70_nvfp4_qpn2 = True
+        layer.sm70_nvfp4_qpn2_activation_pack = self.config.policy.activation_pack
+        pack_op = (
+            "nvfp4_qpn2_tm_dispatch_sm70_out"
+            if qpn2_shared
+            else "nvfp4_qpn2_prefill_dispatch_sm70_out"
+            if qpn2_prefill_enabled
+            else "nvfp4_qpn2_dispatch_sm70_out"
+        )
+        if not self.config.policy.activation_pack:
+            logger.info_once("QPN2 activation packing disabled by KernelConfig.")
+        elif not sm70_ops.has_qpn2_activation_pack(pack_op):
+            logger.info_once(
+                "QPN2 activation packing unavailable: rebuild the native extension."
+            )
+        else:
+            logger.info_once(
+                "QPN2 activation packing enabled for native aligned FP16 shapes; "
+                "small row counts retain the direct path."
+            )
         layer.sm70_nvfp4_qpn2_shared_weight = qpn2_shared
         layer.sm70_nvfp4_qpn2_global_scale = qpn2_global_scale
         layer.sm70_nvfp4_qpn2_output_size = qpn2_output_size
@@ -328,6 +347,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         nacc = int(layer.sm70_nvfp4_qpn2_nacc)
         if gated_silu:
             split_k, nacc = _qpn2_config(x_2d.shape[1], kernel_output_size * 2, True)
+        activation_pack = getattr(layer, "sm70_nvfp4_qpn2_activation_pack", True)
         if getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
             min_prefill_m = (
                 layer.sm70_nvfp4_qpn2_prefill_min_m
@@ -349,6 +369,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 gated_silu,
                 min_prefill_m,
                 state.prescaled_scales,
+                activation_pack=activation_pack,
             )
         elif getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
             sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(
@@ -366,6 +387,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 state.q_ld,
                 gated_silu,
                 layer.sm70_nvfp4_qpn2_prefill_min_m,
+                activation_pack=activation_pack,
             )
         else:
             sm70_ops.nvfp4_qpn2_dispatch_sm70_out(
@@ -382,6 +404,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 state.k_ld,
                 state.q_ld,
                 gated_silu,
+                activation_pack=activation_pack,
             )
         if kernel_output_size != logical_output_size:
             out_2d = out_2d[:, :logical_output_size]
