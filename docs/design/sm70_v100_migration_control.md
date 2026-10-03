@@ -48987,3 +48987,13 @@ change list. Six GPU bitwise/graph oracle cases passed; combined-copy graph repl
 6.233 versus 6.824 microseconds median. Do not count this
 as a 35B AWQ/FP8 speed baseline. Environment registrations remain 999; public
 SM70 controls 36→31; unchecked reads 0; startup ENV write sites 20→19.
+
+### Retire DFlash2 candidate-order research override
+
+Remove the failed candidate-order environment registration and both typed
+ordering choices. Keep dense ordering mandatory; its old alias is warning-only
+for one released cycle. Historical quality evidence is recorded in the
+[retirement design](sm70_dflash2_retired_candidate_order.md). Standard 324 routes
+remain equal; one explicit failed-experiment edge intentionally changes.
+Registrations 999→998; public SM70 controls remain 31; unchecked reads 0;
+startup ENV write sites remain 19. Native numerical functions stay unchanged.
