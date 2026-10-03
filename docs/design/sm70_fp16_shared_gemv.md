@@ -234,6 +234,8 @@ The compensated down does not win this measurement. Startup admission now
 requires the candidate's upper quartile to be below the vendor's lower
 quartile; an overlap retains the vendor. The existing range/SiLU provider
 keeps its original accumulation mode, and only the measured linear candidate
-opts into compensation. Source-complete installed GPU tests and the focused
-C1 distribution comparison are pending for the new artifact. Do not carry
-forward the earlier artifact's task or timing results as its qualification.
+opts into compensation. Twenty GPU tests pass on the source-complete installed
+artifact, including changed-input graphs, finite FP16 activation inputs and
+the M1/M5 cancellation regressions. The focused C1 distribution comparison is
+pending. Do not carry forward the earlier artifact's task or timing results
+as its qualification.
