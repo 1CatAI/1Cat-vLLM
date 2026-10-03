@@ -368,3 +368,12 @@ retain their negative/small results without repeating them.
   FP32, inputs/intermediate/output stay FP16. Normal source build succeeds;
   no default dispatch change yet. The TP4 M5/M10 real-weight micro screen must
   pass before choosing this schedule; full model gates follow. No private DSO.
+
+- FP32 cooperative HC normal-source TP4 screen completes M5/M10, eight real
+  pairs, six input scales and alternating width replay. Intermediate/output/
+  injection match the FP32 three-kernel control (maximum error zero). Critical
+  rank median per pair: M5 23.253 -> 26.568 us; M10 22.947 -> 27.240 us.
+  Reject cooperative FP32 as a default: 14.3%/18.7% regression. No model
+  reload for this rejected schedule. Retain
+  `.artifacts/mtp15/remote_hc_fp32_cooperative_screen.json`. Existing default
+  FP32 chain and previously merged automatic local argmax remain active.
