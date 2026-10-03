@@ -248,6 +248,17 @@ def main():
             "routes": {},
         }
         for name, (call, graph_safe) in routes.items():
+            if name in (
+                "turbomind_gguf_grouped_selected",
+                "turbomind_gguf_grouped_vec",
+            ):
+                # Out operators return None. Expose their output to elapsed()
+                # so every small-output route captures eight device calls.
+                def call_with_output(call=call, out=out):
+                    call()
+                    return out
+
+                call = call_with_output
             try:
                 call()
             except RuntimeError as error:
