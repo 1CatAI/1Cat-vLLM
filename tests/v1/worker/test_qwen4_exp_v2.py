@@ -345,6 +345,8 @@ def test_dcp2_slot_mapping_preserves_replicated_group_on_sm70() -> None:
     torch.accelerator.synchronize()
     assert slots[0].tolist() == [112, -1, 120, -1, 128, -1]
     assert slots[1].tolist() == [192, 193, 208, 209, 224, 225]
+
+
 @pytest.mark.parametrize("explicit", [True, False])
 def test_mtp_local_argmax_preserves_explicit_choice(explicit):
     from vllm.config import SpeculativeConfig
