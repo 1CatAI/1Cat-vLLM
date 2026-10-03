@@ -375,13 +375,18 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
             storage = str(getattr(text, "ple_embedding_dtype", "")).removeprefix(
                 "torch."
             )
+            # The model's hf_to_vllm_mapper is applied to the quantization
+            # config only when the model is built, so its layer metadata still
+            # uses checkpoint names here. ple_layer_ids are 1-based: id L is
+            # the PLE module of decoder layer L - 1.
             methods = [
                 _get_ple_embedding_quant_method(
                     cfg.quant_config,
-                    f"model.layers.{index}.ple.ple_embedding.ngram_embedding",
+                    f"model.language_model.layers.{int(layer_id) - 1}"
+                    ".ple.ple_embedding.ngram_embedding",
                     force_fp8_storage=storage == "float8_e4m3fn",
                 )
-                for index in layers
+                for layer_id in layers
             ]
             if any(method is None for method in methods):
                 reason = "checkpoint metadata does not provide raw E4M3 PLE storage"
