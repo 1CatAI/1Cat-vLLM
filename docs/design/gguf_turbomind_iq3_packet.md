@@ -5,7 +5,10 @@ Flash-Next TP4 N=160/K=2560: IQ3_XXS E512/M=8192 takes approximately 562 us,
 versus native AWQ 354 us. A CUDA trace confirms the active lattice
 CTA32/N128/K32 mainloop with 127 registers and no local memory. Hardware
 counters are unavailable; this trace does not establish which instructions
-stall. Source-format dispatch and existing mma884 scheduling remain in use.
+stall. A matched AWQ trace selects CTA8/N256/K64 with 162 registers, no local
+memory and about 353 us kernel time. With sixteen rows per expert, the lattice
+M32/N128 tiles pad M and use two N tiles, while native M8/N256 tiles use two
+M tiles. Source-format dispatch and existing mma884 scheduling remain in use.
 
 This candidate moves each eight-value fragment's two codebook indices, eight
 signs and two high index bits into one 32-bit U4 operand packet. The separate
@@ -22,3 +25,9 @@ compilation, GPU oracle/capture checks and matched real-weight timing are
 pending. The candidate is not a default-selection recommendation until those
 measurements establish a useful tradeoff. Existing measured dispatch bands
 must be rechecked against the changed physical representation.
+
+The candidate also registers the existing native U4 grouped tile geometry
+(CTA8/N256/K64) for IQ3. Measurement outside capture decides whether to reuse
+it; there is no expert-count/shape threshold or new environment variable.
+This addresses the observed padding mismatch within TurboMind rather than
+adding a separate scheduling path.

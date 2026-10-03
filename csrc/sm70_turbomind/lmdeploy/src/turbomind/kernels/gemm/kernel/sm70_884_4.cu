@@ -84,6 +84,11 @@ void Registry::sm70_884_4() {
     auto add_lattice = [this]<int Type, int Group>() {
       using C = Config_GgufLattice<Type,Group,kColMajor>;
       using G = Config_GgufLattice<Type,Group,kColMajor,0>;
+      if constexpr (Type == 18 || Type == 21) {
+        // Reuse the native U4 grouped tile: small expert row counts need
+        // less M padding and a full local N span in one tile.
+        Add<typename G::template Type<8,256,64,1,4,1,D,S,2,true,1,Group>>();
+      }
       if constexpr (Type == 17) {
         using Grouped64 = typename G::template Type<128,64,Group,2,1,1,D,D,2,true,1,Group,64,64>;
         using Grouped128 = typename G::template Type<128,128,Group,2,2,1,D,D,2,true,1,Group,64,128>;
