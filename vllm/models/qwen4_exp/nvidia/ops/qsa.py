@@ -2259,6 +2259,17 @@ def _use_sm70_qsa_resolved_indices(q, k_cache, indices, kv_cache_dtype):
     )
 
 
+def qsa_e4m3_capability_reason(dtype: torch.dtype) -> str | None:
+    """Software E4M3 decode uses the tensor-core dtype of the query."""
+    if not current_platform.is_cuda() or not current_platform.has_device_capability(70):
+        return "requires CUDA tensor cores with compute capability at least 7.0"
+    if dtype == torch.float16:
+        return None
+    if dtype == torch.bfloat16 and current_platform.has_device_capability(80):
+        return None
+    return "requires FP16 activations, or native BF16 tensor cores"
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,

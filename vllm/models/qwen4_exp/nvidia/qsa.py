@@ -11,7 +11,6 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -416,25 +415,13 @@ def _verify_e4m3_kv_requirements(
     model_config: ModelConfig,
     cache_config: CacheConfig,
 ) -> None:
-    """Phase gate for the QSA E4M3 main KV cache (extracted for CPU unit tests).
-
-    Behavior is byte-identical to the former inline checks: same conditions,
-    order and messages. The MTP0 clause is relaxed only when the phase-2 opt-in
-    envs.VLLM_QWEN4EXP_QSA_E4M3_MTP is set; SM70/FP16/TP4 are unchanged.
-    """
+    """Admit calibrated E4M3 from kernel capabilities, independent of TP/MTP."""
     if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
         return
-    if not current_platform.is_device_capability(70):
-        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires SM70")
-    if model_config.dtype != torch.float16:
-        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires FP16 activations")
-    if vllm_config.parallel_config.tensor_parallel_size != 4:
-        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires TP4")
-    if (
-        vllm_config.speculative_config is not None
-        and not envs.VLLM_QWEN4EXP_QSA_E4M3_MTP
-    ):
-        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires MTP0")
+    from .ops.qsa import qsa_e4m3_capability_reason
+
+    if reason := qsa_e4m3_capability_reason(model_config.dtype):
+        raise NotImplementedError(f"QSA E4M3 cache unavailable: {reason}")
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):

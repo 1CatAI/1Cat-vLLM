@@ -679,7 +679,6 @@ if TYPE_CHECKING:
     VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD: str | None = None
     # Opt-in (phase 2): allow the Qwen4Exp QSA E4M3 main KV cache together with
     # MTP speculative decoding. Default 0 keeps the phase-1 MTP0 gate exactly.
-    VLLM_QWEN4EXP_QSA_E4M3_MTP: bool = False
     VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS: str | None = None
     VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE: str = "stream"
     VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS: str | None = None
@@ -10096,19 +10095,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="None",
         effective_default="None",
-        automatic_conditions=(),
-        acceleration_paths=("QSA sparse attention/indexer",),
-        user_visible=False,
-    ),
-    "VLLM_QWEN4EXP_QSA_E4M3_MTP": env_var(
-        lambda: bool(int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_MTP", "0"))),
-        description=(
-            "Qwen4Exp: allow the QSA E4M3 main KV cache together with MTP"
-            " speculative decoding. Default 0 keeps the MTP0 gate exactly."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
