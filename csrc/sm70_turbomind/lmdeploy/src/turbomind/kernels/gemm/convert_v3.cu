@@ -100,6 +100,15 @@ std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, in
     return {};
 }
 
+std::array<const LayoutConverter*, 2> GetGgufLut4Converters(int sm)
+{
+    if (sm != 70) return {};
+    constexpr Cvt<uint16_t, uint4_t> W;
+    constexpr Cvt<uint16_t, uint16_t> S;
+    return {W(Sm70{}, constant<kRowMajor>{}, constant<(Pack)(HMMA_884 | OPERAND_B | 1)>{}),
+            S(Sm70{}, constant<kColMajor>{}, constant<(Pack)(HMMA_884 | OPERAND_V | 1)>{})};
+}
+
 std::array<const LayoutConverter*, 2> GetConverters(DataType data_type,
                                                     DataType weight_type,  //
                                                     DataType input_type,

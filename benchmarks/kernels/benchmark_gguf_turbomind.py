@@ -16,6 +16,11 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops  # noqa: F401
+from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
+    LUT4_TYPES,
+    Lut4GGUFProjection,
+    transcode_lut4,
+)
 from vllm.model_executor.layers.quantization.gguf_native import (
     native_available,
     pad_weight_tail,
@@ -33,6 +38,52 @@ from vllm.transformers_utils.gguf_tensor_reader import (
 M_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 512, 2048, 8192)
 
 
+def transcode_projection(data, weight_type):
+    if weight_type in LUT4_TYPES:
+        return transcode_lut4(data, weight_type)
+    return transcode_affine(data, weight_type)
+
+
+def prepare_projection(projection):
+    codes = torch.from_numpy(projection.codes).cuda()
+    scales = torch.from_numpy(projection.scales).cuda()
+    if isinstance(projection, Lut4GGUFProjection):
+        return torch.ops._C.gguf_lut4_sm70_prepare(
+            codes, scales, projection.lut_id, projection.group_size
+        )
+    return torch.ops._C.gguf_affine_sm70_prepare(
+        codes,
+        scales,
+        torch.from_numpy(projection.mins).cuda(),
+        projection.bits,
+        projection.group_size,
+    )
+
+
+def canonical_dense_call(projection, out, x, weight, stats, k_ld, q_ld):
+    is_lut = isinstance(projection, Lut4GGUFProjection)
+    op = (
+        torch.ops._C.gguf_lut4_gemm_sm70_out
+        if is_lut
+        else torch.ops._C.gguf_affine_gemm_sm70_out
+    )
+    decoder = projection.lut_id if is_lut else projection.bits
+    return partial(
+        op, out, x, weight, stats, decoder, k_ld, q_ld, projection.group_size
+    )
+
+
+def canonical_grouped_call(projection, out, x, offsets, wp, sp, experts):
+    is_lut = isinstance(projection, Lut4GGUFProjection)
+    op = (
+        torch.ops._C.gguf_lut4_grouped_gemm_sm70_out
+        if is_lut
+        else torch.ops._C.gguf_affine_grouped_gemm_sm70_out
+    )
+    decoder = projection.lut_id if is_lut else projection.bits
+    return partial(op, out, x, offsets, wp, sp, decoder, experts, projection.group_size)
+
+
 def elapsed(call, iterations, capture=False):
     # Let short decode operators reach steady GPU clocks after CPU transcoding.
     # Synchronize batches rather than time Python launch latency as warmup.
@@ -48,6 +99,14 @@ def elapsed(call, iterations, capture=False):
     for _ in range(3):
         result = call()
     if capture:
+        # Several device invocations per replay keep small-M timings from
+        # including gaps between Python graph.replay calls under CPU load.
+        # Large outputs retain one invocation to bound graph-pool memory.
+        inner = (
+            8
+            if isinstance(result, torch.Tensor) and result.numel() <= 10_000_000
+            else 1
+        )
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -56,7 +115,8 @@ def elapsed(call, iterations, capture=False):
         torch.cuda.current_stream().wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            result = call()
+            for _ in range(inner):
+                result = call()
         measure = graph.replay
         # Exclude the driver's first replay/upload from steady-state timing.
         # Warming the eager call does not warm this newly instantiated graph.
@@ -65,6 +125,7 @@ def elapsed(call, iterations, capture=False):
         torch.accelerator.synchronize()
     else:
         measure = call
+        inner = 1
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     start.record()
     for _ in range(iterations):
@@ -73,7 +134,7 @@ def elapsed(call, iterations, capture=False):
     end.synchronize()
     # Keep output alive through replay: upstream ops allocate their result.
     del result
-    return start.elapsed_time(end) * 1000 / iterations
+    return start.elapsed_time(end) * 1000 / (iterations * inner)
 
 
 def prepare_awq_comparator(canonical):
@@ -128,6 +189,7 @@ def main():
         "iterations": args.iterations,
         "warmup_ms_per_route": 100,
         "graph": args.cuda_graph,
+        "graph_inner_invocations": "8 for outputs <= 10000000 elements; otherwise 1",
         "checkpoint": Path(args.gguf).name,
         "tensor_manifest": [
             {
@@ -145,17 +207,11 @@ def main():
         weight_type = int(tensor.tensor_type)
         array = tensor.data[args.expert] if tensor.data.ndim == 3 else tensor.data
         source = np.array(array, copy=True)
-        canonical = transcode_affine(source, weight_type)
+        canonical = transcode_projection(source, weight_type)
         reference = dequantize(source, weight_type)
         rounding = reconstruction_error(canonical, reference)
         n, k = canonical.codes.shape
-        weight, stats, meta = torch.ops._C.gguf_affine_sm70_prepare(
-            torch.from_numpy(canonical.codes).cuda(),
-            torch.from_numpy(canonical.scales).cuda(),
-            torch.from_numpy(canonical.mins).cuda(),
-            canonical.bits,
-            canonical.group_size,
-        )
+        weight, stats, meta = prepare_projection(canonical)
         k_ld, q_ld = meta.tolist()
         packed = pad_weight_tail(torch.from_numpy(source).cuda(), weight_type)
         dense = torch.from_numpy(reference).half().cuda()
@@ -165,26 +221,22 @@ def main():
             x = (torch.randn((m, k), device="cuda") * 0.125).half()
             out = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
+            call = canonical_dense_call(canonical, out, x, weight, stats, k_ld, q_ld)
+
             def tm(
                 out=out,
-                x=x,
-                weight=weight,
-                stats=stats,
-                bits=canonical.bits,
-                k_ld=k_ld,
-                q_ld=q_ld,
-                group_size=canonical.group_size,
+                call=call,
             ):
-                torch.ops._C.gguf_affine_gemm_sm70_out(
-                    out, x, weight, stats, bits, k_ld, q_ld, group_size
-                )
+                call()
                 return out
 
             tm()
             expected = x.float() @ dense.float().T
             error = (out.float() - expected).norm() / expected.norm()
             if not torch.isfinite(out).all() or error.item() > 0.003:
-                raise AssertionError(f"{name}, M={m}: GGUF affine error {error.item()}")
+                raise AssertionError(
+                    f"{name}, M={m}: GGUF canonical error {error.item()}"
+                )
             capabilities = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
                 packed, x, weight_type, n
             )

@@ -131,6 +131,18 @@ using Config_GgufBitPlane =
               Operand_V_Pack<uint64_t>, kRowMajor, half, raster_order, group_axis>;
 
 template <Order raster_order, int group_axis = -1>
+using Config_GgufLut4_IQ =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint4_t>, Transform_HMMA_SM70_Lut4<0>,
+              Operand_V_Pack<uint16_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
+using Config_GgufLut4_E2M1 =
+    Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+              Operand_B_Pack<uint4_t>, Transform_HMMA_SM70_Lut4<1>,
+              Operand_V_Pack<uint16_t>, kRowMajor, half, raster_order, group_axis>;
+
+template <Order raster_order, int group_axis = -1>
 using Config_MXF4 = Sm70_s884<Operand_A<half>,             // A
                               Transform_Default,           // tarnsform A
                               VoidOperand,                 // U

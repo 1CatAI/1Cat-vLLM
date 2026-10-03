@@ -921,6 +921,8 @@ enum class TuneKeyKind : int {
   kGgufBitPlane3 = 13,
   kGgufBitPlane5 = 14,
   kGgufBitPlane6 = 15,
+  kGgufLut4IQ = 16,
+  kGgufLut4E2M1 = 17,
 };
 
 struct DenseTuneKey {
@@ -3481,6 +3483,207 @@ void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
       layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
       out.data_ptr(), d, workspace.workspace, stream);
   TORCH_CHECK(result == 0, "GGUF affine TurboMind grouped GEMM failed");
+}
+
+namespace {
+
+auto gguf_lut4_quant_type(int lut_id) {
+  TORCH_CHECK(lut_id == 0 || lut_id == 1, "GGUF LUT4 table is unsupported");
+  return lut_id == 0 ? turbomind::gemm::QuantType::kLut4IQ
+                     : turbomind::gemm::QuantType::kLut4E2M1;
+}
+
+bool gguf_lut4_group_supported(int lut_id, int group_size) {
+  return group_size == 32 || (lut_id == 1 && group_size == 16);
+}
+
+std::array<turbomind::gemm::MatrixLayout, 2> gguf_lut4_layouts(int n, int k,
+                                                               int group_size) {
+  const auto converters = turbomind::gemm::GetGgufLut4Converters(70);
+  TORCH_CHECK(converters[0] && converters[1],
+              "GGUF LUT4 converters unavailable");
+  turbomind::gemm::MatrixLayout w{turbomind::kUint4, converters[0]->order, n, k,
+                                  k};
+  std::swap(w.rows, w.cols);
+  w.order = ~w.order;
+  w.pack = converters[0]->pack;
+  turbomind::gemm::MatrixLayout s{turbomind::kUint16, converters[1]->order, n,
+                                  k / group_size, n};
+  std::swap(s.rows, s.cols);
+  s.order = ~s.order;
+  s.pack = converters[1]->pack;
+  return {w, s};
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is unsupported");
+  TORCH_CHECK(codes.is_cuda() && scales.device() == codes.device(),
+              "GGUF LUT4 tensors must share a CUDA device");
+  TORCH_CHECK(codes.scalar_type() == torch::kUInt8 && codes.dim() == 2 &&
+                  scales.scalar_type() == torch::kFloat16 && scales.dim() == 2,
+              "GGUF LUT4 expects uint8 codes [N,K], FP16 scales [N,K/group]");
+  const int64_t n = codes.size(0), k = codes.size(1);
+  TORCH_CHECK(
+      n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+          scales.size(0) == n && scales.size(1) == k / group_size &&
+          n <= INT_MAX && k <= INT_MAX,
+      "GGUF LUT4 requires complete canonical groups and group-32 N packing");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(codes));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF LUT4 requires SM70");
+  TORCH_CHECK((codes < 16).all().item<bool>(),
+              "GGUF LUT4 code exceeds a nibble");
+  const auto converters = turbomind::gemm::GetGgufLut4Converters(70);
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  auto source_w = layouts[0];
+  source_w.type = turbomind::kHalf;
+  source_w.pack = 0;
+  auto numeric_codes = codes.to(torch::kInt16).contiguous();
+  auto weight = torch::empty({k, n / 8}, codes.options().dtype(torch::kInt32));
+  TORCH_CHECK(
+      converters[0]->Convert(numeric_codes.data_ptr(), source_w,
+                             weight.data_ptr(), layouts[0], stream) == 0,
+      "GGUF LUT4 weight conversion failed");
+  auto coefficients = scales.transpose(0, 1).contiguous();
+  auto source_s = layouts[1];
+  source_s.pack = 0;
+  auto stats =
+      torch::empty({k / group_size, n}, codes.options().dtype(torch::kInt16));
+  TORCH_CHECK(converters[1]->Convert(coefficients.data_ptr(), source_s,
+                                     stats.data_ptr(), layouts[1], stream) == 0,
+              "GGUF LUT4 scale conversion failed");
+  auto meta = torch::tensor({static_cast<int64_t>(layouts[0].ld),
+                             static_cast<int64_t>(layouts[1].ld)},
+                            torch::TensorOptions().dtype(torch::kInt64));
+  return {weight, stats, meta};
+}
+
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device(),
+              "GGUF LUT4 GEMM tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kInt32 &&
+                  stats.scalar_type() == torch::kInt16 && input.dim() == 2 &&
+                  out.dim() == 2 && weight.dim() == 2 && stats.dim() == 2 &&
+                  input.stride(1) == 1 && out.stride(1) == 1 &&
+                  weight.is_contiguous() && stats.is_contiguous(),
+              "GGUF LUT4 GEMM requires FP16 matrices and prepared U4 weights "
+              "and FP16 scale storage");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && n > 0 && k > 0 && n % 32 == 0 && k % group_size == 0 &&
+                  out.size(0) == m && weight.size(0) == k &&
+                  weight.size(1) == n / 8 && stats.size(0) == k / group_size &&
+                  stats.size(1) == n,
+              "GGUF LUT4 GEMM shape mismatch");
+  TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && k_ld > 0 &&
+                  q_ld > 0 && k_ld <= INT_MAX && q_ld <= INT_MAX,
+              "GGUF LUT4 GEMM descriptor exceeds int32");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  layouts[0].ld = k_ld;
+  layouts[1].ld = q_ld;
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  turbomind::gemm::Operation operation{};
+  // LUT tables use distinct keys in the existing measured cache.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group_size, stream,
+      lut_id == 0 ? TuneKeyKind::kGgufLut4IQ : TuneKeyKind::kGgufLut4E2M1, true,
+      false, 32);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lut4_quant_type(lut_id),
+                       static_cast<int>(group_size)};
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], stats.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind GEMM failed");
+}
+
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size) {
+  gguf_lut4_quant_type(lut_id);
+  TORCH_CHECK(gguf_lut4_group_supported(lut_id, group_size),
+              "GGUF LUT4 canonical group is not supported");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF grouped LUT4 tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  offsets.scalar_type() == torch::kInt32 &&
+                  weight_ptrs.scalar_type() == torch::kUInt8 &&
+                  stats_ptrs.scalar_type() == torch::kUInt8 &&
+                  input.dim() == 2 && out.dim() == 2 && input.is_contiguous() &&
+                  out.is_contiguous() && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
+              "GGUF grouped LUT4 requires FP16 matrices and prepared pointers");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF grouped LUT4 descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lut4_layouts(n, k, group_size);
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::Operation operation{};
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {gguf_lut4_quant_type(lut_id),
+                       static_cast<int>(group_size)};
+  operation.batch_dim = 0;
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF LUT4 TurboMind grouped GEMM failed");
 }
 
 std::vector<torch::Tensor> awq_sm70_prepare_impl(
@@ -6469,6 +6672,32 @@ turbomind::gemm::DispatchPolicy select_awq_moe_dispatch_policy(
 
 }  // namespace awq_sm70
 }  // namespace vllm
+
+std::vector<torch::Tensor> gguf_lut4_sm70_prepare(torch::Tensor codes,
+                                                  torch::Tensor scales,
+                                                  int64_t lut_id,
+                                                  int64_t group_size) {
+  return vllm::awq_sm70::gguf_lut4_sm70_prepare(codes, scales, lut_id,
+                                                group_size);
+}
+
+void gguf_lut4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             int64_t lut_id, int64_t k_ld, int64_t q_ld,
+                             int64_t group_size) {
+  vllm::awq_sm70::gguf_lut4_gemm_sm70_out(out, input, weight, stats, lut_id,
+                                          k_ld, q_ld, group_size);
+}
+
+void gguf_lut4_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs, int64_t lut_id,
+                                     int64_t num_experts, int64_t group_size) {
+  vllm::awq_sm70::gguf_lut4_grouped_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, lut_id, num_experts,
+      group_size);
+}
 
 std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
                                                     torch::Tensor scales,
