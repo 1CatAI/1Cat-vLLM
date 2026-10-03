@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Measured FP16 linears in the existing mixed-precision kernel lifecycle."""
 
+import math
 import statistics
 from dataclasses import dataclass
 
@@ -187,7 +188,15 @@ class Sm70Fp16LinearKernel(MPLinearKernel):
 
     def apply_weights(self, layer, x, bias=None):
         weight = getattr(layer, self.w_q_name)
-        if bias is not None or x.dtype != torch.float16:
+        width = math.prod(x.shape[:-1])
+        if (
+            bias is not None
+            or x.dtype != torch.float16
+            or width not in self.plain_widths
+        ):
+            # Keep the vendor operation visible to the compiler when this
+            # width did not pass admission. An opaque fallback can change
+            # prefill lowering even though no candidate kernel is selected.
             return torch.nn.functional.linear(x, weight, bias)
         return torch.ops.vllm.sm70_fp16_measured_linear(
             x, weight, False, self.plain_widths
@@ -195,7 +204,13 @@ class Sm70Fp16LinearKernel(MPLinearKernel):
 
     def apply_fused_silu_and_mul(self, layer, x):
         sizes: list[int] = list(getattr(layer, "output_sizes", ()))
-        if len(sizes) != 2 or sizes[0] != sizes[1] or x.dtype != torch.float16:
+        width = math.prod(x.shape[:-1])
+        if (
+            len(sizes) != 2
+            or sizes[0] != sizes[1]
+            or x.dtype != torch.float16
+            or width not in self.gated_widths
+        ):
             return None
         return torch.ops.vllm.sm70_fp16_measured_linear(
             x, getattr(layer, self.w_q_name), True, self.gated_widths

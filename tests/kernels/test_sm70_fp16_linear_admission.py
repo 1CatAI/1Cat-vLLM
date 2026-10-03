@@ -75,3 +75,24 @@ def test_unmeasured_width_uses_vendor_and_preserves_leading_dimensions(shape):
         actual, torch.nn.functional.linear(x, weight), rtol=0, atol=0
     )
     assert impl._fake(x, weight, False, []).shape == actual.shape
+
+
+@pytest.mark.parametrize("shape", [(5, 73), (17, 73), (2, 3, 73)])
+def test_unmeasured_layer_keeps_vendor_visible_to_compiler(shape):
+    kernel = object.__new__(impl.Sm70Fp16LinearKernel)
+    kernel.w_q_name = "weight"
+    kernel.plain_widths = kernel.gated_widths = [1]
+    layer = SimpleNamespace(
+        weight=torch.randn(34, 73, dtype=torch.float16), output_sizes=[17, 17]
+    )
+    x = torch.randn(shape, dtype=torch.float16)
+    with patch.object(
+        torch.ops.vllm,
+        "sm70_fp16_measured_linear",
+        side_effect=AssertionError("unmeasured width hidden behind custom op"),
+    ):
+        actual = kernel.apply_weights(layer, x)
+        assert kernel.apply_fused_silu_and_mul(layer, x) is None
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(x, layer.weight), rtol=0, atol=0
+    )
