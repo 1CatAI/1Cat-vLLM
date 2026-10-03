@@ -171,12 +171,23 @@ changing the probe order does not explain the failure.
 
 All three candidate arms fail the existing thresholds. Their step-zero
 prefill logits match the control exactly; deviations appear during decode.
-A separate diagnostic preserves the original prefill call path and enables
-the adapter only in the existing decode compilation context. Its result is
-pending. Neither a prefill defect nor a faulty transfer is established by
-these observations. Kernel PTX contains FP32 multiply-accumulate operations,
-and the fused activation retains the native FP16 SiLU boundary; there is no
-evidence of reduced accumulation precision.
+The diagnostic that preserves the original prefill call path and enables
+gate/up only in the existing decode compilation context reproduces all 32
+rows exactly. Down under that restriction also fails (mean KL 0.00521689,
+top-1 agreement 93.75%, maximum raw-logit error 1.74414). Its first decode
+position matches the unrestricted down result; later rows differ. Per-matrix
+cold startup admission is measured anew, so these diagnostic launches do not
+establish identical selection at every layer. Preserving prefill does not
+resolve either failure. Neither faulty transfer nor reduced accumulation
+precision is established. Kernel PTX contains FP32 multiply-accumulate
+operations, and the fused activation retains the native FP16 SiLU boundary.
+
+Unmeasured widths now retain compiler-visible vendor linear operations and
+decline activation fusion. CPU and dynamic compilation checks pass; installed
+model qualification of this fallback repair remains pending. The next
+arithmetic audit captures real shared-expert inputs at the first differing
+decode position and evaluates the candidate, vendor route and independent
+FP64 reference on the same inputs. It is diagnostic, not a speed benchmark.
 
 The tokenizer has 248077 valid contiguous IDs, including added tokens, while
 the model matrix has 248320 rows. New manifests exclude the 243 padding rows.
