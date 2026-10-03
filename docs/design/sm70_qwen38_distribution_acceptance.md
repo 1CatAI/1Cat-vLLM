@@ -365,6 +365,12 @@ runtime block scales are FP16: selected W13 packed weights plus scales read
 reads total 7.714208 MB/layer, implying 0.4937 ms across 48 layers. This supports
 the prepared-layout accounting but does not measure whole-model DRAM traffic.
 
+Attribution totals 2.407 GB/card/token inside the model graph, plus 317.850 MB
+for the local FP16 LM head, or 2.725 GB/card/token. Its weight-only floor is
+3.633 ms at 750 GB/s. This revises the earlier 2.45-GB estimate without treating
+those parameter bytes as actual HBM counters. Rank-masked embedding and any
+traffic omitted by the weight-only definition remain separately identified.
+
 The five single-CTA families consume 1.518 ms summed service: router top-k
 0.3840, shared gate 0.2507, activation 0.2029, HC down gather 0.4843, and QSA
 top-k 0.1975 ms. Router GEMV alone averages 9.91 us in this trace; the router
@@ -382,6 +388,8 @@ the full source build. The matched normal-wheel C1 arms measured:
 
 Both arms' 36 task outputs reach natural EOS and have nonempty final answers,
 zero replacement characters and no token-cap failures. Current-artifact C1
-teacher-forcing distribution and the short C4 smoke remain required before
-PR #831 merge. The 16.0% TPOT reduction is transport-specific and does not include
+teacher-forcing passes at 768 positions across 16 fixed windows and three
+repeats: zero forward/reverse KL, zero raw/centered logit error, 100% top-1
+agreement, and zero default-repeat noise. This includes two 258K windows per
+repeat. The short C4 smoke remains required before PR #831 merge. The 16.0% TPOT reduction is transport-specific and does not include
 a dense 8-bit arm or establish the 7.5-ms target.
