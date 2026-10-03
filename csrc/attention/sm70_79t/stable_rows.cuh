@@ -5,6 +5,7 @@
 // Model scores violate both assumptions. Keep block masses and the online
 // accumulator in FP32, and bound each FP16 PV operation by scaling V.
 __device__ float const* g_79t_tail_row_max = nullptr;
+__device__ int* g_79t_prefix_outliers = nullptr;
 constexpr int kStableScoreSampleStride = 8;
 constexpr float kStableScoreMargin = 4.0f;
 constexpr float kStableValueCenterThreshold = 0.05f;
@@ -95,11 +96,14 @@ __global__ void stable_scale_values(__half const* input, __half* output,
 
 // Each lane reads a pair of adjacent query rows. K tiles stay independent,
 // preserving coalesced loads from the transposed cuBLAS score workspace.
-template <bool Tail>
+template <bool Tail, bool Repair = false>
 __global__ void stable_row_max_partials(__half const* scores, float* partials,
                                         int rows, int width) {
   int row = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
   int stride = rows;
   int local_row = row;
   int64_t base = 0;
@@ -116,7 +120,7 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   int end = min(width, int(blockIdx.y + 1) * 8192);
 #pragma unroll 4
   for (int col = int(blockIdx.y) * 8192; col < end;
-       col += kStableScoreSampleStride) {
+       col += Repair ? 1 : kStableScoreSampleStride) {
     float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
         scores + base + int64_t(col) * stride + local_row));
     maximum.x = fmaxf(maximum.x, value.x);
@@ -127,14 +131,25 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   partials[offset + 1] = maximum.y;
 }
 
+template <bool Tail, bool Repair = false>
 __global__ void stable_finish_max(float const* partials, float* maxima,
                                   int rows, int tiles) {
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) return;
+  if constexpr (Repair) {
+    if (!g_79t_prefix_outliers[row / PVThreadblockShape::kM]) return;
+  }
   float value = -CUDART_INF_F;
   for (int tile = 0; tile < tiles; ++tile)
     value = fmaxf(value, partials[int64_t(tile) * rows + row]);
   maxima[row] = value + kStableScoreMargin;
+  if constexpr (!Tail) {
+    if constexpr (Repair) {
+      g_row_sum_out[row] = 0.0f;
+    } else if (row % PVThreadblockShape::kM == 0) {
+      g_79t_prefix_outliers[row / PVThreadblockShape::kM] = 0;
+    }
+  }
 }
 
 __global__ void stable_merge_prefix(StablePrefixPartial const* partial,
