@@ -50,9 +50,10 @@ def test_delayed_producer_changing_width_captured_bytes(dtype):
                 sem = CpuGpuSemaphore(device, host_region=region)
                 hidden = torch.zeros(1, 1, dtype=torch.float16, device=device)
                 by_width = {}
+                capture_stream = torch.cuda.Stream(device=device)
                 for count in (1, 2, 4, 8, 16):
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
+                    with torch.cuda.graph(graph, stream=capture_stream):
                         torch.ops.vllm.ple_offload_wait(
                             sem.flag_tensor, output, hidden, region.result, count
                         )

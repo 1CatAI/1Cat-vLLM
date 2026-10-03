@@ -194,6 +194,28 @@ These are separate-arm samples; interleaved and concurrent timings, teacher-
 forced distributions and graph budget attribution are still required before
 claiming complete admission. Dense 8-bit remains disabled.
 
+Five complete engine-interval samples per arm and width have now completed
+with atomic cohorts, 8192 input / 513 output tokens and the same installed
+source. The first sample of each new width includes initial cache/JIT effects;
+it is retained rather than silently dropped. The final four samples agree on
+the direction, but five fully warmed and interleaved samples are still pending.
+
+| Width | CUDA median step ms | Mapped median step ms | CUDA aggregate tok/s | Mapped aggregate tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| C1 | 13.029 | 11.077 | 76.75 | 90.27 |
+| C2 | 15.727 | 14.243 | 127.17 | 140.42 |
+| C4 | 17.107 | 15.366 | 233.82 | 260.31 |
+| C8 | 21.386 | 19.459 | 374.07 | 411.12 |
+| C16 | 31.716 | 31.533 | 504.47 | 507.40 |
+
+C16 is essentially unchanged within noise; no meaningful throughput gain is
+claimed there. C2/C4/C8 improve by about 10–11% aggregate throughput. Kernel,
+communication and PLE wait attribution still require the new graph trace.
+These data remain pinned to the original paired source, not subsequent main
+changes. The PR is now rebased onto main and a new normal wheel was built from
+matching standard native sources, including the new GGUF target; fresh runtime
+validation of that integration artifact remains pending.
+
 The first teacher-forcing smoke captured 64 English C1 positions through the
 current model runner in both installed-package arms. Mean/p99/max KL and
 maximum logit error were zero; top-1 agreement was 100%. This checks the capture

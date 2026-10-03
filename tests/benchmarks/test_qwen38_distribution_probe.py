@@ -76,3 +76,41 @@ def test_worker_probe_tracks_request_mapping_and_rejects_wrong_input(tmp_path):
             torch.tensor([0]),
             None,
         )
+
+
+def test_default_repeat_noise_blocks_an_identical_candidate(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from benchmarks.benchmark_sm70_qwen38_distribution import compare
+
+    reference, candidate = tmp_path / "reference", tmp_path / "candidate"
+    cohorts = [
+        {"width": 1, "repeat": r, "id": "english", "category": "english", "rows": 1}
+        for r in range(3)
+    ]
+    report = {
+        "complete": True,
+        "manifest_sha256": "same-frozen-prefix",
+        "captures": cohorts,
+        "widths": [1],
+        "repeats": 3,
+        "contract": "same",
+        "engine": {},
+    }
+    for root in (reference, candidate):
+        root.mkdir()
+        (root / "capture.json").write_text(json.dumps(report))
+        for cohort in cohorts:
+            folder = root / "1" / str(cohort["repeat"]) / "english"
+            folder.mkdir(parents=True)
+            values = [1, 0, 0] if cohort["repeat"] == 1 else [0, 0, 0]
+            np.save(folder / "0000.npy", values)
+            (folder / "0000.json").write_text(json.dumps({"active_width": 1}))
+    with pytest.raises(SystemExit, match="thresholds"):
+        compare(SimpleNamespace(reference=reference, output=candidate))
+    result = json.loads((candidate / "comparison.json").read_text())
+    assert result["distribution_passed"]
+    assert not result["default_noise_passed"]
