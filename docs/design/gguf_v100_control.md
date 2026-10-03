@@ -198,3 +198,37 @@ actual caller. Its outputs are excluded. A separate launch used system CUDA
 12.0 for Tilelang and failed before generation; subsequent runs explicitly
 use CUDA 12.8. Neither failure is quality evidence. The wider quality suite
 and primary-model comparisons are still pending.
+
+### Loader synchronization and installed artifact
+
+After integration at `1d1d1c9d80a762ec6d3c7fd46fb85954f730967f`, the
+Qwen3.5 adapter's GDN layout and mixed-projection storage compose with the
+packaged native fallback policy. The 19 metadata and 13 adapter contracts pass
+both from source and from a fresh ordinary wheel installation. All 210
+installed dependencies pass compatibility checking. This Python-only loader
+artifact uses the complete normal precompiled operator wheel for that base;
+no private extension override is required. Core and native extension hashes
+match their packaged and installed copies, without RPATH/RUNPATH.
+
+Loader source: `afad28789341c204ccf3046621124f8ec74b7e39`.
+Wheel SHA256:
+`177bcd84f73eb63e46cbba602f70d515df472551e7630758599f0b60d9665f61`.
+Core SHA256:
+`20ac310a9a80ac4075719cfd1c75a9e70f9649eb714ff21b7be12e584fc2a2cf`.
+Native reference SHA256:
+`74ed944b8abb0f8679757a4e1bf0acef453f4a9803002f2c47b35b47f39d163f`.
+
+Installed inference uses the same tiny checkpoint and CPU oracle, V100 32GB
+GPU0–3, TP4, Python 3.12.3, CUDA 12.8, Torch 2.10.0+cu128, FP16,
+maxlen 2048, maxbatch 256, maxseqs 4, 0.1 GPU memory utilization, eager
+execution, no MTP and FP16 KV. English/arithmetic still match 64/64 greedy
+tokens each. Chinese matches 23 tokens before diverging in this run; this is
+not a resolved quality result. A preceding one-token full-logit generation and
+new packaged fallback implementation make this a distinct run from the earlier
+13-token localization baseline. Its first-logit RMSE/relative-L2 values remain
+0.1243/0.02949, 0.1408/0.04647 and 0.1656/0.06349, with matching top-1.
+
+Embedded chat-template generation with thinking disabled returns `Paris`,
+`4` and `你好` for the three fixed short prompts. These checks establish
+installed loader/tokenizer operation; broader distribution/quality checks and
+primary-model speed remain pending. No model-level TurboMind speed is claimed.
