@@ -391,5 +391,7 @@ zero replacement characters and no token-cap failures. Current-artifact C1
 teacher-forcing passes at 768 positions across 16 fixed windows and three
 repeats: zero forward/reverse KL, zero raw/centered logit error, 100% top-1
 agreement, and zero default-repeat noise. This includes two 258K windows per
-repeat. The short C4 smoke remains required before PR #831 merge. The 16.0% TPOT reduction is transport-specific and does not include
+repeat. The short C4 smoke passed with four natural-stop, nonempty healthy answers,
+including English, Chinese, code and arithmetic. Both C1 gates and the
+pre-merge C4 execution gate are complete. The 16.0% TPOT reduction is transport-specific and does not include
 a dense 8-bit arm or establish the 7.5-ms target.
