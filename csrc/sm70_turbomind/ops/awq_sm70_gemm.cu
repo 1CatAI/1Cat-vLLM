@@ -3190,6 +3190,13 @@ bool gguf_uses_bitplanes(int bits) {
   return bits == 3 || bits == 5 || bits == 6;
 }
 
+auto gguf_affine_quant_type(int bits) {
+  return bits == 3 ? turbomind::gemm::QuantType::kCenteredBitPlane3
+                   : (gguf_uses_bitplanes(bits)
+                          ? turbomind::gemm::QuantType::kBitPlane
+                          : turbomind::gemm::QuantType::kK);
+}
+
 int gguf_low_bits(int bits) {
   return bits == 3 ? 2 : ((bits == 5 || bits == 6) ? 4 : bits);
 }
@@ -3227,9 +3234,10 @@ std::array<turbomind::gemm::MatrixLayout, 2> gguf_affine_layouts(
   std::swap(w.rows, w.cols);
   w.order = ~w.order;
   w.pack = converters[0]->pack;
-  turbomind::gemm::MatrixLayout s{
-      gguf_uses_bitplanes(bits) ? turbomind::kUint64 : turbomind::kUint32,
-      converters[1]->order, n, k / group_size, n};
+  turbomind::gemm::MatrixLayout s{gguf_uses_bitplanes(bits) && bits != 3
+                                      ? turbomind::kUint64
+                                      : turbomind::kUint32,
+                                  converters[1]->order, n, k / group_size, n};
   std::swap(s.rows, s.cols);
   s.order = ~s.order;
   s.pack = converters[1]->pack;
@@ -3238,8 +3246,8 @@ std::array<turbomind::gemm::MatrixLayout, 2> gguf_affine_layouts(
 
 }  // namespace
 
-__global__ void gguf_bitplane_metadata_kernel(uint64_t* metadata,
-                                              const uint8_t* codes,
+template <class T>
+__global__ void gguf_bitplane_metadata_kernel(T* metadata, const uint8_t* codes,
                                               const uint16_t* scales,
                                               const uint16_t* mins, int n,
                                               int k, int group, int low_bits,
@@ -3257,10 +3265,15 @@ __global__ void gguf_bitplane_metadata_kernel(uint64_t* metadata,
             codes[static_cast<int64_t>(row) * k + g * group + i] >> low_bits)
         << (i * high_bits);
   }
-  const uint32_t affine = static_cast<uint32_t>(scales[index]) |
-                          (static_cast<uint32_t>(mins[index]) << 16);
-  metadata[static_cast<int64_t>(g) * n + row] =
-      affine | (static_cast<uint64_t>(high) << 32);
+  if constexpr (sizeof(T) == 4) {
+    metadata[static_cast<int64_t>(g) * n + row] =
+        static_cast<uint32_t>(scales[index]) | (high << 16);
+  } else {
+    const uint32_t affine = static_cast<uint32_t>(scales[index]) |
+                            (static_cast<uint32_t>(mins[index]) << 16);
+    metadata[static_cast<int64_t>(g) * n + row] =
+        affine | (static_cast<uint64_t>(high) << 32);
+  }
 }
 
 std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
@@ -3295,6 +3308,11 @@ std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
     TORCH_CHECK((codes < (1 << bits)).all().item<bool>(),
                 "GGUF affine code exceeds canonical width");
   }
+  if (bits == 3) {
+    TORCH_CHECK(
+        (mins == scales.mul(-4)).all().item<bool>(),
+        "GGUF centered Q3 scale/min mismatch requires the reference fallback");
+  }
   const auto converters = gguf_affine_converters(bits);
   auto layouts = gguf_affine_layouts(n, k, bits, group_size);
   auto source_w = layouts[0];
@@ -3318,10 +3336,11 @@ std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
           .contiguous();
   auto source_s = layouts[1];
   source_s.pack = 0;
-  auto stats = torch::empty(
-      {k / group_size, n},
-      codes.options().dtype(gguf_uses_bitplanes(bits) ? torch::kInt64
-                                                      : torch::kInt32));
+  auto stats =
+      torch::empty({k / group_size, n},
+                   codes.options().dtype(gguf_uses_bitplanes(bits) && bits != 3
+                                             ? torch::kInt64
+                                             : torch::kInt32));
   torch::Tensor raw_metadata;
   if (gguf_uses_bitplanes(bits)) {
     raw_metadata = torch::empty_like(stats);
@@ -3329,13 +3348,24 @@ std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
     auto contiguous_scales = scales.contiguous();
     auto contiguous_mins = mins.contiguous();
     const int64_t count = n * (k / group_size);
-    gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
-        reinterpret_cast<uint64_t*>(raw_metadata.data_ptr<int64_t>()),
-        contiguous_codes.data_ptr<uint8_t>(),
-        reinterpret_cast<const uint16_t*>(
-            contiguous_scales.data_ptr<at::Half>()),
-        reinterpret_cast<const uint16_t*>(contiguous_mins.data_ptr<at::Half>()),
-        n, k, group_size, gguf_low_bits(bits), bits - gguf_low_bits(bits));
+    if (bits == 3) {
+      gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+          reinterpret_cast<uint32_t*>(raw_metadata.data_ptr<int32_t>()),
+          contiguous_codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_scales.data_ptr<at::Half>()),
+          nullptr, n, k, group_size, gguf_low_bits(bits),
+          bits - gguf_low_bits(bits));
+    } else {
+      gguf_bitplane_metadata_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+          reinterpret_cast<uint64_t*>(raw_metadata.data_ptr<int64_t>()),
+          contiguous_codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_scales.data_ptr<at::Half>()),
+          reinterpret_cast<const uint16_t*>(
+              contiguous_mins.data_ptr<at::Half>()),
+          n, k, group_size, gguf_low_bits(bits), bits - gguf_low_bits(bits));
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   TORCH_CHECK(converters[1]->Convert(
@@ -3364,8 +3394,9 @@ void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
       input.scalar_type() == torch::kFloat16 &&
           out.scalar_type() == torch::kFloat16 &&
           weight.scalar_type() == torch::kInt32 &&
-          stats.scalar_type() ==
-              (gguf_uses_bitplanes(bits) ? torch::kInt64 : torch::kInt32) &&
+          stats.scalar_type() == (gguf_uses_bitplanes(bits) && bits != 3
+                                      ? torch::kInt64
+                                      : torch::kInt32) &&
           input.dim() == 2 && out.dim() == 2 && weight.dim() == 2 &&
           stats.dim() == 2 && input.stride(1) == 1 && out.stride(1) == 1 &&
           weight.is_contiguous() && stats.is_contiguous(),
@@ -3409,9 +3440,7 @@ void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                             : TuneKeyKind::kGgufAffineU8)))),
       true, false, 32);
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
-  operation.quant_b = {gguf_uses_bitplanes(bits)
-                           ? turbomind::gemm::QuantType::kBitPlane
-                           : turbomind::gemm::QuantType::kK,
+  operation.quant_b = {gguf_affine_quant_type(bits),
                        static_cast<int>(group_size)};
   auto& workspace = get_workspace(device, stream);
   const int result = get_gemm(device).Run(
@@ -3472,9 +3501,7 @@ void gguf_affine_grouped_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   a.offsets = d.offsets = offsets.data_ptr<int>();
   turbomind::gemm::Operation operation{};
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
-  operation.quant_b = {gguf_uses_bitplanes(bits)
-                           ? turbomind::gemm::QuantType::kBitPlane
-                           : turbomind::gemm::QuantType::kK,
+  operation.quant_b = {gguf_affine_quant_type(bits),
                        static_cast<int>(group_size)};
   operation.batch_dim = 0;
   auto& workspace = get_workspace(device, stream);
