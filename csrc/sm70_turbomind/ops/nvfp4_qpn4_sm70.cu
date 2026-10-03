@@ -11,6 +11,7 @@
   #include <ATen/core/dispatch/Dispatcher.h>
   #include <ATen/core/stack.h>
 #endif
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
@@ -186,6 +187,53 @@ __global__ void nvfp4_qpn4_dequantize_sm70_kernel(
         __low2half(value);
     output[static_cast<size_t>(group * 16 + logical_k1) * n + col] =
         __high2half(value);
+  }
+}
+
+// Materialize the same FP16 values using aligned vectors. Small prefill GEMMs
+// are sensitive to the scalar stores in the original dequantization kernel.
+template <bool UseScaleCode, bool TurboMindLayout>
+__global__ void nvfp4_qpn4_dequantize_vector_sm70_kernel(
+    half* __restrict__ output, const uint8_t* __restrict__ codes,
+    const void* __restrict__ packed_scales, half scale_hi, half scale_lo, int n,
+    int k) {
+  __shared__ __align__(16) half tile[128 * 32];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int local_group = tid >> 5;
+  const int group = blockIdx.y * 8 + local_group;
+  const int col = blockIdx.x * 32 + qpn_col_from_lane(lane);
+  const size_t word =
+      (static_cast<size_t>(blockIdx.x) * (k / 16) + group) * 32 + lane;
+  half scale;
+  if constexpr (UseScaleCode) {
+    scale = nvfp4_scale_code_to_half(
+        reinterpret_cast<const uint8_t*>(packed_scales)[word], scale_hi,
+        scale_lo);
+  } else {
+    scale = reinterpret_cast<const half*>(packed_scales)[word];
+  }
+  const Nvfp4Qpn2CodeReader<TurboMindLayout> reader(codes, blockIdx.x, k / 16,
+                                                    lane);
+  half2 weights[8];
+  fp4x16_to_half2x8(reader.load(group), weights);
+  const half2 scale2 = __halves2half2(scale, scale);
+#pragma unroll
+  for (int pair = 0; pair < 8; ++pair) {
+    const half2 value = __hmul2(weights[pair], scale2);
+    const int physical_k = (pair & 3) + ((pair & 4) ? 8 : 0);
+    const int k0 = logical_k_from_physical(physical_k);
+    const int k1 = logical_k_from_physical(physical_k + 4);
+    tile[(local_group * 16 + k0) * 32 + (col & 31)] = __low2half(value);
+    tile[(local_group * 16 + k1) * 32 + (col & 31)] = __high2half(value);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int vector = tid; vector < 512; vector += 256) {
+    const int row = blockIdx.y * 128 + vector / 4;
+    const int column = blockIdx.x * 32 + (vector & 3) * 8;
+    *reinterpret_cast<uint4*>(output + static_cast<size_t>(row) * n + column) =
+        reinterpret_cast<const uint4*>(tile)[vector];
   }
 }
 
@@ -565,7 +613,8 @@ std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
 template <bool TurboMindLayout>
 void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
                                      torch::Tensor scales, double global_scale,
-                                     bool use_scale_code) {
+                                     bool use_scale_code,
+                                     bool vector_stores = false) {
   TORCH_CHECK(out.is_cuda() && codes.is_cuda() && scales.is_cuda(),
               "nvfp4_qpn4_dequantize_sm70_out: tensors must be CUDA");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
@@ -597,6 +646,26 @@ void nvfp4_qpn4_dequantize_sm70_impl(torch::Tensor out, torch::Tensor codes,
   const SplitHalfScale split_scale =
       split_half_scale(static_cast<float>(global_scale) * kFp4Bias);
   const half zero_scale = __float2half_rn(0.0f);
+  if (vector_stores) {
+    const dim3 grid(static_cast<unsigned>(n / 32),
+                    static_cast<unsigned>(k / 128));
+    if (use_scale_code) {
+      nvfp4_qpn4_dequantize_vector_sm70_kernel<true, TurboMindLayout>
+          <<<grid, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+              codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+              split_scale.hi, split_scale.lo, static_cast<int>(n),
+              static_cast<int>(k));
+    } else {
+      nvfp4_qpn4_dequantize_vector_sm70_kernel<false, TurboMindLayout>
+          <<<grid, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+              reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+              codes.data_ptr<uint8_t>(), scales.data_ptr<at::Half>(),
+              zero_scale, zero_scale, static_cast<int>(n), static_cast<int>(k));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
   if (use_scale_code) {
     nvfp4_qpn4_dequantize_sm70_kernel<true, TurboMindLayout>
         <<<blocks, kPrepareThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -621,6 +690,29 @@ void nvfp4_qpn4_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
                                          use_scale_code);
 }
 
+void nvfp4_prefill_fp32_mm_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor weight) {
+  const c10::cuda::CUDAGuard guard(input.device());
+  const int m = input.size(0), k = input.size(1), n = weight.size(1);
+  auto handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasMath_t saved_math;
+  TORCH_CUDABLAS_CHECK(cublasGetMathMode(handle, &saved_math));
+  TORCH_CUDABLAS_CHECK(cublasSetMathMode(
+      handle, static_cast<cublasMath_t>(
+                  CUBLAS_TENSOR_OP_MATH |
+                  CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
+  const float alpha = 1.f, beta = 0.f;
+  // Row-major X[M,K] * W[K,N] is column-major W[N,K] * X[K,M].
+  // Preserve FP32 accumulation without changing process-global Torch flags.
+  const auto status = cublasGemmEx(
+      handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, weight.data_ptr(),
+      CUDA_R_16F, n, input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
+      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  const auto restored = cublasSetMathMode(handle, saved_math);
+  TORCH_CUDABLAS_CHECK(status);
+  TORCH_CUDABLAS_CHECK(restored);
+}
+
 template <bool TurboMindLayout>
 void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
                                   torch::Tensor input, torch::Tensor codes,
@@ -628,6 +720,8 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
                                   bool use_scale_code, bool gated_silu) {
   TORCH_CHECK(input.is_cuda() && out.is_cuda(),
               "nvfp4_qpn4_prefill_sm70_out: input and output must be CUDA");
+  TORCH_CHECK(out.get_device() == input.get_device(),
+              "NVFP4 prefill input and output must share one device");
   TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
                   out.scalar_type() == torch::kFloat16,
               "nvfp4_qpn4_prefill_sm70_out: input and output must be FP16");
@@ -653,13 +747,22 @@ void nvfp4_qpn4_prefill_sm70_impl(torch::Tensor out, int64_t dense_weight_ptr,
           : torch::from_blob(reinterpret_cast<void*>(dense_weight_ptr), {k, n},
                              input.options());
   nvfp4_qpn4_dequantize_sm70_impl<TurboMindLayout>(
-      dense_weight, codes, scales, global_scale, use_scale_code);
+      dense_weight, codes, scales, global_scale, use_scale_code, m <= 1024);
   if (!gated_silu) {
-    at::mm_out(out, input, dense_weight);
+    if (m <= 1024) {
+      nvfp4_prefill_fp32_mm_out(out, input, dense_weight);
+    } else {
+      at::mm_out(out, input, dense_weight);
+    }
     return;
   }
 
-  auto gate_up = at::mm(input, dense_weight);
+  auto gate_up = torch::empty({m, n}, input.options());
+  if (m <= 1024) {
+    nvfp4_prefill_fp32_mm_out(gate_up, input, dense_weight);
+  } else {
+    at::mm_out(gate_up, input, dense_weight);
+  }
   constexpr int kThreads = 256;
   nvfp4_qpn4_silu_and_mul_sm70_kernel<<<static_cast<int>(m), kThreads, 0,
                                         at::cuda::getCurrentCUDAStream()>>>(

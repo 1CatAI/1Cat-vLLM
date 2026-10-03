@@ -15,8 +15,11 @@ in the global vocabulary and each rank merges only its own slots.
 `KernelConfig.ple_disk_cascade` defaults to true. Admission requires raw E4M3
 PLE storage, FP16 embedding output, CUDA compute ranks, file-backed safetensors
 loading and a supported local worker topology. PLE layers must be on the first
-pipeline stage. Pipeline parallelism is supported; context-parallel groups,
-DBO, non-local workers and weight transfer currently use their existing paths.
+pipeline stage. Pipeline parallelism and decode context parallelism are
+supported: DCP shards attention KV while PLE input tokens and hidden states
+remain replicated across the same TP group. Attention kernels retain their
+own DCP layout checks; for example, QSA supports DCP1 and DCP2. Prefill context
+parallelism, DBO, non-local workers and weight transfer use their existing paths.
 The startup report records the admission result and rejection reason.
 
 Existing explicit hybrid, disk-only or whole-table offload placement retains

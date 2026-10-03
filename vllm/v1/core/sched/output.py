@@ -216,6 +216,12 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # Nonzero only for a latency-controlled mixed step. Pure decode incurs no
+    # GPU timing events and retains its uniform FULL-graph route.
+    mixed_prefill_tokens: int = 0
+    mixed_decode_tokens: int = 0
+    mixed_prefill_budget: int = 0
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None

@@ -439,6 +439,7 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         self.config = config
         self.partition = config.partition
+        self._prepared_caches = {}
         from vllm.media.progress import report_loading
 
         def loading(done, component):
@@ -570,14 +571,33 @@ class MiniMaxH3Pipeline(nn.Module):
                 device=self.device,
             )
             weights = fusion.apply(weights)
-        loaded = self.transformer.load_weights(weights)
-        if fusion is not None:
-            fusion.validate_fully_applied(loaded)
-        required = set(dict(self.transformer.named_parameters()))
-        required.update(dict(self.transformer.named_buffers()))
-        missing = required - loaded
-        if missing:
-            raise RuntimeError(f"H3 DiT checkpoint missing tensors: {sorted(missing)}")
+        from .prepared_weights import load_transformer_checkpoint
+
+        group = get_tp_group()
+        cache = load_transformer_checkpoint(
+            self.transformer,
+            weights,
+            [
+                transformer_path,
+                path / "model_index.json",
+                path / "transformer/config.json",
+            ],
+            enabled=config.prepared_weight_cache,
+            fusion=fusion,
+            restore_adaln=restore_adaln,
+            root=Path(envs.VLLM_CACHE_ROOT) / "h3-prepared",
+            rank=group.rank_in_group,
+            world_size=group.world_size,
+            options={
+                "partition": config.partition,
+                "int8_layout": config.int8_weight_layout,
+                "fp16_layout": config.fp16_weight_layout,
+                "residual_sp": config.residual_sequence_parallel,
+            },
+            limit_bytes=int(config.prepared_weight_cache_gib * 2**30),
+        )
+        if cache is not None:
+            self._prepared_caches["transformer"] = cache
         for layer in self.transformer.modules():
             method = getattr(layer, "quant_method", None)
             if method is not None:
@@ -622,7 +642,6 @@ class MiniMaxH3Pipeline(nn.Module):
             load_model=True,
             encoder_group=self.text_encoder_group,
         )
-        self._prepared_caches = {}
 
         def load_encoder_weights():
             if self._host_backing is not None:

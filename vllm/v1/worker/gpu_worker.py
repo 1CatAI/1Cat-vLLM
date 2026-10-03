@@ -220,8 +220,9 @@ class Worker(WorkerBase):
         # do not create a connector.
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
-        if parallel_config.decode_context_parallel_size != 1:
-            unsupported.append(f"DCP={parallel_config.decode_context_parallel_size}")
+        # DCP shards attention KV, not the hidden/input tokens replicated over
+        # TP. PLE still computes once per DP rank and fans out to the same TP
+        # output buffers. Attention kernels validate their own DCP layouts.
         if parallel_config.use_ubatching:
             unsupported.append("ubatching/DBO")
         if self.vllm_config.weight_transfer_config is not None:
@@ -941,10 +942,12 @@ class Worker(WorkerBase):
         )
 
         selections = self.vllm_config.kernel_config.linear_kernel_selections
+        transports = self.vllm_config.kernel_config.ple_result_transports
         return {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
             "linear_kernel_selections": selections,
+            "ple_result_transports": transports,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
         }

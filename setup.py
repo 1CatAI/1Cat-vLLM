@@ -209,7 +209,9 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
     dst_pkg.mkdir(parents=True, exist_ok=True)
 
     for py_file in FLASH_ATTN_V100_PACKAGE.glob("*.py"):
-        shutil.copy2(py_file, dst_pkg / py_file.name)
+        dst_file = dst_pkg / py_file.name
+        if py_file.resolve() != dst_file.resolve():
+            shutil.copy2(py_file, dst_file)
 
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
     for ext_name in ("flash_attn_v100_cuda", "paged_kv_utils"):
@@ -239,7 +241,9 @@ def bundle_precompiled_flash_attn_v100(build_lib: str) -> None:
     dst_pkg = Path(build_lib) / "flash_attn_v100"
     dst_pkg.mkdir(parents=True, exist_ok=True)
     for py_file in FLASH_ATTN_V100_PACKAGE.glob("*.py"):
-        shutil.copy2(py_file, dst_pkg / py_file.name)
+        dst_file = dst_pkg / py_file.name
+        if py_file.resolve() != dst_file.resolve():
+            shutil.copy2(py_file, dst_file)
     for extension in extensions:
         dst_ext = dst_pkg / extension.name
         shutil.copy2(extension, dst_ext)
@@ -513,7 +517,9 @@ class cmake_build_ext(build_ext):
             # Bundle companion kernels beside them just like the native _C
             # extensions; wheel builds still stage everything in build_lib.
             bundle_dir = str(ROOT_DIR) if self.inplace else self.build_lib
-            bundle_flash_attn_v100(bundle_dir)
+            bundle_flash_attn_v100(
+                str(FLASH_ATTN_V100_ROOT) if self.inplace else self.build_lib
+            )
             bundle_flash_qla_sm70(bundle_dir, self.build_temp)
 
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
@@ -593,7 +599,9 @@ class precompiled_build_ext(build_ext):
 
     def run(self) -> None:
         if _is_cuda():
-            bundle_precompiled_flash_attn_v100(self.build_lib)
+            bundle_precompiled_flash_attn_v100(
+                str(FLASH_ATTN_V100_ROOT) if self.inplace else self.build_lib
+            )
 
     def build_extensions(self) -> None:
         print("Skipping build_ext: using precompiled extensions.")
@@ -1500,7 +1508,7 @@ setup(
         "scripts/serve_flash_next_nvfp4_v100.sh",
     ],
     package_dir={
-        "flash_attn_v100": str(FLASH_ATTN_V100_PACKAGE),
+        "flash_attn_v100": "flash-attention-v100/flash_attn_v100",
     },
     ext_modules=ext_modules,
     rust_extensions=rust_extensions,

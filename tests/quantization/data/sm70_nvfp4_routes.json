@@ -175,40 +175,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -229,40 +229,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -283,40 +283,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -337,40 +337,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -391,40 +391,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -445,40 +445,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -655,40 +655,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -709,40 +709,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -763,40 +763,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -817,40 +817,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -871,40 +871,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -925,40 +925,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1135,40 +1135,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1189,40 +1189,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1243,40 +1243,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1297,40 +1297,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1351,40 +1351,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1405,40 +1405,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1615,40 +1615,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1669,40 +1669,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1723,40 +1723,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1777,40 +1777,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1831,40 +1831,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -1885,40 +1885,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2095,40 +2095,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2149,40 +2149,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2203,40 +2203,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2257,40 +2257,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2311,40 +2311,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2365,40 +2365,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2575,40 +2575,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2629,40 +2629,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2683,40 +2683,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2737,40 +2737,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2791,40 +2791,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -2845,40 +2845,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4426,40 +4426,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4481,7 +4481,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4489,7 +4489,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4497,7 +4497,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4505,7 +4505,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4513,7 +4513,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4535,7 +4535,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4543,7 +4543,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4551,7 +4551,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4559,7 +4559,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4567,7 +4567,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4588,40 +4588,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": true,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4669,7 +4669,7 @@
             "split_k": 8,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4677,7 +4677,7 @@
             "split_k": 8,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4685,7 +4685,7 @@
             "split_k": 8,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4693,7 +4693,7 @@
             "split_k": 8,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4701,7 +4701,7 @@
             "split_k": 8,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4789,40 +4789,40 @@
             "m": 1,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 8,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 32,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 64,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_prefill_dispatch_sm70_out",
             "m": 1024,
             "split_k": 16,
             "nacc": 2,
-            "gated": 1024,
-            "prefill_min_m": 0
+            "gated": false,
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4844,7 +4844,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4852,7 +4852,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4860,7 +4860,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4868,7 +4868,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4876,7 +4876,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 256
           }
         ]
       }
@@ -4898,7 +4898,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 9
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4906,7 +4906,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 9
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4914,7 +4914,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 9
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4922,7 +4922,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 9
           },
           {
             "op": "nvfp4_qpn2_tm_dispatch_sm70_out",
@@ -4930,7 +4930,7 @@
             "split_k": 16,
             "nacc": 2,
             "gated": false,
-            "prefill_min_m": 0
+            "prefill_min_m": 9
           }
         ]
       }
