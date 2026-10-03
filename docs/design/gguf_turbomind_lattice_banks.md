@@ -71,4 +71,20 @@ about 30% and 58%; this change does not close the large grouped workload gap.
 Output relative L2 versus official dequantization and FP32 accumulation is
 0.000393–0.000408. Source extension fingerprint:
 `52231cc48200b9218ad87633db4d12fc15a038373fdc692f08002df522cec8e4`.
-Clean installed-wheel validation is recorded separately below.
+
+## Installed artifact
+
+An ordinary wheel installed with 210 compatible dependencies into a fresh
+runtime passes the same 40 GPU checks. It runs outside the source tree with
+no Python path override, preload or private extension. Normal extension,
+packaged member and installed extension fingerprints match; the extension
+has no RPATH/RUNPATH.
+
+Installed E512 M=128/512/8192 framework timings are 69.38/241.72/554.80 us,
+versus AWQ 72.50/185.88/351.93 us. Direct GEMM is 134.71/303.87/554.91 us.
+These reproduce the narrowed implementation's gains and the remaining gap.
+
+- Source: `5892da0311` (subsequent documentation changes do not affect code).
+- Wheel: `1cat_vllm-1.5.2.dev399+g5892da031.precompiled-cp312-cp312-linux_x86_64.whl`.
+- Wheel SHA256: `93a9035071d07993e6aafa87f16be3ecc2b65236966940a567178a31126b8007`.
+- Normal `_C` SHA256: `5cd0fa29e533f92644e012c57fe7b439293bf360e8988b8d73d7bbef54839f6a`.
