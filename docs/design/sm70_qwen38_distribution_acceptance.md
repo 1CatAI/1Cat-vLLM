@@ -121,6 +121,75 @@ C1 endpoint time, actual per-layer graph
 counts/times, cross-card synchronization boundaries, PLE residual wait and
 traffic floor. Communication kernel count is not the number of global syncs.
 
+### Mapped-transport Step 0 refresh
+
+The fresh installed-artifact run uses `eac8c525d` model source and standard native
+targets matching its base, Torch 2.10/cu128, CUDA 12.8, four V100-SXM2-32GBs
+with full NVLink connectivity, FP16 KV, FP32 state, disk mmap, no MTP, 94%
+memory utilization, 262144 startup capacity and 8192 input / 513 output tokens.
+Five controls with NSYS collection disabled measured 11.2201, 11.0289,
+11.1497, 11.1635 and 11.1918 ms/token, median 11.1635. They are controls under
+the profiler launcher, not separate fully unprofiled endpoint qualification.
+Subsequent unrelated main native changes are not covered by this artifact.
+
+The one graph-node trace has eight complete graphs per rank. Retain all raw
+data; use graphs 2 through 6 on all four ranks for the budget. The first graph
+has staggered profiler-start peer waits; the first two and the last are excluded
+explicitly. Every selected graph has 1349 kernels. Source-verified HC markers
+partition all nodes into embedding, 48 layers and the final HC mixer.
+
+| Trace view | Measured result |
+| --- | ---: |
+| Graph kernels per rank/step | 1349 |
+| Total kernels including work outside the model graph | median 1396 |
+| Communication-related kernels per complete step | median 290 |
+| Regular GDN layer span, excluding the PLE-bearing layer | mean 184.34 us |
+| Regular GDN layer kernel activity union | mean 160.54 us |
+| Regular GDN layer intervals without kernels | mean 23.86 us |
+| QSA layer span | mean 303.34 us |
+| QSA layer kernel activity union | mean 270.86 us |
+| QSA layer intervals without kernels | mean 32.40 us |
+| GDN graph kernel counts | 24–27 |
+| QSA graph kernel counts | 33 |
+| PLE combine-to-dequant bracket | median 988.41 us |
+| PLE bracket before H2D starts | median 873.75 us |
+| PLE H2D copy itself | median 4.69 us |
+| PLE bracket after H2D ends | median 112.00 us |
+
+The PLE bracket contains the host-result wait and graph/copy scheduling; it is
+not a pure flag-wait measurement. It does not support parking sampled prefetch
+under the 0.2 ms rule. A separate event measurement is still needed before
+attributing the whole bracket to CPU lookup. The approximately 12.60 ms traced
+step interval is also not the 11.16 ms control TPOT. Do not subtract their
+components as if they were one unprofiled wall-clock budget.
+
+The trace has 99 cuBLAS GEMVs, about 0.948 ms summed service: 48 shared gate/up
+projections (0.504 ms), 48 shared down projections (0.393 ms), one PLE value
+projection (0.024 ms), and two final HC projections (0.028 ms). These match the
+loaded ordinary linear methods. Shared and routed expert work overlaps, so
+eliminating that service cannot be claimed as the same endpoint saving.
+
+Independent microbenchmarks measured a 4.09–4.13 us NVLink flag round trip
+using system release/acquire publication across pairs 0–1, 0–2 and 0–3, with
+generation checks across five graph replays. This includes the memory protocol;
+it is not bare NVLink wire latency. The dependent-kernel graph boundary median
+was 1.024 us for 1-CTA and 80-CTA producer/consumer pairs on all four GPUs.
+The observed global-timer quantum is 1.024 us, limiting per-sample precision;
+CUDA-event averages independently check the flag round trip.
+
+Representative cold-cache NCU counters on actual layer-0 TP0 expert weights:
+
+| Native expert kernel | DRAM read MB | DRAM write MB | NCU us | Read floor at 750 GB/s, us | Remaining NCU us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| W13 + SiLU | 5.137184 | 0.019488 | 15.264 | 6.8496 | 8.4144 |
+| W2 + weighted reduce | 2.577024 | 0.000128 | 12.256 | 3.4360 | 8.8200 |
+
+These actual isolated counters establish the expert floor; they do not fill
+unmeasured dense/state/communication traffic or represent in-model warm-cache
+DRAM bytes. Full per-layer read floors, under-bandwidth time and pure cross-GPU
+flag waits remain explicitly unmeasured. Their absence must not be filled with
+the planning estimate of 44 MB per layer.
+
 Step 0 uses one new graph-node trace with mapped result transport. For each
 layer report measured DRAM-read bytes divided by 750 GB/s, the remaining kernel
 duration, gaps on the dependency path, and cross-GPU flag waits. Nsight Systems
