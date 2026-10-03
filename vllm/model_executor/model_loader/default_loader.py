@@ -16,6 +16,7 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
@@ -35,10 +36,50 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _decoder_root(model: nn.Module) -> nn.Module:
+    """The module to search for the decoder stack: the language model of a
+    multimodal model, otherwise the model itself."""
+    if isinstance(model, SupportsMultiModal):
+        return model.get_language_model()
+    return model
+
+
+def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
+    """[start, end) of the decoder layers this pipeline stage holds, or None
+    when it holds all of them. vLLM decoder stacks keep a full-length
+    `layers` list with placeholders and record their range in
+    start_layer/end_layer.
+
+    Multimodal models are searched in their language model only: an encoder
+    tower built with make_layers carries its own pipeline range, which must
+    not filter the language model's layers. Two different partial ranges
+    are ambiguous and raise instead of skipping the wrong layers."""
+    ranges = set()
+    for module in _decoder_root(model).modules():
+        start = getattr(module, "start_layer", None)
+        end = getattr(module, "end_layer", None)
+        layers = getattr(module, "layers", None)
+        if (
+            isinstance(start, int)
+            and isinstance(end, int)
+            and layers is not None
+            and not (start == 0 and end == len(layers))
+        ):
+            ranges.add((start, end))
+    if len(ranges) > 1:
+        raise ValueError(
+            "Direct I/O loading found several pipeline-partial layer stacks "
+            f"{sorted(ranges)} in {type(model).__name__} and cannot tell which "
+            "one the checkpoint's decoder layers belong to"
+        )
+    return ranges.pop() if ranges else None
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -72,6 +113,11 @@ class DefaultModelLoader(BaseModelLoader):
         skip_weight: Callable[[str], bool] | None = None
         """If defined, tensors whose checkpoint name (before *prefix*) it
         accepts are skipped before they are read from disk."""
+
+        map_weight: Callable[[str], bool] | None = None
+        """If defined, tensors whose checkpoint name (before *prefix*) it
+        accepts stay memory-mapped under direct I/O: the model reads them
+        only partially or keeps them file-backed."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -298,6 +344,8 @@ class DefaultModelLoader(BaseModelLoader):
                         local_expert_ids=self.local_expert_ids,
                         indexed_weights_by_file=indexed_weights_by_file,
                         skip_weight=source.skip_weight,
+                        map_weight=source.map_weight,
+                        auto_direct=not getattr(self, "_auto_direct_disabled", False),
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -327,18 +375,69 @@ class DefaultModelLoader(BaseModelLoader):
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
+    def _skip_weight_for(self, model: nn.Module) -> Callable[[str], bool] | None:
+        """The model's own skip predicate, plus, for direct I/O under pipeline
+        parallelism, the decoder layers another stage owns. A memory-mapped
+        shard only reads what a stage touches; direct I/O reads up front, so
+        it must leave those tensors out itself."""
+        from vllm.distributed import get_pp_group
+
+        skip_weight = getattr(model, "skip_checkpoint_weight", None)
+        strategy = self.load_config.safetensors_load_strategy
+        if strategy not in (None, "direct"):
+            return skip_weight
+        from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+        if not model_parallel_is_initialized():
+            return skip_weight
+        # Without pipeline parallelism there is no stage to filter, and not
+        # every multimodal model can name its language model.
+        if get_pp_group().world_size == 1:
+            return skip_weight
+        try:
+            layer_range = _pipeline_stage_layer_range(model)
+        except ValueError:
+            if strategy == "direct":
+                raise
+            self._auto_direct_disabled = True
+            logger.info_once(
+                "Auto direct I/O unavailable: pipeline decoder layer ranges "
+                "are ambiguous; retaining mapped loading."
+            )
+            return skip_weight
+        if layer_range is None:
+            return skip_weight
+        other_stage = decoder_layer_filter(*layer_range)
+        if skip_weight is None:
+            return other_stage
+        return lambda name: skip_weight(name) or other_stage(name)
+
     def get_all_weights(
         self,
         model_config: ModelConfig,
         model: nn.Module,
+        skip_weight: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream the primary checkpoint's tensors, then the secondary ones.
+
+        *skip_weight* lets a caller that needs only part of the checkpoint
+        leave the rest out before it is touched: even a memory-mapped tensor
+        is read (with readahead) once it is handed out.
+        """
+        model_skip = self._skip_weight_for(model)
+        if skip_weight is not None and model_skip is not None:
+            caller_skip = skip_weight
+            skip_weight = lambda name: caller_skip(name) or model_skip(name)  # noqa: E731
+        elif skip_weight is None:
+            skip_weight = model_skip
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
-            skip_weight=getattr(model, "skip_checkpoint_weight", None),
+            skip_weight=skip_weight,
+            map_weight=getattr(model, "map_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
 
