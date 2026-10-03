@@ -71,6 +71,28 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 
 void Registry::sm70_884_4() {
   {
+    auto add_lattice = [this]<int Type, int Group>() {
+      using C = Config_GgufLattice<Type,Group,kColMajor>;
+      using G = Config_GgufLattice<Type,Group,kColMajor,0>;
+      Add<typename C::template Type<128,256,16,2,4,1,D,D,2,true,1,Group,128,128>>();
+      Add<typename C::template Type<64,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<32,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<16,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<8,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<128,128,32,2,2,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<64,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<32,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<8,128,32,1,4,1,D,S,2,true,1,Group>>();
+    };
+    add_lattice.template operator()<16,32>();
+    add_lattice.template operator()<17,16>();
+    add_lattice.template operator()<18,32>();
+    add_lattice.template operator()<19,32>();
+    add_lattice.template operator()<21,32>();
+    add_lattice.template operator()<22,16>();
+    add_lattice.template operator()<29,16>();
+  }
+  {
     auto add_planes = [this]<class C, class G, int GroupSize>() {
       // Metadata holds the high plane for one full group. CTA K must be a
       // multiple of that group so the register code position restarts at 0.

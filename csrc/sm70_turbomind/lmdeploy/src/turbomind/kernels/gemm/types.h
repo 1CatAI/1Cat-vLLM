@@ -91,6 +91,13 @@ enum class QuantType : int {
   kB = 3,
     kBitPlane = 4,
     kCenteredBitPlane3 = 7,
+  kLatticeIQ2XXS = 8,
+  kLatticeIQ2XS = 9,
+  kLatticeIQ3XXS = 10,
+  kLatticeIQ1S = 11,
+  kLatticeIQ3S = 12,
+  kLatticeIQ2S = 13,
+  kLatticeIQ1M = 14,
   kDefault = kK,
 };
 

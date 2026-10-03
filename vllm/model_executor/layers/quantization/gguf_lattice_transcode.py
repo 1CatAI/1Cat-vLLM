@@ -52,6 +52,46 @@ class LatticeGGUFProjection:
             * self.scales.astype(np.float32)[..., None]
         ).reshape(self.shape)
 
+    def mma884_storage(self) -> tuple[np.ndarray, np.ndarray]:
+        """U2 operand stream and scale/sign/index metadata, without requantizing.
+
+        Eight logical U2 codes become one 16-bit MMA packet. IQ2 places the
+        low index byte and sign mask there; IQ3 places two low index bytes.
+        IQ1 stores its full eleven-bit index and delta polarity. Metadata
+        retains high index bits and signs alongside one FP16 group scale.
+        """
+        n, k = self.shape
+        indices = self.indices.astype(np.uint64)
+        scales = self.scales.view(np.uint16).astype(np.uint64)
+        if self.source_type in (19, 29):
+            packets = indices | (self.deltas.astype(np.uint64) << 15)
+            metadata = scales.astype(np.uint16)
+        elif self.grid_width == 8:
+            packets = (indices & 255) | (self.signs.astype(np.uint64) << 8)
+            high = (indices >> 8).reshape(n, k // self.group_size, -1)
+            shifts = 16 + 2 * np.arange(high.shape[-1], dtype=np.uint64)
+            metadata = (scales | np.bitwise_or.reduce(high << shifts, axis=-1)).astype(
+                np.uint32
+            )
+        else:
+            pairs = indices.reshape(n, k // 8, 2)
+            packets = (pairs[..., 0] & 255) | ((pairs[..., 1] & 255) << 8)
+            sign_groups = self.signs.astype(np.uint64).reshape(
+                n, k // self.group_size, -1
+            )
+            sign_shifts = 16 + 8 * np.arange(sign_groups.shape[-1], dtype=np.uint64)
+            high = (indices >> 8).reshape(n, k // self.group_size, -1)
+            high_shifts = 48 + np.arange(high.shape[-1], dtype=np.uint64)
+            metadata = scales | np.bitwise_or.reduce(
+                sign_groups << sign_shifts, axis=-1
+            )
+            metadata |= np.bitwise_or.reduce(high << high_shifts, axis=-1)
+        # Invert Converter<uint16_t,uint2_t>'s adjacent-half pairing so it
+        # preserves the packet verbatim after operand packing.
+        shifts = np.array([0, 8, 2, 10, 4, 12, 6, 14], dtype=np.uint64)
+        codes = ((packets[..., None] >> shifts) & 3).astype(np.uint8).reshape(n, k)
+        return np.ascontiguousarray(codes), np.ascontiguousarray(metadata)
+
     def tp_slice(self, rank: int, size: int, *, axis: int):
         if not 0 <= rank < size or axis not in (0, 1):
             raise ValueError("Invalid GGUF TP rank, size or axis")
