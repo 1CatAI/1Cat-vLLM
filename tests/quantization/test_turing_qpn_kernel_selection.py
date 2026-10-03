@@ -321,3 +321,16 @@ def test_fp8_scratch_is_owned_by_each_invocation(monkeypatch):
         x[:0], torch.empty(0), torch.empty(0), 32, 8, 2, False
     ).shape == (0, 32)
     assert dispatched == []
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_nvfp4_activation_pack_is_captured_per_engine(engine, monkeypatch, enabled):
+    engine.kernel_config.sm70_nvfp4.activation_pack = enabled
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.ones(32, 64))
+    layer.weight_scale = torch.nn.Parameter(torch.ones(32, 8))
+    monkeypatch.setattr(qpn.tm, "prepare_nvfp4_qpn2_dense_linear", lambda layer: None)
+    kernel = object.__new__(qpn.TuringQpn2NvFp4LinearKernel)
+    kernel.process_weights_after_loading(layer)
+    engine.kernel_config.sm70_nvfp4.activation_pack = not enabled
+    assert layer.sm70_nvfp4_qpn2_activation_pack == enabled
