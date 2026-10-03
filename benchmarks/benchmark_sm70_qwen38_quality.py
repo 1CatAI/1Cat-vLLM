@@ -100,6 +100,34 @@ def metrics(o):
     }
 
 
+def prompt_token_ids(case, tok):
+    prompt = case.get("prompt")
+    if case["category"] == "needle":
+        filler = tok.encode(
+            "This is an irrelevant archived note. No key is recorded in this line.\n",
+            add_special_tokens=False,
+        )
+        body = (filler * ((case["target_tokens"] + len(filler) - 1) // len(filler)))[
+            : case["target_tokens"] - 200
+        ]
+        at = int(len(body) * case["depth"])
+        needle = tok.encode(
+            "\n唯一的密钥是：" + case["answer"] + "。\n",
+            add_special_tokens=False,
+        )
+        body = body[:at] + needle + body[at:]
+        prompt = (
+            "请从以下档案找出唯一密钥。\n" + tok.decode(body) + "\n请原样输出密钥。"
+        )
+    return tok.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        return_dict=False,
+    )
+
+
 def run(args):
     out = args.output.parent
     out.mkdir(parents=True, exist_ok=True)
@@ -108,6 +136,9 @@ def run(args):
     import torch
     from transformers import AutoTokenizer
 
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
     import vllm
     from vllm import LLM, SamplingParams
 
@@ -152,11 +183,12 @@ def run(args):
         max_model_len=262144,
         max_num_batched_tokens=8192,
         max_num_seqs=1,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.94,
         enable_prefix_caching=False,
         language_model_only=True,
         speculative_config=None,
         disable_log_stats=False,
+        kernel_config={"ple_result_transport": args.ple_result_transport},
     )
     try:
         cfg = llm.llm_engine.vllm_config
@@ -197,34 +229,7 @@ def run(args):
             save()
             print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
         for i, case in enumerate(suite["cases"]):
-            prompt = case.get("prompt")
-            if case["category"] == "needle":
-                filler = tok.encode(
-                    "This is an irrelevant archived note. "
-                    "No key is recorded in this line.\n",
-                    add_special_tokens=False,
-                )
-                body = (
-                    filler * ((case["target_tokens"] + len(filler) - 1) // len(filler))
-                )[: case["target_tokens"] - 200]
-                at = int(len(body) * case["depth"])
-                needle = tok.encode(
-                    "\n唯一的密钥是：" + case["answer"] + "。\n",
-                    add_special_tokens=False,
-                )
-                body = body[:at] + needle + body[at:]
-                prompt = (
-                    "请从以下档案找出唯一密钥。\n"
-                    + tok.decode(body)
-                    + "\n请原样输出密钥。"
-                )
-            prompt_ids = tok.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=True,
-                return_dict=False,
-            )
+            prompt_ids = prompt_token_ids(case, tok)
             o = llm.generate(
                 [{"prompt_token_ids": prompt_ids}],
                 SamplingParams(
@@ -278,6 +283,9 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
+    )
     args = parser.parse_args()
     # Resolve defaults in a fresh process, before importing the runtime.
     for key in list(os.environ):

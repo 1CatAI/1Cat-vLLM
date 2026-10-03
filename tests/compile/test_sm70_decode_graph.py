@@ -18,7 +18,7 @@ from vllm.config.vllm import (
     VllmConfig,
     _apply_qwen4exp_ple_cascade_defaults,
     _apply_sm70_qwen38_decode_defaults,
-    _apply_sm70_qwen38_hybrid_ple_defaults,
+    _apply_sm70_qwen38_disk_ple_defaults,
     _is_sm70_qwen38_decode_compile_contract,
     _qwen4exp_ple_cascade_requested,
 )
@@ -235,10 +235,10 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""
 
-    _apply_sm70_qwen38_hybrid_ple_defaults(parallel_config)
+    _apply_sm70_qwen38_disk_ple_defaults(parallel_config)
     ipc_path = parallel_config._ple_offload_ipc_path
 
-    assert os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] == "1"
+    assert os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] == "0"
     assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
     assert os.environ["VLLM_PLE_DISK_OFFLOAD"] == "1"
     assert ipc_path.startswith("ipc://")

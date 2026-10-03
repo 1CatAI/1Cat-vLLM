@@ -91,6 +91,8 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
                         torch::Tensor const& page_table, double scale);
 
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
+torch::Tensor create_cuda_pinned_tensor(torch::Tensor& reference,
+                                        at::IntArrayRef sizes);
 
 #if !defined(USE_ROCM) && defined(ENABLE_SM70_TURBOMIND)
 void silu_and_mul_interleaved(torch::Tensor& out, torch::Tensor& input);

@@ -31,6 +31,8 @@ class PleOffloadRegistration:
     # serves for this rank (PleOffloadLayer.remote_placement); layers absent
     # from the mapping follow the whole-table contract.
     remote_placements: dict[str, Any] = field(default_factory=dict)
+    # Mapped consumers own the H2D graph node; no CUDA output IPC is needed.
+    cpu_output_buffers: dict[str, torch.Tensor] | None = None
 
 
 @dataclass
@@ -40,6 +42,9 @@ class PleOffloadRequest:
     dp_rank: int
     num_tokens: int
     num_reqs: int
+    # Optional immutable row warming, never a model computation request.
+    prefetch_ids: list[int] | None = None
+    prefetch_context: list[list[int]] | None = None
 
 
 _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)

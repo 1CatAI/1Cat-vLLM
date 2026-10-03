@@ -1,6 +1,37 @@
 #include <torch/all.h>
 #include <torch/cuda.h>
 #include <cuda_runtime.h>
+#include <limits>
+#include <memory>
+
+// Large resident UVA tables must not use the caching host allocator: it
+// rounds a 9--12 GiB request to 16 GiB, defeating the model's host RAM budget.
+torch::Tensor create_cuda_pinned_tensor(torch::Tensor& reference,
+                                        at::IntArrayRef sizes) {
+  TORCH_CHECK(reference.device().is_cpu(), "Reference tensor must be on CPU");
+  size_t count = 1;
+  for (const int64_t size : sizes) {
+    TORCH_CHECK(size >= 0, "Pinned tensor dimensions must be nonnegative");
+    TORCH_CHECK(size == 0 || count <= std::numeric_limits<size_t>::max() / size,
+                "Pinned tensor size overflow");
+    count *= size;
+  }
+  const size_t element_size = reference.element_size();
+  TORCH_CHECK(count <= std::numeric_limits<size_t>::max() / element_size,
+              "Pinned tensor byte size overflow");
+  if (count == 0) return torch::empty(sizes, reference.options());
+
+  void* host_ptr = nullptr;
+  const cudaError_t error =
+      cudaHostAlloc(&host_ptr, count * element_size, cudaHostAllocMapped);
+  TORCH_CHECK(error == cudaSuccess,
+              "cudaHostAlloc failed: ", cudaGetErrorString(error));
+  auto owner =
+      std::shared_ptr<void>(host_ptr, [](void* ptr) { cudaFreeHost(ptr); });
+  return torch::from_blob(
+      host_ptr, sizes, [owner = std::move(owner)](void*) {},
+      reference.options());
+}
 
 // This function assumes that `cpu_tensor` is a CPU tensor,
 // and that UVA (Unified Virtual Addressing) is enabled.

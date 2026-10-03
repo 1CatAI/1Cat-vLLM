@@ -49007,3 +49007,49 @@ for one released cycle. Historical quality evidence is recorded in the
 remain equal; one explicit failed-experiment edge intentionally changes.
 Registrations 999→998; public SM70 controls remain 31; unchecked reads 0;
 startup ENV write sites remain 19. Native numerical functions stay unchanged.
+
+## Flash-Next MTP4 default 15-ms campaign (2026-10-03)
+
+Owned Draft PR [#821](https://github.com/1CatAI/1Cat-vLLM/pull/821), base
+`7eee270267d36c9648bad6286ede54c04a031046`. Contract and relaxed FP32
+association quality gates are frozen in
+[the campaign document](sm70_flash_next_mtp4_15ms.md). Retain FP16 and 256K
+service admission; speed input is exactly 8192 tokens without a profiler or
+supplied performance environment variables. No wheel packaging.
+
+The remote four-V100 NV2 group has 62.7 GiB host RAM and a fixed 185-W cap.
+PLE hybrid local decode previously waited on a remote semaphore that FULL
+replay never submitted. Restrict the remote wait to cascade placement.
+Torch 2.10 host caching then rounded each budgeted 9.04-GiB PLE table to
+16 GiB, causing kernel OOM before any timed request. The normal native mapped
+allocator now requests exact bytes; six mapping/lifetime GPU tests pass.
+Do not repeat either failure or shrink 256K to bypass it.
+
+BV16's corrected owned-source 36-layer component saves only 0.010/0.013 ms
+at M5/M10. Four-warp QKV K splitting regresses M10; generic full-local HC
+Triton split-K fusion is about four times slower. Reject those variants.
+Default full-model speed, teacher-forcing logits, fresh quality and acceptance
+remain pending; candidate loader tests do not qualify as endpoint evidence.
+
+
+### Flash-Next no-MTP: mapped result transport and distribution gates
+
+The decode acceptance contract now permits FP32 reassociation while retaining
+FP16 dense weights/activations and FP32 accumulators/state. Greedy equality is
+only diagnostic. The initial full-vocabulary teacher-forcing limits and task
+checks are recorded in
+[the acceptance design](sm70_qwen38_distribution_acceptance.md).
+
+The mapped transport registers only bounded result/flag buffers; the ngram
+weights remain disk-backed mmap. The normal installed-wheel C1 pair measured
+13.117008 versus 11.082492 ms/token (six separate-arm samples), with 36/36 tasks
+and natural stops in both arms. A 64-position English capture had zero KL/logit
+error. Concurrent timings, complete distribution/noise checks and fresh graph
+budget attribution remain pending; these numbers are not complete admission.
+
+Do not repeat the scalar-projection cooperative GDN segment: it regressed C16
+by about 113%. Keeping native batched projection reduced the loss to about 7%
+but regressed every measured width. Neither variant is admitted. The next
+structural prototype must remove synchronization/phase overhead or include a
+larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
+separate and disabled in these arms.

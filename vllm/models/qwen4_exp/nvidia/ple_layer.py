@@ -7,6 +7,7 @@ import math
 import os
 import resource
 import time
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -800,11 +801,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             dtype=self._meta_weight_dtype,
             device=device,
         )
-        host_storage = torch.empty(
-            (placement.host_rows, self.embedding_dim),
-            dtype=self._meta_weight_dtype,
-            device="cpu",
-            pin_memory=placement.host_rows > 0,
+        # Torch's caching host allocator rounds multi-GiB tables to the next
+        # power of two. Use the normal native factory so placement accounts
+        # for the actual allocation rather than a hidden 16-GiB block.
+        host_reference = torch.empty(0, dtype=self._meta_weight_dtype, device="cpu")
+        host_storage = torch.ops._C.create_cuda_pinned_tensor(
+            host_reference, [placement.host_rows, self.embedding_dim]
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.
@@ -1114,6 +1116,18 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_shard_pointers: list[int] = []
         self._disk_mapped_paths: set[str] = set()
         runtime = get_current_vllm_config_or_none()
+        kernel = getattr(runtime, "kernel_config", None)
+        speculative = getattr(runtime, "speculative_config", None)
+        self._prefetch_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._prefetch_cache_rows = (
+            kernel.ple_draft_prefetch_cache_bytes // self.head_dim
+            if self._file_backed_shards
+            and kernel is not None
+            and kernel.ple_draft_prefetch
+            and speculative is not None
+            and speculative.method == "mtp"
+            else 0
+        )
         self._release_disk_pages = bool(
             getattr(
                 getattr(runtime, "kernel_config", None), "ple_disk_release_pages", False
@@ -1536,6 +1550,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if self._release_disk_pages and self._disk_mapped_paths:
             _madvise_mapped_tensor(shard, _MADV_DONTNEED)
 
+    def prefetch_rows(self, input_ids, query_start_loc, ngram_context) -> None:
+        """Cache only predicted immutable FP8 rows, without model side effects."""
+        capacity = self._prefetch_cache_rows
+        if not capacity:
+            return
+        flat_ids = (
+            self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+            .reshape(-1)
+            .numpy()
+        )
+        missing = np.array(
+            [
+                row
+                for row in np.unique(flat_ids)
+                if int(row) not in self._prefetch_cache
+            ],
+            dtype=np.int64,
+        )
+        if not missing.size:
+            return
+        rows = self._gather_mapped_rows(missing)
+        for row_id, row in zip(missing.tolist(), rows):
+            self._prefetch_cache[row_id] = row.copy()
+            while len(self._prefetch_cache) > capacity:
+                self._prefetch_cache.popitem(last=False)
+
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
 
@@ -1566,6 +1606,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             rows_ptr = rows.ctypes.data
             touched_shards: set[int] = set()
             for output_row, row_id in enumerate(flat_ids.tolist()):
+                cache = getattr(self, "_prefetch_cache", None)
+                cached = cache.get(row_id) if cache is not None else None
+                if cached is not None:
+                    assert cache is not None
+                    rows[output_row] = cached
+                    cache.move_to_end(row_id)
+                    continue
                 shard_index, local_row = divmod(row_id, shard_size)
                 ctypes.memmove(
                     rows_ptr + output_row * row_bytes,
@@ -1694,11 +1741,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
-        if self._is_cpu_offloaded:
+        if self._is_cpu_offloaded and getattr(self, "_cascade", False):
             # Cascade: the resident tiers are gathered here, the rows beyond
             # them arrive from the worker in the shared output buffer.
             remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
             return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
+        # Hybrid decode reads its complete device/pinned-host table locally.
+        # Its graph replay does not submit an offload request, so waiting on
+        # the remote semaphore here would block forever after prefill resets it.
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
@@ -1804,6 +1854,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                             f"{embedding.weight.dtype}, got {loaded_weight.dtype}"
                         )
                     mapped_path = _advise_random_file_access(loaded_weight)
+                    self._prefetch_cache.clear()
                     self._disk_shards[shard_index] = loaded_weight
                     self._disk_mapped_paths.add(mapped_path)
                     loaded.add("ngram_embedding.weight")

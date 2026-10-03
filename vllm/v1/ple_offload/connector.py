@@ -19,6 +19,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.host_result import HostResultRegion
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
@@ -90,6 +91,7 @@ class PleOffloadConnector:
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
         self._layers = self._setup_layers(vllm_config, model)
+        self.draft_prefetcher = None
 
         # Both runner paths stage into the same shared buffers. TP0 registers
         # them with CUDA so MRV2 can use asynchronous D2H copies.
@@ -157,6 +159,23 @@ class PleOffloadConnector:
                         for _ in range(vllm_config.max_concurrent_batches):
                             self._d2h_event_pool.put_nowait(torch.cuda.Event())
                 self._start_request_thread(ipc_addr)
+                speculative = vllm_config.speculative_config
+                if (
+                    self._uses_cuda_inputs
+                    and envs.VLLM_PLE_DISK_OFFLOAD
+                    and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                    and vllm_config.kernel_config.ple_draft_prefetch
+                    and vllm_config.kernel_config.ple_draft_prefetch_cache_bytes > 0
+                    and speculative is not None
+                    and speculative.method == "mtp"
+                    and speculative.num_speculative_tokens >= 2
+                ):
+                    from vllm.v1.ple_offload.prefetch import DraftPlePrefetcher
+
+                    self.draft_prefetcher = DraftPlePrefetcher(
+                        vllm_config, device, ipc_addr, self.dp_rank
+                    )
+                    logger.info("Disk PLE draft-prefix row prefetch enabled")
         except Exception:
             self.close()
             raise
@@ -179,19 +198,51 @@ class PleOffloadConnector:
 
         config = vllm_config.model_config.hf_text_config
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        for layer in layers.values():
-            # The CPU worker writes results here through CUDA IPC. The GPU
-            # placeholder waits on the paired cross-process semaphore.
-            output_buffer = torch.empty(
-                max_num_tokens,
-                int(config.ple_embed_dim),
-                dtype=layer.get_offload_output_dtype(vllm_config.model_config.dtype),
-                device=self.device,
-            )
-            layer.setup_cross_process_offload(
-                output_buffer,
-                CpuGpuSemaphore(self.device),
-            )
+        self._host_result_regions: dict[str, HostResultRegion] = {}
+        mode = vllm_config.kernel_config.ple_result_transport
+        try:
+            for name, layer in layers.items():
+                # The CPU worker writes results here through CUDA IPC. The GPU
+                # placeholder waits on the paired cross-process semaphore.
+                output_buffer = torch.empty(
+                    max_num_tokens,
+                    int(config.ple_embed_dim),
+                    dtype=layer.get_offload_output_dtype(
+                        vllm_config.model_config.dtype
+                    ),
+                    device=self.device,
+                )
+                region = None
+                reason = None
+                if mode != "cuda":
+                    if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+                        reason = "hybrid_local_decode"
+                    else:
+                        try:
+                            region = HostResultRegion.create(output_buffer)
+                        except (RuntimeError, ValueError) as error:
+                            reason = str(error)
+                    if region is None and mode == "mapped":
+                        raise RuntimeError(
+                            f"Mapped PLE result transport rejected: {reason}"
+                        )
+                if region is not None:
+                    self._host_result_regions[name] = region
+                    layer._cpu_output_buffer = region.result
+                layer.setup_cross_process_offload(
+                    output_buffer, CpuGpuSemaphore(self.device, host_region=region)
+                )
+                vllm_config.kernel_config.ple_result_transports[name] = {
+                    "mode": "mapped" if region is not None else "cuda",
+                    "reason": reason,
+                    "pinned_result_bytes": region.pinned_bytes if region else 0,
+                    "scope": "prepared_layer_transport",
+                }
+        except Exception:
+            for region in self._host_result_regions.values():
+                region.close()
+            self._host_result_regions.clear()
+            raise
         return layers
 
     def _pin_input_buffers(self) -> None:
@@ -242,10 +293,16 @@ class PleOffloadConnector:
             tp_rank=self.tp_rank,
             dp_rank=self.dp_rank,
             gpu_output_buffers={
-                name: layer._gpu_output_buffer for name, layer in self._layers.items()
+                name: layer._gpu_output_buffer
+                for name, layer in self._layers.items()
+                if name not in self._host_result_regions
             },
             sem_flag_tensors={
-                name: layer._sem.flag_tensor for name, layer in self._layers.items()
+                name: layer._sem.shared_flag_tensor
+                for name, layer in self._layers.items()
+            },
+            cpu_output_buffers={
+                name: r.result for name, r in self._host_result_regions.items()
             },
             input_ids_buf=self._input_ids_buf,
             query_start_loc_buf=self._query_start_loc_buf,
@@ -258,6 +315,8 @@ class PleOffloadConnector:
         )
 
         payload = _dump_registration(registration)
+        for region in self._host_result_regions.values():
+            region.validate_registration()
         assert self._registration_socket is not None
         self._registration_socket.send(payload)
 
@@ -468,6 +527,8 @@ class PleOffloadConnector:
         # placeholder still waits for a completed output semaphore.
         stream = torch.cuda.current_stream(self.device)
         for layer in self._layers.values():
+            if (cpu_output := getattr(layer, "_cpu_output_buffer", None)) is not None:
+                cpu_output[:num_tokens].zero_()
             layer._gpu_output_buffer[:num_tokens].zero_()
             layer._sem.signal(stream)
 
@@ -481,6 +542,9 @@ class PleOffloadConnector:
 
     def close(self) -> None:
         """Stop request transport and release host registrations."""
+        prefetcher = getattr(self, "draft_prefetcher", None)
+        if prefetcher is not None:
+            prefetcher.close()
         request_thread = self._request_thread
         if request_thread is not None and request_thread.is_alive():
             try:
@@ -497,6 +561,9 @@ class PleOffloadConnector:
         if self._pinned_input_buffers:
             with torch.accelerator.device_index(self.device.index):
                 self._unpin_input_buffers()
+        for region in getattr(self, "_host_result_regions", {}).values():
+            region.close()
+        self._host_result_regions = {}
         self._d2h_event_pool = None
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)
