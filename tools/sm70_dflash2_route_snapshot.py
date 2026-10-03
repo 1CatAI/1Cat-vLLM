@@ -89,14 +89,20 @@ def _guard_expressions(source):
 
 def load_baseline(ref, directory=None):
     source = _read(ref, "vllm/config/vllm.py")
-    defaults = _assignment(source, "_SM70_DFLASH2_VERIFIER_DEFAULTS")
-    if not isinstance(defaults, ast.Dict):
-        raise ValueError("Use a pre-migration baseline for the verifier migration gate")
+    defaults_node = _assignment(source, "_SM70_DFLASH2_VERIFIER_DEFAULTS")
+    policy_source = None
+    if not isinstance(defaults_node, ast.Dict):
+        policy_source = _read(ref, "vllm/config/sm70_dflash2.py")
+        defaults_node = _assignment(policy_source, "SM70_DFLASH2_VERIFIER_DEFAULTS")
+        source = _read(ref, "vllm/model_executor/models/config.py")
+        function_name = "sm70_dflash2_verifier_qualified"
+    else:
+        function_name = "_is_sm70_dflash2_verifier_contract"
+    defaults = ast.literal_eval(defaults_node)
     qualification = next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_is_sm70_dflash2_verifier_contract"
+        n
+        for n in ast.parse(source).body
+        if isinstance(n, ast.FunctionDef) and n.name == function_name
     )
     namespace = {"torch": torch, "Mapping": Mapping, "Any": Any}
     exec(
@@ -107,7 +113,6 @@ def load_baseline(ref, directory=None):
         ),
         namespace,
     )
-    source = _read(ref, "vllm/envs.py")
     from tools.pre_commit.check_env_metadata import registrations
 
     getters = {
@@ -115,13 +120,35 @@ def load_baseline(ref, directory=None):
             compile(ast.Expression(value.args[0]), "<historical getter>", "eval"),
             {"os": os},
         )
-        for name, value in registrations(source).items()
-        if name in SM70_DFLASH2_LEGACY_FIELDS
+        for name, value in registrations(_read(ref, "vllm/envs.py")).items()
+        if name in defaults
     }
+    policy_class = None
+    if policy_source is not None:
+        import sys
+        from types import ModuleType
+
+        module = ModuleType("_historical_dflash_policy_" + ref[:12])
+        sys.modules[module.__name__] = module
+        exec(compile(policy_source, "<historical policy>", "exec"), vars(module))
+        module.envs = NS(environment_variables=getters)
+        policy_class = module.Sm70DFlash2Config
+    vocab = ast.parse(
+        _read(ref, "vllm/model_executor/layers/vocab_parallel_embedding.py")
+    )
+    order = next(
+        n
+        for n in vocab.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_sm70_dflash2_use_dense_order"
+    )
     return NS(
-        defaults=ast.literal_eval(defaults),
+        defaults=defaults,
         getters=getters,
-        qualify=namespace["_is_sm70_dflash2_verifier_contract"],
+        qualify=namespace[function_name],
+        policy_class=policy_class,
+        order=compile(
+            ast.Module(body=[order], type_ignores=[]), "<historical tie order>", "exec"
+        ),
         guards=_guard_expressions(_read(ref, GDN_SOURCE)),
     )
 
@@ -185,7 +212,25 @@ def snapshot(baseline=None):
             qualified = qualify(
                 cfg.model_config, cfg.speculative_config, cfg.parallel_config
             )
-            if baseline:
+            if baseline and baseline.policy_class is not None:
+                policy = baseline.policy_class()
+                policy.resolve(qualified=qualified)
+                if cfg.speculative_config is not None:
+                    cfg.speculative_config.sm70_dflash2 = policy
+                # Unconfigured layers retain the original standalone getter.
+                states = {
+                    name: bool(getattr(policy, field))
+                    if cfg.speculative_config is not None
+                    else getter()
+                    for name, getter in baseline.getters.items()
+                    for field in [
+                        name.removeprefix("VLLM_SM70_DFLASH2_").lower()
+                        if name != "VLLM_SM70_FP8_QPN8"
+                        else "target_fp8_qpn8"
+                    ]
+                }
+                legacy_env = NS(**states)
+            elif baseline:
                 if qualified:
                     for name, value in defaults.items():
                         os.environ.setdefault(name, value)
@@ -224,6 +269,28 @@ def snapshot(baseline=None):
             admissions = {
                 name: bool(getattr(namespace["self"], name)) for name in GUARDS
             }
+            if baseline:
+                from vllm.logger import init_logger
+
+                order_namespace = {
+                    "_sm70_dflash2_option": lambda field, layer=None: states[
+                        "VLLM_SM70_DFLASH2_" + field.upper()
+                    ],
+                    "logger": init_logger(__name__),
+                }
+                exec(baseline.order, order_namespace)
+                dense_order = order_namespace["_sm70_dflash2_use_dense_order"]()
+            else:
+                from vllm.model_executor.layers.vocab_parallel_embedding import (
+                    _sm70_dflash2_use_dense_order,
+                )
+
+                dense_order = _sm70_dflash2_use_dense_order()
+            states = {
+                name: value
+                for name, value in states.items()
+                if name in SM70_DFLASH2_LEGACY_FIELDS
+            }
             label = f"{model}/{kv}/tp{tp}/{spec}/c{concurrency}/budget{budget}"
             if gdn_heads != (16, 48):
                 label += "/gdn-k8-v24"
@@ -233,6 +300,7 @@ def snapshot(baseline=None):
                 "config": label,
                 "qualified": qualified,
                 "policy": states,
+                "dense_tie_order": dense_order,
                 "gdn_layer_admission": admissions,
             }
 
@@ -248,11 +316,24 @@ def snapshot(baseline=None):
     selected = ("27b_dflash2_nvfp4", "fp8_e4m3", 4, "dflash", 4, 8192)
     edges = [
         row(selected, {name: value})
-        for name in defaults
+        for name in (
+            *SM70_DFLASH2_VERIFIER_DEFAULTS,
+            "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER",
+            "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
+        )
         for value in ("0", "1", "2", "-1")
     ]
     edges.append(
         row(("27b_dflash2_nvfp4", "fp8_e4m3", 2, "dflash", 1, 8192), gdn_heads=(8, 24))
+    )
+    edges.append(
+        row(
+            selected,
+            {
+                "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "0",
+                "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "1",
+            },
+        )
     )
     envs.disable_envs_cache()
     return {"cases": cases, "edge_cases": edges}

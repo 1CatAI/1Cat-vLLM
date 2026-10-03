@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
@@ -579,6 +579,13 @@ class PleOffloadRunner:
         """
         model_config = self.vllm_config.model_config
         load_config = self.vllm_config.load_config
+        if load_config.safetensors_load_strategy == "direct":
+            # This process needs only the PLE tensors, and the disk tier serves
+            # them from the mapped checkpoint (file-backed shards). O_DIRECT
+            # would copy the tables into anonymous memory and read every other
+            # tensor of the checkpoint only to drop it; the lazy mapping reads
+            # just the PLE pages.
+            load_config = replace(load_config, safetensors_load_strategy="lazy")
 
         # Step 1: build complete structure, while only PLE subtrees allocate CPU
         # memory. All transformer, MoE, and vision parameters remain on meta.
@@ -619,16 +626,19 @@ class PleOffloadRunner:
         mapper = getattr(model, "hf_to_vllm_mapper", None)
         matched_checkpoint_tensors = 0
 
+        def is_offload_weight(weight_name: str) -> bool:
+            mapped_name: str | None = weight_name
+            if mapper is not None:
+                mapped_names = mapper.apply_list([weight_name])
+                mapped_name = mapped_names[0] if mapped_names else None
+            return mapped_name is not None and mapped_name.startswith(offload_prefixes)
+
         def offload_only_iter(
             weights: Iterable[tuple[str, torch.Tensor]],
         ) -> Iterable[tuple[str, torch.Tensor]]:
             nonlocal matched_checkpoint_tensors
             for weight_name, tensor in weights:
-                mapped_name: str | None = weight_name
-                if mapper is not None:
-                    mapped_names = mapper.apply_list([weight_name])
-                    mapped_name = mapped_names[0] if mapped_names else None
-                if mapped_name is not None and mapped_name.startswith(offload_prefixes):
+                if is_offload_weight(weight_name):
                     matched_checkpoint_tensors += 1
                     yield weight_name, tensor
 
@@ -641,7 +651,14 @@ class PleOffloadRunner:
             for layer in offload_layers.values():
                 initialize_dummy_weights(layer, model_config)
         elif isinstance(loader, DefaultModelLoader):
-            all_weights = loader.get_all_weights(model_config, model)
+            # Skip the rest before it is touched: handing out even a mapped
+            # tensor reads it with readahead, which made this process read the
+            # whole checkpoint through the page cache (2026-09-29, Flash-Next).
+            all_weights = loader.get_all_weights(
+                model_config,
+                model,
+                skip_weight=lambda name: not is_offload_weight(name),
+            )
             loaded_params = model.load_weights(offload_only_iter(all_weights))
             if matched_checkpoint_tensors == 0:
                 raise RuntimeError(

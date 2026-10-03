@@ -13,6 +13,20 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+# Checkpoint tensors of the PLE table: ``...ngram_embedding.shard_<i>.weight``.
+PLE_SHARD_PREFIX = "ngram_embedding.shard_"
+
+
+def is_ple_checkpoint_shard(name: str) -> bool:
+    """Whether a checkpoint tensor is a shard of the PLE embedding table.
+
+    The ranks read only their rows of these shards and the disk tier serves
+    the rest from the mapped checkpoint, so they must stay memory-mapped
+    under direct I/O (see map_checkpoint_weight of the models).
+    """
+    return f".{PLE_SHARD_PREFIX}" in name or name.startswith(PLE_SHARD_PREFIX)
+
+
 def check_ple_layers_on_first_pp_rank(text_config: Any, pp_size: int) -> None:
     """Refuse a pipeline split that puts a PLE layer beyond the first rank.
 
