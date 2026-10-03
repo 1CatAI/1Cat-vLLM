@@ -68,6 +68,21 @@ class TurboMindGgufLatticeKernel(MPLinearKernel):
             "gguf_lattice_gemm_sm70_out",
             True,
         )
+        self.operator_capabilities = (
+            self.capability,
+            GGUFOperatorCapability(
+                GGUFDecoderFamily.LATTICE,
+                quant_type_name(self.config.source_type),
+                "gguf_lattice_blas_sm70_out",
+                True,
+                min_m=128,
+                reason=(
+                    "prefill_selection_pending_measurements"
+                    if hasattr(torch.ops._C, "gguf_lattice_blas_sm70_out")
+                    else "operator_missing:gguf_lattice_blas_sm70_out"
+                ),
+            ),
+        )
         layer._gguf_tm_lattice_prepared = True
 
     def apply_weights(self, layer, x, bias=None):

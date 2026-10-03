@@ -4801,3 +4801,31 @@ if hasattr(torch.ops._C, "gguf_lattice_grouped_gemm_sm70_out"):
         group_size: int,
     ) -> None:
         return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_dequantize_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_dequantize_sm70_out")
+    def _gguf_lattice_dequantize_sm70_out_fake(
+        out: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        source_type: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_blas_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_blas_sm70_out")
+    def _gguf_lattice_blas_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        source_type: int,
+        scratch: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        return None

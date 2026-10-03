@@ -170,3 +170,47 @@ model integration. Static SASS for the IQ3_S CTA128/N256/K32 decoder shows
 repeated 16-bit shared lookup loads. GPU hardware counters remain unavailable
 under the previously recorded driver permissions, so static counts are not
 claimed as runtime attribution.
+
+## Word lookup and canonical FP32 prefill
+
+Aligned word lookup reads a whole four/eight-byte grid row once and restores
+FP16 pairs in registers. Matched IQ3_S CTA128/N256/K32 static SASS changes
+40 table halfword loads into 20 word loads, while MMA instruction counts
+remain unchanged. Dense and grouped timing improves about 4–8%, leaving
+substantial grouped gaps. These static counts are not hardware-counter data.
+
+Canonical lattice dequantization reuses that decoder, writes transient
+FP16 `[K,N]` scratch, and calls cuBLAS with explicit FP32 accumulation and
+reductions. Output and scratch are caller-owned and graph-safe. All seven
+formats reconstruct canonical FP16 weights elementwise, match the FP32 GEMM
+oracle, and pass graph replay/full-graph tracing. The combined suite passes
+92 GPU checks with one non-SM70 skip. Framework reporting declares this
+candidate; default selection remains pending the complete timing bands.
+
+| Type | N | K | M | Word fused | Canonical DQ + FP32 GEMM | AWQ |
+| --- | --- | --- | --- | --- | --- | --- |
+| IQ2_XS | 160 | 2560 | 1 | 21.22 | 16.03 | 13.67 |
+| IQ2_XS | 160 | 2560 | 128 | 64.08 | 14.60 | 25.78 |
+| IQ2_XS | 160 | 2560 | 512 | 64.90 | 25.25 | 26.25 |
+| IQ2_XS | 160 | 2560 | 2048 | 77.60 | 80.09 | 70.71 |
+| IQ2_XS | 160 | 2560 | 8192 | 259.29 | 160.01 | 240.61 |
+| IQ3_XXS | 160 | 2560 | 1 | 16.77 | 13.46 | 13.28 |
+| IQ3_XXS | 160 | 2560 | 128 | 68.12 | 12.00 | 25.97 |
+| IQ3_XXS | 160 | 2560 | 512 | 68.42 | 20.76 | 26.18 |
+| IQ3_XXS | 160 | 2560 | 2048 | 81.07 | 77.16 | 71.47 |
+| IQ3_XXS | 160 | 2560 | 8192 | 265.52 | 157.15 | 240.87 |
+| IQ3_S | 1536 | 2560 | 1 | 20.08 | 34.84 | 15.25 |
+| IQ3_S | 1536 | 2560 | 128 | 43.25 | 46.83 | 46.64 |
+| IQ3_S | 1536 | 2560 | 512 | 91.07 | 124.56 | 85.81 |
+| IQ3_S | 1536 | 2560 | 2048 | 379.42 | 282.15 | 358.34 |
+| IQ3_S | 1536 | 2560 | 8192 | 1155.28 | 769.95 | 960.82 |
+
+Canonical DQ at M=8192 costs 769.95 us for IQ3_S, versus AWQ 960.82 us,
+with unchanged FP16 activations and FP32 accumulation. Small expert shapes
+have a nonmonotonic crossover: at M=128/512 DQ wins clearly, but at M=2048
+its difference from fused MMA is small. Intermediate and boundary points
+must be measured before setting default bands.
+
+Grouped M=8192 improves from 405.49 to 385.47 us (IQ2_XS) and from 361.99
+to 342.75 us (IQ3_XXS), while AWQ remains about 228.4 us. Grouped continues
+to use the fused operator; dense DQ timing does not claim grouped performance.

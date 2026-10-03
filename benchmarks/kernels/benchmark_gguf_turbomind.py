@@ -322,7 +322,7 @@ def main():
         nvfp4 = nvfp4_comparator(canonical) if awq is None else None
         blas_scratch = (
             None
-            if isinstance(canonical, (Lut4GGUFProjection, LatticeGGUFProjection))
+            if isinstance(canonical, Lut4GGUFProjection)
             else torch.empty((k, n), device="cuda", dtype=torch.float16)
         )
         # The native capability API includes llama.cpp's preferred-dispatch
@@ -383,12 +383,18 @@ def main():
                     stats=stats,
                     scratch=blas_scratch,
                 ):
-                    torch.ops._C.gguf_affine_blas_sm70_out(
+                    is_lattice = isinstance(canonical, LatticeGGUFProjection)
+                    op = (
+                        torch.ops._C.gguf_lattice_blas_sm70_out
+                        if is_lattice
+                        else torch.ops._C.gguf_affine_blas_sm70_out
+                    )
+                    op(
                         out,
                         x,
                         weight,
                         stats,
-                        canonical.bits,
+                        canonical.source_type if is_lattice else canonical.bits,
                         scratch,
                         canonical.group_size,
                     )
@@ -420,6 +426,10 @@ def main():
                     )
             row = {
                 "native_unavailable_reason": native_reason,
+                "native_preferred_capabilities": capabilities,
+                "reference_mmq_forced": bool(
+                    mmq_supported and m >= 8 and not capabilities & 8
+                ),
                 "tensor": name,
                 "type": quant_type_name(weight_type),
                 "expert": args.expert if tensor.data.ndim == 3 else None,

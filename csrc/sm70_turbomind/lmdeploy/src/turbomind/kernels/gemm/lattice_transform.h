@@ -37,31 +37,28 @@ struct Transform_HMMA_SM70_Lattice {
       const uint16_t packet = (const uint16_t&)data[k][m];
       uint32_t scale = metadata & 65535U;
       scale |= scale << 16;
+      // A lattice row is exactly four/eight consecutive biased bytes.
+      // Fetch the row as aligned words once, then unpack FP16 pairs in
+      // registers instead of repeatedly reading adjacent shared halfwords.
+      uint64_t table_values;
+      if constexpr (Codebook::kWidth == 8) {
+        const int index = Type == 19 || Type == 29 ? packet & 2047 :
+            (packet & 255) | (((metadata >> (16+2*(base/8))) & 3) << 8);
+        table_values = *reinterpret_cast<const uint64_t*>(grid+index*8);
+      } else {
+        const int first = (packet & 255) | (((metadata >> (48+base/4)) & 1) << 8);
+        const int second = (packet >> 8) | (((metadata >> (49+base/4)) & 1) << 8);
+        const uint32_t low = *reinterpret_cast<const uint32_t*>(grid+first*4);
+        const uint32_t high = *reinterpret_cast<const uint32_t*>(grid+second*4);
+        table_values = low | (static_cast<uint64_t>(high) << 32);
+      }
       Array<F,8> decoded;
       PRAGMA_UNROLL
       for (int i = 0; i < 8; i += 2) {
-        uint32_t pair = 0;
-        PRAGMA_UNROLL
-        for (int j = 0; j < 2; ++j) {
-          const int pos = i+j;
-          int index, entry;
-          if constexpr (Type == 19 || Type == 29) {
-            index = packet & 2047;
-            entry = grid[index*8+pos];
-          } else if constexpr (Codebook::kWidth == 8) {
-            index = (packet & 255) | (((metadata >> (16+2*(base/8))) & 3) << 8);
-            entry = grid[index*8+pos];
-          } else {
-            const int chunk = pos/4;
-            index = ((packet >> (8*chunk)) & 255) |
-                    (((metadata >> (48+base/4+chunk)) & 1) << 8);
-            entry = grid[index*4+pos%4];
-          }
-          pair |= static_cast<uint32_t>(entry) << (16*j);
-        }
         constexpr uint32_t magic = 0x64006400U;
-        constexpr uint32_t bias = 0x64806480U; // 1024 + value bias 128
-        pair |= magic;
+        constexpr uint32_t bias = 0x64806480U;
+        const uint32_t bytes = static_cast<uint32_t>(table_values >> (i*8));
+        const uint32_t pair = __byte_perm(bytes,magic,0x7170);
         half2 values = __hsub2((const half2&)pair,(const half2&)bias);
         if constexpr (Type == 19 || Type == 29) {
           const half delta = __float2half((packet & 32768) ? -0.125f : 0.125f);
