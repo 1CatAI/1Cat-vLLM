@@ -11,6 +11,7 @@ import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -368,6 +369,7 @@ def _qwen38_sm70_fp16_fused_hc(
     packed_down: torch.Tensor | None = None,
     packed_up: torch.Tensor | None = None,
     concurrent_batch: bool = False,
+    reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch):
         from vllm.distributed.parallel_state import get_tp_group
@@ -424,13 +426,27 @@ def _qwen38_sm70_fp16_fused_hc(
         local_down = x.new_empty((1, 88))
         gathered_down = x.new_empty((1, 336))
         block = x.new_empty((1, _HC_DIM))
-        _qwen38_hc_down_local_shard_kernel[(88,)](
-            x,
-            down_weight,
-            local_down,
-            TP_RANK=tp_rank,
-            num_warps=4,
-        )
+        if reassociated_down and Sm70Fp16GemvSiluKernel.can_implement(
+            x, down_weight, local_down, 81, 80, tp_rank * 80, 320 + tp_rank, 4.0
+        ):
+            Sm70Fp16GemvSiluKernel.apply_out(
+                x,
+                down_weight,
+                local_down,
+                81,
+                80,
+                prefix_start=tp_rank * 80,
+                suffix_start=320 + tp_rank,
+                divisor=4.0,
+            )
+        else:
+            _qwen38_hc_down_local_shard_kernel[(88,)](
+                x,
+                down_weight,
+                local_down,
+                TP_RANK=tp_rank,
+                num_warps=4,
+            )
         custom_ar.sm70_qwen38_hc_down_allgather(local_down, gathered_down)
         if custom_ar.supports_sm70_qwen38_hc_up_mix_allgather():
             custom_ar.sm70_qwen38_hc_up_mix_allgather(
@@ -476,17 +492,30 @@ def _qwen38_sm70_fp16_fused_hc(
     lora = x.new_empty((1, _HC_RANK))
     injection = x.new_empty((1, _HC_COUNT))
     block = x.new_empty((1, _HC_DIM))
-    _qwen38_hc_down_silu_inject_kernel[(_HC_RANK + _HC_COUNT,)](
-        x,
-        down_weight,
-        lora,
-        injection,
-        K=_HC_HIDDEN,
-        BLOCK_K=256,
-        RANK_VALUE=_HC_RANK,
-        HC_COUNT=_HC_COUNT,
-        num_warps=4,
-    )
+    if reassociated_down:
+        projected = x.new_empty((1, _HC_RANK + _HC_COUNT))
+        Sm70Fp16GemvSiluKernel.apply_out(
+            x,
+            down_weight,
+            projected,
+            _HC_RANK + _HC_COUNT,
+            _HC_RANK,
+            suffix_start=_HC_RANK,
+            divisor=float(_HC_COUNT),
+        )
+        lora, injection = projected[:, :_HC_RANK], projected[:, _HC_RANK:]
+    else:
+        _qwen38_hc_down_silu_inject_kernel[(_HC_RANK + _HC_COUNT,)](
+            x,
+            down_weight,
+            lora,
+            injection,
+            K=_HC_HIDDEN,
+            BLOCK_K=256,
+            RANK_VALUE=_HC_RANK,
+            HC_COUNT=_HC_COUNT,
+            num_warps=4,
+        )
     _qwen38_hc_up_gate_mix_row4_kernel[(triton.cdiv(_HC_DIM, 4),)](
         lora,
         up_weight,
@@ -510,6 +539,7 @@ def _qwen38_sm70_fp16_fused_hc_fake(
     packed_down: torch.Tensor | None = None,
     packed_up: torch.Tensor | None = None,
     concurrent_batch: bool = False,
+    reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del down_weight, up_weight, packed_down, packed_up
     return (
@@ -560,6 +590,7 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         getattr(down_layer, "_sm70_qwen38_hc_batch_packed", None),
         getattr(up_layer, "_sm70_qwen38_hc_batch_packed", None),
         getattr(down_layer, "_sm70_qwen38_hc_batch_concurrent", False),
+        getattr(down_layer, "_sm70_fp16_gemv_silu_ranges", False),
     )
 
 
@@ -591,6 +622,13 @@ def enable_qwen38_sm70_fp16_fused_hc(
         ):
             continue
         child._sm70_qwen38_fp16_fused_hc = True
+        # The generic operator changes FP32 reduction association. Enable it
+        # for the quality-equivalent no-speculative policy; verifier/draft and
+        # batch-invariant execution retain their existing reductions.
+        config = vllm_config or get_current_vllm_config()
+        child.input_mix_weight_down_block_inject._sm70_fp16_gemv_silu_ranges = (
+            config.speculative_config is None and not envs.VLLM_BATCH_INVARIANT
+        )
         concurrent_batch = bool(
             envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
             and _batch_runtime_contract(vllm_config)
