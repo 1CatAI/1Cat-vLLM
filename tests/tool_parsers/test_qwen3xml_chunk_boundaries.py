@@ -125,3 +125,38 @@ def test_empty_and_multiline_calls(width):
         "path": "/tmp/a",
         "content": 'line 1\n  "quoted" & x &lt; y\nline 3',
     }
+
+
+@pytest.mark.parametrize("width", [1, 7, 19, 37, 71, 145, 1000])
+def test_missing_parameter_close_recovers_only_its_own_call(width):
+    text = (
+        "<tool_call><function=weather><parameter=city>Dallas\n"
+        "<parameter=state>TX</parameter><parameter=unit>fahrenheit</parameter>"
+        "</function></tool_call>\n"
+        "<tool_call><function=read><parameter=path>/tmp/a</parameter>"
+        "</function></tool_call>"
+    )
+    parser = Qwen3XMLToolParser(Mock())
+    request = ChatCompletionRequest(model="test", messages=[])
+    expected = parser.extract_tool_calls(text, request)
+    assert [c.function.name for c in expected.tool_calls] == ["weather", "read"]
+    args = [{"city": "Dallas", "state": "TX", "unit": "fahrenheit"}, {"path": "/tmp/a"}]
+    assert [json.loads(c.function.arguments) for c in expected.tool_calls] == args
+    calls: dict[int, dict[str, str]] = {}
+    previous = ""
+    for pos in range(0, len(text), width):
+        chunk = text[pos : pos + width]
+        current = previous + chunk
+        delta = parser.extract_tool_calls_streaming(
+            previous, current, chunk, [], [], [], request
+        )
+        previous = current
+        if delta is None:
+            continue
+        for call in delta.tool_calls or []:
+            entry = calls.setdefault(call.index, {"name": "", "arguments": ""})
+            if call.function:
+                entry["name"] += call.function.name or ""
+                entry["arguments"] += call.function.arguments or ""
+    assert [c["name"] for c in calls.values()] == ["weather", "read"]
+    assert [json.loads(c["arguments"]) for c in calls.values()] == args
