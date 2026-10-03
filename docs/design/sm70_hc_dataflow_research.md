@@ -92,10 +92,27 @@ An ordinary/cooperative dispatch probe uses the same argument struct, 125 CTAs,
 arms. Five-run medians are 1.930 and 1.927 us per node, respectively. The large
 remaining HC cost is not explained by cooperative dispatch itself.
 
-The next diagnostic changes polling to volatile loads followed by one acquire
-after readiness, and keeps local norm flags at GPU scope. Peer publication
-retains system ordering. It has not been measured yet. None of these research
-results admits a default model path or demonstrates a full-model improvement.
+Polling now uses volatile loads followed by one acquire after readiness, and
+local norm flags keep GPU scope. Peer publication retains system ordering.
+That build measures 38.543 us, with all boundary and replay checks passing.
+
+The final build reuses the existing production HC FP32 sigmoid primitive,
+including its exponent and full-precision division instructions. It measures
+44.616 us; the four toy TP cases and actual-size replay checks pass, with the
+same maximum boundary error of 0.001953125. The 38.543-us result belongs to the
+previous sigmoid implementation and is not the final candidate's timing.
+
+Final steady CTA phase medians are 7.168-us down prefetch, 1.024-us down input
+wait, 9.216-us down compute/push; and 2.048-us up prefetch, 19.456-us up input
+wait, 10.240-us up compute/push, 5.120-us peer wait. Norm computation measures
+4.096 us. These overlapping phases localize the current dependency chain; they
+are not additive layer attribution or actual DRAM counters.
+
+The prototype remains above the HC budget and is parked. None of these
+research results admits a default model path or demonstrates a full-model
+improvement. A subsequent design must shorten the measured down-to-up chain
+and incorporate the preceding reduction, rather than repeat this standalone
+fixed-role launch unchanged.
 
 Standalone GPU scripts keep a raw flock descriptor until process exit, so CUDA
 teardown remains inside the ownership window.

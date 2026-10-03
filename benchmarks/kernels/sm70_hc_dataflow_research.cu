@@ -74,7 +74,21 @@ __device__ float warp_sum(float v) {
   for (int d = 16; d; d /= 2) v += __shfl_down_sync(0xffffffffu, v, d);
   return v;
 }
-__device__ float sigmoid(float v) { return 1.f / (1.f + expf(-v)); }
+// Reuse the accepted HC FP32 sigmoid primitive.
+__device__ __forceinline__ float sigmoid(float value) {
+  constexpr uint32_t kLog2E = 0x3fb8aa3b;
+  const float log2e = __uint_as_float(kLog2E);
+  const float negated = __fsub_rn(0.0f, value);
+  const float exponent = __fmul_rn(negated, log2e);
+  float exp2;
+  asm volatile("ex2.approx.f32 %0, %1;" : "=f"(exp2) : "f"(exponent));
+  const float denominator = __fadd_rn(exp2, 1.0f);
+  float result;
+  asm volatile("div.full.f32 %0, %1, %2;"
+               : "=f"(result)
+               : "f"(1.0f), "f"(denominator));
+  return result;
+}
 
 union HalfPack {
   uint4 vector;
