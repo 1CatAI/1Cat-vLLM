@@ -42,6 +42,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
@@ -612,7 +613,7 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
-        if envs.VLLM_PLE_CPU_OFFLOAD and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if ple_offload_enabled(vllm_config) and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.worker.spawn_ple_offload()
         elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.worker.prepare_ple_offload_spawn()
@@ -629,7 +630,7 @@ class WorkerProc:
             # Load those shards before the file-backed PLE worker scans the
             # checkpoint so startup does not create avoidable memory pressure.
             self.worker.spawn_ple_offload()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if ple_offload_enabled(vllm_config):
             self.worker.wait_ple_offload_ready()
 
         scheduler_config = vllm_config.scheduler_config
