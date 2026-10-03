@@ -35,6 +35,16 @@ class ExactMnkKernelImpl final : public KernelImpl<Gemm> {
   }
 };
 
+// Narrow GGUF expert projections otherwise spend much of an N128/N256
+// tile on padding. Keep these candidates out of wide projection descriptors.
+template<class Gemm>
+class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
+ public:
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) && KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
 // Default-cache-B kernel for the exact Qwen3.8 TP4 W2 prefill descriptor.
 // Expert-sorted prefill gives each expert several adjacent M tiles, so keeping
 // B cacheable may reuse its FP4 weights across those tiles. The exact contract
@@ -71,6 +81,35 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 
 void Registry::sm70_884_4() {
   {
+    auto add_lattice = [this]<int Type, int Group>() {
+      using C = Config_GgufLattice<Type,Group,kColMajor>;
+      using G = Config_GgufLattice<Type,Group,kColMajor,0>;
+      if constexpr (Type == 17) {
+        using Grouped64 = typename G::template Type<128,64,Group,2,1,1,D,D,2,true,1,Group,64,64>;
+        using Grouped128 = typename G::template Type<128,128,Group,2,2,1,D,D,2,true,1,Group,64,128>;
+        Add(std::make_unique<GgufLatticeNarrowKernelImpl<typename Grouped64::Kernel>>());
+        Add(std::make_unique<GgufLatticeNarrowKernelImpl<typename Grouped128::Kernel>>());
+        using Grouped16 = typename G::template Type<16,128,32,1,4,1,D,S,2,true,1,Group>;
+        Add(std::make_unique<GgufLatticeNarrowKernelImpl<typename Grouped16::Kernel>>());
+      }
+
+      Add<typename C::template Type<128,256,Group,2,4,1,D,D,2,true,1,Group,128,128>>();
+      Add<typename C::template Type<64,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<32,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<16,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<8,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<128,128,32,2,2,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<64,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<32,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename G::template Type<8,128,32,1,4,1,D,S,2,true,1,Group>>();
+    };
+    add_lattice.template operator()<16,32>();
+    add_lattice.template operator()<17,16>();
+    add_lattice.template operator()<18,32>();
+    add_lattice.template operator()<19,32>();
+    add_lattice.template operator()<21,32>();
+    add_lattice.template operator()<22,16>();
+    add_lattice.template operator()<29,16>();
     auto add_lut = [this]<class C, class G, int GroupSize>() {
       Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true,
                                     1, GroupSize, 128, 128>>();

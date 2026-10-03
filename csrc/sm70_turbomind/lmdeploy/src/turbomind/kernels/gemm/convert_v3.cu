@@ -101,6 +101,24 @@ std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, in
     return {};
 }
 
+std::array<const LayoutConverter*,2> GetGgufLatticeConverters(int type,int sm) {
+    if (sm != 70) return {};
+    constexpr Cvt<uint16_t,uint2_t> W;
+    constexpr auto wp = constant<(Pack)(HMMA_884|OPERAND_B|1)>{};
+    constexpr auto sp = constant<(Pack)(HMMA_884|OPERAND_V|1)>{};
+    const auto* weight = W(Sm70{},constant<kRowMajor>{},wp);
+    if (type == 18 || type == 21) {
+        constexpr Cvt<uint64_t,uint64_t> S;
+        return {weight,S(Sm70{},constant<kColMajor>{},sp)};
+    }
+    if (type == 19 || type == 29) {
+        constexpr Cvt<uint16_t,uint16_t> S;
+        return {weight,S(Sm70{},constant<kColMajor>{},sp)};
+    }
+    constexpr Cvt<uint32_t,uint32_t> S;
+    return {weight,S(Sm70{},constant<kColMajor>{},sp)};
+}
+
 std::array<const LayoutConverter*, 2> GetGgufLut4Converters(int sm)
 {
     if (sm != 70) return {};

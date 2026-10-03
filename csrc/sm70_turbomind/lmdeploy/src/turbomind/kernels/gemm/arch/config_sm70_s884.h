@@ -15,6 +15,7 @@
 #include "src/turbomind/kernels/gemm/thread_group_map.h"
 #include "src/turbomind/kernels/gemm/tiled_mma.h"
 #include "src/turbomind/kernels/gemm/transform.h"
+#include "src/turbomind/kernels/gemm/lattice_transform.h"
 #include "src/turbomind/kernels/gemm/types.h"
 
 namespace turbomind::gemm::sm70_s884 {
@@ -135,6 +136,13 @@ using Config_GgufBitPlane =
               Operand_B_Pack<std::conditional_t<LowBits == 2, uint2_t, uint4_t>>,
               Transform_HMMA_SM70_BitPlane<LowBits, HighBits, GroupSize>,
               Operand_V_Pack<uint64_t>, kRowMajor, half, raster_order, group_axis>;
+
+template<int Type, int GroupSize, Order raster_order, int group_axis = -1>
+using Config_GgufLattice = Sm70_s884<Operand_A<half>, Transform_Default, VoidOperand,
+    Operand_B_Pack<uint2_t>, Transform_HMMA_SM70_Lattice<Type,GroupSize>,
+    Operand_V_Pack<std::conditional_t<Type == 18 || Type == 21,uint64_t,
+        std::conditional_t<Type == 19 || Type == 29,uint16_t,uint32_t>>>,
+    kRowMajor, half, raster_order, group_axis>;
 
 template <Order raster_order, int group_axis = -1>
 using Config_GgufLut4_IQ =

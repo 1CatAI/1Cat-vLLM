@@ -192,6 +192,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
            &gguf_affine_blas_sm70_out);
   ops.def(
+      "gguf_lattice_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "Tensor stats, int source_type, int group_size) -> ()");
+  ops.impl("gguf_lattice_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int source_type, Tensor(b!) scratch, int group_size) -> "
+      "()");
+  ops.impl("gguf_lattice_blas_sm70_out", torch::kCUDA,
+           &gguf_lattice_blas_sm70_out);
+  ops.def(
       "gguf_lut4_sm70_prepare(Tensor codes, Tensor scales, int lut_id, "
       "int group_size) -> Tensor[]");
   ops.impl("gguf_lut4_sm70_prepare", torch::kCUDA, &gguf_lut4_sm70_prepare);
@@ -205,6 +216,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int group_size) -> ()");
   ops.impl("gguf_lut4_grouped_gemm_sm70_out", torch::kCUDA,
            &gguf_lut4_grouped_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_sm70_prepare(Tensor codes, Tensor scales, int source_type, "
+      "int group_size) -> Tensor[]");
+  ops.impl("gguf_lattice_sm70_prepare", torch::kCUDA,
+           &gguf_lattice_sm70_prepare);
+  ops.def(
+      "gguf_lattice_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor weight, "
+      "Tensor stats, int source_type, int k_ld, int q_ld, int group_size) -> "
+      "()");
+  ops.impl("gguf_lattice_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_grouped_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_lattice_grouped_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_grouped_gemm_sm70_out);
   ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
   ops.impl("silu_and_mul_interleaved", torch::kCUDA, &silu_and_mul_interleaved);
 

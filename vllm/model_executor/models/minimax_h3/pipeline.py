@@ -622,16 +622,41 @@ class MiniMaxH3Pipeline(nn.Module):
             load_model=True,
             encoder_group=self.text_encoder_group,
         )
-        if self._host_backing is not None:
-            PinnedModuleStager.map_cpu_weights(
-                self.text_encoder, self._host_backing, preserve_parameters=False
+        self._prepared_caches = {}
+
+        def load_encoder_weights():
+            if self._host_backing is not None:
+                PinnedModuleStager.map_cpu_weights(
+                    self.text_encoder, self._host_backing, preserve_parameters=False
+                )
+            self.text_encoder.load_weights(
+                iter_checkpoint_weights(shared / "text_encoder")
             )
-        self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
+
+        encoder_backing = self._host_backing
+        if config.prepared_weight_cache:
+            from .prepared_weights import load_cached_component
+
+            cache = load_cached_component(
+                self.text_encoder,
+                load_encoder_weights,
+                [shared / "text_encoder"],
+                root=Path(envs.VLLM_CACHE_ROOT) / "h3-prepared",
+                component="text_encoder",
+                rank=self.text_encoder_group.rank_in_group,
+                world_size=self.text_encoder_group.world_size,
+                limit_bytes=int(config.prepared_weight_cache_gib * 2**30),
+            )
+            if cache is not None:
+                self._prepared_caches["text_encoder"] = cache
+                encoder_backing = cache
+        else:
+            load_encoder_weights()
         self._encoder_stager = PinnedModuleStager(
             self.text_encoder,
             self.device,
             pin_memory=config.host_weight_pin_memory,
-            host_backing=self._host_backing,
+            host_backing=encoder_backing,
         )
         self._dit_layer_stager: LayerwiseModuleStager | None = None
         self._encoder_layer_stager: LayerwiseModuleStager | None = None
@@ -764,6 +789,8 @@ class MiniMaxH3Pipeline(nn.Module):
         reducer = getattr(self, "_residual_reduction", None)
         if reducer is not None:
             reducer.close()
+        for cache in getattr(self, "_prepared_caches", {}).values():
+            cache.close()
 
     @torch.inference_mode()
     def forward(self, request: H3Request):
