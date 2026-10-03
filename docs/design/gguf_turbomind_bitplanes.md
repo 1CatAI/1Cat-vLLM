@@ -46,6 +46,16 @@ environment and could not identify the CUDA platform after the eight new
 direct-operator checks passed. Installing the declared normal package
 metadata resolved this test-environment failure; the complete run then passed.
 
+The final normal wheel passes 43 GPU checks (one existing fixture skipped) in
+an isolated installed runtime without source-path overrides or preloaded
+libraries. The wheel, its installed core and its packaged core agree:
+
+- Compiled source: `ed7a9e9be3`.
+- Wheel: `1cat_vllm-1.5.2.dev231+ged7a9e9be.precompiled-cp312-cp312-linux_x86_64.whl`.
+- Wheel SHA256: `052da74dbf466cde6e35a96e99fc452ecbd4e2447f8a254aa74e7a274ea4aef8`.
+- Core SHA256: `73e882e58a68c4576d83a6002dbb7d92a5e3d87c543bce9629bdbf0de11abb14`.
+- The core has no RPATH/RUNPATH; the packaged GGUF reference extension is unchanged.
+
 ## Initial measurements and profiling
 
 Measurements use V100-SXM2-32GB, CUDA 12.8 and Torch 2.10.0+cu128, FP16
