@@ -21,6 +21,10 @@ pytestmark = pytest.mark.skipif(
         (4, 37, 8192, 32, 40),
         (8, 129, 256, 64, 136),
         (16, 33, 64, 32, 40),
+        (1, 2560, 160, 0, 2560),
+        (5, 321, 160, 159, 328),
+        (17, 37, 255, 19, 43),
+        (33, 19, 73, 0, 24),
     ],
 )
 def test_rows_padding_and_changed_graph_inputs(m, n, k, prefix, pad):

@@ -25,26 +25,35 @@ def _fp16_gemv_silu_ranges_kernel(
     PREFIX_START: tl.constexpr,
     SUFFIX_START: tl.constexpr,
     DIVISOR: tl.constexpr,
+    M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ROWS: tl.constexpr,
 ):
-    token, row = tl.program_id(0), tl.program_id(1)
+    tiles: tl.constexpr = triton.cdiv(OUTPUT_N, ROWS)
+    token, tile = tl.program_id(0) // tiles, tl.program_id(0) % tiles
+    row = tile * ROWS + tl.arange(0, ROWS)
     active = row < N
     wr = tl.where(row < PREFIX, PREFIX_START + row, SUFFIX_START + row - PREFIX)
     offset = tl.arange(0, BLOCK_K)
-    accum = tl.zeros((BLOCK_K,), tl.float32)
+    accum = tl.zeros((ROWS, BLOCK_K), tl.float32)
     for start in tl.static_range(0, K, BLOCK_K):
         col = start + offset
-        a = tl.load(
-            x + token * K + col, active & (col < K), 0, eviction_policy="evict_last"
-        )
+        a = tl.load(x + token * K + col, col < K, 0, eviction_policy="evict_last")
         b = tl.load(
-            weight + wr * K + col, active & (col < K), 0, eviction_policy="evict_first"
+            weight + wr[:, None] * K + col[None, :],
+            active[:, None] & (col[None, :] < K),
+            0,
+            eviction_policy="evict_first",
         )
-        accum += a.to(tl.float32) * b.to(tl.float32)
-    value = tl.sum(accum, 0).to(tl.float16).to(tl.float32)
+        accum += a[None, :].to(tl.float32) * b.to(tl.float32)
+    value = tl.sum(accum, 1).to(tl.float16).to(tl.float32)
     scaled = value / DIVISOR
     value = tl.where(row < PREFIX, scaled * tl.sigmoid(scaled), value)
-    tl.store(out + token * OUTPUT_N + row, tl.where(active, value, 0.0))
+    tl.store(
+        out + token * OUTPUT_N + row,
+        tl.where(active, value, 0.0),
+        (row < OUTPUT_N) & (token < M),
+    )
 
 
 @lru_cache
@@ -73,7 +82,7 @@ class Sm70Fp16GemvSiluKernel:
         return bool(
             current_platform.is_device_capability(70)
             and x.ndim == weight.ndim == out.ndim == 2
-            and 1 <= x.shape[0] <= 16
+            and x.shape[0] > 0
             and x.shape[1] > 0
             and weight.shape[1] == x.shape[1]
             and out.shape[0] == x.shape[0]
@@ -132,7 +141,12 @@ class Sm70Fp16GemvSiluKernel:
             block_k, warps = 512, 4
         else:
             block_k, warps = 256, 4
-        _fp16_gemv_silu_ranges_kernel[(m, out.shape[1])](
+        # Short rows otherwise launch mostly empty CTAs. Four rows per CTA
+        # retain the FP32 reduction for each row while amortizing dispatch.
+        # This schedule is measured on rotating FP16 weights; batch width is
+        # not an implementation boundary.
+        rows = 4 if k <= 256 and active_columns * m >= 4 * _sm_count(x.device) else 1
+        _fp16_gemv_silu_ranges_kernel[(m * triton.cdiv(out.shape[1], rows),)](
             x,
             weight,
             out,
@@ -143,6 +157,8 @@ class Sm70Fp16GemvSiluKernel:
             PREFIX_START=prefix_start,
             SUFFIX_START=suffix_start,
             DIVISOR=divisor,
+            M=m,
             BLOCK_K=block_k,
+            ROWS=rows,
             num_warps=warps,
         )
