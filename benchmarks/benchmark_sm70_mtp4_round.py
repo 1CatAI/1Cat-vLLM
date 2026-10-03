@@ -37,6 +37,8 @@ def main() -> None:
         )
     if args.repeats < 3:
         raise ValueError("At least three measured repetitions are required")
+    # AOT compilation uses this root in addition to CompilationConfig.cache_dir.
+    os.environ["VLLM_CACHE_ROOT"] = str(args.out.parent.resolve() / "vllm_cache")
     from benchmarks.benchmark_sm70_model_tokens import (
         _metric_snapshot,
         _request_metrics_dict,
@@ -101,6 +103,7 @@ def main() -> None:
         "kv_cache_memory_bytes": 4 * 1024**3,
         "enable_prefix_caching": True,
         "language_model_only": True,
+        "disable_log_stats": False,
         "compilation_config": {
             "cache_dir": str(args.out.parent.resolve() / "compile_cache"),
         },
@@ -120,6 +123,7 @@ def main() -> None:
         "engine": copy.deepcopy(engine),
         "fixtures": fixtures,
         "cases": [],
+        "warmup_outputs": [],
         "complete": False,
         "startup_diagnostics": args.startup_diagnostics,
     }
@@ -168,6 +172,15 @@ def main() -> None:
                 )[0]
                 after = _metric_snapshot(llm)
                 if repeat < 0:
+                    report["warmup_outputs"].append(
+                        {
+                            "id": fixture["id"],
+                            "token_ids": list(result.outputs[0].token_ids),
+                            "text": result.outputs[0].text,
+                            "finish_reason": result.outputs[0].finish_reason,
+                        }
+                    )
+                    save()
                     continue
                 output = result.outputs[0]
                 metrics = _request_metrics_dict(result.metrics, len(output.token_ids))
@@ -220,7 +233,7 @@ def main() -> None:
         raise
     finally:
         if llm is not None:
-            llm.llm_engine.shutdown()
+            llm.llm_engine.engine_core.shutdown()
 
 
 if __name__ == "__main__":

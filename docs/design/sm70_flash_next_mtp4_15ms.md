@@ -168,3 +168,32 @@ capability/configuration dispatch; final users must not set tuning variables.
 - The next default run isolates vLLM's compile cache through the normal
   `CompilationConfig.cache_dir` infrastructure setting, in addition to owned
   Inductor/Triton/extension caches. No user performance environment flags.
+
+- With the PLE condition repaired, a normal default engine completes graph
+  capture, kernel warmup and a full 8K+513 warmup/request. The benchmark's
+  first counter admission fails because `LLM` disables statistics by default,
+  and its cleanup calls an obsolete engine method. Enable standard endpoint
+  statistics explicitly and use `llm_engine.engine_core.shutdown()`. Preserve
+  this failed harness run; it supplies no complete-round measurement.
+- `CompilationConfig.cache_dir` does not isolate AOT artifacts or the separate
+  decode compiler. The benchmark now sets only the internal cache-location
+  root after auditing supplied variables. This is infrastructure, not an
+  operator/performance override; no environment setup is required from users.
+
+- Full-local HC split-K plus fused up/gate/mix screening is rejected: the
+  96-module M5 control is 3.633 ms versus best candidate 14.586 ms; M10 is
+  3.717 versus 14.582 ms. FP16 checkpoint intermediates remain finite, but
+  neither numerical relaxation nor fusion alone implies lower latency.
+  Retain the component JSON and source; no model promotion/quality reload.
+  Its initial launch resolved the inherited installed vLLM instead of the
+  owned source and lacked HC registration, producing no timing. The corrected
+  run explicitly verifies the owned source import before timing.
+- Audit discovers the earlier BV16 script also resolved the inherited installed
+  module (different source hash). Its 0.009/0.016-ms result is therefore an
+  exploratory component observation, not current-source dispatch evidence;
+  do not promote it or use it in an endpoint speed estimate.
+- Owner supplies a remote development host. Its four V100 GPUs are idle and
+  fully connected by NV2 links. Keep the desktop/display GPU and all foreign
+  source trees untouched. Runtime is Python 3.12.14 / Torch 2.10.0+cu128;
+  transfer the task source and normal in-tree native build with SHA verification,
+  no private overlay and no wheel. Freeze the host's 185-W GPU power cap.
