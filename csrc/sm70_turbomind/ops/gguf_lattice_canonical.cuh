@@ -6,11 +6,12 @@
 #include "src/turbomind/kernels/gemm/lattice_transform.h"
 
 namespace vllm::sm70_gguf {
-template <int Type>
+template <int Type, int Replicas = 1>
 struct LatticeCanonicalDecoder {
   static constexpr int kGroup =
       Type == 17 || Type == 22 || Type == 29 ? 16 : 32;
-  using Transform = turbomind::gemm::Transform_HMMA_SM70_Lattice<Type, kGroup>;
+  using Transform =
+      turbomind::gemm::Transform_HMMA_SM70_Lattice<Type, kGroup, Replicas>;
   using Stats = std::conditional_t<
       Type == 18 || Type == 21, uint64_t,
       std::conditional_t<Type == 19 || Type == 29, uint16_t, uint32_t>>;
