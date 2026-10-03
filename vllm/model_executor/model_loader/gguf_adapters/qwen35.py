@@ -44,6 +44,10 @@ _LAYERS = {
 
 
 class Qwen35Adapter:
+    global_names = _GLOBALS
+    layer_names = _LAYERS
+    architecture_label = "Qwen3.5"
+
     def __init__(self, config, tp_size=1):
         self.config = config
         self.tp_size = tp_size
@@ -62,8 +66,8 @@ class Qwen35Adapter:
     def build_name_map(self, tensors):
         result = {}
         for name in tensors:
-            if name in _GLOBALS:
-                result[name] = _GLOBALS[name]
+            if name in self.global_names:
+                result[name] = self.global_names[name]
                 continue
             match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
             if match:
@@ -75,10 +79,10 @@ class Qwen35Adapter:
                         self.config, "num_nextn_predict_layers", 0
                     ):
                         continue
-                elif suffix in _LAYERS:
-                    result[name] = f"model.layers.{block}.{_LAYERS[suffix]}"
+                elif suffix in self.layer_names:
+                    result[name] = f"model.layers.{block}.{self.layer_names[suffix]}"
                     continue
-            raise ValueError(f"Unmapped Qwen3.5 GGUF tensor: {name}")
+            raise ValueError(f"Unmapped {self.architecture_label} GGUF tensor: {name}")
         return result
 
     @staticmethod

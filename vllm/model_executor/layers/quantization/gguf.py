@@ -416,7 +416,7 @@ def _apply_gguf_embedding_fake(
     hidden_size: int,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    return torch.empty(x.shape[0], hidden_size, dtype=dtype, device=x.device)
+    return torch.empty((*x.shape, hidden_size), dtype=dtype, device=x.device)
 
 
 try:
