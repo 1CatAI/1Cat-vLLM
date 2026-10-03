@@ -105,3 +105,34 @@ gates, full-model timing, and one short C4 smoke remain required before merge.
 The operator result is not a claim of 96 launches removed or an endpoint
 speedup. First-phase 7.5-ms/token and second-phase 6-ms/token targets remain
 outstanding.
+
+## Installed C1 endpoint and quality result
+
+The ordinary source-complete artifact at 735099f240 includes the mapped PLE
+transport qualified by #831. Both arms use that same artifact; the control
+selects `Sm70Fp16LinearKernel` through the existing disabled-kernel control.
+The kernel/adapter uses FP16 input, weights and output with FP32 accumulation;
+the final capability guard explicitly rejects FP32 output configurations.
+
+| C1 result, six samples | Disabled | Enabled |
+|---|---:|---:|
+| Median ms/token | 11.11511 | 10.98625 |
+| Range ms/token | 11.02277–11.15845 | 10.77369–11.04027 |
+| MBPP | 12/12 | 12/12 |
+| GSM8K | 12/12 | 12/12 |
+| Chinese QA | 8/8 | 8/8 |
+| Needle retrieval | 4/4 | 4/4 |
+| Natural EOS and nonempty final answers | 36/36 | 36/36 |
+| Replacement characters and token-cap failures | 0 | 0 |
+
+The median difference is 0.12886 ms/token (1.16% lower TPOT). Sample ranges
+overlap. This is much smaller than the isolated projection gain; shared and
+routed work overlaps, so service-time savings cannot be added to the endpoint.
+A final graph-node trace is queued to verify actual kernel selection/counts
+and attribute this small difference. Do not infer all layer routes from the
+last admission record in a grouped startup report.
+
+The installed GPU loader smoke selected M1 plain/fused gate-up and plain down,
+reported their numerical/cold admission through the existing framework, and
+passed changed-input graph replay against independent FP64 references.
+C1 teacher-forcing distribution and the short C4 smoke remain pending.
