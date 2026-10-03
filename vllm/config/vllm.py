@@ -1389,10 +1389,20 @@ class VllmConfig:
         model_config.hf_config = hf_config
         model_config.model_arch_config = model_config.get_model_arch_config()
 
+        kernel_config = self.kernel_config
+        if (
+            kernel_config.ple_disk_cascade_active
+            or getattr(self.model_config.hf_text_config, "ple_layer_ids", None)
+            or getattr(hf_config.get_text_config(), "ple_layer_ids", None)
+        ):
+            # PLE admission is model-specific; a draft must not reset its parent's
+            # storage placement. Keep existing sharing for models without PLE.
+            kernel_config = copy.deepcopy(kernel_config)
+
         return replace(
             self,
             model_config=model_config,
-            kernel_config=copy.deepcopy(self.kernel_config),
+            kernel_config=kernel_config,
         )
 
     def _set_config_default(self, config_obj: Any, key: str, value: Any) -> None:

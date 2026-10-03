@@ -105,7 +105,8 @@ def test_multiple_engines_keep_independent_policy(config):
         assert ple_offload_enabled()
 
 
-def test_hf_config_clone_does_not_reset_parent_admission(tmp_path):
+@pytest.mark.parametrize("active", [False, True])
+def test_hf_config_clone_preserves_policy_ownership(tmp_path, active):
     from transformers import Qwen3Config
 
     hf = Qwen3Config(
@@ -128,8 +129,8 @@ def test_hf_config_clone_does_not_reset_parent_admission(tmp_path):
         max_model_len=64,
     )
     parent = VllmConfig(model_config=model)
-    parent.kernel_config.ple_disk_cascade_active = True
+    parent.kernel_config.ple_disk_cascade_active = active
     child = parent.with_hf_config(copy.deepcopy(hf))
-    assert child.kernel_config is not parent.kernel_config
-    assert parent.kernel_config.ple_disk_cascade_active
+    assert (child.kernel_config is parent.kernel_config) is not active
+    assert parent.kernel_config.ple_disk_cascade_active is active
     assert not child.kernel_config.ple_disk_cascade_active
