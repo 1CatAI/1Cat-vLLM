@@ -27,6 +27,10 @@ The CPU reads words atomically between two generation checks. Changed or odd
 generations are discarded. The GPU never waits for acknowledgement; skipped
 publications use normal lookup.
 
+The reader owns both shared tensors for its entire lifetime. Keeping only a
+flag address is insufficient: registration messages are released after startup,
+which otherwise unmaps the flag while the reader still polls it.
+
 Each layer and DP rank owns a bounded cache keyed by all raw ngram tokens.
 Lookup and cache fill run on the same CPU worker thread. Cached rows own their
 bytes, so staging-buffer reuse cannot mutate them. Reordered/recycled requests
@@ -37,7 +41,7 @@ maximum concurrent requests, not the embedding table size.
 
 ## Validation status
 
-Three targeted CPU tests cover torn snapshots, skipped generations, byte
+Four targeted CPU tests cover mailbox lifetime, torn snapshots, skipped generations, byte
 ownership, eviction, request reordering, wrong-byte detection, cache hits and
 normal-lookup fallback. Fifty related CPU tests passed. The SM70 publication
 kernel compiles without allocating GPU work and emitted PTX includes system
@@ -52,8 +56,16 @@ rank zero. That was corrected before taking these results. The expanded M1–16
 oracle also passed, with 200 publications and 199 coherent snapshots per rank,
 zero wrong keys.
 
-A normal source-complete wheel has been built. Installed-runtime integration,
-teacher-forcing/task quality and matched C1/C4/C8/C16 timing remain pending.
+A normal source-complete wheel has been built. The C1 control with prefetch
+disabled passed all 36 task cases, including the 258K needle, with natural EOS
+and no replacement characters. Its six-run median decode time was 11.075 ms.
+The first enabled run exposed a mailbox flag lifetime bug: the CPU lookup
+process exited with SIGSEGV and GPU workers waited during startup. A regression
+test fails before the ownership fix and passes after it. This failed run is not
+a speed or quality result; installed-runtime retesting remains pending.
+
+Teacher-forcing/task quality and matched timing are accepted at C1 only.
+One short C4 end-to-end smoke is required before merging.
 No end-to-end speedup is claimed yet. This change depends on the mapped result
 transport in #831. Dense 8-bit and MTP are separate work.
 
