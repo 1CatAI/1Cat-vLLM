@@ -38,15 +38,6 @@ class ExactMnkKernelImpl final : public KernelImpl<Gemm> {
 // Narrow GGUF expert projections otherwise spend much of an N128/N256
 // tile on padding. Keep these candidates out of wide projection descriptors.
 template<class Gemm>
-class GgufLatticeNativeGroupedKernelImpl final : public KernelImpl<Gemm> {
- public:
-  bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return desc.num > 1 && desc.m >= 512 &&
-           KernelImpl<Gemm>::is_feasible(desc);
-  }
-};
-
-template<class Gemm>
 class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
@@ -93,10 +84,6 @@ void Registry::sm70_884_4() {
     auto add_lattice = [this]<int Type, int Group>() {
       using C = Config_GgufLattice<Type,Group,kColMajor>;
       using G = Config_GgufLattice<Type,Group,kColMajor,0>;
-      if constexpr (Type == 18 || Type == 21) {
-        using NativeTile = typename G::template Type<8,256,64,1,4,1,D,S,2,true,1,Group>;
-        Add(std::make_unique<GgufLatticeNativeGroupedKernelImpl<typename NativeTile::Kernel>>());
-      }
       if constexpr (Type == 17) {
         using Grouped64 = typename G::template Type<128,64,Group,2,1,1,D,D,2,true,1,Group,64,64>;
         using Grouped128 = typename G::template Type<128,128,Group,2,2,1,D,D,2,true,1,Group,64,128>;
