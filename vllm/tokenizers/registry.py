@@ -45,6 +45,7 @@ _VLLM_TOKENIZERS = {
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Tokenizer"),
     "grok2": ("grok2", "Grok2Tokenizer"),
     "hf": ("hf", "CachedHfTokenizer"),
+    "gguf": ("gguf", "GGUFTokenizer"),
     "kimi_audio": ("kimi_audio", "KimiAudioTokenizer"),
     "mistral": ("mistral", "MistralTokenizer"),
     "qwen_vl": ("qwen_vl", "QwenVLTokenizer"),
@@ -126,7 +127,14 @@ def resolve_tokenizer_args(
                 tokenizer_name = tokenizer_path
 
     # Separate model folder from file path for GGUF models
-    if is_gguf(tokenizer_name):
+    if is_gguf(tokenizer_name) and tokenizer_mode in ("auto", "gguf"):
+        from vllm.transformers_utils.gguf_files import resolve_gguf_file
+
+        tokenizer_name = resolve_gguf_file(
+            tokenizer_name, revision=revision, cache_dir=download_dir
+        )
+        tokenizer_mode = "gguf"
+    elif is_gguf(tokenizer_name):
         if check_gguf_file(tokenizer_name):
             kwargs["gguf_file"] = Path(tokenizer_name).name
             tokenizer_name = Path(tokenizer_name).parent

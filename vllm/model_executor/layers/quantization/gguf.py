@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.quantization.gguf_layout import GGUFLinearLayout
 from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
     dense_admission,
@@ -61,6 +62,8 @@ class GGUFConfig(QuantizationConfig):
     def __init__(self, unquantized_modules: list[str] | None = None) -> None:
         super().__init__()
         self.unquantized_modules = unquantized_modules or []
+        self.linear_layouts: dict[str, GGUFLinearLayout] = {}
+        self.fallback_reasons: dict[str, str] = {}
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -106,7 +109,9 @@ class GGUFConfig(QuantizationConfig):
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
                 return UnquantizedLinearMethod()
-            return GGUFLinearMethod(self)
+            method = GGUFLinearMethod(self, self.linear_layouts.get(prefix))
+            method.fallback_reason = self.fallback_reasons.get(prefix)
+            return method
         elif isinstance(layer, VocabParallelEmbedding):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
@@ -473,8 +478,12 @@ class GGUFLinearMethod(LinearMethodBase):
         quant_config: The GGUF quantization config.
     """
 
-    def __init__(self, quant_config: GGUFConfig):
+    def __init__(
+        self, quant_config: GGUFConfig, layout: GGUFLinearLayout | None = None
+    ):
         self.quant_config = quant_config
+        self.layout = layout
+        self.fallback_reason: str | None = None
         config = get_current_vllm_config_or_none()
         policy = config.kernel_config.sm70_gguf if config is not None else None
         self.native_enabled = policy.enabled if policy is not None else True
@@ -502,6 +511,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 "input_dim": 1,
                 "output_dim": 0,
                 "tensor_shape": tensor_shape,
+                "gguf_layout": self.layout,
                 "is_gguf_weight": True,
                 "data_container": [],
                 "shard_id": [],
@@ -623,9 +633,22 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = qweight.shard_id
         if len(data_container := qweight.data_container) > 1:
             dtype = {data.dtype for data in data_container}
-            assert len(dtype) == 1, ValueError(
-                f"Data container has mixed dtypes: {dtype}"
-            )
+            if len(dtype) > 1:
+                order = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
+                layer.gguf_shard_weights = torch.nn.ParameterList(
+                    Parameter(
+                        data_container[shard_id_map[index]].to(device=qweight.device),
+                        requires_grad=False,
+                    )
+                    for index in order
+                )
+                layer.gguf_shard_types = tuple(
+                    layer.qweight_type.shard_weight_type[index] for index in order
+                )
+                data_container.clear()
+                # Retain the registered parameter contract without unused storage.
+                qweight.materialize((0,), dtype=self.params_dtype)
+                return
             dtype = next(iter(dtype))
             # concat dim0 and pad dim1
             padded_side = max(x.size(1) for x in data_container)
@@ -656,24 +679,34 @@ class GGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.layout is not None:
+            x = self.layout.input_to_gguf(x)
         if hasattr(layer, "gguf_native_shard_weights"):
+            weights = layer.gguf_native_shard_weights
+            types = layer.gguf_native_shard_types
+        elif hasattr(layer, "gguf_shard_weights"):
+            weights = layer.gguf_shard_weights
+            types = layer.gguf_shard_types
+        else:
+            weights = None
+        if weights is not None:
             out = torch.cat(
                 [
                     fused_mul_mat_gguf(
                         x, weight, weight_type, self.native_enabled, self.prefill_min_m
                     )
-                    for weight, weight_type in zip(
-                        layer.gguf_native_shard_weights, layer.gguf_native_shard_types
-                    )
+                    for weight, weight_type in zip(weights, types)
                 ],
                 dim=-1,
             )
-            return out if bias is None else out + bias
+            if bias is not None:
+                out.add_(bias)
+            return out
         shard_id = layer.qweight.shard_id
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            shard_id = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:

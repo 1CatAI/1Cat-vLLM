@@ -997,9 +997,24 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if isinstance(loaded_shard_id, tuple) and (
             is_gguf_weight or is_gguf_weight_type
         ):
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported for GGUF."
-            )
+            if (
+                is_gguf_weight
+                and sum(self.output_sizes[gguf_index] for gguf_index in loaded_shard_id)
+                != loaded_weight.shape[param.output_dim]
+            ):
+                raise ValueError(
+                    "GGUF combined shard row count does not match projections"
+                )
+            offset = 0
+            for gguf_index in loaded_shard_id:
+                if is_gguf_weight_type:
+                    shard = loaded_weight
+                else:
+                    gguf_rows = self.output_sizes[gguf_index]
+                    shard = loaded_weight.narrow(param.output_dim, offset, gguf_rows)
+                    offset += gguf_rows
+                self.weight_loader(param, shard, gguf_index)
+            return
         if is_gguf_weight_type:
             if loaded_shard_id is not None:
                 param.data[loaded_shard_id].copy_(loaded_weight)
@@ -1553,6 +1568,13 @@ class QKVParallelLinear(ColumnParallelLinear):
             start_idx = self.tp_rank * shard_size
 
             if loaded_shard_id is not None:
+                shard_size = self._get_shard_size_mapping(loaded_shard_id)
+                shard_rank = (
+                    self.tp_rank
+                    if loaded_shard_id == "q"
+                    else self.tp_rank // self.num_kv_head_replicas
+                )
+                start_idx = shard_rank * shard_size
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
                 param.shard_id.append(loaded_shard_id)
                 param.shard_id_map[loaded_shard_id] = len(param.data_container)
@@ -1852,10 +1874,31 @@ class RowParallelLinear(LinearBase):
         if is_gguf_weight_type:
             param.weight_type = loaded_weight.item()
 
+        if is_gguf_weight and input_dim is not None and not is_sharded_weight:
+            import gguf
+
+            block_size, _ = gguf.GGML_QUANT_SIZES[self.qweight_type.weight_type]
+            if self.input_size_per_partition % block_size:
+                raise ValueError(
+                    f"GGUF {self.prefix}: local K={self.input_size_per_partition} "
+                    f"is not aligned to quantization block {block_size}; "
+                    "use expert parallelism or a block-aligned format"
+                )
+            if (layout := getattr(param, "gguf_layout", None)) is not None:
+                loaded_weight = layout.shard_weight(
+                    loaded_weight,
+                    dim=input_dim,
+                    logical_size=self.input_size,
+                    block_size=block_size,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
+                is_sharded_weight = True
+
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
             weight_shape = list(loaded_weight.shape)
-            if input_dim:
+            if input_dim is not None and not is_sharded_weight:
                 weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
             param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
 

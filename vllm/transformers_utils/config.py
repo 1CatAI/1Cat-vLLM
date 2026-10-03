@@ -619,17 +619,13 @@ def maybe_override_with_speculators(
     Returns:
         Tuple of (resolved_model, resolved_tokenizer, speculative_config)
     """
-    if check_gguf_file(model):
-        kwargs["gguf_file"] = Path(model).name
-        gguf_model_repo = Path(model).parent
-    elif is_remote_gguf(model):
-        repo_id, _ = split_remote_gguf(model)
-        gguf_model_repo = Path(repo_id)
-    else:
-        gguf_model_repo = None
+    # GGUF checkpoints do not contain a JSON speculators manifest. Do not
+    # send them through Transformers' separate GGUF config parser here.
+    if is_gguf(model):
+        return model, tokenizer, vllm_speculative_config
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
     config_dict, _ = PretrainedConfig.get_config_dict(
-        model if gguf_model_repo is None else gguf_model_repo,
+        model,
         revision=revision,
         token=hf_token,
         **without_trust_remote_code(kwargs),
@@ -667,8 +663,35 @@ def get_config(
     hf_overrides_fn: Callable[[PretrainedConfig], PretrainedConfig] | None = None,
     **kwargs,
 ) -> PretrainedConfig:
-    # Separate model folder from file path for GGUF models
+    # Native GGUF metadata parsing precedes HF repository/config discovery.
+    # Explicit --hf-config-path reaches this function as a normal HF reference.
+    from .gguf_config import (
+        _ARCHITECTURES,
+        gguf_config_from_metadata,
+        read_gguf_metadata,
+    )
+    from .gguf_files import resolve_gguf_file
 
+    _is_gguf = is_gguf(model)
+    if _is_gguf:
+        local_gguf = resolve_gguf_file(
+            model,
+            revision=revision,
+            cache_dir=kwargs.get("cache_dir"),
+            token=kwargs.get("token"),
+        )
+        metadata = read_gguf_metadata(local_gguf)
+        if metadata.get("general.architecture") in _ARCHITECTURES:
+            config = gguf_config_from_metadata(metadata)
+            if hf_overrides_kw:
+                config.update(hf_overrides_kw)
+            if hf_overrides_fn:
+                config = hf_overrides_fn(config)
+            patch_rope_parameters(config)
+            patch_rope_parameters(config.get_text_config())
+            return config
+
+    # Preserve legacy config handling for architectures awaiting native adapters.
     _is_gguf = is_gguf(model)
     _is_remote_gguf = is_remote_gguf(model)
     if _is_gguf:

@@ -97,6 +97,43 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
     return result
 
 
+def loaded_gguf_layers(model) -> dict[str, Any]:
+    """Report prepared GGUF storage and missing accelerators beside other routes.
+
+    This is preparation/capability evidence, not per-request kernel-hit evidence.
+    """
+    import torch
+
+    result = {}
+    for name, layer in model.named_modules():
+        method = getattr(layer, "quant_method", None)
+        if type(method).__name__ not in (
+            "GGUFLinearMethod",
+            "GGUFEmbeddingMethod",
+            "GGUFMoEMethod",
+        ):
+            continue
+        descriptor = getattr(layer, "qweight_type", None)
+        types = list(getattr(descriptor, "shard_weight_type", {}).values())
+        if descriptor is not None and not types:
+            types = [getattr(descriptor, "weight_type", None)]
+        layout = getattr(method, "layout", None)
+        result[name] = {
+            "method": type(method).__name__,
+            "weight_types": types,
+            "layout": type(layout).__name__ if layout is not None else None,
+            "separate_projection_storage": hasattr(layer, "gguf_shard_weights"),
+            "native_operators": {
+                op: hasattr(torch.ops._C, op)
+                for op in ("ggml_dequantize", "ggml_mul_mat_vec_a8", "ggml_mul_mat_a8")
+            },
+            "storage_fallback_reason": getattr(method, "fallback_reason", None),
+            "acceleration_fallback_reason": "gguf_turbomind_repack_not_integrated",
+            "scope": "prepared_gguf_storage_and_operator_capability",
+        }
+    return result
+
+
 def loaded_sm70_preparations(model) -> dict[str, Any]:
     """Read existing preparation flags and packed buffers; never select a route."""
     variants = {}
