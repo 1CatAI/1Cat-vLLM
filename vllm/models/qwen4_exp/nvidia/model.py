@@ -201,6 +201,7 @@ def _finalize_qsa_e4m3_scale_load(
     cache_dtype: str,
     *,
     require_calibrated_speculative_draft: bool = False,
+    require_calibrated_target: bool = False,
 ) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return
@@ -218,6 +219,12 @@ def _finalize_qsa_e4m3_scale_load(
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
     missing_scales = required_scales - loaded
+    if require_calibrated_target and missing_scales:
+        raise ValueError(
+            "Automatically selected QSA E4M3 requires complete calibrated "
+            "K/V scales; refusing to start. Missing: "
+            + ", ".join(sorted(missing_scales))
+        )
     if require_calibrated_speculative_draft and missing_scales:
         raise ValueError(
             "QSA E4M3 speculative draft scale overlay is incomplete; refusing "
@@ -1125,7 +1132,14 @@ class Qwen4ExpForCausalLM(
         )
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         if self._qsa_scale_gate_at_this_level:
-            _finalize_qsa_e4m3_scale_load(self, loaded, self.model._kv_cache_dtype)
+            _finalize_qsa_e4m3_scale_load(
+                self,
+                loaded,
+                self.model._kv_cache_dtype,
+                require_calibrated_target=(
+                    self.vllm_config.kernel_config.qsa_auto_e4m3_active
+                ),
+            )
         return loaded
 
 
@@ -1336,7 +1350,12 @@ class Qwen4ExpForConditionalGeneration(
         )
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         _finalize_qsa_e4m3_scale_load(
-            self, loaded, self.language_model.model._kv_cache_dtype
+            self,
+            loaded,
+            self.language_model.model._kv_cache_dtype,
+            require_calibrated_target=(
+                self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
+            ),
         )
         return loaded
 

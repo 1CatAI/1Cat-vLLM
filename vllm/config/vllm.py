@@ -1395,6 +1395,8 @@ class VllmConfig:
             or getattr(self.model_config.hf_text_config, "ple_layer_ids", None)
             or getattr(hf_config.get_text_config(), "ple_layer_ids", None)
             or kernel_config.sm70_sparse.active
+            or kernel_config.qsa_auto_e4m3_active
+            or getattr(hf_config.get_text_config(), "indexer_n_heads", None)
             or getattr(hf_config.get_text_config(), "index_head_dim", None)
         ):
             # Model-local admission must not be reset by a derived draft config.
@@ -1594,6 +1596,14 @@ class VllmConfig:
             )
             self.cache_config.cache_dtype = "auto"
             self.cache_config.cache_dtype_from_checkpoint = False
+
+        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_auto_e4m3
+
+        if resolve_qsa_auto_e4m3(self):
+            logger.info_once(
+                "Defaulting calibrated QSA main KV storage to E4M3; "
+                "activations and recurrent states retain their precision."
+            )
 
         self.try_verify_and_update_config()
         # Models may have supplied their own DCP defaults above; anything still
