@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import importlib.util
 import json
+import os
 import signal
 import statistics
 from pathlib import Path
@@ -198,6 +199,13 @@ def run_case(module, tp, hidden, hc, low_rank, trace=False):
         if trace and width == 1:
             record["cta_globaltimer_ns"] = [d["trace"][0].cpu().tolist() for d in local]
         records.append(record)
+    steady_trace = None
+    if trace:
+        # The last node in a long graph removes initial host launch skew.
+        diagnostic_graphs = capture(module, local, 1, eps, steps=100)
+        replay(diagnostic_graphs)
+        synchronize(tp)
+        steady_trace = [d["trace"][0].cpu().tolist() for d in local]
     # This is candidate-only timing, not speedup over the production path.
     for data in local:
         data["trace"] = None
@@ -223,6 +231,7 @@ def run_case(module, tp, hidden, hc, low_rank, trace=False):
         "correctness": records,
         "candidate_c1_us": times,
         "candidate_c1_median_us": statistics.median(times),
+        "steady_cta_globaltimer_ns": steady_trace,
     }
 
 
@@ -246,20 +255,19 @@ def main():
     if args.real_only:
         shapes = [(4, 2560, 4, 320)]
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with Path("/tmp/gpu0-3.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # Waiting for shared GPUs does not consume the kernel watchdog.
-        signal.alarm(args.timeout_seconds)
-        result = {"research_only": True, "complete": False, "cases": []}
-        for shape in shapes:
-            result["cases"].append(run_case(module, *shape, trace=args.trace))
-            args.output.write_text(json.dumps(result, indent=2) + "\n")
-            print(
-                "CASE", shape, result["cases"][-1]["candidate_c1_median_us"], flush=True
-            )
-        result["complete"] = True
+    # Keep the raw descriptor until process exit, including CUDA teardown.
+    lock_fd = os.open("/tmp/gpu0-3.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    # Waiting for shared GPUs does not consume the kernel watchdog.
+    signal.alarm(args.timeout_seconds)
+    result = {"research_only": True, "complete": False, "cases": []}
+    for shape in shapes:
+        result["cases"].append(run_case(module, *shape, trace=args.trace))
         args.output.write_text(json.dumps(result, indent=2) + "\n")
-        signal.alarm(0)
+        print("CASE", shape, result["cases"][-1]["candidate_c1_median_us"], flush=True)
+    result["complete"] = True
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    signal.alarm(0)
 
 
 if __name__ == "__main__":

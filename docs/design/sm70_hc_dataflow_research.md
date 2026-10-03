@@ -60,3 +60,42 @@ An optional per-CTA globaltimer trace separates weight prefetch, prerequisite
 waiting, computation/push and the final peer wait to localize this negative
 result. Trace timestamps are diagnostic, with the V100 timer's measured
 1.024-us resolution; they do not fill the model's missing DRAM-byte counters.
+
+## Reader and norm follow-up
+
+The scalar reader spent 36.864 us (median CTA duration) prefetching down weights.
+128-bit read-only loads reduce that to roughly 7–8 us and up prefetch to 3.072 us.
+Capability checks use alignment and row layout; incompatible views keep the
+scalar reader within the same algorithm. C1 median drops to 53.156 us. Replays
+and the FP64 boundary reference still pass.
+
+Combine/norm initially reloaded materialized residuals from global memory.
+Vector input/output and affine loads now preserve those FP16 values in shared
+memory until normalization finishes. This keeps both FP16 boundaries and FP32
+math. The actual-size C1 median becomes 44.339 us; all TP and width checks pass.
+The build uses 47 registers with no spills.
+
+Steady timing comes from the last node of a 100-node graph: single-node
+cross-GPU replays include host launch skew. Median CTA phases after the norm
+change are as follows. Norm's second column measures its own computation,
+whereas down/up measure prerequisite waiting. Rows overlap and cannot be added
+as a layer budget.
+
+| Role | Prefetch | Input wait / norm | Compute and push | Peer wait |
+|---|---:|---:|---:|---:|
+| Norm | 0.000 | 6.144 | 0.000 | 0.000 |
+| Down | 7.168 | 0.000 | 9.216 | 0.000 |
+| Up | 3.072 | 20.480 | 10.240 | 5.120 |
+
+An ordinary/cooperative dispatch probe uses the same argument struct, 125 CTAs,
+128 threads, 40,992-byte dynamic shared memory, 1,000 graph nodes and alternating
+arms. Five-run medians are 1.930 and 1.927 us per node, respectively. The large
+remaining HC cost is not explained by cooperative dispatch itself.
+
+The next diagnostic changes polling to volatile loads followed by one acquire
+after readiness, and keeps local norm flags at GPU scope. Peer publication
+retains system ordering. It has not been measured yet. None of these research
+results admits a default model path or demonstrates a full-model improvement.
+
+Standalone GPU scripts keep a raw flock descriptor until process exit, so CUDA
+teardown remains inside the ownership window.

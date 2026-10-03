@@ -23,6 +23,7 @@ struct Params {
   unsigned long long* trace;
   Peer peers[MaxPeers];
   int m, hidden, hc, low_rank, tp, rank, down_ctas, up_ctas;
+  bool vector_down, vector_up, vector_norm;
   float eps;
 };
 
@@ -39,13 +40,46 @@ __device__ void release(unsigned* p, unsigned v) {
                : "memory");
 }
 __device__ void wait(const unsigned* p, unsigned generation) {
-  while (acquire(p) != generation) __nanosleep(128);
+  unsigned value;
+  do {
+    asm volatile("ld.volatile.global.u32 %0, [%1];"
+                 : "=r"(value)
+                 : "l"(p)
+                 : "memory");
+    if (value != generation) __nanosleep(128);
+  } while (value != generation);
+  (void)acquire(p);
+}
+
+__device__ void release_gpu(unsigned* p, unsigned generation) {
+  asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(generation)
+               : "memory");
+}
+
+__device__ void wait_gpu(const unsigned* p, unsigned generation) {
+  unsigned value;
+  do {
+    asm volatile("ld.volatile.global.u32 %0, [%1];"
+                 : "=r"(value)
+                 : "l"(p)
+                 : "memory");
+    if (value != generation) __nanosleep(128);
+  } while (value != generation);
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+               : "=r"(value)
+               : "l"(p)
+               : "memory");
 }
 __device__ float warp_sum(float v) {
   for (int d = 16; d; d /= 2) v += __shfl_down_sync(0xffffffffu, v, d);
   return v;
 }
 __device__ float sigmoid(float v) { return 1.f / (1.f + expf(-v)); }
+
+union HalfPack {
+  uint4 vector;
+  half elements[8];
+};
 
 __device__ void mark(Params p, int row, int stage) {
   if (!threadIdx.x && p.trace) {
@@ -60,7 +94,7 @@ __device__ void mark(Params p, int row, int stage) {
 // every producer can run while consumers wait, without any grid-wide barrier.
 template <int M>
 __global__ void __launch_bounds__(Threads) hc_dataflow(Params p) {
-  extern __shared__ half cache[];
+  extern __shared__ __align__(16) half cache[];
   const int t = threadIdx.x, lane = t & 31, warp = t / 32;
   const int total_hidden = p.hc * p.hidden;
   const int local_hidden = p.hidden / p.tp;
@@ -75,24 +109,55 @@ __global__ void __launch_bounds__(Threads) hc_dataflow(Params p) {
   // This load is independent of the current input, and occurs before polling.
   if (blockIdx.x >= p.hc && blockIdx.x < p.hc + p.down_ctas) {
     const int tile = blockIdx.x - p.hc;
-    for (int i = t; i < DownTile * total_hidden; i += Threads) {
-      const int row = tile * DownTile + i / total_hidden;
-      const int global_row =
-          row < local_lora
-              ? p.rank * local_lora + row
-              : p.low_rank + p.rank * local_injection + row - local_lora;
-      cache[i] = row < local_down
-                     ? p.down_weight[size_t(global_row) * total_hidden +
-                                     i % total_hidden]
-                     : __float2half_rn(0.f);
+    if (p.vector_down) {
+      const int width = total_hidden / 8;
+      for (int i = t; i < DownTile * width; i += Threads) {
+        const int row = tile * DownTile + i / width;
+        const int global_row =
+            row < local_lora
+                ? p.rank * local_lora + row
+                : p.low_rank + p.rank * local_injection + row - local_lora;
+        reinterpret_cast<uint4*>(cache)[i] =
+            row < local_down
+                ? __ldg(reinterpret_cast<const uint4*>(p.down_weight) +
+                        size_t(global_row) * width + i % width)
+                : make_uint4(0, 0, 0, 0);
+      }
+    } else {
+      for (int i = t; i < DownTile * total_hidden; i += Threads) {
+        const int row = tile * DownTile + i / total_hidden;
+        const int global_row =
+            row < local_lora
+                ? p.rank * local_lora + row
+                : p.low_rank + p.rank * local_injection + row - local_lora;
+        cache[i] = row < local_down
+                       ? p.down_weight[size_t(global_row) * total_hidden +
+                                       i % total_hidden]
+                       : __float2half_rn(0.f);
+      }
     }
   } else if (blockIdx.x >= p.hc + p.down_ctas) {
     const int tile = blockIdx.x - p.hc - p.down_ctas;
-    for (int i = t; i < OutputTile * p.hc * p.low_rank; i += Threads) {
-      const int r = i / p.low_rank;
-      const int h = p.rank * local_hidden + tile * OutputTile + r % OutputTile;
-      const int global_row = (r / OutputTile) * p.hidden + h;
-      cache[i] = p.up_weight[size_t(global_row) * p.low_rank + i % p.low_rank];
+    if (p.vector_up) {
+      const int width = p.low_rank / 8;
+      for (int i = t; i < OutputTile * p.hc * width; i += Threads) {
+        const int r = i / width;
+        const int h =
+            p.rank * local_hidden + tile * OutputTile + r % OutputTile;
+        const int global_row = (r / OutputTile) * p.hidden + h;
+        reinterpret_cast<uint4*>(cache)[i] =
+            __ldg(reinterpret_cast<const uint4*>(p.up_weight) +
+                  size_t(global_row) * width + i % width);
+      }
+    } else {
+      for (int i = t; i < OutputTile * p.hc * p.low_rank; i += Threads) {
+        const int r = i / p.low_rank;
+        const int h =
+            p.rank * local_hidden + tile * OutputTile + r % OutputTile;
+        const int global_row = (r / OutputTile) * p.hidden + h;
+        cache[i] =
+            p.up_weight[size_t(global_row) * p.low_rank + i % p.low_rank];
+      }
     }
   }
   __syncthreads();
@@ -103,19 +168,45 @@ __global__ void __launch_bounds__(Threads) hc_dataflow(Params p) {
     if (blockIdx.x < p.hc) {
       const int branch = blockIdx.x;
       const size_t base = size_t(row) * total_hidden + branch * p.hidden;
-      const float injection =
-          2.f * sigmoid(__half2float(p.injection[row * p.hc + branch]) / p.hc);
+      auto* partial = reinterpret_cast<float*>(cache + p.hidden);
+      if (!t)
+        partial[4] =
+            2.f *
+            sigmoid(__half2float(p.injection[row * p.hc + branch]) / p.hc);
+      __syncthreads();
+      const float injection = partial[4];
       float squares = 0.f;
-      for (int h = t; h < p.hidden; h += Threads) {
-        const half v = __float2half_rn(
-            __half2float(p.residual[base + h]) +
-            injection * __half2float(p.block[size_t(row) * p.hidden + h]));
-        p.combined[base + h] = v;
-        const float f = __half2float(v);
-        squares = fmaf(f, f, squares);
+      if (p.vector_norm) {
+        for (int v = t; v < p.hidden / 8; v += Threads) {
+          HalfPack residual, block, combined;
+          residual.vector =
+              __ldg(reinterpret_cast<const uint4*>(p.residual + base) + v);
+          block.vector = __ldg(
+              reinterpret_cast<const uint4*>(p.block + size_t(row) * p.hidden) +
+              v);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            combined.elements[e] =
+                __float2half_rn(fmaf(injection, __half2float(block.elements[e]),
+                                     __half2float(residual.elements[e])));
+            const float f = __half2float(combined.elements[e]);
+            squares = fmaf(f, f, squares);
+          }
+          reinterpret_cast<uint4*>(cache)[v] = combined.vector;
+          reinterpret_cast<uint4*>(p.combined + base)[v] = combined.vector;
+        }
+      } else {
+        for (int h = t; h < p.hidden; h += Threads) {
+          const half v = __float2half_rn(
+              __half2float(p.residual[base + h]) +
+              injection * __half2float(p.block[size_t(row) * p.hidden + h]));
+          p.combined[base + h] = v;
+          cache[h] = v;
+          const float f = __half2float(v);
+          squares = fmaf(f, f, squares);
+        }
       }
       squares = warp_sum(squares);
-      auto* partial = reinterpret_cast<float*>(cache);
       if (!lane) partial[warp] = squares;
       __syncthreads();
       if (!t)
@@ -124,20 +215,37 @@ __global__ void __launch_bounds__(Threads) hc_dataflow(Params p) {
             p.eps);
       __syncthreads();
       const float inverse = partial[0];
-      for (int h = t; h < p.hidden; h += Threads) {
-        const float y = __half2float(p.combined[base + h]) * inverse;
-        p.normalized[base + h] = __float2half_rn(
-            y + y * __half2float(p.norm_weight[branch * p.hidden + h]));
+      if (p.vector_norm) {
+        for (int v = t; v < p.hidden / 8; v += Threads) {
+          HalfPack combined, weight, normalized;
+          combined.vector = reinterpret_cast<uint4*>(cache)[v];
+          weight.vector = __ldg(reinterpret_cast<const uint4*>(
+                                    p.norm_weight + branch * p.hidden) +
+                                v);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const float y = __half2float(combined.elements[e]) * inverse;
+            normalized.elements[e] =
+                __float2half_rn(fmaf(y, __half2float(weight.elements[e]), y));
+          }
+          reinterpret_cast<uint4*>(p.normalized + base)[v] = normalized.vector;
+        }
+      } else {
+        for (int h = t; h < p.hidden; h += Threads) {
+          const float y = __half2float(cache[h]) * inverse;
+          p.normalized[base + h] = __float2half_rn(
+              y + y * __half2float(p.norm_weight[branch * p.hidden + h]));
+        }
       }
       __threadfence();
       __syncthreads();
-      if (!t) release(p.norm_flags + row * p.hc + branch, generation);
+      if (!t) release_gpu(p.norm_flags + row * p.hc + branch, generation);
       mark(p, row, 2);
       mark(p, row, 3);
     } else if (blockIdx.x < p.hc + p.down_ctas) {
       const int tile = blockIdx.x - p.hc;
       for (int b = t; b < p.hc; b += Threads)
-        wait(p.norm_flags + row * p.hc + b, generation);
+        wait_gpu(p.norm_flags + row * p.hc + b, generation);
       __syncthreads();
       mark(p, row, 2);
       float value[DownTile] = {0.f, 0.f};
@@ -264,6 +372,43 @@ void prepare_peers(const std::vector<torch::Tensor>& outputs) {
   }
 }
 
+__global__ void dispatch_probe(Params p) {
+  extern __shared__ unsigned char memory[];
+  if (!threadIdx.x && p.low_rank) memory[0] = 1;
+  __syncthreads();
+  if (!threadIdx.x) p.epochs[blockIdx.x] += p.low_rank ? memory[0] : 1;
+}
+
+void probe(torch::Tensor counter, bool cooperative, int grid, int shared) {
+  c10::cuda::CUDAGuard guard(counter.device());
+  TORCH_CHECK(counter.is_cuda() && counter.scalar_type() == torch::kInt32 &&
+              counter.is_contiguous() && counter.numel() >= grid && grid > 0 &&
+              shared >= 0);
+  Params p{};
+  p.epochs = reinterpret_cast<unsigned*>(counter.data_ptr());
+  p.low_rank = shared;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      dispatch_probe, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      std::max(shared, 32)));
+  if (cooperative) {
+    int blocks, device;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop;
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, dispatch_probe, Threads, shared));
+    TORCH_CHECK(prop.cooperativeLaunch &&
+                grid <= blocks * prop.multiProcessorCount);
+    void* args[] = {&p};
+    C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)dispatch_probe, grid,
+                                               Threads, args, shared, stream));
+  } else {
+    dispatch_probe<<<grid, Threads, shared, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 void run(torch::Tensor residual, torch::Tensor block, torch::Tensor injection,
          torch::Tensor norm_weight, torch::Tensor down_weight,
          torch::Tensor up_weight, torch::Tensor combined,
@@ -329,8 +474,14 @@ void run(torch::Tensor residual, torch::Tensor block, torch::Tensor injection,
   p.norm_weight = (half*)norm_weight.data_ptr();
   p.down_weight = (half*)down_weight.data_ptr();
   p.up_weight = (half*)up_weight.data_ptr();
+  p.vector_down = uintptr_t(p.down_weight) % 16 == 0 && hc * hidden % 8 == 0;
+  p.vector_up = uintptr_t(p.up_weight) % 16 == 0 && low_rank % 8 == 0;
   p.combined = (half*)combined.data_ptr();
   p.normalized = (half*)normalized.data_ptr();
+  p.vector_norm =
+      hidden % 8 == 0 && uintptr_t(p.residual) % 16 == 0 &&
+      uintptr_t(p.block) % 16 == 0 && uintptr_t(p.norm_weight) % 16 == 0 &&
+      uintptr_t(p.combined) % 16 == 0 && uintptr_t(p.normalized) % 16 == 0;
   p.norm_flags = (unsigned*)norm_flags.data_ptr();
   p.epochs = (unsigned*)epochs.data_ptr();
   for (int i = 0; i < tp; ++i) {
@@ -368,6 +519,7 @@ void run(torch::Tensor residual, torch::Tensor block, torch::Tensor injection,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("prepare_peers", &prepare_peers);
+  m.def("probe", &probe);
   m.def("run", &run, pybind11::arg("residual"), pybind11::arg("block"),
         pybind11::arg("injection"), pybind11::arg("norm_weight"),
         pybind11::arg("down_weight"), pybind11::arg("up_weight"),
