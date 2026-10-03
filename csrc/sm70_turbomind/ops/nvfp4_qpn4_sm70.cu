@@ -690,7 +690,7 @@ void nvfp4_qpn2_shared_decode_sm70_out(
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_weight,
     torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
-    int64_t tm_q_ld, bool gated_silu);
+    int64_t tm_q_ld, bool gated_silu, bool activation_pack);
 
 // This distinct operator is the layout capability gate. Old binaries never
 // consume TurboMind codes as QPN2. A zero threshold disables dense prefill.
@@ -699,7 +699,7 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_scales, int64_t tm_group_size,
     int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
-    bool prescaled_scales) {
+    bool prescaled_scales, bool activation_pack) {
   TORCH_CHECK(min_prefill_m == 0 || min_prefill_m > 8,
               "Shared QPN2 prefill threshold must be zero or exceed M=8");
   TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && tm_weight.dim() == 2 &&
@@ -731,19 +731,18 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     }
     return;
   }
-  nvfp4_qpn2_shared_decode_sm70_out(
-      out, input, codes, scales, global_scale, split_k, accumulator_chains,
-      tm_weight, tm_scales, tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+  nvfp4_qpn2_shared_decode_sm70_out(out, input, codes, scales, global_scale,
+                                    split_k, accumulator_chains, tm_weight,
+                                    tm_scales, tm_group_size, tm_k_ld, tm_q_ld,
+                                    gated_silu, activation_pack);
 }
 
-void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor codes, torch::Tensor scales,
-                                  double global_scale, int64_t split_k,
-                                  int64_t accumulator_chains,
-                                  torch::Tensor tm_weight,
-                                  torch::Tensor tm_scales,
-                                  int64_t tm_group_size, int64_t tm_k_ld,
-                                  int64_t tm_q_ld, bool gated_silu);
+void nvfp4_qpn2_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu, bool activation_pack);
 #endif
 
 void nvfp4_qpn2_prefill_dispatch_sm70_out(
@@ -751,7 +750,8 @@ void nvfp4_qpn2_prefill_dispatch_sm70_out(
     torch::Tensor scales, double global_scale, int64_t split_k,
     int64_t accumulator_chains, torch::Tensor tm_weight,
     torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
-    int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m) {
+    int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
+    bool activation_pack) {
   TORCH_CHECK(min_prefill_m > 8,
               "QPN2-packed prefill threshold must exceed M=8");
   if (input.size(0) >= min_prefill_m) {
@@ -767,7 +767,8 @@ void nvfp4_qpn2_prefill_dispatch_sm70_out(
 #ifndef VLLM_QPN4_STANDALONE
   nvfp4_qpn2_dispatch_sm70_out(out, input, codes, scales, global_scale, split_k,
                                accumulator_chains, tm_weight, tm_scales,
-                               tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+                               tm_group_size, tm_k_ld, tm_q_ld, gated_silu,
+                               activation_pack);
 #else
   // Source overlays retain the validated decode extension. Route small M
   // through its existing opaque dispatch without exposing an M-dependent
@@ -776,7 +777,7 @@ void nvfp4_qpn2_prefill_dispatch_sm70_out(
       c10::Dispatcher::singleton().findSchemaOrThrow(
           "_C::nvfp4_qpn2_dispatch_sm70_out", "");
   torch::jit::Stack stack;
-  stack.reserve(13);
+  stack.reserve(14);
   stack.emplace_back(out);
   stack.emplace_back(input);
   stack.emplace_back(codes);
@@ -790,6 +791,7 @@ void nvfp4_qpn2_prefill_dispatch_sm70_out(
   stack.emplace_back(tm_k_ld);
   stack.emplace_back(tm_q_ld);
   stack.emplace_back(gated_silu);
+  stack.emplace_back(activation_pack);
   qpn2_dispatch.callBoxed(&stack);
 #endif
 }
@@ -1181,7 +1183,7 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor codes, Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains, Tensor tm_weight, Tensor tm_scales, "
       "int tm_group_size, int tm_k_ld, int tm_q_ld, bool gated_silu, "
-      "int min_prefill_m) -> ()");
+      "int min_prefill_m, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_prefill_dispatch_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_prefill_dispatch_sm70_out);
   ops.def(
