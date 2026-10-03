@@ -129,3 +129,20 @@ def test_pure_prefill_and_disabled_control_keep_full_budget():
     assert step.num_scheduled_tokens["long"] == 1023
     assert step.num_scheduled_tokens[resident.request_id] == 1
     assert step.mixed_prefill_tokens == 0
+
+
+def test_adaptive_threshold_floor_does_not_override_mixed_latency_budget():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        long_prefill_token_threshold=128,
+        long_prefill_token_threshold_adaptive=True,
+    )
+    resident = _resident(scheduler)
+    scheduler.mixed_prefill_enabled = True
+    incoming = create_requests(num_requests=1, num_tokens=16384)[0]
+    incoming.request_id = "incoming"
+    scheduler.add_request(incoming)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[resident.request_id] > 0
+    assert output.num_scheduled_tokens[incoming.request_id] == 512
+    assert output.mixed_prefill_tokens == 512
