@@ -12,12 +12,12 @@ import json
 import math
 
 import torch
-from vllm.models.qwen4_exp.nvidia.ops.qsa_dcp import qsa_localize_dcp_indices
 
 from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_output_gate,
     qsa_sparse_paged_attention,
 )
+from vllm.models.qwen4_exp.nvidia.ops.qsa_dcp import qsa_localize_dcp_indices
 
 
 def error(actual, reference):
