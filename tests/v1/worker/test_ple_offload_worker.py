@@ -14,6 +14,7 @@ import vllm.envs as envs
 import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config.load import LoadConfig
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -63,19 +64,33 @@ class _TestDefaultModelLoader:
     def __init__(self, checkpoint_names: list[str]) -> None:
         self.checkpoint_names = checkpoint_names
 
-    def get_all_weights(self, model_config, model):
-        """Return a small streamed checkpoint for weight-filtering tests."""
+    def get_all_weights(self, model_config, model, skip_weight=None):
+        """Return a small streamed checkpoint for weight-filtering tests,
+        recording which tensors were handed out (and so touched)."""
         del model_config, model
-        return ((name, torch.ones(2)) for name in self.checkpoint_names)
+        self.touched: list[str] = []
+        for name in self.checkpoint_names:
+            if skip_weight is not None and skip_weight(name):
+                continue
+            self.touched.append(name)
+            yield name, torch.ones(2)
 
 
 def _load_test_ple_weights(
     monkeypatch: pytest.MonkeyPatch,
     checkpoint_names: list[str],
+    load_config: LoadConfig | None = None,
+    used_load_configs: list[LoadConfig] | None = None,
 ) -> tuple[ple_offload_worker.PleOffloadRunner, _WeightLoadingModel]:
     """Run PLE weight discovery with a mapped synthetic checkpoint."""
     model = _WeightLoadingModel()
     loader = _TestDefaultModelLoader(checkpoint_names)
+
+    def get_model_loader(config: LoadConfig) -> _TestDefaultModelLoader:
+        if used_load_configs is not None:
+            used_load_configs.append(config)
+        return loader
+
     monkeypatch.setattr(
         ple_offload_worker,
         "initialize_model",
@@ -89,7 +104,7 @@ def _load_test_ple_weights(
     monkeypatch.setattr(
         ple_offload_worker,
         "get_model_loader",
-        lambda _: loader,
+        get_model_loader,
     )
     monkeypatch.setattr(
         ple_offload_worker,
@@ -102,7 +117,7 @@ def _load_test_ple_weights(
     )
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32),
-        load_config=SimpleNamespace(),
+        load_config=load_config or LoadConfig(),
     )
     runner._layers = {}
     runner._load_weights()
@@ -125,6 +140,44 @@ def test_ple_offload_loads_mapped_checkpoint_names(
         "checkpoint.ple.bias",
     ]
     assert runner.layer_names == ["ple"]
+
+
+def test_ple_offload_does_not_touch_other_checkpoint_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Handing out a tensor reads it (mmap readahead), so the offload process
+    # must skip everything but the PLE tensors before the loader yields them.
+    loaders: list[_TestDefaultModelLoader] = []
+    original = _TestDefaultModelLoader.__init__
+
+    def record(self, names):
+        original(self, names)
+        loaders.append(self)
+
+    monkeypatch.setattr(_TestDefaultModelLoader, "__init__", record)
+    _load_test_ple_weights(
+        monkeypatch,
+        ["checkpoint.ple.weight", "checkpoint.unrelated.weight", "checkpoint.ple.bias"],
+    )
+
+    assert loaders[0].touched == ["checkpoint.ple.weight", "checkpoint.ple.bias"]
+
+
+def test_ple_offload_loads_lazily_under_direct_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The disk tier serves PLE rows from the mapped checkpoint; O_DIRECT
+    # buffers are anonymous memory the offload process must not load into.
+    used: list[LoadConfig] = []
+
+    _load_test_ple_weights(
+        monkeypatch,
+        ["checkpoint.ple.weight", "checkpoint.ple.bias"],
+        LoadConfig(safetensors_load_strategy="direct"),
+        used,
+    )
+
+    assert [config.safetensors_load_strategy for config in used] == ["lazy"]
 
 
 def test_ple_offload_rejects_checkpoint_without_matching_weights(
