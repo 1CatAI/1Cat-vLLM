@@ -261,6 +261,10 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m,
     bool prescaled_scales = false, bool activation_pack = false);
 
+std::string nvfp4_qpn2_activation_pack_reason_sm70(torch::Tensor codes,
+                                                   int64_t k, int64_t n,
+                                                   int64_t split_k);
+
 void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
                               double global_scale, int64_t split_k,

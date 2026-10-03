@@ -386,6 +386,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &nvfp4_qpn2_tm_dispatch_sm70_out);
 
   ops.def(
+      "nvfp4_qpn2_activation_pack_reason_sm70(Tensor codes, int k, int n, "
+      "int split_k) -> str");
+  ops.impl("nvfp4_qpn2_activation_pack_reason_sm70", torch::kCUDA,
+           &nvfp4_qpn2_activation_pack_reason_sm70);
+
+  ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains, bool activation_pack=False) -> ()");

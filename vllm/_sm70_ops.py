@@ -135,6 +135,7 @@ def _op(name: str):
     return getattr(torch.ops._C, name)
 
 
+@torch.compiler.assume_constant_result
 def has_qpn2_activation_pack(name: str) -> bool:
     """Older extensions keep their original route without the new argument."""
     op = getattr(torch.ops._C, name, None)
