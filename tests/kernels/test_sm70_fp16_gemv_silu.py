@@ -115,3 +115,18 @@ def test_gate_up_materializations_and_graph_replay(m, n, k):
         silu = torch.nn.functional.silu(projected[:, :n].double()).half()
         expected = (silu.double() * projected[:, n:].double()).half()
         torch.testing.assert_close(out.cpu(), expected, atol=0.002, rtol=0.002)
+
+
+def test_gate_up_uses_standard_fp32_silu_for_finite_fp16_inputs():
+    # K=1 removes reduction order from this check. The two FP16 arguments
+    # -2.724609375 and -4.921875 expose sigmoid approximation rounding.
+    bits = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    values = bits.view(torch.float16)
+    values = values[torch.isfinite(values)].cuda()
+    weight = torch.cat([values, torch.ones_like(values)]).reshape(-1, 1)
+    x = torch.ones(1, 1, device="cuda", dtype=torch.float16)
+    out = torch.empty(1, values.numel(), device="cuda", dtype=torch.float16)
+    expected = torch.empty_like(out)
+    torch.ops._C.silu_and_mul(expected, weight.reshape(1, -1))
+    Sm70Fp16GateUpKernel.apply_out(x, weight, out)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

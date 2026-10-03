@@ -10,7 +10,7 @@ from functools import lru_cache
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 
 @triton.jit
@@ -202,7 +202,9 @@ def _fp16_gate_up_kernel(
     g = tl.sum(gate, 1).to(tl.float16).to(tl.float32)
     u = tl.sum(up, 1).to(tl.float16).to(tl.float32)
     # Retain the activation's FP16 materialization before multiplication.
-    silu = (g * tl.sigmoid(g)).to(tl.float16).to(tl.float32)
+    # Use the native activation's FP32 exp/div arithmetic rather than a
+    # sigmoid approximation before the FP16 materialization.
+    silu = tl.div_rn(g, 1.0 + tldevice.exp(-g)).to(tl.float16).to(tl.float32)
     tl.store(out + token * N + rows, silu * u, (rows < N) & (token < M))
 
 
