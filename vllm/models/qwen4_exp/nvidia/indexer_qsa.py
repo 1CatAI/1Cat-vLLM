@@ -349,6 +349,7 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
         )
 
 
