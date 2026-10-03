@@ -49,38 +49,40 @@ environment variable is used.
 
 | Type | Experts | M | GEMM us | Vector us | AWQ us |
 | --- | --- | --- | --- | --- | --- |
-| IQ2_XS | 4 | 1 | 23.97 | 11.42 | 15.26 |
-| IQ2_XS | 4 | 2 | 23.03 | 11.72 | 15.39 |
-| IQ2_XS | 4 | 4 | 23.01 | 11.98 | 16.08 |
-| IQ2_XS | 4 | 8 | 23.18 | 17.87 | 18.31 |
-| IQ2_XS | 4 | 16 | 23.54 | 29.70 | 16.28 |
-| IQ2_XS | 4 | 32 | 25.64 | 53.91 | 17.40 |
-| IQ2_XS | 4 | 64 | 27.80 | 101.73 | 21.67 |
-| IQ2_XS | 4 | 128 | 31.92 | 197.48 | 27.96 |
-| IQ3_XXS | 4 | 1 | 23.27 | 10.39 | 15.33 |
-| IQ3_XXS | 4 | 2 | 20.39 | 10.85 | 15.44 |
-| IQ3_XXS | 4 | 4 | 20.39 | 11.16 | 16.18 |
-| IQ3_XXS | 4 | 8 | 20.53 | 16.64 | 18.13 |
-| IQ3_XXS | 4 | 16 | 24.12 | 27.60 | 16.27 |
-| IQ3_XXS | 4 | 32 | 24.84 | 49.66 | 17.42 |
-| IQ3_XXS | 4 | 64 | 37.50 | 93.90 | 21.70 |
-| IQ3_XXS | 4 | 128 | 27.97 | 182.32 | 27.96 |
-| IQ2_XS | 512 | 1 | 45.98 | 18.94 | 19.79 |
-| IQ2_XS | 512 | 2 | 56.68 | 19.00 | 25.51 |
-| IQ2_XS | 512 | 4 | 59.55 | 31.23 | 26.94 |
-| IQ2_XS | 512 | 8 | 65.42 | 27.80 | 28.71 |
-| IQ2_XS | 512 | 16 | 69.42 | 23.40 | 33.27 |
-| IQ2_XS | 512 | 32 | 77.72 | 33.23 | 57.80 |
-| IQ2_XS | 512 | 64 | 87.52 | 46.64 | 63.69 |
-| IQ2_XS | 512 | 128 | 105.11 | 71.01 | 72.31 |
-| IQ3_XXS | 512 | 1 | 55.49 | 18.07 | 19.54 |
-| IQ3_XXS | 512 | 2 | 66.32 | 17.87 | 25.10 |
-| IQ3_XXS | 512 | 4 | 68.34 | 18.18 | 26.07 |
-| IQ3_XXS | 512 | 8 | 74.20 | 18.43 | 28.14 |
-| IQ3_XXS | 512 | 16 | 78.82 | 21.96 | 33.54 |
-| IQ3_XXS | 512 | 32 | 88.20 | 32.10 | 56.61 |
-| IQ3_XXS | 512 | 64 | 101.11 | 49.66 | 63.90 |
-| IQ3_XXS | 512 | 128 | 136.51 | 77.62 | 72.23 |
+| IQ2_XS | 4 | 1 | 23.89 | 10.70 | 15.20 |
+| IQ2_XS | 4 | 2 | 23.00 | 11.02 | 15.30 |
+| IQ2_XS | 4 | 4 | 22.97 | 11.23 | 16.01 |
+| IQ2_XS | 4 | 8 | 23.18 | 17.14 | 18.46 |
+| IQ2_XS | 4 | 16 | 23.47 | 28.99 | 16.19 |
+| IQ2_XS | 4 | 32 | 25.51 | 53.26 | 17.39 |
+| IQ2_XS | 4 | 64 | 27.67 | 101.03 | 21.60 |
+| IQ2_XS | 4 | 128 | 31.93 | 196.76 | 28.00 |
+| IQ3_XXS | 4 | 1 | 21.10 | 9.74 | 15.18 |
+| IQ3_XXS | 4 | 2 | 20.28 | 10.18 | 15.31 |
+| IQ3_XXS | 4 | 4 | 20.33 | 10.40 | 16.01 |
+| IQ3_XXS | 4 | 8 | 20.50 | 15.84 | 18.45 |
+| IQ3_XXS | 4 | 16 | 23.91 | 26.96 | 16.19 |
+| IQ3_XXS | 4 | 32 | 24.71 | 48.90 | 17.36 |
+| IQ3_XXS | 4 | 64 | 37.41 | 93.29 | 21.50 |
+| IQ3_XXS | 4 | 128 | 27.90 | 181.69 | 27.99 |
+| IQ2_XS | 512 | 1 | 45.79 | 18.40 | 19.54 |
+| IQ2_XS | 512 | 2 | 56.32 | 18.28 | 28.69 |
+| IQ2_XS | 512 | 4 | 59.62 | 18.37 | 26.48 |
+| IQ2_XS | 512 | 8 | 64.93 | 18.71 | 28.66 |
+| IQ2_XS | 512 | 16 | 69.10 | 21.49 | 33.43 |
+| IQ2_XS | 512 | 32 | 77.61 | 30.61 | 57.33 |
+| IQ2_XS | 512 | 64 | 87.17 | 46.33 | 63.82 |
+| IQ2_XS | 512 | 128 | 105.28 | 70.54 | 72.34 |
+| IQ2_XS | 512 | 512 | 276.61 | 240.73 | 185.42 |
+| IQ3_XXS | 512 | 1 | 55.91 | 17.38 | 19.51 |
+| IQ3_XXS | 512 | 2 | 66.09 | 17.30 | 25.10 |
+| IQ3_XXS | 512 | 4 | 68.39 | 17.59 | 26.41 |
+| IQ3_XXS | 512 | 8 | 74.23 | 18.04 | 28.63 |
+| IQ3_XXS | 512 | 16 | 78.05 | 21.15 | 33.08 |
+| IQ3_XXS | 512 | 32 | 87.25 | 31.56 | 56.85 |
+| IQ3_XXS | 512 | 64 | 101.36 | 49.17 | 64.04 |
+| IQ3_XXS | 512 | 128 | 135.19 | 77.06 | 72.27 |
+| IQ3_XXS | 512 | 512 | 311.31 | 264.42 | 186.23 |
 
 Four experts have a clear crossover: vector decode wins through M=8 but
 repeats weight work as each expert receives more rows. With 512 experts,
@@ -101,19 +103,30 @@ Wheel SHA256:
 Core SHA256:
 `913608cd66cf22ea9f670b046d3f582dab5317cf907dae5c28c52ac579f6f5bc`.
 
-All timings below use actual IQ3_XXS TP4 N=160/K=2560 expert matrices and
-CUDA graph replay; times are microseconds. These points use 100 ms warmup and
-20 iterations, with eight device invocations per graph replay.
+The corrected sweep uses actual TP4 N=160/K=2560 expert matrices, 100 ms
+warmup, 100 iterations and eight device invocations per CUDA graph replay for
+every small-output route. All earlier small-row measurements were rechecked
+under this common capture contract; the table above reports the corrected
+sweep. The measured default intervals are unchanged. Times are microseconds.
 
-| Experts | M | Selected | Selected us | Direct vector us | Grouped GEMM us | AWQ us |
-| --- | --- | --- | --- | --- | --- | --- |
-| 4 | 16 | GEMM | 24.63 | 27.75 | 24.00 | 16.22 |
-| 512 | 128 | Vector | 78.23 | 78.18 | 135.91 | 72.37 |
-| 512 | 512 | Vector | 264.24 | 264.50 | 307.40 | 184.63 |
+| Type | Experts | M | Selected | Selected us | Direct vector us | GEMM us | AWQ us |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| IQ3_XXS | 4 | 8 | Vector | 15.85 | 15.84 | 20.50 | 18.45 |
+| IQ3_XXS | 4 | 16 | GEMM | 23.98 | 26.96 | 23.91 | 16.19 |
+| IQ2_XS | 512 | 128 | Vector | 70.50 | 70.54 | 105.28 | 72.34 |
+| IQ3_XXS | 512 | 128 | Vector | 76.97 | 77.06 | 135.19 | 72.27 |
+| IQ2_XS | 512 | 512 | Vector | 240.42 | 240.73 | 276.61 | 185.42 |
+| IQ3_XXS | 512 | 512 | Vector | 264.50 | 264.42 | 311.31 | 186.23 |
 
-The E4/M=8 selected route measured 311.35 us once, while the identical direct
-vector call measured 16.54 us. This inconsistent point is excluded from route
-calibration and awaits a targeted replay check. E512 selected and direct calls
-agree, but M=512 remains about 43% slower than AWQ. Output relative L2 is
-0.00040–0.00041. These projection results exclude routing and the full FFN;
-model throughput and quality remain unmeasured.
+The first E4/M=8 selected measurement was 311.35 us versus 16.54 us for the
+identical direct call. Both out-operator callables returned `None`, causing
+single-invocation capture while the GEMM wrapper exposed its output and
+captured eight invocations. Returning the output buffer consistently removes
+this measurement mismatch. The corrected selected/direct values agree; the
+initial inconsistent point is excluded from calibration.
+
+At E512/M=512, IQ2_XS remains about 30% slower than AWQ and IQ3_XXS about
+42% slower. Output relative L2 remains 0.00039–0.00041. These projection
+results exclude routing and the full FFN; model throughput and quality remain
+unmeasured. No activation quantization or lower-precision accumulation was
+introduced.
