@@ -83,6 +83,13 @@ def main():
     dense = torch.from_numpy(reference).half().cuda()
     e, n, k = dense.shape
     projection = canonical[0]
+    # The MoE wrappers chunk large workloads using their own limits. Probe
+    # type/shape availability at a supported dense batch, not at the total
+    # routed row count, which has a different dense MMQ/MMVQ limit.
+    probe = torch.empty((8, k), dtype=torch.float16, device="cuda")
+    caps = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
+        packed[0], probe, weight_type, n
+    )
     output = {
         "checkpoint": Path(args.gguf).name,
         "tensor": tensor.name,
@@ -138,9 +145,6 @@ def main():
         error = (out.float() - expected).norm() / expected.norm()
         if not torch.isfinite(out).all() or error.item() > 0.003:
             raise AssertionError(f"M={m}: grouped affine error {error.item()}")
-        caps = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
-            packed[0], x, weight_type, n
-        )
         routes = {
             "turbomind_gguf_grouped": (tm, True),
             "cached_fp16_per_expert_lower_bound": (cached_dense, True),
@@ -182,6 +186,15 @@ def main():
             "routes": {},
         }
         for name, (call, graph_safe) in routes.items():
+            try:
+                call()
+            except RuntimeError as error:
+                if name.startswith("llama_moe_") and "does not support" in str(error):
+                    row["routes"][name] = {
+                        "unavailable_reason": str(error).rsplit(", ", 1)[-1]
+                    }
+                    continue
+                raise
             times = {"eager_us": elapsed(call, args.iterations)}
             if args.cuda_graph and graph_safe:
                 times["graph_us"] = elapsed(call, args.iterations, capture=True)
