@@ -23,7 +23,7 @@ async def measure(args, prompts):
     ]
     ready = [asyncio.Event() for _ in range(4)]
     residents_ready = [asyncio.Event() for _ in range(2)]
-    salt = f"mixed-prefill-{time.time_ns()}"
+    salt = args.cache_salt or f"mixed-prefill-{time.time_ns()}"
 
     async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
 
@@ -101,8 +101,14 @@ async def measure(args, prompts):
         for timestamp, count in record["events"]
         if injected <= timestamp <= phase_end
     )
-    gaps = [
+    overlapping_gaps = [
         right[0] - left[0]
+        for record in records[:2]
+        for left, right in zip(record["events"], record["events"][1:])
+        if left[0] < phase_end and right[0] > injected
+    ]
+    gaps = [
+        min(right[0], phase_end) - max(left[0], injected)
         for record in records[:2]
         for left, right in zip(record["events"], record["events"][1:])
         if left[0] < phase_end and right[0] > injected
@@ -122,6 +128,7 @@ async def measure(args, prompts):
         "resident_tokens_during_prefill": phase_tokens,
         "resident_tps_during_prefill": phase_tokens / (phase_end - injected),
         "longest_resident_gap_s": max(gaps),
+        "longest_full_gap_overlapping_prefill_s": max(overlapping_gaps),
         "incoming_ttft_s": [r["events"][0][0] - r["start_s"] for r in records[2:]],
         "records": records,
     }
@@ -136,6 +143,7 @@ def main():
     parser.add_argument("--input-tokens", type=int, default=32768)
     parser.add_argument("--resident-output", type=int, default=32768)
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--cache-salt", default=None)
     args = parser.parse_args()
     raw = args.prompts.read_bytes()
     prompts = json.loads(raw)["prompts"][:4]
