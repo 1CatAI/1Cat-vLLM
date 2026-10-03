@@ -181,7 +181,7 @@ class Qwen35Adapter:
                 # FP16 before the destination parameter copies it back to FP32.
                 target_dtype = torch.float32 if name.endswith(".A_log") else dtype
                 converted = weight.to(target_dtype)
-                if torch.isfinite(weight).all() and not torch.isfinite(converted).all():
+                if torch.any(torch.isfinite(weight) & ~torch.isfinite(converted)):
                     raise ValueError(
                         f"GGUF {raw}: values overflow {dtype}; use --dtype float32"
                     )

@@ -197,3 +197,17 @@ def test_text_model_supplies_three_identical_mrope_position_axes():
     assert positions.shape == (3, 4)
     assert positions.device.type == "cpu" and delta == 0
     assert torch.equal(positions, torch.arange(4).expand(3, -1))
+
+
+def test_bf16_overflow_is_detected_even_with_an_existing_nan():
+    import gguf
+
+    source = torch.tensor([1e10, float("nan")], dtype=torch.bfloat16)
+    tensor = SimpleNamespace(
+        tensor_type=gguf.GGMLQuantizationType.BF16,
+        data=source.view(torch.uint16).numpy(),
+    )
+    adapter = Qwen35Adapter(config())
+    name = "model.layers.0.input_layernorm.weight"
+    with pytest.raises(ValueError, match="overflow"):
+        list(adapter.weights({"norm": tensor}, {"norm": name}, torch.float16))
