@@ -7,11 +7,11 @@
 __device__ float const* g_79t_tail_row_max = nullptr;
 __device__ int* g_79t_prefix_outliers = nullptr;
 __device__ int* g_79t_score_recovery = nullptr;
-// FP32 accumulation alone does not protect an FP16 score workspace. Outside
-// the finite range, recompute the affected 64-token query tile from original
+// FP32 accumulation alone does not protect an FP16 score workspace. Beyond
+// this range, recompute the affected 64-token query tile from the original
 // Q/K with FP32 logits, avoiding both storage overflow and coarse rounding.
 // Reuse centered/scaled V and restore only after FP32 normalization.
-constexpr float kStableCompactScoreLimit = 65504.0f;
+constexpr float kStableCompactScoreLimit = 128.0f;
 constexpr int kStableRecoveryRows = 64 * 6;
 // Keep the established normal-range shift and V scaling. Recovery corrects
 // unsafe tiles without changing these rounding choices for unaffected tiles.
@@ -187,9 +187,10 @@ __global__ void stable_finish_max(float const* partials, float* maxima,
     float sampled = -CUDART_INF_F;
     for (int tile = 0; tile < tiles; ++tile)
       sampled = fmaxf(sampled, partials[int64_t(tiles + tile) * rows + row]);
-    // Keep the established finite-score shift. This extraction repairs only
-    // nonfinite FP16 storage; finite-score precision changes stay separate.
-    if (isfinite(sampled)) shift_value = sampled;
+    // Preserve the existing shift when the sampled maximum and its margin
+    // already bound every tail score. Correct only a genuinely missed peak.
+    if (isfinite(sampled) && value <= sampled + kStableScoreMargin)
+      shift_value = sampled;
   }
   maxima[row] = shift_value + kStableScoreMargin;
   // A prefix sample can miss a peak by at most kStableMaxExpInput without
