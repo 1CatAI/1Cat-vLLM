@@ -48,6 +48,7 @@ def test_admission_requires_precision_policy_and_unpacked_weights():
             {"has_g_idx": True},
             {"group_size": 32},
             {"act_type": torch.float32},
+            {"out_type": torch.float32},
             {"partition_weight_shape": (0, 17)},
         ):
             assert not impl.Sm70Fp16LinearKernel.can_implement(

@@ -137,7 +137,11 @@ class Sm70Fp16LinearKernel(MPLinearKernel):
             return False, "requires unpacked FP16 configuration"
         if not current_platform.is_device_capability(70):
             return False, "requires SM70"
-        if c.weight_type != scalar_types.float16 or c.act_type != torch.float16:
+        if (
+            c.weight_type != scalar_types.float16
+            or c.act_type != torch.float16
+            or c.out_type not in (None, torch.float16)
+        ):
             return False, "requires FP16 weights and input"
         if c.zero_points or c.has_g_idx or c.group_size != -1:
             return False, "does not consume quantization metadata"
