@@ -105,3 +105,11 @@ is empty; dependencies are standard CUDA, Torch and system libraries.
 
 - Wheel SHA256: `0b22a8be69e69fff96921a3390cd7c969a454783f7fce3c499910ebd766fab2f`
 - Core SHA256: `207fc91f918992324a4f4030d8fc7067cec4bba11a0e3d3fcce20319ae3f8203`
+
+The final integration includes LUT4 operators from main. A regenerated
+normal wheel from `b2ebfe9ede2eaf9a13a9bf67721ad9bdf10127c5` passes 21 installed GPU checks covering
+affine prefill and LUT4. Source, wheel and installed core hashes match;
+RPATH/RUNPATH remain empty. The affine prefill arithmetic is unchanged.
+
+- Final wheel SHA256: `53faa03f7df0221466fc77008d59e83ec69582f69f9811125b947b68f32c09ad`
+- Final core SHA256: `b6a3385459729f78f11acc06b1b4290d9dcc128ade182450c5a15a904324b692`
