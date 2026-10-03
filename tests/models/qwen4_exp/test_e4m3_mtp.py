@@ -226,3 +226,25 @@ def test_remap_mtp_scale_names_to_draft_module_paths():
     )
     # Target scales never start with "mtp." and are not rerouted by the drafter.
     assert _remap_mtp_weight_name("model.layers.5.self_attn.k_scale") is None
+
+
+def test_automatic_e4m3_refuses_unit_scale_fallback(monkeypatch):
+    monkeypatch.setattr(model_mod, "is_offload_process", lambda: False)
+    monkeypatch.setenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0")
+    stub = _make_qsa_stub(0.1, 0.2)
+    container = _FakeModel(stub)
+    with pytest.raises(ValueError, match="Automatically selected QSA E4M3"):
+        _finalize_qsa_e4m3_scale_load(
+            container,
+            {"layers.0.self_attn.k_scale"},
+            E4M3,
+            require_calibrated_target=True,
+        )
+    assert stub._qsa_kv_scales_finalized is False
+    _finalize_qsa_e4m3_scale_load(
+        container,
+        {"layers.0.self_attn.k_scale", "layers.0.self_attn.v_scale"},
+        E4M3,
+        require_calibrated_target=True,
+    )
+    assert stub._qsa_kv_scales_finalized is True

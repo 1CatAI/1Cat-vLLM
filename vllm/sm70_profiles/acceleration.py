@@ -391,6 +391,11 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": cfg.kernel_config.ple_disk_cascade_reason,
         "scope": "configuration_capability",
     }
+    report["qsa_auto_e4m3"] = {
+        "enabled": cfg.kernel_config.qsa_auto_e4m3_active,
+        "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
+        "scope": "calibrated_cache_storage",
+    }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
         "scope": "indexed_sparse_attention",
