@@ -81,5 +81,45 @@ actual checkpoint timing remains the evidence for performance.
 At M=8192, IQ2_XS improves from 322.27 to 207.61 us, versus AWQ 228.37 us.
 IQ3_XXS improves from 342.03 to 301.95 us, versus AWQ 228.29 us, leaving a
 material gap. Router/sorting/full FFN work is excluded. The cold-graph check passes: capture before tuning, eager measurement and
-replay of the earlier graph all match the FP32 oracle. The final candidate
-set, larger expert counts and installed-wheel validation remain pending. These operator results do not establish model throughput.
+replay of the earlier graph all match the FP32 oracle. The ordinary installed wheel passes 96 GPU checks with one non-SM70 skip,
+including the final candidate set and cold-graph behavior. Complete dependency
+checking passes; source-built, packaged and installed core hashes match, with
+no RPATH/RUNPATH. These operator results do not establish model throughput.
+
+## Installed wheel and 512-expert measurements
+
+The installed environment uses Python 3.12.3, Torch 2.10.0+cu128,
+Transformers 5.18.0, GGUF 0.19.0, XGrammar 0.2.0 and Tilelang 0.1.10.
+Wheel SHA256:
+`cf7e4c6a9bdc77f8de7f9ccadf764269b74d1302b2609c8e0c420ec5c91e67ca`.
+Core SHA256:
+`20ac310a9a80ac4075719cfd1c75a9e70f9649eb714ff21b7be12e584fc2a2cf`.
+
+All rows retain TP4 N=160/K=2560. M counts sorted expert rows, with one
+assignment per row. Router/top-k expansion and the complete FFN are excluded.
+The 512-expert sweep uses all distinct checkpoint expert matrices. At M=128,
+384 experts are empty; at M=512 each expert receives one row; at M=8192 each
+receives sixteen rows. These are operator distributions rather than model
+request-concurrency measurements.
+
+| Type | Experts | M | GGUF us | AWQ us | MMVQ us | MMQ us | Output relative L2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| IQ2_XS | 4 | 512 | 40.79 | 28.06 | 763.48 | 230.44 | 0.000389 |
+| IQ2_XS | 4 | 8192 | 208.01 | 228.46 | 12104.10 | 2225.70 | 0.000390 |
+| IQ2_XS | 512 | 128 | 113.79 | 72.77 | 201.82 | 827.92 | 0.000393 |
+| IQ2_XS | 512 | 512 | 274.84 | 186.48 | 801.48 | 2726.57 | 0.000389 |
+| IQ2_XS | 512 | 8192 | 448.17 | 351.68 | 12217.66 | 7742.73 | 0.000389 |
+| IQ3_XXS | 4 | 512 | 36.64 | 28.08 | 745.45 | 223.69 | 0.000407 |
+| IQ3_XXS | 4 | 8192 | 300.32 | 228.64 | 11645.76 | 2192.37 | 0.000407 |
+| IQ3_XXS | 512 | 128 | 152.01 | 72.45 | 197.82 | 763.89 | 0.000404 |
+| IQ3_XXS | 512 | 512 | 307.14 | 186.23 | 783.05 | 2509.22 | 0.000407 |
+| IQ3_XXS | 512 | 8192 | 562.61 | 351.40 | 12008.97 | 7532.20 | 0.000407 |
+
+The E4 M=8192 improvement reproduces after installation: IQ2_XS 208.01 us
+versus AWQ 228.46 us, and IQ3_XXS 300.32 us versus AWQ 228.64 us.
+Larger expert counts expose another gap. At E512/M=8192, IQ2_XS costs
+448.17 us versus AWQ 351.68 us, and IQ3_XXS costs 562.61 us versus
+351.40 us. E512/M=128 is 113.79/152.01 us versus AWQ about 72.6 us.
+These distributions require grouped decode/batch work before connecting
+Flash-Next; the E4 prefill improvement does not establish parity for all MoE
+workloads. No lower-precision activation or accumulator mode was introduced.
