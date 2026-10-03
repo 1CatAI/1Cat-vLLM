@@ -92,6 +92,7 @@ class Qwen4ExpAdapter(Qwen35Adapter):
             Qwen35Adapter.is_linear(name)
             and "hyper_connection" not in name
             and not name.endswith("ngram_embedding.weight")
+            and name != "lm_head.weight"
             and not name.endswith(
                 (".mlp.gate.weight", ".mlp.shared_expert_gate.weight")
             )

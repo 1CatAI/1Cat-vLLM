@@ -103,6 +103,7 @@ def test_hc_and_ple_mapping_and_inverse_norm_convolution():
     assert not adapter.is_linear(mapping["blk.0.hc_attn_inject.weight"])
     assert not adapter.is_linear("model.layers.0.mlp.gate.weight")
     assert not adapter.is_linear("model.layers.0.mlp.shared_expert_gate.weight")
+    assert not adapter.is_linear("lm_head.weight")
     assert adapter.restore(
         "model.layers.0.mlp.shared_expert_gate.weight", torch.ones(4)
     ).shape == (1, 4)
