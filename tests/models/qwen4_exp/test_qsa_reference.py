@@ -17,6 +17,12 @@ from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
+
+class _BuilderCommonMetadata(SimpleNamespace):
+    def replace(self, **kwargs):
+        return type(self)(**(vars(self) | kwargs))
+
+
 requires_qsa_kernels = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
     reason="QSA kernels require CUDA and Triton",
@@ -230,6 +236,7 @@ def _qsa_sparse_paged_attention_reference(
 def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.block_table_buffer = torch.empty((0, 0), dtype=torch.int32, device=device)
     builder.compress_ratio = 1
     builder.is_circular_buffer = False
     builder.storage_block_size = 64
@@ -239,7 +246,7 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     builder.k_work_metadata_buffer = torch.empty(0, 2, dtype=torch.int32, device=device)
     query_start_loc = torch.tensor([0, 4, 8, 12, 12], dtype=torch.int32, device=device)
     token_to_req = torch.tensor([0] * 4 + [1] * 4 + [2] * 4 + [0] * 4, device=device)
-    common = SimpleNamespace(
+    common = _BuilderCommonMetadata(
         num_actual_tokens=16,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
@@ -276,6 +283,7 @@ def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
 def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
     device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.block_table_buffer = torch.empty((0, 0), dtype=torch.int32, device=device)
     builder.compress_ratio = 4
     builder.is_circular_buffer = True
     builder.kv_cache_spec = SimpleNamespace(block_size=4)
@@ -287,7 +295,7 @@ def test_qsa_circular_buffer_metadata_keeps_only_each_requests_suffix() -> None:
     query_start_loc = torch.tensor([0, 7, 13, 13], dtype=torch.int32, device=device)
     token_to_req = torch.tensor([0] * 7 + [1] * 6 + [0] * 3, device=device)
     block_table = torch.tensor([[1], [0], [2]], dtype=torch.int32, device=device)
-    common = SimpleNamespace(
+    common = _BuilderCommonMetadata(
         num_actual_tokens=16,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
@@ -384,6 +392,7 @@ def test_qsa_ring_capacity_must_divide_the_attention_block_size() -> None:
 def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     device = torch.device("cuda")
     builder = QSAMetadataBuilder.__new__(QSAMetadataBuilder)
+    builder.block_table_buffer = torch.empty((0, 0), dtype=torch.int32, device=device)
     builder.compress_ratio = 4
     builder.is_circular_buffer = False
     builder.storage_block_size = 16
@@ -397,7 +406,7 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     token_to_req = torch.tensor(
         [0, 0, 0, 2, 2, 2, 2, 2], dtype=torch.int32, device=device
     )
-    common = SimpleNamespace(
+    common = _BuilderCommonMetadata(
         num_actual_tokens=8,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
