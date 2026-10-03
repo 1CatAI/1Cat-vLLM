@@ -261,6 +261,12 @@ class Sm70Fp8Config:
     """Use TurboMind; auto retains the shared legacy backend preference."""
     block_qpn8: bool = True
     """Use native weight-only block QPN8 when its kernel capabilities match."""
+    block_qpn8_volta_turbomind_prefill: bool | None = None
+    """Keep a second, TurboMind-packed copy of each block QPN8 weight on Volta
+    for rows beyond M=8. False holds one packed layout and serves those rows
+    through the dense FP16 prefill that Turing uses. Auto keeps the copy only
+    when decode can exceed 8 rows (max_num_seqs * (speculative tokens + 1)):
+    below that it serves just prefill, where the dense path keeps pace."""
     dequant_fallback: bool | None = None
     """Keep the legacy dense dequantization route available when requested."""
     qpn8: bool | None = None

@@ -9,8 +9,11 @@ policy; no model identity or parallel layout limits this admission.
 
 M=0 returns an empty output. M=1..8 uses packed GEMM. Volta retains its
 TurboMind layout for larger M, avoiding a full dense reconstruction on short
-prefills. Turing uses invocation-private dense scratch for its existing FP16
-prefill operator. Native arithmetic is unchanged.
+prefills, when decode can exceed M=8 or
+kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill asks for it.
+Turing, and Volta without that second layout, use invocation-private
+dense scratch for the existing FP16 prefill operator. Native arithmetic is
+unchanged.
 """
 
 from collections.abc import Sequence
@@ -170,6 +173,17 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         ScaledMMLinearKernel.__init__(self, config, layer_param_names)
         self.policy = self._policy(config)
 
+    def _keep_volta_turbomind_copy(self) -> bool:
+        explicit = self.policy.block_qpn8_volta_turbomind_prefill
+        if explicit is not None:
+            return explicit
+        engine = get_current_vllm_config_or_none()
+        if engine is None:
+            return True
+        spec = engine.speculative_config
+        verify_rows = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+        return engine.scheduler_config.max_num_seqs * verify_rows > _QPN8_MAX_M
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         weight = layer.weight.data
         n, k = weight.shape
@@ -195,7 +209,11 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             "_sm70_block_fp8_qpn8_packed_scales", group_scales, persistent=False
         )
         capability = current_platform.get_device_capability()
-        if capability is not None and capability.to_int() in (70, 72):
+        if (
+            capability is not None
+            and capability.to_int() in (70, 72)
+            and self._keep_volta_turbomind_copy()
+        ):
             packed, scales, metadata = sm70_ops.fp8_sm70_prepare(
                 weight, block_scales, 128, False
             )
@@ -207,11 +225,18 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             )
             layer._qpn8_fallback_k_ld = int(metadata[0].item())
             layer._qpn8_fallback_q_ld = int(metadata[1].item())
-        logger.info_once(
-            "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses %s "
-            "because the native block-scale GEMM does not support those rows.",
-            "TurboMind" if hasattr(layer, "_qpn8_fallback_k_ld") else "FP16 prefill",
-        )
+        if hasattr(layer, "_qpn8_fallback_k_ld"):
+            logger.info_once(
+                "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses a "
+                "second, TurboMind-packed copy of each weight. Set "
+                "kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill=false "
+                "to hold one layout and use the FP16 prefill instead."
+            )
+        else:
+            logger.info_once(
+                "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses the "
+                "FP16 prefill, which needs no second copy of the weights."
+            )
         layer._qpn8_out_features = n
         layer._qpn8_cfg = _sm70_fp8_qpn8_config(k_dim, n_dim, False)
         layer.sm70_fp8_turbomind = True
