@@ -15,7 +15,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from benchmark_gguf_turbomind import M_VALUES, elapsed, prepare_awq_comparator
+from benchmark_gguf_turbomind import (
+    M_VALUES,
+    canonical_grouped_call,
+    elapsed,
+    prepare_awq_comparator,
+    prepare_projection,
+    transcode_projection,
+)
 
 from vllm import _custom_ops  # noqa: F401
 from vllm.model_executor.layers.quantization.gguf_native import (
@@ -24,7 +31,6 @@ from vllm.model_executor.layers.quantization.gguf_native import (
 )
 from vllm.model_executor.layers.quantization.gguf_transcode import (
     reconstruction_error,
-    transcode_affine,
 )
 from vllm.transformers_utils.gguf_tensor_reader import (
     GGUFReader,
@@ -61,19 +67,10 @@ def main():
         raise ValueError("Expected a stacked expert tensor and valid expert count")
     source = np.array(tensor.data[: args.experts], copy=True)
     weight_type = int(tensor.tensor_type)
-    canonical = [transcode_affine(expert, weight_type) for expert in source]
+    canonical = [transcode_projection(expert, weight_type) for expert in source]
     reference = dequantize(source, weight_type)
     rounding = [reconstruction_error(p, reference[e]) for e, p in enumerate(canonical)]
-    prepared = [
-        torch.ops._C.gguf_affine_sm70_prepare(
-            torch.from_numpy(p.codes).cuda(),
-            torch.from_numpy(p.scales).cuda(),
-            torch.from_numpy(p.mins).cuda(),
-            p.bits,
-            p.group_size,
-        )
-        for p in canonical
-    ]
+    prepared = [prepare_projection(p) for p in canonical]
     tm_weights, tm_stats, (wp, sp) = stack_prepared(prepared)
     awq_prepared = [prepare_awq_comparator(p) for p in canonical]
     awq = None
@@ -106,6 +103,7 @@ def main():
         "iterations": args.iterations,
         "warmup_ms_per_route": 100,
         "graph": args.cuda_graph,
+        "graph_inner_invocations": "8 for outputs <= 10000000 elements; otherwise 1",
         "results": [],
     }
     for m in args.m:
@@ -120,10 +118,10 @@ def main():
         x = (torch.randn((m, k), device="cuda") * 0.125).half()
         out = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
-        def tm(out=out, x=x, offsets=offsets):
-            torch.ops._C.gguf_affine_grouped_gemm_sm70_out(
-                out, x, offsets, wp, sp, projection.bits, e, projection.group_size
-            )
+        call = canonical_grouped_call(projection, out, x, offsets, wp, sp, e)
+
+        def tm(out=out, call=call):
+            call()
             return out
 
         def awq_call(out=out, x=x, offsets=offsets):

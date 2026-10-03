@@ -71,6 +71,30 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 
 void Registry::sm70_884_4() {
   {
+    auto add_lut = [this]<class C, class G, int GroupSize>() {
+      Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true,
+                                    1, GroupSize, 128, 128>>();
+      Add<typename G::template Type<128, 128, 16, 2, 2, 1, D, D, 2, true,
+                                    1, GroupSize, 64, 128>>();
+      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+    };
+    add_lut.template operator()<Config_GgufLut4_IQ<kColMajor>,
+                                Config_GgufLut4_IQ<kColMajor, 0>, 32>();
+    add_lut.template operator()<Config_GgufLut4_E2M1<kColMajor>,
+                                Config_GgufLut4_E2M1<kColMajor, 0>, 16>();
+    add_lut.template operator()<Config_GgufLut4_E2M1<kColMajor>,
+                                Config_GgufLut4_E2M1<kColMajor, 0>, 32>();
+  }
+  {
     auto add_planes = [this]<class C, class G, int GroupSize>() {
       // Metadata holds the high plane for one full group. CTA K must be a
       // multiple of that group so the register code position restarts at 0.

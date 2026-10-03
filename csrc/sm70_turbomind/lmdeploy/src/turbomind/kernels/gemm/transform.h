@@ -240,6 +240,62 @@ struct Transform_HMMA_SM70_BitPlane {
   }
 };
 
+// Nonlinear nibbles use the native U4 packing. Lookup and scale restore
+// FP16 weights in registers before the shared mma884 loop.
+template <int Table>
+struct Transform_HMMA_SM70_Lut4 {
+  static constexpr auto kQuantType =
+      Table == 0 ? QuantType::kLut4IQ : QuantType::kLut4E2M1;
+
+  __device__ static uint32_t iq_values(uint32_t nibbles) {
+    // Four official IQ4_NL values + 128. Two lookups cover eight values
+    // each; a third byte permutation selects their high index bits.
+    const uint32_t selector = nibbles & 0x7777U;
+    const uint32_t lo = __byte_perm(0x3F2D1801U, 0x766A5D4FU, selector);
+    const uint32_t hi = __byte_perm(0xA6998D81U, 0xF1D9C5B5U, selector);
+    return __byte_perm(lo, hi, ((nibbles & 0x8888U) >> 1) | 0x3210U);
+  }
+
+  template <class F, int Nf, int Mf, int K, class D, int Nd, int Md, class S,
+            int Ns, int Ms, int Ks>
+  __device__ static void apply(Array<F, Nf> (&frag)[K][Mf], int k,
+                               Array<D, Nd> (&data)[K][Md],
+                               Array<S, Ns> (&stat)[Ks][Ms], int div) {
+    static_assert(std::is_same_v<D, uint4_t> && std::is_same_v<F, half>);
+    static_assert(std::is_same_v<S, uint16_t> && Nd == 8 && Nf * Mf == Nd * Md);
+    auto& dst = reinterpret_cast<Array<F, Nd> (&)[Md]>(frag[k]);
+    auto& scales = reinterpret_cast<Array<S, 1> (&)[Ns * Ms]>(stat[k / div]);
+    PRAGMA_UNROLL
+    for (int m = 0; m < Md; ++m) {
+      Array<F, Nd> decoded;
+      if constexpr (Table == 0) {
+        const uint32_t packed = (const uint32_t&)data[k][m];
+        constexpr uint32_t magic = 0x64006400U;
+        constexpr uint32_t bias = 0x64806480U;  // 1152 == 1024 + 128
+        const uint32_t even = iq_values(packed);
+        const uint32_t odd = iq_values(packed >> 16);
+        PRAGMA_UNROLL
+        for (int i = 0; i < Nd; i += 2) {
+          const uint32_t selector = (i / 2) | ((i / 2 + 4) << 8);
+          const uint32_t halves = magic |
+              (__byte_perm(even, odd, selector) & 0x00FF00FFU);
+          (half2&)decoded[i] = __hsub2((const half2&)halves, (const half2&)bias);
+        }
+      } else {
+        decoded = ConvertKvCache<fp4_e2m1_t, F>::convert(
+            (const Array<fp4_e2m1_t, Nd>&)data[k][m]);
+      }
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 2) {
+        uint32_t scale = scales[(m * Nd + i) / Nf][0];
+        scale |= scale << 16;
+        (half2&)decoded[i] = __hmul2((const half2&)decoded[i], (const half2&)scale);
+      }
+      dst[m] = decoded;
+    }
+  }
+};
+
 // Q3's exact centered form omits a redundant min and the unused 16 high bits.
 // Preparation requires min == -4 * scale; otherwise the caller must fall back.
 struct Transform_HMMA_SM70_CenteredBitPlane3 {

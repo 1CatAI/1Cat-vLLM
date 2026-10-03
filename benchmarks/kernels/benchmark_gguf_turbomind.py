@@ -16,6 +16,11 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops  # noqa: F401
+from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
+    LUT4_TYPES,
+    Lut4GGUFProjection,
+    transcode_lut4,
+)
 from vllm.model_executor.layers.quantization.gguf_native import (
     native_available,
     pad_weight_tail,
@@ -34,8 +39,30 @@ from vllm.transformers_utils.gguf_tensor_reader import (
 M_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 512, 2048, 8192)
 
 
+def transcode_projection(data, weight_type):
+    if weight_type in LUT4_TYPES:
+        return transcode_lut4(data, weight_type)
+    return transcode_affine(data, weight_type)
+
+
+def prepare_projection(projection):
+    codes = torch.from_numpy(projection.codes).cuda()
+    scales = torch.from_numpy(projection.scales).cuda()
+    if isinstance(projection, Lut4GGUFProjection):
+        return torch.ops._C.gguf_lut4_sm70_prepare(
+            codes, scales, projection.lut_id, projection.group_size
+        )
+    return torch.ops._C.gguf_affine_sm70_prepare(
+        codes,
+        scales,
+        torch.from_numpy(projection.mins).cuda(),
+        projection.bits,
+        projection.group_size,
+    )
+
+
 def partition_source(source, weight_type, size, rank, axis):
-    canonical = transcode_affine(source, weight_type)
+    canonical = transcode_projection(source, weight_type)
     reference = dequantize(source, weight_type)
     if size == 1:
         if rank != 0:
@@ -60,6 +87,30 @@ def partition_source(source, weight_type, size, rank, axis):
         :, rank * span // block * byte_size : (rank + 1) * span // block * byte_size
     ]
     return canonical, reference, np.ascontiguousarray(raw), None
+
+
+def canonical_dense_call(projection, out, x, weight, stats, k_ld, q_ld):
+    is_lut = isinstance(projection, Lut4GGUFProjection)
+    op = (
+        torch.ops._C.gguf_lut4_gemm_sm70_out
+        if is_lut
+        else torch.ops._C.gguf_affine_gemm_sm70_out
+    )
+    decoder = projection.lut_id if is_lut else projection.bits
+    return partial(
+        op, out, x, weight, stats, decoder, k_ld, q_ld, projection.group_size
+    )
+
+
+def canonical_grouped_call(projection, out, x, offsets, wp, sp, experts):
+    is_lut = isinstance(projection, Lut4GGUFProjection)
+    op = (
+        torch.ops._C.gguf_lut4_grouped_gemm_sm70_out
+        if is_lut
+        else torch.ops._C.gguf_affine_grouped_gemm_sm70_out
+    )
+    decoder = projection.lut_id if is_lut else projection.bits
+    return partial(op, out, x, offsets, wp, sp, decoder, experts, projection.group_size)
 
 
 def elapsed(call, iterations, capture=False):
@@ -146,6 +197,22 @@ def awq_comparator(canonical):
     return run
 
 
+def nvfp4_comparator(canonical):
+    n, k = canonical.codes.shape
+    if k % 16:
+        return None
+    codes = torch.from_numpy((canonical.codes & 15).T.copy()).cuda()
+    scales = torch.full((k // 16, n), 0.00390625, dtype=torch.float16, device="cuda")
+    weight, stats, meta = torch.ops._C.nvfp4_sm70_prepare(codes, scales, 16, False)
+    k_ld, q_ld = meta.tolist()
+
+    def run(out, x):
+        torch.ops._C.nvfp4_gemm_sm70_out(out, x, weight, stats, 16, k_ld, q_ld, False)
+        return out
+
+    return run
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf")
@@ -200,13 +267,7 @@ def main():
         )
         rounding = reconstruction_error(canonical, reference)
         n, k = canonical.codes.shape
-        weight, stats, meta = torch.ops._C.gguf_affine_sm70_prepare(
-            torch.from_numpy(canonical.codes).cuda(),
-            torch.from_numpy(canonical.scales).cuda(),
-            torch.from_numpy(canonical.mins).cuda(),
-            canonical.bits,
-            canonical.group_size,
-        )
+        weight, stats, meta = prepare_projection(canonical)
         k_ld, q_ld = meta.tolist()
         packed = (
             pad_weight_tail(torch.from_numpy(raw_source).cuda(), weight_type)
@@ -215,32 +276,33 @@ def main():
         )
         dense = torch.from_numpy(reference).half().cuda()
         awq = awq_comparator(canonical)
-        blas_scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+        nvfp4 = nvfp4_comparator(canonical) if awq is None else None
+        blas_scratch = (
+            None
+            if isinstance(canonical, Lut4GGUFProjection)
+            else torch.empty((k, n), device="cuda", dtype=torch.float16)
+        )
         for m in args.m:
             torch.manual_seed(20261003 + m)
             x = (torch.randn((m, k), device="cuda") * 0.125).half()
             out = torch.empty((m, n), dtype=torch.float16, device="cuda")
 
+            call = canonical_dense_call(canonical, out, x, weight, stats, k_ld, q_ld)
+
             def tm(
                 out=out,
-                x=x,
-                weight=weight,
-                stats=stats,
-                bits=canonical.bits,
-                k_ld=k_ld,
-                q_ld=q_ld,
-                group_size=canonical.group_size,
+                call=call,
             ):
-                torch.ops._C.gguf_affine_gemm_sm70_out(
-                    out, x, weight, stats, bits, k_ld, q_ld, group_size
-                )
+                call()
                 return out
 
             tm()
             expected = x.float() @ dense.float().T
             error = (out.float() - expected).norm() / expected.norm()
             if not torch.isfinite(out).all() or error.item() > 0.003:
-                raise AssertionError(f"{name}, M={m}: GGUF affine error {error.item()}")
+                raise AssertionError(
+                    f"{name}, M={m}: GGUF canonical error {error.item()}"
+                )
             capabilities = (
                 torch.ops._C_gguf.ggml_dense_upstream_capabilities(
                     packed, x, weight_type, n
@@ -254,33 +316,43 @@ def main():
                     torch.nn.functional.linear, x, dense
                 ),
             }
+            blas_error = None
+            if blas_scratch is not None:
 
-            def canonical_blas(
-                out=out,
-                x=x,
-                canonical=canonical,
-                weight=weight,
-                stats=stats,
-                scratch=blas_scratch,
-            ):
-                torch.ops._C.gguf_affine_blas_sm70_out(
-                    out, x, weight, stats, canonical.bits, scratch, canonical.group_size
-                )
-                return out
+                def canonical_blas(
+                    out=out,
+                    x=x,
+                    canonical=canonical,
+                    weight=weight,
+                    stats=stats,
+                    scratch=blas_scratch,
+                ):
+                    torch.ops._C.gguf_affine_blas_sm70_out(
+                        out,
+                        x,
+                        weight,
+                        stats,
+                        canonical.bits,
+                        scratch,
+                        canonical.group_size,
+                    )
+                    return out
 
-            canonical_blas()
-            blas_error = (out.float() - expected).norm() / expected.norm()
-            if not torch.isfinite(out).all() or blas_error.item() > 0.003:
-                raise AssertionError(
-                    f"{name}, M={m}: canonical BLAS error {blas_error.item()}"
-                )
-            routes["turbomind_canonical_blas_fp32"] = canonical_blas
+                canonical_blas()
+                blas_error = ((out.float() - expected).norm() / expected.norm()).item()
+                if not torch.isfinite(out).all() or blas_error > 0.003:
+                    raise AssertionError(
+                        f"{name}, M={m}: canonical BLAS error {blas_error}"
+                    )
+                routes["turbomind_canonical_blas_fp32"] = canonical_blas
             if packed is not None:
                 routes["dequant_cublas"] = partial(
                     torch.ops._C_gguf.ggml_dense_blas, packed, x, weight_type, n
                 )
             if awq is not None:
                 routes["turbomind_awq_group128"] = partial(awq, out, x)
+            elif nvfp4 is not None:
+                routes["turbomind_nvfp4_group16"] = partial(nvfp4, out, x)
             for bit, route in ((4, "mmvq"), (8, "mmq")):
                 if capabilities & bit:
                     routes[f"llama_{route}"] = partial(
@@ -292,7 +364,6 @@ def main():
                     )
             row = {
                 "native_unavailable_reason": native_reason,
-                "canonical_blas_output_relative_l2": blas_error.item(),
                 "tensor": name,
                 "type": quant_type_name(weight_type),
                 "expert": args.expert if tensor.data.ndim == 3 else None,
