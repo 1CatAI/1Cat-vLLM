@@ -197,6 +197,22 @@ def awq_comparator(canonical):
     return run
 
 
+def nvfp4_comparator(canonical):
+    n, k = canonical.codes.shape
+    if k % 16:
+        return None
+    codes = torch.from_numpy((canonical.codes & 15).T.copy()).cuda()
+    scales = torch.full((k // 16, n), 0.00390625, dtype=torch.float16, device="cuda")
+    weight, stats, meta = torch.ops._C.nvfp4_sm70_prepare(codes, scales, 16, False)
+    k_ld, q_ld = meta.tolist()
+
+    def run(out, x):
+        torch.ops._C.nvfp4_gemm_sm70_out(out, x, weight, stats, 16, k_ld, q_ld, False)
+        return out
+
+    return run
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf")
@@ -260,6 +276,7 @@ def main():
         )
         dense = torch.from_numpy(reference).half().cuda()
         awq = awq_comparator(canonical)
+        nvfp4 = nvfp4_comparator(canonical) if awq is None else None
         for m in args.m:
             torch.manual_seed(20261003 + m)
             x = (torch.randn((m, k), device="cuda") * 0.125).half()
@@ -300,6 +317,8 @@ def main():
                 )
             if awq is not None:
                 routes["turbomind_awq_group128"] = partial(awq, out, x)
+            elif nvfp4 is not None:
+                routes["turbomind_nvfp4_group16"] = partial(nvfp4, out, x)
             for bit, route in ((4, "mmvq"), (8, "mmq")):
                 if capabilities & bit:
                     routes[f"llama_{route}"] = partial(

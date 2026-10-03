@@ -67,9 +67,8 @@ The second M=1 probe had common graph/host scheduling inflation across routes
 under CPU load and is excluded from the table. The harness now captures eight
 device invocations per replay when output has at most ten million elements,
 and divides elapsed time by that count. Larger outputs retain one invocation
-to bound graph-pool memory. Eager timing is unchanged. Full IQ4_NL sweeps and actual grouped expert speed appear below. Real
-IQ4_XS coefficient error, TP4 shapes and normal-wheel validation remain pending
-before model integration.
+to bound graph-pool memory. Eager timing is unchanged. Full IQ4_NL sweeps and actual grouped expert speed appear below. Real IQ4_XS and TP4 measurements follow below. Normal-wheel validation
+remains a separate gate before model integration.
 
 ## Full operator measurements
 
@@ -113,5 +112,70 @@ Router, sorting and the full MoE FFN are excluded. The reference
 grouped dequantization path requires a host sort and cannot be captured;
 its column therefore uses eager timings. Empty experts occur at small M.
 At M=8192, GGUF grouped is 497.36 us versus AWQ grouped 449.02 us,
-MMQ 2696.35 us and MMVQ 16443.95 us. The remaining AWQ difference and
-real IQ4_XS/TP4 shapes must be evaluated before model connection.
+MMQ 2696.35 us and MMVQ 16443.95 us. The remaining AWQ difference must be addressed before model connection.
+
+## Dense IQ4_XS projection
+
+The 27B `blk.0.ffn_gate.weight` projection has N=17408/K=5120.
+Nested coefficients have maximum absolute reconstruction error
+6.0558319091796875e-05 and relative L2 error 0.00016060 against the
+official FP32 dequantization formula. GEMM output relative L2 is about
+0.0003163. No indices are changed.
+
+| M | GGUF | AWQ | MMVQ | MMQ | DQ + cuBLAS |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 93.62 | 69.29 | 72.26 | unavailable | 962.25 |
+| 2 | 82.04 | 74.43 | 76.91 | unavailable | 963.64 |
+| 4 | 83.11 | 74.65 | 88.78 | unavailable | 964.65 |
+| 8 | 83.80 | 72.72 | 127.26 | 168.01 | 968.59 |
+| 16 | 95.39 | 95.55 | unavailable | 189.81 | 981.73 |
+| 32 | 142.22 | 114.86 | unavailable | 262.53 | 976.99 |
+| 64 | 293.20 | 206.87 | unavailable | unavailable | 1092.31 |
+| 128 | 476.41 | 461.16 | unavailable | unavailable | 1272.03 |
+| 512 | 1581.64 | 1401.85 | unavailable | unavailable | 1837.33 |
+| 2048 | 5699.28 | 5022.21 | unavailable | unavailable | 5199.92 |
+| 8192 | 23573.15 | 20565.66 | unavailable | unavailable | 18498.20 |
+
+Large-M fused IQ4_XS retains about a 14–15% difference versus AWQ.
+Canonical dequantization is a separate candidate to investigate; these
+measurements do not justify model integration yet.
+
+## TP4 expert down projection
+
+Flash-Next remains TP4. IQ4_NL down weights slice from K=640 to K=160,
+preserving complete group32 blocks. Coefficient reconstruction is exact.
+AWQ group128 cannot represent this local K, so the native comparison uses
+NVFP4 group16 at the same N=2560/K=160. It compares speed, not checkpoint
+quality. All timings below use CUDA graphs and are microseconds.
+
+| M | GGUF | Native NVFP4 | MMVQ | MMQ | DQ + cuBLAS |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 5.29 | 5.33 | 7.60 | unavailable | 9.29 |
+| 2 | 5.15 | 5.36 | 8.52 | unavailable | 9.22 |
+| 4 | 5.00 | 5.45 | 9.27 | unavailable | 10.25 |
+| 8 | 5.15 | 5.60 | 10.23 | 13.71 | 9.86 |
+| 16 | 5.29 | 5.68 | unavailable | 14.72 | 10.07 |
+| 32 | 5.28 | 5.42 | unavailable | 17.79 | 10.56 |
+| 64 | 5.36 | 5.95 | unavailable | unavailable | 11.89 |
+| 128 | 8.35 | 8.45 | unavailable | unavailable | 13.15 |
+| 512 | 18.58 | 17.91 | unavailable | unavailable | 29.08 |
+| 2048 | 44.55 | 41.37 | unavailable | unavailable | 89.84 |
+| 8192 | 175.82 | 170.39 | unavailable | unavailable | 320.61 |
+
+These measurements keep tensor parallelism and do not substitute expert
+parallelism. Canonical slicing across larger source superblocks is tested
+separately; unsupported raw reference slices report their block boundary
+reason rather than benchmarking malformed packed weights.
+
+## Installed artifact validation
+
+A normal wheel built from source revision `f01116d3af` passes 34 CPU
+checks and 55 GPU checks (one non-SM70 test skipped) in a fresh environment.
+The installed TP4 projection measures M=512 at 18.57 us versus native NVFP4
+17.91 us, and M=8192 at 179.15 us versus 169.16 us. No preload or private
+shared library is required. The core has no RPATH/RUNPATH and depends only
+on standard CUDA, Torch and system libraries. Source, wheel and installed
+core hashes match.
+
+- Wheel SHA256: `7ed9e273c45b3a0c398296b7e8a74ef43c8537a5b4f9fd2eb990753272f3ff67`
+- Core SHA256: `f28920f322669081343e3bf207401123b44e5c35bbe985667f52b289d10d3948`
