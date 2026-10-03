@@ -629,14 +629,21 @@ def enable_qwen38_sm70_fp16_fused_hc(
         child.input_mix_weight_down_block_inject._sm70_fp16_gemv_silu_ranges = (
             config.speculative_config is None and not envs.VLLM_BATCH_INVARIANT
         )
+        fp32_partials = (
+            not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        )
         concurrent_batch = bool(
             envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
             and _batch_runtime_contract(vllm_config)
             and tp4
-            # MTP's qualified schedule rounds each K512 partial to FP16.
-            # Batch admission must not replace that numerical contract with
-            # the no-MTP FP32-partial schedule.
-            and not _mtp_batch_runtime_contract(vllm_config)
+            # The default worker disables FP16 partial reductions. Reuse the
+            # batch operator's FP32-partial schedule for that MTP policy rather
+            # than falling back to two full, replicated projections. The
+            # legacy FP16-partial policy retains its own qualified schedule.
+            and (
+                not _mtp_batch_runtime_contract(vllm_config)
+                or (envs.VLLM_SM70_MTP_HC_BATCH and fp32_partials)
+            )
         )
         # Only HC's packed collective owns exactly four TP shards. Local router
         # and shared-expert kernels use the independent MTP admission above.

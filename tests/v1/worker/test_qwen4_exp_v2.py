@@ -345,3 +345,50 @@ def test_dcp2_slot_mapping_preserves_replicated_group_on_sm70() -> None:
     torch.accelerator.synchronize()
     assert slots[0].tolist() == [112, -1, 120, -1, 128, -1]
     assert slots[1].tolist() == [192, 193, 208, 209, 224, 225]
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_mtp_local_argmax_preserves_explicit_choice(explicit):
+    from vllm.config import SpeculativeConfig
+
+    config = SimpleNamespace(use_local_argmax_reduction=explicit)
+    SpeculativeConfig._resolve_local_argmax_reduction(config)
+    assert config.use_local_argmax_reduction is explicit
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({}, True),
+        ({"dtype": torch.bfloat16}, False),
+        ({"tp": 2}, False),
+        ({"greedy": False}, False),
+        ({"sm70": False}, False),
+        ({"architecture": "OtherMTP"}, False),
+        ({"parallel": True}, False),
+        ({"method": "eagle"}, False),
+    ],
+)
+def test_mtp_local_argmax_default_admission(change, expected, monkeypatch):
+    from vllm.config import SpeculativeConfig
+    from vllm.platforms import current_platform
+
+    config = SimpleNamespace(
+        use_local_argmax_reduction=None,
+        method=change.get("method", "mtp"),
+        draft_sample_method="greedy" if change.get("greedy", True) else "probabilistic",
+        parallel_drafting=change.get("parallel", False),
+        draft_model_config=SimpleNamespace(
+            dtype=change.get("dtype", torch.float16),
+            hf_config=SimpleNamespace(
+                architectures=[change.get("architecture", "Qwen4ExpMTP")]
+            ),
+        ),
+        draft_parallel_config=SimpleNamespace(tensor_parallel_size=change.get("tp", 4)),
+    )
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda *_: change.get("sm70", True)
+    )
+    SpeculativeConfig._resolve_local_argmax_reduction(config)
+    assert config.use_local_argmax_reduction is expected
