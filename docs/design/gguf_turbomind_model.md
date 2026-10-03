@@ -209,5 +209,19 @@ Prefill averages two runs with one generated token after warmup. These results
 exclude startup: weight preparation took about 237 seconds and initial graph
 capture about 240 seconds. The packaged core fingerprint remains
 `5cd0fa29e533f92644e012c57fe7b439293bf360e8988b8d73d7bbef54839f6a`.
-The native NVFP4 comparison and common quality set are still pending; this table
-does not establish native-path performance parity or full quality validation.
+The same workload on the Qwen3.8-27B QUASAR NVFP4 checkpoint gives:
+
+| Concurrent requests | GGUF decode (tok/s) | NVFP4 decode (tok/s) | GGUF/NVFP4 |
+| ---: | ---: | ---: | ---: |
+| 1 | 47.51 | 66.75 | 0.712 |
+| 4 | 178.38 | 251.26 | 0.710 |
+| 8 | 319.63 | 470.88 | 0.679 |
+| 16 | 555.05 | 830.51 | 0.668 |
+
+NVFP4 prefill is 2.5089 s at 8K and 10.4705 s at 32K, so GGUF is
+approximately 0.3%/1.6% slower. Prefill is close to the native path; decode
+throughput still trails by 29–33%. Both checkpoints complete the four natural
+text checks, but this does not substitute for the common quality set, which
+remains pending. Investigate the C4 graph kernel breakdown before choosing a
+decode optimization. Trace instrumentation is separate from accepted unprofiled
+throughput and does not change the kernel precision policy.

@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prompts-json", type=Path, required=True)
     parser.add_argument("--require-installed", action="store_true")
+    parser.add_argument("--cuda-profiler-capture", action="store_true")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
@@ -102,6 +103,7 @@ def main():
         "decode": [],
         "prefill": [],
         "complete": False,
+        "cuda_profiler_capture": args.cuda_profiler_capture,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -169,11 +171,18 @@ def main():
                     return output
 
                 client.get_output = observed
+                capture = args.cuda_profiler_capture and repeat == 0
                 try:
+                    if capture:
+                        torch.accelerator.synchronize()
+                        torch.cuda.cudart().cudaProfilerStart()
                     outputs = generate_cohort(
                         llm, prompts[:width], sampling, atomic=True
                     )
                 finally:
+                    if capture:
+                        torch.accelerator.synchronize()
+                        torch.cuda.cudart().cudaProfilerStop()
                     client.get_output = original
                 if any(len(o.outputs[0].token_ids) != args.output_len for o in outputs):
                     raise RuntimeError("Incomplete synthetic timing request")
