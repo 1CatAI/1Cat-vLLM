@@ -40,7 +40,7 @@ def prepare(canonical):
         canonical.bits,
         canonical.group_size,
     )
-    assert stats.dtype == torch.int64
+    assert stats.dtype == (torch.int32 if canonical.bits == 3 else torch.int64)
     return weight, stats, *meta.tolist()
 
 
@@ -70,7 +70,8 @@ def test_bitplane_framework_storage_and_fullgraph_tracing(weight_type):
             ),
         )
     kernel.process_weights_after_loading(layer)
-    assert layer.scales.dtype == torch.int64 and layer.mins is None
+    assert layer.scales.dtype == (torch.int32 if canonical.bits == 3 else torch.int64)
+    assert layer.mins is None
     torch.manual_seed(20261003 + weight_type)
     x = (torch.randn((8, k), device="cuda") * 0.125).half()
     expected = (
@@ -112,6 +113,16 @@ def test_bitplane_decode_batch_prefill_and_graph(weight_type):
                 run()
             graph.replay()
             torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.0002)
+
+
+def test_centered_q3_rejects_nonredundant_min():
+    # Underflow can round scale and min differently. Do not silently replace
+    # an independently rounded min with -4 times the rounded scale.
+    codes = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
+    scales = torch.full((32, 1), 2**-24, dtype=torch.float16, device="cuda")
+    mins = torch.full_like(scales, -3 * 2**-24)
+    with pytest.raises(RuntimeError, match="scale/min mismatch"):
+        torch.ops._C.gguf_affine_sm70_prepare(codes, scales, mins, 3, 16)
 
 
 @pytest.mark.parametrize("weight_type", [11, 13, 14])

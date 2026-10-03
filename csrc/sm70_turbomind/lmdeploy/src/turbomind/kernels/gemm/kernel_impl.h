@@ -21,6 +21,16 @@
 
 namespace turbomind::gemm {
 
+template<class Mainloop, class = void>
+struct DecoderQuantTag {
+    static constexpr auto value = QuantType::kNone;
+};
+
+template<class Mainloop>
+struct DecoderQuantTag<Mainloop, std::void_t<decltype(Mainloop::TransformB::kQuantType)>> {
+    static constexpr auto value = Mainloop::TransformB::kQuantType;
+};
+
 template<class Gemm>
 class KernelImpl: public Kernel {
 public:
@@ -67,7 +77,9 @@ public:
         }
 
         if constexpr (OpV::SmemLayout::kSize > 1) {
-            constexpr auto quant_type = std::is_same_v<typename OpV::Dtype, uint64_t>
+            constexpr auto quant_type = DecoderQuantTag<Impl>::value != QuantType::kNone
+                                            ? DecoderQuantTag<Impl>::value
+                                        : std::is_same_v<typename OpV::Dtype, uint64_t>
                                             ? QuantType::kBitPlane
                                             : QuantType::kDefault;
             desc_.quant_b = QuantDesc{quant_type, OpV::kGroupSize};

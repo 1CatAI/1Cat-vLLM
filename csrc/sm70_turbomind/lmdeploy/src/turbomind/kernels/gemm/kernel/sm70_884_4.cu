@@ -88,8 +88,8 @@ void Registry::sm70_884_4() {
       Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
       Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
     };
-    add_planes.template operator()<Config_GgufBitPlane<2, 1, 16, kColMajor>,
-                                   Config_GgufBitPlane<2, 1, 16, kColMajor, 0>, 16>();
+    add_planes.template operator()<Config_GgufCenteredBitPlane3<kColMajor>,
+                                   Config_GgufCenteredBitPlane3<kColMajor, 0>, 16>();
     add_planes.template operator()<Config_GgufBitPlane<4, 1, 32, kColMajor>,
                                    Config_GgufBitPlane<4, 1, 32, kColMajor, 0>, 32>();
     add_planes.template operator()<Config_GgufBitPlane<4, 2, 16, kColMajor>,

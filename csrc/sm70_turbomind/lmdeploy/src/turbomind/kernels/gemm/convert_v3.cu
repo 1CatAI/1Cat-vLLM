@@ -89,8 +89,9 @@ std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, in
     constexpr auto weight_layout = constant<(Pack)(HMMA_884 | OPERAND_B | 1)>{};
     if (low_bits == 2) {
         constexpr Cvt<uint16_t, uint2_t> W;
+        constexpr Cvt<uint32_t, uint32_t> S3;
         return {W(Sm70{}, constant<kRowMajor>{}, weight_layout),
-                S(Sm70{}, constant<kColMajor>{}, layout)};
+                S3(Sm70{}, constant<kColMajor>{}, layout)};
     }
     if (low_bits == 4) {
         constexpr Cvt<uint16_t, uint4_t> W;
