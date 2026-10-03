@@ -5840,6 +5840,12 @@ extern "C" cudaError_t onecat_sm70_d256_dense_state_raw(
     const void*, const void*, const void*, float*, float*, void*, int, int, int,
     int, float, cudaStream_t);
 
+extern "C" cudaError_t onecat_v37_recover_score_tiles_raw(const void*,
+                                                          const void*,
+                                                          const void*, void*,
+                                                          const int*, int, int,
+                                                          cudaStream_t);
+
 namespace FLASH_NAMESPACE {
 
   #if PREFIX_TORCH_QUERY_TOKENS == 8192
@@ -5997,7 +6003,8 @@ __global__ void set_half2_runtime_globals(int rows, float* row_sum,
                                           int tail_rows, float* tail_sum,
                                           const float* row_max,
                                           const float* tail_max,
-                                          int* prefix_outliers) {
+                                          int* prefix_outliers,
+                                          int* score_recovery) {
   g_rows = rows;
   g_row_sum_out = row_sum;
   g_tail_rows = tail_rows;
@@ -6007,6 +6014,7 @@ __global__ void set_half2_runtime_globals(int rows, float* row_sum,
   g_row_max = row_max;
   g_79t_tail_row_max = tail_max;
   g_79t_prefix_outliers = prefix_outliers;
+  g_79t_score_recovery = score_recovery;
     #endif
 }
 
@@ -6062,6 +6070,7 @@ struct Sm70GqaHalf2Workspace {
       prefix_max;
   at::Tensor prefix_accumulator, max_partials, tail_max_partials,
       prefix_outliers;
+  at::Tensor score_recovery;
     #endif
   // Graph memcpy nodes retain their host source addresses. Keep metadata
   // immutable for each KV length/value buffer, including after later captures.
@@ -6177,10 +6186,15 @@ struct Sm70GqaHalf2Workspace {
     prefix_max = at::empty({kRows}, fp32);
     prefix_accumulator = at::empty({kRows, kHeadDim}, fp32);
     max_partials = at::empty({16, kRows}, fp32);
+    // Tail scans need two planes (complete and sampled maxima).
+    static_assert(2 * ((kQuery + 8191) / 8192) <= 16);
     tail_max_partials = at::empty({16, kRows}, fp32);
     prefix_outliers = at::empty(
         {(kRows + PVThreadblockShape::kM - 1) / PVThreadblockShape::kM},
         q.options().dtype(at::ScalarType::Int));
+    static_assert(kRows % kStableRecoveryRows == 0);
+    score_recovery = at::empty({kRows / kStableRecoveryRows},
+                               q.options().dtype(at::ScalarType::Int));
     #endif
   }
 
@@ -6285,6 +6299,9 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
                                  prefix_stream));
   C10_CUDA_CHECK(
       cudaMemsetAsync(maximum_value, 0, sizeof(float), prefix_stream));
+  C10_CUDA_CHECK(cudaMemsetAsync(workspace->score_recovery.data_ptr<int>(), 0,
+                                 workspace->score_recovery.nbytes(),
+                                 prefix_stream));
   stable_value_center<<<1, 256, 0, prefix_stream>>>(
       reinterpret_cast<__half const*>(value), value_center, total_kv);
   stable_value_amax<<<1024, 256, 0, prefix_stream>>>(
@@ -6306,9 +6323,10 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
       Workspace::kRows, prefix_sum_output, Workspace::kTailTileRows,
       tail_row_sums, row_max_output, tail_max,
     #if defined(PREFIX_TORCH_STABLE_ROWS)
-      workspace->prefix_outliers.data_ptr<int>()
+      workspace->prefix_outliers.data_ptr<int>(),
+      workspace->score_recovery.data_ptr<int>()
     #else
-      nullptr
+      nullptr, nullptr
     #endif
   );
 
@@ -6717,6 +6735,19 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
       reinterpret_cast<__half const*>(tail_numerator), tail_sum, tail_max,
       value_center, maximum_value, reinterpret_cast<__half*>(output),
       repaired_rows, prefix > 0);
+  // Overwrite only flagged query tiles. The guard is device-side and reset
+  // on every replay; no host readback, new score slab, or graph branch.
+  // Reuse the now-dead prefix accumulator for normalized FP32 residuals.
+  // Large biased V must retain the same centering as the normal route.
+  C10_CUDA_CHECK(onecat_v37_recover_score_tiles_raw(
+      q.data_ptr<at::Half>(), k.data_ptr<at::Half>(), scaled_value,
+      prefix_accumulator, workspace->score_recovery.data_ptr<int>(),
+      Workspace::kQuery, total_kv, prefix_stream));
+  stable_restore_recovered<<<Workspace::kRows / kStableRecoveryRows, 256, 0,
+                             prefix_stream>>>(
+      prefix_accumulator, value_center, maximum_value,
+      workspace->score_recovery.data_ptr<int>(),
+      reinterpret_cast<__half*>(output));
     #else
       #if defined(PREFIX_TORCH_PREFIX_FP32_OUTPUT)
   merge_float_prefix_direct_round_major_tail<<<
