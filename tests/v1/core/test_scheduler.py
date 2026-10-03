@@ -403,6 +403,37 @@ def test_long_prefill_threshold_applies_with_other_requests():
     assert output.num_scheduled_tokens[short_req.request_id] == 10
 
 
+def test_long_prefill_threshold_caps_running_prefill_when_request_arrives():
+    """A running prefill uses the whole budget while alone and is capped on
+    the step a new request arrives, which is then scheduled in that step."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=400,
+    )
+    long_req = create_requests(num_requests=1, num_tokens=4000)[0]
+    scheduler.add_request(long_req)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[long_req.request_id] == 1024
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[long_req.request_id],
+            req_id_to_index={long_req.request_id: 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    short_req = create_requests(num_requests=1, num_tokens=600, req_ids=["short"])[0]
+    scheduler.add_request(short_req)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[long_req.request_id] == 400
+    assert output.num_scheduled_tokens[short_req.request_id] == 400
+
+
 def test_long_prefill_threshold_floored_by_fair_share():
     """With the adaptive flag, the effective threshold never falls below the
     fair share of the token budget: max_num_batched_tokens / num queued +
