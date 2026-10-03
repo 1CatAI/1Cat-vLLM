@@ -94,6 +94,13 @@ class Qwen4ExpAdapter(Qwen35Adapter):
             and not name.endswith("ngram_embedding.weight")
             and name != "lm_head.weight"
             and not name.endswith(
+                (
+                    ".ple.norm_key.weight",
+                    ".ple.norm_query.weight",
+                    ".ple.norm_conv.weight",
+                )
+            )
+            and not name.endswith(
                 (".mlp.gate.weight", ".mlp.shared_expert_gate.weight")
             )
         )

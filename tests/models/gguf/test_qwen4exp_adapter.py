@@ -104,6 +104,8 @@ def test_hc_and_ple_mapping_and_inverse_norm_convolution():
     assert not adapter.is_linear("model.layers.0.mlp.gate.weight")
     assert not adapter.is_linear("model.layers.0.mlp.shared_expert_gate.weight")
     assert not adapter.is_linear("lm_head.weight")
+    for norm in ("norm_key", "norm_query", "norm_conv"):
+        assert not adapter.is_linear(f"model.layers.1.ple.{norm}.weight")
     assert adapter.restore(
         "model.layers.0.mlp.shared_expert_gate.weight", torch.ones(4)
     ).shape == (1, 4)

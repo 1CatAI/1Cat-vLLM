@@ -2,12 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF experts with independent gate/up/down storage and aligned TP slices."""
 
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
 import torch
 from torch.nn import Parameter
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.model_executor.kernels.gguf import (
+    GGUFDecoderFamily,
+    admit_moe_fallback,
+    decoder_family,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     MoEActivation,
@@ -53,6 +59,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
+        self.params_dtype = params_dtype
         if self.moe.dp_size != 1 or self.moe.pcp_size != 1 or self.moe.ep_size != 1:
             raise ValueError(
                 "Native GGUF experts currently require DP=PCP=EP=1; use TP"
@@ -88,7 +95,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         if shard_id not in self.weight_types:
             raise ValueError(f"Missing GGUF {shard_id} type before expert payload")
         value = self.weight_types[shard_id]
-        if value not in NATIVE_TYPES | {0, 1, 30}:
+        if (
+            value not in NATIVE_TYPES
+            and decoder_family(value) != GGUFDecoderFamily.FLOAT
+        ):
             raise ValueError(f"Unsupported native GGUF expert {quant_type_name(value)}")
         rows, k = (
             (self.hidden_size, self.intermediate_size)
@@ -141,6 +151,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             "ep_size": layer.ep_size,
             "projections": {},
         }
+        self.projection_capabilities = {}
         for shard in ("w1", "w3", "w2"):
             if self.loaded_experts[shard] != set(range(self.num_experts)):
                 raise ValueError(f"Incomplete GGUF {shard} expert payloads")
@@ -148,12 +159,13 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             if not weight.is_cuda:
                 raise ValueError("Native GGUF experts require CUDA storage")
             value = self.weight_types[shard]
-            setattr(layer, "gguf_" + shard, pad_weight_tail(weight, value))
+            prepared = pad_weight_tail(weight, value)
+            setattr(layer, "gguf_" + shard, prepared)
+            capability = admit_moe_fallback(prepared, value, self.params_dtype)
+            self.projection_capabilities[shard] = capability
             self.native_admission["projections"][shard] = {
-                "weight_type": quant_type_name(value),
+                **asdict(capability),
                 "shape": list(weight.shape),
-                "decode": "upstream_moe",
-                "prefill": "grouped_dense",
             }
 
     def get_fused_moe_quant_config(self, layer):
@@ -178,18 +190,9 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         tokens, top_k = ids.shape
         native = torch.ops._C_gguf
 
-        # MMVQ handles small batches. Larger eager batches group by expert
-        # before dense projection, reading one expert for its token group.
         def projection(shard):
-            value = self.weight_types[shard]
-            if value in (0, 1, 30):
-                return native.ggml_moe_upstream
-            if tokens > 32 or value in (34, 35):
-                return native.ggml_moe_grouped_dense
-            # The routed down rows are tokens*top_k. Force MMVQ chunks here
-            # so the raw auto selector cannot choose a host-sorted grouped
-            # projection during decode graph capture.
-            return native.ggml_moe_mmvq
+            capability = self.projection_capabilities[shard]
+            return getattr(native, capability.operator)
 
         gate = projection("w1")(
             x.contiguous(),
