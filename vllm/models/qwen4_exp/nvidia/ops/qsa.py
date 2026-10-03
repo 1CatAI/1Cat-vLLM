@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+from itertools import pairwise
 
 import regex as re
 import torch
@@ -1412,6 +1413,99 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+def _qsa_indexer_request_segments(
+    query_start_loc: list[int],
+    min_rows: int,
+) -> list[tuple[int, int, int | None]]:
+    """Split a batch's rows into single-request runs and multi-request runs.
+
+    Returns ``(start, end, request)`` row ranges in order. A request with at
+    least ``min_rows`` rows gets its own range with its index; consecutive
+    smaller requests share one range with ``request=None``.
+    """
+
+    segments: list[tuple[int, int, int | None]] = []
+    for request, (start, end) in enumerate(pairwise(query_start_loc)):
+        if end <= start:
+            continue
+        if end - start >= min_rows:
+            segments.append((start, end, request))
+        elif segments and segments[-1][2] is None and segments[-1][1] == start:
+            segments[-1] = (segments[-1][0], end, None)
+        else:
+            segments.append((start, end, None))
+    return segments
+
+
+def _qsa_select_by_request(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+    out: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+) -> bool:
+    """Select a multi-request batch one long request at a time.
+
+    The cuBLAS indexer serves only one request's page table. Without this, a
+    prefill that shares its step with decode rows or another prefill falls
+    back to the paged Triton scorer, whose cost grows with the context length.
+    Each request with enough rows is selected on its own, exactly as when it
+    runs alone; the remaining short requests keep the batched fallback. The
+    row split comes from the host copy of ``query_start_loc``, so no device
+    synchronization is added. Returns False when the batch is left unchanged.
+    """
+
+    rows = q.shape[0]
+    if (
+        page_table.shape[0] < 2
+        or not _SM70_INDEXER_CUBLAS
+        or not current_platform.is_device_capability(70)
+        or not _qsa_indexer_cublas_shape_supported(q, k_cache, page_table[:1])
+    ):
+        return False
+    query_start_loc = query_start_loc_cpu.tolist()
+    # CUDA-graph padding can add rows past the mapped requests; leave such
+    # batches (decode graphs) on the batched path.
+    if query_start_loc[0] != 0 or query_start_loc[-1] != rows:
+        return False
+    segments = _qsa_indexer_request_segments(
+        query_start_loc, _SM70_INDEXER_CUBLAS_MIN_ROWS
+    )
+    if all(request is None for _, _, request in segments):
+        return False
+    for start, end, request in segments:
+        if request is None:
+            qsa_select_paged_tokens(
+                q[start:end],
+                k_cache,
+                page_table,
+                token_to_req[start:end],
+                query_positions[start:end],
+                sequence_lengths,
+                token_topk,
+                compress_ratio,
+                out[start:end],
+            )
+        else:
+            qsa_select_paged_tokens(
+                q[start:end],
+                k_cache,
+                page_table[request : request + 1],
+                torch.zeros_like(token_to_req[start:end]),
+                query_positions[start:end],
+                sequence_lengths[request : request + 1],
+                token_topk,
+                compress_ratio,
+                out[start:end],
+            )
+    return True
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1422,6 +1516,7 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    query_start_loc_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -1432,6 +1527,19 @@ def qsa_select_paged_tokens(
     if out.shape != (rows, output_width):
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
+        return out
+    if query_start_loc_cpu is not None and _qsa_select_by_request(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+        out,
+        query_start_loc_cpu,
+    ):
         return out
 
     capacity_columns = page_table.shape[1] * k_cache.shape[1]
