@@ -51,6 +51,25 @@ padding, SiLU boundaries and poisoned output, including widths above 16.
 FP16 subnormal and invalid-layout/range checks also pass. These operator
 checks are separate from the C1 teacher-forcing distribution and task gates.
 
+One-pass Nsight Compute 2022.4 counters on real layer-zero weights provide
+actual DRAM reads. These use isolated kernel replay with the profiler's cold
+cache, rather than the rotating graph timing above. They must not replace
+whole-model graph durations or fill unmeasured layer-wide byte columns.
+
+| Projection and arm | Actual read bytes | NCU us | Read floor us at 750 GB/s | Remaining us |
+|---|---:|---:|---:|---:|
+| Gate/up cuBLAS | 1651200 | 8.000 | 2.202 | 5.798 |
+| Gate/up candidate | 1646720 | 5.536 | 2.196 | 3.340 |
+| Down cuBLAS | 824896 | 6.272 | 1.100 | 5.172 |
+| Down candidate | 822208 | 4.768 | 1.096 | 3.672 |
+
+Measured DRAM writes are 32 bytes for cuBLAS gate/up and zero for the other
+three kernels. Output data can remain in L2 at kernel completion; zero DRAM
+writes does not mean no output stores occurred. Candidate read bandwidth is
+297.457 and 172.443 GB/s respectively. The remaining gap still argues for
+reducing dependent stages rather than claiming these small projections have
+reached the bandwidth target.
+
 The measurements explicitly load candidate Python for a standalone operator
 diagnostic. No installed model source is overlaid. Normal installed-wheel
 validation omits `--kernel-source`:
