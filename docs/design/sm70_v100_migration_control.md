@@ -1,5 +1,18 @@
 # SM70/V100 Migration Control
 
+2026-10-04: The [mixed NVFP4 DFlash2 latency campaign](sm70_unsloth_dflash2_12ms.md)
+freezes a source-complete same-host baseline: 18.425 ms at 1K and 20.198 ms
+at 8K, with original FP8 head and 256K maximum length. All 140 reductions
+already use push; do not count a NCCL-to-push gain again. The short captures
+contain seven/four dense-reference rounds out of fifteen at 1K/8K. Draft
+projection and noncausal sliding attention remain major costs. Window-relative
+split-KV passes five GPU replay tests in a source-complete wheel. Its unseeded
+complete intervals are 18.041/19.639 ms, but token counts change and 8K C4
+throughput declines 3.3%; matching seeds and model numerical gates remain open.
+The existing pull plus Gemma-norm fusion measures 22.009 us against 10.713 us
+for push plus separate norm, so do not enable that decode pattern. No runtime
+speedup is accepted yet.
+
 Date: 2026-05-30
 
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
@@ -48997,6 +49010,19 @@ production defaults. Explicit unified channels, including empty, take
 precedence. These are compatibility aliases for one full released cycle;
 registrations and public control counts do not decrease in this step. Native
 arithmetic, forwarding code and the scored selector remain unchanged.
+
+### Original unsloth DFlash2 latency admission: seeded control
+
+The new V100 TP4 host uses the original FP8-head unsloth checkpoint, max length
+262144, 1K/8K inputs and the same frozen source-complete control. Matched seeds
+show that the sliding-window split saves 0.35–0.54 ms per single-request round,
+but one 1K fixture loses tokens/round from 2.924 to 2.057. C4 common-window
+throughput drops 441.44→344.32 tok/s at 1K and 406.62→394.23 at 8K. Reject default
+promotion pending a fixed-prefix full-head and proposal audit. All six greedy
+token sequences and three natural-EOS responses match; those do not erase the
+acceptance or concurrency failure. See the
+[latency design](sm70_unsloth_dflash2_12ms.md) for artifact identity and full
+criteria. This experiment does not establish 35B AWQ/FP8 migration parity.
 
 ### Retire DFlash2 candidate-order research override
 
