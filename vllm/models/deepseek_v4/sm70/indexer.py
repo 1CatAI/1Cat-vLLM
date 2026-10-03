@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from vllm.config import CUDAGraphMode, get_current_vllm_config
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
@@ -918,12 +918,16 @@ def sm70_indexer_decode_logits(
     block_table: torch.Tensor,
     max_seq_len: int,
     table_rows_per_request: int = 1,
+    *,
+    indexer_decode_cublas: bool,
 ) -> torch.Tensor:
     """Gather paged FP8 index keys and compute batched decode scores.
 
     `table_rows_per_request` is how many consecutive `block_table` rows belong
     to one request: 1 in the native layout, the verifier length when a uniform
-    speculative decode was flattened to one row per token."""
+    speculative decode was flattened to one row per token.
+    `indexer_decode_cublas` is the engine's `KernelConfig.sm70_sparse` setting;
+    callers pass it because the forward pass runs outside the config context."""
     assert cache.dtype == torch.uint8 and cache.ndim == 3
     assert cache.shape[-1] >= _INDEX_CACHE_BYTES
     # The relu path scores per head, so it needs q as [rows, heads, dim]; the
@@ -941,8 +945,7 @@ def sm70_indexer_decode_logits(
     max_seq_len = max(1, int(max_seq_len))
     total_rows = weighted_q.shape[0]
 
-    policy = get_current_vllm_config().kernel_config.sm70_sparse
-    if _RELU_LOGITS and _DECODE_CUBLAS and policy.indexer_decode_cublas:
+    if _RELU_LOGITS and _DECODE_CUBLAS and indexer_decode_cublas:
         blocker = _decode_cublas_blocker(
             q,
             cache,
