@@ -6,7 +6,12 @@ at 8K, with original FP8 head and 256K maximum length. All 140 reductions
 already use push; do not count a NCCL-to-push gain again. The short captures
 contain seven/four dense-reference rounds out of fifteen at 1K/8K. Draft
 projection and noncausal sliding attention remain major costs. Window-relative
-split-KV is the first experimental candidate; no runtime speedup is accepted yet.
+split-KV passes five GPU replay tests in a source-complete wheel. Its unseeded
+complete intervals are 18.041/19.639 ms, but token counts change and 8K C4
+throughput declines 3.3%; matching seeds and model numerical gates remain open.
+The existing pull plus Gemma-norm fusion measures 22.009 us against 10.713 us
+for push plus separate norm, so do not enable that decode pattern. No runtime
+speedup is accepted yet.
 
 Date: 2026-05-30
 

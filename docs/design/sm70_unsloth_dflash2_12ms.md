@@ -196,7 +196,9 @@ QKV rows. Single-request BV8 measures 18.575 us versus 14.118 us for BV2 in a
 At four requests, BV8/4 are about 38.4 us and BV2/1 regress to 41.7/43.2 us.
 Two-warp variants both regress and change state bits; reject them. Only the
 single-request FP32-state/precomputed-gating contract is a candidate for BV2.
-The full source wrapper and installed model still need validation.
+Sixteen focused packed-verifier tests now pass against the source wrapper,
+including FP16/FP32 state, q3/q7 draft counts, single/multiple requests and
+the runtime bridge. Installed combined-model validation remains open.
 
 NCU confirms the exact shared-layout M8 NVFP4 gate/up and down kernels. The
 gate/up grid is 136 blocks of 512 threads; down has 160 blocks. DRAM throughput
@@ -212,3 +214,49 @@ in the protected temporary directory. Keep ownership locks in a user parent
 process while invoking the privileged profiler child; do not alter shared lock
 permissions. The corrected counter captures complete. GPU probes wait when
 another task owns the shared GPU lock; a busy lock is not a numerical failure.
+
+## Source-complete sliding-window experiment
+
+The isolated sliding-window wheel builds and passes the clean-artifact and
+dependency checks. Its SHA256 is
+`9fa9cc1a30f611238958532092732612eb0bc60104777802b3cd2bd86830c4ec`.
+Five GPU tests pass, including captured replays with live sequence lengths,
+permuted physical pages, heterogeneous batches, split boundaries and 262144
+tokens. Thirty seeded operator cases have maximum absolute difference
+0.00012207 against retained baseline outputs. Full-model KL is still required.
+
+| Diagnostic | Baseline | Sliding split |
+| --- | ---: | ---: |
+| B1 1K attention, 140-node graph average | 82.56 us | 45.97 us |
+| B1 8K attention, 140-node graph average | 154.02 us | 58.23 us |
+| B1 1K draft layer service, Torch profile | 2.588 ms | 2.270 ms |
+| B1 8K draft layer service, Torch profile | 2.921 ms | 2.350 ms |
+| 1K complete interval, three unseeded requests | 18.425 ms | 18.041 ms |
+| 8K complete interval, one unseeded request | 20.198 ms | 19.639 ms |
+| C4 1K shared steady window | 412.40 tok/s | 430.71 tok/s |
+| C4 8K shared steady window | 387.45 tok/s | 374.81 tok/s |
+
+The short captures contain ten compact/five reference rounds at 1K and
+thirteen compact/two reference rounds at 8K. Greedy output token sequences
+match all three retained 1K fixtures, but some round boundaries change.
+Temperature-0.7 outputs and emitted-token counts differ, and the unseeded
+8K C4 result declines 3.3%. These observations do not admit the optimization.
+The benchmark drivers now accept fixed request seeds; C4 gives each request
+a stable distinct seed. Matching control/candidate results and numerical gates
+must resolve acceptance and concurrent throughput before promotion.
+
+The existing TP4 pull allreduce plus Gemma norm passes output/residual checks,
+but measures 22.009 us against 10.713 us for the actual push plus separate norm
+in the same four-process 140-node harness. Do not register that existing pull
+fusion for decode. The first harness passed an already incremented Gemma
+weight to a helper that increments it; preserve that harness failure separately
+from the corrected passing check.
+
+A research-only FP16 M8 projection kernel retains checkpoint values and uses
+FP32 local partials. Original-shard microbenchmarks suggest about 0.45 ms across
+five draft layers; software prefetch does not improve the chosen geometries.
+Small operator error is insufficient: earlier draft GEMM experiments changed
+proposal probabilities despite improving local reference error. Require a
+fixed-prefix full-head and selector comparison before model timing. Source
+integration and native artifact tests are in progress; no private extension
+is eligible as a serving dependency or performance result.
