@@ -381,20 +381,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains, Tensor tm_scales, int tm_group_size, "
       "int tm_k_ld, int tm_q_ld, bool gated_silu, int min_prefill_m, "
-      "bool prescaled_scales=False) -> ()");
+      "bool prescaled_scales=False, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_tm_dispatch_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_tm_dispatch_sm70_out);
 
   ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
-      "int accumulator_chains) -> ()");
+      "int accumulator_chains, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_gemm_sm70_out", torch::kCUDA, &nvfp4_qpn2_gemm_sm70_out);
 
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
-      "int accumulator_chains) -> ()");
+      "int accumulator_chains, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_gated_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_gated_sm70_out);
 
@@ -402,7 +402,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "nvfp4_qpn2_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor codes, Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains, Tensor tm_weight, Tensor tm_scales, "
-      "int tm_group_size, int tm_k_ld, int tm_q_ld, bool gated_silu) -> ()");
+      "int tm_group_size, int tm_k_ld, int tm_q_ld, bool gated_silu, bool "
+      "activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_dispatch_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_dispatch_sm70_out);
 
@@ -411,7 +412,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor codes, Tensor scales, float global_scale, int split_k, "
       "int accumulator_chains, Tensor tm_weight, Tensor tm_scales, "
       "int tm_group_size, int tm_k_ld, int tm_q_ld, bool gated_silu, "
-      "int min_prefill_m) -> ()");
+      "int min_prefill_m, bool activation_pack=False) -> ()");
   ops.impl("nvfp4_qpn2_prefill_dispatch_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_prefill_dispatch_sm70_out);
 

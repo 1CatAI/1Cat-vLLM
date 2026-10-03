@@ -12,8 +12,6 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a CUDA device"
 )
 
-PACK_ENV = "VLLM_SM70_NVFP4_QPN2_PACK"
-
 
 def _prepared(n: int, k: int, seed: int):
     from vllm import _sm70_ops as sm70_ops
@@ -36,34 +34,39 @@ def _run(
     m: int,
     n: int,
     k: int,
-    pack: str,
-    monkeypatch,
+    pack: bool,
     split_k: int = 16,
     chains: int = 2,
 ) -> torch.Tensor:
     from vllm import _sm70_ops as sm70_ops
 
-    monkeypatch.setenv(PACK_ENV, pack)
     codes, scales, generator = _prepared(n, k, seed=m * 7 + n + split_k)
     x = torch.randn(m, k, dtype=torch.float16, device="cuda", generator=generator)
     out = torch.empty((m, n // 2 if gated else n), dtype=torch.float16, device="cuda")
     if gated:
-        sm70_ops.nvfp4_qpn2_gated_sm70_out(out, x, codes, scales, 0.01, split_k, chains)
+        sm70_ops.nvfp4_qpn2_gated_sm70_out(
+            out, x, codes, scales, 0.01, split_k, chains, activation_pack=pack
+        )
     else:
-        sm70_ops.nvfp4_qpn2_gemm_sm70_out(out, x, codes, scales, 0.01, split_k, chains)
+        sm70_ops.nvfp4_qpn2_gemm_sm70_out(
+            out, x, codes, scales, 0.01, split_k, chains, activation_pack=pack
+        )
     torch.accelerator.synchronize()
     return out
 
 
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("m", [1, 2, 4, 5, 7, 8, 9, 15, 16, 17, 32])
-def test_block_pack_is_bit_identical(gated: bool, m: int, monkeypatch):
+def test_block_pack_is_bit_identical(gated: bool, m: int):
     if not hasattr(torch.ops._C, "nvfp4_qpn2_gemm_sm70_out"):
         pytest.skip("build without the SM70 QPN2 extension")
+    from vllm import _sm70_ops as sm70_ops
+
+    assert sm70_ops.has_qpn2_activation_pack("nvfp4_qpn2_gemm_sm70_out")
     n, k = (8704, 5120) if gated else (3584, 5120)
     split_k = 8 if gated else 16
-    unpacked = _run(gated, m, n, k, "0", monkeypatch, split_k)
-    packed = _run(gated, m, n, k, "1", monkeypatch, split_k)
+    unpacked = _run(gated, m, n, k, False, split_k)
+    packed = _run(gated, m, n, k, True, split_k)
     assert torch.equal(packed, unpacked)
     assert torch.isfinite(unpacked).all()
 
@@ -84,10 +87,13 @@ def test_block_pack_is_bit_identical(gated: bool, m: int, monkeypatch):
 )
 @pytest.mark.parametrize("m", [3, 8, 15, 32])
 def test_block_pack_is_bit_identical_across_launch_configs(
-    n: int, k: int, split_k: int, chains: int, m: int, monkeypatch
+    n: int, k: int, split_k: int, chains: int, m: int
 ):
     if not hasattr(torch.ops._C, "nvfp4_qpn2_gemm_sm70_out"):
         pytest.skip("build without the SM70 QPN2 extension")
-    unpacked = _run(False, m, n, k, "0", monkeypatch, split_k, chains)
-    packed = _run(False, m, n, k, "1", monkeypatch, split_k, chains)
+    from vllm import _sm70_ops as sm70_ops
+
+    assert sm70_ops.has_qpn2_activation_pack("nvfp4_qpn2_gemm_sm70_out")
+    unpacked = _run(False, m, n, k, False, split_k, chains)
+    packed = _run(False, m, n, k, True, split_k, chains)
     assert torch.equal(packed, unpacked)
