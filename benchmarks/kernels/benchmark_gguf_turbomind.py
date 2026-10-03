@@ -83,6 +83,7 @@ def prepare_awq_comparator(canonical):
     codes = torch.from_numpy(canonical.codes.copy()).cuda().to(torch.int64)
     if canonical.bits == 8:
         codes = codes >> 4
+    codes = codes & 15
     shifts = torch.arange(8, device="cuda") * 4
     packed = (codes.T.reshape(k, n // 8, 8) << shifts).sum(-1).int()
     scale = torch.full((k // 128, n), 0.00390625, dtype=torch.float16, device="cuda")

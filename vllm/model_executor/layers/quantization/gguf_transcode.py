@@ -67,6 +67,7 @@ AFFINE_GROUP32_TYPES = frozenset(
 )
 
 AFFINE_U2_TYPES = frozenset((10, 34, 35, 41, 42))
+AFFINE_BITPLANE_TYPES = frozenset((6, 7, 11, 13, 14))
 
 
 def transcode_affine(data: np.ndarray, weight_type: int) -> AffineGGUFProjection:
@@ -78,6 +79,8 @@ def transcode_affine(data: np.ndarray, weight_type: int) -> AffineGGUFProjection
     """
     if weight_type in AFFINE_GROUP32_TYPES:
         return transcode_affine_group32(data, weight_type)
+    if weight_type in AFFINE_BITPLANE_TYPES:
+        return transcode_affine_bitplanes(data, weight_type)
     if weight_type not in AFFINE_U2_TYPES:
         raise ValueError(f"GGUF type {weight_type} has no affine codec")
     block, size = quant_size(weight_type)
@@ -132,6 +135,106 @@ def transcode_affine(data: np.ndarray, weight_type: int) -> AffineGGUFProjection
         _fp16_coefficients(scales.reshape(rows, k // group), "scale"),
         _fp16_coefficients(mins.reshape(rows, k // group), "min"),
     )
+
+
+def transcode_affine_bitplanes(
+    data: np.ndarray, weight_type: int
+) -> AffineGGUFProjection:
+    """Preserve 3/5/6-bit integer codes and source affine group boundaries.
+
+    The storage decoder combines a U2/U4 low plane with a one/two-bit high
+    plane. These formulas follow gguf-py's official reconstruction; no code
+    values are rounded or requantized.
+    """
+    if weight_type not in AFFINE_BITPLANE_TYPES:
+        raise ValueError(f"GGUF type {weight_type} has no bit-plane codec")
+    block, size = quant_size(weight_type)
+    if data.dtype != np.uint8 or data.ndim != 2 or data.shape[1] % size:
+        raise ValueError("GGUF projection needs complete packed rows [N,bytes]")
+    rows, width = data.shape
+    k = width // size * block
+    blocks = np.ascontiguousarray(data).reshape(-1, size)
+    count = blocks.shape[0]
+    if weight_type in (6, 7):
+        bits, group = 5, 32
+        d = blocks[:, :2].copy().view("<f2").astype(np.float32)
+        start = 4 if weight_type == 7 else 2
+        high = blocks[:, start : start + 4].copy().view("<u4")
+        high = (high >> np.arange(32, dtype=np.uint32)) & 1
+        low = blocks[:, start + 4 :].reshape(-1, 1, 16)
+        low = (low >> np.array([0, 4], np.uint8)[None, :, None]) & 15
+        codes = low.reshape(count, 32) | (high.astype(np.uint8) << 4)
+        scales = d
+        mins = (
+            blocks[:, 2:4].copy().view("<f2").astype(np.float32)
+            if weight_type == 7
+            else -16 * d
+        )
+    elif weight_type == 13:
+        bits, group = 5, 32
+        d = blocks[:, :2].copy().view("<f2").astype(np.float32)
+        dmin = blocks[:, 2:4].copy().view("<f2").astype(np.float32)
+        scale_codes, min_codes = gguf.quants.Q4_K.get_scale_min(blocks[:, 4:16])
+        scales, mins = (
+            d * scale_codes.astype(np.float32),
+            -dmin * min_codes.astype(np.float32),
+        )
+        low = blocks[:, 48:].reshape(count, 4, 1, 32)
+        low = (low >> np.array([0, 4], np.uint8)[None, None, :, None]) & 15
+        high = blocks[:, 16:48].reshape(count, 1, 32)
+        high = (high >> np.arange(8, dtype=np.uint8)[None, :, None]) & 1
+        codes = low.reshape(count, 8, 32) | (high << 4)
+    elif weight_type == 14:
+        bits, group = 6, 16
+        d = blocks[:, -2:].copy().view("<f2").astype(np.float32)
+        scales = d * blocks[:, 192:208].view(np.int8).astype(np.float32)
+        mins = -32 * scales
+        low = blocks[:, :128].reshape(count, 2, 1, 64)
+        low = (low >> np.array([0, 4], np.uint8)[None, None, :, None]) & 15
+        high = blocks[:, 128:192].reshape(count, 2, 1, 32)
+        high = (high >> np.array([0, 2, 4, 6], np.uint8)[None, None, :, None]) & 3
+        codes = low.reshape(count, 8, 32) | (high.reshape(count, 8, 32) << 4)
+    else:
+        bits, group = 3, 16
+        d = blocks[:, -2:].copy().view("<f2").astype(np.float32)
+        packed_scales = blocks[:, 96:108]
+        low_scales = packed_scales[:, :8, None].transpose(0, 2, 1)
+        low_scales = low_scales >> np.array([0, 4], np.uint8)[None, :, None]
+        high_scales = packed_scales[:, 8:, None].transpose(0, 2, 1)
+        high_scales = high_scales >> np.array([0, 2, 4, 6], np.uint8)[None, :, None]
+        scale_codes = (low_scales.reshape(count, 16) & 15) | (
+            (high_scales.reshape(count, 16) & 3) << 4
+        )
+        scales = d * (scale_codes.astype(np.int16) - 32).astype(np.float32)
+        mins = -4 * scales
+        low = blocks[:, 32:96].reshape(count, 2, 1, 32)
+        low = (low >> np.array([0, 2, 4, 6], np.uint8)[None, None, :, None]) & 3
+        high = blocks[:, :32].reshape(count, 1, 32)
+        high = (high >> np.arange(8, dtype=np.uint8)[None, :, None]) & 1
+        codes = low.reshape(count, 8, 32) | (high << 2)
+    return AffineGGUFProjection(
+        weight_type,
+        bits,
+        group,
+        np.ascontiguousarray(codes.reshape(rows, k)),
+        _fp16_coefficients(scales.reshape(rows, k // group), "scale"),
+        _fp16_coefficients(mins.reshape(rows, k // group), "min"),
+    )
+
+
+def pack_affine_high_plane(projection: AffineGGUFProjection) -> np.ndarray:
+    """Little-endian high-code bits per canonical group, in 32-bit words."""
+    if projection.source_type not in AFFINE_BITPLANE_TYPES:
+        raise ValueError("Projection does not use the bit-plane decoder")
+    low_bits = 2 if projection.bits == 3 else 4
+    high_bits = projection.bits - low_bits
+    high = (
+        (projection.codes >> low_bits)
+        .reshape(*projection.scales.shape, projection.group_size)
+        .astype(np.uint64)
+    )
+    shifts = np.arange(projection.group_size, dtype=np.uint64) * high_bits
+    return np.ascontiguousarray((high << shifts).sum(-1).astype(np.uint32))
 
 
 def _fp16_coefficients(value: np.ndarray, name: str) -> np.ndarray:
