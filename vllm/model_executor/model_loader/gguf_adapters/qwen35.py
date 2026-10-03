@@ -12,6 +12,7 @@ import regex as re
 import torch
 
 from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
+from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 
 _GLOBALS = {
     "token_embd.weight": "model.embed_tokens.weight",
@@ -96,7 +97,7 @@ class Qwen35Adapter:
             (".down_proj.weight", ".out_proj.weight", ".o_proj.weight")
         ):
             return False
-        block_size, _ = gguf.GGML_QUANT_SIZES[tensor.tensor_type]
+        block_size, _ = quant_size(tensor.tensor_type)
         local_k, remainder = divmod(int(tensor.shape[0]), self.tp_size)
         tiled_span = local_k
         if self.layout is not None and name.endswith("linear_attn.out_proj.weight"):
@@ -171,7 +172,7 @@ class Qwen35Adapter:
             dense_fallback = self.needs_dense_fallback(name, tensor)
             if quantized and (not self.is_linear(name) or dense_fallback):
                 # Embeddings and convolution use the model's dense parameters.
-                data = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
+                data = dequantize(tensor.data, tensor.tensor_type)
                 weight = torch.from_numpy(data.copy())
             elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
                 data = tensor.data.view(np.uint16).copy()

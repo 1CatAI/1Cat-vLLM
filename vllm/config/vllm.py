@@ -2022,6 +2022,9 @@ class VllmConfig:
                     self.parallel_config,
                 )
                 and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+                # The current hybrid offloader expects FP8/dense PLE rows.
+                # GGUF keeps packed IQ rows in TP vocabulary partitions.
+                and self.model_config.quantization != "gguf"
                 # Hybrid PLE has its own placement requirements. Other PP/DP
                 # layouts still use the independently admitted FP16 operators.
                 and self.parallel_config.pipeline_parallel_size == 1

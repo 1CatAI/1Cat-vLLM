@@ -141,7 +141,22 @@ heads, 128-dimensional GDN heads, HC count=4/rank=320. PLE keys include
 exact int64 multipliers, offsets and prime vocabulary sizes. GGUF PLE layer
 index 1 maps to HF layer ID 2. Q2_0 uses K blocks of 64, so expert down
 local K=160 still cannot be byte-sliced under TP4; IQ4_NL K blocks of 32
-are aligned. Final EP/conversion admission remains pending.
+are aligned. The user requires Flash-Next TP as well as attention TP.
+For its 30 Q2_0 routed down projections, loading now converts each expert
+from 64-value Q2_0 to two 32-value Q4_1 blocks before TP4 slicing: reuse
+scale d, integer code 0-3, and additive min=-d. No values are requantized.
+The Q2_0 source bytes total 7,077,888,000; converted bytes total
+15,728,640,000. TP4 storage increases by 2,162,688,000 bytes (2.014 GiB)
+per rank, avoiding a whole-expert FP16 expansion or an EP requirement.
+
+The native expert loader retains separate gate/up/down formats and validates
+every TP block boundary before allocating storage. Three CPU tests cover
+exact decoded equality including signed/subnormal/maximal finite scales,
+all four K=160 boundaries, independent projection storage and rejection of
+unconverted Q2_0. Three GPU FFN tests at M=1/8/64 compare the sum of four
+TP partials against the full expert reference. The real two-shard directory
+contains 1,224 tensors and all have adapter names. These are local contracts;
+the primary-model forward and quality gates are still pending.
 
 ### Loading validation and open gates
 

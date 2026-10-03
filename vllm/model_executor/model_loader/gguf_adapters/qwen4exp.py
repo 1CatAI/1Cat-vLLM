@@ -11,6 +11,9 @@ import gguf
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.quantization.gguf_repack import q2_0_to_q4_1
+from vllm.transformers_utils.gguf_tensor_reader import dequantize
+
 from .qwen35 import _LAYERS, Qwen35Adapter
 
 _HC = {
@@ -51,6 +54,7 @@ _EXTRA = {
 
 
 class Qwen4ExpAdapter(Qwen35Adapter):
+    native_expert_storage = True
     architecture_label = "Qwen4Exp"
     layer_names = {**_LAYERS, **_HC, **_EXPERTS, **_EXTRA}
     global_names = {
@@ -123,9 +127,7 @@ class Qwen4ExpAdapter(Qwen35Adapter):
         ):
             value = torch.from_numpy(tensor.data.copy())
         else:
-            value = torch.from_numpy(
-                gguf.quants.dequantize(tensor.data, tensor.tensor_type)
-            )
+            value = torch.from_numpy(dequantize(tensor.data, tensor.tensor_type))
         converted = value.to(dtype)
         if torch.any(torch.isfinite(value) & ~torch.isfinite(converted)):
             raise ValueError("Qwen4Exp GGUF indexer projection overflows target dtype")
@@ -174,11 +176,29 @@ class Qwen4ExpAdapter(Qwen35Adapter):
                 gguf.GGMLQuantizationType.F32,
                 gguf.GGMLQuantizationType.BF16,
             )
+            repack = (
+                int(tensor.tensor_type) == 42
+                and projection == "down_proj"
+                and int(tensor.shape[0]) % (64 * self.tp_size) != 0
+            )
             storage_type = (
-                int(gguf.GGMLQuantizationType.F16)
+                int(
+                    {
+                        torch.float16: gguf.GGMLQuantizationType.F16,
+                        torch.float32: gguf.GGMLQuantizationType.F32,
+                        torch.bfloat16: gguf.GGMLQuantizationType.BF16,
+                    }[dtype]
+                )
                 if floating
+                else int(gguf.GGMLQuantizationType.Q4_1)
+                if repack
                 else int(tensor.tensor_type)
             )
+            if repack:
+                self.fallback_reasons[prefix + ".down_proj"] = (
+                    "lossless_Q2_0_to_Q4_1_before_tp:"
+                    f"local_K={int(tensor.shape[0]) // self.tp_size},block=32"
+                )
             # Keep one type per logical gate/up/down projection. The expert
             # method handles local expert admission and TP storage boundaries.
             for expert in range(self.config.num_experts):
@@ -190,7 +210,12 @@ class Qwen4ExpAdapter(Qwen35Adapter):
                 else torch.from_numpy(tensor.data)
             )
             for expert in range(self.config.num_experts):
-                yield f"{prefix}.{expert}.{projection}.qweight", packed[expert]
+                weight = (
+                    torch.from_numpy(q2_0_to_q4_1(tensor.data[expert]))
+                    if repack
+                    else packed[expert]
+                )
+                yield f"{prefix}.{expert}.{projection}.qweight", weight
         if table_entry is not None:
             raw, name = table_entry
             tensor = tensors[raw]
