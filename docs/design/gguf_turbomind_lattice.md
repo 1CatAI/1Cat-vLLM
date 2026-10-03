@@ -284,8 +284,8 @@ IQ2_XS grouped candidates remain, restricted to N<=256 and M<=64 or M>=512. At M
 candidate costs 36.17 us versus the previous 32.12 us, so intermediate M
 retains the existing candidates. The final candidate
 set passes 95 GPU checks with one non-SM70 skip, including interval
-boundaries, shared scratch and graph tracing. Installed-wheel validation
-remains pending. Grouped performance still
+boundaries, shared scratch and graph tracing. The ordinary wheel also passes 56 CPU and 95 GPU checks with one
+non-SM70 skip in a separate installed environment. Grouped performance still
 needs work before model integration; dense DQ results do not establish full
 MoE or model throughput.
 
@@ -293,7 +293,8 @@ MoE or model throughput.
 
 The table uses the same four distinct experts and all standard M values.
 Only IQ2_XS received new narrow candidates. The M=128 regression motivates
-excluding them for M=65–511; that final exclusion requires revalidation.
+excluding them for M=65–511. The installed wheel restores M=128 to
+31.71 us, versus AWQ 28.10 us.
 
 | Type | M | GGUF us | AWQ us | MoE MMVQ us | MoE MMQ us |
 | --- | --- | --- | --- | --- | --- |
@@ -319,3 +320,30 @@ excluding them for M=65–511; that final exclusion requires revalidation.
 | IQ3_XXS | 512 | 36.97 | 28.22 | 758.71 | 226.34 |
 | IQ3_XXS | 2048 | 94.59 | 71.97 | 3024.26 | 800.68 |
 | IQ3_XXS | 8192 | 342.03 | 228.77 | 11967.08 | 2195.65 |
+
+## Installed-wheel validation
+
+The ordinary SM70 wheel contains the normal `_C` and `_C_gguf` components.
+The source-built, packaged and installed `_C` hashes match and contain no
+RPATH/RUNPATH. Python 3.12.3, Torch 2.10.0+cu128, GGUF 0.19.0,
+Transformers 5.18.0, XGrammar 0.2.0 and Tilelang 0.1.10 were used.
+
+Wheel SHA256:
+`da76d05691d0226bdd6654dc6809d943dc6049b043ce899226f5d5284c680600`.
+Core SHA256:
+`5ce398153efd6a51b1b8ed686c6f9f075c52214bc3dfbf6b4a89b0dfa183a90f`.
+
+| Operator | M | Installed us | AWQ us |
+| --- | --- | --- | --- |
+| IQ2_XS grouped, four experts | 64 | 29.38 | 21.75 |
+| IQ2_XS grouped, four experts | 128 | 31.71 | 28.10 |
+| IQ2_XS grouped, four experts | 8192 | 322.28 | 228.11 |
+| IQ3_XXS dense, canonical DQ | 128 | 12.00 | 25.94 |
+| IQ3_XXS dense, canonical DQ | 8192 | 159.60 | 239.22 |
+| IQ3_S dense, fused | 128 | 43.65 | 46.55 |
+| IQ3_S dense, canonical DQ | 8192 | 771.64 | 949.15 |
+
+No model adapter, tokenizer, routing algorithm or PLE integration is changed
+by this operator layer. Full-model quality and throughput remain separate
+work. Grouped still has a material gap at large M and requires further
+operator work before connecting Flash-Next.
