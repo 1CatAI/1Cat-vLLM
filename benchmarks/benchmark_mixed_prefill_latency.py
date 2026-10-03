@@ -24,6 +24,32 @@ async def measure(args, prompts):
     ready = [asyncio.Event() for _ in range(4)]
     residents_ready = [asyncio.Event() for _ in range(2)]
     salt = args.cache_salt or f"mixed-prefill-{time.time_ns()}"
+    failed = asyncio.get_running_loop().create_future()
+
+    def check_request(task):
+        if (
+            not task.cancelled()
+            and (error := task.exception()) is not None
+            and not failed.done()
+        ):
+            failed.set_result(error)
+
+    async def wait_ready(events):
+        ready_phase = asyncio.gather(*(event.wait() for event in events))
+        try:
+            done, _ = await asyncio.wait(
+                (ready_phase, failed),
+                timeout=args.timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if failed in done:
+                raise failed.result()
+            if ready_phase not in done:
+                raise TimeoutError("Requests did not reach the measurement phase")
+        finally:
+            if not ready_phase.done():
+                ready_phase.cancel()
+            await asyncio.gather(ready_phase, return_exceptions=True)
 
     async with httpx.AsyncClient(timeout=args.timeout, trust_env=False) as client:
 
@@ -71,19 +97,20 @@ async def measure(args, prompts):
                         if choice.get("finish_reason"):
                             record["finish_reason"] = choice["finish_reason"]
 
-        tasks = [asyncio.create_task(request(i)) for i in range(2)]
+        def start_request(index):
+            task = asyncio.create_task(request(index))
+            task.add_done_callback(check_request)
+            return task
+
+        tasks = [start_request(i) for i in range(2)]
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*(r.wait() for r in residents_ready)), args.timeout
-            )
+            await wait_ready(residents_ready)
             # Both requests are now in steady decode. No pause/barrier hides
             # interaction between their decode and the arriving prefill work.
             injected = time.monotonic()
-            long_tasks = [asyncio.create_task(request(i)) for i in range(2, 4)]
+            long_tasks = [start_request(i) for i in range(2, 4)]
             tasks.extend(long_tasks)
-            await asyncio.wait_for(
-                asyncio.gather(*(r.wait() for r in ready[2:])), args.timeout
-            )
+            await wait_ready(ready[2:])
             phase_end = max(records[i]["events"][0][0] for i in range(2, 4))
             if any(tasks[i].done() for i in range(2)):
                 raise RuntimeError("A resident ended before both prefills completed")

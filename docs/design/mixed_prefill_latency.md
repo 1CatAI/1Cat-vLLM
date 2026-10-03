@@ -100,8 +100,11 @@ The control source was b2335687 plus #841. The candidate incorporated main
 1d1d1c9d as well as this work. These results validate the combined candidate;
 they do not isolate the contribution of each kernel or intervening main fix.
 Eight deterministic natural-EOS answer checks passed in both arms. Long
-needle checks also used natural completion; cache-hit validation is recorded
-separately from repeated-prompt answer correctness.
+needle checks also used natural completion. The final SWA replay-window fix
+passed four natural-EOS 32K needle checks (two cold, two repeated), with a
+nonzero prefix-hit counter. Incoming TTFTs in this quality workload changed
+from 18.04/35.86 s to 5.21/10.20 s on the repeated prompts. This is evidence of
+correct cache reuse, not a comparison of uncached prefill kernel throughput.
 
 The first dequantization/GEMM fusion candidate was rejected. Communication
 and computation overlap is not implemented in this change. Broad scheduler
