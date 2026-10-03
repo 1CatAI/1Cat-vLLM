@@ -915,6 +915,8 @@ enum class TuneKeyKind : int {
   kNvfp4Dense = 7,
   kMxfp4Moe = 8,
   kNvfp4Moe = 9,
+  kGgufAffineU4 = 10,
+  kGgufAffineU8 = 11,
 };
 
 struct DenseTuneKey {
@@ -3296,9 +3298,13 @@ void gguf_affine_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                   static_cast<int>(m), static_cast<int>(n),
                                   static_cast<int>(out.stride(0))};
   turbomind::gemm::Operation operation{};
-  operation.dispatch =
-      bits == 4 ? select_awq_dense_dispatch_policy(device, m, n, k, 32, stream)
-                : select_dense_dispatch_policy(device, m, n, k, 32, stream);
+  // Canonical affine types use distinct keys and the existing measured cache.
+  // Never inherit AWQ's opt-in tuning gate or alias u4 and u8 tuning state.
+  // An uncached graph descriptor falls back without measuring in capture.
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, 32, stream,
+      bits == 4 ? TuneKeyKind::kGgufAffineU4 : TuneKeyKind::kGgufAffineU8, true,
+      false, 32);
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   operation.quant_b = {turbomind::gemm::QuantType::kK, 32};
   auto& workspace = get_workspace(device, stream);

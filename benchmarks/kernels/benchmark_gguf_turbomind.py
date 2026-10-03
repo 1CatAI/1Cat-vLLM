@@ -56,6 +56,11 @@ def elapsed(call, iterations, capture=False):
         with torch.cuda.graph(graph, stream=stream):
             result = call()
         measure = graph.replay
+        # Exclude the driver's first replay/upload from steady-state timing.
+        # Warming the eager call does not warm this newly instantiated graph.
+        for _ in range(3):
+            measure()
+        torch.accelerator.synchronize()
     else:
         measure = call
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
