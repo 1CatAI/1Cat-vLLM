@@ -226,6 +226,7 @@ def _nvfp4_qpn2_dispatch_linear(
     k: int,
     split_k: int,
     accumulator_chains: int,
+    activation_pack: bool = True,
 ) -> torch.Tensor:
     # The split on M happens here at run time, inside one opaque op: a Python
     # branch in the model's forward would be traced once by torch.compile at
@@ -237,7 +238,14 @@ def _nvfp4_qpn2_dispatch_linear(
 
         out = torch.empty((x.shape[0], n), dtype=x.dtype, device=x.device)
         sm70_ops.nvfp4_qpn2_gemm_sm70_out(
-            out, x, codes, scales, global_scale, split_k, accumulator_chains
+            out,
+            x,
+            codes,
+            scales,
+            global_scale,
+            split_k,
+            accumulator_chains,
+            activation_pack=activation_pack,
         )
         return out
     return _nvfp4_qpn2_dense_linear(x, codes, scales, global_scale, n, k)
@@ -252,6 +260,7 @@ def _nvfp4_qpn2_dispatch_linear_fake(
     k: int,
     split_k: int,
     accumulator_chains: int,
+    activation_pack: bool = True,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], n))
 
@@ -273,11 +282,20 @@ def nvfp4_qpn2_dispatch_linear(
     k: int,
     split_k: int,
     accumulator_chains: int,
+    activation_pack: bool = True,
 ) -> torch.Tensor:
     """QPN2 kernels for M <= 32, dequantization plus cuBLAS above.
 
     The split is decided at run time inside the op.
     """
     return torch.ops.vllm.nvfp4_qpn2_dispatch_linear(
-        x, codes, scales, global_scale, n, k, split_k, accumulator_chains
+        x,
+        codes,
+        scales,
+        global_scale,
+        n,
+        k,
+        split_k,
+        accumulator_chains,
+        activation_pack,
     )

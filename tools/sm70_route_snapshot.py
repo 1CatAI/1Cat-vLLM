@@ -126,7 +126,7 @@ def snapshot_layer(
         )
 
     def dispatch(name):
-        def run(*args):
+        def run(*args, **kwargs):
             # Record the opaque native entry and its scalar plan, not tensor addresses.
             calls.append(
                 {
