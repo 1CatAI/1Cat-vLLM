@@ -800,11 +800,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             dtype=self._meta_weight_dtype,
             device=device,
         )
-        host_storage = torch.empty(
-            (placement.host_rows, self.embedding_dim),
-            dtype=self._meta_weight_dtype,
-            device="cpu",
-            pin_memory=placement.host_rows > 0,
+        # Torch's caching host allocator rounds multi-GiB tables to the next
+        # power of two. Use the normal native factory so placement accounts
+        # for the actual allocation rather than a hidden 16-GiB block.
+        host_reference = torch.empty(0, dtype=self._meta_weight_dtype, device="cpu")
+        host_storage = torch.ops._C.create_cuda_pinned_tensor(
+            host_reference, [placement.host_rows, self.embedding_dim]
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.

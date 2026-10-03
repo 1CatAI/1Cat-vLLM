@@ -197,3 +197,28 @@ capability/configuration dispatch; final users must not set tuning variables.
   source trees untouched. Runtime is Python 3.12.14 / Torch 2.10.0+cu128;
   transfer the task source and normal in-tree native build with SHA verification,
   no private overlay and no wheel. Freeze the host's 185-W GPU power cap.
+
+- The owner confirms 256K service admission remains mandatory on the remote
+  host; speed inputs remain exactly 8192 tokens. Do not shrink context or KV
+  capacity to hide a failed startup. The first remote default run is killed
+  by the kernel OOM handler while PLE tables materialize (zero timed cases).
+  Its logical placement is 9.04 GiB pinned host plus 2.88 GiB device per rank.
+  Torch 2.10's CachingHostAllocator rounds 9.04 GiB to 16 GiB; four backing
+  allocations exceed the host's 62.7-GiB RAM despite the 15.67-GiB reserve.
+- Add a normal CPU-dispatched native factory using `cudaHostAllocMapped` at
+  the requested byte size, with shared ownership retained by the existing
+  UVA alias. PLE uses it without changing placement, dtype or table contents.
+  Native source build succeeds; six GPU allocation, mapping and lifetime
+  checks pass, including unchanged Torch host-cache allocation counters.
+  No wheel, preload, private DSO or new user setting is required.
+- The corrected owned-source BV16 recurrence component is 0.642517 ->
+  0.632661 ms (M5) and 0.777301 -> 0.764160 ms (M10) per 36 layers; finite
+  output/state checks pass, with maximum observed output error 3.0518e-5.
+  This confirms a tiny component gain and does not justify promotion.
+- Next numerical candidate: the worker's standard FP32-reduction policy
+  prevents the legacy MTP HC half-partial schedule from dispatching. Reuse
+  the already-shipped FP32-partial batch operator under that policy, honoring
+  explicit MTP/batch disables and retaining the legacy half-partial selection
+  when reduced reductions are enabled. Loader/dispatch CPU gates pass 26
+  tests. Full-model numerical, quality, acceptance and speed gates are pending;
+  this candidate is separate from the startup/memory repair.
