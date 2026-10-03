@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.kernel import Sm70SparseConfig
 from vllm.platforms.interface import DeviceCapability
 
 
@@ -64,7 +65,11 @@ def test_sparse_decode_retains_paged_route_for_measured_overhead_cases(
         ),
     ):
         reason = sparse._bmm_blocker(
-            q, prefill=False, index_width=width, prefer_paged=True
+            q,
+            Sm70SparseConfig(),
+            prefill=False,
+            index_width=width,
+            prefer_paged=True,
         )
     assert (reason is None) is preferred
 
