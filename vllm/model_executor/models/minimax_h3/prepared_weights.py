@@ -446,6 +446,46 @@ class PreparedWeights:
         self.lease.close()
 
 
+def load_transformer_checkpoint(
+    module,
+    weights,
+    paths,
+    *,
+    enabled,
+    fusion=None,
+    restore_adaln=False,
+    **cache_options,
+):
+    """Cache logical checkpoint tensors before ordinary quantizer post-processing.
+
+    Post-load layout conversion and precision validation still run on every
+    pipeline construction. Fused or reconstructed adapter checkpoints retain
+    their ordinary load and validation path.
+    """
+
+    def load():
+        loaded = module.load_weights(weights)
+        if fusion is not None:
+            fusion.validate_fully_applied(loaded)
+        required = set(dict(module.named_parameters()))
+        required.update(dict(module.named_buffers()))
+        missing = required - loaded
+        if missing:
+            raise RuntimeError(f"H3 DiT checkpoint missing tensors: {sorted(missing)}")
+
+    if not enabled or fusion is not None or restore_adaln:
+        if enabled:
+            logger.info(
+                "H3 transformer prepared-weight cache skipped: adapter transforms "
+                "require the ordinary checkpoint loader"
+            )
+        load()
+        return None
+    return load_cached_component(
+        module, load, paths, component="transformer_checkpoint", **cache_options
+    )
+
+
 def load_cached_component(
     module,
     load,
