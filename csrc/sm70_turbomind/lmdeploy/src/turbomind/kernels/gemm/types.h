@@ -90,6 +90,8 @@ enum class QuantType : int {
   kM = 2,
   kB = 3,
     kBitPlane = 4,
+    kLut4IQ = 5,
+    kLut4E2M1 = 6,
     kCenteredBitPlane3 = 7,
   kLatticeIQ2XXS = 8,
   kLatticeIQ2XS = 9,
@@ -113,6 +115,10 @@ inline const char* to_string(QuantType q) {
       return "b";
     case QuantType::kBitPlane:
       return "bitplane";
+    case QuantType::kLut4IQ:
+      return "lut4iq";
+    case QuantType::kLut4E2M1:
+      return "lut4e2m1";
     case QuantType::kCenteredBitPlane3:
       return "centeredbitplane3";
     default:

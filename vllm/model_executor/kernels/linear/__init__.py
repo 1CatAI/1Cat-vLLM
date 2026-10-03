@@ -62,6 +62,10 @@ from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
     Sm70GgufAffineConfig,
     TurboMindGgufAffineKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf_lut4 import (
+    Sm70GgufLut4Config,
+    TurboMindGgufLut4Kernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -213,6 +217,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindAwqLinearKernel,
         TurboMindGgufAffineKernel,
+        TurboMindGgufLut4Kernel,
         TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
@@ -374,6 +379,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
         TurboMindGgufAffineKernel,
+        TurboMindGgufLut4Kernel,
         TurboMindAwqLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
@@ -793,6 +799,12 @@ def choose_mp_linear_kernel(
             kernel
             for kernel in platform_kernels
             if issubclass(kernel, TurboMindGgufAffineKernel)
+        ]
+    elif isinstance(config, Sm70GgufLut4Config):
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindGgufLut4Kernel)
         ]
     elif isinstance(config, Sm70AwqLinearLayerConfig):
         # Other MP kernels accept GPTQ packing, not the legacy AWQ GEMM
@@ -1253,6 +1265,8 @@ __all__ = [
     "MPLinearLayerConfig",
     "Sm70GgufAffineConfig",
     "TurboMindGgufAffineKernel",
+    "Sm70GgufLut4Config",
+    "TurboMindGgufLut4Kernel",
     "AllSparkLinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",

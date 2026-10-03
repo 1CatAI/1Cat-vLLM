@@ -481,6 +481,9 @@ class KernelConfig:
     )
     """Observed MoE capability decisions, excluded from compilation hashing."""
 
+    fused_fp16_aux_gemv: bool = True
+    """Fuse compatible auxiliary projections already using exact FP16 GEMV."""
+
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
