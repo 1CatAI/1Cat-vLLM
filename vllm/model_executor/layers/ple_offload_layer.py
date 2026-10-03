@@ -237,6 +237,11 @@ class PleOffloadLayer(nn.Module, ABC):
     _gpu_output_buffer: torch.Tensor
     _sem: CpuGpuSemaphore
 
+    @classmethod
+    def supports_sampled_row_prefetch(cls) -> bool:
+        """Whether complete raw ngram keys identify immutable independent rows."""
+        return False
+
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Skip subclass initialization in cross-process GPU-worker mode."""
         super().__init_subclass__(**kwargs)

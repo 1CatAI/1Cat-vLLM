@@ -24,6 +24,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
 )
+from vllm.platforms import current_platform
 from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
@@ -86,6 +87,7 @@ class PleOffloadConnector:
         input_ids_source: torch.Tensor,
         query_start_loc_source: torch.Tensor,
         ngram_context_source: torch.Tensor | None,
+        sampled_keys_supported: bool = False,
     ) -> None:
         self.device = device
         self.dp_rank = get_dp_group().rank_in_group
@@ -107,6 +109,7 @@ class PleOffloadConnector:
         ).share_memory_()
         self._ngram_context_buf = None
         config = vllm_config.model_config.hf_text_config
+        self._ngram_eos_token_id = int(config.eos_token_id)
         ngram_context_len = int(config.ngram_size) - 1
         if ngram_context_len > 0:
             self._ngram_context_buf = torch.empty(
@@ -123,6 +126,58 @@ class PleOffloadConnector:
         self._ngram_context_source = ngram_context_source
         self._uses_cuda_inputs = self._input_ids_source.is_cuda
         self._validate_input_sources()
+
+        self._sampled_key_region = None
+        self._sampled_key_payload = None
+        self._sampled_key_epoch = None
+        prefetch_reason: str | None = "publisher_not_bound"
+        if (
+            vllm_config.kernel_config.ple_sample_prefetch
+            and self.tp_rank == 0
+            and self._uses_cuda_inputs
+            and sampled_keys_supported
+            and current_platform.has_device_capability(70, device_id=self.device.index)
+            and vllm_config.speculative_config is None
+            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and ngram_context_len > 0
+            and all(
+                layer.supports_sampled_row_prefetch() for layer in self._layers.values()
+            )
+        ):
+            try:
+                # This is only a tiny key/validity mailbox, never table memory.
+                shape = (scheduler_config.max_num_seqs, ngram_context_len + 2)
+                region = HostResultRegion.create(
+                    torch.empty(shape, dtype=torch.int32, device=self.device)
+                )
+                with torch.accelerator.device_index(self.device.index):
+                    self._sampled_key_payload = (
+                        torch.ops._C.get_cuda_view_from_cpu_tensor(region.result)
+                    )
+                    self._sampled_key_epoch = torch.zeros(
+                        1, dtype=torch.int32, device=self.device
+                    )
+                self._sampled_key_region = region
+                prefetch_reason = None
+            except (RuntimeError, ValueError) as error:
+                if "region" in locals():
+                    region.close()
+                logger.info("PLE sampled-key prefetch unavailable: %s", error)
+                self._sampled_key_payload = None
+                self._sampled_key_epoch = None
+                prefetch_reason = str(error)
+        for name in self._layers:
+            vllm_config.kernel_config.ple_result_transports[name]["sample_prefetch"] = {
+                "enabled": self._sampled_key_region is not None,
+                "reason": prefetch_reason,
+                "producer_tp_rank": 0,
+                "registered_key_bytes": (
+                    self._sampled_key_region.pinned_bytes
+                    if self._sampled_key_region
+                    else 0
+                ),
+                "scope": "prepared_sampled_key_publication",
+            }
 
         self._pinned_input_buffers: list[torch.Tensor] = []
         # MRV2 may queue more than one batch under asynchronous scheduling.
@@ -288,6 +343,12 @@ class PleOffloadConnector:
             cpu_output_buffers={
                 name: r.result for name, r in self._host_result_regions.items()
             },
+            sampled_key_payload=(
+                self._sampled_key_region.result if self._sampled_key_region else None
+            ),
+            sampled_key_flag=(
+                self._sampled_key_region.flag if self._sampled_key_region else None
+            ),
             input_ids_buf=self._input_ids_buf,
             query_start_loc_buf=self._query_start_loc_buf,
             ngram_context_buf=self._ngram_context_buf,
@@ -301,6 +362,8 @@ class PleOffloadConnector:
         payload = _dump_registration(registration)
         for region in self._host_result_regions.values():
             region.validate_registration()
+        if self._sampled_key_region is not None:
+            self._sampled_key_region.validate_registration()
         assert self._registration_socket is not None
         self._registration_socket.send(payload)
 
@@ -505,6 +568,25 @@ class PleOffloadConnector:
             return
         self._launch(num_reqs, num_tokens)
 
+    def publish_sampled_keys(self, history, mapping, seq_lens, sampled, counts) -> None:
+        """Start advisory CPU lookup without waiting for an acknowledgement."""
+        region = self._sampled_key_region
+        if region is None:
+            return
+        from vllm.model_executor.kernels.ple.sampled_keys import publish_sampled_keys
+
+        publish_sampled_keys(
+            history,
+            mapping,
+            seq_lens,
+            sampled,
+            counts,
+            self._sampled_key_payload,
+            region.cuda_flag,
+            self._sampled_key_epoch,
+            self._ngram_eos_token_id,
+        )
+
     def signal_dummy_outputs(self, num_tokens: int) -> None:
         """Locally satisfy PLE waits for dummy and capture forwards."""
         # Dummy and capture forwards do not send CPU requests, but every PLE
@@ -545,6 +627,9 @@ class PleOffloadConnector:
         for region in getattr(self, "_host_result_regions", {}).values():
             region.close()
         self._host_result_regions = {}
+        if (sampled_region := getattr(self, "_sampled_key_region", None)) is not None:
+            sampled_region.close()
+            self._sampled_key_region = None
         self._d2h_event_pool = None
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)

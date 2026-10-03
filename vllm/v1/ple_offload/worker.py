@@ -67,6 +67,7 @@ from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weigh
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.ple_offload.prefetch import ExactRowPrefetchCache, SampledKeyReader
 from vllm.v1.ple_offload.protocol import (
     _PLE_OFFLOAD_REQUEST_DECODER,
     PleOffloadRegistration,
@@ -569,6 +570,9 @@ class PleOffloadRunner:
         self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Shared-memory inputs are registered once per DP rank by TP rank zero.
         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
+        self._sampled_key_readers: dict[int, SampledKeyReader] = {}
+        self._prefetch_caches: dict[tuple[int, str], ExactRowPrefetchCache] = {}
+        self._prefetch_scratch: dict[tuple[int, str], torch.Tensor] = {}
         self._load_weights()
 
     @property
@@ -752,6 +756,38 @@ class PleOffloadRunner:
 
         registrations_by_dp: dict[int, list[PleOffloadRegistration]] = {}
         for registration in registrations:
+            payload = registration.sampled_key_payload
+            if (payload is None) != (registration.sampled_key_flag is None):
+                raise RuntimeError("Incomplete PLE sampled-key registration")
+            if payload is not None:
+                if (
+                    registration.tp_rank != 0
+                    or payload.shape
+                    != (
+                        self.vllm_config.scheduler_config.max_num_seqs,
+                        int(self.vllm_config.model_config.hf_text_config.ngram_size)
+                        + 1,
+                    )
+                    or not all(
+                        layer.supports_sampled_row_prefetch()
+                        for layer in self._layers.values()
+                    )
+                ):
+                    raise RuntimeError("Invalid PLE sampled-key capabilities or shape")
+                self._sampled_key_readers[registration.dp_rank] = SampledKeyReader(
+                    payload, registration.sampled_key_flag
+                )
+                for layer_name, layer in self._layers.items():
+                    key = (registration.dp_rank, layer_name)
+                    self._prefetch_caches[key] = ExactRowPrefetchCache(2 * len(payload))
+                    self._prefetch_scratch[key] = torch.empty(
+                        len(payload),
+                        int(self.vllm_config.model_config.hf_text_config.ple_embed_dim),
+                        dtype=layer.get_offload_output_dtype(
+                            self.vllm_config.model_config.dtype
+                        ),
+                        device="cpu",
+                    )
             registrations_by_dp.setdefault(registration.dp_rank, []).append(
                 registration
             )
@@ -923,7 +959,11 @@ class PleOffloadRunner:
         poller = zmq.Poller()
         poller.register(pull_socket, zmq.POLLIN)
         while not shutdown_event.is_set():
-            if pull_socket not in dict(poller.poll(timeout=100)):
+            if pull_socket not in dict(
+                poller.poll(timeout=0 if self._sampled_key_readers else 100)
+            ):
+                if not self._service_sampled_keys():
+                    time.sleep(0)
                 continue
 
             requests = []
@@ -941,6 +981,28 @@ class PleOffloadRunner:
                 raise RuntimeError("Unexpected PLE offload request") from error
 
             self._handle_requests(requests)
+
+    def _service_sampled_keys(self) -> bool:
+        """Populate advisory rows on the same thread as normal lookups."""
+        worked = False
+        for dp_rank, reader in self._sampled_key_readers.items():
+            keys = reader.read()
+            if not keys:
+                continue
+            worked = True
+            tokens = torch.tensor(keys, dtype=torch.int32)
+            offsets = torch.arange(len(keys) + 1, dtype=torch.int32)
+            for layer_name, layer in self._layers.items():
+                key = (dp_rank, layer_name)
+                result = layer.forward_impl(
+                    tokens[:, -1],
+                    tokens[:, -1],
+                    offsets,
+                    tokens[:, :-1],
+                    output_buffer=self._prefetch_scratch[key],
+                )
+                self._prefetch_caches[key].put(keys, result)
+        return worked
 
     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
         """Run requests layer-first so each DP rank can resume promptly."""
@@ -993,13 +1055,44 @@ class PleOffloadRunner:
                     if input_bufs.ngram_context_buf is not None
                     else None
                 )
-                result = layer.forward_impl(
-                    input_bufs.input_ids_buf[: request.num_tokens],
-                    input_bufs.input_ids_buf[: request.num_tokens],
-                    input_bufs.query_start_loc_buf[: request.num_reqs + 1],
-                    ngram_context,
-                    output_buffer=self._pinned_bufs[dp_rank][layer_name],
-                )
+                cache = getattr(self, "_prefetch_caches", {}).get((dp_rank, layer_name))
+                keys = None
+                if (
+                    cache is not None
+                    and ngram_context is not None
+                    and request.num_tokens == request.num_reqs
+                    and torch.equal(
+                        input_bufs.query_start_loc_buf[: request.num_reqs + 1],
+                        torch.arange(request.num_reqs + 1, dtype=torch.int32),
+                    )
+                ):
+                    keys = [
+                        tuple(context) + (int(token),)
+                        for context, token in zip(
+                            ngram_context.tolist(),
+                            input_bufs.input_ids_buf[: request.num_tokens].tolist(),
+                            strict=True,
+                        )
+                    ]
+                destination = self._pinned_bufs[dp_rank][layer_name][
+                    : request.num_tokens
+                ]
+                if (
+                    keys is not None
+                    and cache is not None
+                    and cache.copy(keys, destination)
+                ):
+                    result = destination
+                else:
+                    result = layer.forward_impl(
+                        input_bufs.input_ids_buf[: request.num_tokens],
+                        input_bufs.input_ids_buf[: request.num_tokens],
+                        input_bufs.query_start_loc_buf[: request.num_reqs + 1],
+                        ngram_context,
+                        output_buffer=self._pinned_bufs[dp_rank][layer_name],
+                    )
+                    if keys is not None and cache is not None:
+                        cache.put(keys, result)
 
                 # The result is identical on every TP rank in this DP group.
                 # Each copy stream signals only after its DMA completes.

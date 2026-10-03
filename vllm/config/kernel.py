@@ -490,6 +490,8 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed per-layer result transport and small pinned-buffer sizes."""
+    ple_sample_prefetch: bool = True
+    """Prefetch immutable rows when the runner supports sampled-key publication."""
 
     @field_validator("moe_backend", mode="before")
     @classmethod
