@@ -16,7 +16,8 @@ __global__ void lattice_grouped_vec_kernel(half* output, const half* input,
                                            const StridedPtr* weights,
                                            const StridedPtr* stats, int m,
                                            int k, int n) {
-  using Decoder = vllm::sm70_gguf::LatticeCanonicalDecoder<Type>;
+  using Decoder =
+      vllm::sm70_gguf::LatticeCanonicalDecoder<Type, Type == 18 ? 8 : 1>;
   using Transform = typename Decoder::Transform;
   const int expert = blockIdx.y;
   const int begin = offsets[expert], end = offsets[expert + 1];
