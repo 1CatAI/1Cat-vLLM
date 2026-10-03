@@ -269,7 +269,7 @@ class SpecDecodeBaseProposer:
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
-        self.use_local_argmax_reduction: bool = (
+        self.use_local_argmax_reduction: bool = bool(
             self.speculative_config.use_local_argmax_reduction
         )
 
