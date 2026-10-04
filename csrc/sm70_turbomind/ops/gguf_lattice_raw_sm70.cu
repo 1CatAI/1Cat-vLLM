@@ -547,9 +547,11 @@ void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
             splits);
   }
 }
-void validate_raw(torch::Tensor w, int type, int64_t n, int64_t k) {
-  TORCH_CHECK(type == 21 || type == 22, "Unsupported raw GGUF lattice type");
-  const int block_bytes = type == 21 ? 110 : 82;
+void validate_raw(torch::Tensor w, int type, int64_t n, int64_t k,
+                  bool allow_xxs = false) {
+  TORCH_CHECK(type == 21 || type == 22 || (allow_xxs && type == 18),
+              "Unsupported raw GGUF lattice type");
+  const int block_bytes = type == 18 ? 98 : type == 21 ? 110 : 82;
   const int64_t row_bytes = k / 256 * block_bytes;
   TORCH_CHECK(
       w.is_cuda() && w.scalar_type() == torch::kUInt8 && w.dim() == 2 &&
@@ -604,9 +606,11 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
                    out.scalar_type() == torch::kFloat32),
               "Raw GGUF dequant requires a contiguous FP16/FP32 [N,K] output");
   const c10::cuda::CUDAGuard guard(weight.device());
-  validate_raw(weight, source_type, out.size(0), out.size(1));
+  validate_raw(weight, source_type, out.size(0), out.size(1), true);
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (source_type == 21)
+  if (source_type == 18)
+    launch_dequant<18>(out, weight, stream);
+  else if (source_type == 21)
     launch_dequant<21>(out, weight, stream);
   else
     launch_dequant<22>(out, weight, stream);
@@ -626,7 +630,7 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
               "Raw GGUF vector requires FP16 M=1");
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
-  validate_raw(weight, source_type, n, k);
+  validate_raw(weight, source_type, n, k, true);
   TORCH_CHECK(splits >= 1 && splits <= k / 256,
               "Invalid raw GGUF split-K count");
   if (splits > 1)
@@ -648,13 +652,17 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
         reinterpret_cast<const half*>(input.data_ptr()),                    \
         weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
   if (prefetch) {
-    if (source_type == 21) {
+    if (source_type == 18) {
+      RAW_VEC(18, true);
+    } else if (source_type == 21) {
       RAW_VEC(21, true);
     } else {
       RAW_VEC(22, true);
     }
   } else {
-    if (source_type == 21) {
+    if (source_type == 18) {
+      RAW_VEC(18, false);
+    } else if (source_type == 21) {
       RAW_VEC(21, false);
     } else {
       RAW_VEC(22, false);
@@ -1101,8 +1109,8 @@ void gguf_lattice_raw_grouped_gate_up_sm70_out(
     torch::Tensor gate, torch::Tensor up, torch::Tensor input,
     torch::Tensor gate_weights, torch::Tensor up_weights, torch::Tensor offsets,
     torch::Tensor ids, int64_t source_type, int64_t top_k) {
-  TORCH_CHECK(source_type == 21 || source_type == 22,
-              "Raw grouped gate/up supports IQ3_S and IQ2_S");
+  TORCH_CHECK(source_type == 18 || source_type == 21 || source_type == 22,
+              "Raw grouped gate/up supports IQ3_XXS, IQ3_S and IQ2_S");
   TORCH_CHECK(
       input.is_cuda() && input.dim() == 2 &&
           input.scalar_type() == torch::kFloat16 && input.is_contiguous(),
@@ -1130,7 +1138,7 @@ void gguf_lattice_raw_grouped_gate_up_sm70_out(
                   ids.numel() == input.size(0),
               "Raw grouped gate/up route descriptor mismatch");
   const int64_t routes = input.size(0), k = input.size(1), n = gate.size(1);
-  const int bytes = source_type == 21 ? 110 : 82;
+  const int bytes = source_type == 18 ? 98 : source_type == 21 ? 110 : 82;
   TORCH_CHECK(top_k > 0 && top_k <= 16 && routes % top_k == 0 &&
                   routes / top_k <= 32 && n > 0 && n <= INT_MAX && k > 0 &&
                   k <= INT_MAX && k % 256 == 0 && gate_weights.size(0) > 0 &&
@@ -1139,7 +1147,10 @@ void gguf_lattice_raw_grouped_gate_up_sm70_out(
   if (!routes) return;
   const c10::cuda::CUDAGuard guard(input.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (source_type == 21)
+  if (source_type == 18)
+    dispatch_grouped_gate_up<18>(gate, up, input, gate_weights, up_weights,
+                                 offsets, ids, routes / top_k, stream);
+  else if (source_type == 21)
     dispatch_grouped_gate_up<21>(gate, up, input, gate_weights, up_weights,
                                  offsets, ids, routes / top_k, stream);
   else
