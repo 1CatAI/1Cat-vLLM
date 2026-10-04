@@ -271,7 +271,14 @@ the matched NVFP4 control by 12–19%. Prefill at 8K/32K is 2.423/10.263 s,
 remain identical to the preceding GGUF run and its llama.cpp reference.
 
 Full operator grids, graph attribution and model workload details are in
-`gguf_turbomind_model.md`. The fixed 36-case quality comparison is running
-separately. It is not complete, and the tiny-model 23-token Chinese difference
-is still open. Flash-Next remains TP4; its model integration, canonical MoE
-preparation and packed PLE offloading remain separate unfinished work.
+`gguf_turbomind_model.md`. The fixed 36-case quality comparison completes with
+34/36 for both GGUF and NVFP4: all code, arithmetic and Chinese cases pass,
+as do the 8K/32K needles. Both routes fail the 128K/258048-token needles with
+repeated `!`. An eager NVFP4 audit localizes the first nonfinite output to
+layer 15 attention in the second 8192-token prefill chunk. The captured Q/K/V
+are finite; an isolated Q8192 operator reproduces 34 positive infinities.
+The sampled tail maximum misses the actual peak by about 17. Tail intermediate
+range recovery is tracked in #875, separately from GGUF weight preparation.
+The tiny-model 23-token Chinese difference is still open. Flash-Next remains
+TP4; its model integration, canonical MoE preparation and packed PLE offloading
+remain separate unfinished work.
