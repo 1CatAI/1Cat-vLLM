@@ -1289,3 +1289,46 @@ body with FP32 accumulators and original scale bits. Routing offsets and
 caller-owned prefix scratch may change between graph replays. No CPU routing
 synchronization, per-token expert launch, persistent FP16 weight, or default
 model dispatch is added. Numeric and grouped timing gates remain pending.
+
+The normal grouped wheel (`d374319288`, core SHA256
+`646784f2234a34e59121b183cb930be4a37d1e3da780777276b107ffd566d060`)
+passes 54 checks in 12.57 s, including changed routing, empty experts, distinct
+expert scale bits, multi-K-block lookahead, and 1/7/512/1024 experts. No hidden
+library overrides are used; 210 installed dependencies are compatible.
+
+Real Flash expert gate comparisons use TP4 N160/K2560, E512 and ten distinct
+experts per input token. Graphs cycle ten distinct complete weight banks, so
+C1 active payloads exceed twice 6 MiB L2. Sorting and the rest of the FFN are
+excluded. Original-bit GPU packet conversion is performed before timing.
+
+| Format | Input tokens | Routed rows | Raw grouped us | Canonical grouped us |
+|---|---:|---:|---:|---:|
+| IQ3_S | 1 | 10 | 29.324 | 72.639 |
+| IQ3_S | 5 | 50 | 37.518 | 94.395 |
+| IQ3_S | 8 | 80 | 54.609 | 113.043 |
+| IQ3_S | 16 | 160 | 79.822 | 141.101 |
+| IQ3_S | 512 | 5120 | 331.224 | 525.757 |
+| IQ2_S | 1 | 10 | 30.800 | 61.159 |
+| IQ2_S | 5 | 50 | 48.837 | 81.237 |
+| IQ2_S | 8 | 80 | 57.563 | 94.022 |
+| IQ2_S | 16 | 160 | 88.404 | 104.694 |
+| IQ2_S | 512 | 5120 | 388.271 | 473.192 |
+
+Output relative L2 is 0.0002036–0.0002122 against official FP32 reconstruction
+rounded to the existing FP16 MMA operands, with FP32 dot accumulation. Full
+model numerical/quality and step-time comparisons remain separate gates.
+
+C8 NCU graph-node counters after L2 eviction show grouped main-node DRAM reads
+of 14,215,232 bytes (IQ3_S) and 10,761,856 bytes (IQ2_S), against 13,552,000
+and 10,102,400 active original payload bytes. The prefix node reads 9,184 bytes
+for each format. Main nodes use 122 registers and 18,688/24,832 shared bytes,
+19.99/16.40% active warps and 24.90/37.33% long-scoreboard stall. Activations,
+routing and memory-sector effects are included in DRAM counts; the counters
+do not prove one exact physical read per source byte. Profiler durations are
+not used to derive model TPOT. Persistent packet storage remains 90,112,000
+and 67,174,400 bytes per 512-expert projection, exactly the original TP payload.
+
+`benchmarks/kernels/benchmark_gguf_raw_grouped.py` provides the reproducible
+full-graph comparison, automatic weight-bank sizing, original-byte budget,
+official numerical oracle and per-route times. Routing sorting and the complete
+MoE layer must be measured after model integration before claiming step savings.
