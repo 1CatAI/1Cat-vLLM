@@ -576,3 +576,13 @@ quantized qkvz is 27.648 us, or 34.816 us with separate ba. The current
 37.888 us candidate still fails its 20 us target. Only eight GDN layers
 have both quantized segments in the supported type, so the local saving
 corresponds to 0.032768–0.040960 ms per round, not a full-model result.
+
+The bounded cache-policy control retains the read-only signed table and
+changes weight loads to streaming, with a 33% carveout request. It has
+78.375 instructions/K16, 54 registers, 16 KiB partial storage and no
+spills. Outputs remain bitwise retained. Matched read-only-cached/stream/
+stream/read-only-cached is 100.352/92.160/92.160/100.352 us, versus
+shared 62.464 us and native NVFP4 51.200–52.224 us. Cache policy explains
+part of the read-only regression but does not make it competitive.
+The shared decoder remains the research candidate. No optimized route is
+enabled in the normal model runtime by these source checkpoints.
