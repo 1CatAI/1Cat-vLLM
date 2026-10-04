@@ -57,7 +57,7 @@ struct LatticeRawDecoder {
   // so the reference FP32 product is exact too. One final half2 multiply
   // therefore matches FP32 dequantization followed by round-to-nearest half.
   // Float output and vector FMA still use the original FP32 scale formula.
-  template <class Output>
+  template <class Output, bool IntegerFactor = false>
   __device__ static turbomind::Array<Output, 8> table_fragment(uint64_t packed,
                                                                uint32_t signs,
                                                                float d,
@@ -78,7 +78,18 @@ struct LatticeRawDecoder {
         const uint32_t mask =
             (((signs >> i) & 1) << 15) | (((signs >> (i + 1)) & 1) << 31);
         (uint32_t&)values ^= mask;
-        const half2 exact_factor = __hmul2(values, factor);
+        half2 exact_factor;
+        if constexpr (Type == 21 && IntegerFactor) {
+          // Positive grids are 1..15 and the original factor is 1..31.
+          // Two 16-bit integer lanes multiply without carry. Adding the
+          // FP16 1024 magic is exact for all products (maximum 465).
+          const uint32_t integers = __byte_perm(bytes, 0, 0x4140) - 0x00800080U;
+          const uint32_t products = integers * (1 + 2 * nibble) + magic;
+          exact_factor = __hsub2((const half2&)products, (const half2&)magic);
+          (uint32_t&)exact_factor ^= mask;
+        } else {
+          exact_factor = __hmul2(values, factor);
+        }
         (half2&)result[i] = __hmul2(exact_factor, base);
       }
       return result;
