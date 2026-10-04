@@ -840,8 +840,8 @@ and 12.6% slower for down, so narrower extraction alone does not close the
 dense concurrency gap. Flash gate M512 retains an 8.7% gap in this run;
 Flash output is 8.8% faster. These are complete unprofiled graph paths with
 FP32 accumulation, cold weight banks, identical shape controls and 100
-replays. M1 does not use the changed warp packet-fetch path and is not
-repeated here. Grouped expert/model step gains remain unmeasured.
+replays. The previously selected M1 original-row and row-wise vector paths do
+not use the changed warp packet-fetch path and are not repeated here. Grouped expert/model step gains remain unmeasured.
 
 Installed core SHA256:
 `450dcc11c47ab2823730ad241791945102f4fa8354533f83d6e68ec01ea9be2e`.
