@@ -74,6 +74,30 @@ FP32 reference stays below 0.000213; ordinary-activation maximum absolute
 error is at most 6.07e-5, and the large-Q case is 0.000971 after FP16 output
 rounding. Thirteen CPU admission checks pass.
 
-The prototype is a research extension. The normal FA2 build, complete wheel,
-backend route-hit and model measurements are still pending; do not treat the
-prototype as a required runtime sidecar or a production performance result.
+## Normal package validation
+
+The normal CMake FA2 target and complete wheel at source
+`96d2b8efb28c2274bba8acad6b43fb3306ccdd7b` build and install successfully.
+The wheel passes 100 CPU loading/admission checks in 11.45 seconds and five
+GPU reference/graph checks in 3.67 seconds. The latter exercise q2/q8,
+strided KV, C4, 128K/256K context and zeroed device lengths.
+
+Five Python modules match source, wheel and installed contents exactly.
+All sixteen native libraries match either the qualified base (fifteen) or
+the newly built FA2 artifact. ELF dependencies contain only standard
+Torch/CUDA/cuBLAS/system libraries. A fresh process registers the native
+operator from the normal package without an external library override.
+
+The actual backend method selects the FP16 grouped route. Its graph replay
+matches the native entry exactly, with noncontiguous KV strides
+[439296,264,264,1]. Cold-L2 normal-wheel timings are:
+
+| Requests | Rows/request | Live context | Backend µs |
+| ---: | ---: | ---: | ---: |
+| 1 | 8 | 1024 | 39.936 |
+| 1 | 8 | 8192 | 76.800 |
+| 4 | 8 | 8192 | 237.568 |
+
+The complete model/trace comparison follows the shared floating-projection
+loading integration boundary. These package/backend results do not establish
+complete-round speed or model-level acceptance equivalence.
