@@ -3116,6 +3116,16 @@ def sm70_qwen38_hc_up_local(lora, packed, branches, output, rank) -> None:
     )
 
 
+def supports_sm70_qwen38_hc_replicated() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_replicated")
+
+
+def sm70_qwen38_hc_replicated(x, down, up, partials, lora, output, injection) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_replicated(
+        x, down, up, partials, lora, output, injection
+    )
+
+
 def sm70_qwen38_hc_batch(
     fa: int,
     inp: torch.Tensor,

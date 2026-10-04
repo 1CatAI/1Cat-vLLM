@@ -64,3 +64,23 @@ def test_local_hc_fp32_arithmetic_and_disjoint_tp_packets(m):
         torch.testing.assert_close(block, previous, rtol=0, atol=0)
     actual = torch.stack(blocks).float().sum(0).half()
     torch.testing.assert_close(actual, reference_block, rtol=0.003, atol=0.003)
+    assert ops.supports_sm70_qwen38_hc_replicated()
+    packed_down = _pack_hc_batch_weight(down, "down", None)
+    packed_up = _pack_hc_batch_weight(up, "up", None)
+    partials = torch.empty(20, m, 352, dtype=torch.float32, device="cuda")
+    lora = torch.empty(m, 320, dtype=torch.float16, device="cuda")
+    block = torch.empty(m, 2560, dtype=torch.float16, device="cuda")
+    injection = torch.empty(m, 4, dtype=torch.float16, device="cuda")
+    ops.sm70_qwen38_hc_replicated(
+        x, packed_down, packed_up, partials, lora, block, injection
+    )
+    torch.testing.assert_close(block, reference_block, rtol=0.003, atol=0.003)
+    torch.testing.assert_close(injection, projected[:, 320:324], rtol=0.003, atol=0.003)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.sm70_qwen38_hc_replicated(
+            x, packed_down, packed_up, partials, lora, block, injection
+        )
+    previous = block.clone()
+    graph.replay()
+    torch.testing.assert_close(block, previous, rtol=0, atol=0)
