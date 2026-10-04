@@ -104,6 +104,7 @@ def _hash_subject(method, policy):
         sm70_dflash2=policy,
         mtp_expert_quantization=None,
         draft_model_config=None,
+        use_local_argmax_reduction=None,
         use_dflash_family=lambda: method == "dflash",
         use_dspark=lambda: False,
         use_dflash_ddtree=lambda: False,
