@@ -83,13 +83,31 @@ gate failed:
 
 Serial and pair-first product folding, and alternate lane reduction trees,
 were checked against retained real inputs without finding a better match.
-Further layout trials are stopped. The complete natural quality suite and
-768-position distribution comparison are an investigation of the initial
-thresholds, not admission under relaxed limits. Thresholds remain unchanged;
-promotion requires a documented, evidence-based contract decision.
+Further layout trials are stopped. The complete natural quality comparison
+also rejects this candidate; distribution thresholds remain unchanged.
 
-Matched natural task-quality results, endpoint per-step timing, a short C4
-health check and the graph-node trace remain pending. No model speedup or
-phase-target claim is accepted yet. In-projection,
+The matched installed-artifact endpoint uses TP4, 262144 startup capacity,
+8192 input / 513 output tokens, FP16 dense/activations/KV, FP32 state, CUDA
+graphs, disk-mapped ngrams and no MTP. Six timing samples follow one warmup.
+GPU 0–3 are V100-SXM2-32GBs with full NVLink connectivity, a measured 300-W
+power limit and 877-MHz memory clocks; no GPU settings were changed.
+
+| Arm | C1 median ms/token | Sample range ms/token | M=1 admitted matrices/rank | Task scores | Natural EOS |
+| --- | ---: | ---: | --- | ---: | ---: |
+| Disabled via existing kernel registry | 11.04115 | 10.92117–11.17972 | 0/0/0/0 | 36/36 | 36/36 |
+| Fusion enabled | 11.06298 | 10.86482–11.24090 | 39/32/29/35 | 36/36 | 35/36 |
+
+The candidate median is 0.20% higher, with overlapping sample ranges. This
+does not establish an endpoint speedup despite the isolated 15.2% reduction.
+With identical seeded natural sampling, MBPP-16 stops at 628 tokens in the
+control, but reaches the 4096-token cap in the candidate and repeats a long
+final-answer line eleven times. Passing the code assertions does not override
+that output-health regression. Both arms retain all four needle contexts,
+including 258K. The 768-position investigation, C4 smoke and graph-node trace
+were skipped after the C1 quality failure; no default admission is claimed.
+
+The quality runner now records output-health failures independently of task
+scores and returns a nonzero status when health fails. The failed fusion is
+retained as research evidence and is not merged. In-projection,
 out-projection, LM head, MTP, dense quantization and communication algorithms
 are outside this change.
