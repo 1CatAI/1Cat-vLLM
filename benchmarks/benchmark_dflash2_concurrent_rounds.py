@@ -147,9 +147,8 @@ async def run(args):
                 await profile_task
                 response = await client.post(args.base_url + "/stop_profile")
                 response.raise_for_status()
-        if args.profile_after_chunks is not None:
-            if profile_task is None:
-                raise ValueError("Cohort completed before profiling could start")
+        if args.profile_after_chunks is not None and profile_task is None:
+            raise ValueError("Cohort completed before profiling could start")
     result = {
         "contract": {
             key: str(value) if isinstance(value, Path) else value
