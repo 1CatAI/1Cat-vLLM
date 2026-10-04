@@ -64,7 +64,30 @@ expert intervals. Singleton intervals read each block once; pairs share the
 same decoded block. Longer intervals reuse the shared codebook and reread
 weight blocks for their next pair. M=1 retains its single-token tile.
 This preserves the FP32 reduction order of each token while bounding
-register pressure. Correctness and speed for that revision are pending.
+register pressure. Source `a28fda2095`, ordinary package `1.5.2.dev542`, passes
+the same eight GPU checks, including bitwise raw-vector comparison and graph
+replay. Its core SHA256 is
+`f256c98d99cff4b9760c305f94207d6befe61e199476c6d1a715b503429d4ea1`.
+The token-pair variants use 48 registers for IQ2_S and 56 for IQ3_S, with
+no local-memory spill.
+
+| Type | M | Canonical gate/up (µs) | Token-pair raw gate/up (µs) | Saving (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| IQ2_S | 1 | 121.858 | 17.011 | 104.847 |
+| IQ2_S | 5 | 159.891 | 72.013 | 87.878 |
+| IQ2_S | 20 | 213.280 | 239.777 | -26.497 |
+| IQ3_S | 1 | 142.715 | 15.207 | 127.508 |
+| IQ3_S | 5 | 186.012 | 67.478 | 118.534 |
+| IQ3_S | 20 | 289.946 | 223.569 | 66.377 |
+
+Projection errors are unchanged from the initial implementation. Using the
+20 IQ2_S and 10 IQ3_S layers suggests 2.943 ms less gate/up service at M=5.
+This remains a layer extrapolation; acceptance and full-round latency are
+unmeasured. IQ2_S at M=20 still rejects default vector dispatch.
+
+A further operator screen doubles output rows per CTA for M greater than one,
+amortizing codebook initialization across eight output rows. The M=1 row tile
+is retained. That revision is pending correctness and speed measurements.
 
 The checkpoint contains IQ3_XXS in 17 gate/up layers, IQ2_S in 20, IQ3_S in
 10 and IQ4_XS in one. This operator currently covers the 30 IQ2_S/IQ3_S
