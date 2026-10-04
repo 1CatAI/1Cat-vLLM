@@ -568,6 +568,8 @@ def main():
                     workspace,
                     natural,
                     temporary,
+                    partitions=1,
+                    shared_metadata=False,
                 ):
                     torch.ops._C.gguf_lattice_compact_blas_sm70_out(
                         temporary,
@@ -576,25 +578,59 @@ def main():
                         source_type,
                         workspace,
                         natural,
+                        99,
+                        partitions,
+                        shared_metadata,
                     )
                     output.copy_(temporary)
 
                 for natural, scratch in ((False, raw_scratch), (True, natural_scratch)):
-                    candidates.append(
-                        (
-                            "compact_dequant_cublas_f32" + ("_tn" if natural else ""),
-                            partial(
-                                fp32_blas,
-                                out,
-                                x,
-                                compact,
-                                kind,
-                                scratch,
-                                natural,
-                                fp32_result,
-                            ),
+                    schedules = [(1, False)]
+                    if not natural:
+                        schedules += [(2, False), (4, False)]
+                        if n % 32 == 0:
+                            schedules += [(2, True), (4, True)]
+                    for partitions, shared in schedules:
+                        suffix = "_tn" if natural else ""
+                        if partitions != 1:
+                            suffix += f"_parts{partitions}"
+                        if shared:
+                            suffix += "_sharedmeta"
+                        candidates.append(
+                            (
+                                "compact_dequant_cublas_f32" + suffix,
+                                partial(
+                                    fp32_blas,
+                                    out,
+                                    x,
+                                    compact,
+                                    kind,
+                                    scratch,
+                                    natural,
+                                    fp32_result,
+                                    partitions,
+                                    shared,
+                                ),
+                            )
                         )
-                    )
+                        if shared:
+                            candidates.append(
+                                (
+                                    f"compact_dequant_cublas_algo2_parts{partitions}_sharedmeta",
+                                    partial(
+                                        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                                        out,
+                                        x,
+                                        compact,
+                                        kind,
+                                        scratch,
+                                        False,
+                                        102,
+                                        partitions,
+                                        True,
+                                    ),
+                                )
+                            )
         old()
         old_error = errors(out, expected)
 

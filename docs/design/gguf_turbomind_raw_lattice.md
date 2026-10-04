@@ -1384,3 +1384,30 @@ instead of loading them separately in all eight warps. It publishes through
 the existing codebook barrier and queues each warp's first original packet
 before setup. Shared planes retain original bits; there is no expanded FP16
 coefficient, persistent overhead, precision change, or model default.
+
+Cooperative metadata passes 58 focused checks in 13.84 s, including exact
+temporary FP16 weights, changed inputs and overflow cancellation with both
+FP16/FP32 results. In full graphs on the real Flash gate M512 shape (eight
+distinct banks), FP32 output/default cuBLAS/two partitions improves from
+94.088 to 92.978 us; FP16 output/algorithm 2/two partitions improves from
+96.244 to 94.404 us. Four-partition comparisons show little benefit. Same-run
+canonical is 89.941 us, leaving a 3.4% speed gap. No model default is selected.
+
+The normal compiler reports unchanged 32 registers and no spills for both
+formats, with only 384 additional shared bytes. NCU of the FP32-output winner
+shows DQ reads 1,727,552 bytes, 70.99% active warps and 35.90% long-scoreboard
+stall (prior DQ comparison: 42.73%). Its cuBLAS kernel uses 138 registers,
+14.21% active warps and reads 10,981,856 bytes; final FP16 copy reads 3,147,168
+bytes. These nodes and byte budgets are reported independently; profiler
+durations are not used as model step latency. The public dense benchmark now
+includes cooperative metadata and FP32-output partition controls.
+
+A CPU Q2_0 TP4 fragment prototype on three real down experts (N2560/K640)
+produces exact original-byte inverses and FP32 reconstruction for local K160.
+It uses 46 unaligned bytes per rank row, totaling 184 versus 180 original
+bytes: four duplicated original scale bytes per complete row. This is not a
+strict equal-byte implementation, has no GPU kernel or default, and remains
+separate from the accepted IQ3_S/IQ2_S storage layouts.
+
+The complete real-weight FP32 GEMM algorithm check times out before acquiring
+the shared GPU lock; it provides no new algorithm performance evidence.
