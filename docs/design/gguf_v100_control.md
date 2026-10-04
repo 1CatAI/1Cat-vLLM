@@ -262,3 +262,34 @@ has SHA256 `17a06f4c462608c07006aaf1fb71d902dc1362380a7df0b7d7339d310873345e`;
 all 210 installed dependencies are compatible. The subsequent main sync adds
 the independently validated IQ3_XXS grouped-vector codebook layout; that
 operator is not used by the tiny dense model in this check.
+
+### Canonical dense model integration and coalescing
+
+The installed dense GGUF integration prepares affine, LUT4 and lattice
+projections through the shared TurboMind lifecycle. Adjacent compatible shards
+coalesce before packing; mixed types retain separate ordered dispatch. Real
+projection sweeps select FP16 caching for merged Q8 alpha/beta rows and canonical
+DQ+FP32 cuBLAS for calibrated large affine shapes. FP16 activations and FP32
+accumulation are preserved. Twelve targeted GPU checks pass from source and
+from a fresh normal wheel; the core fingerprint is unchanged.
+
+Qwen3.8-27B UD-Q4_K_M, TP4 on V100 x4, FP16 activation/KV, no MTP,
+FULL_AND_PIECEWISE graphs, I1024/O128 and two complete-cohort repeats:
+C1/C4/C8/C16 aggregate pure decode is 58.88/216.73/396.87/671.47 tok/s.
+These improve the preceding GGUF implementation by 21–24%, while still trailing
+the matched NVFP4 control by 12–19%. Prefill at 8K/32K is 2.423/10.263 s,
+3.4%/2.0% faster than that control. All four natural greedy sequences and EOS
+remain identical to the preceding GGUF run and its llama.cpp reference.
+
+Full operator grids, graph attribution and model workload details are in
+`gguf_turbomind_model.md`. The fixed 36-case quality comparison completes with
+34/36 for both GGUF and NVFP4: all code, arithmetic and Chinese cases pass,
+as do the 8K/32K needles. Both routes fail the 128K/258048-token needles with
+repeated `!`. An eager NVFP4 audit localizes the first nonfinite output to
+layer 15 attention in the second 8192-token prefill chunk. The captured Q/K/V
+are finite; an isolated Q8192 operator reproduces 34 positive infinities.
+The sampled tail maximum misses the actual peak by about 17. Tail intermediate
+range recovery is tracked in #875, separately from GGUF weight preparation.
+The tiny-model 23-token Chinese difference is still open. Flash-Next remains
+TP4; its model integration, canonical MoE preparation and packed PLE offloading
+remain separate unfinished work.
