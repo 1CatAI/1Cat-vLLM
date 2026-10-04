@@ -323,6 +323,12 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
             "components": copies,
             "total_bytes": sum(copies.values()) if reference_layout else None,
             "excludes": "allocator overhead, graphs, temporary workspaces and KV cache",
+            "precision_policy_note": (
+                "Router/shared estimates assume FP16 reduced-precision reductions "
+                "are enabled and FP16 accumulation is disabled. Workers skip "
+                "these copies otherwise; inspect sm70_preparations for actual "
+                "packed bytes and per-layer precision rejection reasons."
+            ),
             "capacity_note": (
                 "Packed weights reduce memory available to KV and graph/workspace "
                 "peaks. An explicit KV byte budget does not shrink automatically. "

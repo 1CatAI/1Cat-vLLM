@@ -546,6 +546,21 @@ direct_register_custom_op(
 )
 
 
+def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
+    # Match the router/shared runtime precision guards without changing their
+    # forward hooks or fallbacks. The worker sets this policy before loading;
+    # configure it before preparing weights, not during graph replay.
+    matmul = torch.backends.cuda.matmul
+    reason = None
+    if not matmul.allow_fp16_reduced_precision_reduction:
+        reason = "fp16_reduced_precision_reduction_disabled"
+    elif matmul.allow_fp16_accumulation:
+        reason = "fp16_accumulation_enabled"
+    # The loaded-worker report already collects _sm70_*_reason attributes.
+    setattr(layer, f"_sm70_mtp_{role}_batch_reason", reason)
+    return reason is None
+
+
 class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
     """Prepare admitted FP16 projections; use row GEMV for single tokens."""
 
@@ -559,7 +574,9 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
             raise RuntimeError(
                 "Rebuild the SM70 extension for batched dense projections"
             )
-        if getattr(layer, "_sm70_mtp_prepare_shared_batch", False):
+        if getattr(
+            layer, "_sm70_mtp_prepare_shared_batch", False
+        ) and _mtp_batch_packing_allowed(layer, "shared"):
             weight = layer.weight
             if weight.is_cuda and weight.dtype == torch.float16:
                 if not hasattr(torch.ops._C, "qwen38_shared_up_batch_sm70_out"):
@@ -576,7 +593,9 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
             from .sm70_fp16_hc import _prepare_hc_batch_weight
 
             _prepare_hc_batch_weight(layer)
-        if getattr(layer, "_sm70_mtp_prepare_router_batch", False):
+        if getattr(
+            layer, "_sm70_mtp_prepare_router_batch", False
+        ) and _mtp_batch_packing_allowed(layer, "router"):
             weight = layer.weight
             if weight.is_cuda and weight.dtype == torch.float16:
                 if not hasattr(torch.ops._C, "qwen38_router_batch_sm70_out"):
