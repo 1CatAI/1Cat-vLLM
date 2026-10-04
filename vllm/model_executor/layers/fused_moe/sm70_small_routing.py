@@ -123,10 +123,10 @@ def _small_route(
         boundaries = torch.arange(experts + 1, device=x.device)
         offsets = torch.searchsorted(sorted_ids, boundaries).to(torch.int32)
         routed = x[order // top_k].contiguous()
-        return routed, offsets, sorted_ids, order.argsort().to(torch.int32)
+        return routed, offsets, sorted_ids.long(), order.argsort().to(torch.int32)
     routed = x.new_empty((r, h))
     offsets = torch.empty(experts + 1, device=x.device, dtype=torch.int32)
-    sorted_ids = ids.new_empty((r,))
+    sorted_ids = torch.empty(r, device=x.device, dtype=torch.int64)
     inverse = torch.empty(r, device=x.device, dtype=torch.int32)
     _route_and_gather[(triton.cdiv(r, 8), triton.cdiv(h, 256))](
         x,
@@ -152,7 +152,7 @@ def _small_route_fake(x: torch.Tensor, ids: torch.Tensor, experts: int):
     return (
         x.new_empty((r, x.shape[1])),
         torch.empty(experts + 1, device=x.device, dtype=torch.int32),
-        ids.new_empty((r,)),
+        torch.empty(r, device=x.device, dtype=torch.int64),
         torch.empty(r, device=x.device, dtype=torch.int32),
     )
 
