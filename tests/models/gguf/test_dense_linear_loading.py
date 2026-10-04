@@ -103,3 +103,30 @@ def test_model_dense_preparation_runs_after_all_linear_methods(monkeypatch):
         model, SimpleNamespace(quantization="gguf"), torch.device("cpu")
     )
     assert events == [model.a, model.b, "prepare"]
+
+
+@pytest.mark.parametrize("reduced", [False, True])
+def test_fp32_router_does_not_require_fp16_partial_reduction(reduced, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm import envs
+    from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+        _router_batch_runtime_ok,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_SM70_MTP_ROUTER_BATCH", True)
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", reduced
+    )
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+    common = dict(
+        dtype=torch.float16,
+        device=torch.device("cuda:0"),
+        is_cuda=True,
+        is_contiguous=lambda: True,
+        data_ptr=lambda: 16,
+    )
+    x = SimpleNamespace(ndim=2, shape=(5, 2560), **common)
+    packed = SimpleNamespace(shape=(64, 40, 2, 4, 8, 8), **common)
+    assert _router_batch_runtime_ok(x, packed)

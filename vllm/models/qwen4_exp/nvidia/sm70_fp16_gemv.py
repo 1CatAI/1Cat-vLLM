@@ -340,7 +340,8 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         and packed.dtype == x.dtype
         and packed.is_contiguous()
         and packed.data_ptr() % 16 == 0
-        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        # This kernel keeps all four partials and their ordered sum in FP32.
+        # The cuBLAS reduced-precision switch does not describe its arithmetic.
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
     )
 
