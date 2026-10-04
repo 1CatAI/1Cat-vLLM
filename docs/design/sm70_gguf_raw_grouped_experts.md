@@ -97,9 +97,21 @@ GPU checks but provides no material improvement. The row change is reverted.
 | IQ3_S | 5 | 186.065 | 68.976 |
 | IQ3_S | 20 | 288.036 | 220.812 |
 
-The token-pair implementation is retained. IQ2_S at M=20 still uses the
-canonical operator when scheduling is connected. A single-kernel counter
-sample precedes further changes; no model restart follows these tile screens.
+The token-pair implementation is retained. The central kernel capability
+declaration admits measured original batches M=1/5 for IQ2_S and M=1/5/20
+for IQ3_S. IQ2_S M=20 reports
+`measured_slower_than_canonical_grouped_gemm`; unmeasured batches and shapes
+retain canonical scheduling. Seven CPU capability tests pass. The rejection
+uses original token count, before top-k routing expands it.
+
+The current ordinary package is `1.5.2.dev548` from `4331761a4f`. Its core
+SHA256 is
+`efc4cb077ae69c45848c187a048b09683f71a3a007c8fdc2623114f0834941c7`;
+the whole wheel SHA256 is
+`eeeca72f392165b292e0fd1bc70a39b15d8247ac1a1b40dd142b266d41ee1ee1`.
+Native source matches the tested token-pair revision. Fresh-process package
+import and dependency checks pass without private library overrides.
+No model restart follows these tile screens.
 
 The checkpoint contains IQ3_XXS in 17 gate/up layers, IQ2_S in 20, IQ3_S in
 10 and IQ4_XS in one. This operator currently covers the 30 IQ2_S/IQ3_S
