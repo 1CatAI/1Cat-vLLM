@@ -85,9 +85,21 @@ Projection errors are unchanged from the initial implementation. Using the
 This remains a layer extrapolation; acceptance and full-round latency are
 unmeasured. IQ2_S at M=20 still rejects default vector dispatch.
 
-A further operator screen doubles output rows per CTA for M greater than one,
-amortizing codebook initialization across eight output rows. The M=1 row tile
-is retained. That revision is pending correctness and speed measurements.
+A further screen doubles output rows per CTA for M greater than one,
+amortizing codebook initialization across eight output rows. Source
+`93a23db`, packaged with documentation in `1.5.2.dev545`, passes all eight
+GPU checks but provides no material improvement. The row change is reverted.
+
+| Type | M | Canonical gate/up (µs) | Larger row tile (µs) |
+| --- | ---: | ---: | ---: |
+| IQ2_S | 5 | 159.152 | 72.079 |
+| IQ2_S | 20 | 213.595 | 234.520 |
+| IQ3_S | 5 | 186.065 | 68.976 |
+| IQ3_S | 20 | 288.036 | 220.812 |
+
+The token-pair implementation is retained. IQ2_S at M=20 still uses the
+canonical operator when scheduling is connected. A single-kernel counter
+sample precedes further changes; no model restart follows these tile screens.
 
 The checkpoint contains IQ3_XXS in 17 gate/up layers, IQ2_S in 20, IQ3_S in
 10 and IQ4_XS in one. This operator currently covers the 30 IQ2_S/IQ3_S
