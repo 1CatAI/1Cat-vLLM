@@ -42,7 +42,6 @@ def main():
     parser.add_argument("--prompts-json", type=Path, required=True)
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--cuda-profiler-capture", action="store_true")
-    parser.add_argument("--eager", action="store_true")
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 4, 8, 16])
@@ -86,7 +85,8 @@ def main():
         enable_prefix_caching=False,
         disable_log_stats=False,
         language_model_only=True,
-        enforce_eager=args.eager,
+        enforce_eager=False,
+        compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
     )
     if args.model.suffix.lower() == ".gguf":
         config["quantization"] = "gguf"
@@ -125,8 +125,20 @@ def main():
     def save():
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
+    save()
     llm = LLM(**config)
     try:
+        resolved = llm.llm_engine.vllm_config.compilation_config
+        report["resolved_compilation"] = {
+            "mode": resolved.mode.name,
+            "cudagraph_mode": resolved.cudagraph_mode.name,
+        }
+        save()
+        if resolved.cudagraph_mode.name != "FULL":
+            raise RuntimeError(
+                "FULL CUDA graph was downgraded to "
+                f"{resolved.cudagraph_mode.name}; no timing results recorded"
+            )
         report["worker_routes"] = llm.collective_rpc(
             "get_sm70_acceleration_report", timeout=30
         )

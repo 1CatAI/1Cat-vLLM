@@ -141,3 +141,17 @@ the driver fails. Both CPU cases pass from source and the installed wheel.
 This diagnostic changes neither precision nor kernel dispatch. The same
 8192-token full-model retry must establish whether cold compilation, retained
 allocations or another source accounts for the OOM before changing budgets.
+
+## Full CUDA graph measurement contract
+
+Model measurements explicitly request VLLM_COMPILE with CUDA graph mode FULL.
+The benchmark records the resolved compilation mode and rejects a downgrade
+before collecting timing results. Eager measurements are excluded from the
+model comparison; earlier isolated memory diagnostics remain historical
+evidence. Numerical checks compare finite values, reconstruction errors and
+logit distributions without requiring identical generated token sequences.
+
+The default FULL_AND_PIECEWISE retry was stopped during checkpoint loading
+when the measurement contract changed. It produced no timing results. The
+replacement retains TP4, FP16 operands/KV, FP32 SSM state and accumulation,
+8192-token batches, and the same C1/C4/C8/C16 and 8K/32K workloads.
