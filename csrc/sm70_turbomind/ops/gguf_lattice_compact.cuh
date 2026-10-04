@@ -58,41 +58,48 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     return result;
   }
 
-  // All 32 lanes participate, including lanes whose output column is masked.
-  // At width 32 this issues 13/9 adjacent uint64 reads for IQ3_S/IQ2_S.
-  // The final N tile uses a continuous bitstream without per-octet padding.
+  struct PacketWindow {
+    uint64_t loaded;
+    int bias;
+  };
+
+  // Fetch is separate from shuffling so a caller can prefetch the next
+  // original-bit packet window while decoding and multiplying the current one.
   template <bool FullWidth = false>
-  __device__ static uint32_t packet(const uint8_t* tile, int width, int octet,
-                                    int col) {
+  __device__ static PacketWindow fetch(const uint8_t* tile, int width,
+                                       int octet) {
+    const int lane = threadIdx.x % 32;
     if constexpr (FullWidth) {
       const auto* words =
           reinterpret_cast<const uint64_t*>(tile) + octet * (kPacketBits / 2);
-      const int lane = threadIdx.x % 32;
-      const uint64_t loaded = lane < kPacketBits / 2 ? words[lane] : 0;
-      const int bit = col * kPacketBits;
-      const uint64_t low = __shfl_sync(0xffffffffU, loaded, bit / 64);
-      const uint64_t high = __shfl_sync(0xffffffffU, loaded, bit / 64 + 1);
-      const int shift = bit % 64;
-      const uint64_t value =
-          shift ? (low >> shift) | (high << (64 - shift)) : low;
-      return value & ((uint32_t{1} << kPacketBits) - 1);
+      return {lane < kPacketBits / 2 ? words[lane] : 0, 0};
+    } else {
+      const auto address = reinterpret_cast<uintptr_t>(tile);
+      const int64_t bit =
+          (address & 7) * 8 + int64_t{octet} * width * kPacketBits;
+      const auto* words =
+          reinterpret_cast<const uint64_t*>(address & ~uintptr_t{7});
+      const int bias = bit % 64, count = (bias + width * kPacketBits + 63) / 64;
+      return {lane < count ? words[bit / 64 + lane] : 0, bias};
     }
-    const auto address = reinterpret_cast<uintptr_t>(tile);
-    const int64_t first_bit =
-        (address & 7) * 8 + int64_t{octet} * width * kPacketBits;
-    const auto* words =
-        reinterpret_cast<const uint64_t*>(address & ~uintptr_t{7});
-    const int word_begin = first_bit / 64, bias = first_bit % 64;
-    const int word_count = (bias + width * kPacketBits + 63) / 64;
-    const int lane = threadIdx.x % 32;
-    const uint64_t loaded = lane < word_count ? words[word_begin + lane] : 0;
-    const int bit = bias + col * kPacketBits;
+  }
+
+  __device__ static uint32_t extract(PacketWindow window, int col) {
+    const int bit = window.bias + col * kPacketBits;
     const int source = bit / 64, shift = bit % 64;
-    const uint64_t low = __shfl_sync(0xffffffffU, loaded, source);
-    const uint64_t high = __shfl_sync(0xffffffffU, loaded, source + 1);
+    const uint64_t low = __shfl_sync(0xffffffffU, window.loaded, source);
+    const uint64_t high = __shfl_sync(0xffffffffU, window.loaded, source + 1);
     const uint64_t value =
         shift ? (low >> shift) | (high << (64 - shift)) : low;
     return value & ((uint32_t{1} << kPacketBits) - 1);
+  }
+
+  // Every lane participates, including masked output columns. N tails keep
+  // one continuous bitstream, with no per-octet alignment padding.
+  template <bool FullWidth = false>
+  __device__ static uint32_t packet(const uint8_t* tile, int width, int octet,
+                                    int col) {
+    return extract(fetch<FullWidth>(tile, width, octet), col);
   }
 
   // Warp-parallel K for vector decode: lanes read different K octets.

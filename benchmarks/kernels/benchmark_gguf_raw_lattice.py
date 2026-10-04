@@ -345,6 +345,21 @@ def main():
                             ),
                         )
                     )
+                    candidates.append(
+                        (
+                            f"compact_mma_prefetch_split{split}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_mma_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tmp,
+                                split,
+                                True,
+                            ),
+                        )
+                    )
             else:
                 candidates.append(
                     (

@@ -185,3 +185,92 @@ The graph/bank/environment contract is the same as the first table.
 Vectorization helps dense decode/MMA, but dense MMA still loses about 2–2.4x
 and prefill still loses 7–8%. The equal-byte permutation remains necessary
 to evaluate; no default or storage-removal decision is made from these data.
+
+## Equal-byte permutation measurements
+
+Source `92d466ae58` (core
+`fe0a70f7c0f21cfc65e95ccea7c5035a92833ce523c25e68a0a9bfbfad7821e7`)
+passes all 20 focused checks, including independent reconstruction of every
+source bit, exact FP32 dequantization and changed-input graph replay. Maximum
+output relative L2 error is 0.000217. Dense M512 matches canonical; vector
+and small-M dense MMA still fail the speed gate.
+
+Source `89eb838d72` (core
+`a1b1c877e3876634aa4334a009897f5d935f81f14697cfa9b95d0491a2e716cb`)
+specializes complete N32 tiles and adds warp-parallel K vector decode. All
+20 checks pass again (5.91 s). The same graph/bank contract now includes two
+Flash-Next dense projections. Times are µs/projection; GPU permutation runs
+once before timing.
+
+| Projection (N×K) | M | Canonical | Best equal-byte | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate (4352×5120) | 1 | 31.925 | 38.378 | compact_row_vec_split1 |
+| 27B gate (4352×5120) | 5 | 36.200 | 53.871 | compact_mma_split3 |
+| 27B gate (4352×5120) | 8 | 33.274 | 55.404 | compact_mma_split3 |
+| 27B gate (4352×5120) | 16 | 42.205 | 103.585 | compact_mma_split3 |
+| 27B gate (4352×5120) | 512 | 364.116 | 363.092 | compact_dequant_cublas |
+| 27B down (5120×4352) | 1 | 30.937 | 37.298 | compact_row_vec_split1 |
+| 27B down (5120×4352) | 5 | 31.836 | 59.372 | compact_mma_split2 |
+| 27B down (5120×4352) | 8 | 31.998 | 60.600 | compact_mma_split2 |
+| 27B down (5120×4352) | 16 | 37.978 | 76.327 | compact_mma_split2 |
+| 27B down (5120×4352) | 512 | 341.079 | 339.048 | compact_dequant_cublas |
+| IQ3_S expert (160×2560) | 1 | 16.222 | 7.019 | compact_row_vec_split8 |
+| IQ3_S expert (160×2560) | 5 | 17.472 | 10.801 | compact_mma_split10 |
+| IQ3_S expert (160×2560) | 8 | 17.567 | 10.894 | compact_mma_split10 |
+| IQ3_S expert (160×2560) | 16 | 17.263 | 12.218 | compact_mma_split10 |
+| IQ3_S expert (160×2560) | 512 | 68.837 | 27.321 | compact_dequant_cublas |
+| IQ2_S expert (160×2560) | 1 | 18.460 | 9.612 | compact_row_vec_split8 |
+| IQ2_S expert (160×2560) | 5 | 19.388 | 12.939 | compact_mma_split10 |
+| IQ2_S expert (160×2560) | 8 | 19.444 | 13.090 | compact_mma_split10 |
+| IQ2_S expert (160×2560) | 16 | 19.438 | 12.016 | compact_mma_split10 |
+| IQ2_S expert (160×2560) | 512 | 64.236 | 29.600 | compact_dequant_cublas |
+| Flash gate (1536×2560) | 1 | 17.945 | 11.250 | compact_row_vec_split1 |
+| Flash gate (1536×2560) | 5 | 18.331 | 17.845 | compact_mma_split7 |
+| Flash gate (1536×2560) | 8 | 18.479 | 18.060 | compact_mma_split7 |
+| Flash gate (1536×2560) | 16 | 20.209 | 22.179 | compact_mma_split7 |
+| Flash gate (1536×2560) | 512 | 89.881 | 126.663 | compact_dequant_cublas |
+| Flash output (2560×1536) | 1 | 14.969 | 9.902 | compact_row_vec_split1 |
+| Flash output (2560×1536) | 5 | 15.617 | 16.782 | compact_mma_split4 |
+| Flash output (2560×1536) | 8 | 15.848 | 17.024 | compact_mma_split4 |
+| Flash output (2560×1536) | 16 | 17.301 | 20.812 | compact_mma_split4 |
+| Flash output (2560×1536) | 512 | 81.837 | 87.971 | compact_dequant_cublas |
+
+Flash gate M512 does not improve with the current dequantization/cuBLAS path.
+No default or format is promoted across the remaining speed gaps.
+
+## Counters and next optimization
+
+Nsight Compute 2022.4 records original-row graph counters after warming the
+actual capture stream and pinning the unprofiled candidate. Source
+`92d466ae58`, M8, one projection, 64 MiB eviction outside the measured region:
+
+| Shape | Canonical DRAM read bytes | Original-row DRAM read bytes |
+| --- | ---: | ---: |
+| 27B gate | 11,246,016 | 10,483,840 |
+| IQ3_S expert | 268,224 | 246,912 |
+| IQ2_S expert | 274,624 | 206,720 |
+
+These are whole-graph counters including activations, codebooks and split
+partials. Dirty output left in L2 can yield zero DRAM writes in the region.
+Profiled durations are perturbed and do not replace unprofiled timings.
+
+Node profiling of `89eb838d72` identifies the dense MMA bottleneck:
+
+| Gate M | Equal-byte long-scoreboard stall | Canonical stall | Equal-byte active warps |
+| --- | ---: | ---: | ---: |
+| 8 | 65.42% | 12.90% | 30.05% |
+| 16 | 67.60% | 12.94% | 28.67% |
+
+The vector node has 63.99% active warps, 32.56% long-scoreboard stall and
+19.25% math-pipe throttle. There are no register spills. The next candidate
+separates packet fetch from extraction and prefetches the next packet window
+and aligned activation fragment in registers before current decode/MMA.
+It uses no cp.async, expanded scale or reduced-precision accumulation.
+
+Static storage savings are 6,236,160 bytes per rank for the four 27B IQ3_S
+projections, and 1,138,094,080 bytes per rank across Flash-Next IQ3_S/IQ2_S
+tensors. For C1, ten experts per expert projection and one read of each touched
+weight imply about 38,031,360 fewer weight bytes per rank, including dense
+projections. This conditional estimate does not measure expert reuse,
+collective overlap or end-to-end latency. Grouped and model measurements
+are required before reporting a step speedup.
