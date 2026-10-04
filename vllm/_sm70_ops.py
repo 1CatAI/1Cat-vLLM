@@ -306,6 +306,70 @@ if hasattr(torch.ops._C, "silu_and_mul_interleaved"):
         return None
 
 
+if hasattr(torch.ops._C, "gguf_affine_gemm_sm70_out"):
+
+    @register_fake("_C::gguf_affine_gemm_sm70_out")
+    def _gguf_affine_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        bits: int,
+        k_ld: int,
+        q_ld: int,
+        group_size: int = 32,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out"):
+
+    @register_fake("_C::gguf_affine_grouped_gemm_sm70_out")
+    def _gguf_affine_grouped_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        offsets: torch.Tensor,
+        weight_ptrs: torch.Tensor,
+        stats_ptrs: torch.Tensor,
+        bits: int,
+        num_experts: int,
+        group_size: int = 32,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lut4_gemm_sm70_out"):
+
+    @register_fake("_C::gguf_lut4_gemm_sm70_out")
+    def _gguf_lut4_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        lut_id: int,
+        k_ld: int,
+        q_ld: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lut4_grouped_gemm_sm70_out"):
+
+    @register_fake("_C::gguf_lut4_grouped_gemm_sm70_out")
+    def _gguf_lut4_grouped_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        offsets: torch.Tensor,
+        weight_ptrs: torch.Tensor,
+        stats_ptrs: torch.Tensor,
+        lut_id: int,
+        num_experts: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
 def awq_sm70_prepare(
     qweight: torch.Tensor,
     scales: torch.Tensor,
@@ -4675,5 +4739,109 @@ if hasattr(torch.ops._C, "fp8_moe_single_token_sm70_out"):
         w2_direct_reduce: bool,
         indexed_expert_ptrs: bool,
         exact_per_route: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_affine_dequantize_sm70_out"):
+
+    @register_fake("_C::gguf_affine_dequantize_sm70_out")
+    def _gguf_affine_dequantize_sm70_out_fake(
+        out: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        bits: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_affine_blas_sm70_out"):
+
+    @register_fake("_C::gguf_affine_blas_sm70_out")
+    def _gguf_affine_blas_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        bits: int,
+        scratch: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_gemm_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_gemm_sm70_out")
+    def _gguf_lattice_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        source_type: int,
+        k_ld: int,
+        q_ld: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_grouped_gemm_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_grouped_gemm_sm70_out")
+    def _gguf_lattice_grouped_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        offsets: torch.Tensor,
+        weight_ptrs: torch.Tensor,
+        stats_ptrs: torch.Tensor,
+        source_type: int,
+        num_experts: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_dequantize_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_dequantize_sm70_out")
+    def _gguf_lattice_dequantize_sm70_out_fake(
+        out: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        source_type: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_grouped_vec_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_grouped_vec_sm70_out")
+    def _gguf_lattice_grouped_vec_sm70_out_fake(
+        out,
+        input,
+        offsets,
+        weight_ptrs,
+        stats_ptrs,
+        source_type,
+        num_experts,
+        group_size,
+    ):
+        return None
+
+
+if hasattr(torch.ops._C, "gguf_lattice_blas_sm70_out"):
+
+    @register_fake("_C::gguf_lattice_blas_sm70_out")
+    def _gguf_lattice_blas_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        stats: torch.Tensor,
+        source_type: int,
+        scratch: torch.Tensor,
+        group_size: int,
     ) -> None:
         return None

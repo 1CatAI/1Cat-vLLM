@@ -239,11 +239,6 @@ def _apply_sm70_qwen38_decode_defaults(
         # Keep M=1 draft graphs independently of the verifier query width.
         # Otherwise the prepared single-token operators never reach capture.
         defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
-    elif cfg.speculative_config is None:
-        # Pin the native FP32 gated-norm arithmetic across independently
-        # compiled C1/batch graphs. Tiny fusion-dependent rounding differences
-        # can change an MoE route and ultimately flip an EOS token.
-        defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
@@ -315,6 +310,90 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
     # ParallelConfig is validated before these model-aware defaults are
     # applied, so initialize the endpoint that its validator would have
     # created for an explicit PLE configuration.
+    parallel_config.ensure_ple_offload_ipc_path()
+
+
+def _ple_disk_cascade_cuda_supported() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_cuda()
+
+
+def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
+    """Resolve disk tiers from storage, dtype and worker topology capabilities."""
+    policy = cfg.kernel_config
+    policy.ple_disk_cascade_active = False
+    reason = None
+    model = cfg.model_config
+    text = getattr(model, "hf_text_config", None)
+    layers = getattr(text, "ple_layer_ids", None)
+    if not policy.ple_disk_cascade:
+        reason = "disabled by KernelConfig"
+    elif model is None or not layers:
+        reason = "no PLE layers"
+    elif not _ple_disk_cascade_cuda_supported():
+        reason = "requires CUDA resident tiers"
+    elif model.dtype != torch.float16:
+        reason = "requires FP16 embedding output"
+    elif (
+        envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        or envs.VLLM_PLE_DISK_OFFLOAD
+        or envs.VLLM_PLE_CPU_OFFLOAD
+    ):
+        reason = "existing explicit PLE placement takes precedence"
+    elif cfg.load_config.load_format not in ("auto", "safetensors"):
+        reason = "requires file-backed safetensors shards"
+    elif cfg.parallel_config.prefill_context_parallel_size != 1:
+        reason = "PLE worker does not yet support prefill context-parallel groups"
+    elif (
+        cfg.parallel_config.nnodes != 1
+        or cfg.parallel_config.data_parallel_backend != "mp"
+        or cfg.parallel_config.data_parallel_size_local
+        != cfg.parallel_config.data_parallel_size
+        or cfg.parallel_config.use_ubatching
+        or cfg.weight_transfer_config is not None
+    ):
+        reason = "requires local multiprocessing workers without DBO or weight transfer"
+    else:
+        from vllm.models.qwen4_exp.common.ple import (
+            check_ple_layers_on_first_pp_rank,
+        )
+        from vllm.models.qwen4_exp.nvidia.ple_layer import (
+            _get_ple_embedding_quant_method,
+        )
+
+        try:
+            check_ple_layers_on_first_pp_rank(
+                text, cfg.parallel_config.pipeline_parallel_size
+            )
+        except (ValueError, RuntimeError) as exc:
+            reason = str(exc)
+        if reason is None:
+            storage = str(getattr(text, "ple_embedding_dtype", "")).removeprefix(
+                "torch."
+            )
+            # The model's hf_to_vllm_mapper is applied to the quantization
+            # config only when the model is built, so its layer metadata still
+            # uses checkpoint names here. ple_layer_ids are 1-based: id L is
+            # the PLE module of decoder layer L - 1.
+            methods = [
+                _get_ple_embedding_quant_method(
+                    cfg.quant_config,
+                    f"model.language_model.layers.{int(layer_id) - 1}"
+                    ".ple.ple_embedding.ngram_embedding",
+                    force_fp8_storage=storage == "float8_e4m3fn",
+                )
+                for layer_id in layers
+            ]
+            if any(method is None for method in methods):
+                reason = "checkpoint metadata does not provide raw E4M3 PLE storage"
+    policy.ple_disk_cascade_reason = reason
+    policy.ple_disk_cascade_active = reason is None
+    return policy.ple_disk_cascade_active
+
+
+def _apply_qwen4exp_ple_cascade_defaults(parallel_config: ParallelConfig) -> None:
+    """Prepare the worker endpoint without changing process environment."""
     parallel_config.ensure_ple_offload_ipc_path()
 
 
@@ -1312,7 +1391,25 @@ class VllmConfig:
         model_config.hf_config = hf_config
         model_config.model_arch_config = model_config.get_model_arch_config()
 
-        return replace(self, model_config=model_config)
+        kernel_config = self.kernel_config
+        if (
+            kernel_config.ple_disk_cascade_active
+            or getattr(self.model_config.hf_text_config, "ple_layer_ids", None)
+            or getattr(hf_config.get_text_config(), "ple_layer_ids", None)
+            or kernel_config.sm70_sparse.active
+            or kernel_config.qsa_auto_e4m3_active
+            or getattr(hf_config.get_text_config(), "indexer_n_heads", None)
+            or getattr(hf_config.get_text_config(), "index_head_dim", None)
+        ):
+            # Model-local admission must not be reset by a derived draft config.
+            # Keep existing sharing for unrelated models.
+            kernel_config = copy.deepcopy(kernel_config)
+
+        return replace(
+            self,
+            model_config=model_config,
+            kernel_config=kernel_config,
+        )
 
     def _set_config_default(self, config_obj: Any, key: str, value: Any) -> None:
         """Set config attribute to default if not already set by user.
@@ -1502,10 +1599,32 @@ class VllmConfig:
             self.cache_config.cache_dtype = "auto"
             self.cache_config.cache_dtype_from_checkpoint = False
 
+        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_auto_e4m3
+
+        if resolve_qsa_auto_e4m3(self):
+            logger.info_once(
+                "Defaulting calibrated QSA main KV storage to E4M3; "
+                "activations and recurrent states retain their precision."
+            )
+
         self.try_verify_and_update_config()
+        # Models may have supplied their own DCP defaults above; anything still
+        # unset falls back to the stock ones.
+        self.parallel_config.set_dcp_defaults()
 
-        from vllm.model_executor.models.config import sm70_dflash2_nvfp4_qualified
+        from vllm.model_executor.models.config import (
+            sm70_dflash2_nvfp4_qualified,
+            sm70_flash_next_batch_qualified,
+        )
 
+        self.kernel_config.resolve_sm70_rmsnorm_gated(
+            qualified=(
+                _is_sm70_qwen38_decode_compile_contract(
+                    self.model_config, self.speculative_config, self.parallel_config
+                )
+                and sm70_flash_next_batch_qualified(self)
+            )
+        )
         self.kernel_config.sm70_nvfp4.resolve(
             qualified=sm70_dflash2_nvfp4_qualified(self)
         )
@@ -2345,6 +2464,13 @@ class VllmConfig:
             custom_ops = self.compilation_config.custom_ops
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
+
+        if self.model_config is not None and _qwen4exp_ple_cascade_requested(self):
+            _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
+            logger.info_once(
+                "Qwen4Exp PLE overflow cascade: the PLE offload worker reads the "
+                "rows beyond the resident tiers from the mapped checkpoint."
+            )
 
         current_platform.apply_config_platform_defaults(self)
 
@@ -3381,14 +3507,10 @@ class VllmConfig:
 
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
-            assert block_size <= self.scheduler_config.max_num_batched_tokens, (
-                "In Mamba cache align mode, block_size "
-                f"({block_size}) must be <= "
-                "max_num_batched_tokens "
-                f"({self.scheduler_config.max_num_batched_tokens})."
-            )
-            if self.scheduler_config.long_prefill_token_threshold > 0:
-                assert self.scheduler_config.long_prefill_token_threshold >= block_size
+            # A chunk may be shorter than a cache block. The running state is
+            # updated in place, and the scheduler stops at retained boundaries
+            # before moving it to the next block. Only completed boundary states
+            # are eligible for prefix-cache reuse.
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "

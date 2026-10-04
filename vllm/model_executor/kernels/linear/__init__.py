@@ -58,6 +58,18 @@ from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     Sm70AwqLinearLayerConfig,
     TurboMindAwqLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+    Sm70GgufAffineConfig,
+    TurboMindGgufAffineKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf_lattice import (
+    Sm70GgufLatticeConfig,
+    TurboMindGgufLatticeKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf_lut4 import (
+    Sm70GgufLut4Config,
+    TurboMindGgufLut4Kernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -165,6 +177,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
@@ -203,7 +218,11 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "turbomind": {
         TuringQpn2NvFp4LinearKernel,
         TuringQpn8Fp8LinearKernel,
+        QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindAwqLinearKernel,
+        TurboMindGgufAffineKernel,
+        TurboMindGgufLut4Kernel,
+        TurboMindGgufLatticeKernel,
         TurboMindFp8LinearKernel,
         Qpn2NvFp4LinearKernel,
         Qpn4NvFp4LinearKernel,
@@ -326,6 +345,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        QPN8Fp8BlockScaledMMLinearKernel,
         TurboMindFp8LinearKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
@@ -363,6 +383,9 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        TurboMindGgufAffineKernel,
+        TurboMindGgufLut4Kernel,
+        TurboMindGgufLatticeKernel,
         TurboMindAwqLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
@@ -606,6 +629,7 @@ def init_sm70_fp8_linear_kernel(
     out_dtype: torch.dtype,
     weight_shape: tuple[int, int],
     is_scale_e8m0: bool,
+    is_bmm: bool = False,
 ) -> TurboMindFp8LinearKernel:
     from vllm.config import get_current_vllm_config
 
@@ -616,6 +640,7 @@ def init_sm70_fp8_linear_kernel(
         out_dtype=out_dtype,
         weight_shape=weight_shape,
         is_scale_e8m0=is_scale_e8m0,
+        is_bmm=is_bmm,
         policy=get_current_vllm_config().kernel_config.sm70_fp8,
     )
     kernel_type = choose_scaled_mm_linear_kernel(
@@ -773,7 +798,27 @@ def choose_mp_linear_kernel(
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
 
-    if isinstance(config, Sm70AwqLinearLayerConfig):
+    if isinstance(config, Sm70GgufAffineConfig):
+        # Canonical GGUF codes and additive coefficients are not GPTQ/AWQ
+        # checkpoint packing. Report admission failures rather than reinterpret.
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindGgufAffineKernel)
+        ]
+    elif isinstance(config, Sm70GgufLut4Config):
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindGgufLut4Kernel)
+        ]
+    elif isinstance(config, Sm70GgufLatticeConfig):
+        platform_kernels = [
+            kernel
+            for kernel in platform_kernels
+            if issubclass(kernel, TurboMindGgufLatticeKernel)
+        ]
+    elif isinstance(config, Sm70AwqLinearLayerConfig):
         # Other MP kernels accept GPTQ packing, not the legacy AWQ GEMM
         # checkpoint packing. The format adapter retains its Triton fallback.
         platform_kernels = [
@@ -1230,6 +1275,12 @@ __all__ = [
     "TritonInt8ScaledMMLinearKernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
+    "Sm70GgufAffineConfig",
+    "TurboMindGgufAffineKernel",
+    "Sm70GgufLatticeConfig",
+    "TurboMindGgufLatticeKernel",
+    "Sm70GgufLut4Config",
+    "TurboMindGgufLut4Kernel",
     "AllSparkLinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",

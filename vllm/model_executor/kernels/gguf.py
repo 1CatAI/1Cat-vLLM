@@ -74,6 +74,78 @@ class GGUFOperatorCapability:
         return m >= self.min_m and (self.max_m is None or m <= self.max_m)
 
 
+# Actual TP4 expert sweeps in docs/design/gguf_turbomind_lattice_decode.md.
+# (source, K, N, experts) -> measured vector intervals. Unknown descriptors
+# retain grouped GEMM. The unmeasured gap is deliberately not interpolated.
+_LATTICE_GROUPED_VECTOR_BANDS = {
+    (source, 2560, 160, experts): bands
+    for source in (17, 18)
+    for experts, bands in (
+        (4, ((1, 8),)),
+        (512, ((1, 128), (512, 512))),
+    )
+}
+
+
+def lattice_grouped_capabilities(
+    source_type: int, k: int, n: int, num_experts: int, dtype, enabled: bool = True
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Declare prepared lattice schedules without synchronizing routed rows."""
+    family = decoder_family(source_type)
+    if family != GGUFDecoderFamily.LATTICE:
+        raise ValueError("Canonical lattice storage is required")
+    source = quant_type_name(source_type)
+    group = 16 if source_type in (17, 22, 29) else 32
+    shared_reason = None
+    if not enabled:
+        shared_reason = "disabled_by_kernel_config"
+    elif dtype != torch.float16:
+        shared_reason = "requires_fp16_activations"
+    elif k <= 0 or n <= 0 or k % group or n % 32 or num_experts <= 0:
+        shared_reason = "local_shape_cuts_canonical_group_or_output_pack"
+    gemm_name = "gguf_lattice_grouped_gemm_sm70_out"
+    vec_name = "gguf_lattice_grouped_vec_sm70_out"
+    gemm = GGUFOperatorCapability(
+        family,
+        source,
+        gemm_name,
+        True,
+        reason=shared_reason
+        or (
+            None
+            if hasattr(torch.ops._C, gemm_name)
+            else f"operator_missing:{gemm_name}"
+        ),
+    )
+    bands = _LATTICE_GROUPED_VECTOR_BANDS.get((source_type, k, n, num_experts))
+    reason = shared_reason
+    if reason is None and not hasattr(torch.ops._C, vec_name):
+        reason = f"operator_missing:{vec_name}"
+    elif reason is None and bands is None:
+        reason = "grouped_vector_shape_has_no_calibration"
+    vector = tuple(
+        GGUFOperatorCapability(
+            family,
+            source,
+            vec_name,
+            True,
+            min_m=minimum,
+            max_m=maximum,
+            reason=reason,
+        )
+        for minimum, maximum in (bands or ((1, None),))
+    )
+    return (gemm, *vector)
+
+
+def select_lattice_grouped_capability(capabilities, m: int) -> GGUFOperatorCapability:
+    """Prefer calibrated decode, then the admitted grouped GEMM schedule."""
+    for capability in (*capabilities[1:], capabilities[0]):
+        if capability.reason is None and capability.supports_m(m):
+            return capability
+    raise ValueError("No prepared lattice grouped operator admits this descriptor")
+
+
 def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapability:
     """Inspect the installed operator at preparation time, not on every token.
 

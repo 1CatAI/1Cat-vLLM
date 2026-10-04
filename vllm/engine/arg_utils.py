@@ -497,7 +497,7 @@ class EngineArgs:
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
-    dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
+    dcp_comm_backend: DCPCommBackend | None = ParallelConfig.dcp_comm_backend
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
     cp_kv_cache_interleave_size: int = ParallelConfig.cp_kv_cache_interleave_size
     data_parallel_size: int = ParallelConfig.data_parallel_size
@@ -556,6 +556,10 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
+    long_prefill_token_threshold_adaptive: bool = (
+        SchedulerConfig.long_prefill_token_threshold_adaptive
+    )
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1427,7 +1431,15 @@ class EngineArgs:
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--long-prefill-token-threshold-adaptive",
+            **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
+        scheduler_group.add_argument(
+            "--mixed-prefill-step-latency-ms",
+            **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+        )
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
@@ -2285,6 +2297,10 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
+            long_prefill_token_threshold_adaptive=(
+                self.long_prefill_token_threshold_adaptive
+            ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
@@ -2493,6 +2509,15 @@ class EngineArgs:
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
+        )
+
+        # Checked here, once before any worker starts, and not in
+        # VllmConfig.__post_init__: model construction rebuilds the config in
+        # every worker while the first stage may already pin its tables.
+        from vllm.models.qwen4_exp.common.ple import check_ple_host_share
+
+        check_ple_host_share(
+            model_config.hf_text_config, parallel_config.tensor_parallel_size
         )
 
         return config

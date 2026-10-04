@@ -15,6 +15,10 @@ namespace turbomind {
 
 namespace detail {
 
+struct __uint2_t {
+    uint16_t x;
+};
+
 struct __uint4_t {
     uint32_t x;
 };

@@ -172,3 +172,77 @@ def test_prefix_prefill_small_query_rows_match_prefill_route(
             out_on[start:end], out_off[start:end], atol=atol, rtol=1e-2
         )
     assert torch.isfinite(out_on).all()
+
+
+def _grouped_e4m3_ready(impl) -> bool:
+    return getattr(impl, "flash_attn_grouped_e4m3_fp32_paged", None) is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("block_size", [16, 784])
+@pytest.mark.parametrize(
+    "small_rows",
+    [
+        [(8, 4104)],  # one DFlash2 verify span
+        [(8, 4104), (1, 20000), (5, 9000)],  # verify, plain decode, short tail
+        [(16, 8208), (8, 65544)],  # a q15 span is two groups of eight
+        [(8, 3000 + 97 * i) for i in range(18)],  # more than 16 groups
+    ],
+)
+@pytest.mark.parametrize("host_seq_upper_bound", [0, 5])
+@torch.inference_mode()
+def test_dflash2_e4m3_rows_take_grouped_fp32_and_match_prefill_route(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+    small_rows: list[tuple[int, int]],
+    host_seq_upper_bound: int,
+) -> None:
+    """A DFlash2 target keeps its FP32 grouped route inside a mixed batch."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 is SM70/V100 only")
+    pytest.importorskip("flash_attn_v100")
+    import vllm.v1.attention.backends.flash_attn_v100 as backend
+
+    torch.manual_seed(4321)
+    device = "cuda"
+    impl = _make_impl("fp8_e4m3")
+    if not (impl.use_flash_v100_prefill_paged and impl.use_flash_v100_decode):
+        pytest.skip("paged prefill and decode ops are both required")
+    if not _grouped_e4m3_ready(impl):
+        pytest.skip("grouped E4M3 FP32 operator is unavailable")
+    query, kv_cache, attn_metadata, query_start_loc = _make_mixed_batch(
+        device=device,
+        block_size=block_size,
+        kv_cache_dtype="fp8_e4m3",
+        chunk_len=96,
+        chunk_context=1000,
+        small_rows=small_rows,
+    )
+    attn_metadata.is_dflash_selector_target = True
+    chunk_end = int(query_start_loc[1].item())
+    spans = list(zip(query_start_loc[1:-1].tolist(), query_start_loc[2:].tolist()))
+
+    routes: list[str] = []
+    monkeypatch.setattr(backend, "_record_route", routes.append)
+
+    monkeypatch.setenv(FLAG, "0")
+    backend.envs.disable_envs_cache()
+    out_off = _run(impl, query, kv_cache, attn_metadata)
+
+    if host_seq_upper_bound:
+        # The host shadow may only be an upper bound; lengths come from the
+        # device, so the result must not move.
+        attn_metadata.seq_lens_cpu = attn_metadata.seq_lens_cpu + host_seq_upper_bound
+    monkeypatch.setenv(FLAG, "1")
+    backend.envs.disable_envs_cache()
+    routes.clear()
+    out_on = _run(impl, query, kv_cache, attn_metadata)
+    assert "prefill_prefix_decode_rows_e4m3_grouped_fp32" in routes, routes
+    assert "prefill_prefix_decode_rows_scalar" not in routes, routes
+
+    assert torch.equal(out_on[:chunk_end], out_off[:chunk_end])
+    for start, end in spans:
+        torch.testing.assert_close(
+            out_on[start:end], out_off[start:end], atol=5e-3, rtol=1e-2
+        )
+    assert torch.isfinite(out_on).all()

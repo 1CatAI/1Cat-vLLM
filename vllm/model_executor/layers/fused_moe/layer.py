@@ -329,6 +329,7 @@ class FusedMoE(PluggableLayer):
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
             activation=self.activation,
             device=vllm_config.device_config.device,
             routing_method=self.routing_method_type,

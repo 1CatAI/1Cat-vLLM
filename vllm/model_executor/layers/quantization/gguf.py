@@ -688,30 +688,27 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
-        if hasattr(layer, "gguf_shard_weights"):
-            out = torch.cat(
-                [
-                    fused_mul_mat_gguf(x, weight, weight_type)
-                    for weight, weight_type in zip(
-                        layer.gguf_shard_weights, layer.gguf_shard_types
-                    )
-                ],
-                dim=-1,
-            )
-            return out if bias is None else out + bias
         if hasattr(layer, "gguf_native_shard_weights"):
+            weights = layer.gguf_native_shard_weights
+            types = layer.gguf_native_shard_types
+        elif hasattr(layer, "gguf_shard_weights"):
+            weights = layer.gguf_shard_weights
+            types = layer.gguf_shard_types
+        else:
+            weights = None
+        if weights is not None:
             out = torch.cat(
                 [
                     fused_mul_mat_gguf(
                         x, weight, weight_type, self.native_enabled, self.prefill_min_m
                     )
-                    for weight, weight_type in zip(
-                        layer.gguf_native_shard_weights, layer.gguf_native_shard_types
-                    )
+                    for weight, weight_type in zip(weights, types)
                 ],
                 dim=-1,
             )
-            return out if bias is None else out + bias
+            if bias is not None:
+                out.add_(bias)
+            return out
         shard_id = layer.qweight.shard_id
 
         if shard_id:

@@ -159,7 +159,9 @@ def test_mixed_float_and_quantized_projections_keep_logical_order(monkeypatch):
     assert layer.gguf_shard_weights[1].dtype == torch.uint8
     calls = []
 
-    def dispatch(x, weight, weight_type):
+    def dispatch(x, weight, weight_type, enabled, prefill_min_m):
+        assert enabled == method.native_enabled
+        assert prefill_min_m == method.prefill_min_m
         calls.append(weight_type)
         return x @ weight.to(x.dtype).T
 

@@ -332,7 +332,22 @@ class StreamingXMLToolCallParser:
                 found_any = True
 
             except Exception as e:
-                logger.warning("Error when parsing XML elements: %s", e)
+                # Expat retains an unmatched parameter in its XML stack even
+                # when our value handler has recovered at the next parameter.
+                # Recover only the closing element being processed, so a close
+                # earlier in a burst cannot accidentally finish its next call.
+                closing = element.strip()
+                if self.current_call_id is not None and closing in (
+                    self.function_end_token,
+                    self.tool_call_end_token,
+                ):
+                    if closing == self.tool_call_end_token:
+                        self._end_element("tool_call")
+                    elif self.current_function_open:
+                        self._end_element("function")
+                    found_any = True
+                else:
+                    logger.warning("Error when parsing XML elements: %s", e)
 
             # Update processed position
             self.last_processed_pos = end_pos

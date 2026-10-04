@@ -26,8 +26,15 @@ std::array<const LayoutConverter*, 2> GetConverters(DataType data_type,
                                                     bool     grouped,
                                                     int      sm);
 
+std::array<const LayoutConverter*, 2> GetGgufBitPlaneConverters(int low_bits, int sm);
+std::array<const LayoutConverter*, 2> GetGgufLut4Converters(int sm);
+
 // Free with `cudaFree`
 void* MakeStridedPtrs(const std::vector<std::pair<void*, int>>& ptrs, cudaStream_t stream);
 void* MakeBlockedPtrs(const std::vector<std::pair<void*, int>>& ptrs, cudaStream_t stream);
 
 }  // namespace turbomind::gemm
+
+namespace turbomind::gemm {
+std::array<const LayoutConverter*,2> GetGgufLatticeConverters(int source_type,int sm);
+}

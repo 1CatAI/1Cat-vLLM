@@ -47,6 +47,10 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.host_result import (
+    publish_host_flag,
+    wait_host_resets,
+)
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
@@ -289,9 +293,10 @@ class PleOffloadOutputTarget:
     """GPU output destination and semaphore for one TP worker."""
 
     tp_rank: int
-    gpu_output_buffer: torch.Tensor  # IPC-mapped GPU buffer for this TP worker
+    gpu_output_buffer: torch.Tensor | None  # CUDA IPC for legacy transport
     sem: CpuGpuSemaphore  # semaphore paired with gpu_output_buffer
-    copy_stream: torch.cuda.Stream
+    copy_stream: torch.cuda.Stream | None
+    cpu_output_buffer: torch.Tensor | None = None
 
 
 @dataclass
@@ -334,6 +339,11 @@ class PleOffloadWorkerHandle:
 
 def _init_offload_distributed() -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
+    # The worker builds its model in the PP1 world configured below, but it
+    # inherits the GPU workers' environment: a VLLM_PP_LAYER_PARTITION written
+    # for the real pipeline makes get_pp_indices() refuse the single stage
+    # ("len(partitions) != pp_size") while the meta model is constructed.
+    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     if dist.is_initialized():
         return
 
@@ -759,10 +769,14 @@ class PleOffloadRunner:
                 )
 
         for registration in registrations:
-            if set(registration.gpu_output_buffers) != set(self.layer_names):
+            cpu_buffers = registration.cpu_output_buffers or {}
+            if set(cpu_buffers) & set(registration.gpu_output_buffers):
+                raise RuntimeError("PLE layer registered both result transports")
+            registered_names = set(cpu_buffers) | set(registration.gpu_output_buffers)
+            if registered_names != set(self.layer_names):
                 raise RuntimeError(
                     "Registered PLE layers do not match CPU layers: "
-                    f"registered={sorted(registration.gpu_output_buffers)}, "
+                    f"registered={sorted(registered_names)}, "
                     f"cpu={sorted(self.layer_names)}"
                 )
             targets_for_dp = self._worker_targets.setdefault(registration.dp_rank, {})
@@ -774,6 +788,36 @@ class PleOffloadRunner:
                         registration.sem_flag_tensors[layer_name]
                     ),
                     copy_stream=torch.cuda.Stream(device=gpu_buffer.device),
+                )
+                targets_for_dp.setdefault(layer_name, []).append(target)
+            for layer_name, cpu_buffer in cpu_buffers.items():
+                flag = registration.sem_flag_tensors[layer_name]
+                if (
+                    cpu_buffer.device.type != "cpu"
+                    or cpu_buffer.ndim != 2
+                    or not cpu_buffer.is_contiguous()
+                    or not cpu_buffer.is_shared()
+                    or cpu_buffer.shape[0]
+                    < self.vllm_config.scheduler_config.max_num_batched_tokens
+                    or cpu_buffer.shape[1]
+                    != int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    or cpu_buffer.dtype
+                    != self._layers[layer_name].get_offload_output_dtype(
+                        self.vllm_config.model_config.dtype
+                    )
+                    or flag.device.type != "cpu"
+                    or flag.dtype != torch.int32
+                    or not flag.is_contiguous()
+                    or not flag.is_shared()
+                    or flag.numel() < 1
+                ):
+                    raise RuntimeError("Invalid mapped PLE result or flag storage")
+                target = PleOffloadOutputTarget(
+                    tp_rank=registration.tp_rank,
+                    gpu_output_buffer=None,
+                    sem=CpuGpuSemaphore.from_ipc_tensor(flag),
+                    copy_stream=None,
+                    cpu_output_buffer=cpu_buffer,
                 )
                 targets_for_dp.setdefault(layer_name, []).append(target)
             # All TP ranks in one DP group receive the same input, so buffers
@@ -790,6 +834,7 @@ class PleOffloadRunner:
                 "TP rank zero did not register PLE input buffers for every DP "
                 f"rank: expected={set(range(dp_size))}, got={set(self._input_bufs)}"
             )
+        self._bind_remote_placements(registrations, dp_size, tp_size)
 
         config = self.vllm_config.model_config.hf_text_config
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -803,6 +848,11 @@ class PleOffloadRunner:
                         f"{len(targets)} targets, expected {tp_size}"
                     )
                 targets.sort(key=lambda target: target.tp_rank)
+                if all(t.cpu_output_buffer is not None for t in targets):
+                    self._pinned_bufs[dp_rank][layer_name] = targets[
+                        0
+                    ].cpu_output_buffer
+                    continue
                 self._pinned_bufs[dp_rank][layer_name] = torch.empty(
                     max_tokens,
                     embedding_dim,
@@ -817,6 +867,50 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+
+    def _bind_remote_placements(
+        self,
+        registrations: list[PleOffloadRegistration],
+        dp_size: int,
+        tp_size: int,
+    ) -> None:
+        """Hand each tiered layer the row geometry of every tensor-parallel rank."""
+        by_layer: dict[str, dict[int, dict[int, Any]]] = {}
+        for registration in registrations:
+            for layer_name, placement in registration.remote_placements.items():
+                by_layer.setdefault(layer_name, {}).setdefault(
+                    registration.dp_rank, {}
+                )[registration.tp_rank] = placement
+        for layer_name, by_dp in by_layer.items():
+            layer = self._layers.get(layer_name)
+            if layer is None:
+                raise RuntimeError(
+                    f"PLE remote placement for unknown layer {layer_name}"
+                )
+            expected = {dp_rank: set(range(tp_size)) for dp_rank in range(dp_size)}
+            received = {dp_rank: set(ranks) for dp_rank, ranks in by_dp.items()}
+            if received != expected:
+                raise RuntimeError(
+                    f"PLE layer {layer_name}: every rank must register its remote "
+                    f"placement, expected {expected}, got {received}"
+                )
+            # The tensor-parallel geometry is the same in every data-parallel
+            # replica, so one placement list per layer serves all of them.
+            placements = [by_dp[0][tp_rank] for tp_rank in range(tp_size)]
+            for dp_rank in range(1, dp_size):
+                replica = [by_dp[dp_rank][tp_rank] for tp_rank in range(tp_size)]
+                if replica != placements:
+                    raise RuntimeError(
+                        f"PLE layer {layer_name}: remote placements differ "
+                        "between data-parallel ranks"
+                    )
+            layer.bind_remote_placements(placements)
+            logger.info(
+                "PLE layer %s: remote placements of %d tensor-parallel rank(s): %s",
+                layer_name,
+                tp_size,
+                placements,
+            )
 
     @torch.inference_mode()
     def busy_loop(
@@ -882,8 +976,16 @@ class PleOffloadRunner:
                 # previous result has been consumed. The GPU runner resets the
                 # flag after the complete model forward.
                 for target in targets:
-                    target.copy_stream.synchronize()
-                    target.sem.wait_reset(target.copy_stream)
+                    if target.copy_stream is not None:
+                        target.copy_stream.synchronize()
+                        target.sem.wait_reset(target.copy_stream)
+                host_flags = [
+                    t.sem.flag_tensor
+                    for t in targets
+                    if t.cpu_output_buffer is not None
+                ]
+                if host_flags:
+                    wait_host_resets(host_flags)
 
                 input_bufs = self._input_bufs[dp_rank]
                 ngram_context = (
@@ -903,12 +1005,21 @@ class PleOffloadRunner:
                 # Each copy stream signals only after its DMA completes.
                 slices = tuple(slice(0, size) for size in result.shape)
                 direct_copy = (
-                    result.device.type == "cpu"
+                    any(t.copy_stream is not None for t in targets)
+                    and result.device.type == "cpu"
                     and result.is_pinned()
                     and result.is_contiguous()
                 )
                 result_bytes = result.numel() * result.element_size()
                 for target in targets:
+                    if target.cpu_output_buffer is not None:
+                        destination = target.cpu_output_buffer[slices]
+                        if destination.data_ptr() != result.data_ptr():
+                            destination.copy_(result)
+                        publish_host_flag(target.sem.flag_tensor)
+                        continue
+                    assert target.gpu_output_buffer is not None
+                    assert target.copy_stream is not None
                     destination = target.gpu_output_buffer[slices]
                     if (
                         direct_copy

@@ -11,13 +11,13 @@ import hashlib
 import json
 import os
 import statistics
-import subprocess
 import time
 from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
 
+import vllm
 from benchmarks.benchmark_sm70_model_tokens import (
     _metric_snapshot,
     _request_metrics_dict,
@@ -132,7 +132,7 @@ def long_quality_prompt_ids(tokenizer, length):
 
 
 def finalize_measurements(report):
-    """Collect every planned case, but never accept failed token parity."""
+    """Finalize timing; no-MTP quality uses the independent distribution gate."""
     report["measurements_complete"] = True
     report["complete"] = False
     checks = [
@@ -142,6 +142,14 @@ def finalize_measurements(report):
         for matched in case.get(key, [])
     ]
     checks.extend(run["matches_reference"] for run in report.get("baseline_runs", []))
+    if report.get("mode") == "nomtp":
+        # Free-running parity is diagnostic under the owner-approved FP16
+        # distribution contract. Timing completeness does not accept quality.
+        report["token_parity_passed"] = all(checks) if checks else None
+        report["quality_accepted"] = False
+        report["quality_gate"] = "requires teacher-forced distribution and task suite"
+        report["complete"] = True
+        return
     if not checks:
         report["token_parity_passed"] = None
         raise RuntimeError(
@@ -165,6 +173,9 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--mode", choices=("nomtp", "mtp"), default="nomtp")
     parser.add_argument("--widths", default="1,4,8,16")
+    parser.add_argument(
+        "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
+    )
     parser.add_argument("--input-len", type=int, default=8192)
     parser.add_argument("--output-len", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=2)
@@ -181,7 +192,9 @@ def main():
     )
     parser.add_argument("--baseline-reference", type=Path)
     parser.add_argument(
-        "--reference", type=Path, help="Same-contract token parity gate"
+        "--reference",
+        type=Path,
+        help="Same-contract reference; no-MTP token differences are diagnostic",
     )
     parser.add_argument(
         "--diagnostic-reference",
@@ -215,6 +228,10 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     config = engine_args(model, use_defaults=True)
     config.pop("worker_extension_cls")
+    config["kernel_config"] = {
+        **config.get("kernel_config", {}),
+        "ple_result_transport": args.ple_result_transport,
+    }
     config["max_num_seqs"] = max(widths)
     config["gpu_memory_utilization"] = args.gpu_memory_utilization
     if args.kv_cache_memory_bytes is not None:
@@ -226,9 +243,8 @@ def main():
             "draft_sample_method": "greedy",
         }
     report = {
-        "source_sha": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "runtime": vllm.__version__,
+        "runtime_path": vllm.__file__,
         "mode": args.mode,
         "engine": config,
         "torch": torch.__version__,
@@ -512,8 +528,12 @@ def main():
                     for key in ("tokens_match_reference", "tokens_match_first_repeat")
                 ):
                     print(
-                        f"C{width} repeat {repeat}: token parity FAILED; "
-                        "retaining remaining diagnostic cases before failing the run",
+                        f"C{width} repeat {repeat}: token differences recorded; "
+                        + (
+                            "distribution and task quality determine no-MTP acceptance"
+                            if args.mode == "nomtp"
+                            else "retaining remaining cases before the parity gate"
+                        ),
                         flush=True,
                     )
                 save()

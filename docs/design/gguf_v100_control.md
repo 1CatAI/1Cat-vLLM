@@ -141,22 +141,18 @@ heads, 128-dimensional GDN heads, HC count=4/rank=320. PLE keys include
 exact int64 multipliers, offsets and prime vocabulary sizes. GGUF PLE layer
 index 1 maps to HF layer ID 2. Q2_0 uses K blocks of 64, so expert down
 local K=160 still cannot be byte-sliced under TP4; IQ4_NL K blocks of 32
-are aligned. The user requires Flash-Next TP as well as attention TP.
-For its 30 Q2_0 routed down projections, loading now converts each expert
-from 64-value Q2_0 to two 32-value Q4_1 blocks before TP4 slicing: reuse
-scale d, integer code 0-3, and additive min=-d. No values are requantized.
-The Q2_0 source bytes total 7,077,888,000; converted bytes total
-15,728,640,000. TP4 storage increases by 2,162,688,000 bytes (2.014 GiB)
-per rank, avoiding a whole-expert FP16 expansion or an EP requirement.
+are aligned. Flash-Next retains TP4. Canonical group32 reblocking supports
+Q2_0 K=160 shards in the TurboMind operator layer; the canonical MoE model
+connection remains pending. The adapter fallback currently converts each
+64-value Q2_0 block into two Q4_1 blocks using the same integer values, scale
+and additive offset. This preserves decoded values but adds 2.014 GiB per rank
+for the 30 affected expert down projections. Replace this temporary storage
+with canonical u2 when integrating grouped TurboMind experts.
 
-The native expert loader retains separate gate/up/down formats and validates
-every TP block boundary before allocating storage. Three CPU tests cover
-exact decoded equality including signed/subnormal/maximal finite scales,
-all four K=160 boundaries, independent projection storage and rejection of
-unconverted Q2_0. Three GPU FFN tests at M=1/8/64 compare the sum of four
-TP partials against the full expert reference. The real two-shard directory
-contains 1,224 tensors and all have adapter names. These are local contracts;
-the primary-model forward and quality gates are still pending.
+Three CPU tests cover decoded equality, all four K=160 boundaries and
+independent projection storage; three GPU FFN checks compare summed TP
+partials with the full expert reference. All 1,224 checkpoint tensors have
+adapter names. Full-model generation and quality are still pending.
 
 ### Loading validation and open gates
 
@@ -187,3 +183,82 @@ from apply_chat_template by default; it now requests return_dict=False.
 These are implementation-localization results, not primary-model quality
 or speed acceptance. Hold the shared GPU flock and do not terminate other
 tasks. No accepted whole-model throughput is recorded.
+
+### Chinese greedy divergence localization
+
+A controlled 20-token run uses the same tiny checkpoint, prompt token IDs,
+TP4, FP16, eager execution and no MTP. Single-request legacy inference
+chooses token 96617 at step 13 and matches all 20 CPU llama.cpp tokens.
+The original three-request batch is reproducible: it chooses token 103911
+at step 13. The competing-logit margin (96617 minus 103911) changes from
++0.09375 in the single request to -0.0625 in the batch.
+
+The CPU reference also matches all 20 tokens after exact F32 reconstruction
+of every GGUF weight, so CPU activation quantization alone does not explain
+the divergence. Replacing the batch's quantized linear calls with the packaged
+FP16 dequantization plus GEMM reference restores all 20 reference tokens;
+its step-13 margin is +0.203125. Worker dispatch logs confirm this replacement
+for Q4_K, Q8_0 and Q6_K. This localizes the correction to the linear numerical
+path; a finer separation of activation quantization, weight rounding and
+accumulation remains pending. It supports the FP16-activation TurboMind
+direction without changing loader mappings.
+
+The first precision-hook attempt patched the Python implementation after
+the custom operator had already been registered, so it did not replace the
+actual caller. Its outputs are excluded. A separate launch used system CUDA
+12.0 for Tilelang and failed before generation; subsequent runs explicitly
+use CUDA 12.8. Neither failure is quality evidence. The wider quality suite
+and primary-model comparisons are still pending.
+
+### Loader synchronization and installed artifact
+
+After integration at `1d1d1c9d80a762ec6d3c7fd46fb85954f730967f`, the
+Qwen3.5 adapter's GDN layout and mixed-projection storage compose with the
+packaged native fallback policy. The 19 metadata and 13 adapter contracts pass
+both from source and from a fresh ordinary wheel installation. All 210
+installed dependencies pass compatibility checking. This Python-only loader
+artifact uses the complete normal precompiled operator wheel for that base;
+no private extension override is required. Core and native extension hashes
+match their packaged and installed copies, without RPATH/RUNPATH.
+
+Loader source: `afad28789341c204ccf3046621124f8ec74b7e39`.
+Wheel SHA256:
+`177bcd84f73eb63e46cbba602f70d515df472551e7630758599f0b60d9665f61`.
+Core SHA256:
+`20ac310a9a80ac4075719cfd1c75a9e70f9649eb714ff21b7be12e584fc2a2cf`.
+Native reference SHA256:
+`74ed944b8abb0f8679757a4e1bf0acef453f4a9803002f2c47b35b47f39d163f`.
+
+Installed inference uses the same tiny checkpoint and CPU oracle, V100 32GB
+GPU0–3, TP4, Python 3.12.3, CUDA 12.8, Torch 2.10.0+cu128, FP16,
+maxlen 2048, maxbatch 256, maxseqs 4, 0.1 GPU memory utilization, eager
+execution, no MTP and FP16 KV. English/arithmetic still match 64/64 greedy
+tokens each. Chinese matches 23 tokens before diverging in this run; this is
+not a resolved quality result. A preceding one-token full-logit generation and
+new packaged fallback implementation make this a distinct run from the earlier
+13-token localization baseline. Its first-logit RMSE/relative-L2 values remain
+0.1243/0.02949, 0.1408/0.04647 and 0.1656/0.06349, with matching top-1.
+
+Embedded chat-template generation with thinking disabled returns `Paris`,
+`4` and `你好` for the three fixed short prompts. These checks establish
+installed loader/tokenizer operation; broader distribution/quality checks and
+primary-model speed remain pending. No model-level TurboMind speed is claimed.
+
+## Current-main loader check
+
+The loader was synchronized with main `48a66d2838` without changing other
+SM70 routes. All 19 metadata and 13 adapter tests pass from source and a fresh
+ordinary wheel installation. The installed tiny-model run uses the same TP4,
+FP16/eager/no-MTP contract above: English and arithmetic match 64/64 greedy
+tokens; Chinese matches 23 tokens before divergence. First-logit RMSE is
+0.128859/0.148466/0.165342, relative L2 is 0.030586/0.049015/0.063375,
+and all first-logit top-1 values match. Embedded chat results remain `Paris`,
+`4`, and `你好`. Broader quality work remains pending.
+
+The normal packaged `_C` matches the main operator artifact,
+`4910c47ab1aaed253001d5950bf44dd40a350b2b087202a8ea2b13f2c5457782`.
+Wheel `1cat_vllm-1.5.2.dev406+g7285a28e6.precompiled-cp312-cp312-linux_x86_64.whl`
+has SHA256 `17a06f4c462608c07006aaf1fb71d902dc1362380a7df0b7d7339d310873345e`;
+all 210 installed dependencies are compatible. The subsequent main sync adds
+the independently validated IQ3_XXS grouped-vector codebook layout; that
+operator is not used by the tiny dense model in this check.

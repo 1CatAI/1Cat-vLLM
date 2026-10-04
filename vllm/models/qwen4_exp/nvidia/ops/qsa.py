@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import math
 import os
+from itertools import pairwise
 
 import regex as re
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
@@ -50,7 +52,7 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 
 
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
-_SM70_QSA_MTP_TOPK = os.getenv("VLLM_SM70_QSA_MTP_TOPK", "0") == "1"
+_SM70_QSA_MTP_TOPK = envs.VLLM_SM70_QSA_MTP_TOPK
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     legacy_qsa_tuning(
         "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", SM70_QSA_TUNING.score_tile_mb
@@ -622,6 +624,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    final_lse_ptr,
     output_gate_ptr,
     stride_q_row,
     stride_q_head,
@@ -758,6 +761,17 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
+        if final_lse_ptr is not None:
+            lse = tl.where(
+                has_values,
+                max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
+                -float("inf"),
+            )
+            tl.store(
+                final_lse_ptr + row * NUM_QUERY_HEADS + first_head + head_offsets,
+                lse,
+                mask=head_offsets < GROUP_SIZE,
+            )
         if KV_E4M3:
             # V dequantization is linear, so apply its scalar after the
             # normalized FP32 accumulation instead of to every loaded value.
@@ -818,6 +832,7 @@ def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    final_lse_ptr,
     output_gate_ptr,
     stride_output_row,
     stride_output_head,
@@ -846,6 +861,13 @@ def _qsa_merge_splitk_kernel(
     shifted = tl.where(split_mask & has_values, lse - lse_max, -float("inf"))
     weights = tl.math.exp2(shifted)
     denominator = tl.sum(weights, axis=0)
+    if final_lse_ptr is not None:
+        merged_lse = tl.where(
+            has_values,
+            lse_max + tl.math.log2(tl.maximum(denominator, 1.0e-20)),
+            -float("inf"),
+        )
+        tl.store(final_lse_ptr + row * NUM_QUERY_HEADS + head, merged_lse)
     partial_output = tl.load(
         partial_output_ptr
         + ((split_offsets[:, None] * num_rows + row) * NUM_QUERY_HEADS + head)
@@ -1411,6 +1433,99 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+def _qsa_indexer_request_segments(
+    query_start_loc: list[int],
+    min_rows: int,
+) -> list[tuple[int, int, int | None]]:
+    """Split a batch's rows into single-request runs and multi-request runs.
+
+    Returns ``(start, end, request)`` row ranges in order. A request with at
+    least ``min_rows`` rows gets its own range with its index; consecutive
+    smaller requests share one range with ``request=None``.
+    """
+
+    segments: list[tuple[int, int, int | None]] = []
+    for request, (start, end) in enumerate(pairwise(query_start_loc)):
+        if end <= start:
+            continue
+        if end - start >= min_rows:
+            segments.append((start, end, request))
+        elif segments and segments[-1][2] is None and segments[-1][1] == start:
+            segments[-1] = (segments[-1][0], end, None)
+        else:
+            segments.append((start, end, None))
+    return segments
+
+
+def _qsa_select_by_request(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+    out: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+) -> bool:
+    """Select a multi-request batch one long request at a time.
+
+    The cuBLAS indexer serves only one request's page table. Without this, a
+    prefill that shares its step with decode rows or another prefill falls
+    back to the paged Triton scorer, whose cost grows with the context length.
+    Each request with enough rows is selected on its own, exactly as when it
+    runs alone; the remaining short requests keep the batched fallback. The
+    row split comes from the host copy of ``query_start_loc``, so no device
+    synchronization is added. Returns False when the batch is left unchanged.
+    """
+
+    rows = q.shape[0]
+    if (
+        page_table.shape[0] < 2
+        or not _SM70_INDEXER_CUBLAS
+        or not current_platform.is_device_capability(70)
+        or not _qsa_indexer_cublas_shape_supported(q, k_cache, page_table[:1])
+    ):
+        return False
+    query_start_loc = query_start_loc_cpu.tolist()
+    # CUDA-graph padding can add rows past the mapped requests; leave such
+    # batches (decode graphs) on the batched path.
+    if query_start_loc[0] != 0 or query_start_loc[-1] != rows:
+        return False
+    segments = _qsa_indexer_request_segments(
+        query_start_loc, _SM70_INDEXER_CUBLAS_MIN_ROWS
+    )
+    if all(request is None for _, _, request in segments):
+        return False
+    for start, end, request in segments:
+        if request is None:
+            qsa_select_paged_tokens(
+                q[start:end],
+                k_cache,
+                page_table,
+                token_to_req[start:end],
+                query_positions[start:end],
+                sequence_lengths,
+                token_topk,
+                compress_ratio,
+                out[start:end],
+            )
+        else:
+            qsa_select_paged_tokens(
+                q[start:end],
+                k_cache,
+                page_table[request : request + 1],
+                torch.zeros_like(token_to_req[start:end]),
+                query_positions[start:end],
+                sequence_lengths[request : request + 1],
+                token_topk,
+                compress_ratio,
+                out[start:end],
+            )
+    return True
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1421,6 +1536,7 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    query_start_loc_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -1431,6 +1547,19 @@ def qsa_select_paged_tokens(
     if out.shape != (rows, output_width):
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
+        return out
+    if query_start_loc_cpu is not None and _qsa_select_by_request(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+        out,
+        query_start_loc_cpu,
+    ):
         return out
 
     capacity_columns = page_table.shape[1] * k_cache.shape[1]
@@ -2130,6 +2259,17 @@ def _use_sm70_qsa_resolved_indices(q, k_cache, indices, kv_cache_dtype):
     )
 
 
+def qsa_e4m3_capability_reason(dtype: torch.dtype) -> str | None:
+    """Software E4M3 decode uses the tensor-core dtype of the query."""
+    if not current_platform.is_cuda() or not current_platform.has_device_capability(70):
+        return "requires CUDA tensor cores with compute capability at least 7.0"
+    if dtype == torch.float16:
+        return None
+    if dtype == torch.bfloat16 and current_platform.has_device_capability(80):
+        return None
+    return "requires FP16 activations, or native BF16 tensor cores"
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2144,8 +2284,13 @@ def qsa_sparse_paged_attention(
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA over paged FP16/BF16 or calibrated E4M3 K/V."""
+    """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
+
+    LSE callers may supply FP32 output to avoid rounding each rank's partial
+    result. Apply output gating after the cross-rank merge, not per rank.
+    """
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -2190,8 +2335,21 @@ def qsa_sparse_paged_attention(
         out = torch.empty_like(q)
     if out.shape != q.shape:
         raise ValueError("QSA sparse output must match its query")
-    assert out.dtype == q.dtype and out.device == q.device
+    allowed_output_dtypes = (q.dtype, torch.float32) if lse is not None else (q.dtype,)
+    assert out.dtype in allowed_output_dtypes and out.device == q.device
     assert out.stride(2) == 1
+    if lse is not None:
+        if (
+            lse.shape != q.shape[:2]
+            or lse.dtype != torch.float32
+            or lse.device != q.device
+            or not lse.is_contiguous()
+        ):
+            raise ValueError("QSA LSE requires contiguous FP32 [rows, heads] output")
+        if output_gate is not None:
+            raise ValueError(
+                "QSA DCP must apply its gate after merging partial outputs"
+            )
     output_gate_view = output_gate.view_as(q) if output_gate is not None else None
     if output_gate_view is not None:
         if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
@@ -2201,7 +2359,7 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
-    if _use_sm70_qsa_xqa_page4(
+    if lse is None and _use_sm70_qsa_xqa_page4(
         q,
         k_cache,
         v_cache,
@@ -2299,6 +2457,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        lse,
         output_gate_view,
         q.stride(0),
         q.stride(1),
@@ -2341,6 +2500,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        lse,
         output_gate_view,
         out.stride(0),
         out.stride(1),

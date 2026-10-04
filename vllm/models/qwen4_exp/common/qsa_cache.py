@@ -224,6 +224,8 @@ def _build_qsa_metadata_kernel(
     compress_ratio: tl.constexpr,
     circular_buffer_size: tl.constexpr,
     num_block_table_columns: tl.constexpr,
+    IGNORE_COMMON_SLOT_MASK: tl.constexpr,
+    MAP_PLAIN_SLOT: tl.constexpr,
     launch_pdl: tl.constexpr,
     TOKEN_BLOCK_SIZE: tl.constexpr,
     REQUEST_SCAN_SIZE: tl.constexpr,
@@ -284,6 +286,22 @@ def _build_qsa_metadata_kernel(
         slot = physical_block * circular_buffer_size + (
             logical_position % circular_buffer_size
         )
+    elif MAP_PLAIN_SLOT:
+        logical_block = tl.maximum(logical_position, 0) // storage_block_size
+        valid = (
+            mapped & (logical_position >= 0) & (logical_block < num_block_table_columns)
+        )
+        physical_block = tl.load(
+            block_table_ptr
+            + request_idx * block_table_stride_0
+            + logical_block * block_table_stride_1,
+            mask=valid,
+            other=-1,
+        )
+        valid &= physical_block >= 0
+        slot = physical_block * storage_block_size + (
+            logical_position % storage_block_size
+        )
     elif compress_ratio != 1:
         compressed_position = tl.maximum(logical_position, 0) // compress_ratio
         logical_block = compressed_position // storage_block_size
@@ -301,13 +319,14 @@ def _build_qsa_metadata_kernel(
             other=-1,
         )
         valid &= physical_block >= 0
-        valid &= (
-            tl.load(common_slot_mapping_ptr + token_idx, mask=mapped, other=-1) >= 0
-        )
+        if not IGNORE_COMMON_SLOT_MASK:
+            valid &= (
+                tl.load(common_slot_mapping_ptr + token_idx, mask=mapped, other=-1) >= 0
+            )
         slot = physical_block * storage_block_size + (
             compressed_position % storage_block_size
         )
-    if (circular_buffer_size > 0) or (compress_ratio != 1):
+    if (circular_buffer_size > 0) or (compress_ratio != 1) or MAP_PLAIN_SLOT:
         tl.store(
             slot_mapping_ptr + token_idx,
             tl.where(valid, slot, -1),
@@ -386,6 +405,8 @@ def build_qsa_metadata_triton(
     circular_buffer_size: int = 0,
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
+    ignore_common_slot_mask: bool = False,
+    map_plain_slot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -442,13 +463,15 @@ def build_qsa_metadata_triton(
         compress_ratio,
         circular_buffer_size,
         block_table.shape[1],
+        IGNORE_COMMON_SLOT_MASK=ignore_common_slot_mask,
+        MAP_PLAIN_SLOT=map_plain_slot,
         launch_pdl=_metadata_launch_pdl(),
         TOKEN_BLOCK_SIZE=128,
         REQUEST_SCAN_SIZE=request_scan_size,
         WORK_BLOCK_SIZE=256,
         num_warps=4,
     )
-    if circular_buffer_size == 0 and compress_ratio == 1:
+    if circular_buffer_size == 0 and compress_ratio == 1 and not map_plain_slot:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
     return token_to_req, logical_positions, slot_mapping
 
@@ -464,6 +487,8 @@ def _build_qsa_metadata_torch(
     circular_buffer_size: int = 0,
     k_work_metadata_buffer: torch.Tensor | None = None,
     request_capacity: int | None = None,
+    ignore_common_slot_mask: bool = False,
+    map_plain_slot: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del request_capacity
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -495,6 +520,16 @@ def _build_qsa_metadata_torch(
             query_start_loc=common_attn_metadata.query_start_loc,
             out=slot_mapping_buffer,
         )
+    elif map_plain_slot:
+        slot_mapping = slot_mapping_buffer[:num_tokens]
+        slot_mapping.copy_(
+            _logical_to_physical_qsa_slots(
+                common_attn_metadata.block_table_tensor,
+                token_to_req,
+                logical_positions,
+                storage_block_size,
+            )
+        )
     elif compress_ratio == 1:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
     else:
@@ -506,9 +541,10 @@ def _build_qsa_metadata_torch(
             compress_ratio,
             slot_mapping_buffer,
         )
-        slot_mapping.masked_fill_(
-            common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
-        )
+        if not ignore_common_slot_mask:
+            slot_mapping.masked_fill_(
+                common_attn_metadata.slot_mapping[:num_tokens] < 0, -1
+            )
     if k_work_metadata_buffer is not None:
         query_lens = (
             common_attn_metadata.query_start_loc[1:]
@@ -567,6 +603,9 @@ class QSAForwardMetadata(AttentionMetadata):
     num_actual_tokens: int
     storage_block_size: int
     compress_ratio: int
+    # Host copy of query_start_loc. It lets QSA selection split a mixed batch
+    # by request without a device synchronization.
+    query_start_loc_cpu: torch.Tensor | None = None
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -586,6 +625,20 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
+        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self.has_sharded_main_owner = any(
+            "mtp" not in name.split(".") for name in layer_names
+        )
+        # Under DCP the replicated MTP draft shares the target's KV cache
+        # group, so a draft-only builder (the eager draft steps build one) gets
+        # the same rank-local block table and ownership-masked slot map as the
+        # target. It must convert pages and ignore the ownership mask exactly
+        # like a selector with a sharded main owner.
+        self.reads_sharded_group = self.has_sharded_main_owner or (
+            self.dcp_world_size > 1
+            and bool(layer_names)
+            and all("mtp" in name.split(".") for name in layer_names)
+        )
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = kv_cache_spec.compress_ratio
         else:
@@ -639,31 +692,50 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
 
         if not self.block_table_buffer.numel():
             return block_table
+        # A mixed target/draft KV group can expose scheduler-level physical
+        # IDs directly, even when a layer's own kernel block is narrower.
+        # The buffer was sized for the maximum number of physical pages.
+        if block_table.shape[1] <= self.block_table_buffer.shape[1]:
+            return block_table
         kernel_block_size = getattr(
             self, "kernel_block_size", self.kv_cache_spec.block_size
         )
-        if self.kv_cache_spec.block_size % kernel_block_size:
+        group_block_size = self.kv_cache_spec.block_size
+        # The common block table enumerates the kernel blocks this rank owns.
+        # When the group's main K/V is DCP-sharded those entries count local
+        # tokens, while a QSA side page declares the global span it covers
+        # (see qsa_dcp_block_geometry). Convert that span back to local tokens
+        # before deriving the virtual expansion. This applies to a replicated
+        # selector sharing a sharded main owner's table just as much as to a
+        # sharded page: both read the same local table. The replicated MTP
+        # draft keeps its QSA caches replicated but reads that same table.
+        table_counts_local_tokens = (
+            self.kv_cache_spec.dcp_sharded or self.reads_sharded_group
+        )
+        if table_counts_local_tokens and self.dcp_world_size > 1:
+            if group_block_size % self.dcp_world_size:
+                raise RuntimeError("QSA replicated page must cover whole DCP group")
+            group_block_size //= self.dcp_world_size
+        if group_block_size % kernel_block_size:
             raise RuntimeError(
                 "QSA scheduler block size must be divisible by the KV-group "
                 "kernel block size"
             )
-        expansion = self.kv_cache_spec.block_size // kernel_block_size
+        expansion = group_block_size // kernel_block_size
         if expansion == 1:
             return block_table
-        if block_table.shape[1] % expansion:
-            raise RuntimeError(
-                "QSA common block-table width does not match its virtual "
-                "kernel-block expansion"
-            )
         rows = block_table.shape[0]
-        columns = block_table.shape[1] // expansion
+        # The final physical page can be only partly represented when the
+        # maximum sequence length is not a multiple of the virtual expansion.
+        # Its first kernel entry still names the physical QSA page.
+        columns = (block_table.shape[1] + expansion - 1) // expansion
         if (
             rows > self.block_table_buffer.shape[0]
             or columns > (self.block_table_buffer.shape[1])
         ):
             raise RuntimeError("QSA canonical block-table buffer is too small")
         canonical = self.block_table_buffer[:rows, :columns]
-        expanded_first = block_table[:, : columns * expansion : expansion]
+        expanded_first = block_table[:, ::expansion]
         torch.div(
             expanded_first,
             expansion,
@@ -705,7 +777,17 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             ),
             k_work_metadata_buffer=k_work_metadata if build_k_work else None,
             request_capacity=request_capacity,
+            # The common slot map follows sharded main K/V ownership. A
+            # replicated selector, including the draft's, still writes every
+            # selected group boundary.
+            ignore_common_slot_mask=(
+                build_k_work and self.reads_sharded_group and self.dcp_world_size > 1
+            ),
         )
+        if common_attn_metadata.is_dummy_batch and (
+            self.is_circular_buffer or self.compress_ratio != 1
+        ):
+            slot_mapping.fill_(PAD_SLOT_ID)
         return QSAForwardMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
@@ -717,6 +799,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
         )
 
 
@@ -767,6 +850,34 @@ class QSAStateBackend(AttentionBackend):
         if include_num_layers_dimension:
             return (0, 1, 2, 3, 4)
         return (0, 1, 2, 3)
+
+
+def qsa_dcp_block_geometry(
+    vllm_config: VllmConfig, prefix: str
+) -> tuple[int, int, bool]:
+    """Return local main slots, replicated side span, and main DCP ownership.
+
+    A cache block spans ``block_size`` global tokens at every DCP size, so the
+    prefix-cache and recurrent-state granularity match DCP1. The target main
+    K/V is sharded: each rank holds ``block_size // dcp`` slots of it, and the
+    allocator packs ``dcp`` such layers into one physical page, the page a
+    recurrent state needs. The standalone MTP drafter keeps its entire QSA cache
+    replicated, and every selector covers the full span on each rank.
+    """
+    block_size = vllm_config.cache_config.block_size
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    if dcp not in (1, 2):
+        raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
+    if block_size % dcp:
+        raise ValueError(
+            f"Qwen4Exp QSA block size {block_size} must divide over DCP {dcp}"
+        )
+    is_draft = "mtp" in prefix.split(".")
+    return (
+        block_size if is_draft else block_size // dcp,
+        block_size,
+        not is_draft,
+    )
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
@@ -860,6 +971,7 @@ class QSAKeyStateCache(_QSAStateCache):
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
+            dcp_sharded=False,
         )
 
 
@@ -867,13 +979,14 @@ class QSACompressedKeyCache(_QSAStateCache):
     """Normalized, group-first-RoPE 16-bit key per complete group."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        del vllm_config
+        _, side_block_size, _ = qsa_dcp_block_geometry(vllm_config, self.prefix)
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=side_block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
+            dcp_sharded=False,
         )
 
 

@@ -41,7 +41,9 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadataBuilder,
 )
 from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+    MAX_GROUPS_PER_CALL,
     grouped_e4m3_fp32_allowed,
+    grouped_e4m3_fp32_groups_allowed,
     load_grouped_e4m3_fp32,
 )
 from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
@@ -540,6 +542,7 @@ _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
 _logged_prefill_prefix_decode_rows = False
+_logged_prefill_prefix_decode_rows_grouped = False
 _logged_prefill_smallq_decode_xqa = False
 _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
@@ -1857,8 +1860,17 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
 
     padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(query)
     leading_padding = _SM70_79T_MAX_QUERY_LEN - query_len
-    padded_query[:, :leading_padding].zero_()
-    padded_query[:, leading_padding:].copy_(query)
+    # A scheduler can split the first chunk below 8192 while other requests
+    # decode. If KV is also shorter, pad only future keys and shift the real
+    # query slice back by the same amount. For original query i, the last
+    # visible key remains KV - Q + i; padded keys are always masked out.
+    kv_padding = max(0, _SM70_79T_MAX_QUERY_LEN - int(key.shape[1]))
+    if kv_padding:
+        key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, kv_padding))
+        value = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, kv_padding))
+        leading_padding -= kv_padding
+    padded_query.zero_()
+    padded_query[:, leading_padding : leading_padding + query_len].copy_(query)
     _run_sm70_gqa_groups(
         architecture_q8192_op,
         padded_query,
@@ -1868,7 +1880,7 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
         softmax_scale,
         True,
     )
-    out.copy_(padded_out[:, leading_padding:])
+    out.copy_(padded_out[:, leading_padding : leading_padding + query_len])
     return out
 
 
@@ -3563,6 +3575,149 @@ def _build_ddtree_visibility_mask(
         if right >= 0:
             visible &= k_pos.unsqueeze(0) <= q_pos.unsqueeze(1) + right
     return visible
+
+
+_MIXED_ROWS_PLAN_ATTR = "_flash_v100_mixed_decode_rows_plan"
+_MIXED_ROWS_GROUP = 8
+
+
+class _MixedDecodeRowsPlan:
+    """Layout of the small-query rows of one mixed prefill/decode step.
+
+    The host side depends only on ``query_start_loc`` and the sequence-length
+    shadow, so it is built once per step and shared by every attention layer of
+    the group instead of re-deriving it (lists, host-to-device copies, gathers)
+    in each layer. Visible KV lengths are never taken from the host shadow: it
+    can be an upper bound under async speculative decoding, so every row length
+    is derived on the device from the authoritative ``seq_lens``.
+
+    Tokens are ordered by request and then by position inside the request.
+    A request with ``q`` query tokens is split into ``ceil(q / 8)`` groups of
+    eight rows for the request-major grouped operator; the causal boundary of
+    each row is carried by its own length, so slicing a longer span is exact.
+    """
+
+    __slots__ = (
+        "rows",
+        "max_query_len",
+        "max_seq_len_hint",
+        "num_groups",
+        "src_idx",
+        "token_req",
+        "token_delta",
+        "dst_idx",
+        "group_req",
+        "_token_lengths",
+        "_group_lengths",
+        "_group_table",
+    )
+
+    def __init__(
+        self,
+        rows: tuple[int, ...],
+        qsl: list[int],
+        seq_lens_host: list[int],
+        device: torch.device,
+    ) -> None:
+        src: list[int] = []
+        req: list[int] = []
+        delta: list[int] = []
+        dst: list[int] = []
+        group_req: list[int] = []
+        max_query_len = 0
+        max_seq_len = 0
+        for i in rows:
+            q_len = qsl[i + 1] - qsl[i]
+            max_query_len = max(max_query_len, q_len)
+            max_seq_len = max(max_seq_len, int(seq_lens_host[i]))
+            base = len(group_req) * _MIXED_ROWS_GROUP
+            group_req.extend([i] * -(-q_len // _MIXED_ROWS_GROUP))
+            for j in range(q_len):
+                src.append(qsl[i] + j)
+                req.append(i)
+                delta.append(1 + j - q_len)
+                dst.append(base + j)
+        self.rows = rows
+        self.max_query_len = max_query_len
+        self.max_seq_len_hint = max_seq_len
+        self.num_groups = len(group_req)
+        packed = torch.tensor(
+            src + req + delta + dst + group_req,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        ).to(device, non_blocking=True)
+        n = len(src)
+        self.src_idx = packed[:n]
+        self.token_req = packed[n : 2 * n]
+        self.token_delta = packed[2 * n : 3 * n].to(torch.int32)
+        self.dst_idx = packed[3 * n : 4 * n]
+        self.group_req = packed[4 * n :]
+        self._token_lengths: torch.Tensor | None = None
+        self._group_lengths: torch.Tensor | None = None
+        self._group_table: torch.Tensor | None = None
+
+    def token_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """Visible KV length of every selected query token (int32, [T])."""
+        if self._token_lengths is None:
+            self._token_lengths = (
+                seq_lens.index_select(0, self.token_req).to(torch.int32)
+                + self.token_delta
+            )
+        return self._token_lengths
+
+    def group_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """Row lengths of the padded eight-row groups (zero on padding rows)."""
+        if self._group_lengths is None:
+            lengths = torch.zeros(
+                self.num_groups * _MIXED_ROWS_GROUP,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            lengths.index_copy_(0, self.dst_idx, self.token_lengths(seq_lens))
+            self._group_lengths = lengths
+        return self._group_lengths
+
+    def group_table(self, block_table: torch.Tensor) -> torch.Tensor:
+        """One block-table row per eight-row group ([G, columns])."""
+        if self._group_table is None:
+            self._group_table = block_table.index_select(0, self.group_req)
+        return self._group_table
+
+
+def _mixed_decode_rows_plan(
+    attn_metadata: TritonAttentionMetadata,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_query_len: int,
+    device: torch.device,
+) -> _MixedDecodeRowsPlan | None:
+    """Select the resident decode/verification rows of a mixed batch.
+
+    Returns ``None`` when the batch has no such row, or only such rows (that
+    shape is the uniform small-query batch and has its own route). The result is
+    cached on the step's metadata object, which every layer of the group shares.
+    """
+    cached = getattr(attn_metadata, _MIXED_ROWS_PLAN_ATTR, False)
+    if cached is not False:
+        return cast(_MixedDecodeRowsPlan | None, cached)
+    num_seqs = len(query_start_loc) - 1
+    qsl = query_start_loc[: num_seqs + 1].tolist()
+    seq_lens_host = seq_lens[:num_seqs].tolist()
+    rows = tuple(
+        i
+        for i in range(num_seqs)
+        if 1 <= qsl[i + 1] - qsl[i] <= max_query_len
+        and int(seq_lens_host[i]) > qsl[i + 1] - qsl[i]
+    )
+    plan = (
+        _MixedDecodeRowsPlan(rows, qsl, seq_lens_host, device)
+        if rows and len(rows) != num_seqs
+        else None
+    )
+    with suppress(AttributeError):
+        setattr(attn_metadata, _MIXED_ROWS_PLAN_ATTR, plan)
+    return plan
 
 
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
@@ -8327,6 +8482,86 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and not _is_cuda_graph_capturing(query)
         )
 
+    def _run_mixed_rows_grouped_e4m3(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        out_view: torch.Tensor,
+        plan: _MixedDecodeRowsPlan,
+    ) -> bool:
+        """Run the resident rows of a mixed batch on the grouped E4M3 operator.
+
+        This is the route a uniform verification batch already takes: eight
+        query rows share one pass over the request's KV, accumulate in FP32 and
+        keep the explicit per-row causal length. Without it a DFlash2 target in
+        a mixed batch reads the whole KV once per query token through the
+        scalar decoder, and the cost grows with the context. Returns ``False``
+        when the operator or the layout is not admitted; nothing has been
+        written to ``out_view`` in that case.
+        """
+        global _logged_prefill_prefix_decode_rows_grouped
+        grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
+        if grouped_op is None:
+            return False
+        table = plan.group_table(attn_metadata.block_table)
+        lengths = plan.group_lengths(attn_metadata.seq_lens)
+        total_rows = plan.num_groups * _MIXED_ROWS_GROUP
+        q_pad = query.new_zeros((total_rows, query.shape[1], query.shape[2]))
+        out_pad = torch.empty_like(q_pad)
+        chunks = [
+            (g0, min(g0 + MAX_GROUPS_PER_CALL, plan.num_groups))
+            for g0 in range(0, plan.num_groups, MAX_GROUPS_PER_CALL)
+        ]
+        for g0, g1 in chunks:
+            r0, r1 = g0 * _MIXED_ROWS_GROUP, g1 * _MIXED_ROWS_GROUP
+            if not grouped_e4m3_fp32_groups_allowed(
+                self,
+                q_pad[r0:r1],
+                key_cache,
+                value_cache,
+                table[g0:g1],
+                lengths[r0:r1],
+                causal=bool(getattr(attn_metadata, "causal", True)),
+                out=out_pad[r0:r1],
+            ):
+                return False
+        q_pad.index_copy_(0, plan.dst_idx, query.index_select(0, plan.src_idx))
+        k_scale = float(layer._k_scale_float)
+        v_scale = float(layer._v_scale_float)
+        for g0, g1 in chunks:
+            r0, r1 = g0 * _MIXED_ROWS_GROUP, g1 * _MIXED_ROWS_GROUP
+            # Row lengths are authoritative: padding rows have length zero and
+            # produce zero output, so no row can read an unwritten KV entry.
+            grouped_op(
+                q_pad[r0:r1],
+                key_cache,
+                value_cache,
+                table[g0:g1],
+                lengths[r0:r1],
+                out=out_pad[r0:r1],
+                softmax_scale=self.scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        out_view.index_copy_(0, plan.src_idx, out_pad.index_select(0, plan.dst_idx))
+        if not _logged_prefill_prefix_decode_rows_grouped:
+            logger.info(
+                "FLASH_ATTN_V100 mixed-batch small-query rows take the grouped "
+                "E4M3 FP32 route (requests=%d, groups=%d, max_q=%d, "
+                "max_seq_len=%d).",
+                len(plan.rows),
+                plan.num_groups,
+                plan.max_query_len,
+                plan.max_seq_len_hint,
+            )
+            _logged_prefill_prefix_decode_rows_grouped = True
+        _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "grouped_fp32")
+        _record_route("prefill_prefix_decode_rows_e4m3_grouped_fp32")
+        return True
+
     def _run_prefill_prefix_decode_rows(
         self,
         layer: torch.nn.Module,
@@ -8346,53 +8581,33 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         the whole context (kernel/fused_mha_api.cpp launches ``grid(ceil(q/BM),
         1, B*H)``). A resident decoder at 240K pays ~58 ms per layer that way
         versus ~1.8 ms on the partitioned decode kernel (1CatAI/1Cat-vLLM#490),
-        and an MTP/DFlash verify row (q = K+1) has the same grid. Every query
-        token of a selected row becomes one decode row whose visible KV length
-        grows by one, the expansion _flash_v100_small_query_prefill_as_decode
-        uses for the verifier, so the causal mask is preserved. Returns the row
-        indices consumed here; the caller's per-sequence loop skips them.
+        and an MTP/DFlash verify row (q = K+1) has the same grid. The rows are
+        therefore pulled out of the prefill batch and run on a decode operator.
+        Every query token of a selected row becomes one decode row whose visible
+        KV length grows by one, the expansion _flash_v100_small_query_prefill_as_decode
+        uses for the verifier, so the causal mask is preserved. A DFlash2 E4M3
+        target takes the grouped FP32 operator like its uniform verifier does;
+        other layouts use XQA or the scalar decoder. Returns the row indices
+        consumed here; the caller's per-sequence loop skips them.
         """
         global _logged_prefill_prefix_decode_rows
-        num_seqs = len(query_start_loc) - 1
-        qsl = query_start_loc[: num_seqs + 1].tolist()
-        seq_lens_host = seq_lens[:num_seqs].tolist()
-        max_q = max(1, int(self.smallq_decode_max_query_len))
-        rows = [
-            i
-            for i in range(num_seqs)
-            if 1 <= qsl[i + 1] - qsl[i] <= max_q
-            and int(seq_lens_host[i]) > qsl[i + 1] - qsl[i]
-        ]
-        if not rows or len(rows) == num_seqs:
+        plan = _mixed_decode_rows_plan(
+            attn_metadata,
+            query_start_loc,
+            seq_lens,
+            max(1, int(self.smallq_decode_max_query_len)),
+            query.device,
+        )
+        if plan is None:
             return set()
-
-        token_idx: list[int] = []
-        token_rows: list[int] = []
-        token_seq_lens: list[int] = []
-        for i in rows:
-            q_len = qsl[i + 1] - qsl[i]
-            seq_len = int(seq_lens_host[i])
-            for j in range(q_len):
-                token_idx.append(qsl[i] + j)
-                token_rows.append(i)
-                token_seq_lens.append(seq_len - q_len + 1 + j)
-        device = query.device
-        start_idx = torch.tensor(token_idx, device=device, dtype=torch.long)
-        q_rows = query.index_select(0, start_idx)
-        out_rows = torch.empty_like(q_rows)
-        block_table = attn_metadata.block_table.index_select(
-            0, torch.tensor(token_rows, device=device, dtype=torch.long)
-        )
-        seq_lens_rows = torch.tensor(
-            token_seq_lens, device=device, dtype=attn_metadata.seq_lens.dtype
-        )
-        max_seq_len_hint = max(token_seq_lens)
-        max_query_len_rows = max(qsl[i + 1] - qsl[i] for i in rows)
-
+        num_rows = int(plan.src_idx.numel())
+        max_seq_len_hint = plan.max_seq_len_hint
+        max_query_len_rows = plan.max_query_len
+        num_heads = int(query.shape[1])
         num_kv_heads = int(key_cache.shape[2])
         q_per_kv = (
-            int(q_rows.shape[1]) // num_kv_heads
-            if num_kv_heads > 0 and int(q_rows.shape[1]) % num_kv_heads == 0
+            num_heads // num_kv_heads
+            if num_kv_heads > 0 and num_heads % num_kv_heads == 0
             else 0
         )
         fp16_kv = (
@@ -8419,7 +8634,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_decode_xqa
             and self.flash_attn_decode_paged_xqa is not None
             and (fp16_kv or fp8_e5m2_kv or fp8_e4m3_kv)
-            and int(q_rows.shape[2]) == 256
+            and int(query.shape[2]) == 256
             and (
                 q_per_kv in (6, 8)
                 or (q_per_kv == 4 and max_seq_len_hint >= _decode_xqa_q4_min_seq_len())
@@ -8428,7 +8643,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 not fp8_e4m3_kv
                 or (
                     q_per_kv == 6
-                    and (q_rows.shape[0] == 1 or _e4m3_batch_xqa_allowed(q_rows))
+                    and (
+                        num_rows == 1
+                        or (
+                            envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+                            and num_rows > 1
+                            and num_heads % 6 == 0
+                        )
+                    )
                 )
             )
             and (
@@ -8436,6 +8658,25 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 or (q_per_kv != 4 and max_seq_len_hint >= _decode_fp8_xqa_min_seq_len())
             )
         )
+        if (
+            self.kv_cache_dtype == "fp8_e4m3"
+            and not use_xqa
+            and self._run_mixed_rows_grouped_e4m3(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out_view,
+                plan,
+            )
+        ):
+            return set(plan.rows)
+
+        q_rows = query.index_select(0, plan.src_idx)
+        out_rows = torch.empty_like(q_rows)
+        block_table = attn_metadata.block_table.index_select(0, plan.token_req)
+        seq_lens_rows = plan.token_lengths(attn_metadata.seq_lens)
         partition_size_hint = (
             _g6_aligned_page_partition_size_hint(
                 q_rows, key_cache, value_cache, self.kv_cache_dtype
@@ -8469,7 +8710,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     batch_context_routing=True,
                 )
                 return out_rows
-
         else:
             route = "prefill_prefix_decode_rows_scalar"
 
@@ -8495,8 +8735,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "FLASH_ATTN_V100 mixed-batch small-query rows take the paged "
                 "decode route (%s, rows=%d of %d, max_q=%d, max_seq_len=%d).",
                 route,
-                len(rows),
-                num_seqs,
+                len(plan.rows),
+                len(query_start_loc) - 1,
                 max_query_len_rows,
                 max_seq_len_hint,
             )
@@ -8505,9 +8745,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             route=route,
             q_len=max_query_len_rows,
             seq_len=max_seq_len_hint,
-            heads_q=int(q_rows.shape[1]),
+            heads_q=num_heads,
             heads_kv=num_kv_heads,
-            head_dim=int(q_rows.shape[2]),
+            head_dim=int(query.shape[2]),
             block_size=int(key_cache.shape[1]),
             fn=run,
         )
@@ -8517,8 +8757,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             "xqa_paged" if use_xqa else "scalar_paged",
         )
         _record_route(route)
-        out_view.index_copy_(0, start_idx, out_rows)
-        return set(rows)
+        out_view.index_copy_(0, plan.src_idx, out_rows)
+        return set(plan.rows)
 
     def _run_prefill_paged_call(
         self,
