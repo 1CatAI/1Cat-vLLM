@@ -95,6 +95,24 @@ def test_dense_dequantization_retains_owned_output_without_an_extra_copy(monkeyp
     assert weight.data_ptr() == values.ctypes.data
 
 
+def test_quantized_context_projection_uses_declared_operand_dtype():
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+
+    class Projection(torch.nn.Module):
+        input_size = 32
+        quant_method = SimpleNamespace(params_dtype=torch.float16)
+
+        def forward(self, x):
+            assert x.dtype == torch.float16
+            return x
+
+    draft = DFlashQwen3ForCausalLM.__new__(DFlashQwen3ForCausalLM)
+    torch.nn.Module.__init__(draft)
+    draft.model = SimpleNamespace(fc=Projection(), use_aux_hidden_state=True)
+    inputs = torch.linspace(-1, 1, 32, dtype=torch.float32)
+    assert torch.equal(draft.combine_hidden_states(inputs), inputs.half())
+
+
 def test_dense_auxiliaries_decode_without_qwen35_norm_offsets():
     adapter = get_gguf_adapter(gguf_config_from_metadata(metadata()), tp_size=4)
     data = gguf.quants.quantize(
