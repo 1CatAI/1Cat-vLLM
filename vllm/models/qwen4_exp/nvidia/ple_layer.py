@@ -1774,11 +1774,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
-        if self._is_cpu_offloaded:
+        if self._is_cpu_offloaded and getattr(self, "_cascade", False):
             # Cascade: the resident tiers are gathered here, the rows beyond
             # them arrive from the worker in the shared output buffer.
             remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
             return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
+        # Hybrid decode reads the complete device/pinned-host table locally.
+        # Graph replay submits no remote request, so it must not wait for IPC.
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:

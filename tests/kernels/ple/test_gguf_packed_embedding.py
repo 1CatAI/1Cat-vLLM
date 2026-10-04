@@ -228,3 +228,46 @@ def test_gpu_packets_match_cpu_and_changed_graph_ids(monkeypatch, tmp_path, plac
     graph.replay()
     torch.accelerator.synchronize()
     torch.testing.assert_close(result, reference[ids], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cascade", [None, False, True])
+def test_local_hybrid_lookup_waits_only_for_cascade_rows(monkeypatch, cascade):
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    monkeypatch.setattr(ple_layer, "is_offload_process", lambda: True)
+    layer = object.__new__(ple_layer.Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(layer)
+    layer._is_cpu_offloaded = True
+    if cascade is not None:
+        layer._cascade = cascade
+    ids = torch.tensor([[1, 2], [3, 4]])
+    layer.compute_ngram_ids = lambda *_: ids
+    calls = []
+    remote = torch.full((2, 6), 7, dtype=torch.float16)
+
+    def wait(*args):
+        calls.append("wait")
+        return remote
+
+    class Embedding(torch.nn.Module):
+        def forward(self, ngram_ids, remote_rows=None):
+            torch.testing.assert_close(ngram_ids, ids)
+            if cascade:
+                assert remote_rows is remote
+            else:
+                assert remote_rows is None
+            calls.append("lookup")
+            return torch.arange(12, dtype=torch.float16).reshape(2, 2, 3)
+
+    layer.wait_offloaded_output = wait
+    layer.ngram_embedding = Embedding()
+    result = layer.forward_impl(
+        torch.empty(2, 4),
+        torch.tensor([1, 2]),
+        torch.tensor([0, 2]),
+        torch.zeros(1, 2, dtype=torch.int64),
+    )
+    torch.testing.assert_close(
+        result, torch.arange(12, dtype=torch.float16).reshape(2, 6)
+    )
+    assert calls == (["wait", "lookup"] if cascade else ["lookup"])
