@@ -63,9 +63,15 @@ fusion savings, while parallel top-k added service time.
 
 ## Qualification status
 
-Eight CPU admission/hash tests and scoped static checks pass. A full source
-artifact is being built; installed GPU tests, the matched C1 distribution and
-natural task-quality gates, endpoint per-step timing, a short C4 health check
-and the graph-node trace are pending. No model speedup or phase-target claim
-is accepted yet. In-projection, out-projection, LM head, MTP, dense quantization
-and communication algorithms are outside this change.
+Eight CPU admission/hash tests and scoped static checks pass. The normal source
+artifact contains 16 newly built native modules; packaged Python matches the
+qualified source and loader paths exclude build directories. Ten installed
+GPU tests pass, including replay with changed inputs and all 63,488 finite
+FP16 gate values against native activation. The installed wheel SHA256 is
+`bd774a8c6b25bf8da90efdd9f5f426954ddd5f83cd8a878826bea2b935118be8`.
+
+Matched C1 distribution and natural task-quality gates, endpoint per-step
+timing, a short C4 health check and the graph-node trace remain pending.
+No model speedup or phase-target claim is accepted yet. In-projection,
+out-projection, LM head, MTP, dense quantization and communication algorithms
+are outside this change.
