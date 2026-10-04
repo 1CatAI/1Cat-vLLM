@@ -517,6 +517,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             if unquantized_head
             else None
         )
+        draft_vocab_head = getattr(self, "sm70_draft_vocab_head", None)
+        if draft_vocab_head is not None:
+            logits = draft_vocab_head(hidden_states)
+            values, local_ids = _topk(logits, selector.top_k)
+            local_candidates = (values, draft_vocab_head.token_ids[local_ids])
         if local_candidates is None:
             logits = self.lm_head.quant_method.apply(
                 self.lm_head, hidden_states, bias=None

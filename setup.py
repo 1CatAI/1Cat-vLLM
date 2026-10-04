@@ -1435,6 +1435,8 @@ package_data = {
     "vllm": [
         "py.typed",
         "assets/*.pt",
+        "assets/*draft_vocab*.bin",
+        "assets/*draft_vocab*LICENSE.txt",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
