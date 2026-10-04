@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -104,3 +105,66 @@ def test_canonical_vector_fallback_uses_routed_rows(monkeypatch):
         [1, 128],
     )
     assert calls == ["vector", "vector"]
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("rank", range(4))
+def test_expert_bank_retains_complete_tp_rows_and_counts_storage(
+    monkeypatch, kind, rank
+):
+    from vllm.model_executor.kernels.gguf import (
+        GGUFDecoderFamily,
+        GGUFOperatorCapability,
+    )
+    from vllm.model_executor.layers.quantization import gguf_turbomind_moe as module
+    from vllm.transformers_utils.gguf_tensor_reader import quant_size
+
+    monkeypatch.setattr(
+        module,
+        "current_platform",
+        SimpleNamespace(
+            is_device_capability=lambda _: True,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "raw_grouped_gate_up_capabilities",
+        lambda *a, **kw: (
+            GGUFOperatorCapability(
+                GGUFDecoderFamily.LATTICE, str(kind), "raw", True, min_m=1, max_m=1
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        torch.ops,
+        "_C",
+        SimpleNamespace(
+            gguf_lattice_sm70_prepare=lambda codes, stats, *args: (
+                codes,
+                stats,
+                torch.tensor([1, 2, 3, 4]),
+            ),
+            awq_moe_build_strided_ptrs=lambda *args: (
+                torch.empty(2, dtype=torch.uint8),
+                torch.empty(2, dtype=torch.uint8),
+            ),
+            gguf_lattice_grouped_gemm_sm70_out=object(),
+        ),
+    )
+    _, block_bytes = quant_size(kind)
+    sources = np.random.default_rng(kind).integers(
+        0, 256, (2, 128, block_bytes), dtype=np.uint8
+    )
+    sources[:, :, :2] = np.float16(0.01).tobytes()[0], np.float16(0.01).tobytes()[1]
+    bank = module.GGUFExpertBank(kind, 2, "cpu", torch.float16, retain_raw=True)
+    for expert in range(2):
+        bank.add(expert, torch.from_numpy(sources[expert]), rank, 4, axis=0)
+    bank.finalize()
+    assert not bank.pending and not bank.raw_pending
+    stride = (block_bytes + 7) // 8 * 8
+    assert bank.raw_weights.shape == (2, 32, stride)
+    assert bank.raw_weights.dtype == torch.uint8
+    expected = torch.from_numpy(sources[:, rank * 32 : (rank + 1) * 32])
+    assert torch.equal(bank.raw_weights[:, :, :block_bytes], expected)
+    assert torch.count_nonzero(bank.raw_weights[:, :, block_bytes:]) == 0
+    assert bank.raw_weights.numel() == 2 * 32 * stride
