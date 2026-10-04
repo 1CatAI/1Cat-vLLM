@@ -192,6 +192,31 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
            &gguf_affine_blas_sm70_out);
   ops.def(
+      "gguf_lattice_compact_reorder_sm70_out(Tensor(a!) out, Tensor raw, int "
+      "source_type, int logical_k) -> ()");
+  ops.impl("gguf_lattice_compact_reorder_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_reorder_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "int source_type) -> ()");
+  ops.impl("gguf_lattice_compact_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) partial, int splits=1) -> ()");
+  ops.impl("gguf_lattice_compact_vec_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_vec_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) partial, int splits=1) -> ()");
+  ops.impl("gguf_lattice_compact_mma_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_mma_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) scratch) -> ()");
+  ops.impl("gguf_lattice_compact_blas_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_blas_sm70_out);
+  ops.def(
       "gguf_lattice_raw_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, int "
       "tile_n=32) -> ()");

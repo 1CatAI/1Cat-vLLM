@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
+
 import gguf
 import numpy as np
 import pytest
@@ -130,3 +132,101 @@ def test_raw_blas_graph(kind):
     torch.testing.assert_close(
         out.float(), x.float() @ reference.float().T, rtol=0.003, atol=0.01
     )
+
+
+def restore_compact_bytes(storage, kind, n, k):
+    """Independent bitstream inverse: verify every source bit survives."""
+    block_bytes, bits, small_bytes = (110, 26, 4) if kind == 21 else (82, 18, 8)
+    blocks = k // 256
+    restored = np.zeros((n, blocks, block_bytes), dtype=np.uint8)
+    for first in range(0, n, 32):
+        width = min(32, n - first)
+        packet_bytes = width * bits * 4
+        for block in range(blocks):
+            start = first * blocks * block_bytes + block * width * block_bytes
+            tile = storage[start : start + width * block_bytes]
+            stream = int.from_bytes(tile[:packet_bytes].tobytes(), "little")
+            target = restored[first : first + width, block]
+            target[:, :2] = tile[packet_bytes : packet_bytes + width * 2].reshape(
+                width, 2
+            )
+            target[:, 106 if kind == 21 else 74 :] = tile[
+                packet_bytes + width * 2 :
+            ].reshape(width, small_bytes)
+            for octet in range(32):
+                for col in range(width):
+                    packet = (stream >> ((octet * width + col) * bits)) & (
+                        (1 << bits) - 1
+                    )
+                    if kind == 21:
+                        target[col, 2 + octet * 2] = packet & 255
+                        target[col, 3 + octet * 2] = (packet >> 9) & 255
+                        target[col, 66 + octet // 4] |= (
+                            ((packet >> 8) & 1) | (((packet >> 17) & 1) << 1)
+                        ) << (2 * (octet % 4))
+                        target[col, 74 + octet] = packet >> 18
+                    else:
+                        target[col, 2 + octet] = packet & 255
+                        target[col, 66 + octet // 4] |= ((packet >> 8) & 3) << (
+                            2 * (octet % 4)
+                        )
+                        target[col, 34 + octet] = packet >> 10
+    return restored.reshape(n, -1)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("n", [1, 7, 37, 64])
+def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    data = packed(kind, n=n)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    count = (data.nbytes + 7) // 8 * 8
+    weight = torch.empty(count, dtype=torch.uint8, device="cuda")
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+        weight, source, kind, raw.logical_k
+    )
+    encoded = weight.cpu().numpy()
+    assert count - data.nbytes <= 7
+    assert np.array_equal(restore_compact_bytes(encoded, kind, n, raw.logical_k), data)
+    assert not encoded[data.nbytes :].any()
+    reference = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    ).cuda()
+    decoded = torch.empty_like(reference)
+    torch.ops._C.gguf_lattice_compact_dequantize_sm70_out(decoded, weight, kind)
+    torch.testing.assert_close(decoded, reference, rtol=0, atol=0)
+    for m in (1, 5, 8, 16, 512):
+        x = torch.randn(m, raw.logical_k, device="cuda", dtype=torch.float16)
+        out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+        scratch = torch.empty(reference.T.shape, dtype=torch.float16, device="cuda")
+        for split in (1, 3) if m <= 64 else (1,):
+            partials = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
+            if m == 512:
+                run = partial(
+                    torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                    out,
+                    x,
+                    weight,
+                    kind,
+                    scratch,
+                )
+            else:
+                op = (
+                    torch.ops._C.gguf_lattice_compact_vec_sm70_out
+                    if m == 1
+                    else torch.ops._C.gguf_lattice_compact_mma_sm70_out
+                )
+                run = partial(op, out, x, weight, kind, partials, split)
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            expected = x.float() @ (reference if m == 1 else reference.half().float()).T
+            torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.01)
+            if m == 512:
+                torch.testing.assert_close(scratch, reference.half().T, rtol=0, atol=0)

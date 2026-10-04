@@ -221,6 +221,17 @@ def raw_lattice_capabilities(
     source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
 ) -> tuple[GGUFOperatorCapability, ...]:
     """Original IQ blocks; each operator owns its FP32 accumulation policy."""
+    return _lattice_storage_capabilities("raw", source_type, k, n, dtype, enabled)
+
+
+def compact_lattice_capabilities(
+    source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Equal-byte GPU permutation with unchanged original scale precision."""
+    return _lattice_storage_capabilities("compact", source_type, k, n, dtype, enabled)
+
+
+def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
     reason = None
     if not enabled:
         reason = "disabled_by_kernel_config"
@@ -231,9 +242,9 @@ def raw_lattice_capabilities(
     elif k <= 0 or k % 256 or n <= 0:
         reason = "raw_shape_cuts_source_block"
     bands = (
-        ("gguf_lattice_raw_vec_sm70_out", 1, 1),
-        ("gguf_lattice_raw_mma_sm70_out", 2, 64),
-        ("gguf_lattice_raw_blas_sm70_out", 512, None),
+        (f"gguf_lattice_{layout}_vec_sm70_out", 1, 1),
+        (f"gguf_lattice_{layout}_mma_sm70_out", 2, 64),
+        (f"gguf_lattice_{layout}_blas_sm70_out", 512, None),
     )
     return tuple(
         GGUFOperatorCapability(

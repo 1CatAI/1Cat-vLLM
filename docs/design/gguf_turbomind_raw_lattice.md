@@ -119,3 +119,69 @@ and dequantization/cuBLAS loses about 7–8%. Neither a universal raw default
 nor removal of canonical model storage is justified. Next collect DRAM and
 stall counters, then evaluate load pipelining and the equal-byte GPU reorder
 fallback for dense shapes. No end-to-end step saving is claimed by this table.
+
+## Equal-byte MMA permutation candidate
+
+The dense speed failure motivates a GPU-only bit permutation. IQ3_S encodes
+each eight K values as two nine-bit grid indices and eight signs (26 bits).
+IQ2_S uses one ten-bit grid index and eight signs (18 bits). Thirty-two octets
+therefore consume 104/72 bytes per source row block. Adding the original
+FP16 d and 4/8 small-scale bytes retains exactly 110/82 bytes per 256 weights.
+A 32-column macro-tile places these tightly packed packets before the d and
+small-scale planes. The final N macro-tile uses its actual column count and
+a continuous packet bitstream. Only the entire buffer receives up to seven
+trailing alignment bytes.
+
+GPU reordering consumes the original padded rows and writes that equal-byte
+layout. A production loader would release the source buffer afterwards; the
+comparison benchmark keeps separate candidate buffers for measurement. No
+expanded scale or index cache belongs to the format. A warp reads 13/9
+consecutive uint64 packet words per K octet and uses shuffle to extract its
+26/18-bit packet. Original scales are loaded once per 256-value block and
+multiplied in FP32. This removes per-block raw staging barriers from MMA.
+The new operators are compiled in the same normal extension. GPU numerical,
+bit-for-bit inverse, and speed checks for this candidate are still pending.
+
+The first counter experiment exposed a harness issue: its canonical graph
+captured a 32 MiB workspace initialization because warmup used a different
+stream. Ordinary graph timings already warmed their actual capture stream.
+Counter capture now also warms its explicit stream and pins the unprofiled
+winning candidate. The earlier counter artifacts are retained as rejected
+comparisons; their initialization writes are not application weight traffic.
+
+## Vectorized activation loads
+
+Source `3d89c06570` replaces eight scalar activation loads per fragment with
+one aligned uint4 load, without changing the arithmetic. All 12 original
+checks pass again. Whole-wheel SHA256:
+`2008ed9c89af31501163ba5a5f548f8bd684ae403d5f5a7a10db2de0a78aa559`;
+core SHA256:
+`f5ba280ffdae2bac646120f3f4be0ba8800b23dec83f6daadafa0b8c1b3138e6`.
+The graph/bank/environment contract is the same as the first table.
+
+| Projection | M | Canonical µs | Raw best µs | Raw/canonical |
+| --- | ---: | ---: | ---: | ---: |
+| 27B gate IQ3_S | 1 | 31.809 | 40.883 | 1.285 |
+| 27B gate IQ3_S | 5 | 32.932 | 66.426 | 2.017 |
+| 27B gate IQ3_S | 8 | 33.206 | 68.804 | 2.072 |
+| 27B gate IQ3_S | 16 | 39.823 | 84.152 | 2.113 |
+| 27B gate IQ3_S | 512 | 366.879 | 393.140 | 1.072 |
+| 27B down IQ3_S | 1 | 33.245 | 37.027 | 1.114 |
+| 27B down IQ3_S | 5 | 31.674 | 72.490 | 2.289 |
+| 27B down IQ3_S | 8 | 31.713 | 74.223 | 2.340 |
+| 27B down IQ3_S | 16 | 38.063 | 90.863 | 2.387 |
+| 27B down IQ3_S | 512 | 340.157 | 368.266 | 1.083 |
+| Flash expert IQ3_S | 1 | 16.317 | 7.019 | 0.430 |
+| Flash expert IQ3_S | 5 | 17.623 | 10.651 | 0.604 |
+| Flash expert IQ3_S | 8 | 17.613 | 10.822 | 0.614 |
+| Flash expert IQ3_S | 16 | 18.102 | 12.118 | 0.669 |
+| Flash expert IQ3_S | 512 | 69.008 | 31.937 | 0.463 |
+| Flash expert IQ2_S | 1 | 18.168 | 9.619 | 0.529 |
+| Flash expert IQ2_S | 5 | 19.316 | 13.160 | 0.681 |
+| Flash expert IQ2_S | 8 | 19.375 | 13.350 | 0.689 |
+| Flash expert IQ2_S | 16 | 19.649 | 14.123 | 0.719 |
+| Flash expert IQ2_S | 512 | 64.062 | 34.175 | 0.533 |
+
+Vectorization helps dense decode/MMA, but dense MMA still loses about 2–2.4x
+and prefill still loses 7–8%. The equal-byte permutation remains necessary
+to evaluate; no default or storage-removal decision is made from these data.

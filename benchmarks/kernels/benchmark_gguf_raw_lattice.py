@@ -51,6 +51,7 @@ def main():
         type=int,
         help="Distinct banks per graph; default exceeds twice L2",
     )
+    p.add_argument("--include-compact", action="store_true")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--profile", choices=("canonical", "raw"))
     p.add_argument(
@@ -73,6 +74,12 @@ def main():
     k_ld, q_ld = meta.tolist()
     original = torch.from_numpy(raw.data).cuda()
     n, k = raw.shape
+    compact = None
+    if a.include_compact:
+        compact = torch.empty(
+            (payload.nbytes + 7) // 8 * 8, dtype=torch.uint8, device="cuda"
+        )
+        torch.ops._C.gguf_lattice_compact_reorder_sm70_out(compact, original, kind, k)
     l2_bytes = getattr(
         torch.cuda.get_device_properties(0), "L2_cache_size", 6 * 1024 * 1024
     )
@@ -83,19 +90,38 @@ def main():
     banks = (
         a.weight_banks
         if a.weight_banks is not None
-        else max(1, math.ceil(2 * l2_bytes / min(raw_bytes, canonical_bytes)))
+        else max(
+            1,
+            math.ceil(
+                2
+                * l2_bytes
+                / min(
+                    raw_bytes,
+                    canonical_bytes,
+                    compact.numel() if compact is not None else raw_bytes,
+                )
+            ),
+        )
     )
     if banks < 1:
         p.error("--weight-banks must be positive")
     # Separate addresses keep small expert tests from measuring only L2 hits.
-    weight_banks = [(original, w, stats)] + [
-        (original.clone(), w.clone(), stats.clone()) for _ in range(banks - 1)
+    weight_banks = [(original, w, stats, compact)] + [
+        (
+            original.clone(),
+            w.clone(),
+            stats.clone(),
+            compact.clone() if compact is not None else None,
+        )
+        for _ in range(banks - 1)
     ]
 
     def banked_call(call, out):
         calls = []
-        for rw, cw, cs in weight_banks:
+        for rw, cw, cs, cp in weight_banks:
             replacements = {id(original): rw, id(w): cw, id(stats): cs}
+            if compact is not None:
+                replacements[id(compact)] = cp
             calls.append(
                 partial(
                     call.func,
@@ -114,6 +140,10 @@ def main():
     ref = torch.from_numpy(dequantize(payload, kind)).cuda()
     decoded = torch.empty_like(ref)
     torch.ops._C.gguf_lattice_raw_dequantize_sm70_out(decoded, original, kind)
+    if compact is not None:
+        torch.ops._C.gguf_lattice_compact_dequantize_sm70_out(decoded, compact, kind)
+        torch.testing.assert_close(decoded, ref, rtol=0, atol=0)
+        torch.ops._C.gguf_lattice_raw_dequantize_sm70_out(decoded, original, kind)
     weight_error = errors(decoded, ref)
     torch.testing.assert_close(decoded, ref, rtol=0, atol=0)
     # Scratch belongs to the invocation, not persistent weight storage.
@@ -143,6 +173,7 @@ def main():
         "row_padding_bytes": raw.padding_bytes_per_row,
         "original_payload_bytes": n * raw.payload_bytes_per_row,
         "raw_weight_bytes": original.numel(),
+        "compact_weight_bytes": compact.numel() if compact is not None else None,
         "canonical_weight_bytes": w.numel() * w.element_size()
         + stats.numel() * stats.element_size(),
         "weight_error": weight_error,
@@ -242,6 +273,71 @@ def main():
                     ),
                 )
             )
+        if compact is not None:
+            if m == 1:
+                auto = min(
+                    k // 256,
+                    max(1, math.ceil(4 * report["sm_count"] / math.ceil(n / 128))),
+                )
+                for split in sorted({1, auto}):
+                    tmp = torch.empty((split, n), dtype=torch.float32, device="cuda")
+                    candidates.append(
+                        (
+                            f"compact_vec_split{split}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_vec_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tmp,
+                                split,
+                            ),
+                        )
+                    )
+            elif m <= 64:
+                mt = 8 if m <= 8 else 16 if m <= 16 else 32
+                auto = min(
+                    k // 256,
+                    max(
+                        1,
+                        math.ceil(
+                            4
+                            * report["sm_count"]
+                            / (math.ceil(n / 32) * math.ceil(m / mt))
+                        ),
+                    ),
+                )
+                for split in sorted({1, auto}):
+                    tmp = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
+                    candidates.append(
+                        (
+                            f"compact_mma_split{split}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_mma_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tmp,
+                                split,
+                            ),
+                        )
+                    )
+            else:
+                candidates.append(
+                    (
+                        "compact_dequant_cublas",
+                        partial(
+                            torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                            out,
+                            x,
+                            compact,
+                            kind,
+                            raw_scratch,
+                        ),
+                    )
+                )
         old()
         old_error = errors(out, expected)
 
