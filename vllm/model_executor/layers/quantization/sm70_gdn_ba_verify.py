@@ -4,19 +4,16 @@
 
 import torch
 
-from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.platforms import current_platform
 
 
 def apply_gdn_ba_verify(layer, x):
-    config = get_current_vllm_config_or_none()
     qkvz = layer.in_proj_qkvz
     ba = layer.in_proj_ba
     if (
         not getattr(layer, "enable_sm70_dflash2_fused_gdn_verify", False)
-        or config is None
-        or config.lora_config is not None
+        or not getattr(layer, "enable_sm70_gdn_ba_verify", False)
         or not isinstance(qkvz, LinearBase)
         or not isinstance(ba, LinearBase)
         or not current_platform.is_device_capability(70)

@@ -2311,6 +2311,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        # Runtime forward/capture need not retain the initialization config.
+        # Capture LoRA exclusion while the owning configuration is available.
+        self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
