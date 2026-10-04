@@ -160,20 +160,20 @@ class GGUFExpertBank(torch.nn.Module):
         )
         if self.n % 32:
             raise ValueError("Canonical GGUF expert output cuts a 32-row pack")
-        if self.retain_raw:
-            self.raw_capabilities = raw_grouped_gate_up_capabilities(
-                self.source_type,
-                self.k,
-                self.n,
-                self.experts,
-                self.dtype,
-                is_sm70=current_platform.is_device_capability(70),
+        self.raw_capabilities = raw_grouped_gate_up_capabilities(
+            self.source_type,
+            self.k,
+            self.n,
+            self.experts,
+            self.dtype,
+            is_sm70=current_platform.is_device_capability(70),
+            original_storage_available=self.retain_raw,
+        )
+        if self.retain_raw and any(c.reason is None for c in self.raw_capabilities):
+            raw = RawGGUFProjection.from_rows(source, self.source_type).tp_slice(
+                rank, size, axis=axis
             )
-            if any(c.reason is None for c in self.raw_capabilities):
-                raw = RawGGUFProjection.from_rows(source, self.source_type).tp_slice(
-                    rank, size, axis=axis
-                )
-                self.raw_pending[index] = torch.from_numpy(raw.data).to(self.device)
+            self.raw_pending[index] = torch.from_numpy(raw.data).to(self.device)
         if isinstance(canonical, LatticeGGUFProjection):
             codes, stats = canonical.mma884_storage()
             stats = stats.view({2: np.int16, 4: np.int32, 8: np.int64}[stats.itemsize])
@@ -385,7 +385,9 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 "outside_m_band": "canonical_grouped_operator",
                 "reason": None
                 if self.raw_gate_up
-                else "requires_matching_admitted_original_block_banks_without_ep",
+                else "original_expert_bank_not_retained"
+                if gate.source_type == up.source_type and layer.ep_size == 1
+                else "requires_matching_original_block_formats_without_ep",
             },
             "routing": {
                 **asdict(SM70_SMALL_ROUTING),
