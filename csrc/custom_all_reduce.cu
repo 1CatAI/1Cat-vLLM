@@ -900,8 +900,8 @@ void sm70_qwen38_hc_replicated(torch::Tensor input, torch::Tensor packed_down,
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
                   input.dim() == 2 && input.size(0) >= 2 &&
-                  input.size(0) <= 16 && input.size(1) == 10240,
-              "Replicated batch HC requires SM70 [2..16, 10240] input");
+                  input.size(0) <= 20 && input.size(1) == 10240,
+              "Replicated batch HC requires SM70 [2..20, 10240] input");
   const int m = input.size(0);
   for (const auto& tensor :
        {input, packed_down, packed_up, lora, output, injection})

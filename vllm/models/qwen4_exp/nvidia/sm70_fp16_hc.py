@@ -137,7 +137,7 @@ def _replicated_runtime_ok(x, down, up, concurrent_batch):
         and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 16
+        and (2 <= x.shape[0] <= 16 or x.shape[0] == 20)
         and x.shape[1] == _HC_HIDDEN
         and x.is_cuda
         and x.dtype == torch.float16
