@@ -1108,3 +1108,18 @@ exercise cancellation where intermediate partial sums exceed the FP16 range.
 Correctness and speed remain unvalidated until the packaged runtime passes
 these checks and the complete M=512 graph comparison. This candidate has no
 model dispatch registration.
+
+The first packaged candidate passed all 32 focused checks. For Flash-Next
+`blk.0.attn_gate.weight`, TP4 rank 0, N=1536/K=2560/M=512, its complete graph
+was 102.531 us versus canonical 91.606 us and the best cuBLAS alternative
+96.956 us. It therefore does not satisfy the speed gate. Exact dequantization
+error was zero; output relative L2 error was 0.00020724.
+
+NCU node counters show the packed-workspace dequantizer reads 1,695,744 bytes
+for a 1,689,600-byte payload, while its FP16 GEMM reads 10,557,376 bytes. The
+selected 128x128x16 GEMM uses 255 registers and achieves 11.07% active warps.
+The cuBLAS algorithm-2 alternative reads 1,696,064 bytes in dequantization and
+10,504,800 bytes in GEMM. These counters describe separate workspace passes,
+not persistent compressed-weight expansion. Profiler timings are not used as
+end-to-end speed measurements. Smaller FP16 tiles are the next candidate;
+no model route is enabled by this result.
