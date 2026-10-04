@@ -74,3 +74,53 @@ def test_conv_gate_zero(slot, accepted, length, row_stride):
     assert torch.equal(g.view(torch.int32), candidate_g.view(torch.int32))
     assert torch.equal(beta.view(torch.int32), candidate_beta.view(torch.int32))
     assert torch.equal(out.view(torch.int16), torch.zeros_like(out).view(torch.int16))
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(70), reason="SM70 verifier"
+)
+def test_single_request_in_padded_metadata():
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    qkv = torch.empty(8, 2560, device="cuda", dtype=torch.float16)
+    a = torch.empty(8, 12, device="cuda", dtype=torch.float16)
+    b = torch.empty_like(a)
+    state = torch.empty(1, 10, 2560, device="cuda", dtype=torch.float16).transpose(
+        -1, -2
+    )
+    layer = SimpleNamespace(
+        enable_sm70_dflash2_fused_gdn_verify=True,
+        tp_size=4,
+        num_k_heads=16,
+        num_v_heads=48,
+        head_k_dim=128,
+        head_v_dim=128,
+        gqa_interleaved_layout=False,
+        activation="silu",
+        conv1d=SimpleNamespace(
+            weight=torch.empty(2560, 1, 4, device="cuda", dtype=torch.float16),
+            bias=None,
+        ),
+    )
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=0,
+        num_spec_decodes=1,
+        num_actual_tokens=8,
+        spec_sequence_masks=torch.empty(8, device="cuda", dtype=torch.bool),
+        ddtree_parent_ids=None,
+        spec_query_start_loc=torch.empty(9, device="cuda", dtype=torch.int32),
+        spec_state_indices_tensor=torch.empty(8, 8, device="cuda", dtype=torch.int32),
+        spec_state_slot_selectors=torch.empty(8, device="cuda", dtype=torch.int32),
+    )
+    can_use = QwenGatedDeltaNetAttention._can_use_sm70_gdn_preprocess
+    assert can_use(layer, qkv, a, b, state, metadata)
+    metadata.num_spec_decodes = 2
+    assert not can_use(layer, qkv, a, b, state, metadata)
+    metadata.num_spec_decodes = 1
+    metadata.num_actual_tokens = 4
+    assert not can_use(layer, qkv, a, b, state, metadata)
