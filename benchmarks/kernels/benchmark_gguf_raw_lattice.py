@@ -295,6 +295,27 @@ def main():
                             ),
                         )
                     )
+                row_auto = min(
+                    k // 256,
+                    max(1, math.ceil(4 * report["sm_count"] / math.ceil(n / 4))),
+                )
+                for split in sorted({1, row_auto}):
+                    tmp = torch.empty((split, n), dtype=torch.float32, device="cuda")
+                    candidates.append(
+                        (
+                            f"compact_row_vec_split{split}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_vec_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tmp,
+                                split,
+                                True,
+                            ),
+                        )
+                    )
             elif m <= 64:
                 mt = 8 if m <= 8 else 16 if m <= 16 else 32
                 auto = min(

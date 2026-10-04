@@ -201,7 +201,12 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
         x = torch.randn(m, raw.logical_k, device="cuda", dtype=torch.float16)
         out = torch.empty((m, n), device="cuda", dtype=torch.float16)
         scratch = torch.empty(reference.T.shape, dtype=torch.float16, device="cuda")
-        for split in (1, 3) if m <= 64 else (1,):
+        plans = (
+            [(split, row_wise) for split in (1, 3) for row_wise in (False, True)]
+            if m == 1
+            else [(split, False) for split in ((1, 3) if m <= 64 else (1,))]
+        )
+        for split, row_wise in plans:
             partials = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
             if m == 512:
                 run = partial(
@@ -218,7 +223,16 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
                     if m == 1
                     else torch.ops._C.gguf_lattice_compact_mma_sm70_out
                 )
-                run = partial(op, out, x, weight, kind, partials, split)
+                run = partial(
+                    op,
+                    out,
+                    x,
+                    weight,
+                    kind,
+                    partials,
+                    split,
+                    *((row_wise,) if m == 1 else ()),
+                )
             for _ in range(3):
                 run()
             graph = torch.cuda.CUDAGraph()

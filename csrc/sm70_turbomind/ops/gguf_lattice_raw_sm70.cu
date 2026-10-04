@@ -124,7 +124,8 @@ __global__ void reduce_vec(half* out, const float* partial, int n, int splits) {
   out[col] = __float2half_rn(sum);
 }
 
-template <int Type, int NT, int MT, bool Compact = false>
+template <int Type, int NT, int MT, bool Compact = false,
+          bool FullWidth = false>
 __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int m, int n, int k,
                                int stride, int splits) {
@@ -144,15 +145,15 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
   const int begin = blocks * blockIdx.z / splits;
   const int end = blocks * (blockIdx.z + 1) / splits;
   for (int block = begin; block < end; ++block) {
-    const int width = min(NT, n - col_begin);
+    const int width = FullWidth ? 32 : min(NT, n - col_begin);
     const uint8_t* tile = nullptr;
     typename Packed::Parameters parameters{};
     if constexpr (Compact) {
       static_assert(NT == 32);
       tile = weight + int64_t{col_begin} * blocks * Packed::kBlockBytes +
              int64_t{block} * width * Packed::kBlockBytes;
-      if (col_begin + bcol < n)
-        parameters = Packed::parameters(tile, width, bcol);
+      if (FullWidth || col_begin + bcol < n)
+        parameters = Packed::template parameters<FullWidth>(tile, width, bcol);
     } else {
       // All loaders in a warp read consecutive uint64 words of one source row.
       for (int row = warp; row < NT; row += 4) {
@@ -172,9 +173,9 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
       const int base = warp * 64 + step;
       typename MMA::FragB b{};
       if constexpr (Compact) {
-        const bool valid = col_begin + bcol < n;
-        const uint32_t packet =
-            Packed::packet(tile, width, base / 8, valid ? bcol : 0);
+        const bool valid = FullWidth || col_begin + bcol < n;
+        const uint32_t packet = Packed::template packet<FullWidth>(
+            tile, width, base / 8, valid ? bcol : 0);
         if (valid) {
           const auto values =
               Packed::fragment(parameters, packet, base / 8, grid);
@@ -347,12 +348,54 @@ __global__ void compact_vec_kernel(half* out, float* partial, const half* x,
   }
 }
 
-template <int Type, int NT, int MT, bool Compact = false>
+template <int Type, bool Split, bool FullWidth = false>
+__global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
+                                       const uint8_t* weight, int n, int k,
+                                       int splits) {
+  using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
+  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
+  Decode::initialize(grid);
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int row = blockIdx.x * 4 + warp;
+  if (row >= n) return;
+  const int first = row / 32 * 32;
+  const int width = FullWidth ? 32 : min(32, n - first), col = row - first;
+  const int blocks = k / 256, begin = blocks * blockIdx.y / splits;
+  const int end = blocks * (blockIdx.y + 1) / splits;
+  float sum = 0.f;
+  for (int block = begin; block < end; ++block) {
+    const auto* tile = weight + int64_t{first} * blocks * Decode::kBlockBytes +
+                       int64_t{block} * width * Decode::kBlockBytes;
+    const auto parameters =
+        Decode::template parameters<FullWidth>(tile, width, col);
+    const auto packet = Decode::scalar_packet(tile, width, lane, col);
+    const auto values = Decode::fragment(parameters, packet, lane, grid);
+    const uint4 loaded =
+        *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
+    const auto& activation =
+        reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      sum = fmaf(__half2float(activation[j]), values[j], sum);
+  }
+#pragma unroll
+  for (int distance = 16; distance > 0; distance /= 2)
+    sum += __shfl_down_sync(0xffffffffU, sum, distance);
+  if (lane == 0) {
+    if constexpr (Split)
+      partial[int64_t{blockIdx.y} * n + row] = sum;
+    else
+      out[row] = __float2half_rn(sum);
+  }
+}
+
+template <int Type, int NT, int MT, bool Compact = false,
+          bool FullWidth = false>
 void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
                 torch::Tensor partial, int splits, cudaStream_t stream) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   const dim3 grid((n + NT - 1) / NT, (m + MT - 1) / MT, splits);
-  raw_mma_kernel<Type, NT, MT, Compact><<<grid, 128, 0, stream>>>(
+  raw_mma_kernel<Type, NT, MT, Compact, FullWidth><<<grid, 128, 0, stream>>>(
       reinterpret_cast<half*>(out.data_ptr()),
       splits > 1 ? partial.data_ptr<float>() : nullptr,
       reinterpret_cast<const half*>(input.data_ptr()),
@@ -633,7 +676,8 @@ void gguf_lattice_compact_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
-                                       torch::Tensor partial, int64_t splits) {
+                                       torch::Tensor partial, int64_t splits,
+                                       bool row_wise) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -646,7 +690,33 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                     partial.is_contiguous() && partial.numel() >= splits * n,
                 "Compact vector requires FP32 partial storage");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid((n + 127) / 128, splits);
+  const dim3 grid(row_wise ? (n + 3) / 4 : (n + 127) / 128, splits);
+#define COMPACT_ROW_VEC(TYPE, FULL)                                         \
+  if (splits == 1)                                                          \
+    compact_row_vec_kernel<TYPE, false, FULL><<<grid, 128, 0, stream>>>(    \
+        reinterpret_cast<half*>(out.data_ptr()), nullptr,                   \
+        reinterpret_cast<const half*>(input.data_ptr()),                    \
+        weight.data_ptr<uint8_t>(), n, k, splits);                          \
+  else                                                                      \
+    compact_row_vec_kernel<TYPE, true, FULL><<<grid, 128, 0, stream>>>(     \
+        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), \
+        reinterpret_cast<const half*>(input.data_ptr()),                    \
+        weight.data_ptr<uint8_t>(), n, k, splits)
+  if (row_wise) {
+    if (source_type == 21) {
+      if (n % 32 == 0) {
+        COMPACT_ROW_VEC(21, true);
+      } else {
+        COMPACT_ROW_VEC(21, false);
+      }
+    } else {
+      if (n % 32 == 0) {
+        COMPACT_ROW_VEC(22, true);
+      } else {
+        COMPACT_ROW_VEC(22, false);
+      }
+    }
+  } else {
 #define COMPACT_VEC(TYPE)                                                   \
   if (splits == 1)                                                          \
     compact_vec_kernel<TYPE, false><<<grid, 128, 0, stream>>>(              \
@@ -658,12 +728,14 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
         reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), \
         reinterpret_cast<const half*>(input.data_ptr()),                    \
         weight.data_ptr<uint8_t>(), n, k, splits)
-  if (source_type == 21) {
-    COMPACT_VEC(21);
-  } else {
-    COMPACT_VEC(22);
-  }
+    if (source_type == 21) {
+      COMPACT_VEC(21);
+    } else {
+      COMPACT_VEC(22);
+    }
 #undef COMPACT_VEC
+  }
+#undef COMPACT_ROW_VEC
   if (splits > 1)
     reduce_vec<<<(n + 255) / 256, 256, 0, stream>>>(
         reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), n,
@@ -688,19 +760,28 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                     partial.numel() >= splits * m * n,
                 "Compact MMA requires FP32 partial storage");
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_MMA(TYPE)                                               \
-  if (m <= 8)                                                           \
-    launch_mma<TYPE, 32, 8, true>(out, input, weight, partial, splits,  \
-                                  stream);                              \
-  else if (m <= 16)                                                     \
-    launch_mma<TYPE, 32, 16, true>(out, input, weight, partial, splits, \
-                                   stream);                             \
-  else                                                                  \
-    launch_mma<TYPE, 32, 32, true>(out, input, weight, partial, splits, stream)
+#define COMPACT_MMA(TYPE, FULL)                                               \
+  if (m <= 8)                                                                 \
+    launch_mma<TYPE, 32, 8, true, FULL>(out, input, weight, partial, splits,  \
+                                        stream);                              \
+  else if (m <= 16)                                                           \
+    launch_mma<TYPE, 32, 16, true, FULL>(out, input, weight, partial, splits, \
+                                         stream);                             \
+  else                                                                        \
+    launch_mma<TYPE, 32, 32, true, FULL>(out, input, weight, partial, splits, \
+                                         stream)
   if (source_type == 21) {
-    COMPACT_MMA(21);
+    if (n % 32 == 0) {
+      COMPACT_MMA(21, true);
+    } else {
+      COMPACT_MMA(21, false);
+    }
   } else {
-    COMPACT_MMA(22);
+    if (n % 32 == 0) {
+      COMPACT_MMA(22, true);
+    } else {
+      COMPACT_MMA(22, false);
+    }
   }
 #undef COMPACT_MMA
   if (splits > 1)

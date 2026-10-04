@@ -203,7 +203,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &gguf_lattice_compact_dequantize_sm70_out);
   ops.def(
       "gguf_lattice_compact_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
-      "weight, int source_type, Tensor(b!) partial, int splits=1) -> ()");
+      "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
+      "row_wise=False) -> ()");
   ops.impl("gguf_lattice_compact_vec_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_vec_sm70_out);
   ops.def(

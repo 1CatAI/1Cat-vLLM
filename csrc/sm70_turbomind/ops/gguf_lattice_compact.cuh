@@ -37,23 +37,46 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     }
   }
 
+  template <bool FullWidth = false>
   __device__ static Parameters parameters(const uint8_t* tile, int width,
                                           int col) {
+    if constexpr (FullWidth) width = 32;
     const auto* metadata = tile + width * kPacketBytesPerRow;
     Parameters result{};
     result.d = __half2float(reinterpret_cast<const half*>(metadata)[col]);
     const auto* scales = metadata + width * 2 + col * kScaleBytes;
+    if constexpr (FullWidth) {
+      if constexpr (Type == 21)
+        result.scales = *reinterpret_cast<const uint32_t*>(scales);
+      else
+        result.scales = *reinterpret_cast<const uint64_t*>(scales);
+    } else {
 #pragma unroll
-    for (int i = 0; i < kScaleBytes; ++i)
-      result.scales |= uint64_t{scales[i]} << (8 * i);
+      for (int i = 0; i < kScaleBytes; ++i)
+        result.scales |= uint64_t{scales[i]} << (8 * i);
+    }
     return result;
   }
 
   // All 32 lanes participate, including lanes whose output column is masked.
   // At width 32 this issues 13/9 adjacent uint64 reads for IQ3_S/IQ2_S.
   // The final N tile uses a continuous bitstream without per-octet padding.
+  template <bool FullWidth = false>
   __device__ static uint32_t packet(const uint8_t* tile, int width, int octet,
                                     int col) {
+    if constexpr (FullWidth) {
+      const auto* words =
+          reinterpret_cast<const uint64_t*>(tile) + octet * (kPacketBits / 2);
+      const int lane = threadIdx.x % 32;
+      const uint64_t loaded = lane < kPacketBits / 2 ? words[lane] : 0;
+      const int bit = col * kPacketBits;
+      const uint64_t low = __shfl_sync(0xffffffffU, loaded, bit / 64);
+      const uint64_t high = __shfl_sync(0xffffffffU, loaded, bit / 64 + 1);
+      const int shift = bit % 64;
+      const uint64_t value =
+          shift ? (low >> shift) | (high << (64 - shift)) : low;
+      return value & ((uint32_t{1} << kPacketBits) - 1);
+    }
     const auto address = reinterpret_cast<uintptr_t>(tile);
     const int64_t first_bit =
         (address & 7) * 8 + int64_t{octet} * width * kPacketBits;
@@ -67,6 +90,21 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     const int source = bit / 64, shift = bit % 64;
     const uint64_t low = __shfl_sync(0xffffffffU, loaded, source);
     const uint64_t high = __shfl_sync(0xffffffffU, loaded, source + 1);
+    const uint64_t value =
+        shift ? (low >> shift) | (high << (64 - shift)) : low;
+    return value & ((uint32_t{1} << kPacketBits) - 1);
+  }
+
+  // Warp-parallel K for vector decode: lanes read different K octets.
+  __device__ static uint32_t scalar_packet(const uint8_t* tile, int width,
+                                           int octet, int col) {
+    const auto address = reinterpret_cast<uintptr_t>(tile);
+    const int64_t bit =
+        (address & 7) * 8 + (int64_t{octet} * width + col) * kPacketBits;
+    const auto* words =
+        reinterpret_cast<const uint64_t*>(address & ~uintptr_t{7});
+    const uint64_t low = words[bit / 64], high = words[bit / 64 + 1];
+    const int shift = bit % 64;
     const uint64_t value =
         shift ? (low >> shift) | (high << (64 - shift)) : low;
     return value & ((uint32_t{1} << kPacketBits) - 1);

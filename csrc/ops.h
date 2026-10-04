@@ -943,7 +943,8 @@ void gguf_lattice_compact_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
-                                       torch::Tensor partial, int64_t splits);
+                                       torch::Tensor partial, int64_t splits,
+                                       bool row_wise);
 void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
