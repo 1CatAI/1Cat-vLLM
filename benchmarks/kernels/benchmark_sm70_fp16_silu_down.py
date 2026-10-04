@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from vllm import _custom_ops as ops
+import vllm._custom_ops  # noqa: F401 - register the native control operators
 from vllm.model_executor.kernels.linear.fp16_silu_down import apply
 
 
@@ -88,7 +88,7 @@ def main():
 
         def reference(x, weight):
             activation = x.new_empty((1, weight.shape[1]))
-            ops.silu_and_mul(activation, x)
+            torch.ops._C.silu_and_mul(activation, x)
             return torch.nn.functional.linear(activation, weight)
 
         checks = []

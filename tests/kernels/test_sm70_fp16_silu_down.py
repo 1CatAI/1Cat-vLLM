@@ -38,12 +38,12 @@ def test_replay_uses_changed_inputs():
 def test_silu_boundary_for_all_finite_half_values():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 is required")
-    from vllm import _custom_ops as ops
+    import vllm._custom_ops  # noqa: F401 - register native activation operators
 
     values = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.float16)
     values = values[torch.isfinite(values)].cuda()
     x = torch.stack((values, torch.ones_like(values)), dim=1)
     expected = torch.empty_like(values).reshape(-1, 1)
-    ops.silu_and_mul(expected, x)
+    torch.ops._C.silu_and_mul(expected, x)
     weight = torch.ones(1, 1, device="cuda", dtype=torch.float16)
     torch.testing.assert_close(apply(x, weight), expected, atol=0, rtol=0)
