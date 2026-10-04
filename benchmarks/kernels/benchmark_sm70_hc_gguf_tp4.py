@@ -52,7 +52,7 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--replicated", action="store_true")
-    parser.add_argument("--m", type=int, nargs="+", default=[5, 10])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[5, 10])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(rank)
@@ -118,7 +118,7 @@ def main():
             )
     results = []
     try:
-        for m in args.m:
+        for m in args.batch_sizes:
             torch.manual_seed(20261004 + m)
             x = (torch.randn(m, 10240, device="cuda") * 0.125).half()
             worst_abs = worst_l2 = 0.0
