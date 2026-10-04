@@ -91,3 +91,33 @@ equal. Repeated graph replay completed without failure.
 
 These measurements establish an operator boundary and local tail overlap.
 They do not establish a model speedup or a per-round saving across all layers.
+
+## Signed and aligned decoder candidates
+
+Two further research entries use the shared signed-codebook API and retain
+the original two-level scales. The signed compact entry preserves the 224-CTA
+geometry. The aligned entry uses two N32 tiles per quantized CTA, each with
+eight warps. Each warp covers five K128 records, avoiding a K64 tail. It uses
+64 quantized CTAs plus the unchanged 96 b/a CTAs, for a total of 160.
+
+| Candidate | K-loop instructions per K16 | Registers | Shared bytes | Spills |
+| --- | ---: | ---: | ---: | ---: |
+| Signed compact | 128 | 40 | 49,152 | 0 |
+| Signed aligned records | 93.25 | 52 | 49,152 | 0 |
+
+The aligned loop contains 746 static instructions and 128 HMMA instructions
+per K128. Both entries request the 96 KiB shared-memory carveout. The b/a
+branch returns uniformly before signed-codebook initialization, so dense
+CTAs do not populate the 32 KiB table. Static shared-memory allocation still
+applies to those CTAs.
+
+The shared CPU converter recovered every source byte of the real QKVZ
+projection, including original scales, from its 9,011,200-byte aligned form.
+The partition screen covers all 128 N32 tiles and all 40 K128 records per
+tile. The aligned reduction uses eight FP32 partitions instead of sixteen;
+its changed reduction order still requires numerical qualification.
+
+These two entries have CPU compilation and SASS evidence only. They have no
+GPU correctness, speed, or model evidence and are not admitted production
+routes. The signed public API itself remains an experiment. No GPU tests are
+run until its shared screening supports the next implementation decision.
