@@ -448,6 +448,44 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
   }
 }
 
+template <int Type>
+__global__ void compact_dequant_natural_kernel(half* out, const uint8_t* weight,
+                                               int n, int k) {
+  using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
+  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
+  // Eight-half row padding keeps every vector aligned. Shared copy swaps
+  // warp ownership from N columns to contiguous K without a strided store.
+  __shared__ __align__(16) half decoded[32][264];
+  Decode::initialize(grid);
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int first = blockIdx.x * 32, width = min(32, n - first);
+  const int block = blockIdx.y;
+  const auto* tile = weight + int64_t{first} * (k / 256) * Decode::kBlockBytes +
+                     int64_t{block} * width * Decode::kBlockBytes;
+  typename Decode::Parameters parameters{};
+  if (lane < width) parameters = Decode::parameters(tile, width, lane);
+  for (int octet = warp; octet < 32; octet += 4) {
+    const auto packet =
+        Decode::packet(tile, width, octet, lane < width ? lane : 0);
+    if (lane < width) {
+      const auto values =
+          Decode::template fragment<half>(parameters, packet, octet, grid);
+      *reinterpret_cast<uint4*>(&decoded[lane][octet * 8]) =
+          *reinterpret_cast<const uint4*>(&values);
+    }
+  }
+  __syncthreads();
+  for (int index = threadIdx.x; index < 32 * 32; index += blockDim.x) {
+    const int row = index / 32, octet = index % 32;
+    if (row < width) {
+      const int64_t destination =
+          int64_t{first + row} * k + block * 256 + octet * 8;
+      *reinterpret_cast<uint4*>(out + destination) =
+          *reinterpret_cast<const uint4*>(&decoded[row][octet * 8]);
+    }
+  }
+}
+
 template <int Type, bool Split>
 __global__ void compact_vec_kernel(half* out, float* partial, const half* x,
                                    const uint8_t* weight, int n, int k,
@@ -1004,11 +1042,11 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (natural_layout) {
     if (source_type == 21)
-      compact_dequant_kernel<21, half, false><<<grid, 128, 0, stream>>>(
+      compact_dequant_natural_kernel<21><<<grid, 128, 0, stream>>>(
           reinterpret_cast<half*>(scratch.data_ptr()),
           weight.data_ptr<uint8_t>(), n, k);
     else
-      compact_dequant_kernel<22, half, false><<<grid, 128, 0, stream>>>(
+      compact_dequant_natural_kernel<22><<<grid, 128, 0, stream>>>(
           reinterpret_cast<half*>(scratch.data_ptr()),
           weight.data_ptr<uint8_t>(), n, k);
   } else {

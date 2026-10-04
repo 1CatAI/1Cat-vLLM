@@ -703,3 +703,31 @@ NN candidate and the same FP32 computation/reduction policy. Temporary
 workspace byte size is unchanged; persistent weights remain equal-byte
 packets. Changed-input graphs and exact workspace comparisons cover both
 layouts before speed selection. Validation of TN remains pending.
+
+## Strided natural-workspace result
+
+Source `c64a8d7c2f` passes all 24 checks (7.87 s), including exact workspace
+values and changed-input graphs for NN and TN. The initial natural `[N,K]`
+workspace path is slower at every measured M512 shape; it is not selected.
+
+| Projection | Canonical µs | Compact NN µs | Initial compact TN µs |
+| --- | ---: | ---: | ---: |
+| 27B gate | 367.676 | 363.468 | 1075.453 |
+| 27B down | 342.257 | 339.610 | 982.836 |
+| IQ3_S expert | 69.220 | 27.258 | 57.179 |
+| IQ2_S expert | 64.382 | 30.288 | 59.517 |
+| Flash gate | 91.674 | 126.169 | 172.969 |
+| Flash output | 81.766 | 87.610 | 137.094 |
+
+A node capture of Flash gate TN attributes 100.064 µs to dequantization
+(4,540,096 DRAM read bytes) and 109.728 µs to its 128×128 cuBLAS GEMM
+(10,513,248 read bytes). There is no separate split-K reduction. Natural
+workspace dequantization uses 32 registers with no stack; the loss comes
+from strided partial-sector writes rather than spills. cuBLAS has 250
+registers/thread and 6.25% active warps in this capture.
+
+The next candidate stages decoded FP16 values in a padded shared tile and
+changes warp ownership for the output copy. Each warp then writes contiguous
+K vectors with aligned 128-bit stores. Padding belongs only to temporary
+shared storage; both workspace and persistent weight byte sizes remain
+unchanged. NN is retained and TN numerical/performance checks run again.
