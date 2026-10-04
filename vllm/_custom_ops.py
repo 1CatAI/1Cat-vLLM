@@ -4253,3 +4253,10 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+if hasattr(torch.ops._C, "sm70_bf16_weight_linear"):
+
+    @register_fake("_C::sm70_bf16_weight_linear")
+    def _sm70_bf16_weight_linear_fake(input, weight):
+        return input.new_empty((input.shape[0], weight.shape[0]))
