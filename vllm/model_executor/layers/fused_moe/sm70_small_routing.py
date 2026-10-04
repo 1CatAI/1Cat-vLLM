@@ -94,6 +94,25 @@ def _route_and_gather(
 
 
 @triton.jit
+def _weighted_route_value(
+    DOWN,
+    INVERSE,
+    WEIGHTS,
+    token,
+    h,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    K: tl.constexpr,
+):
+    route = token * TOP_K + K
+    position = tl.load(INVERSE + route, token < M, other=0)
+    value = tl.load(DOWN + position * H + h, token < M, other=0).to(tl.float32)
+    weight = tl.load(WEIGHTS + route, token < M, other=0).to(tl.float32)
+    return value * weight
+
+
+@triton.jit
 def _unroute_weighted_sum(
     DOWN,
     INVERSE,
@@ -106,13 +125,30 @@ def _unroute_weighted_sum(
 ):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     token, h = index // H, index % H
-    acc = tl.full((BLOCK,), 0, tl.float32)
-    for k in range(TOP_K):
-        route = token * TOP_K + k
-        position = tl.load(INVERSE + route, token < M, other=0)
-        value = tl.load(DOWN + position * H + h, token < M, other=0).to(tl.float32)
-        weight = tl.load(WEIGHTS + route, token < M, other=0).to(tl.float32)
-        acc += value * weight
+    # Torch Reduce.cuh uses vt0=4 independent accumulators for this
+    # non-contiguous reduction axis and short top-k. Preserve its order,
+    # including separate FP32 products, without materializing the product.
+    acc0 = tl.full((BLOCK,), 0, tl.float32)
+    acc1 = tl.full((BLOCK,), 0, tl.float32)
+    acc2 = tl.full((BLOCK,), 0, tl.float32)
+    acc3 = tl.full((BLOCK,), 0, tl.float32)
+    for base in tl.static_range(0, TOP_K, 4):
+        acc0 += _weighted_route_value(
+            DOWN, INVERSE, WEIGHTS, token, h, M, H, TOP_K, base
+        )
+        if base + 1 < TOP_K:
+            acc1 += _weighted_route_value(
+                DOWN, INVERSE, WEIGHTS, token, h, M, H, TOP_K, base + 1
+            )
+        if base + 2 < TOP_K:
+            acc2 += _weighted_route_value(
+                DOWN, INVERSE, WEIGHTS, token, h, M, H, TOP_K, base + 2
+            )
+        if base + 3 < TOP_K:
+            acc3 += _weighted_route_value(
+                DOWN, INVERSE, WEIGHTS, token, h, M, H, TOP_K, base + 3
+            )
+    acc = ((acc0 + acc1) + acc2) + acc3
     tl.store(OUT + index, acc, token < M)
 
 
