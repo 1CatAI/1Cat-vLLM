@@ -180,3 +180,27 @@ pure decode 4.840% and does not pass non-regression; retain it as a negative
 result. A 1024-output-token, three-repeat comparison with complete token
 recording precedes the admission decision. Final larger-capacity acceptance
 and model quality measurements remain separate follow-ups.
+
+### Longer Flash-Next C4 smoke
+
+At the same 128-input-token C4 configuration, use 1,024 output tokens and
+three repeats per arm in a matched normal installed package. Pure decode is
+228.918/229.421/233.225 tok/s without ring and
+260.337/263.335/263.158 tok/s with ring. Summing emitted tokens and engine
+seconds across all repeats gives 230.505 versus 262.269 tok/s (+13.780%).
+Weighted round means are 67.673 versus 65.624 ms, an observed 2.049 ms reduction.
+
+Within each arm, all complete timing token lists and acceptance counters are
+identical across three repeats. Four separate natural greedy prompts have
+identical complete token lists between arms and stop at EOS. This longer
+C4 smoke does not regress; the negative 256-output-token point remains above.
+Output identity for the collective merge check refers to these natural prompts.
+
+The forced-length timing lists differ between arms at zero-based positions
+34, 471, 495 and 669 in the four streams. Full-cohort mean acceptance changes
+from 3.285 to 3.830, and steady emitted tokens per request-round from 3.900
+to 4.303. Acceptance and timing have distinct statistical windows. These
+changes prevent attributing the full throughput or round reduction to the
+collective. The difference is retained for numerical attribution; final model
+distribution and long-output checks remain separate. Actual trace calls,
+waiting and overlap are the next input to the cost model.
