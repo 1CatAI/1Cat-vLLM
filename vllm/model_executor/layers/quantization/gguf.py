@@ -69,6 +69,7 @@ class GGUFConfig(QuantizationConfig):
         self.unquantized_modules = unquantized_modules or []
         self.linear_layouts: dict[str, GGUFLinearLayout] = {}
         self.fallback_reasons: dict[str, str] = {}
+        self.native_expert_storage = False
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -126,6 +127,12 @@ class GGUFConfig(QuantizationConfig):
                 return GGUFLMHeadMethod(self)
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
+            if self.native_expert_storage:
+                from vllm.model_executor.layers.quantization.gguf_moe import (
+                    GGUFNativeMoEMethod,
+                )
+
+                return GGUFNativeMoEMethod(self, layer.moe_config)
             # TODO: Select UnquantizedFusedMoEMethod on unquantized layers.
             return GGUFMoEMethod(self, layer.moe_config)
         return None
@@ -463,7 +470,7 @@ def _apply_gguf_embedding_fake(
     dtype: torch.dtype | None = None,
     native_enabled: bool = True,
 ) -> torch.Tensor:
-    return torch.empty(x.shape[0], hidden_size, dtype=dtype, device=x.device)
+    return torch.empty((*x.shape, hidden_size), dtype=dtype, device=x.device)
 
 
 try:
@@ -545,7 +552,56 @@ class GGUFLinearMethod(LinearMethodBase):
         set_weight_attrs(qweight_type, extra_weight_attrs)
         layer.register_parameter("qweight_type", qweight_type)
 
+    def _prepare_dense_weight(self, layer: torch.nn.Module) -> bool:
+        """Restore ordinary floating projections to the dense linear lifecycle.
+
+        A floating shard inside a mixed projection is still a GGUF projection.
+        Only a complete, unpacked matrix with no input-layout transform can
+        replace the method, without changing the layer's forward semantics.
+        """
+        if isinstance(self, GGUFEmbeddingMethod) or self.layout is not None:
+            return False
+        qweight = layer.qweight
+        if qweight.data_container:
+            ids = (
+                ["q", "k", "v"] if "q" in qweight.shard_id else sorted(qweight.shard_id)
+            )
+            sources = [
+                (
+                    qweight.data_container[qweight.shard_id_map[index]],
+                    layer.qweight_type.shard_weight_type[index],
+                )
+                for index in ids
+            ]
+        else:
+            sources = [(qweight, layer.qweight_type.weight_type)]
+        if not sources or any(
+            source_type not in UNQUANTIZED_TYPES
+            or weight.ndim != 2
+            or weight.dtype != self.params_dtype
+            or not weight.is_floating_point()
+            for weight, source_type in sources
+        ):
+            return False
+        expected_n, expected_k = qweight.tensor_shape
+        if (
+            any(weight.shape[1] != expected_k for weight, _ in sources)
+            or sum(weight.shape[0] for weight, _ in sources) != expected_n
+        ):
+            return False
+        weights = [weight.to(qweight.device) for weight, _ in sources]
+        weight = weights[0] if len(weights) == 1 else torch.cat(weights, dim=0)
+        layer.register_parameter("weight", Parameter(weight.contiguous(), False))
+        # Replace the layer's references, not shared checkpoint storage.
+        del layer.qweight
+        del layer.qweight_type
+        layer.quant_method = UnquantizedLinearMethod()
+        layer.quant_method.process_weights_after_loading(layer)
+        return True
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self._prepare_dense_weight(layer):
+            return
         ready = self.native_enabled and native_available()
         self.native_admission: dict[str, Any] = {
             "enabled": self.native_enabled,

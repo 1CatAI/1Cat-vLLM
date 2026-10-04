@@ -228,6 +228,47 @@ def raw_grouped_gate_up_capabilities(
     )
 
 
+def small_grouped_vector_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Measured canonical down vectors; M counts routed rows, not input tokens."""
+    name = "gguf_small_grouped_vec_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_type not in (20, 42):
+        reason = "requires_iq4_nl_or_q2_0_canonical_storage"
+    elif (k, n, num_experts) != (160, 2560, 512):
+        reason = "grouped_vector_shape_has_no_calibration"
+    elif not hasattr(torch.ops._C, name):
+        reason = f"operator_missing:{name}"
+    # Cold weight sweeps at original M=1/5/20, top-k=10. M=20
+    # regresses for both formats; do not interpolate unmeasured batches.
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            name,
+            True,
+            min_m=m,
+            max_m=m,
+            reason=reason,
+        )
+        for m in (10, 50)
+    )
+
+
 def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapability:
     """Inspect the installed operator at preparation time, not on every token.
 

@@ -978,3 +978,9 @@ void gguf_lattice_compact_tm_f16_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor scratch, torch::Tensor offsets,
     torch::Tensor weight_ptrs, int64_t dq_partitions);
+void gguf_small_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs,
+                                     int64_t source_type, int64_t num_experts,
+                                     int64_t group_size);

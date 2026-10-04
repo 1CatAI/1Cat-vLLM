@@ -411,18 +411,20 @@ class TestCudagraphDispatcher:
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
 
-    def test_dsv4_context_bucket_requires_explicit_override_for_mtp_on_sm70(
-        self, monkeypatch
+    @pytest.mark.parametrize("speculative_tokens", [3, 5, 7])
+    def test_dsv4_context_buckets_are_derived_for_mtp_on_sm70(
+        self, monkeypatch, speculative_tokens
     ):
+        query_rows = speculative_tokens + 1
         monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
         monkeypatch.delenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", raising=False)
         comp_config = CompilationConfig(
             cudagraph_mode="FULL_DECODE_ONLY",
             mode=CompilationMode.NONE,
-            cudagraph_capture_sizes=[8, 16],
+            cudagraph_capture_sizes=[query_rows, 16],
         )
         config = _create_vllm_config(comp_config, max_num_seqs=2)
-        config.speculative_config = MagicMock(num_speculative_tokens=7)
+        config.speculative_config = MagicMock(num_speculative_tokens=speculative_tokens)
         config.model_config.architectures = ["DeepseekV4ForCausalLM"]
         config.model_config.max_model_len = 4096
         config.model_config.hf_config.index_topk = 512
@@ -431,19 +433,21 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
+            patch.object(
+                current_platform, "is_device_capability_family", return_value=True
+            ),
         ):
-            default_dispatcher = CudagraphDispatcher(config)
-        assert not default_dispatcher.has_attention_context_buckets
-
-        monkeypatch.setenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", "2048")
-        dispatcher = CudagraphDispatcher(config)
+            dispatcher = CudagraphDispatcher(config)
+        # Speculative graphs bucket like single-row decode: the sparse indexer
+        # needs a bounded key length to take its cuBLAS route under full graphs.
+        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048,)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
-            uniform_decode_query_len=8,
+            uniform_decode_query_len=query_rows,
         )
 
         bounded = BatchDescriptor(
-            num_tokens=8,
+            num_tokens=query_rows,
             num_reqs=1,
             uniform=True,
             attention_context_bucket=2048,
@@ -452,7 +456,7 @@ class TestCudagraphDispatcher:
         assert bounded in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
 
         mode, desc = dispatcher.dispatch(
-            num_tokens=8,
+            num_tokens=query_rows,
             uniform_decode=True,
             attention_context_len=1024,
         )
@@ -463,7 +467,7 @@ class TestCudagraphDispatcher:
         explicitly_disabled = CudagraphDispatcher(config)
         explicitly_disabled.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
-            uniform_decode_query_len=8,
+            uniform_decode_query_len=query_rows,
         )
         assert not explicitly_disabled.has_attention_context_buckets
 

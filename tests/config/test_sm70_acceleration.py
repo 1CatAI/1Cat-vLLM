@@ -36,6 +36,7 @@ def config(monkeypatch):
         lambda page: dict.fromkeys(
             (
                 "grouped_fp32",
+                "fp16_grouped",
                 "long_operator",
                 "long_enabled",
                 "page_supported",
@@ -184,7 +185,13 @@ def test_user_override_and_strict_failure(config, monkeypatch):
 def test_strict_target_requirements_do_not_apply_to_internal_draft(config, monkeypatch):
     monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
     config.cache_config.cache_dtype = "auto"
-    with pytest.raises(ValueError, match="e4m3_grouped_fp32"):
+    native_capabilities = acc._native_capabilities
+    monkeypatch.setattr(
+        acc,
+        "_native_capabilities",
+        lambda page: {**native_capabilities(page), "fp16_grouped": False},
+    )
+    with pytest.raises(ValueError, match="fp16_grouped_fp32: operator_missing"):
         acc.log_and_validate(config)
     config.is_speculative_draft = True
     report = acc.log_and_validate(config)
@@ -217,7 +224,7 @@ def test_flashnext_report_uses_its_own_required_paths_and_ignores_kv_dtype(
             "qwen38_decode",
             "batch_gemm",
             "compile_graph",
-        ]
+        ] + (["fp16_grouped_fp32"] if dtype == "auto" else [])
         assert not report["expected_failures"]
 
 

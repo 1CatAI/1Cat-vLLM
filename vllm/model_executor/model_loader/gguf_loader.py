@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING, cast
 
 import gguf
@@ -103,6 +103,20 @@ class GGUFModelLoader(BaseModelLoader):
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
         config = model_config.hf_config
+        text_config = config.get_text_config()
+        if text_config.model_type == "qwen4_exp_text":
+            from vllm.transformers_utils.gguf_config import load_gguf_config
+
+            native_config = load_gguf_config(self._prepare_weights(model_config))
+            # HF dimensions remain authoritative. Add only checkpoint-specific
+            # hash/storage metadata absent from the supplied config.
+            for key in (
+                "gguf_architecture",
+                "gguf_ple_constants",
+                "gguf_ple_eos_token_id",
+            ):
+                if not hasattr(text_config, key):
+                    setattr(text_config, key, getattr(native_config, key))
         from vllm.transformers_utils.gguf_files import (
             gguf_shard_paths,
             gguf_tensor_index,
@@ -419,12 +433,28 @@ class GGUFModelLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
 
-    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+    def get_all_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+        *,
+        skip_weight: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Filter mapped names before the adapter touches tensor payloads."""
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
-        model.load_weights(
-            self._get_weights_iterator(model_config, local_model_path, gguf_weights_map)
+        if skip_weight is not None:
+            gguf_weights_map = {
+                raw: name
+                for raw, name in gguf_weights_map.items()
+                if not skip_weight(name)
+            }
+        yield from self._get_weights_iterator(
+            model_config, local_model_path, gguf_weights_map
         )
+
+    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        model.load_weights(self.get_all_weights(model_config, model))
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -459,6 +489,9 @@ class GGUFModelLoader(BaseModelLoader):
                 adapter.needs_dense_fallback(name, self._native_tensors[raw])
             quant_config.fallback_reasons = adapter.fallback_reasons
             quant_config.linear_layouts = adapter.linear_layouts(gguf_weights_map)
+            quant_config.native_expert_storage = getattr(
+                adapter, "native_expert_storage", False
+            )
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)
