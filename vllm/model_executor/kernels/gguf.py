@@ -176,6 +176,55 @@ def select_lattice_grouped_capability(capabilities, m: int) -> GGUFOperatorCapab
     raise ValueError("No prepared lattice grouped operator admits this descriptor")
 
 
+def raw_grouped_gate_up_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Joint raw projections; M denotes original tokens before top-k routing.
+
+    Only measured original batch sizes are admitted. In particular IQ2_S
+    at M=20 retains canonical grouped GEMM; neighboring batches are not
+    inferred from the three measured points.
+    """
+    operator = "gguf_lattice_raw_grouped_gate_up_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif source_type not in (21, 22):
+        reason = "raw_grouped_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (k, n, num_experts) != (2560, 160, 512):
+        reason = "raw_grouped_shape_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=m,
+            max_m=m,
+            reason=reason
+            or (
+                "measured_slower_than_canonical_grouped_gemm"
+                if source_type == 22 and m == 20
+                else None
+            ),
+        )
+        for m in (1, 5, 20)
+    )
+
+
 def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapability:
     """Inspect the installed operator at preparation time, not on every token.
 
