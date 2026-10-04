@@ -11,6 +11,7 @@ from typing import Literal
 import torch
 from einops import rearrange
 from torch import nn
+from torch.fx.node import has_side_effect
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
@@ -3937,17 +3938,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 disabled=self.disable_sm70_qwen_gdn_full_forward,
                 auto_enabled=self.auto_sm70_qwen_gdn_full_forward,
             ):
-                conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
-                    layer_name,
-                    hidden_states if output is None else output,
-                )
                 if output is None:
                     return torch.ops.vllm.qwen_gdn_full_forward_direct(
                         hidden_states,
-                        conv_state_cache,
-                        ssm_state_cache,
                         layer_name,
                     )
+                conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
+                    layer_name,
+                    output,
+                )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
                     output,
@@ -7454,16 +7453,14 @@ def qwen_gdn_full_forward_fake(
 
 def qwen_gdn_full_forward_direct(
     hidden_states: torch.Tensor,
-    conv_state_cache: torch.Tensor,
-    ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Keep the full-forward order while returning its projection allocation."""
     layer_name = _resolve_layer_name(layer_name)
     layer = get_forward_context().no_compile_layers[layer_name]
-    # Match the original opaque op's explicit recurrent-state dependencies.
-    # Its eager body accesses these same caches through the layer object.
-    _ = conv_state_cache, ssm_state_cache
+    # The opaque body resolves the context-owned caches, as the existing
+    # full-forward implementation does. Lifting both typed cache views into
+    # AOT exposes fp16/fp32 aliases of one paged allocation and is unsupported.
     output = layer._full_forward(hidden_states, None)
     if output is None:
         raise RuntimeError("Direct GDN full-forward did not return a projection")
@@ -7473,8 +7470,6 @@ def qwen_gdn_full_forward_direct(
 
 def qwen_gdn_full_forward_direct_fake(
     hidden_states: torch.Tensor,
-    conv_state_cache: torch.Tensor,
-    ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
@@ -7828,9 +7823,13 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="qwen_gdn_full_forward_direct",
     op_func=qwen_gdn_full_forward_direct,
-    mutates_args=["conv_state_cache", "ssm_state_cache"],
+    mutates_args=[],
     fake_impl=qwen_gdn_full_forward_direct_fake,
 )
+# Preserve the context-owned recurrent update when FX removes unused nodes.
+# The projection result also orders each decoder layer's actual execution.
+
+has_side_effect(torch.ops.vllm.qwen_gdn_full_forward_direct.default)
 
 
 direct_register_custom_op(
