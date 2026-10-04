@@ -199,6 +199,9 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         if (
             self.config.policy.qualified
             and self.config.policy.prefill
+            and self.config.policy.shared_weight
+            and self.config.policy.shared_scales
+            and sm70_tm.use_native_qpn_layouts()
             # QPN4's FP4 representation scales FP16 group factors by 2**14.
             # Preserve generic fallback if even the largest E4M3 scale could
             # overflow that representation.

@@ -411,6 +411,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     native_only = bool(
                         policy is not None
                         and policy.qualified
+                        and sm70_tm.use_native_qpn_layouts()
                         and current_platform.is_device_capability(70)
                     )
                     batch_tm = sm70_tm.use_batched_gemm_layouts() and not native_only
