@@ -570,6 +570,7 @@ def main():
                     temporary,
                     partitions=1,
                     shared_metadata=False,
+                    algorithm=99,
                 ):
                     torch.ops._C.gguf_lattice_compact_blas_sm70_out(
                         temporary,
@@ -578,7 +579,7 @@ def main():
                         source_type,
                         workspace,
                         natural,
-                        99,
+                        algorithm,
                         partitions,
                         shared_metadata,
                     )
@@ -614,6 +615,24 @@ def main():
                             )
                         )
                         if shared:
+                            candidates.append(
+                                (
+                                    "compact_dequant_cublas_f32_algo11" + suffix,
+                                    partial(
+                                        fp32_blas,
+                                        out,
+                                        x,
+                                        compact,
+                                        kind,
+                                        scratch,
+                                        natural,
+                                        fp32_result,
+                                        partitions,
+                                        shared,
+                                        111,
+                                    ),
+                                )
+                            )
                             candidates.append(
                                 (
                                     f"compact_dequant_cublas_algo2_parts{partitions}_sharedmeta",

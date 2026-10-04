@@ -1419,3 +1419,10 @@ algorithm 11 GEMM plus final FP16 cast is 78.982 us versus 80.347 us default
 (eight-bank full graphs); dequantization is excluded. Algorithm 11 is admitted
 only with FP32 output, with a native rejection for FP16 output and installed
 changed-input/overflow regressions. The complete-path speed gate is pending.
+
+The packaged algorithm-11 change passes 62 focused checks in 13.30 s. Its
+FP32-output/two-partition/cooperative-metadata complete graph takes 92.286 us
+versus 89.942 us same-run canonical on the real Flash gate M512 shape, with
+relative L2 0.0002074. The remaining speed gap is 2.6%; no model default or
+step savings are claimed. FP16-output algorithm 11 remains explicitly rejected.
+The public benchmark includes this measured FP32-only candidate.
