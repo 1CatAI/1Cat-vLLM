@@ -42,6 +42,15 @@ def _dispatch(
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
     if x.shape[0] <= 32:
+        # Retune only the single-request gated shape; preserve the admitted
+        # two-chain batch reductions for concurrent requests.
+        if (
+            x.shape[0] <= 8
+            and gated_silu
+            and x.shape[1] == 5120
+            and out.shape[1] == 4352
+        ):
+            accumulator_chains = 1
         op = (
             sm70_ops.nvfp4_qpn2_gated_sm70_out
             if gated_silu
@@ -55,6 +64,7 @@ def _dispatch(
     if workspace is None or workspace.numel() < k * n:
         raise RuntimeError("Native QPN2 prefill workspace is unavailable")
     device = codes.device.index
+    assert device is not None
     scale_workspace = _scale_workspaces.get(device)
     if scale_workspace is None:
         scale_workspace = torch.empty(
