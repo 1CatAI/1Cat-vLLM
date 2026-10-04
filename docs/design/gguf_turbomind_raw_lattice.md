@@ -818,3 +818,33 @@ remain consecutive and cover exactly the original packet bits; FP32 scale
 formulas and accumulator precision are unchanged. This candidate requires
 the existing inverse, all-grid, boundary, graph and real-shape speed checks
 before selection.
+
+## Narrow packet fetch result
+
+Source `44f2c91727` passes all 26 checks (7.32 s), including official
+dequantization, bit-preserving permutation, N tails, coefficient boundaries,
+FP32 partial cancellation and changed-input full graphs. The 32-bit fetch
+retains the original payload bit layout and byte size.
+
+| Projection | M | Canonical µs | Best equal-byte µs |
+| --- | ---: | ---: | ---: |
+| 27B gate | 5 / 8 / 16 / 512 | 33.016 / 33.315 / 39.381 / 366.328 | 29.757 / 31.468 / 46.931 / 366.653 |
+| 27B down | 5 / 8 / 16 / 512 | 31.812 / 31.942 / 37.912 / 340.344 | 27.483 / 28.717 / 42.705 / 338.213 |
+| IQ3_S expert | 5 / 8 / 16 / 512 | 19.291 / 18.268 / 17.384 / 69.054 | 7.514 / 7.743 / 8.149 / 27.067 |
+| IQ2_S expert | 5 / 8 / 16 / 512 | 20.433 / 19.983 / 20.114 / 64.033 | 9.578 / 9.628 / 10.343 / 30.559 |
+| Flash gate | 5 / 8 / 16 / 512 | 20.823 / 19.252 / 21.268 / 89.837 | 9.770 / 10.174 / 13.483 / 97.621 |
+| Flash output | 5 / 8 / 16 / 512 | 16.082 / 15.855 / 17.065 / 81.533 | 9.652 / 9.987 / 12.907 / 74.387 |
+
+The 27B M5/M8 improvement is retained. M16 remains 19.2% slower for gate
+and 12.6% slower for down, so narrower extraction alone does not close the
+dense concurrency gap. Flash gate M512 retains an 8.7% gap in this run;
+Flash output is 8.8% faster. These are complete unprofiled graph paths with
+FP32 accumulation, cold weight banks, identical shape controls and 100
+replays. M1 does not use the changed warp packet-fetch path and is not
+repeated here. Grouped expert/model step gains remain unmeasured.
+
+Installed core SHA256:
+`450dcc11c47ab2823730ad241791945102f4fa8354533f83d6e68ec01ea9be2e`.
+Whole-wheel SHA256:
+`45e62f62fc57cd77087b84240a4ea4d66bc2702c6de382886037db5264d54e85`.
+All 210 installed dependency packages are compatible.
