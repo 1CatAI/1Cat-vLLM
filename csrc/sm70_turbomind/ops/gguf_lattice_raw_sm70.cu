@@ -474,9 +474,12 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
   typename Decode::Parameters parameters{};
   if (lane < width)
     parameters = Decode::template parameters<FullWidth>(tile, width, lane);
+  auto current = Decode::template fetch<FullWidth>(tile, width, warp);
   for (int octet = warp; octet < 32; octet += 4) {
-    const auto packet = Decode::template packet<FullWidth>(
-        tile, width, octet, lane < width ? lane : 0);
+    typename Decode::PacketWindow next{};
+    if (octet + 4 < 32)
+      next = Decode::template fetch<FullWidth>(tile, width, octet + 4);
+    const auto packet = Decode::extract(current, lane < width ? lane : 0);
     if (lane < width) {
       const auto values =
           Decode::template fragment<Output>(parameters, packet, octet, grid);
@@ -495,6 +498,7 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
         }
       }
     }
+    current = next;
   }
 }
 
