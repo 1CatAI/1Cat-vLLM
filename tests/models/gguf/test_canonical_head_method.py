@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import Any
 
 import gguf
 import pytest
@@ -11,6 +12,7 @@ from vllm.model_executor.layers.quantization.gguf import (
     GGUFConfig,
     GGUFEmbeddingMethod,
     GGUFLMHeadMethod,
+    _gguf_lm_head_projection,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -72,3 +74,45 @@ def test_quantized_head_loads_packed_vocab_rows_and_zero_padding(rank):
     assert layer.qweight_type.weight_type == int(quant_type)
     torch.testing.assert_close(layer.qweight[: end - start], raw[start:end])
     assert torch.count_nonzero(layer.qweight[end - start :]) == 0
+
+
+def test_q6_head_dispatch_preserves_u8_group16_and_raw_type(monkeypatch):
+    calls: list[tuple[Any, ...]] = []
+
+    def canonical(x, codes, stats, cache, family, bits, group, *args):
+        calls.append(("canonical", family, bits, group))
+        return x.new_zeros((x.shape[0], 4))
+
+    def raw(x, weight, source_type, *args):
+        calls.append(("raw", source_type))
+        return x.new_zeros((x.shape[0], 4))
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "prepared_gguf_projection", canonical, raising=False
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.gguf.fused_mul_mat_gguf", raw
+    )
+    for m in (1, 5, 20, 32):
+        out = _gguf_lm_head_projection(
+            torch.empty(m, 256, dtype=torch.float16),
+            torch.empty(4, 210, dtype=torch.uint8),
+            torch.empty(0),
+            torch.empty(0),
+            0,
+            0,
+            1,
+            20,
+            True,
+            8,
+            int(gguf.GGMLQuantizationType.Q6_K),
+            8,
+            16,
+        )
+        assert out.shape == (m, 4)
+        expected = (
+            ("canonical", 0, 8, 16)
+            if m <= 20
+            else ("raw", int(gguf.GGMLQuantizationType.Q6_K))
+        )
+        assert calls[-1] == expected
