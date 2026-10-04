@@ -43,7 +43,7 @@ def test_only_measured_original_batches_are_admitted(operator, kind, expected):
             512,
             torch.float16,
             True,
-            "raw_grouped_source_format_unavailable",
+            "raw_grouped_source_format_has_no_calibration",
         ),
         (21, 2560, 160, 512, torch.float32, True, "requires_fp16_activations"),
         (
