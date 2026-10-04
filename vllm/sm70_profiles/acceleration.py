@@ -514,7 +514,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": sparse_policy.reason,
         "configuration": asdict(sparse_policy),
         "decode_fallback": "retain configured paged QK-D for low query/index workloads",
-        "indexer_graph_fallback": "paged indexer for fixed full-graph key buckets",
+        "indexer_graph_fallback": (
+            "paged indexer for unbounded full graphs or rejected key layouts"
+        ),
         "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
     }
     report["ple_result_transports"] = cfg.kernel_config.ple_result_transports
