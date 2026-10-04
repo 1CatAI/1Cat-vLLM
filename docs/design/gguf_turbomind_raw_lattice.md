@@ -1192,3 +1192,19 @@ vector-variant checks: its accumulation call still applied d alone after the
 fragment stopped applying small scale. The missing factor is corrected by
 calling the original FP32 `block_scale` helper. The failed build collected no
 speed evidence; the numerical tolerances are unchanged.
+
+Corrected complete-scale factoring passes 42 checks. Gate/down M1 are
+32.803/30.890 us versus 32.659/30.772 us canonical in the six-route comparison.
+Nine alternating-order pairs produce gate medians 32.614/33.581 us raw/canonical
+and down 30.807/30.475 us. Different canonical launch selection and process
+conditions affect the gate baseline; these results do not close every M1 gate.
+Output relative L2 is approximately 0.000205.
+
+NCU shows full-scale factoring reduces FP32-pipe instructions from 3,777,536
+to 3,168,256, with DRAM reads 9,738,016 bytes, 40 registers and 55.08% active
+warps. Integer-pipe instructions remain 3,355,392. The next vector candidate
+expands only the fixed codebook to exact FP32 integers in shared memory once
+per CTA. It removes repeated byte unpacking/conversion; original weights/scales
+are unchanged. The larger shared table may reduce occupancy, so it is optional
+and requires measured dispatch. Scale formation, local FMA and reductions
+remain FP32.

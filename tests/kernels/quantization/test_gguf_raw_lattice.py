@@ -40,8 +40,10 @@ def test_original_payload_and_tp_slicing(kind):
 
 
 @pytest.mark.parametrize("kind", [21, 22])
-@pytest.mark.parametrize("factor_scale", [False, True])
-def test_raw_dequant_and_vector_graph(kind, factor_scale):
+@pytest.mark.parametrize(
+    "factor_scale,float_grid", [(False, False), (True, False), (True, True)]
+)
+def test_raw_dequant_and_vector_graph(kind, factor_scale, float_grid):
     data = packed(kind)
     raw = RawGGUFProjection.from_rows(data, kind)
     w = torch.from_numpy(raw.data).cuda()
@@ -61,7 +63,7 @@ def test_raw_dequant_and_vector_graph(kind, factor_scale):
         for prefetch in (False, True):
             run = lambda splits=splits, prefetch=prefetch: (
                 torch.ops._C.gguf_lattice_raw_vec_sm70_out(
-                    out, x, w, kind, partial, splits, prefetch, factor_scale
+                    out, x, w, kind, partial, splits, prefetch, factor_scale, float_grid
                 )
             )
             for _ in range(3):
