@@ -108,6 +108,8 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
 
         def record(*args, _arm=arm, _original=original, **kwargs):
             calls[_arm] += 1
+            if _arm == 1 and tokens in (5, 20):
+                assert kwargs["out"].data_ptr() == outputs[1].data_ptr()
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(mod, name, record)
