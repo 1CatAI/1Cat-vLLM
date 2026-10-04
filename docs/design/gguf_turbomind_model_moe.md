@@ -28,5 +28,32 @@ All five focused cases pass on V100: Q2_0 source retention, mixed IQ3_XXS gate /
 IQ4_NL up / Q2_0 down FFNs at M=1/8/32/512, four TP partitions and changed-input
 CUDA graph replay. The down bank uses u2/group32 with local K=160. FP16 operands
 and FP32 accumulation are preserved; references use official GGUF decoding.
-These are layer checks. Full Flash-Next model loading, logits and throughput
+These are layer checks. Full Flash-Next logits, generation and throughput
 are still pending.
+
+## Full-checkpoint loading
+
+The IQ3_XXS checkpoint loads with TP4 on V100 32 GB x4, CUDA 12.8,
+Torch 2.10.0+cu128, FP16 activation/KV, FP32 SSM state, no MTP, eager
+execution, max length 2048, batch budget 256 and four sequence slots.
+Model weights occupy 17.74 GiB per rank. Loading takes 662–741 seconds;
+engine profiling and warmup complete in another 69.61 seconds. Linear
+projections select the canonical affine, LUT4 and lattice implementations.
+
+The first generation harness stops before generation when serializing a
+Transformers `BatchEncoding`. Its replacement explicitly requests token ID
+lists and validates all four prompts outside GPU execution before rerunning.
+No generation result is inferred from the successful initialization.
+
+The combined wheel with packed PLE cascade admission has SHA256
+`299b95c853ab7b2184a03406ec9d0d51fbaa6732e7debebdf32f0250f1315a86`.
+Eight relevant Python modules match source, wheel and installed bytes; the
+canonical core and corrected FA2 fingerprints remain unchanged. All 21
+installed cascade configuration checks pass. The PLE CPU worker loads its
+five checkpoint entries and verifies both materialized parameters.
+
+The pinned llama.cpp CPU reference consumes identical prompt IDs and returns
+`Paris`, `4`, `你好` and a coherent Chinese explanation. All four first-logit
+vectors are finite. The explanation reaches the reference's 64-token limit,
+so its greedy comparison is limited to that prefix. GPU generation and
+comparison results remain pending.
