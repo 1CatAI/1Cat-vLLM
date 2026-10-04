@@ -49,3 +49,35 @@ Reproduce under an exclusive GPU lease:
 python benchmarks/kernels/benchmark_sm70_small_moe_routing.py --output RESULT.json
 python -m pytest tests/kernels/test_sm70_small_moe_routing.py
 ```
+
+## Preserve the existing FP32 reduction order
+
+The initial restoration loop sums weighted outputs sequentially. Torch 2.10's
+`ATen/native/cuda/Reduce.cuh` uses four independent accumulators for this
+short, strided reduction, then combines them in order. Source `4867f38844`
+keeps that order inside the fused kernel, with separate FP32 products and
+FP16 final output. Thirty-five checks pass, including exact output equality
+for M=1..32 and top-k=1/2/3/4/8/10/16 with FP16 or FP32 routing weights.
+
+The original single-invocation graph timing can include host replay gaps when
+two short kernels finish before the next replay is submitted. An additional
+measurement uses eight operator chains per graph and normalizes by eight.
+Source `4a019a1573`, ordinary package `1.5.2.dev495`, retains the same kernel
+as the exact-output check. The table uses five samples of 100 graph replays.
+
+| M | Torch chain (µs) | Exact fused chain (µs) | Estimated saving over 48 layers (ms) |
+| --- | ---: | ---: | ---: |
+| 1 | 46.424 | 5.964 | 1.942 |
+| 5 | 54.248 | 5.956 | 2.318 |
+| 10 | 56.138 | 8.342 | 2.294 |
+| 20 | 134.326 | 13.037 | 5.822 |
+| 32 | 140.357 | 16.768 | 5.932 |
+
+Maximum absolute and relative L2 differences are zero at every point. The
+single-invocation result for this same kernel was 20.326 µs at M=5, versus
+5.956 µs with the longer captured sequence; both measurements are retained.
+These remain synthetic-route operator results. The model integration run
+used the earlier sequential reduction and measured C1 30.932 ms/round,
+78.803 tokens/s and C4 56.924 ms/round, 258.219 tokens/s. C4 remains 1.5%
+below the original 262.269 tokens/s, despite normal natural outputs.
+The exact reduction's effect on model acceptance has not been established.
