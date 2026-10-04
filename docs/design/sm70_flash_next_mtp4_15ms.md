@@ -317,3 +317,32 @@ until shared full-vocabulary distribution, task quality, acceptance and C4
 checks pass. Expert-plan snapshots now record actual valid groups without
 per-round CPU synchronization; measured traffic/floor ranking remains pending
 those GPU data rather than assuming all 50 routes read distinct experts.
+
+### Traffic qualification and QPN8 screen
+
+Source `5c95f6e627`, same native binary and model computation as the recorded
+baseline. The plan-only diagnostic attaches no Nsight collector and preserves
+the 300-round token tape. All four ranks record 48 layers and agree on valid
+groups: after excluding edge rounds, the mean is 29.561 groups/layer, not 50.
+Issued W13 codes plus FP16 scales total 726,491,919 bytes/round/card; W2 totals
+363,245,960. Their 750-GB/s floors are 0.969 and 0.484 ms. The matching node
+services are 1.693 and 0.840 ms. These are issued-weight floors versus profiled
+service, not measured DRAM bandwidth. Do not claim 730 GB/s from the maximum
+route count. Qualify steady kernels at the observed group density next.
+
+The existing QPN8 native-chain M5 screen completes on real checkpoint weights,
+FP16 inputs/output and FP32 accumulation, seven alternating graph trials:
+
+| Projection chain | Current native FP16 | Existing channel-QPN8 | Saving |
+| --- | ---: | ---: | ---: |
+| GDN input, all 36 layers including BA and output splits | 1.182 ms | 1.153 ms | 0.029 ms |
+| Output, all 48 layers | 0.674 ms | 0.422 ms | 0.252 ms |
+
+The native GDN issued-weight rate is already approximately 644 GB/s. Halving
+its QKVZ storage does not halve chain latency: the existing FP8 path retains
+BA and split/staging work. Reject this full GDN conversion for insufficient
+benefit; do not promote it or repeat parameter sweeps. Output projection stays
+a candidate, with only 0.252 ms measured operator saving. Neither arm has model
+numerical/quality admission; FP8 operator relative L2 errors reach about 2.7%
+versus FP64, so operator timing cannot justify enabling it by default. No FP8
+runtime defaults change and no model test is credited to these microbenchmarks.
