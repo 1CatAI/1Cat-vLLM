@@ -1003,11 +1003,11 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
 }
 
 namespace {
-// One CTA owns a small output-row tile from each projection of an expert.
+// One CTA owns two output rows from each projection of an active expert.
 // Repeated route slots return before initializing the shared codebook. Every
 // original block is decoded once per token pair and output row, with no
 // tensor-core M tile padding. Larger expert intervals use additional pairs.
-template <int Type, int MaxTokens, int RowsPerWarp>
+template <int Type, int MaxTokens>
 __global__ void raw_grouped_gate_up_kernel(
     half* gate, half* up, const half* input, const uint8_t* gate_weights,
     const uint8_t* up_weights, const int* offsets, const int64_t* ids, int n,
@@ -1021,63 +1021,59 @@ __global__ void raw_grouped_gate_up_kernel(
   __shared__ __align__(16) uint8_t raw[4][120];
   Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  const int first = blockIdx.x * (2 * RowsPerWarp) + warp % 2;
+  const int row = blockIdx.x * 2 + warp % 2;
+  if (row >= n) return;
   const uint8_t* weights = warp < 2 ? gate_weights : up_weights;
   half* output = warp < 2 ? gate : up;
-  for (int row = first; row < n && row < first + 2 * RowsPerWarp; row += 2) {
-    const uint8_t* row_data = weights + (int64_t{expert} * n + row) * stride;
-    for (int chunk = begin; chunk < end; chunk += MaxTokens) {
-      float sums[MaxTokens] = {};
-      for (int block = 0; block < k / 256; ++block) {
-        const auto* data =
-            stage_block<Type>(raw[warp], row_data, block, stride);
-        const auto values = Decode::fragment(data, lane * 8, grid);
-#pragma unroll
-        for (int token = 0; token < MaxTokens; ++token) {
-          if (chunk + token < end) {
-            const auto* x =
-                input + int64_t{chunk + token} * k + block * 256 + lane * 8;
-            const uint4 loaded = *reinterpret_cast<const uint4*>(x);
-            const auto& activation =
-                reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
-#pragma unroll
-            for (int i = 0; i < 8; ++i)
-              sums[token] =
-                  fmaf(__half2float(activation[i]), values[i], sums[token]);
-          }
-        }
-        __syncwarp();
-      }
+  const uint8_t* row_data = weights + (int64_t{expert} * n + row) * stride;
+  for (int chunk = begin; chunk < end; chunk += MaxTokens) {
+    float sums[MaxTokens] = {};
+    for (int block = 0; block < k / 256; ++block) {
+      const auto* data = stage_block<Type>(raw[warp], row_data, block, stride);
+      const auto values = Decode::fragment(data, lane * 8, grid);
 #pragma unroll
       for (int token = 0; token < MaxTokens; ++token) {
         if (chunk + token < end) {
+          const auto* x =
+              input + int64_t{chunk + token} * k + block * 256 + lane * 8;
+          const uint4 loaded = *reinterpret_cast<const uint4*>(x);
+          const auto& activation =
+              reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
 #pragma unroll
-          for (int distance = 16; distance > 0; distance /= 2)
-            sums[token] += __shfl_down_sync(0xffffffffU, sums[token], distance);
-          if (lane == 0)
-            output[int64_t{chunk + token} * n + row] =
-                __float2half_rn(sums[token]);
+          for (int i = 0; i < 8; ++i)
+            sums[token] =
+                fmaf(__half2float(activation[i]), values[i], sums[token]);
         }
+      }
+      __syncwarp();
+    }
+#pragma unroll
+    for (int token = 0; token < MaxTokens; ++token) {
+      if (chunk + token < end) {
+#pragma unroll
+        for (int distance = 16; distance > 0; distance /= 2)
+          sums[token] += __shfl_down_sync(0xffffffffU, sums[token], distance);
+        if (lane == 0)
+          output[int64_t{chunk + token} * n + row] =
+              __float2half_rn(sums[token]);
       }
     }
   }
 }
 
-template <int Type, int MaxTokens, int RowsPerWarp>
+template <int Type, int MaxTokens>
 void launch_grouped_gate_up(torch::Tensor gate, torch::Tensor up,
                             torch::Tensor input, torch::Tensor gate_weights,
                             torch::Tensor up_weights, torch::Tensor offsets,
                             torch::Tensor ids, cudaStream_t stream) {
-  raw_grouped_gate_up_kernel<Type, MaxTokens, RowsPerWarp>
-      <<<dim3((gate.size(1) + 2 * RowsPerWarp - 1) / (2 * RowsPerWarp),
-              input.size(0)),
-         128, 0, stream>>>(reinterpret_cast<half*>(gate.data_ptr()),
-                           reinterpret_cast<half*>(up.data_ptr()),
-                           reinterpret_cast<const half*>(input.data_ptr()),
-                           gate_weights.data_ptr<uint8_t>(),
-                           up_weights.data_ptr<uint8_t>(),
-                           offsets.data_ptr<int>(), ids.data_ptr<int64_t>(),
-                           gate.size(1), input.size(1), gate_weights.size(2));
+  raw_grouped_gate_up_kernel<Type, MaxTokens>
+      <<<dim3((gate.size(1) + 1) / 2, input.size(0)), 128, 0, stream>>>(
+          reinterpret_cast<half*>(gate.data_ptr()),
+          reinterpret_cast<half*>(up.data_ptr()),
+          reinterpret_cast<const half*>(input.data_ptr()),
+          gate_weights.data_ptr<uint8_t>(), up_weights.data_ptr<uint8_t>(),
+          offsets.data_ptr<int>(), ids.data_ptr<int64_t>(), gate.size(1),
+          input.size(1), gate_weights.size(2));
 }
 
 template <int Type>
@@ -1086,13 +1082,15 @@ void dispatch_grouped_gate_up(torch::Tensor gate, torch::Tensor up,
                               torch::Tensor up_weights, torch::Tensor offsets,
                               torch::Tensor ids, int tokens,
                               cudaStream_t stream) {
+#define GROUPED_CASE(MAX)                                                      \
+  launch_grouped_gate_up<Type, MAX>(gate, up, input, gate_weights, up_weights, \
+                                    offsets, ids, stream)
   if (tokens <= 1) {
-    launch_grouped_gate_up<Type, 1, 1>(gate, up, input, gate_weights,
-                                       up_weights, offsets, ids, stream);
+    GROUPED_CASE(1);
   } else {
-    launch_grouped_gate_up<Type, 2, 2>(gate, up, input, gate_weights,
-                                       up_weights, offsets, ids, stream);
+    GROUPED_CASE(2);
   }
+#undef GROUPED_CASE
 }
 }  // namespace
 
