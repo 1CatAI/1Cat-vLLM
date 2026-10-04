@@ -26,6 +26,7 @@ def test_profile_failure_reports_memory_and_preserves_error(
 
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(gpu_worker.current_platform, "mem_get_info", driver_info)
+
     def allocator_info(device):
         if allocator_info_fails:
             raise RuntimeError("allocator unavailable after accelerator failure")
