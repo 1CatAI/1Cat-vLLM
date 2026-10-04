@@ -34,6 +34,7 @@ def launch(tmp_path, monkeypatch):
         min_free_gib=8,
         timing_only=True,
         cases=None,
+        case_id=None,
     )
 
 
@@ -90,3 +91,12 @@ def test_estimate_requires_matching_contract_and_marks_large_deviation():
     candidate["contract"] = {"tp": 2}
     with pytest.raises(ValueError, match="contract"):
         endpoint.compare_timing(baseline, candidate, 0.63)
+
+
+def test_unknown_triage_case_is_rejected_before_loading(launch):
+    launch.timing_only = False
+    launch.cases = launch.output.parent / "cases.json"
+    launch.cases.write_text(json.dumps({"cases": [{"id": "known"}]}))
+    launch.case_id = ["unknown"]
+    with pytest.raises(RuntimeError, match="Unknown quality case"):
+        endpoint.preflight(launch)

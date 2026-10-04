@@ -187,6 +187,8 @@ def run(args):
         if args.cases is not None
         else None,
         "quality_evaluated": not args.timing_only,
+        "quality_seed_base": args.quality_seed,
+        "quality_case_ids": args.case_id,
         "sampling": suite["sampling"],
         "contract": {
             "model": model,
@@ -239,45 +241,53 @@ def run(args):
             "get_sm70_acceleration_report", timeout=30
         )
         save()
-        chunk = tok.encode(
-            "This fixed benchmark prompt is used to create a deterministic "
-            "tokenized input for single-request decode measurement. ",
-            add_special_tokens=False,
-        )
-        ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
-        llm.generate(
-            [{"prompt_token_ids": ids}],
-            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
-            use_tqdm=False,
-        )
-        for i in range(6):
-            o = llm.generate(
+        if not args.quality_only:
+            chunk = tok.encode(
+                "This fixed benchmark prompt is used to create a deterministic "
+                "tokenized input for single-request decode measurement. ",
+                add_special_tokens=False,
+            )
+            ids = (chunk * ((8192 + len(chunk) - 1) // len(chunk)))[:8192]
+            llm.generate(
                 [{"prompt_token_ids": ids}],
-                SamplingParams(
-                    temperature=0,
-                    top_p=1,
-                    top_k=-1,
-                    seed=0,
-                    max_tokens=513,
-                    ignore_eos=True,
-                ),
+                SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                 use_tqdm=False,
-            )[0]
-            report["timing"].append(metrics(o))
-            save()
-            print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
+            )
+            for i in range(6):
+                o = llm.generate(
+                    [{"prompt_token_ids": ids}],
+                    SamplingParams(
+                        temperature=0,
+                        top_p=1,
+                        top_k=-1,
+                        seed=0,
+                        max_tokens=513,
+                        ignore_eos=True,
+                    ),
+                    use_tqdm=False,
+                )[0]
+                report["timing"].append(metrics(o))
+                save()
+                print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
         for i, case in enumerate([] if args.timing_only else suite["cases"]):
+            if args.case_id and case["id"] not in args.case_id:
+                continue
             prompt_ids = prompt_token_ids(case, tok)
             o = llm.generate(
                 [{"prompt_token_ids": prompt_ids}],
                 SamplingParams(
-                    temperature=1, top_p=0.95, top_k=20, seed=4201 + i, max_tokens=4096
+                    temperature=1,
+                    top_p=0.95,
+                    top_k=20,
+                    seed=args.quality_seed + i,
+                    max_tokens=4096,
                 ),
                 use_tqdm=False,
             )[0]
             record = {
                 "id": case["id"],
                 "category": case["category"],
+                "seed": args.quality_seed + i,
                 "input_tokens": len(prompt_ids),
                 "prompt_token_sha256": hashlib.sha256(
                     json.dumps(prompt_ids).encode()
@@ -307,8 +317,10 @@ def run(args):
             }
             for category in ("mbpp", "gsm8k", "chinese", "needle")
         }
-        report["median_tpot_ms"] = statistics.median(
-            r["tpot_ms"] for r in report["timing"]
+        report["median_tpot_ms"] = (
+            statistics.median(r["tpot_ms"] for r in report["timing"])
+            if report["timing"]
+            else None
         )
         report["health_failures"] = health_failures(report["quality"])
         report["health_passed"] = (
@@ -374,7 +386,10 @@ def preflight(args):
     if not args.timing_only:
         if args.cases is None or not args.cases.is_file():
             raise RuntimeError("Quality mode requires the frozen cases JSON")
-        json.loads(args.cases.read_text())
+        suite = json.loads(args.cases.read_text())
+        known = {case["id"] for case in suite["cases"]}
+        if set(args.case_id or []) - known:
+            raise RuntimeError("Unknown quality case IDs")
     if args.output.exists():
         raise RuntimeError("Refusing to overwrite a retained result")
     free = shutil.disk_usage(args.output.parent).free
@@ -407,7 +422,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--cases", type=Path)
-    parser.add_argument("--timing-only", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--timing-only", action="store_true")
+    modes.add_argument("--quality-only", action="store_true")
+    parser.add_argument("--quality-seed", type=int, default=4201)
+    parser.add_argument("--case-id", action="append")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-free-gib", type=float, default=8)
     parser.add_argument("--reference-timing", type=Path)
@@ -420,6 +439,8 @@ def main():
     if args.min_free_gib < 8:
         parser.error("--min-free-gib must be at least 8")
     if args.reference_timing is not None:
+        if args.quality_only:
+            parser.error("--reference-timing requires timing requests")
         if args.expected_saving_ms is None or args.expected_saving_ms <= 0:
             parser.error("--reference-timing requires positive --expected-saving-ms")
         reference = json.loads(args.reference_timing.read_text())

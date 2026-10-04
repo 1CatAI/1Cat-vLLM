@@ -132,7 +132,9 @@ normal source-complete wheel for merge, not for every candidate.
 
 Keep the C1 endpoint entry in `benchmark_sm70_qwen38_quality.py`; use
 `--timing-only` for scheduling changes. It checks disk space, Python and headers,
-the GPU lock, idle GPUs, request metrics and spawn protection before loading.
+the GPU lock, idle GPUs, request metrics and spawn protection before loading. Use `--quality-only --case-id CASE --quality-seed BASE`
+for an affected prompt, keeping three distinct seed bases and both arms; this
+reuses the maintained entry and skips unrelated timing/quality requests.
 Every completion writes a compact summary, including failed launches. Preserve
 raw evidence and clean only owned obsolete caches/build products. While GPUs
 are occupied, develop the next eligible kernel on CPU rather than repeatedly
