@@ -490,6 +490,12 @@ class KernelConfig:
     fused_fp16_aux_gemv_applicable: bool = Field(default=False, init=False)
     """Whether loaded auxiliary projections admit the exact GEMV fusion."""
 
+    fused_fp16_silu_down: bool = True
+    """Fuse measured compatible FP16 SiLU/multiply and down projections."""
+
+    fused_fp16_silu_down_applicable: bool = Field(default=False, init=False)
+    """Whether a loaded operator consults SiLU/down admission."""
+
     linear_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
@@ -545,6 +551,7 @@ class KernelConfig:
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
+            "fused_fp16_silu_down_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "qsa_auto_e4m3_reason",
@@ -553,6 +560,8 @@ class KernelConfig:
             ignored_factors.add("sm70_skinny_moe")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
+        if not self.fused_fp16_silu_down_applicable:
+            ignored_factors.add("fused_fp16_silu_down")
         if not self.qsa_auto_e4m3_active:
             ignored_factors.update({"qsa_auto_e4m3", "qsa_auto_e4m3_active"})
         if not self.ple_disk_cascade_active:

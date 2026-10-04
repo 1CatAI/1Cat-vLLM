@@ -412,6 +412,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if maybe_prepare_online_qpn8(layer):
             return
 
+        if type(self) is UnquantizedLinearMethod:
+            from vllm.model_executor.kernels.linear.mixed_precision import (
+                sm70_silu_down,
+            )
+
+            sm70_silu_down.maybe_prepare_silu_down(layer)
+
         if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
             layer, "_sm70_dsv4_fp13_gemv", False
         ):
@@ -1924,6 +1931,15 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
+
+    def forward_fused_silu_down(self, input_: torch.Tensor) -> torch.Tensor | None:
+        kernel = getattr(self, "_sm70_silu_down_kernel", None)
+        if kernel is None or getattr(self, "_sm70_f16_prepared", False):
+            return None
+        output = kernel.apply_silu_down(self, input_)
+        if output is not None and self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
 
     def forward(
         self,

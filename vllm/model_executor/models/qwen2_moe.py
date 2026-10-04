@@ -170,6 +170,7 @@ class Qwen2MoeMLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
+        self.down_proj._consumes_silu_and_mul = hidden_act == "silu"
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -205,12 +206,17 @@ class Qwen2MoeMLP(nn.Module):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
         fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
         out = fused_act(x) if fused_act is not None else None
+        used_fused_down = False
         if out is None:
             gate_up, _ = self.gate_up_proj(x)
             gate_up = _sm70_dump_qwen_mlp_tensor("mlp_gate_up", self.layer_idx, gate_up)
-            out = self.act_fn(gate_up)
-        out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
-        out, _ = self.down_proj(out)
+            out = self.down_proj.forward_fused_silu_down(gate_up)
+            used_fused_down = out is not None
+            if not used_fused_down:
+                out = self.act_fn(gate_up)
+        if not used_fused_down:
+            out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
+            out, _ = self.down_proj(out)
         out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
 
         used_exact_gate = False
