@@ -55,5 +55,33 @@ five checkpoint entries and verifies both materialized parameters.
 The pinned llama.cpp CPU reference consumes identical prompt IDs and returns
 `Paris`, `4`, `你好` and a coherent Chinese explanation. All four first-logit
 vectors are finite. The explanation reaches the reference's 64-token limit,
-so its greedy comparison is limited to that prefix. GPU generation and
-comparison results remain pending.
+so its greedy comparison is limited to that prefix. The installed TP4 run
+completes all four requests with natural EOS. Paris and arithmetic match the
+reference bodies. Translation correctly includes `你好` but differs from the
+reference at its first token; the Chinese explanation is coherent and differs
+at its second token. Token identity is diagnostic rather than a correctness
+gate. Numerical comparisons and the broader quality suite remain pending.
+
+## Numerical and performance measurement
+
+Model Runner V2 supports raw log probabilities but rejects raw-logit mode.
+Requesting raw logits currently falls back to V1, which is inappropriate for
+the Qwen4Exp QSA/PLE state contract. The initial measurement attempt was
+stopped before it produced performance data; its log is retained. Use the
+V2-supported `raw_logprobs` mode and request the full vocabulary only for a
+separate one-token request. Natural generation and timing requests do not
+request log probabilities.
+
+Compare the saved vectors to the same GGUF CPU reference after applying
+log-softmax to reference logits. Report finite values, KL in both directions,
+JS divergence, total variation, and centered-logit maximum absolute error,
+RMSE, relative L2 and cosine. Centering removes the unobservable per-row
+normalization constant; these are not absolute raw-logit measurements.
+Do not require token-by-token identity. Operator reconstruction errors and
+FP16 coefficient rounding remain separate from model distribution and quality.
+
+The matched timing contract is TP4, FP16 activation/KV, FP32 SSM, no MTP,
+graph execution, max length 33024, batch budget 8192, 16 sequence slots and
+GPU memory fraction 0.85. Decode uses input/output 1024/128 at C1/C4/C8/C16;
+prefill uses 8192/32768 tokens and one output token, with two measured repeats
+after warmup. GGUF and native NVFP4 use identical frozen prompt IDs.
