@@ -1285,6 +1285,11 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("AllReduce fusion pass is disabled.")
             return False
+        if getattr(self, "sm70_tp4_push_mode", False):
+            # The SM70 replacement checks M=8 at runtime and preserves the
+            # original collective/norm for other row counts. It is safe for
+            # the mixed prefill/decode range, including the extra capture row.
+            return True
         if getattr(self, "sm70_tp4_long_mode", False):
             return bool(
                 compile_range.is_single_size()
