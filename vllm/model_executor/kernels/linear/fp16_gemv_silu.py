@@ -55,7 +55,7 @@ def _fp16_gemv_silu_ranges_kernel(
             accum += product
     if COMPENSATED:
         high, low = tl.reduce((accum, low), 1, _fp32_pair_sum)
-        value = (high + low).to(tl.float16).to(tl.float32)
+        value = _fp32_pair_to_fp16(high, low).to(tl.float32)
     else:
         value = tl.sum(accum, 1).to(tl.float16).to(tl.float32)
     scaled = value / DIVISOR
@@ -190,6 +190,26 @@ def _fp32_pair_sum(ah, al, bh, bl):
 
 
 @triton.jit
+def _fp32_pair_to_fp16(high, low):
+    """Keep the correction when FP32 rounding lands on an FP16 midpoint."""
+    value = high + low
+    bits = value.to(tl.uint32, bitcast=True)
+    exponent = (bits >> 23) & 255
+    shift = tl.minimum(24, tl.maximum(13, 126 - exponent.to(tl.int32)))
+    significand = (bits & 0x7FFFFF) | 0x800000
+    mask = (1 << shift) - 1
+    midpoint = (
+        (exponent >= 102)
+        & (exponent <= 142)
+        & ((significand & mask) == (1 << (shift - 1)))
+    )
+    correction = (high - value) + low
+    step = tl.where((correction > 0) == ((bits >> 31) == 0), 1, -1)
+    adjusted = bits + tl.where(midpoint & (correction != 0), step, 0).to(tl.uint32)
+    return adjusted.to(tl.float32, bitcast=True).to(tl.float16)
+
+
+@triton.jit
 def _fp16_gate_up_kernel(
     x,
     weight,
@@ -228,8 +248,8 @@ def _fp16_gate_up_kernel(
         up, up_low = _fp32_pair_sum(up, up_low, a[None, :] * u, 0.0)
     gh, gl = tl.reduce((gate, gate_low), 1, _fp32_pair_sum)
     uh, ul = tl.reduce((up, up_low), 1, _fp32_pair_sum)
-    g = (gh + gl).to(tl.float16).to(tl.float32)
-    u = (uh + ul).to(tl.float16).to(tl.float32)
+    g = _fp32_pair_to_fp16(gh, gl).to(tl.float32)
+    u = _fp32_pair_to_fp16(uh, ul).to(tl.float32)
     # Retain the activation's FP16 materialization before multiplication.
     # Use the native activation's FP32 exp/div arithmetic rather than a
     # sigmoid approximation before the FP16 materialization.

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import numpy as np
 import pytest
 import torch
 
@@ -7,12 +8,48 @@ from vllm.model_executor.kernels.linear.fp16_gemv_silu import (
     Sm70Fp16CompensatedGemvKernel,
     Sm70Fp16GateUpKernel,
     Sm70Fp16GemvSiluKernel,
+    _fp32_pair_to_fp16,
 )
+from vllm.triton_utils import tl, triton
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an SM70 device",
 )
+
+
+@triton.jit
+def _round_pairs_kernel(high, low, output, COUNT: tl.constexpr):
+    i = tl.arange(0, 32)
+    h = tl.load(high + i, i < COUNT, 0)
+    tail = tl.load(low + i, i < COUNT, 0)
+    tl.store(output + i, _fp32_pair_to_fp16(h, tail), i < COUNT)
+
+
+@pytest.mark.parametrize("direction", [-1, 0, 1])
+def test_compensated_fp16_rounding_keeps_midpoint_correction(direction):
+    high = torch.tensor(
+        [1 + 2**-11, -1 - 2**-11, 2**-15 + 2**-25, -(2**-15) - 2**-25, 65520, -65520],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    low = (
+        torch.tensor(
+            [2**-30, 2**-30, 2**-48, 2**-48, 2**-20, 2**-20],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        * direction
+    )
+    output = torch.empty_like(high, dtype=torch.float16)
+    _round_pairs_kernel[(1,)](high, low, output, COUNT=high.numel())
+    # NumPy rounds float64 directly to float16; a float32 intermediate would
+    # erase the correction and reproduce the defect under test.
+    with np.errstate(over="ignore"):
+        expected = (
+            high.cpu().numpy().astype(np.float64) + low.cpu().numpy().astype(np.float64)
+        ).astype(np.float16)
+    assert torch.equal(output.cpu(), torch.from_numpy(expected))
 
 
 @pytest.mark.parametrize(

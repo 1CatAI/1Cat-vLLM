@@ -285,3 +285,27 @@ Expected endpoint savings must account for the shared-expert auxiliary stream
 and cold weight rotation. Do not credit the full isolated gate/up service
 reduction to the critical stream. Pending tests write separate completion
 summaries; no new trace is needed for this requalification.
+
+## FP16 midpoint correction found during requalification
+
+The installed compensated revision passes all 192 gate/up snapshots but nine
+of 192 down snapshots have slightly greater relative L2 error than the vendor,
+although maximum absolute errors match. This stops model requalification for
+that revision. The cause is double rounding: summing the compensated high and
+low components to one FP32 value can land exactly on an FP16 midpoint and
+discard the correction before the final FP16 conversion.
+
+A retained down projection has FP64 value 0.011562347111976123. Conversion
+through FP32 yields 0.011566162109375, whereas direct FP64-to-FP16 rounding
+and the vendor output give 0.01155853271484375. CPU Torch conversion from
+FP64 to FP16 also uses an intermediate FP32 value, so the oracle must use a
+direct conversion when preserving intermediate FP16 boundaries.
+
+The candidate now keeps the FP32 pair correction at the FP16 conversion. It
+detects a midpoint using the exponent/significand bits, and chooses the
+adjacent representable FP32 value on the correction side before converting.
+Exact midpoint ties retain round-to-even. Accumulation and the correction
+remain FP32; no FP64 arithmetic is introduced in the kernel. Regressions
+cover both signs, subnormal and overflow boundaries. This revised candidate
+remains research-only until the real-activation and installed-source gates
+are rerun; previous compensated timings do not qualify this revision.
