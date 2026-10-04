@@ -32,8 +32,11 @@ def main():
     p.add_argument("--rank", type=int, default=0)
     p.add_argument("--m", nargs="+", type=int, default=[1, 5, 20])
     p.add_argument("--iterations", type=int, default=100)
+    p.add_argument("--weight-banks", type=int, default=6)
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
+    if a.weight_banks < 1:
+        p.error("--weight-banks must be positive")
     assert "site-packages" in vllm.__file__, vllm.__file__
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -70,6 +73,19 @@ def main():
     n, k = raw.shape
     group = 32 if kind == 21 else 16
     capabilities = lattice_grouped_capabilities(kind, k, n, experts, torch.float16)
+    # Rotating addresses prevents the M=1 active expert working set from
+    # fitting entirely in L2. Every replica contains the same real weights.
+    raw_sets = [raw_banks] + [
+        [weight.clone() for weight in raw_banks] for _ in range(a.weight_banks - 1)
+    ]
+    canonical_sets = [canonical_banks]
+    for _ in range(a.weight_banks - 1):
+        banks = []
+        for weight, stats, _, _ in canonical_banks:
+            w, s = weight.clone(), stats.clone()
+            pointers = torch.ops._C.awq_moe_build_strided_ptrs(w, s, *metadata, experts)
+            banks.append((w, s, *pointers))
+        canonical_sets.append(banks)
     results = []
     for m in a.m:
         if not 1 <= m <= 32:
@@ -96,10 +112,11 @@ def main():
             offsets=offsets,
             operator=selected.operator,
         ):
-            for out, bank in zip(outputs, canonical_banks):
-                getattr(torch.ops._C, operator)(
-                    out, routed, offsets, bank[2], bank[3], kind, experts, group
-                )
+            for banks in canonical_sets:
+                for out, bank in zip(outputs, banks):
+                    getattr(torch.ops._C, operator)(
+                        out, routed, offsets, bank[2], bank[3], kind, experts, group
+                    )
             return outputs[0]
 
         def candidate(
@@ -109,9 +126,10 @@ def main():
             sorted_ids=sorted_ids,
             top_k=top_k,
         ):
-            torch.ops._C.gguf_lattice_raw_grouped_gate_up_sm70_out(
-                *outputs, routed, *raw_banks, offsets, sorted_ids, kind, top_k
-            )
+            for banks in raw_sets:
+                torch.ops._C.gguf_lattice_raw_grouped_gate_up_sm70_out(
+                    *outputs, routed, *banks, offsets, sorted_ids, kind, top_k
+                )
             return outputs[0]
 
         canonical()
@@ -141,11 +159,13 @@ def main():
                     out.float(), reference, rtol=0.003, atol=0.03
                 )
             error_rows.append(errors)
-        old_us = elapsed(canonical, a.iterations, capture=True)
-        new_us = elapsed(candidate, a.iterations, capture=True)
+        old_us = elapsed(canonical, a.iterations, capture=True) / a.weight_banks
+        new_us = elapsed(candidate, a.iterations, capture=True) / a.weight_banks
         results.append(
             {
                 "m": m,
+                "active_raw_bytes_per_rotation": len(active)
+                * sum(weight[0].numel() for banks in raw_sets for weight in banks),
                 "routes": m * top_k,
                 "active_experts": len(active),
                 "canonical_capability": asdict(selected),
@@ -163,6 +183,7 @@ def main():
         "source_type": kind,
         "local_shape": [experts, n, k],
         "raw_gate_up_bytes": sum(w.numel() for w in raw_banks),
+        "weight_banks": a.weight_banks,
         "scope": "Real expert weights; synthetic routes; no complete model round",
         "cases": results,
     }
