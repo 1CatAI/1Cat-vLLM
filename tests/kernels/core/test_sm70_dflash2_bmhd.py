@@ -12,18 +12,20 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("page", [1024, 2048])
 @torch.inference_mode()
-def test_direct_bmhd_preserves_window_and_overwrites_output(batch):
+def test_direct_bmhd_preserves_window_and_overwrites_output(batch, page):
     from flash_attn_v100 import flash_attn_prefill_paged
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
 
     assert hasattr(native, "dflash2_paged_bmhd_fwd")
     torch.manual_seed(123)
     q = torch.randn(batch, 8, 8, 128, device="cuda", dtype=torch.float16)
-    kc = torch.randn(5 * batch, 2048, 2, 128, device="cuda", dtype=q.dtype)
+    pages = (8192 + 17 * (batch - 1) + page - 1) // page
+    kc = torch.randn(pages * batch, page, 2, 128, device="cuda", dtype=q.dtype)
     vc = torch.randn_like(kc)
     table = torch.stack(
-        [torch.randperm(5, device="cuda") + 5 * b for b in range(batch)]
+        [torch.randperm(pages, device="cuda") + pages * b for b in range(batch)]
     ).int()
     lengths = torch.full((batch,), 1024, device="cuda", dtype=torch.int32)
     output = torch.empty_like(q)

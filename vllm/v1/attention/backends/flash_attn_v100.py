@@ -8927,7 +8927,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     and max_query_len == 8
                     and query.shape[1:] == (8, 128)
                     and query.dtype == torch.float16
-                    and block_size == 2048
+                    and block_size in (1024, 2048)
                     and key_cache.dtype == value_cache.dtype == torch.float16
                     and window_size == (2047, 2047)
                 )

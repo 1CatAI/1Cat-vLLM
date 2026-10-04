@@ -1594,7 +1594,8 @@ def flash_attn_prefill_paged(
         and k_cache.dtype == v_cache.dtype == torch.float16
         and kv_cache_dtype in ("auto", "fp16")
         and k_cache.ndim == v_cache.ndim == 4
-        and k_cache.shape[1:] == v_cache.shape[1:] == (2048, 2, 128)
+        and k_cache.shape[1] in (1024, 2048)
+        and k_cache.shape[2:] == v_cache.shape[2:] == (2, 128)
         and k_cache.stride(-1) == v_cache.stride(-1) == 1
         and torch.cuda.get_device_capability(q.device) == (7, 0)
         and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")

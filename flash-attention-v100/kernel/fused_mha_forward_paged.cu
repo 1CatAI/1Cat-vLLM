@@ -4111,7 +4111,8 @@ at::Tensor flash_attention_dflash2_paged_bmhd(
   TORCH_CHECK(k.is_cuda() && v.is_cuda() && k.device() == q.device() &&
               v.device() == q.device() && k.scalar_type() == at::kHalf &&
               v.scalar_type() == at::kHalf && k.dim() == 4 &&
-              k.sizes() == v.sizes() && k.size(1) == 2048 && k.size(2) == 2 &&
+              k.sizes() == v.sizes() &&
+              (k.size(1) == 1024 || k.size(1) == 2048) && k.size(2) == 2 &&
               k.size(3) == 128 && k.stride(3) == 1 && v.stride(3) == 1);
   TORCH_CHECK(table.is_cuda() && lengths.is_cuda() &&
               table.device() == q.device() && lengths.device() == q.device() &&
