@@ -14,4 +14,6 @@ The focused source checks pass eight embedding/head-sharing and loader cases,
 and three draft-quantization configuration cases. The mixed-format regression
 selects the normal safetensors loader for a draft paired with a GGUF target.
 The native modules come from the normal precompiled-package build. Installed
-wheel checks and model integration are still pending.
+wheel checks also pass the same eleven cases in a fresh process outside the
+source tree, without private kernel overrides. Full-model draft integration
+is still pending.
