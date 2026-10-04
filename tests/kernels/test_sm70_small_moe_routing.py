@@ -102,13 +102,37 @@ def test_fused_routing_and_fp32_unroute(m, pattern, monkeypatch):
         .half()
     )
     actual = _small_unroute(down, inverse, weights)
-    torch.testing.assert_close(actual, reference, rtol=0.003, atol=0.0001)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         packed = torch.ops.vllm.sm70_small_expert_route(x, ids, 512)
         out = torch.ops.vllm.sm70_small_expert_unroute(down, packed[3], weights)
     graph.replay()
-    torch.testing.assert_close(out, reference, rtol=0.003, atol=0.0001)
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)
     saved = out.clone()
     graph.replay()
     torch.testing.assert_close(out, saved, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(70), reason="CUDA SM70 required"
+)
+@pytest.mark.parametrize("top_k", [1, 2, 3, 4, 8, 10, 16])
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
+def test_unroute_matches_torch_short_reduction_order(top_k, weight_dtype):
+    torch.manual_seed(9100 + top_k)
+    m, h = 5, 2560
+    down = torch.randn(m * top_k, h, device="cuda", dtype=torch.float16)
+    inverse = torch.randperm(m * top_k, device="cuda").int()
+    weights = torch.randn(m, top_k, device="cuda", dtype=weight_dtype)
+    expected = (
+        (
+            down[inverse.long()].reshape(m, top_k, h).float()
+            * weights[:, :, None].float()
+        )
+        .sum(1)
+        .half()
+    )
+    torch.testing.assert_close(
+        _small_unroute(down, inverse, weights), expected, rtol=0, atol=0
+    )
