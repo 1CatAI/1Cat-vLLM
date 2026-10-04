@@ -904,6 +904,12 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=(
+                self.quant_config
+                if self.quant_config is not None
+                and self.quant_config.get_name() == "gguf"
+                else None
+            ),
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
