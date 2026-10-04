@@ -1036,8 +1036,22 @@ __global__ void raw_grouped_gate_up_kernel(
   const uint8_t* row_data = weights + (int64_t{expert} * n + row) * stride;
   for (int chunk = begin; chunk < end; chunk += MaxTokens) {
     float sums[MaxTokens] = {};
+    stage_block<Type>(raw[warp], row_data, 0, stride);
     for (int block = 0; block < k / 256; ++block) {
-      const auto* data = stage_block<Type>(raw[warp], row_data, block, stride);
+      // Use the existing raw vector's software prefetch: keep the next
+      // original block in registers while decoding and multiplying this one.
+      // SM70 has no cp.async. Per-token FMA and reduction order is unchanged.
+      constexpr int bytes = Decode::kBlockBytes;
+      const int next_start = (block + 1) * bytes;
+      const int aligned = next_start & ~7, bias = next_start & 7;
+      const int words = (bias + bytes + 7) / 8;
+      const bool load_next =
+          block + 1 < k / 256 && lane < words && aligned + lane * 8 < stride;
+      uint64_t next_word = 0;
+      if (load_next)
+        next_word =
+            *reinterpret_cast<const uint64_t*>(row_data + aligned + lane * 8);
+      const auto* data = raw[warp] + (block * bytes & 7);
       const auto values = Decode::fragment(data, lane * 8, grid);
 #pragma unroll
       for (int token = 0; token < MaxTokens; ++token) {
@@ -1053,6 +1067,8 @@ __global__ void raw_grouped_gate_up_kernel(
                 fmaf(__half2float(activation[i]), values[i], sums[token]);
         }
       }
+      __syncwarp();
+      if (load_next) reinterpret_cast<uint64_t*>(raw[warp])[lane] = next_word;
       __syncwarp();
     }
 #pragma unroll
