@@ -132,11 +132,13 @@ def main():
         report["resolved_compilation"] = {
             "mode": resolved.mode.name,
             "cudagraph_mode": resolved.cudagraph_mode.name,
+            "decode_cudagraph_mode": resolved.cudagraph_mode.decode_mode().name,
+            "mixed_cudagraph_mode": resolved.cudagraph_mode.mixed_mode().name,
         }
         save()
-        if resolved.cudagraph_mode.name != "FULL":
+        if resolved.cudagraph_mode.decode_mode().name != "FULL":
             raise RuntimeError(
-                "FULL CUDA graph was downgraded to "
+                "FULL decode CUDA graph is unavailable with "
                 f"{resolved.cudagraph_mode.name}; no timing results recorded"
             )
         report["worker_routes"] = llm.collective_rpc(
@@ -144,9 +146,9 @@ def main():
         )
         save()
         for worker in report["worker_routes"]:
-            if worker["cudagraph_mode"] != "FULL":
+            if worker["decode_cudagraph_mode"] != "FULL":
                 raise RuntimeError(
-                    f"Rank {worker['rank']} downgraded FULL CUDA graph to "
+                    f"Rank {worker['rank']} cannot run FULL decode CUDA graph: "
                     f"{worker['cudagraph_mode']}; no timing results recorded"
                 )
         tokenizer = llm.get_tokenizer()
