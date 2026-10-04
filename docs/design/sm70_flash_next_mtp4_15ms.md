@@ -56,9 +56,10 @@ Nsight Systems `--trace=cuda,nvtx --sample=none
 Trace admission is always false. Annotations are installed after graph capture;
 they preserve FULL graphs and distinguish target M5, draft step 0 at its real
 width, draft steps 1--3, target head/sample, preparation and handoff.
-Reset the prefix cache before both control and traced requests: cached GDN
-prefill/chunk boundaries can change outputs. Require matching token tapes and
-round counts before treating a trace as matched.
+Reset the prefix cache before both control and traced requests to keep prefill
+conditions consistent. Report token tapes and round counts, and compare diagnostics against an
+ordinary control in the same loaded engine. Do not assume cross-startup
+identity or hide differences through a timing rescale.
 Report the profiled endpoint round mean beside the unprofiled control. Do not
 rescale kernel service sums to make them equal to unprofiled wall time.
 
@@ -148,8 +149,62 @@ Both fixtures fail the 15-ms target. Node attribution, measured traffic,
 quality/distribution and C4 admission remain pending. No structural-kernel
 speed claim is made.
 
-The initial node capture reused the warm prefix cache, produced a different
-token tape and measured 28.107 ms over 300 rounds. It is a rejected comparison;
-its service times do not decompose the 21.835-ms control. The diagnostic harness
-now resets the prefix cache exactly as speed admission does, and the recapture
-disables CPU context-switch tracing. Calibration remains pending.
+Two node captures measured 28.107 and 28.060 ms over 300 rounds. Both differ
+from the original control's token tape and 311 rounds. Resetting the prefix
+cache and disabling CPU context-switch tracing did not remove the difference.
+The unprofiled CUDA-event run also produces the 300-round tape, including its
+uninstrumented warmup: the difference is not exclusively caused by profiling.
+AOT/cache state and restart variability remain hypotheses, not established
+causes. The event harness now adds ordinary controls in the same loaded engine.
+Do not rescale either node capture into the 21.835-ms control.
+
+### Unprofiled phase diagnostic
+
+Source `8d28bfc00f`, same hardware/max length/input/sampling, no profiler.
+Three endpoint means are 23.844, 23.818 and 23.771 ms over 300 rounds each.
+CUDA event target-to-next-target intervals on rank 2 average 23.784 ms after
+excluding the edge rounds; their agreement with endpoints checks the interval
+boundaries. Event instrumentation overhead has not yet been checked against
+same-process ordinary controls, so these are diagnostic measurements.
+
+| Same-rank GPU-stream wall interval | Mean |
+| --- | ---: |
+| Target M5 forward | 17.591 ms |
+| Draft 0, M5 | 1.338 ms |
+| Draft 1, M1 | 1.045 ms |
+| Draft 2, M1 | 1.034 ms |
+| Draft 3, M1 | 1.030 ms |
+| Draft metadata/gaps beyond its four graphs | 0.114 ms |
+| Target head/sample | 0.729 ms |
+| Target execute outside forward, including preparation/waits | 0.863 ms |
+| Sample/handoff outside head and draft | 0.032 ms |
+| Remaining round boundary | 0.007 ms |
+
+Use nested ranges only once in this wall table. Kernel service from Nsight is
+reported separately. The 300-round synthetic case counts acceptance beyond the
+output cutoff: raw acceptance length is 1.720, while actual steady emitted
+output is 512/300 = 1.707 tokens/round. It is timing-only, not output quality.
+
+### FP32-policy router/shared repair
+
+Real 48-layer checkpoint weights, M5, FP16 inputs/weights/output, FP32
+accumulation/reduction, cold streaming sequences larger than L2, graph timings:
+
+| Operator chain | Vendor control | Native candidate | Saving |
+| --- | ---: | ---: | ---: |
+| Router | 0.616 ms | 0.386 ms | 0.230 ms |
+| Shared up plus SiLU/multiply | 0.644 ms | 0.327 ms | 0.317 ms |
+
+The worst FP64 comparison errors do not increase over the vendor across input
+scales 0, .03, .1, 1 and 3. This is operator evidence, not model distribution or
+quality admission. Shared up now stores FP32 K320 partials under the ordinary
+worker precision policy and preserves the final FP16 projection/activation
+boundaries. The legacy FP16-partial schedule remains available. An explicit
+native FP32 capability allows old binaries to retain the vendor fallback.
+
+The new integration base is `f415b92d9e`: it already contains the router repair,
+PR #900 topology-qualified HC, and #924 GDN preprocessing. Reuse those main changes;
+only the shared FP32 schedule adds new projection behavior here. The combined
+0.547-ms estimate is relative to the earlier c60 control; do not count main's
+router contribution twice. Full-round, shared distribution, quality/acceptance
+and C4 gates on the final source remain pending. The 15-ms objective is unmet.

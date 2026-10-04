@@ -275,7 +275,10 @@ def _qwen38_sm70_shared_up(
         else:
             partial = x.new_empty((8, x.shape[0], 320), dtype=torch.float32)
             torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
-        logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
+        logger.info_once(
+            "SM70 MTP4 shared-expert batch projection enabled (partials=%s).",
+            partial.dtype,
+        )
         return out
     gate_up = torch.nn.functional.linear(x, weight)
     out = gate_up.new_empty((*gate_up.shape[:-1], 160))
