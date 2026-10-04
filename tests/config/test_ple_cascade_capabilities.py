@@ -12,6 +12,7 @@ from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config import vllm as config_module
 from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
@@ -53,6 +54,25 @@ def test_default_admission_and_engine_local_activation(config):
         assert ple_cascade_configured()
         assert ple_offload_enabled()
     assert not ple_offload_enabled()
+
+
+def test_packed_gguf_admission_without_fp8_storage_hint(config):
+    config.load_config.load_format = "gguf"
+    config.quant_config = GGUFConfig()
+    config.model_config.hf_text_config.ple_embedding_dtype = ""
+    assert config_module._qwen4exp_ple_cascade_requested(config)
+    assert config.kernel_config.ple_disk_cascade_reason is None
+    with set_current_vllm_config(config):
+        assert ple_cascade_configured()
+        assert ple_offload_enabled()
+
+
+def test_gguf_format_requires_supported_embedding_method(config):
+    config.load_config.load_format = "gguf"
+    config.quant_config = None
+    config.model_config.hf_text_config.ple_embedding_dtype = ""
+    assert not config_module._qwen4exp_ple_cascade_requested(config)
+    assert "packed GGUF" in config.kernel_config.ple_disk_cascade_reason
 
 
 @pytest.mark.parametrize(
