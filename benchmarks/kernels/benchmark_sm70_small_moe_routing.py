@@ -18,8 +18,12 @@ def timing(fn):
     for _ in range(10):
         fn()
     graph = torch.cuda.CUDAGraph()
+    inner = 8
     with torch.cuda.graph(graph):
-        fn()
+        for _ in range(inner):
+            fn()
+    for _ in range(3):
+        graph.replay()
     samples = []
     for _ in range(5):
         start, end = (
@@ -31,7 +35,9 @@ def timing(fn):
             graph.replay()
         end.record()
         end.synchronize()
-        samples.append(start.elapsed_time(end) * 10)
+        # Several device invocations per replay prevent host replay gaps
+        # from dominating a pair of short kernels.
+        samples.append(start.elapsed_time(end) * 10 / inner)
     return statistics.median(samples)
 
 
