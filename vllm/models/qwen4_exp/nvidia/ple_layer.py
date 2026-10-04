@@ -27,6 +27,10 @@ from vllm.config import (
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.ngram import (
+    SM70_PLE_NGRAM,
+    sm70_ple_ngram_ids,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -1423,6 +1427,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
             logger.info_once("SM70 Qwen3.8 fused M=1 PLE ngram-ID path enabled.")
             return output
+
+        if (
+            not is_offload_process()
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+        ):
+            reason = SM70_PLE_NGRAM.reason(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
+            if reason is None:
+                logger.info_once("SM70 fused small-batch PLE ngram-ID path enabled.")
+                return sm70_ple_ngram_ids(
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    self.layer_multipliers,
+                    self.ngram_heads_vocab_sizes,
+                    self.ngram_heads_offsets,
+                    self.eos_token_id,
+                )
+            logger.debug_once("SM70 small-batch PLE ngram-ID fallback: %s", reason)
 
         if (
             is_offload_process()
