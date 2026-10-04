@@ -285,7 +285,32 @@ from 73.728 to 68.608 us. Native NVFP4 is 49.152 us and canonical 79.872
 us. This saves redundant coefficient work while reusing the shared decoder,
 but still misses the performance gate.
 
-A following reader packs both K8 index/sign packets together into 52 bits
-per column and K16 segment. This preserves all 110 bytes per K256 block;
-three adjacent 32-bit reads replace four reads. Its field extraction and
-all-weight official FP32 oracle must pass before interpreting timing.
+Joint K16 packets preserve all 110 bytes per K256 block: three adjacent
+32-bit reads replace four reads. The all-weight official FP32 oracle passes,
+and GEMM outputs are bitwise equal. At SM 1530 MHz, however, the joint
+reader measures 62.464 us versus separate K8 packets 61.440 us. Two-chain
+versions both measure 65.536 us. Canonical is 76.800 us and native NVFP4
+48.128 us. This permutation is rejected.
+
+Explicitly interleaving each K8 decode with its two MMA instructions does
+not improve the best full-activation single-chain path: both measure
+67.584 us at SM 1290 MHz, with bitwise equal outputs. The compiler already
+interleaves parts of the original source. Both builds retain 64 registers
+and zero spills; the source scheduling change is rejected.
+
+The shared decoder's newer 32-bit warp-window reader is also tested on this
+K64 pair skeleton, using unchanged original-bit storage and dequantization.
+Its all-weight official FP32 oracle passes and GEMM outputs are bitwise
+equal. At SM 1290 MHz, full-activation window reads measure 73.216 us
+versus direct reads 67.584 us; two-chain window reads measure 72.704 us
+versus direct reads 69.632 us. Canonical is 79.872 us and native NVFP4
+49.152 us. Retain direct reads for this skeleton.
+
+NCU on the retained shared-coefficient full-activation candidate reports
+65.664 us profiled duration, 64 registers, 18,432 shared bytes and 40.54%
+achieved occupancy. Long-scoreboard samples cluster at scale extraction
+(101 samples) and original-packet extraction (97 samples); the total is
+264 not-issued samples. Excessive shared wavefronts remain 842,649.
+These sample counts are instruction attribution, not elapsed-time shares.
+The next isolated step removes unnecessary row masks in an M=8-only
+candidate before considering metadata prefetch within the register budget.
