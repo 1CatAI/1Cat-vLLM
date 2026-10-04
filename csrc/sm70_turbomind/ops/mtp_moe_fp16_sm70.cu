@@ -6,17 +6,28 @@
 #include <cuda_fp16.h>
 #include <torch/library.h>
 #include <torch/types.h>
+#include <type_traits>
 
 namespace {
+template <bool Bf16>
+using Weight = std::conditional_t<Bf16, uint16_t, half>;
+
+template <bool Bf16>
+__device__ __forceinline__ float weight_float(Weight<Bf16> value) {
+  if constexpr (Bf16)
+    return __uint_as_float(uint32_t(value) << 16);
+  else
+    return __half2float(value);
+}
 // Preserve the tuned BM2 Triton kernel's sequential FP32 FMA order and
 // FP16 projection boundaries. In particular, W2 applies the router weight
 // before the FP16 store; moe_sum still reduces the ten stored FP16 routes.
-template <int N, int K, int BN, int BK, bool Weighted>
-__global__ void mtp_moe_fp16_tile_kernel(const half* x, const half* w,
+template <int N, int K, int BN, int BK, bool Weighted, bool Bf16>
+__global__ void mtp_moe_fp16_tile_kernel(const half* x, const Weight<Bf16>* w,
                                          const int32_t* ids,
                                          const float* weights,
                                          const int32_t* padded, half* y) {
-  __shared__ half tile[BN][BK + 2];
+  __shared__ Weight<Bf16> tile[BN][BK + 2];
   __shared__ float input[BK];
   const int t = threadIdx.x, route = blockIdx.y;
   if (route * 2 >= *padded) return;
@@ -35,7 +46,7 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const half* w,
       const int n = i / (BK / 8), k = i % (BK / 8) * 8;
       union {
         uint4 v;
-        half h[8];
+        Weight<Bf16> h[8];
       } data;
       data.v = make_uint4(0, 0, 0, 0);
       if (blockIdx.x * BN + n < N && base + k < K)
@@ -48,7 +59,7 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const half* w,
     if (t < BN) {
 #pragma unroll
       for (int k = 0; k < BK; ++k)
-        acc = __fmaf_rn(input[k], __half2float(tile[t][k]), acc);
+        acc = __fmaf_rn(input[k], weight_float<Bf16>(tile[t][k]), acc);
     }
     __syncthreads();
   }
@@ -58,7 +69,8 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const half* w,
   }
 }
 
-__global__ void mtp_moe_fp16_m1_w13_kernel(const half* x, const half* w,
+template <bool Bf16>
+__global__ void mtp_moe_fp16_m1_w13_kernel(const half* x, const Weight<Bf16>* w,
                                            const int32_t* ids,
                                            const int32_t* padded, half* y) {
   constexpr int kN = 320, kK = 2560, kThreads = 64;
@@ -70,21 +82,22 @@ __global__ void mtp_moe_fp16_m1_w13_kernel(const half* x, const half* w,
   __syncthreads();
   float acc = 0.0f;
   if (expert >= 0 && expert < 512) {
-    const half* p = w + (int64_t(expert) * kN + col) * kK;
+    const Weight<Bf16>* p = w + (int64_t(expert) * kN + col) * kK;
     for (int k = 0; k < kK; k += 8) {
       union {
         uint4 v;
-        half h[8];
+        Weight<Bf16> h[8];
       } data;
       data.v = *reinterpret_cast<const uint4*>(p + k);
 #pragma unroll
       for (int j = 0; j < 8; ++j)
-        acc = __fmaf_rn(input[k + j], __half2float(data.h[j]), acc);
+        acc = __fmaf_rn(input[k + j], weight_float<Bf16>(data.h[j]), acc);
     }
   }
   y[route * kN + col] = __float2half_rn(acc);
 }
 
+template <bool Bf16>
 void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
                       torch::Tensor ids, torch::Tensor weights,
                       torch::Tensor padded, bool down) {
@@ -98,7 +111,7 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
                 "MTP FP16 MoE requires same-device contiguous tensors");
   }
   TORCH_CHECK(out.scalar_type() == at::kHalf && x.scalar_type() == at::kHalf &&
-                  w.scalar_type() == at::kHalf &&
+                  w.scalar_type() == (Bf16 ? at::kBFloat16 : at::kHalf) &&
                   ids.scalar_type() == at::kInt &&
                   weights.scalar_type() == at::kFloat &&
                   padded.scalar_type() == at::kInt,
@@ -117,19 +130,19 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
               "MTP FP16 MoE requires 16-byte aligned weights");
   const auto stream = at::cuda::getCurrentCUDAStream();
   const auto* xp = reinterpret_cast<const half*>(x.data_ptr());
-  const auto* wp = reinterpret_cast<const half*>(w.data_ptr());
+  const auto* wp = reinterpret_cast<const Weight<Bf16>*>(w.data_ptr());
   const auto* ip = ids.data_ptr<int32_t>();
   const auto* tp = weights.data_ptr<float>();
   const auto* pp = padded.data_ptr<int32_t>();
   auto* op = reinterpret_cast<half*>(out.data_ptr());
   if (down) {
-    mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true>
+    mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true, Bf16>
         <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
   } else if (m == 1) {
-    mtp_moe_fp16_m1_w13_kernel<<<dim3(5, 10), 64, 0, stream>>>(xp, wp, ip, pp,
-                                                               op);
+    mtp_moe_fp16_m1_w13_kernel<Bf16>
+        <<<dim3(5, 10), 64, 0, stream>>>(xp, wp, ip, pp, op);
   } else {
-    mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false>
+    mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false, Bf16>
         <<<dim3(10, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -140,7 +153,11 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
       "sm70_mtp_moe_fp16_out(Tensor(a!) out, Tensor x, Tensor w, Tensor ids, "
       "Tensor weights, Tensor padded, bool down) -> ()");
+  m.def(
+      "sm70_mtp_moe_bf16_out(Tensor(a!) out, Tensor x, Tensor w, Tensor ids, "
+      "Tensor weights, Tensor padded, bool down) -> ()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
-  m.impl("sm70_mtp_moe_fp16_out", &mtp_moe_fp16_out);
+  m.impl("sm70_mtp_moe_fp16_out", &mtp_moe_fp16_out<false>);
+  m.impl("sm70_mtp_moe_bf16_out", &mtp_moe_fp16_out<true>);
 }

@@ -27,7 +27,14 @@ They cover M1..5 underflow preservation, changing graph inputs and two FP64
 dot-product checks. A normal installed build remains required before model
 integration or performance qualification.
 
-MoE grouped reading, checkpoint allocation, HC and norm integration, real
+A BF16 specialization also reuses the existing MTP MoE reference projections:
+E512, H2560, TP4 I160, top-10 and M1/M5. It changes the weight decoder while
+retaining the sequential FP32 FMA order and router weighting before the Half
+projection output. It adds no model dispatch. This reference retains the
+existing per-route structure; it does not establish grouped-MoE performance.
+BF16 route and replay checks are pending.
+
+Optimized MoE grouped reading, checkpoint allocation, HC and norm integration, real
 activation measurements, and model distribution/acceptance checks are
 pending. Model integration must preserve the original BF16 parameters; it
 must not use automatic Half checkpoint conversion as a baseline.
