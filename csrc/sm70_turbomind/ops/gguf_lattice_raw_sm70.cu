@@ -1298,13 +1298,20 @@ void gguf_lattice_compact_mma_sm70_out(
 void gguf_lattice_compact_blas_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor scratch, bool natural_layout,
-    int64_t algorithm, int64_t dq_partitions, bool shared_metadata) {
+    int64_t algorithm, int64_t dq_partitions, bool shared_metadata,
+    int64_t dq_threads) {
   TORCH_CHECK(algorithm == 99 || algorithm == 102 ||
                   (algorithm == 111 && out.scalar_type() == torch::kFloat32),
               "Compact GGUF BLAS requires default/algorithm 2, or FP32 output "
               "for algorithm 11");
   TORCH_CHECK(dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4,
               "Compact GGUF DQ partitions must be 1, 2 or 4");
+  TORCH_CHECK(dq_threads == 128 || dq_threads == 256 || dq_threads == 512,
+              "Compact GGUF DQ threads must be 128, 256 or 512");
+  TORCH_CHECK(dq_threads * dq_partitions <= 1024,
+              "DQ warps and partitions cannot exceed the 32 source octets");
+  TORCH_CHECK(!natural_layout || dq_threads == 256,
+              "Natural DQ retains its separate thread layout");
   TORCH_CHECK(!natural_layout || dq_partitions == 1,
               "Natural-layout DQ does not support partitions");
   validate_compact_io(out, input, weight, true);
@@ -1322,26 +1329,27 @@ void gguf_lattice_compact_blas_sm70_out(
               "Shared original metadata requires aligned [K,N] workspace");
   const dim3 grid((n + 31) / 32, k / 256, dq_partitions);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_BLAS_DQ(TYPE, FULL)                                            \
-  if (natural_layout)                                                          \
-    compact_dequant_natural_kernel<TYPE, FULL><<<grid, 128, 0, stream>>>(      \
-        reinterpret_cast<half*>(scratch.data_ptr()),                           \
-        weight.data_ptr<uint8_t>(), n, k);                                     \
-  else if constexpr (FULL) {                                                   \
-    if (shared_metadata)                                                       \
-      compact_dequant_kernel<TYPE, half, true, true, false, true>              \
-          <<<grid, 256, 0, stream>>>(                                          \
-              reinterpret_cast<half*>(scratch.data_ptr()),                     \
-              weight.data_ptr<uint8_t>(), n, k);                               \
-    else                                                                       \
-      compact_dequant_kernel<TYPE, half, true, true>                           \
-          <<<grid, 256, 0, stream>>>(                                          \
-              reinterpret_cast<half*>(scratch.data_ptr()),                     \
-              weight.data_ptr<uint8_t>(), n, k);                               \
-  } else                                                                       \
-    compact_dequant_kernel<TYPE, half, true, false><<<grid, 256, 0, stream>>>( \
-        reinterpret_cast<half*>(scratch.data_ptr()),                           \
-        weight.data_ptr<uint8_t>(), n, k)
+#define COMPACT_BLAS_DQ(TYPE, FULL)                                       \
+  if (natural_layout)                                                     \
+    compact_dequant_natural_kernel<TYPE, FULL><<<grid, 128, 0, stream>>>( \
+        reinterpret_cast<half*>(scratch.data_ptr()),                      \
+        weight.data_ptr<uint8_t>(), n, k);                                \
+  else if constexpr (FULL) {                                              \
+    if (shared_metadata)                                                  \
+      compact_dequant_kernel<TYPE, half, true, true, false, true>         \
+          <<<grid, dq_threads, 0, stream>>>(                              \
+              reinterpret_cast<half*>(scratch.data_ptr()),                \
+              weight.data_ptr<uint8_t>(), n, k);                          \
+    else                                                                  \
+      compact_dequant_kernel<TYPE, half, true, true>                      \
+          <<<grid, dq_threads, 0, stream>>>(                              \
+              reinterpret_cast<half*>(scratch.data_ptr()),                \
+              weight.data_ptr<uint8_t>(), n, k);                          \
+  } else                                                                  \
+    compact_dequant_kernel<TYPE, half, true, false>                       \
+        <<<grid, dq_threads, 0, stream>>>(                                \
+            reinterpret_cast<half*>(scratch.data_ptr()),                  \
+            weight.data_ptr<uint8_t>(), n, k)
 #define COMPACT_BLAS_DQ_SELECT(TYPE) \
   if (n % 32 == 0) {                 \
     COMPACT_BLAS_DQ(TYPE, true);     \

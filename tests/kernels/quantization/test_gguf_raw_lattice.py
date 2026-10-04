@@ -883,3 +883,49 @@ def test_planar_equal_bytes_official_values_and_graph(kind, m):
         torch.testing.assert_close(
             out.float(), x.float() @ expected.float().T, rtol=0.001, atol=0.003
         )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("threads", [128, 512])
+def test_compact_workspace_thread_layout_graph(kind, threads):
+    n, k, m = 160, 768, 512
+    data = packed(kind, n=n, k=k)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, original, kind, k)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float32)
+    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        False,
+        111,
+        2,
+        True,
+        threads,
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.normal_()
+    graph.replay()
+    torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out, x.float() @ reference.float().T, rtol=0.001, atol=0.002
+    )
+    with pytest.raises(RuntimeError, match="32 source octets"):
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+            out, x, weight, kind, scratch, False, 111, 4, True, 512
+        )
