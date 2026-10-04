@@ -94,7 +94,11 @@ def main():
         int(
             np.ceil(
                 2
-                * torch.cuda.get_device_properties(0).L2_cache_size
+                * getattr(
+                    torch.cuda.get_device_properties(0),
+                    "L2_cache_size",
+                    6 * 1024 * 1024,
+                )
                 / (min(experts, args.top_k) * compact_bytes)
             )
         ),
