@@ -67,13 +67,13 @@ def _qk_norm_rope(
     variance = tl.sum(values * values, 0) / 256.0
     inverse = tl.rsqrt(variance + EPS)
     w = tl.load(weight + col).to(tl.float32) + 1.0
-    normalized = (values * inverse * w).to(tl.float16)
+    normalized = values * inverse * w
     # Reload only the rotary partner. Its norm shares the same variance,
     # while its learned channel weight can differ.
     partner = tl.where(col < 32, col + 32, tl.where(col < 64, col - 32, col))
     pv = tl.load(source + partner).to(tl.float32)
     pw = tl.load(weight + partner).to(tl.float32) + 1.0
-    pn = (pv * inverse * pw).to(tl.float16)
+    pn = pv * inverse * pw
     frequency = col % 32
     plane = tl.full((256,), 0, tl.int32)
     if POS_PLANES == 3:
@@ -83,8 +83,8 @@ def _qk_norm_rope(
     position = tl.where(position < 0, position + CACHE_ROWS, position)
     cosine = tl.load(Cache + position * 64 + frequency)
     sine = tl.load(Cache + position * 64 + 32 + frequency)
-    # Norm outputs retain their FP16 boundary. Rotary products use FP32 as
-    # in the compiled target path; the head and drafter are untouched.
+    # The compiled target keeps normalized rotary channels in FP32 until
+    # the final rotary store. Do not insert an intermediate FP16 rounding.
     first = normalized.to(tl.float32) * cosine.to(tl.float32)
     second = pn.to(tl.float32) * sine.to(tl.float32)
     sign = tl.where(col < 32, -1.0, 1.0)
@@ -180,7 +180,7 @@ def qk_norm_rope(
         1 if positions.ndim == 1 else 3,
         eps,
         num_warps=4,
-        enable_fp_fusion=False,
+        enable_fp_fusion=True,
     )
     return q, k
 
