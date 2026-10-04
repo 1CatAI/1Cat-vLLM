@@ -73,6 +73,7 @@ def test_exact_legacy_ids_and_graph(monkeypatch, dtype, m, starts):
         replay = layer.compute_ngram_ids(ids, q_starts, context)
     ids.add_(3)
     context.add_(7)
+    q_starts[1:-1].copy_(q_starts[1:-1] // 2)
     expected = reference()
     graph.replay()
     torch.cuda.synchronize()
