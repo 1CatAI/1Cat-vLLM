@@ -228,6 +228,32 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
                 config.rms_norm_eps,
                 runtime_dtype,
             )
+        self.self_attn._sm70_dflash2_qk_rope = bool(
+            self.use_sm70_bf16_emulation
+            and config.hidden_size == 5120
+            and vllm_config.speculative_config is not None
+            and get_dflash_model_draft_tokens(vllm_config.speculative_config) == 7
+            and vllm_config.model_config.dtype == torch.float16
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+            and self.self_attn.q_size == 1024
+            and self.self_attn.kv_size == 256
+            and self.self_attn.head_dim == 128
+            and self.self_attn.is_neox_style
+            and self.self_attn.rotary_emb.rotary_dim == 128
+            and self.self_attn.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
+        )
+        if self.self_attn._sm70_dflash2_qk_rope:
+            # Import registers the cache-aware opaque op before model tracing.
+            from vllm.model_executor.layers.attention import (
+                sm70_dflash2_qk_rope,  # noqa: F401
+            )
+
+            logger.info_once(
+                "SM70 DFlash2 fused Q/K norm, RoPE and KV publication enabled."
+            )
         draft_config = config.dflash_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
@@ -246,6 +272,24 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
+
+        if (
+            self.use_sm70_bf16_emulation
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+        ):
+            for projection in (
+                self.self_attn.qkv_proj,
+                self.self_attn.o_proj,
+                self.mlp.gate_up_proj,
+                self.mlp.down_proj,
+                self.attention_conv.kernel_projection,
+                self.mlp_conv.kernel_projection,
+            ):
+                if isinstance(projection.quant_method, UnquantizedLinearMethod):
+                    projection._sm70_dflash2_fp16_m8 = True
 
     def forward(
         self,
@@ -353,11 +397,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         output_size: int,
         prefix: str,
     ) -> nn.Module:
+        from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+
         use_sharded_fc = (
             sm70_dflash2_enabled(
                 "sharded_context_fc", capture_sm70_dflash2_config(vllm_config)
             )
-            and self.quant_config is None
+            and (self.quant_config is None or isinstance(self.quant_config, GGUFConfig))
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
             and vllm_config.parallel_config.tensor_parallel_size == 4
@@ -381,7 +427,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             bias=False,
             gather_output=True,
             params_dtype=vllm_config.model_config.dtype,
-            quant_config=None,
+            quant_config=self.quant_config,
             prefix=prefix,
             return_bias=False,
         )

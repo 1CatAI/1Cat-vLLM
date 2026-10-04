@@ -3096,6 +3096,36 @@ def supports_sm70_qwen38_hc_batch() -> bool:
     return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_batch")
 
 
+def supports_sm70_qwen38_hc_local() -> bool:
+    owner = _custom_ar_owner_namespace()
+    return all(
+        hasattr(owner, name)
+        for name in ("sm70_qwen38_hc_down_local", "sm70_qwen38_hc_up_local")
+    )
+
+
+def sm70_qwen38_hc_down_local(input, packed, partials, output, rank) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_down_local(
+        input, packed, partials, output, rank
+    )
+
+
+def sm70_qwen38_hc_up_local(lora, packed, branches, output, rank) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_up_local(
+        lora, packed, branches, output, rank
+    )
+
+
+def supports_sm70_qwen38_hc_replicated() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_replicated")
+
+
+def sm70_qwen38_hc_replicated(x, down, up, partials, lora, output, injection) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_replicated(
+        x, down, up, partials, lora, output, injection
+    )
+
+
 def sm70_qwen38_hc_batch(
     fa: int,
     inp: torch.Tensor,
@@ -4253,3 +4283,19 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+if hasattr(torch.ops._C, "sm70_ring_atomic_allreduce_out"):
+
+    @register_fake("_C::sm70_ring_atomic_allreduce_out")
+    def _sm70_ring_allreduce_fake(
+        output,
+        input,
+        addresses,
+        counters,
+        rank_order,
+        rank,
+        capacity,
+        block_packets=False,
+    ) -> None:
+        return None

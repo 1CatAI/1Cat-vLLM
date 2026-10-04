@@ -423,7 +423,20 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             "gdn_hidden_states", layer_name, hidden_states
         )
 
-        if _sm70_gdn_qpn8_ba_dispatch_eligible(
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _sm70_gdn_projection_dump_requested,
+        )
+        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+            apply_gdn_ba_verify,
+        )
+
+        fused_verify_projection = None
+        if not _sm70_gdn_projection_dump_requested(layer_name):
+            fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        if fused_verify_projection is not None:
+            mixed_qkv, z, b, a = fused_verify_projection
+            z = z.reshape(num_tokens, -1, self.head_v_dim)
+        elif _sm70_gdn_qpn8_ba_dispatch_eligible(
             self,
             hidden_states,
             layer_name,
@@ -534,11 +547,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         b = b.contiguous()
         a = a.contiguous()
 
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_out = self._allocate_core_attn_out(mixed_qkv, a, b, hidden_states)
         conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
             layer_name,
             core_attn_out,
@@ -573,11 +582,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
         self.sm70_dflash2_direct_attention_output = bool(
-            envs.VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT
-            and current_platform.is_device_capability(70)
+            current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
             and vllm_config.parallel_config.tensor_parallel_size == 4
             and model_config.dtype == torch.float16
+            and model_config.quantization == "compressed-tensors"
             and config.hidden_size == 5120
             and config.model_type == "qwen3_5_text"
         )
@@ -589,6 +598,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
+            # Make the collective visible beside the following Gemma norm.
+            # The full GDN operator returns the local output projection; KV
+            # cache mutations remain within that same operator boundary.
+            self.sm70_gdn_outer_allreduce = bool(
+                self.sm70_dflash2_direct_attention_output
+                and self.linear_attn.out_proj.bias is None
+            )
+            if self.sm70_gdn_outer_allreduce:
+                self.linear_attn.out_proj.reduce_results = False
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
                 config,
@@ -1063,6 +1081,15 @@ class Qwen3_5ForCausalLMBase(
             self.lm_head, hidden_states, top_k
         )
 
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.logits_processor.get_compact_target_probe_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1256,6 +1283,15 @@ class Qwen3_5ForConditionalGeneration(
         top_k: int,
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         return self.language_model.get_topk_tokens_and_logits_with_fallback(
+            hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.language_model.get_compact_target_probe_with_fallback(
             hidden_states, top_k
         )
 

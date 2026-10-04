@@ -27,6 +27,10 @@ from vllm.config import (
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.ngram import (
+    SM70_PLE_NGRAM,
+    sm70_ple_ngram_ids,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -508,7 +512,16 @@ def _get_ple_embedding_quant_method(
     *,
     force_fp8_storage: bool = False,
 ) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+    """Select an embedding implementation that preserves checkpoint storage."""
+
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+    )
+
+    if isinstance(quant_config, GGUFConfig):
+        from .gguf_embedding import Qwen4ExpPLEGGUFEmbeddingMethod
+
+        return Qwen4ExpPLEGGUFEmbeddingMethod(quant_config)
 
     if force_fp8_storage:
         return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -744,7 +757,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         the rows beyond device and host are read from the mapped checkpoint on
         disk -- instead of overcommitting the device.
         """
-        row_bytes = self.embedding_dim
+        row_bytes = getattr(self, "_storage_dim", self.embedding_dim)
         total_rows = self._meta_weight_shape[0]
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
@@ -1049,6 +1062,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         self.head_dim = embedding_dim // self.ngram_heads
         self.eos_token_id = int(config.eos_token_id)
+        self.eos_token_id = int(
+            getattr(config, "gguf_ple_eos_token_id", self.eos_token_id)
+        )
         self.unigram_vocab_size = int(config.vocab_size)
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         if self.split_ngram_parts <= 0:
@@ -1078,6 +1094,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             sizes.append(size)
             offsets.append(offset)
             offset += size
+        if (constants := getattr(config, "gguf_ple_constants", None)) is not None:
+            # A GGUF converter preserves the checkpoint's exact integer
+            # constants. Never regenerate them from an assumed random seed.
+            multipliers = constants["layer_multipliers"]
+            sizes = constants["ngram_heads_vocab_sizes"]
+            offsets = constants["ngram_heads_offsets"]
+            self.layer_multipliers.copy_(
+                torch.tensor(
+                    multipliers,
+                    dtype=torch.int64,
+                    device=self.layer_multipliers.device,
+                )
+            )
+            offset = offsets[-1] + sizes[-1]
         self.register_buffer(
             "ngram_heads_vocab_sizes",
             torch.tensor(sizes, dtype=torch.long),
@@ -1120,7 +1150,23 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         )
         self._disk_executor: ThreadPoolExecutor | None = None
-        if self._file_backed_shards:
+        from .gguf_embedding import (
+            Qwen4ExpPackedGGUFEmbedding,
+            Qwen4ExpPLEGGUFEmbeddingMethod,
+        )
+
+        self._packed_gguf = isinstance(quant_method, Qwen4ExpPLEGGUFEmbeddingMethod)
+        if self._packed_gguf:
+            self._file_backed_shards = False
+            self.ngram_embedding = Qwen4ExpPackedGGUFEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype,
+                divisor,
+                embedding_prefix,
+                quant_method,
+            )
+        elif self._file_backed_shards:
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp PLE file-backed shards require FP8 checkpoint storage"
@@ -1425,6 +1471,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             return output
 
         if (
+            not is_offload_process()
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+        ):
+            reason = SM70_PLE_NGRAM.reason(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+            )
+            if reason is None:
+                logger.info_once("SM70 fused small-batch PLE ngram-ID path enabled.")
+                return sm70_ple_ngram_ids(
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    self.layer_multipliers,
+                    self.ngram_heads_vocab_sizes,
+                    self.ngram_heads_offsets,
+                    self.eos_token_id,
+                )
+            logger.debug_once("SM70 small-batch PLE ngram-ID fallback: %s", reason)
+
+        if (
             is_offload_process()
             and num_tokens <= 16
             and self.ngram_size == 3
@@ -1682,7 +1754,15 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 if output.dtype == torch.uint8
                 else output
             )
-            if getattr(self, "_cascade", False):
+            if self._packed_gguf:
+                ids = ngram_ids.reshape(-1)
+                target = embedding_output.reshape(-1, self.head_dim)
+                if self._cascade:
+                    mask = ple_disk_mask(ids, self._disk_segments)
+                    target[mask] = self.ngram_embedding.embedding_lookup(ids[mask])
+                else:
+                    target.copy_(self.ngram_embedding.embedding_lookup(ids))
+            elif getattr(self, "_cascade", False):
                 self._remote_lookup(ngram_ids, embedding_output)
             elif getattr(self, "_disk_offload", False):
                 self._disk_embedding_lookup(ngram_ids, embedding_output)
@@ -1694,16 +1774,21 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
-        if self._is_cpu_offloaded:
+        if self._is_cpu_offloaded and getattr(self, "_cascade", False):
             # Cascade: the resident tiers are gathered here, the rows beyond
             # them arrive from the worker in the shared output buffer.
             remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
             return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
+        # Hybrid decode reads the complete device/pinned-host table locally.
+        # Graph replay submits no remote request, so it must not wait for IPC.
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Transport quantized lookup results as opaque E4M3FN bytes."""
         embedding = getattr(self, "ngram_embedding", None)
+        if getattr(self, "_packed_gguf", False):
+            assert embedding is not None
+            return embedding._output_dtype
         weight = getattr(embedding, "weight", None)
         if weight is not None and weight.dtype == torch.float8_e4m3fn:
             return torch.uint8

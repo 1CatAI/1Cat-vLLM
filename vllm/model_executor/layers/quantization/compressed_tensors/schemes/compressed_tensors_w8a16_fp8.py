@@ -45,6 +45,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
@@ -406,7 +407,14 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                     qpn8_codes, qpn8_scales = sm70_ops.fp8_qpn8_prepare_sm70(
                         layer.weight, weight_scale
                     )
-                    batch_tm = sm70_tm.use_batched_gemm_layouts()
+                    policy = capture_sm70_dflash2_config()
+                    native_only = bool(
+                        policy is not None
+                        and policy.qualified
+                        and sm70_tm.use_native_qpn_layouts()
+                        and current_platform.is_device_capability(70)
+                    )
+                    batch_tm = sm70_tm.use_batched_gemm_layouts() and not native_only
                     if batch_tm:
                         gated = (
                             getattr(layer, "prefix", "").rsplit(".", 1)[-1]
@@ -541,7 +549,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None and not getattr(layer, "sm70_fp8_turbomind", False):
+            raise ValueError("Output buffers require the SM70 FP8 route")
         if getattr(layer, "sm70_fp8_fp16_dequant", False):
             return torch.nn.functional.linear(x, layer.weight, bias)
         if getattr(layer, "sm70_fp8_turbomind", False):
@@ -554,11 +565,21 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             x_2d = x.reshape(-1, x.shape[-1])
             if x_2d.stride(-1) != 1:
                 x_2d = x_2d.contiguous()
-            out_2d = torch.empty(
-                (x_2d.shape[0], layer.output_size_per_partition),
-                device=x.device,
-                dtype=x.dtype,
-            )
+            if output is not None:
+                if (
+                    output.shape != out_shape
+                    or output.dtype != x.dtype
+                    or output.device != x.device
+                    or not output.is_contiguous()
+                ):
+                    raise ValueError("Invalid SM70 FP8 projection output buffer")
+                out_2d = output.reshape(-1, layer.output_size_per_partition)
+            else:
+                out_2d = torch.empty(
+                    (x_2d.shape[0], layer.output_size_per_partition),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
             if x_2d.shape[0] == 0:
                 return out_2d.reshape(out_shape)
             if getattr(layer, "sm70_fp8_qpn8", False):

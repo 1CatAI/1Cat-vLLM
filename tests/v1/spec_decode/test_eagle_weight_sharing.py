@@ -56,7 +56,9 @@ def test_loader_shares_target_head_without_replacing_distinct_draft(
         "vllm.compilation.backends.set_model_tag", lambda _tag: nullcontext()
     )
     config = SimpleNamespace(
-        speculative_config=SimpleNamespace(draft_model_config=object())
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(), draft_load_config=None
+        )
     )
 
     result = utils.load_eagle_model(target, config)
@@ -78,3 +80,33 @@ def test_target_head_resolution_prefers_language_model_and_keeps_fallback():
     assert utils.get_target_lm_head(wrapper, language_model) is wrapper.lm_head
     del wrapper.lm_head
     assert utils.get_target_lm_head(wrapper, language_model) is None
+
+
+def test_external_safetensors_draft_uses_its_loader_with_gguf_target(monkeypatch):
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader import get_model_loader
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    target = make_model()
+    draft = make_model()
+    draft_load = LoadConfig(load_format="safetensors")
+    config = SimpleNamespace(
+        load_config=LoadConfig(load_format="gguf"),
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(), draft_load_config=draft_load
+        ),
+    )
+
+    def load(**kwargs):
+        selected = kwargs.get("load_config") or kwargs["vllm_config"].load_config
+        assert isinstance(get_model_loader(selected), DefaultModelLoader)
+        return draft
+
+    monkeypatch.setattr(utils, "get_model", load)
+    monkeypatch.setattr(utils, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag", lambda _tag: nullcontext()
+    )
+    result = utils.load_eagle_model(target, config)
+    assert result.model.embed_tokens is target.model.embed_tokens
+    assert result.lm_head is target.lm_head

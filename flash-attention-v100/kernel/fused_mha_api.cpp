@@ -59,6 +59,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Debug scalar paged decode QK score dump before softmax (Volta)");
   m.def("decode_turboquant_paged_fwd", &flash_attention_turboquant_decode_paged,
         "FlashAttention decode over TurboQuant paged KV cache (Volta)");
+  m.def("dflash2_paged_bmhd_fwd", &flash_attention_dflash2_paged_bmhd,
+        "Small noncausal DFlash2 paged attention in direct BMHD layout");
   m.def("prefill_paged_fwd", &flash_attention_prefill_paged,
         "FlashAttention prefill over paged KV cache (Volta)");
   m.def("prefill_paged_d256_bm32_allp_pair_scratch_fwd",

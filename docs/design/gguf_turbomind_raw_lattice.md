@@ -1328,7 +1328,7 @@ do not prove one exact physical read per source byte. Profiler durations are
 not used to derive model TPOT. Persistent packet storage remains 90,112,000
 and 67,174,400 bytes per 512-expert projection, exactly the original TP payload.
 
-`benchmarks/kernels/benchmark_gguf_raw_grouped.py` provides the reproducible
+`benchmarks/kernels/benchmark_gguf_compact_grouped.py` provides the reproducible
 full-graph comparison, automatic weight-bank sizing, original-byte budget,
 official numerical oracle and per-route times. Routing sorting and the complete
 MoE layer must be measured after model integration before claiming step savings.

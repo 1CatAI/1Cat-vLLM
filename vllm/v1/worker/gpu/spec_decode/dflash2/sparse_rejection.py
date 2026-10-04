@@ -466,7 +466,11 @@ def try_dflash2_sparse_target_rejection(
     )
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
-    if hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
+    if retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
+        target_topk_ids, target_topk_logits, fallback = (
+            model.get_compact_target_probe_with_fallback(sample_hidden_states, probe_k)
+        )
+    elif hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
         target_topk_ids, target_topk_logits, fallback = (
             model.get_topk_tokens_and_logits_with_fallback(
                 sample_hidden_states, probe_k

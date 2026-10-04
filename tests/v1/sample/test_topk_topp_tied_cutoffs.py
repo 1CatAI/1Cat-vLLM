@@ -20,9 +20,10 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
 
 @pytest.mark.parametrize("top_p", [1.0, 0.95, 0.6])
 @pytest.mark.parametrize("case", ["k_tie", "p_tie", "uniform", "unique"])
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p):
-    x = torch.full((8, 32768), -20.0, device="cuda")
+def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p, rows):
+    x = torch.full((rows, 32768), -20.0, device="cuda")
     if case == "k_tie":
         x[:, :24] = 1.0
         x[:, :18] = 2.0
@@ -33,10 +34,34 @@ def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p):
         x.fill_(1.0)
     else:
         x[:, :32] = torch.arange(32, 0, -1, device="cuda") / 8
-    k = torch.full((8,), 20, dtype=torch.int32, device="cuda")
-    p = torch.full((8,), top_p, device="cuda")
+    k = torch.full((rows,), 20, dtype=torch.int32, device="cuda")
+    p = torch.full((rows,), top_p, device="cuda")
     expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
     actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("mask_value", [-float("inf"), -123.0])
+@pytest.mark.parametrize("use_top_k", [False, True])
+def test_single_row_direct_entry_keeps_grammar_ties_on_reference(
+    monkeypatch, mask_value, use_top_k
+):
+    from vllm.v1.sample.ops import topk_topp_triton
+
+    def unsafe_pivot(*args):
+        raise AssertionError("Single-row call reached the unsafe pivot kernel")
+
+    monkeypatch.setattr(topk_topp_triton, "num_compute_units", unsafe_pivot)
+    # A strided row with masked vocabulary and a nucleus split inside a tie.
+    x = torch.full((1, 65536), -float("inf"))[:, ::2]
+    x[:, :24] = 1.0
+    x[:, :2] = 2.0
+    k = torch.tensor([20], dtype=torch.int32) if use_top_k else None
+    p = torch.tensor([0.8])
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    if mask_value != -float("inf"):
+        expected.masked_fill_(torch.isneginf(expected), mask_value)
+    actual = apply_top_k_top_p_triton(x, k, p, mask_value=mask_value)
     assert torch.equal(actual, expected)
 
 

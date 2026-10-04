@@ -20,6 +20,8 @@ _ARCHITECTURES = {
     "qwen3": ("qwen3", "Qwen3ForCausalLM"),
     "qwen35": ("qwen3_5_text", "Qwen3_5ForCausalLM"),
     "qwen35moe": ("qwen3_5_moe_text", "Qwen3_5MoeForCausalLM"),
+    "dflash": ("qwen3", "DFlash2DraftModel"),
+    "qwen4exp": ("qwen4_exp_text", "Qwen4ExpForCausalLM"),
 }
 
 
@@ -88,7 +90,7 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
         "hidden_size": hidden,
         "intermediate_size": (
             positive("expert_feed_forward_length")
-            if arch == "qwen35moe"
+            if arch in ("qwen35moe", "qwen4exp")
             else positive("feed_forward_length")
         ),
         "num_hidden_layers": layers,
@@ -124,7 +126,74 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
     rope["partial_rotary_factor"] = rotary_dim / head_dim
     config["partial_rotary_factor"] = rotary_dim / head_dim
     config["rope_parameters"] = rope
-    if arch.startswith("qwen35"):
+    if arch == "dflash":
+        target_layers = required("target_layers")
+        if (
+            not isinstance(target_layers, list)
+            or not target_layers
+            or any(
+                isinstance(i, bool) or not isinstance(i, int) or i <= 0
+                for i in target_layers
+            )
+            or target_layers != sorted(set(target_layers))
+        ):
+            raise ValueError("GGUF dflash.target_layers must be ordered 1-based IDs")
+        mask_id = metadata.get("tokenizer.ggml.mask_token_id")
+        if (
+            isinstance(mask_id, bool)
+            or not isinstance(mask_id, int)
+            or not 0 <= mask_id < vocab_size
+        ):
+            raise ValueError("GGUF DFlash requires a mask token within the vocabulary")
+        draft: dict[str, Any] = {
+            key: positive(key)
+            for key in (
+                "block_size",
+                "conv_kernel_size",
+                "conv_group_size",
+                "selector_rank",
+                "selector_top_k",
+            )
+        }
+        if draft["block_size"] < 2 or hidden % draft["conv_group_size"]:
+            raise ValueError("GGUF DFlash block/group dimensions are incompatible")
+        draft.update(
+            mask_token_id=mask_id,
+            # llama.cpp writes extraction positions as layer index + 1.
+            target_layer_ids=[i - 1 for i in target_layers],
+        )
+        for source, destination in {
+            "logit_scale": "output_multiplier",
+            "final_logit_softcapping": "final_logit_softcapping",
+            "embedding_scale": "input_embedding_scale",
+            "attention.value_scale": "attention_value_scale",
+        }.items():
+            if (value := optional(source)) is not None:
+                draft[destination] = value
+        window = optional("attention.sliding_window")
+        pattern = optional("attention.sliding_window_pattern", [False] * layers)
+        if len(pattern) != layers or any(not isinstance(i, bool) for i in pattern):
+            raise ValueError("GGUF DFlash sliding-window pattern must match layers")
+        if any(pattern) and (
+            isinstance(window, bool) or not isinstance(window, int) or window <= 0
+        ):
+            raise ValueError("GGUF DFlash sliding layers require a positive window")
+        causal = optional("attention.causal", False)
+        if not isinstance(causal, bool):
+            raise ValueError("GGUF DFlash attention.causal must be boolean")
+        config.update(
+            torch_dtype="bfloat16",
+            is_causal=causal,
+            dflash_config=draft,
+            sliding_window=window,
+            use_sliding_window=any(pattern),
+            max_window_layers=layers,
+            layer_types=[
+                "sliding_attention" if sliding else "full_attention"
+                for sliding in pattern
+            ],
+        )
+    if arch.startswith("qwen35") or arch == "qwen4exp":
         for key, target in {
             "ssm.conv_kernel": "linear_conv_kernel_dim",
             "ssm.state_size": "linear_key_head_dim",
@@ -152,7 +221,7 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
         if len(sections) != 4 or sections[-1] != 0:
             raise ValueError("Qwen3.5 GGUF requires three MRoPE sections and zero tail")
         rope.update(mrope_section=sections[:3], mrope_interleaved=True)
-    if arch == "qwen35moe":
+    if arch in ("qwen35moe", "qwen4exp"):
         config.update(
             num_experts=positive("expert_count"),
             num_experts_per_tok=positive("expert_used_count"),
@@ -163,6 +232,75 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
             norm_topk_prob=optional("expert_weights_norm", True),
             decoder_sparse_step=1,
         )
+    if arch == "qwen4exp":
+        config.update(
+            hc_count=positive("hyper_connection.count"),
+            hc_lowrank=positive("hyper_connection.low_rank"),
+            indexer_n_heads=positive("attention.indexer.head_count"),
+            indexer_kv_heads=1,
+            indexer_head_dim=positive("attention.indexer.key_length"),
+            indexer_budget=positive("attention.indexer.top_k"),
+        )
+        ratios = required("attention.compress_ratios")
+        if len(ratios) != layers + nextn:
+            raise ValueError("GGUF compress_ratios length does not match block_count")
+        active_ratios = {
+            int(ratios[i])
+            for i, layer_type in enumerate(config["layer_types"])
+            if layer_type == "full_attention"
+        }
+        if len(active_ratios) != 1 or min(active_ratios) <= 0:
+            raise ValueError("GGUF QSA requires one positive full-attention ratio")
+        config["indexer_compress_ratio"] = active_ratios.pop()
+        ple_layers = optional("ple.layers", [])
+        if any(not 0 <= i < layers for i in ple_layers):
+            raise ValueError("GGUF PLE layer index is outside backbone")
+        config["ple_layer_ids"] = [i + 1 for i in ple_layers]
+        if ple_layers:
+            if len(ple_layers) != 1:
+                raise ValueError("GGUF qwen4exp currently requires one PLE table")
+            ngram_size = positive("ple.ngram_size")
+            heads_per_ngram = positive("ple.heads_per_ngram")
+            ngram_heads = (ngram_size - 1) * heads_per_ngram
+            constants = {
+                "layer_multipliers": required("ple.layer_multipliers"),
+                "ngram_heads_offsets": required("ple.head_offsets"),
+                "ngram_heads_vocab_sizes": required("ple.head_vocab_sizes"),
+            }
+            expected_lengths = {
+                "layer_multipliers": ngram_size,
+                "ngram_heads_offsets": ngram_heads,
+                "ngram_heads_vocab_sizes": ngram_heads,
+            }
+            for key, values in constants.items():
+                if len(values) != expected_lengths[key] or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value < 1 << 63
+                    for value in values
+                ):
+                    raise ValueError(f"Invalid GGUF PLE integer constants: {key}")
+            offset = 0
+            for start, size in zip(
+                constants["ngram_heads_offsets"], constants["ngram_heads_vocab_sizes"]
+            ):
+                if start != offset or size <= 0:
+                    raise ValueError(
+                        "GGUF PLE offsets must cover contiguous head tables"
+                    )
+                offset += size
+            config.update(
+                ngram_size=ngram_size,
+                heads_per_ngram=heads_per_ngram,
+                ple_conv_kernel_size=positive("ple.conv_kernel"),
+                ple_embed_dim=positive("embedding_length_per_layer_input")
+                * ngram_heads,
+                gguf_ple_constants=constants,
+                gguf_ple_eos_token_id=required("ple.eos_token_id"),
+                # GGUF combines checkpoint shards into one table. Its storage
+                # policy is chosen by the quantized embedding implementation.
+                split_ngram_parts=1,
+            )
     return config
 
 
@@ -177,6 +315,10 @@ def gguf_config_from_metadata(metadata: dict[str, Any]) -> PretrainedConfig:
         from .configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 
         return Qwen3_5MoeTextConfig(**config_dict)
+    if model_type == "qwen4_exp_text":
+        from .configs.qwen4_exp import Qwen4ExpTextConfig
+
+        return Qwen4ExpTextConfig(**config_dict)
     return AutoConfig.for_model(model_type, **config_dict)
 
 

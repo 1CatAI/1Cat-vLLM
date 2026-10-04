@@ -46,6 +46,11 @@ from vllm.v1.attention.ops.sm70_e4m3_grouped import (
     grouped_e4m3_fp32_groups_allowed,
     load_grouped_e4m3_fp32,
 )
+from vllm.v1.attention.ops.sm70_fp16_grouped import (
+    clear_grouped_fp16_workspaces,
+    grouped_fp16_fp32_reason,
+    load_grouped_fp16_fp32,
+)
 from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
@@ -605,6 +610,7 @@ _sm70_79t_q8192_padding_workspaces: dict[
 
 def clear_flash_attn_v100_workspaces() -> None:
     """Release process-global Flash-V100 tensors during engine shutdown."""
+    clear_grouped_fp16_workspaces()
     _sm70_fa2_cu_seqlens_cache.clear()
     _fp8_prefill_bridge_workspaces.clear()
     _fp8_prefill_bridge_tail_workspaces.clear()
@@ -5050,6 +5056,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.flash_attn_grouped_e4m3_fp32_paged = (
             load_grouped_e4m3_fp32() if use_e4m3_fp32 else None
         )
+        self.flash_attn_grouped_fp16_fp32_paged = (
+            load_grouped_fp16_fp32()
+            if self.kv_cache_dtype in ("auto", "float16", "bfloat16")
+            and current_platform.is_device_capability(70)
+            else None
+        )
         self._sm70_scalar_tail_attention = None
         from vllm.v1.attention.ops.sm70_e4m3_scalar import (
             load_scalar_tail_attention,
@@ -5112,6 +5124,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self._flash_prefill_paged_supports_anchor = (
             self.flash_attn_prefill_paged is not None
             and _callable_accepts_keyword(self.flash_attn_prefill_paged, "anchor_lens")
+        )
+        self._flash_prefill_paged_supports_dflash2_bmhd = bool(
+            getattr(self.flash_attn_prefill_paged, "_sm70_dflash2_direct_bmhd", False)
         )
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
@@ -6224,6 +6239,39 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         partition_size_hint: int | None,
     ) -> None:
         global _logged_prefill_smallq_decode_xqa
+        fp16_grouped = getattr(self, "flash_attn_grouped_fp16_fp32_paged", None)
+        if (
+            fp16_grouped is not None
+            and grouped_fp16_fp32_reason(
+                self,
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                attn_metadata,
+                out=out,
+                partition_size_hint=partition_size_hint,
+            )
+            is None
+        ):
+            fp16_grouped(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                seq_lens,
+                out=out,
+                softmax_scale=self.scale,
+            )
+            logger.info_once(
+                "FLASH_ATTN_V100 FP16 KV grouped verifier active "
+                "(FP32 probability/PV/numerator/max/sum, page=%d).",
+                key_cache.shape[1],
+                scope="process",
+            )
+            _record_route("prefill_smallq_fp16_grouped_fp32")
+            return
         grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
             self,
@@ -8871,7 +8919,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and not causal
             and bool(getattr(layer, "is_dflash_draft_attn", False))
             and anchor_lens is None
-            and num_seqs > 1
+            and (
+                num_seqs > 1
+                or (
+                    num_seqs == 1
+                    and self._flash_prefill_paged_supports_dflash2_bmhd
+                    and max_query_len == 8
+                    and query.shape[1:] == (8, 128)
+                    and query.dtype == torch.float16
+                    and block_size in (1024, 2048)
+                    and key_cache.dtype == value_cache.dtype == torch.float16
+                    and window_size == (2047, 2047)
+                )
+            )
             and 0 < max_query_len <= 16
             and query.shape[0] == num_seqs * max_query_len
             and bool(torch.all(query_lens == max_query_len).item())
