@@ -208,3 +208,40 @@ only the shared FP32 schedule adds new projection behavior here. The combined
 0.547-ms estimate is relative to the earlier c60 control; do not count main's
 router contribution twice. Full-round, shared distribution, quality/acceptance
 and C4 gates on the final source remain pending. The 15-ms objective is unmet.
+
+### Trace calibration and source-audited weight floor
+
+`analyze_sm70_mtp4_phases.py` compares each CUDA-event request with its ordinary
+control in the same loaded engine. It reports output/counter differences and
+observer overhead; the initial diagnostic tolerance is 2% in either direction.
+This is a trace reliability check, not a numerical gate or endpoint speed
+admission. Missing controls cannot pass. Per-rank nested intervals are counted
+once, with mean/p50/p90/p99 and an explicit boundary residual. GPU event origins
+are independent across ranks. Never maximize each phase separately and add them.
+The six focused observer/analysis CPU tests pass; GPU calibration remains pending.
+
+The earlier reset-cache node capture at source `7778083c3f` provides these rank-0
+native weight-read audits, sorted by service minus the weight-only floor.
+They are historical profiled service, not new-main endpoint measurements.
+
+| Native target family | Calls/round | Issued weight bytes/round | Weight floor at 750 GB/s | Profiled service | Difference |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HC up with fused gather | 96 | 157,286,400 | 0.210 ms | 1.072 ms | 0.862 ms |
+| HC down partials | 96 | 188,743,680 | 0.252 ms | 0.848 ms | 0.597 ms |
+| Output projection | 48 | 377,487,360 | 0.503 ms | 0.913 ms | 0.410 ms |
+| Packed GDN QKVZ and BA | 36 | 760,872,960 | 1.014 ms | 1.386 ms | 0.372 ms |
+
+HC uses TP-local down `[96,10240]` and up `[2560,320]` packed weights; both
+include padding/stream layout. GDN BA reads 32 padded output columns, not only
+the 24 logical columns. M5 reads each listed pack once; unsupported wider
+shapes must account for repeated row tiles separately. The native source loops
+establish issued reads, not physical DRAM traffic. Activation/state traffic and
+IPC waits are excluded from these floors. Their difference is an investigation
+budget, not a promised optimization gain or a bandwidth-utilization counter.
+
+The complete per-kernel artifact retains unknown traffic explicitly. Vendor
+weight passes require counters; NVFP4 weight and FP16 scale reads depend on the
+actual selected expert groups. Do not substitute resident tensor size or the
+maximum 50 route groups for those unknown measurements. New-main node
+attribution and NCU counters must supersede this historical ranking before
+selecting the next implementation.
