@@ -1,11 +1,11 @@
-# GGUF on V100: implementation and acceptance control
+# GGUF on V100: implementation and validation control
 
 ## Scope and integration
 
 Target: extensible standalone GGUF loading on four SM70 V100s, then recover
 prefill and C1/C4/C8/C16 throughput against matching native quantization paths.
 Integration is `onecat/main`; never change versioned source snapshots for this
-campaign. Kernel admission and startup reporting must use KernelConfig and
+work. Kernel admission and startup reporting must use KernelConfig and
 `vllm/sm70_profiles/acceleration.py`. No new environment switches.
 
 A model generation smoke is not a logits, quality, or throughput acceptance.
@@ -30,24 +30,25 @@ migration gates remain mandatory and are not replaced by a GGUF smoke.
    PLE layer IDs differ between GGUF (zero-based) and HF (one-based).
 4. llama-family, glm4moe, deepseek2 (including MLA kv_b split), gpt-oss and
    minimax-m2 adapters. Handle architecture-specific RoPE permutations.
-5. Modern native kernel closure, with upstream licenses and pinned sources:
-   Q1_0, Q2_0, MXFP4, NVFP4, TQ1/TQ2; numerical and route capability gates.
-6. Q4_0/Q4_1/Q4_K/Q8_0 load-time repack and rounding report; TurboMind/QPN
-   decode, batched GEMM, expert grouping and tensor-core prefill.
-7. Remaining types: MMVQ decode, dequant + FP16 GEMM prefill; measured Volta
-   fused dequant HMMA for intermediate M; grouped MoE token reuse.
+5. Canonical load-time transcode and official-dequantization comparisons:
+   affine integer, LUT4 and lattice families; ternary codes convert to u2.
+   Preserve provenance and report coefficient-rounding error.
+6. TurboMind decode, batched GEMM, tensor-core prefill and grouped MoE for
+   each family. Measure real shapes against native quantization and the
+   llama.cpp reference before selecting runtime capability bands.
+7. Keep llama.cpp operators as fallback, correctness reference and measured
+   M=1 candidates. Shape tuning belongs to the canonical TurboMind path.
 
-## TP/EP decision
+## TP slicing
 
 Quantization block alignment is an operator/storage constraint, independent
 of model names. K-quant has block K=256: local intermediate K=4352 is aligned;
 Flash-Next expert K=640 divided over TP4 gives K=160 and is not aligned.
-Do not slice packed bytes at that boundary. Prefer EP with complete experts
-when the installed GGUF expert method supports EP; otherwise convert the
-unaligned expert tensor at load time to a format with an admitted K boundary.
-EP is not considered implemented by setting enable_expert_parallel alone.
-Coordinate the final decision with the Flash-Next decode work; its observed
-GPU topology differs from the historical full-NVLink baseline.
+Do not slice packed bytes at that boundary. Flash-Next retains TP4: transcode
+before slicing into a canonical format with an admitted K boundary. Q2_0
+becomes u2/group32, so local K=160 is supported without the temporary Q4_1
+expansion. EP does not replace this TP4 contract. The observed GPU topology
+differs from the historical full-NVLink baseline.
 
 ## References and provenance
 
