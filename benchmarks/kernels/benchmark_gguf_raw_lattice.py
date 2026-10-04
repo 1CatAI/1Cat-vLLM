@@ -46,6 +46,11 @@ def main():
     p.add_argument("--tp-rank", type=int, default=0)
     p.add_argument("--m", type=int, nargs="+", default=[1, 5, 8, 16, 512])
     p.add_argument("--iterations", type=int, default=100)
+    p.add_argument(
+        "--weight-banks",
+        type=int,
+        help="Distinct banks per graph; default exceeds twice L2",
+    )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--profile", choices=("canonical", "raw"))
     a = p.parse_args()
@@ -65,6 +70,44 @@ def main():
     k_ld, q_ld = meta.tolist()
     original = torch.from_numpy(raw.data).cuda()
     n, k = raw.shape
+    l2_bytes = getattr(
+        torch.cuda.get_device_properties(0), "L2_cache_size", 6 * 1024 * 1024
+    )
+    raw_bytes = original.numel()
+    canonical_bytes = (
+        w.numel() * w.element_size() + stats.numel() * stats.element_size()
+    )
+    banks = (
+        a.weight_banks
+        if a.weight_banks is not None
+        else max(1, math.ceil(2 * l2_bytes / min(raw_bytes, canonical_bytes)))
+    )
+    if banks < 1:
+        p.error("--weight-banks must be positive")
+    # Separate addresses keep small expert tests from measuring only L2 hits.
+    weight_banks = [(original, w, stats)] + [
+        (original.clone(), w.clone(), stats.clone()) for _ in range(banks - 1)
+    ]
+
+    def banked_call(call, out):
+        calls = []
+        for rw, cw, cs in weight_banks:
+            replacements = {id(original): rw, id(w): cw, id(stats): cs}
+            calls.append(
+                partial(
+                    call.func,
+                    *(replacements.get(id(arg), arg) for arg in call.args),
+                    **call.keywords,
+                )
+            )
+
+        def run():
+            for bank_call in calls:
+                bank_call()
+            return out
+
+        return run
+
     ref = torch.from_numpy(dequantize(payload, kind)).cuda()
     decoded = torch.empty_like(ref)
     torch.ops._C.gguf_lattice_raw_dequantize_sm70_out(decoded, original, kind)
@@ -88,7 +131,9 @@ def main():
         "n": n,
         "k": k,
         "graph": "FULL",
-        "timing_cache_state": "repeated_same_projection",
+        "timing_cache_state": "distinct_weight_banks",
+        "timing_weight_banks": banks,
+        "l2_bytes": l2_bytes,
         "counter_cache_state": "64_MiB_eviction_before_profiled_replay",
         "accumulation": "FP32",
         "row_padding_bytes": raw.padding_bytes_per_row,
@@ -196,17 +241,13 @@ def main():
         old()
         old_error = errors(out, expected)
 
-        def returning(call, out=out):
-            call()
-            return out
-
-        old_us = elapsed(partial(returning, old), a.iterations, capture=True)
+        old_us = elapsed(banked_call(old, out), a.iterations, capture=True) / banks
         measured = []
         for name, call in candidates:
             call()
             error = errors(out, expected)
             assert error["finite"] and error["relative_l2"] < 0.003, error
-            us = elapsed(partial(returning, call), a.iterations, capture=True)
+            us = elapsed(banked_call(call, out), a.iterations, capture=True) / banks
             measured.append({"route": name, "us": us, "error": error})
         best = min(measured, key=lambda r: r["us"])
         report["timings"].append(
