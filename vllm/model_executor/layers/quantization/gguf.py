@@ -64,6 +64,7 @@ class GGUFConfig(QuantizationConfig):
         self.unquantized_modules = unquantized_modules or []
         self.linear_layouts: dict[str, GGUFLinearLayout] = {}
         self.fallback_reasons: dict[str, str] = {}
+        self.native_expert_storage = False
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -119,6 +120,12 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedEmbeddingMethod()
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
+            if self.native_expert_storage:
+                from vllm.model_executor.layers.quantization.gguf_moe import (
+                    GGUFNativeMoEMethod,
+                )
+
+                return GGUFNativeMoEMethod(self, layer.moe_config)
             # TODO: Select UnquantizedFusedMoEMethod on unquantized layers.
             return GGUFMoEMethod(self, layer.moe_config)
         return None
@@ -456,7 +463,7 @@ def _apply_gguf_embedding_fake(
     dtype: torch.dtype | None = None,
     native_enabled: bool = True,
 ) -> torch.Tensor:
-    return torch.empty(x.shape[0], hidden_size, dtype=dtype, device=x.device)
+    return torch.empty((*x.shape, hidden_size), dtype=dtype, device=x.device)
 
 
 try:
