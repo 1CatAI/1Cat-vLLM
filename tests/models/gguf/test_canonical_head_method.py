@@ -76,7 +76,7 @@ def test_quantized_head_loads_packed_vocab_rows_and_zero_padding(rank):
     assert torch.count_nonzero(layer.qweight[end - start :]) == 0
 
 
-def test_q6_head_dispatch_preserves_u8_group16_and_raw_type(monkeypatch):
+def test_q6_head_dispatch_preserves_bitplanes_group16_and_raw_type(monkeypatch):
     calls: list[tuple[Any, ...]] = []
 
     def canonical(x, codes, stats, cache, family, bits, group, *args):
@@ -106,12 +106,12 @@ def test_q6_head_dispatch_preserves_u8_group16_and_raw_type(monkeypatch):
             True,
             8,
             int(gguf.GGMLQuantizationType.Q6_K),
-            8,
+            6,
             16,
         )
         assert out.shape == (m, 4)
         expected = (
-            ("canonical", 0, 8, 16)
+            ("canonical", 0, 6, 16)
             if m <= 20
             else ("raw", int(gguf.GGMLQuantizationType.Q6_K))
         )

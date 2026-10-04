@@ -47,7 +47,7 @@ Reproduce with `benchmarks/kernels/benchmark_sm70_gguf_head.py MODEL.gguf
 
 The existing `GGUFLMHeadMethod` policy now admits the measured Q6_K shard at
 M=1..20. The opaque projection forwards the actual canonical bit width and
-group size: Q6_K uses u8/group16. Its packed fallback also receives the actual
+group size: Q6_K uses 4+2 bit planes with group16. Its packed fallback also receives the actual
 source type. The existing Q4_K M=2..16 policy is retained.
 
 The method retains original packed bytes for unmeasured M values. Therefore
