@@ -9,7 +9,7 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -506,9 +506,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = None
             layer.sm70_fp8_turbomind = True
             layer.sm70_fp8_channel_scale = True
+            head_config = get_current_vllm_config_or_none()
             layer.sm70_fp8_fp32_head = (
                 getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "lm_head"
                 and tuple(layer.weight.shape) == (5120, 62080)
+                and (head_config is None or head_config.lora_config is None)
                 and hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out")
                 and sm70_dflash2_enabled("fp32_logits", capture_sm70_dflash2_config())
             )
