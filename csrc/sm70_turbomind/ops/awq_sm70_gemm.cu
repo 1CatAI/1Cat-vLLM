@@ -4950,8 +4950,15 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
               "fp8_gemm_sm70: weight must be uint8.");
   TORCH_CHECK(tm_scales.scalar_type() == torch::kFloat16,
               "fp8_gemm_sm70: scales must be float16.");
-  TORCH_CHECK(out.scalar_type() == torch::kFloat16,
-              "fp8_gemm_sm70: output must be float16.");
+  const bool fp32_head = out.scalar_type() == torch::kFloat32;
+  TORCH_CHECK(
+      out.scalar_type() == torch::kFloat16 || fp32_head,
+      "fp8_gemm_sm70: output must be float16 or supported FP32 logits.");
+  TORCH_CHECK(
+      !fp32_head || (in_feats.size(0) > 0 && in_feats.size(0) <= 8 &&
+                     in_feats.size(1) == 5120 && tm_weight.size(1) == 62080 &&
+                     !gated_silu && !exact_8k_prefill_prescaled),
+      "fp8_gemm_sm70: unsupported FP32 LM-head shape.");
   TORCH_CHECK(group_size == 128,
               "fp8_gemm_sm70: only group_size=128 is supported.");
 
@@ -5058,8 +5065,11 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   desc_V.ld = static_cast<int>(q_ld);
 
   turbomind::gemm::MatrixLayout desc_D{
-      turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0)),
+      fp32_head ? turbomind::kFloat32 : turbomind::kHalf,
+      turbomind::gemm::kRowMajor,
+      static_cast<int>(m),
+      static_cast<int>(n),
+      static_cast<int>(out.stride(0)),
   };
 
   turbomind::gemm::Operation op{};
@@ -11952,3 +11962,11 @@ void fp8_moe_single_token_router_sm70_out(
   #endif  // defined(VLLM_ENABLE_SM70_TURBOMIND_EXPERIMENTAL_MOE)
 
 #endif  // defined(ENABLE_SM70_TURBOMIND)
+
+void fp8_gemm_sm70_fp32_head_out(torch::Tensor out, torch::Tensor input,
+                                 torch::Tensor weight, torch::Tensor scales,
+                                 int64_t k_ld, int64_t q_ld) {
+  TORCH_CHECK(out.scalar_type() == torch::kFloat32,
+              "FP32 LM-head output is required.");
+  fp8_gemm_sm70_out(out, input, weight, scales, 128, k_ld, q_ld, false, false);
+}

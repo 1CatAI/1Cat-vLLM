@@ -321,6 +321,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
+  ops.def(
+      "fp8_gemm_sm70_fp32_head_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int k_ld, int q_ld) -> ()");
+  ops.impl("fp8_gemm_sm70_fp32_head_out", torch::kCUDA,
+           &fp8_gemm_sm70_fp32_head_out);
+
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
 
