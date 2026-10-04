@@ -1123,3 +1123,11 @@ The cuBLAS algorithm-2 alternative reads 1,696,064 bytes in dequantization and
 not persistent compressed-weight expansion. Profiler timings are not used as
 end-to-end speed measurements. Smaller FP16 tiles are the next candidate;
 no model route is enabled by this result.
+
+The smaller FP16 tiles passed all 32 checks but the measured complete path
+remained 103.099 us versus 92.847 us canonical. They do not justify selecting
+this workspace path. The next dequantizer experiment increases a CTA from four
+to eight warps. For the Flash gate, the 480-CTA grid previously exposed only
+24 resident warps per SM on average; its 75-83% long-scoreboard stall and low
+DRAM throughput motivate more independent packet loads. Octet assignment uses
+the actual warp count, preserving exact coverage and the original byte layout.

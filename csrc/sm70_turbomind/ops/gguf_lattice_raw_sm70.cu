@@ -480,10 +480,11 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
   if (lane < width)
     parameters = Decode::template parameters<FullWidth>(tile, width, lane);
   auto current = Decode::template fetch<FullWidth>(tile, width, warp);
-  for (int octet = warp; octet < 32; octet += 4) {
+  const int warps = blockDim.x / 32;
+  for (int octet = warp; octet < 32; octet += warps) {
     typename Decode::PacketWindow next{};
-    if (octet + 4 < 32)
-      next = Decode::template fetch<FullWidth>(tile, width, octet + 4);
+    if (octet + warps < 32)
+      next = Decode::template fetch<FullWidth>(tile, width, octet + warps);
     const auto packet = Decode::extract(current, lane < width ? lane : 0);
     if (lane < width) {
       const auto values =
@@ -929,11 +930,11 @@ void gguf_lattice_compact_dequantize_sm70_out(torch::Tensor out,
 #define COMPACT_DQ(TYPE, FULL)                                              \
   if (out.scalar_type() == torch::kFloat32)                                 \
     compact_dequant_kernel<TYPE, float, false, FULL>                        \
-        <<<grid, 128, 0, stream>>>(out.data_ptr<float>(),                   \
+        <<<grid, 256, 0, stream>>>(out.data_ptr<float>(),                   \
                                    weight.data_ptr<uint8_t>(), n, k);       \
   else                                                                      \
     compact_dequant_kernel<TYPE, half, false, FULL>                         \
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(out.data_ptr()), \
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(out.data_ptr()), \
                                    weight.data_ptr<uint8_t>(), n, k)
 #define COMPACT_DQ_SELECT(TYPE) \
   if (n % 32 == 0) {            \
@@ -1152,7 +1153,7 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
         reinterpret_cast<half*>(scratch.data_ptr()),                          \
         weight.data_ptr<uint8_t>(), n, k);                                    \
   else                                                                        \
-    compact_dequant_kernel<TYPE, half, true, FULL><<<grid, 128, 0, stream>>>( \
+    compact_dequant_kernel<TYPE, half, true, FULL><<<grid, 256, 0, stream>>>( \
         reinterpret_cast<half*>(scratch.data_ptr()),                          \
         weight.data_ptr<uint8_t>(), n, k)
 #define COMPACT_BLAS_DQ_SELECT(TYPE) \
@@ -1189,11 +1190,11 @@ void gguf_lattice_compact_tm_f16_sm70_out(
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (source_type == 21)
     compact_dequant_kernel<21, half, false, true, true>
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
                                    weight.data_ptr<uint8_t>(), n, k);
   else
     compact_dequant_kernel<22, half, false, true, true>
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
                                    weight.data_ptr<uint8_t>(), n, k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   gguf_workspace_f16_gemm_sm70_out(out, input, offsets, weight_ptrs);
