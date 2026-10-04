@@ -54,7 +54,7 @@ def common_window(requests: list[dict], trim: int) -> dict:
     return {"begin_wall_s": begin, "end_wall_s": end, "requests": results}
 
 
-async def request(client, args, prompt, index, barrier):
+async def request(client, args, prompt, index, barrier, progress=None):
     body = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
@@ -94,6 +94,8 @@ async def request(client, args, prompt, index, barrier):
                     if ttft_ms is None:
                         ttft_ms = (time.perf_counter() - start) * 1000
                     events.append((time.time(), token_ids))
+                    if progress is not None:
+                        progress(index, len(events))
     emitted = sum(len(ids) for _, ids in events)
     if emitted != args.output_tokens:
         raise ValueError(f"Request {index}: emitted {emitted}, expected fixed length")
@@ -116,12 +118,35 @@ async def run(args):
         raise ValueError("Fixture must contain a distinct prompt per request")
     barrier = asyncio.Barrier(args.concurrency)
     async with httpx.AsyncClient(timeout=3600, trust_env=False) as client:
+        counts = [0] * args.concurrency
+        profile_task = None
+
+        async def start_profile():
+            response = await client.post(args.base_url + "/start_profile")
+            response.raise_for_status()
+
+        def progress(index, count):
+            nonlocal profile_task
+            counts[index] = count
+            if (
+                args.profile_after_chunks is not None
+                and min(counts) >= args.profile_after_chunks
+                and profile_task is None
+            ):
+                profile_task = asyncio.create_task(start_profile())
+
         requests = await asyncio.gather(
             *(
-                request(client, args, prompts[index], index, barrier)
+                request(client, args, prompts[index], index, barrier, progress)
                 for index in range(args.concurrency)
             )
         )
+        if args.profile_after_chunks is not None:
+            if profile_task is None:
+                raise ValueError("Cohort completed before profiling could start")
+            await profile_task
+            response = await client.post(args.base_url + "/stop_profile")
+            response.raise_for_status()
     result = {
         "contract": {
             key: str(value) if isinstance(value, Path) else value
@@ -129,6 +154,9 @@ async def run(args):
         },
         "common_decode_window": common_window(requests, args.trim_chunks),
         "raw_requests": requests,
+        "measurement_mode": (
+            "profiled" if args.profile_after_chunks is not None else "unprofiled"
+        ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2))
@@ -151,9 +179,16 @@ def main():
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trim-chunks", type=int, default=20)
+    parser.add_argument(
+        "--profile-after-chunks",
+        type=int,
+        help="Start the server profiler after every stream reaches this count",
+    )
     args = parser.parse_args()
     if args.trim_chunks < 1:
         parser.error("--trim-chunks must be positive")
+    if args.profile_after_chunks is not None and args.profile_after_chunks < 1:
+        parser.error("--profile-after-chunks must be positive")
     asyncio.run(run(args))
 
 
