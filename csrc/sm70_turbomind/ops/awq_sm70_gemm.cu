@@ -7118,6 +7118,13 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
       out, input, weight, stats, source_type, k_ld, q_ld, group_size);
 }
 
+void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weight,
+                                       int64_t source_type) {
+  vllm::awq_sm70::gguf_lattice_planar_gemm_sm70_out(out, input, weight,
+                                                    source_type);
+}
+
 void gguf_lattice_grouped_gemm_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
     torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
