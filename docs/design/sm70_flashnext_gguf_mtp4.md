@@ -143,10 +143,36 @@ needles, and a C4 regression smoke. Numerical limits are mean/p99/max KL
 against FP32 dequantization of the same GGUF checkpoint. Rejection sampling
 must preserve the reference target distribution.
 
-The separate draft loader has passed focused sharing and quantization
+The separate draft loader passes focused sharing and quantization
 configuration tests in a clean installed wheel. The original checkpoint
 contains 31 BF16 MTP tensors, totaling 5,214,301,696 bytes. All values are
-finite, but converting to FP16 changes 583,979 values. The draft path must
-retain BF16 weights and use a compatible reader before model measurements.
-An IQ3_S MTP4 baseline, acceptance statistics and model quality gates remain
-pending.
+finite. The initial model comparison uses the existing FP16 loader; BF16
+reader operators remain a separate precision follow-up.
+
+### Initial Flash-Next MTP4 comparison
+
+The IQ3_S target and FP16 MTP4 draft run on TP4 with FP16 activation/KV,
+FP32 recurrent state, FULL decode graphs, 8,704 capacity, batch budget 512,
+four sequence slots and 0.90 memory utilization. C1 uses 8K input and 256
+fixed-length greedy output tokens; natural greedy prompts are separate.
+
+| C1 measurement | Ring disabled | Default ring |
+|---|---:|---:|
+| Complete engine round mean | 46.822 ms | 41.499 ms |
+| Pure decode | 71.566 tok/s | 75.212 tok/s |
+| Mean acceptance length | 3.427 | 3.036 |
+| Trimmed timing intervals | 57 | 66 |
+
+Four natural prompts have identical complete token lists and EOS in both
+arms. The observed complete-round reduction is 5.323 ms and pure decode
+improves 5.095%. The synthetic acceptance trajectory differs, so the round
+reduction is not an isolated collective saving. Initial timing reports did
+not retain synthetic token lists. Trace attribution must use actual calls
+and overlap before calibrating the projected saving.
+
+Four 8K inputs do not form a stable C4 cohort with batch budget 512. Both C4
+arms instead use 128 input tokens per request, preserving all model and
+execution settings. The default-ring arm records 37 steady intervals,
+66.413 ms per engine round and 240.918 aggregate tok/s; the matching control
+is pending. Final larger-capacity acceptance and model quality measurements
+remain separate follow-ups.
