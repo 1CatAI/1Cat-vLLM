@@ -141,6 +141,7 @@ def capture(args):
         "contract": "TP4 FP16 dense/KV, FP32 accum/state, disk mmap, no MTP",
         "engine": {k: v for k, v in engine_config.items() if k != "kernel_config"},
         "native_sha256": digest(Path(native.__file__)),
+        "kernel_admissions": llm.collective_rpc("distribution_kernel_admissions"),
         "captures": [],
     }
 

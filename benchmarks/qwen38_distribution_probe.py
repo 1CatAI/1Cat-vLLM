@@ -43,6 +43,9 @@ class DistributionProbeWorkerExtension:
     acceptance is taken from this instrumented run.
     """
 
+    def distribution_kernel_admissions(self):
+        return self.vllm_config.kernel_config.linear_kernel_selections
+
     def configure_distribution_probe(self, requests):
         runner = self.model_runner
         if not hasattr(runner, "req_states") or not hasattr(
