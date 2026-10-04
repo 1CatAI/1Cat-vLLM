@@ -1581,6 +1581,35 @@ def flash_attn_prefill_paged(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    if (
+        not causal
+        and window_size == (2047, 2047)
+        and anchor_lens is None
+        and anchored_window == 0
+        and q.is_cuda
+        and q.dtype == torch.float16
+        and q.ndim == 4
+        and 1 <= q.shape[0] <= 4
+        and q.shape[1:] == (8, 8, 128)
+        and k_cache.dtype == v_cache.dtype == torch.float16
+        and kv_cache_dtype in ("auto", "fp16")
+        and k_cache.ndim == v_cache.ndim == 4
+        and k_cache.shape[1:] == v_cache.shape[1:] == (2048, 2, 128)
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        and torch.cuda.get_device_capability(q.device) == (7, 0)
+        and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
+        and (out is None or out.is_contiguous())
+    ):
+        return flash_attn_v100_cuda.dflash2_paged_bmhd_fwd(
+            q.contiguous(),
+            k_cache,
+            v_cache,
+            out,
+            block_table.contiguous(),
+            seq_lens.contiguous(),
+            softmax_scale,
+        )
+
     out_original = out
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
@@ -1618,6 +1647,13 @@ def flash_attn_prefill_paged(
         int(anchored_window),
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
+
+
+# Advertise the packaged direct-output ABI to the attention backend. Older
+# extension builds keep their existing single-request publication path.
+flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
+    flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
+)
 
 
 def fp8_e4m3_paged_kv_to_fp16(

@@ -5,6 +5,7 @@
 Use an untimed attention-input capture containing raw_qkv, q_weight, k_weight,
 and positions. This benchmark does not replace a complete-layer/model gate.
 """
+
 import argparse
 import json
 import statistics
@@ -44,8 +45,14 @@ def main():
         ops.rms_norm(k, raw[:, 1024:1280].reshape_as(k), kw, 1e-6)
         q, k = rope.forward_cuda(positions, q.view(8, 1024), k.view(8, 256))
         ops.reshape_and_cache_flash(
-            k.view(8, 2, 128), raw[:, 1280:].view(8, 2, 128), kc, vc,
-            slots, "auto", scale, scale,
+            k.view(8, 2, 128),
+            raw[:, 1280:].view(8, 2, 128),
+            kc,
+            vc,
+            slots,
+            "auto",
+            scale,
+            scale,
         )
         return q, k
 
@@ -54,9 +61,22 @@ def main():
         from vllm.model_executor.layers.attention.sm70_dflash2_qk_rope import (
             qk_norm_rope_cache,
         )
-        routes.append(("fused", lambda: qk_norm_rope_cache(
-            raw, qw, kw, positions, rope.cos_sin_cache, kc, vc, slots,
-        )))
+
+        routes.append(
+            (
+                "fused",
+                lambda: qk_norm_rope_cache(
+                    raw,
+                    qw,
+                    kw,
+                    positions,
+                    rope.cos_sin_cache,
+                    kc,
+                    vc,
+                    slots,
+                ),
+            )
+        )
     eviction = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     records = []
     for name, fn in routes:
