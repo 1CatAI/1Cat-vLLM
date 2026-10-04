@@ -19,6 +19,10 @@ def main() -> None:
         raise ValueError("Supply retained two-dimensional FP16 head output.")
     from vllm.model_executor.layers.sm70_compact_topk import compact_half_topk
 
+    if compact_half_topk(logits) is None:
+        raise ValueError(
+            "The supplied logits or installed native extension are unsupported."
+        )
     flush = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     graphs = []
     for name, select in (
