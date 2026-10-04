@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
 from vllm.sm70_profiles.acceleration import loaded_sm70_preparations
@@ -60,6 +61,43 @@ def prepare_on_cpu(layer, monkeypatch, *, native_available=True):
             if native_available:
                 m.setattr(torch.ops._C, name, lambda *args: None, raising=False)
         gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
+
+
+@pytest.mark.parametrize(
+    "reduced,accumulation,reason",
+    [
+        (False, False, "fp16_reduced_precision_reduction_disabled"),
+        (True, True, "fp16_accumulation_enabled"),
+        (True, False, None),
+    ],
+)
+def test_precision_skip_info_once_per_role(reduced, accumulation, reason, monkeypatch):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced
+    torch.backends.cuda.matmul.allow_fp16_accumulation = accumulation
+    # A dedicated logger exercises the real info_once deduplication without
+    # depending on earlier loader tests or an initialized distributed group.
+    logger = init_logger(f"test_mtp_packing_policy.{reduced}.{accumulation}")
+    messages = []
+    monkeypatch.setattr(
+        logger, "info", lambda msg, *args, **kwargs: messages.append(msg % args)
+    )
+    monkeypatch.setattr(gemv, "logger", logger)
+    for role in ("router", "shared"):
+        # Target and draft layers share the process/role precision policy.
+        for _ in range(2):
+            layer = torch.nn.Module()
+            assert gemv._mtp_batch_packing_allowed(layer, role) == (reason is None)
+            assert getattr(layer, f"_sm70_mtp_{role}_batch_reason") == reason
+    expected = (
+        []
+        if reason is None
+        else [
+            f"Skipping SM70 MTP {role} packed weights due to precision policy: "
+            f"{reason}."
+            for role in ("router", "shared")
+        ]
+    )
+    assert messages == expected
 
 
 @pytest.mark.parametrize("role", ["router", "shared"])

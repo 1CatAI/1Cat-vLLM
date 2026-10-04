@@ -558,6 +558,13 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
         reason = "fp16_accumulation_enabled"
     # The loaded-worker report already collects _sm70_*_reason attributes.
     setattr(layer, f"_sm70_mtp_{role}_batch_reason", reason)
+    if reason is not None:
+        logger.info_once(
+            "Skipping SM70 MTP %s packed weights due to precision policy: %s.",
+            role,
+            reason,
+            scope="process",
+        )
     return reason is None
 
 
