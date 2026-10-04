@@ -69,5 +69,36 @@ maximum ≤0.05, top-1 agreement ≥99% and maximum logit difference ≤0.5.
 Validate rejection samples against the dense reference token by token. Check
 fixed prompts against llama.cpp, the fixed quality suite including 128K and
 258K needles, and C4 before promotion. No additional precision reduction is
-authorized. Source checks pass; installed loading, graph, numerical and
-model-speed results remain pending.
+authorized. Source checks pass; GPU loading, graph, numerical and model-speed
+results remain pending.
+
+## Installed loading checks and storage budget
+
+The installed normal wheel passes 45 CPU checks on Python 3.12.14,
+Torch 2.10.0+cu128 and CUDA 12.8. Seven changed modules match the source,
+wheel members and installed files exactly; all sixteen native libraries match
+the qualified normal base wheel. The release profile accepts local GGUF draft
+files. Packed context projections expose their declared operand dtype to
+auxiliary-state conversion without changing the existing runtime transport.
+These are package and CPU checks; they do not establish GPU model quality or
+throughput.
+
+The actual target has 40 mixed gate/up layers and 35 mixed GDN qkv/z layers.
+There are 72 distinct checkpoint role/type/TP4-shape combinations across the
+target and draft. Predicting storage from the current canonical code and
+metadata streams gives:
+
+| Storage | Per-rank bytes |
+| --- | --- |
+| Target checkpoint body excluding embedding/head | 2659536384 |
+| Canonical target projection buffers | 3175956480 |
+| Checkpoint head, one read | 178790400 |
+| Canonical head, one read | 198656000 |
+
+The canonical body estimate is about 19% larger than checkpoint storage.
+Expanded coefficients and index/sign metadata therefore need to be included
+in bandwidth accounting. IQ3_S grows from 0.4296875 to 0.5 bytes per weight;
+IQ2_XS grows from 0.2890625 to 0.5. These are CPU format predictions for
+aligned projections, excluding norms, codebook loads, inputs/outputs and
+workspace traffic. Verify them against the loaded GPU buffers before using
+them in a bandwidth or complete-round speed claim.
