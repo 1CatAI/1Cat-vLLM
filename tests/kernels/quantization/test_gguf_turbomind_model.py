@@ -272,3 +272,61 @@ def test_coalesced_shape_prefill_capability_oracle_and_graph(weight_type, n, min
         captured = projection(x)
     graph.replay()
     torch.testing.assert_close(captured, actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("weight_type", [12, 21])
+def test_compile_preserves_runtime_prefill_dispatch(weight_type, monkeypatch):
+    """A graph first traced at prefill M must keep decode's fused route."""
+    torch._dynamo.reset()
+    if weight_type == 12:
+        # The shared affine fixture fixes Q4_K K=768 for its CPU tests.
+        # Tile ten pairs of complete blocks to obtain this calibrated K=5120 shape.
+        data = np.tile(source(weight_type, n=4352)[:, : 2 * 144], (1, 10))
+    else:
+        data = source(weight_type, n=4352, k=5120)
+    projection = GGUFPreparedProjection(
+        torch.from_numpy(data).cuda(), weight_type, torch.float16, True, 8
+    )
+    family = "affine" if weight_type == 12 else "lattice"
+    fused_name = f"gguf_{family}_gemm_sm70_out"
+    blas_name = f"gguf_{family}_blas_sm70_out"
+    fused = getattr(torch.ops._C, fused_name)
+    blas = getattr(torch.ops._C, blas_name)
+    calls = {"fused": 0, "blas": 0}
+
+    def count_fused(*args, **kwargs):
+        calls["fused"] += 1
+        return fused(*args, **kwargs)
+
+    def count_blas(*args, **kwargs):
+        calls["blas"] += 1
+        return blas(*args, **kwargs)
+
+    monkeypatch.setattr(torch.ops._C, fused_name, count_fused)
+    monkeypatch.setattr(torch.ops._C, blas_name, count_blas)
+    graphs = []
+
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(projection, backend=backend, dynamic=True, fullgraph=True)
+    for m in (512, 8, 16, 512):
+        x = torch.randn((m, 5120), device="cuda", dtype=torch.float16)
+        torch._dynamo.mark_dynamic(x, 0, min=2, max=8192)
+        before = calls.copy()
+        result = compiled(x)
+        selected = "blas" if m >= 512 else "fused"
+        assert calls[selected] == before[selected] + 1
+        other = "fused" if selected == "blas" else "blas"
+        assert calls[other] == before[other]
+        torch.testing.assert_close(result, projection(x), rtol=0, atol=0)
+    assert len(graphs) == 1
+    assert any(
+        node.target
+        in (
+            torch.ops.vllm.prepared_gguf_projection,
+            torch.ops.vllm.prepared_gguf_projection.default,
+        )
+        for node in graphs[0].graph.nodes
+    )

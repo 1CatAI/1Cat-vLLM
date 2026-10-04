@@ -315,3 +315,37 @@ an opaque operator; shared scratch is resolved internally from its prepared
 workspace. CPU tests verify branch selection and a single dynamic graph across
 M=512/8/16. GPU route, accuracy and timing checks remain pending; no speedup is
 claimed and the installed model wheel remains unchanged.
+
+## Runtime projection dispatch validation
+
+The corrected dispatcher is an opaque projection operator. It consumes the
+existing family decoder descriptor and admitted M bands, checks actual M at
+execution, and resolves the previously prepared shared BLAS workspace inside
+the operator. This keeps prefill shape comparisons and aliased scratch views
+outside Dynamo tracing. Canonical weights, activation/storage dtypes, and
+FP32 accumulation policies are unchanged.
+
+Two CPU dispatch/graph tests pass. Eighteen focused SM70 GPU checks pass,
+covering all thirteen canonical source formats in the prepared projection
+suite, mixed projection coalescing, changed-M selection and graph replay.
+The affine regression uses a corrected Q4_K fixture with K=5120; its original
+shared helper fixed K=768, which produced a descriptor mismatch.
+
+A segment uses three real rank-0 TP4 weights: IQ3_S gate (4352×5120), IQ3_S
+down (5120×4352) and Q4_K gate (4352×5120). It compiles with Inductor first at
+M=512, then executes M=8 and M=16 with zero difference from eager. At M=8,
+the complete segment costs 98.928 us in a cold-L2 repeated-call CUDA graph.
+The three canonical streams total 36,208,640 bytes, or about 366 GB/s of
+effective weight-footprint throughput; physical DRAM traffic is not measured.
+Nsight Systems captures eighteen calls of each projection. There are no
+lattice/affine dequantization, cuBLAS s884gemm/CUTLASS, or large Triton
+workspace-copy kernels in the M=8 segment. Only the three TurboMind projection
+kernels and explicit benchmark fill operations appear.
+
+The original full-round trace attributes approximately 13 ms to the fixed
+prefill branches, their matrix products and workspace copies. Removing those
+paths is expected to save roughly 11 ms per round before subsequent kernel
+work. This is a prediction, not an end-to-end result. Full-model C1 1K/8K and
+C4 checks follow integration; the next full trace follows the shared dense
+GDN a/b loading fix. Independent IQ3_S, Q8_0 and tiny-dense kernel prototypes
+are stopped in favor of the shared GGUF kernel and loading work.
