@@ -1332,3 +1332,10 @@ and 67,174,400 bytes per 512-expert projection, exactly the original TP payload.
 full-graph comparison, automatic weight-bank sizing, original-byte budget,
 official numerical oracle and per-route times. Routing sorting and the complete
 MoE layer must be measured after model integration before claiming step savings.
+
+The committed grouped benchmark CLI is also exercised on the complete IQ2_S
+E512/top-10/TP4 C8 shape. It selects ten banks automatically, passes the same
+numerical oracle (relative L2 0.0002036) and measures 65.684 us raw versus
+94.024 us canonical with 20 replays. Earlier 50-replay raw timing is 57.563 us;
+that cross-process variation is retained rather than hidden. Both comparisons
+improve over their matched canonical controls.
