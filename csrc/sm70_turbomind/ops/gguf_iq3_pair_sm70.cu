@@ -31,7 +31,7 @@ __device__ uint2 direct_packet(const uint8_t* tile, int width, int octet,
 }
 
 template <int SplitK, bool TwoChains, bool FullActivation = false,
-          int CacheHint = 1>
+          int CacheHint = 1, bool ExactM8 = false>
 __global__ void iq3_pair_kernel(half* __restrict__ output,
                                 const half* __restrict__ input,
                                 const uint8_t* __restrict__ gate,
@@ -90,7 +90,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
   uint4 current_a0 = make_uint4(0, 0, 0, 0),
         current_a1 = make_uint4(0, 0, 0, 0);
   if constexpr (FullActivation) {
-    if (row < m) {
+    if (ExactM8 || row < m) {
       const half* src = input + size_t{row} * k + group_begin * 16;
       current_a0 = *reinterpret_cast<const uint4*>(src);
       current_a1 = *reinterpret_cast<const uint4*>(src + 8);
@@ -118,7 +118,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
         next1 = direct_packet<CacheHint>(next_tile, 32,
                                          ((group + 1) % 16) * 2 + 1, col);
         if constexpr (FullActivation) {
-          if (row < m) {
+          if (ExactM8 || row < m) {
             const half* src = input + size_t{row} * k + (group + 1) * 16;
             next_a0 = *reinterpret_cast<const uint4*>(src);
             next_a1 = *reinterpret_cast<const uint4*>(src + 8);
@@ -145,7 +145,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           input01 = current_a0;
           input23 = current_a1;
         } else {
-          if (input_row_idx < m) {
+          if (ExactM8 || input_row_idx < m) {
             const half* input_row = input + size_t{input_row_idx} * k;
             input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
             input23 =
@@ -183,7 +183,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
         next1 = direct_packet<CacheHint>(next_tile, 32,
                                          ((group + 1) % 16) * 2 + 1, col);
         if constexpr (FullActivation) {
-          if (row < m) {
+          if (ExactM8 || row < m) {
             const half* src = input + size_t{row} * k + (group + 1) * 16;
             next_a0 = *reinterpret_cast<const uint4*>(src);
             next_a1 = *reinterpret_cast<const uint4*>(src + 8);
@@ -210,7 +210,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           input01 = current_a0;
           input23 = current_a1;
         } else {
-          if (input_row_idx < m) {
+          if (ExactM8 || input_row_idx < m) {
             const half* input_row = input + size_t{input_row_idx} * k;
             input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
             input23 =
@@ -248,7 +248,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
         next1 = direct_packet<CacheHint>(next_tile, 32,
                                          ((group + 1) % 16) * 2 + 1, col);
         if constexpr (FullActivation) {
-          if (row < m) {
+          if (ExactM8 || row < m) {
             const half* src = input + size_t{row} * k + (group + 1) * 16;
             next_a0 = *reinterpret_cast<const uint4*>(src);
             next_a1 = *reinterpret_cast<const uint4*>(src + 8);
@@ -275,7 +275,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           input01 = current_a0;
           input23 = current_a1;
         } else {
-          if (input_row_idx < m) {
+          if (ExactM8 || input_row_idx < m) {
             const half* input_row = input + size_t{input_row_idx} * k;
             input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
             input23 =
@@ -313,7 +313,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
         next1 = direct_packet<CacheHint>(next_tile, 32,
                                          ((group + 1) % 16) * 2 + 1, col);
         if constexpr (FullActivation) {
-          if (row < m) {
+          if (ExactM8 || row < m) {
             const half* src = input + size_t{row} * k + (group + 1) * 16;
             next_a0 = *reinterpret_cast<const uint4*>(src);
             next_a1 = *reinterpret_cast<const uint4*>(src + 8);
@@ -340,7 +340,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           input01 = current_a0;
           input23 = current_a1;
         } else {
-          if (input_row_idx < m) {
+          if (ExactM8 || input_row_idx < m) {
             const half* input_row = input + size_t{input_row_idx} * k;
             input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
             input23 =
@@ -423,7 +423,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     } else {
       const int output_row = element >> 5;
       const int output_col = element & 31;
-      if (output_row < m) {
+      if (ExactM8 || output_row < m) {
         const float g = __half2float(__float2half(gate));
         const half silu = __float2half(g / (1.f + expf(-g)));
         output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
@@ -479,7 +479,13 @@ void k64_chunks_gguf_iq3_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   const auto stream = at::cuda::getCurrentCUDAStream();
   TORCH_CHECK(split == 8 && k % 512 == 0 && partitions == 1,
               "K64 probe uses split8/streaming loads");
-  if (staged)
+  // Select the row specialization from the actual input shape.
+  if (staged && m == 8)
+    iq3_pair_kernel<8, false, true, 1, true><<<dim3(n / 32), 512, 0, stream>>>(
+        (half*)out.data_ptr(), (const half*)input.data_ptr(),
+        gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), n, k, m,
+        scratch.data_ptr<float>(), counters.data_ptr<int>(), 1);
+  else if (staged)
     iq3_pair_kernel<8, false, true, 1><<<dim3(n / 32), 512, 0, stream>>>(
         (half*)out.data_ptr(), (const half*)input.data_ptr(),
         gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), n, k, m,

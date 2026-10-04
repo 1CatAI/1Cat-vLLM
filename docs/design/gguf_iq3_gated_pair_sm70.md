@@ -314,3 +314,36 @@ achieved occupancy. Long-scoreboard samples cluster at scale extraction
 These sample counts are instruction attribution, not elapsed-time shares.
 The next isolated step removes unnecessary row masks in an M=8-only
 candidate before considering metadata prefetch within the register budget.
+
+An M=8-only row specialization removes masked activation loads and output
+checks, narrowing admission to exactly eight rows. It rejects M=7 before
+launch. Full-activation registers fall from 64 to 56 without spills; outputs
+remain bitwise equal. At SM 1290 MHz, matched timing improves from 67.584
+to 65.536 us. This does not satisfy the 30 us gate.
+
+One-block-ahead original metadata uses 60 registers on that single-chain
+specialization, without spills. It is bitwise equivalent but measures
+67.584 us versus its matched current-metadata control 66.560 us. Reject
+metadata lookahead in this form. Its two-chain version uses 67 registers
+and is skipped because it crosses the established occupancy boundary.
+
+Byte-domain sign restoration is exhaustively checked on all IQ3_S and
+IQ2_S codebook entries and all 16 four-byte sign patterns. Real weights of
+both types match official dequantization bitwise in FP32 and FP16. The
+best M8 single-chain pair still measures 65.536 us, equal to its control;
+registers fall to 48 without spills. No shared decoder API is promoted on
+this standalone timing result.
+
+A pipeline with raw packets two segments ahead and decoded operands one
+segment ahead initially uses 78 registers with activation prefetch, so it
+is not measured. Without activation prefetch, a single-chain variant uses
+66 registers. A two-CTA launch bound lowers that variant to 64 registers
+without spills; its activation-prefetch counterpart spills and is skipped.
+The bounded variant is bitwise equivalent but measures the same 66.560 us
+as its matched raw-lookahead control. Reject this pipeline.
+
+The retained owned source now dispatches an unmasked row specialization
+only for actual M=8, preserving masked loads for M1–7. A fresh build of the
+owned source passes eager and three graph replays at M1/2/4/7/8, with
+bitwise equality to the original shared-coefficient pair. Its M8 cold graph
+median is 65.536 us. It remains research-only, without model dispatch.
