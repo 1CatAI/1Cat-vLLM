@@ -147,6 +147,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     _validate_dflash_shared_weights(dflash_model, shared_embed, shared_lm_head)
 
+    if shared_lm_head and hasattr(dflash_model.model, "candidate_selector"):
+        from vllm.model_executor.layers.sm70_dflash2_draft_vocab import (
+            maybe_prepare_draft_vocab,
+        )
+
+        maybe_prepare_draft_vocab(dflash_model, vllm_config)
+
     # Keep only the precision the loaded drafter consumes. This affects the
     # auxiliary snapshots, never the target model's hidden/residual tensors.
     # Other drafters retain their existing auxiliary-state contract.
