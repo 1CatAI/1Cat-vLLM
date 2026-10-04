@@ -109,3 +109,11 @@ The earlier Q4_1 conversion is lossless and its generation results remain
 valid reference evidence. Its larger storage and load-time measurements do
 not characterize the final u2 route. Both measurement attempts stopped before
 producing timing data are retained.
+
+Sample all 30 real Q2_0 expert down projections at eight distinct expert IDs
+per projection and 16 rows per expert: 2,457,600 reconstructed weights. The
+canonical representation uses u2/group32. Maximum absolute difference is zero
+against both official Q2_0 decoding and the previous lossless Q4_1 transcode.
+All sampled values are finite. This confirms coefficient/value preservation
+on the sampled checkpoint rows; full-model accumulation and distributions
+are measured separately.
