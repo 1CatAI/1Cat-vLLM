@@ -21,6 +21,19 @@ def test_cpu_route_handles_repeated_experts_and_empty_intervals():
     torch.testing.assert_close(routed[inverse.long()], x.repeat_interleave(2, 0))
 
 
+def test_unroute_cpu_fallback_preserves_fp32_weighted_sum():
+    torch.manual_seed(20261004)
+    down = torch.randn(6, 4).half()
+    inverse = torch.tensor([3, 0, 2, 4, 1, 5], dtype=torch.int32)
+    weights = torch.randn(3, 2)
+    reference = (
+        (down[inverse.long()].view(3, 2, 4).float() * weights[:, :, None]).sum(1).half()
+    )
+    torch.testing.assert_close(
+        _small_unroute(down, inverse, weights), reference, rtol=0, atol=0
+    )
+
+
 def test_route_compilation_keeps_dynamic_m_opaque():
     import vllm.model_executor.layers.fused_moe.sm70_small_routing  # noqa: F401
 

@@ -6,9 +6,12 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -119,7 +122,7 @@ def _small_route(
     m, top_k = ids.shape
     r, h = m * top_k, x.shape[1]
     if SM70_SMALL_ROUTING.reason(x, ids, experts) is not None:
-        sorted_ids, order = ids.reshape(-1).sort(stable=True)
+        sorted_ids, order = ids.reshape(-1).long().sort()
         boundaries = torch.arange(experts + 1, device=x.device)
         offsets = torch.searchsorted(sorted_ids, boundaries).to(torch.int32)
         routed = x[order // top_k].contiguous()
@@ -144,6 +147,7 @@ def _small_route(
         256,
         num_warps=4,
     )
+    logger.info_once("SM70 fused expert alignment/gather enabled for M=%d.", m)
     return routed, offsets, sorted_ids, inverse
 
 
@@ -162,6 +166,19 @@ def _small_unroute(
 ) -> torch.Tensor:
     m, top_k = weights.shape
     h = down.shape[1]
+    if not (
+        down.is_cuda
+        and current_platform.is_device_capability(70)
+        and down.dtype == torch.float16
+        and 1 <= m <= 32
+        and h == 2560
+        and 1 <= top_k <= 16
+        and down.is_contiguous()
+        and inverse.is_contiguous()
+        and weights.is_contiguous()
+    ):
+        restored = down[inverse.long()].view(m, top_k, h)
+        return (restored.float() * weights[..., None].float()).sum(1).to(down.dtype)
     out = down.new_empty((m, h))
     _unroute_weighted_sum[(triton.cdiv(m * h, 256),)](
         down,
