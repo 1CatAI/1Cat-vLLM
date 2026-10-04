@@ -83,12 +83,11 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
   }
 }
 
-template <int Type, bool Split, bool Prefetch = false, bool FactorScale = false,
-          int Replicas = 1>
+template <int Type, bool Split, bool Prefetch = false, bool FactorScale = false>
 __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int n, int k, int stride,
                                int splits) {
-  using Decode = vllm::sm70_gguf::LatticeRawDecoder<Type, Replicas>;
+  using Decode = vllm::sm70_gguf::LatticeRawDecoder<Type>;
   __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
   __shared__ __align__(16) uint8_t raw[4][120];
   Decode::initialize(grid);
@@ -748,8 +747,7 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch, bool factor_scale,
-                                   int64_t codebook_replicas) {
+                                   bool prefetch, bool factor_scale) {
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() &&
                   input.scalar_type() == torch::kFloat16 &&
@@ -757,9 +755,6 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                   input.size(0) == 1 && out.dim() == 2 && out.size(0) == 1 &&
                   input.is_contiguous() && out.is_contiguous(),
               "Raw GGUF vector requires FP16 M=1");
-  TORCH_CHECK(
-      codebook_replicas == 1 || (source_type == 21 && codebook_replicas == 4),
-      "Raw GGUF codebook replicas require IQ3_S and four copies");
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
   validate_raw(weight, source_type, n, k);
@@ -772,45 +767,34 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                 "Raw GGUF split-K requires FP32 partial storage");
   const dim3 grid((n + 3) / 4, splits);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define RAW_VEC(TYPE, PREFETCH, FACTOR, REPLICAS)                      \
-  if (splits == 1)                                                     \
-    raw_vec_kernel<TYPE, false, PREFETCH, FACTOR, REPLICAS>            \
-        <<<grid, 128, 0, stream>>>(                                    \
-            reinterpret_cast<half*>(out.data_ptr()), nullptr,          \
-            reinterpret_cast<const half*>(input.data_ptr()),           \
-            weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits); \
-  else                                                                 \
-    raw_vec_kernel<TYPE, true, PREFETCH, FACTOR, REPLICAS>             \
-        <<<grid, 128, 0, stream>>>(                                    \
-            reinterpret_cast<half*>(out.data_ptr()),                   \
-            partial.data_ptr<float>(),                                 \
-            reinterpret_cast<const half*>(input.data_ptr()),           \
-            weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
-#define SELECT_RAW_VEC(TYPE, FACTOR, REPLICAS) \
-  if (prefetch) {                              \
-    RAW_VEC(TYPE, true, FACTOR, REPLICAS);     \
-  } else {                                     \
-    RAW_VEC(TYPE, false, FACTOR, REPLICAS);    \
+#define RAW_VEC(TYPE, PREFETCH, FACTOR)                                      \
+  if (splits == 1)                                                           \
+    raw_vec_kernel<TYPE, false, PREFETCH, FACTOR><<<grid, 128, 0, stream>>>( \
+        reinterpret_cast<half*>(out.data_ptr()), nullptr,                    \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits);           \
+  else                                                                       \
+    raw_vec_kernel<TYPE, true, PREFETCH, FACTOR><<<grid, 128, 0, stream>>>(  \
+        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),  \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
+#define SELECT_RAW_VEC(TYPE, FACTOR) \
+  if (prefetch) {                    \
+    RAW_VEC(TYPE, true, FACTOR);     \
+  } else {                           \
+    RAW_VEC(TYPE, false, FACTOR);    \
   }
   if (source_type == 21) {
     if (factor_scale) {
-      if (codebook_replicas == 4) {
-        SELECT_RAW_VEC(21, true, 4);
-      } else {
-        SELECT_RAW_VEC(21, true, 1);
-      }
+      SELECT_RAW_VEC(21, true);
     } else {
-      if (codebook_replicas == 4) {
-        SELECT_RAW_VEC(21, false, 4);
-      } else {
-        SELECT_RAW_VEC(21, false, 1);
-      }
+      SELECT_RAW_VEC(21, false);
     }
   } else {
     if (factor_scale) {
-      SELECT_RAW_VEC(22, true, 1);
+      SELECT_RAW_VEC(22, true);
     } else {
-      SELECT_RAW_VEC(22, false, 1);
+      SELECT_RAW_VEC(22, false);
     }
   }
 #undef SELECT_RAW_VEC

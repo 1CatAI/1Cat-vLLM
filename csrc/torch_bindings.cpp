@@ -262,8 +262,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "gguf_lattice_raw_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
-      "prefetch=False, bool factor_scale=False, int codebook_replicas=1) -> "
-      "()");
+      "prefetch=False, bool factor_scale=False) -> ()");
   ops.impl("gguf_lattice_raw_vec_sm70_out", torch::kCUDA,
            &gguf_lattice_raw_vec_sm70_out);
   ops.def(

@@ -1272,3 +1272,11 @@ The next dense-vector candidate interleaves four copies of the IQ3_S byte
 codebook across shared-memory banks. It changes only CTA-local lookup layout;
 original payload, scale reconstruction, FP32 FMA, and persistent storage stay
 unchanged. The single-copy schedule remains available for comparison.
+
+Four-way interleaved IQ3_S vector codebooks pass 48 focused checks but regress
+dense gate/down to 34.571/33.366 us against the same-run single-copy
+32.683/30.844 us. Non-prefetched variants regress too. The four-copy candidate
+is removed; existing raw vector schedules and storage remain unchanged. The
+canonical controls in this comparison are 33.926/31.370 us; earlier paired
+measurements still show process/tactic variability, so M1 is not declared
+unconditionally closed from this one run.
