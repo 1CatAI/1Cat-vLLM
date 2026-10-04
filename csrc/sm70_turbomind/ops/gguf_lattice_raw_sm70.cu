@@ -1225,9 +1225,10 @@ void gguf_lattice_compact_blas_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor scratch, bool natural_layout,
     int64_t algorithm, int64_t dq_partitions, bool shared_metadata) {
-  TORCH_CHECK(
-      algorithm == 99 || algorithm == 102,
-      "Compact GGUF BLAS accepts only default or calibrated algorithm 2");
+  TORCH_CHECK(algorithm == 99 || algorithm == 102 ||
+                  (algorithm == 111 && out.scalar_type() == torch::kFloat32),
+              "Compact GGUF BLAS requires default/algorithm 2, or FP32 output "
+              "for algorithm 11");
   TORCH_CHECK(dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4,
               "Compact GGUF DQ partitions must be 1, 2 or 4");
   TORCH_CHECK(!natural_layout || dq_partitions == 1,

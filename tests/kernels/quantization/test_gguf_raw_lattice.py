@@ -746,3 +746,58 @@ def test_compact_blas_cooperative_original_metadata_graph(kind, dtype):
     x[:, k // 2 :] = -1024
     graph.replay()
     torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_blas_algorithm11_requires_float_output_and_graph(kind, cancellation):
+    n, k, m = (1536, 2560, 512) if cancellation else (160, 768, 512)
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        data.fill(0)
+        data.reshape(n, k // 256, -1)[:, :, :2] = np.array([2.0], dtype="<f2").view(
+            np.uint8
+        )
+    source = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    result = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(result, dtype=torch.float16)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(1024)
+        x[:, k // 2 :] = -1024
+    with pytest.raises(RuntimeError, match="FP32 output"):
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+            out, x, weight, kind, scratch, False, 111, 2, True
+        )
+
+    def run():
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+            result, x, weight, kind, scratch, False, 111, 2, True
+        )
+        out.copy_(result)
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.neg_() if cancellation else x.copy_(torch.randn_like(x))
+    graph.replay()
+    if cancellation:
+        torch.testing.assert_close(result, torch.zeros_like(result), rtol=0, atol=0)
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+    else:
+        expected = (
+            torch.from_numpy(
+                gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+            )
+            .cuda()
+            .half()
+        )
+        torch.testing.assert_close(
+            result, x.float() @ expected.float().T, rtol=5e-5, atol=0.001
+        )
+        torch.testing.assert_close(out, result.half(), rtol=0, atol=0)

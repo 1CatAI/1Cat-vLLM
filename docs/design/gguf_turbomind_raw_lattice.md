@@ -1411,3 +1411,11 @@ separate from the accepted IQ3_S/IQ2_S storage layouts.
 
 The complete real-weight FP32 GEMM algorithm check times out before acquiring
 the shared GPU lock; it provides no new algorithm performance evidence.
+
+The real-weight FP32 GEMM algorithm probe completes after retry. Seventeen
+standard cuBLAS algorithms pass exact cancellation with FP32 results when
+positive/negative partials exceed FP16 range. On actual Flash gate TP4 weights,
+algorithm 11 GEMM plus final FP16 cast is 78.982 us versus 80.347 us default
+(eight-bank full graphs); dequantization is excluded. Algorithm 11 is admitted
+only with FP32 output, with a native rejection for FP16 output and installed
+changed-input/overflow regressions. The complete-path speed gate is pending.
