@@ -13,6 +13,7 @@ import statistics
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
 from benchmarks.kernels.benchmark_sm70_gdn_input_batch import checkpoint_weights
 from benchmarks.kernels.benchmark_sm70_mtp_fp32_dense import capture, elapsed
@@ -22,7 +23,18 @@ from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import _pack_gdn_input_weight
 
 
 def screen(model, role, rank, rows):
-    if role == "output":
+    if role == "head":
+        index = json.loads((model / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        name = next(n for n in index if n.endswith("lm_head.weight"))
+        with safe_open(model / index[name], framework="pt") as f:
+            view = f.get_slice(name)
+            size = view.get_shape()[0] // 4
+            assert view.get_shape()[0] % 4 == 0
+            ws = [view[rank * size : (rank + 1) * size].half().cuda().contiguous()]
+        names, bas, native = [name], [], []
+    elif role == "output":
         names, ws = weights(model, role, rank)
         bas = []
         native = []
@@ -57,7 +69,9 @@ def screen(model, role, rank, rows):
 
     def control():
         for i, (x, w) in enumerate(zip(xs, ws)):
-            if role == "output":
+            if role == "head":
+                torch.mm(x, w.t(), out=output[0][i])
+            elif role == "output":
                 torch.ops._C.qwen38_dense_batch_sm70_out(output[0][i], x, w)
             else:
                 pq, pb = native[i]
@@ -65,7 +79,7 @@ def screen(model, role, rank, rows):
 
     def candidate():
         for i, (x, (codes, scales)) in enumerate(zip(xs, quantized)):
-            if role == "output":
+            if not bas:
                 sm70_ops.fp8_qpn8_gemm_sm70_out(
                     output[1][i], x, codes, scales, 12, 2, True, False
                 )
@@ -134,9 +148,11 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--rank", type=int, choices=range(4), default=0)
-    parser.add_argument("--rows", type=int, choices=range(2, 9), default=5)
-    parser.add_argument("--role", choices=("gdn", "output"), action="append")
+    parser.add_argument("--rows", type=int, choices=range(1, 9), default=5)
+    parser.add_argument("--role", choices=("gdn", "output", "head"), action="append")
     args = parser.parse_args()
+    if args.rows == 1 and args.role != ["head"]:
+        parser.error("M1 qualification is restricted to the draft head")
     torch.set_num_threads(1)
     torch.manual_seed(20261005 + args.rank)
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
