@@ -211,3 +211,55 @@ The 8192-token loading probe rejects the grouped verifier capability because
 its minimum model length is 32768. Short graph baselines use max length 32768;
 the final comparison remains 262144. FP16 activation/KV and FP32 SSM state
 remain the same.
+
+## Preliminary graph and operator measurements
+
+The first unprofiled TP4 graph run uses FP16 activation/KV, FP32 SSM,
+max length 32768, batch budget 1024, one sequence, memory utilization 0.9,
+seven draft tokens, temperature 0.7, seed 123 and no thinking or prefix cache.
+Both target and draft graphs capture successfully; the graph pool is about
+0.55 GiB per rank.
+
+| Actual input tokens | Output tokens | Draft rounds | Accepted drafts | Mean tokens/round | Mean full round ms | Median full round ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 916 | 128 | 32 | 95 | 3.96875 | 46.9065 | 46.5396 |
+| 7242 | 128 | 30 | 98 | 4.26667 | 47.4787 | 47.0882 |
+
+These are engine-core output timestamp intervals, including scheduling and
+communication, with prefill excluded. GPU trace attribution and dense-reference
+branch counts remain required. Re-encoding repeated decoded text merged BPE
+boundaries, so this run does not meet the exact 1024/8192 input contract.
+The corrected producer inserts token IDs between the embedded chat prefix and
+suffix; CPU checks with the actual tokenizer verify exactly 1024/8192 tokens
+and preserve the thinking-disabled assistant suffix.
+
+Independent CUDA extensions preserve FP16 weight reconstruction and FP32 MMA
+accumulation. Probes use actual checkpoint rank-0 TP4 slices and M=1/2/4/8/16.
+The reference is official FP32 GGUF dequantization plus FP32 cuBLAS. Each graph
+has twelve repeated calls with a 16 MiB L2 flush before each call; the median
+covers seven replays. Timing events use external record nodes. Internal graph
+events did not provide timestamps, invalidating the first timer attempt;
+those failed measurements are excluded.
+
+| Tensor and local N/K | Canonical M8 us | Best research M8 us | Raw model head M8 us |
+| --- | ---: | ---: | ---: |
+| IQ3_S gate, 4352/5120 | 37.376 | 48.128 | — |
+| IQ3_S down, 5120/4352 | 35.840 | 44.032 | — |
+| Q4_K head, 62080/5120 | 273.408 | 295.936 | 620.032 |
+| Q8_0 context FC, 1280/25600 | 75.776 | 156.672 | — |
+
+The lattice samples use blk.5.ffn_gate.weight and blk.1.ffn_down.weight.
+Their canonical streams are 11141120 bytes each; head streams are 198656000
+bytes and context FC streams are 36864000 bytes. Research relative L2 errors
+are about 0.00036 for lattice, 0.00072 for head and 0.00030 for FC. These
+validate only operator reconstruction/accumulation, not model distribution.
+Normal/raw head reference errors still need a focused comparison.
+
+The first research kernels lose to the existing canonical paths and are not
+promoted. Their intrablock split increases warps, not CTA count; FC has only
+40 CTAs. Hardware counters must distinguish occupancy, loads and decoding
+before the next kernel change. Canonical head saves about 347 us per M8 call
+against the current raw GGUF head. M1 differs: canonical 340.992 us versus raw
+243.712 us. Routing must therefore be measured by M range. Footprint/elapsed
+bandwidth is useful effective throughput, not measured DRAM traffic. Calls
+per complete round and model-level savings remain unverified.
