@@ -48,4 +48,21 @@ The core extension is unchanged. The corrected normal FA2 fingerprint is
 the whole-wheel fingerprint is
 `c1c3a5fc063ec70280761a80e4a5f43068ec81b7c32637c7c1edbd306c108411`.
 Its dependencies resolve to the declared Torch/CUDA/cuBLAS libraries.
-Model concurrency, 8K/32K prefill and the four frozen needle cases are running.
+Matched Qwen3.8-27B NVFP4 model measurements retain all four natural greedy
+sequences and EOS. TP4, FP16 activation/KV, no MTP, full/piecewise graphs,
+I1024/O128, two repeats, max length 33024, batch 8192 and 16 sequence slots:
+
+| Measurement | Previous | Corrected |
+|---|---:|---:|
+| C1 pure decode tok/s | 66.75 | 65.55 |
+| C4 pure decode tok/s | 251.26 | 249.03 |
+| C8 pure decode tok/s | 470.88 | 471.15 |
+| C16 pure decode tok/s | 830.51 | 831.07 |
+| 8K prefill seconds | 2.509 | 2.467 |
+| 32K prefill seconds | 10.471 | 10.411 |
+
+Prefill reports engine prefill time separately from wall/queue/decode. The
+decode differences are within 1.8%; prefill does not regress. This is a
+matched model measurement, not a claim based on kernel service-time sums.
+The four frozen needle quality cases are still running with the original
+prompts, seeds, sampling, natural EOS and 262144-token model limit.
