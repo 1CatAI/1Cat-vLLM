@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--concurrent-input-len", type=int)
     parser.add_argument("--output-len", type=int, default=128)
+    parser.add_argument("--concurrent-output-len", type=int)
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--prefill", type=int, nargs="*", default=[8192, 32768])
     parser.add_argument("--repeats", type=int, default=2)
@@ -72,6 +73,7 @@ def main():
         or args.output_len < 64
         or args.input_len < 1
         or (args.concurrent_input_len is not None and args.concurrent_input_len < 1)
+        or (args.concurrent_output_len is not None and args.concurrent_output_len < 64)
         or args.repeats < 1
     ):
         raise ValueError("Invalid fixed-width timing workload")
@@ -81,9 +83,20 @@ def main():
     maximum_input = max(
         [args.input_len, args.concurrent_input_len or args.input_len, *args.prefill]
     )
-    model_len = args.max_model_len or maximum_input + args.output_len + 128
+    maximum_output = max(args.output_len, args.concurrent_output_len or args.output_len)
+    model_len = args.max_model_len or maximum_input + maximum_output + 128
     max_seqs = args.max_seqs or max(args.widths)
-    if model_len < maximum_input + args.output_len or max_seqs < max(args.widths):
+    required_length = max(
+        [
+            (args.concurrent_input_len or args.input_len)
+            + (args.concurrent_output_len or args.output_len)
+            if width > 1
+            else args.input_len + args.output_len
+            for width in args.widths
+        ]
+        + [length + 1 for length in args.prefill]
+    )
+    if model_len < required_length or max_seqs < max(args.widths):
         raise ValueError("Model limits cannot contain the requested cohort")
     config = dict(
         model=str(args.model),
@@ -134,6 +147,7 @@ def main():
             "input_len": args.input_len,
             "concurrent_input_len": args.concurrent_input_len or args.input_len,
             "output_len": args.output_len,
+            "concurrent_output_len": args.concurrent_output_len or args.output_len,
             "synthetic": True,
             "ignore_eos": True,
             "temperature": args.temperature,
@@ -243,17 +257,22 @@ def main():
             )
             return {"prompt_token_ids": (piece * (length // len(piece) + 1))[:length]}
 
-        sampling = SamplingParams(
-            temperature=args.temperature,
-            seed=4201,
-            max_tokens=args.output_len,
-            ignore_eos=True,
-        )
         for width in args.widths:
             length = (
                 args.concurrent_input_len
                 if width > 1 and args.concurrent_input_len
                 else args.input_len
+            )
+            output_length = (
+                args.concurrent_output_len
+                if width > 1 and args.concurrent_output_len
+                else args.output_len
+            )
+            sampling = SamplingParams(
+                temperature=args.temperature,
+                seed=4201,
+                max_tokens=output_length,
+                ignore_eos=True,
             )
             cohort = [fixed_prompt(length, i) for i in range(width)]
             generate_cohort(llm, cohort, sampling, atomic=True)
@@ -300,7 +319,7 @@ def main():
                         torch.accelerator.synchronize()
                         torch.cuda.cudart().cudaProfilerStop()
                     client.get_output = original
-                if any(len(o.outputs[0].token_ids) != args.output_len for o in outputs):
+                if any(len(o.outputs[0].token_ids) != output_length for o in outputs):
                     raise RuntimeError("Incomplete synthetic timing request")
                 summary = summarize(records, width)
                 spec_decoding = _spec_decoding_delta(before, _metric_snapshot(llm))
@@ -308,6 +327,7 @@ def main():
                     {
                         "repeat": repeat,
                         "input_len": length,
+                        "output_len": output_length,
                         **summary,
                         "raw_steps": records,
                         "spec_decoding": spec_decoding,
