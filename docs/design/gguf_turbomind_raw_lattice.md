@@ -274,3 +274,52 @@ weight imply about 38,031,360 fewer weight bytes per rank, including dense
 projections. This conditional estimate does not measure expert reuse,
 collective overlap or end-to-end latency. Grouped and model measurements
 are required before reporting a step speedup.
+
+## Register prefetch measurements
+
+Source `25573bc57d`, core SHA256
+`e1cb495a03b29fdeffd6725ce0d8cc18810ea2de90d25a59ba79c308f3118f3c`,
+whole-wheel SHA256
+`3a1b2a1442d90e71615365bf21f31951c2d77f5ef58b4ffac38a78ba5fa2d803`.
+All 20 focused checks pass again (6.40 s), including both prefetch choices,
+N tails, split-K and changed-input graph replay. The matched six-shape graph
+sweep below keeps the earlier cache/bank contract.
+
+| Projection | M | Canonical µs | Best equal-byte µs | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 1 | 31.857 | 38.672 | compact_row_vec_split1 |
+| 27B gate | 5 | 33.151 | 46.412 | compact_mma_prefetch_split3 |
+| 27B gate | 8 | 33.191 | 47.525 | compact_mma_prefetch_split3 |
+| 27B gate | 16 | 39.612 | 63.935 | compact_mma_prefetch_split3 |
+| 27B gate | 512 | 367.236 | 366.102 | compact_dequant_cublas |
+| 27B down | 1 | 30.917 | 37.236 | compact_row_vec_split1 |
+| 27B down | 5 | 31.736 | 49.470 | compact_mma_prefetch_split2 |
+| 27B down | 8 | 31.964 | 50.604 | compact_mma_prefetch_split2 |
+| 27B down | 16 | 37.871 | 67.944 | compact_mma_prefetch_split2 |
+| 27B down | 512 | 340.455 | 338.301 | compact_dequant_cublas |
+| IQ3_S expert | 1 | 16.329 | 7.021 | compact_row_vec_split8 |
+| IQ3_S expert | 5 | 17.706 | 9.803 | compact_mma_prefetch_split10 |
+| IQ3_S expert | 8 | 17.600 | 9.741 | compact_mma_prefetch_split10 |
+| IQ3_S expert | 16 | 17.803 | 10.714 | compact_mma_prefetch_split10 |
+| IQ3_S expert | 512 | 68.832 | 27.337 | compact_dequant_cublas |
+| IQ2_S expert | 1 | 18.528 | 9.607 | compact_row_vec_split8 |
+| IQ2_S expert | 5 | 19.187 | 12.177 | compact_mma_prefetch_split10 |
+| IQ2_S expert | 8 | 19.261 | 12.347 | compact_mma_prefetch_split10 |
+| IQ2_S expert | 16 | 19.067 | 11.905 | compact_mma_split10 |
+| IQ2_S expert | 512 | 64.144 | 29.617 | compact_dequant_cublas |
+| Flash gate | 1 | 18.119 | 11.252 | compact_row_vec_split1 |
+| Flash gate | 5 | 19.132 | 15.495 | compact_mma_prefetch_split7 |
+| Flash gate | 8 | 18.498 | 15.763 | compact_mma_prefetch_split7 |
+| Flash gate | 16 | 20.876 | 20.427 | compact_mma_prefetch_split7 |
+| Flash gate | 512 | 89.973 | 126.816 | compact_dequant_cublas |
+| Flash output | 1 | 16.455 | 9.894 | compact_row_vec_split1 |
+| Flash output | 5 | 15.625 | 14.502 | compact_mma_prefetch_split4 |
+| Flash output | 8 | 15.822 | 14.742 | compact_mma_prefetch_split4 |
+| Flash output | 16 | 17.402 | 18.944 | compact_mma_prefetch_split4 |
+| Flash output | 512 | 81.922 | 87.949 | compact_dequant_cublas |
+
+Prefetch improves dense MMA, especially M16, but 27B dense M1/M5/M8/M16
+still fail parity. Expert projections improve at all measured M. Flash gate
+M512 and output M16/M512 remain gaps. Original-byte storage is proven; speed
+parity across the required shapes is not. No model default or persistent
+canonical storage removal is justified yet.
