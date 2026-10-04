@@ -11,7 +11,6 @@ from typing import Literal
 import torch
 from einops import rearrange
 from torch import nn
-from torch.fx.node import has_side_effect
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
@@ -3938,15 +3937,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 disabled=self.disable_sm70_qwen_gdn_full_forward,
                 auto_enabled=self.auto_sm70_qwen_gdn_full_forward,
             ):
+                conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
+                    layer_name,
+                    hidden_states if output is None else output,
+                )
                 if output is None:
                     return torch.ops.vllm.qwen_gdn_full_forward_direct(
                         hidden_states,
+                        conv_state_cache,
+                        ssm_state_cache,
                         layer_name,
                     )
-                conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
-                    layer_name,
-                    output,
-                )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
                     output,
@@ -3969,6 +3970,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -4035,7 +4037,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        proj_out, _ = self.out_proj(core_attn_out)
+        if output is None:
+            proj_out, _ = self.out_proj(core_attn_out)
+        else:
+            # The caller guards the bias-free, non-reducing SM70 FP8 route.
+            # Write the compiler-owned destination within the original opaque
+            # operator; do not publish a hidden allocator-owned intermediate.
+            proj_out = self.out_proj.scheme.apply_weights(
+                self.out_proj, core_attn_out, output=output
+            )
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_out_proj",
@@ -4059,9 +4069,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens: int,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A16Fp8,
+        )
+
+        direct_write = bool(
+            output is not None
+            and self.enable_sm70_dflash2_fused_gdn_verify
+            and current_platform.is_device_capability(70)
+            and self.tp_size == 4
+            and num_tokens == 8
+            and output.shape == (8, 5120)
+            and output.dtype == torch.float16
+            and output.is_contiguous()
+            and self.out_proj.bias is None
+            and not self.out_proj.reduce_results
+            and getattr(self.out_proj, "sm70_fp8_qpn8", False)
+            and isinstance(self.out_proj.scheme, CompressedTensorsW8A16Fp8)
+        )
+        proj_out = self._compute_output_projection(
+            core_attn_out, z, num_tokens, output if direct_write else None
+        )
         if output is not None:
-            output[:num_tokens] = proj_out
+            if not direct_write:
+                output[:num_tokens] = proj_out
             _sm70_gdn_graph_buffer_copy(
                 "proj_output_after_write",
                 layer_name,
@@ -7320,14 +7351,16 @@ def qwen_gdn_full_forward_fake(
 
 def qwen_gdn_full_forward_direct(
     hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Keep the full-forward order while returning its projection allocation."""
     layer_name = _resolve_layer_name(layer_name)
     layer = get_forward_context().no_compile_layers[layer_name]
-    # The opaque body resolves the context-owned caches, as the existing
-    # full-forward implementation does. Lifting both typed cache views into
-    # AOT exposes fp16/fp32 aliases of one paged allocation and is unsupported.
+    # Match the original opaque op's explicit recurrent-state dependencies.
+    # Its eager body accesses these same caches through the layer object.
+    _ = conv_state_cache, ssm_state_cache
     output = layer._full_forward(hidden_states, None)
     if output is None:
         raise RuntimeError("Direct GDN full-forward did not return a projection")
@@ -7337,6 +7370,8 @@ def qwen_gdn_full_forward_direct(
 
 def qwen_gdn_full_forward_direct_fake(
     hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
@@ -7690,13 +7725,9 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="qwen_gdn_full_forward_direct",
     op_func=qwen_gdn_full_forward_direct,
-    mutates_args=[],
+    mutates_args=["conv_state_cache", "ssm_state_cache"],
     fake_impl=qwen_gdn_full_forward_direct_fake,
 )
-# Preserve the context-owned recurrent update when FX removes unused nodes.
-# The projection result also orders each decoder layer's actual execution.
-
-has_side_effect(torch.ops.vllm.qwen_gdn_full_forward_direct.default)
 
 
 direct_register_custom_op(
