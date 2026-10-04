@@ -43,6 +43,23 @@ _LAYERS = {
 }
 
 
+def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
+    """Bound temporary decode/range-check memory for dense vocabulary tables."""
+    rows, columns = map(int, tensor.shape[::-1])
+    weight = torch.empty((rows, columns), dtype=dtype, device="cpu")
+    for start in range(0, rows, rows_per_chunk):
+        stop = min(start + rows_per_chunk, rows)
+        data = gguf.quants.dequantize(tensor.data[start:stop], tensor.tensor_type)
+        decoded = torch.from_numpy(data)
+        converted = decoded.to(dtype)
+        if torch.any(torch.isfinite(decoded) & ~torch.isfinite(converted)):
+            raise ValueError(
+                f"GGUF {name}: values overflow {dtype}; use --dtype float32"
+            )
+        weight[start:stop].copy_(converted)
+    return weight
+
+
 class Qwen35Adapter:
     def __init__(self, config, tp_size=1):
         self.config = config
@@ -164,6 +181,12 @@ class Qwen35Adapter:
                 gguf.GGMLQuantizationType.F16,
                 gguf.GGMLQuantizationType.BF16,
             )
+            if quantized and name.endswith("embed_tokens.weight"):
+                # Embedding row order is unchanged by restoration. Keep the
+                # existing global-table contract for the TP weight loader,
+                # without full FP32 decode and boolean temporary tables.
+                yield name, _dequantize_embedding(tensor, dtype, raw)
+                continue
             dense_fallback = self.needs_dense_fallback(name, tensor)
             if quantized and (not self.is_linear(name) or dense_fallback):
                 # Embeddings and convolution use the model's dense parameters.
