@@ -93,3 +93,62 @@ The checkpoint's gate/up tensors include IQ3_XXS in 17 layers, IQ2_S in 20,
 IQ3_S in 10 and IQ4_XS in one; filename alone cannot select a decoder.
 Dense quantized projection tuning remains separate. Further model profiling
 follows qualified floating-route integration.
+
+## Joint experts and PLE integration
+
+The next source-containing installed wheel is `1.5.2.dev560+g22e3ff90d`,
+with the same Flash-Next IQ3_S, FP16 MTP4, TP4, KV/state dtypes, batch budget,
+sampling and C1/C4 request lengths as the previous operator integration.
+It adds joint original-block IQ2_S/IQ3_S gate/up, calibrated canonical
+IQ4_NL/Q2_0 down vectors, exact Torch-order unroute reduction and batched
+PLE n-gram IDs. Unmeasured points retain canonical dispatch; the slower
+IQ2_S gate/up and down-vector M=20 points remain excluded.
+
+| Candidate | C1 round ms | C1 tokens/s | C1 full acceptance length | C4 round ms | C4 tokens/s | C4 full acceptance length |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Previous operator integration | 30.932 | 78.803 | 2.643 | 56.924 | 258.219 | 3.403 |
+| Joint experts and PLE | 26.668 | 90.544 | 2.560 | 54.748 | 258.709 | 3.485 |
+
+C1 saves 4.264 ms per round and improves throughput by 14.9% against the
+previous integration; against the original ring-enabled model it saves
+14.831 ms and improves throughput by 20.4%. The 26.668 ms round is below
+the separately recorded 27.4 ms NVFP4 MTP4 reference, but that comparison
+alone does not establish equivalent emitted-token throughput or quality.
+C4 saves 2.176 ms against the previous integration while throughput changes
+by +0.19%. C4 remains 1.36% below the original ring-enabled throughput; this
+result does not establish a strict C4 non-regression gate. The 15–17 ms round
+target is not reached.
+
+Each of the three C1 repeats records 82 steady intervals and 198 emitted
+tokens, or 2.414634 emitted tokens per interval. Full-request speculative
+counters contain 100 drafts, 400 drafted tokens and 156 accepted tokens.
+Each C4 repeat records 257 steady intervals and 3640 emitted tokens across
+four requests, or 3.540856 per request and interval. Full-request counters
+contain 1177 drafts, 4708 drafted tokens and 2925 accepted tokens. Token IDs
+and speculative counters match across all three repeats in each cohort.
+Acceptance counters cover the full request rather than only the steady
+interval window and must not replace its emitted-token denominator.
+
+Four natural greedy prompts finish normally: Paris, arithmetic, Chinese
+translation and a 63-token explanation of Rayleigh scattering. All four
+match original model token IDs. These are text-health checks, not a broad
+quality-set result. Timing cohorts use fixed output lengths with EOS ignored;
+natural prompts honor EOS.
+
+Runtime logs confirm joint original-block type21/type22 at M=5, type21 at
+M=20, both down formats at 50 routed rows, fused small expert alignment,
+FP32 replicated HC, a/b row GEMV at M=5/10/15/20, router and QSA top-k,
+and batched PLE n-gram IDs. The ordinary installed artifact passes 46 CPU
+checks plus 42 GPU/mixed-bank cases, all 211 dependency checks and fresh
+native import. No private DSO, preload or library override is needed.
+
+Model storage is 24.18 GiB per rank. The profiler leaves 2.75 GiB for KV,
+69,360 tokens; captured graphs add about 0.38 GiB. The additional original
+expert banks are retained only for type21/type22; type18's measured M=5 gain
+does not justify another 2.55 GiB per rank in this integration. There is no
+new model trace in this measurement.
+
+Whole wheel SHA256:
+`50f9c856415b3ccbdf428d678bd7664c57ad523b1bc78112f2958aa8b100dc63`.
+Loaded native `_C` SHA256:
+`2259d5e8591b06c8fa58aa274cbaf3293f05e9c477fdd86b146ca10e9504589f`.
