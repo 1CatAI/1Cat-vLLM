@@ -45,9 +45,24 @@ Reproduce with `benchmarks/kernels/benchmark_sm70_gguf_head.py MODEL.gguf
 
 ## Integration status
 
-This change supplies the operator comparison. Model loading still needs to
-retain the quantized head and use the canonical linear lifecycle rather than
-embedding preparation. A shared target/draft head must preserve that same
-object and vocabulary layout. Model integration follows the dense/HC
-complete-round measurement and is checked with natural greedy output and
-the later combined C1/C4 comparison.
+The existing `GGUFLMHeadMethod` policy now admits the measured Q6_K shard at
+M=1..20. The opaque projection forwards the actual canonical bit width and
+group size: Q6_K uses u8/group16. Its packed fallback also receives the actual
+source type. The existing Q4_K M=2..16 policy is retained.
+
+The method retains original packed bytes for unmeasured M values. Therefore
+resident head payload is about 289,292,800 bytes per rank, comprising raw and
+canonical streams, rather than the canonical-only footprint in the table.
+Admitted projections read the canonical stream; no full FP16 head is cached.
+
+Qwen4Exp passes GGUF quantization configuration to its vocabulary head.
+Its architecture adapter still needs to classify the head as a projection
+instead of requesting dense expansion. A shared target/draft head must
+preserve that same object and vocabulary layout. Model integration follows
+the dense/HC complete-round measurement and is checked with natural greedy
+output and the later combined C1/C4 comparison.
+
+Use `--lm-head-method` to additionally exercise actual LM-head post-load
+preparation and dispatch in the operator benchmark. That packaged GPU
+route check remains pending; the table above measures the underlying
+canonical projection directly.
