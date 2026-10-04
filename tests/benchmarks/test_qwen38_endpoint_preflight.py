@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fail before any model import when the endpoint contract is incomplete."""
 
+import fcntl
 import json
 from types import SimpleNamespace
 
@@ -100,3 +101,29 @@ def test_unknown_triage_case_is_rejected_before_loading(launch):
     launch.case_id = ["unknown"]
     with pytest.raises(RuntimeError, match="Unknown quality case"):
         endpoint.preflight(launch)
+
+
+def test_reserved_lock_is_reused_without_releasing_owner(tmp_path):
+    path = tmp_path / "gpu.lock"
+    with path.open("a") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (
+            endpoint.open_gpu_lock(owner.fileno(), path),
+            pytest.raises(BlockingIOError),
+        ):
+            endpoint.open_gpu_lock(lock_path=path)
+        # Closing the duplicate must retain the original owner's reservation.
+        with pytest.raises(BlockingIOError):
+            endpoint.open_gpu_lock(lock_path=path)
+    with endpoint.open_gpu_lock(lock_path=path):
+        pass
+
+
+def test_inherited_descriptor_must_match_required_lock(tmp_path):
+    path = tmp_path / "gpu.lock"
+    path.touch()
+    with (
+        (tmp_path / "different.lock").open("a") as other,
+        pytest.raises(RuntimeError, match="required GPU lock"),
+    ):
+        endpoint.open_gpu_lock(other.fileno(), path)

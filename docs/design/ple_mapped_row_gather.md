@@ -83,3 +83,10 @@ reference major faults average 16.69 per case; prefetch queues I/O before
 copying in the candidate. The warm regression is retained explicitly and the
 C1 endpoint gate remains pending. The first endpoint attempt correctly failed
 before model loading because another task held the GPU lock.
+
+A queued pair may hold one reservation across both processes with an inherited
+file descriptor: `--gpu-lock-fd FD`. The entry verifies that it refers to the
+required lock and takes a nonblocking exclusive lock on that same open file
+description. The caller keeps its original descriptor open until both arms
+finish. This avoids a release/reacquire race while preserving the ordinary
+entry's fail-fast behavior and GPU-idle check. Normal launches need no option.

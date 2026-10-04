@@ -418,6 +418,24 @@ def preflight(args):
     }
 
 
+def open_gpu_lock(inherited_fd=None, lock_path=Path("/tmp/gpu0-3.lock")):
+    """Keep a caller's reservation without releasing and racing to reacquire."""
+    lock = (
+        os.fdopen(os.dup(inherited_fd), "a")
+        if inherited_fd is not None
+        else lock_path.open("a")
+    )
+    try:
+        actual, expected = os.fstat(lock.fileno()), lock_path.stat()
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise RuntimeError("Inherited descriptor is not the required GPU lock")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        lock.close()
+        raise
+    return lock
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -429,6 +447,7 @@ def main():
     parser.add_argument("--case-id", action="append")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-free-gib", type=float, default=8)
+    parser.add_argument("--gpu-lock-fd", type=int)
     parser.add_argument("--reference-timing", type=Path)
     parser.add_argument("--expected-saving-ms", type=float)
     parser.add_argument("--disable-ple-row-gather", action="store_true")
@@ -472,8 +491,7 @@ def main():
     summary = {"complete": False, "output": str(args.output)}
     summary_path = args.output.with_suffix(".summary.json")
     try:
-        with open("/tmp/gpu0-3.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open_gpu_lock(args.gpu_lock_fd):
             summary["preflight"] = preflight(args)
             run(args)
             report = json.loads(args.output.read_text())
