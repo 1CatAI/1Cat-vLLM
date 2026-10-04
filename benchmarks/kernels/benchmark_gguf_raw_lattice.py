@@ -409,6 +409,23 @@ def main():
                         ),
                     )
                 )
+                natural_scratch = torch.empty(
+                    (n, k), device="cuda", dtype=torch.float16
+                )
+                candidates.append(
+                    (
+                        "compact_dequant_cublas_tn",
+                        partial(
+                            torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                            out,
+                            x,
+                            compact,
+                            kind,
+                            natural_scratch,
+                            True,
+                        ),
+                    )
+                )
         old()
         old_error = errors(out, expected)
 

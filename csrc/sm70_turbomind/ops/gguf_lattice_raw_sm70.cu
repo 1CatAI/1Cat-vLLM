@@ -430,12 +430,19 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
     if (lane < width) {
       const auto values =
           Decode::template fragment<Output>(parameters, packet, octet, grid);
+      if constexpr (std::is_same_v<Output, half> && !Transpose) {
+        const int64_t index =
+            int64_t{first + lane} * k + block * 256 + octet * 8;
+        *reinterpret_cast<uint4*>(out + index) =
+            *reinterpret_cast<const uint4*>(&values);
+      } else {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const int logical_k = block * 256 + octet * 8 + j, row = first + lane;
-        const int64_t index = Transpose ? int64_t{logical_k} * n + row
-                                        : int64_t{row} * k + logical_k;
-        out[index] = static_cast<Output>(values[j]);
+        for (int j = 0; j < 8; ++j) {
+          const int logical_k = block * 256 + octet * 8 + j, row = first + lane;
+          const int64_t index = Transpose ? int64_t{logical_k} * n + row
+                                          : int64_t{row} * k + logical_k;
+          out[index] = static_cast<Output>(values[j]);
+        }
       }
     }
   }
@@ -575,7 +582,8 @@ void launch_dequant(torch::Tensor out, torch::Tensor weight,
         out.size(0), out.size(1), weight.size(1));
 }
 void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
-                             torch::Tensor scratch) {
+                             torch::Tensor scratch,
+                             bool natural_layout = false) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   auto handle = at::cuda::getCurrentCUDABlasHandle();
   cublasMath_t saved;
@@ -586,9 +594,10 @@ void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
                   CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
   const float alpha = 1.f, beta = 0.f;
   const auto status = cublasGemmEx(
-      handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, scratch.data_ptr(),
-      CUDA_R_16F, n, input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
-      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      handle, natural_layout ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+      &alpha, scratch.data_ptr(), CUDA_R_16F, natural_layout ? k : n,
+      input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(), CUDA_R_16F, n,
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   const auto restore = cublasSetMathMode(handle, saved);
   TORCH_CUDABLAS_CHECK(status);
   TORCH_CUDABLAS_CHECK(restore);
@@ -978,26 +987,40 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,
-                                        torch::Tensor scratch) {
+                                        torch::Tensor scratch,
+                                        bool natural_layout) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
   validate_compact(weight, source_type, n, k);
   TORCH_CHECK(scratch.device() == weight.device() &&
                   scratch.scalar_type() == torch::kFloat16 &&
-                  scratch.dim() == 2 && scratch.size(0) == k &&
-                  scratch.size(1) == n && scratch.is_contiguous(),
-              "Compact GGUF BLAS requires FP16 [K,N] scratch");
+                  scratch.dim() == 2 &&
+                  scratch.size(0) == (natural_layout ? n : k) &&
+                  scratch.size(1) == (natural_layout ? k : n) &&
+                  scratch.is_contiguous(),
+              "Compact GGUF BLAS scratch must match its FP16 weight layout");
   const dim3 grid((n + 31) / 32, k / 256);
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (source_type == 21)
-    compact_dequant_kernel<21, half, true>
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
-                                   weight.data_ptr<uint8_t>(), n, k);
-  else
-    compact_dequant_kernel<22, half, true>
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
-                                   weight.data_ptr<uint8_t>(), n, k);
+  if (natural_layout) {
+    if (source_type == 21)
+      compact_dequant_kernel<21, half, false><<<grid, 128, 0, stream>>>(
+          reinterpret_cast<half*>(scratch.data_ptr()),
+          weight.data_ptr<uint8_t>(), n, k);
+    else
+      compact_dequant_kernel<22, half, false><<<grid, 128, 0, stream>>>(
+          reinterpret_cast<half*>(scratch.data_ptr()),
+          weight.data_ptr<uint8_t>(), n, k);
+  } else {
+    if (source_type == 21)
+      compact_dequant_kernel<21, half, true><<<grid, 128, 0, stream>>>(
+          reinterpret_cast<half*>(scratch.data_ptr()),
+          weight.data_ptr<uint8_t>(), n, k);
+    else
+      compact_dequant_kernel<22, half, true><<<grid, 128, 0, stream>>>(
+          reinterpret_cast<half*>(scratch.data_ptr()),
+          weight.data_ptr<uint8_t>(), n, k);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  lattice_blas_accumulate(out, input, scratch);
+  lattice_blas_accumulate(out, input, scratch, natural_layout);
 }

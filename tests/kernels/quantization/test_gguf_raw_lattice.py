@@ -211,7 +211,7 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
                 for variant in (False, True)
             ]
             if m <= 64
-            else [(1, False, False, 0)]
+            else [(1, natural, False, 0) for natural in (False, True)]
         )
         if 1 < m <= 64 and n % 32 == 0:
             plans += [(split, True, True, 0) for split in (1, 3)]
@@ -225,6 +225,11 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
         for split, variant, staged, row_tile, bounded in bounded_plans:
             partials = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
             if m == 512:
+                scratch = torch.empty(
+                    reference.shape if variant else reference.T.shape,
+                    dtype=torch.float16,
+                    device="cuda",
+                )
                 run = partial(
                     torch.ops._C.gguf_lattice_compact_blas_sm70_out,
                     out,
@@ -232,6 +237,7 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
                     weight,
                     kind,
                     scratch,
+                    variant,
                 )
             else:
                 op = (
@@ -260,7 +266,8 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
             expected = x.float() @ (reference if m == 1 else reference.half().float()).T
             torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.01)
             if m == 512:
-                torch.testing.assert_close(scratch, reference.half().T, rtol=0, atol=0)
+                expected_scratch = reference.half() if variant else reference.half().T
+                torch.testing.assert_close(scratch, expected_scratch, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("kind", [21, 22])

@@ -653,3 +653,53 @@ allocation to admit seven CTAs/SM. Its original entry point remains the
 comparison. An eight-CTA budget produces an eight-byte stack allocation and
 is rejected before GPU timing. The seven-CTA variant must pass resource,
 FP32 numerical and matched full-graph performance checks before selection.
+
+## Seven-CTA device and counter results
+
+Source `7122dd3b11`, core SHA256
+`c0733c0713737a81dc3fe1a7700ec992508a974508f1a4167617d62c504db6a2`,
+whole-wheel SHA256
+`9d0019a47a4340add14e2d11788278f7af92f185a3d1baf5fb9e543f820bf3b5`.
+All 24 checks pass (8.70 s). Matched M16 graph timings improve every selected
+shape, but dense 27B remains slower than canonical.
+
+| Projection | Canonical µs | Best original/equal-byte µs | Candidate |
+| --- | ---: | ---: | --- |
+| 27B gate | 39.593 | 47.087 | compact_mma_occupancy7_split2 |
+| 27B down | 38.052 | 42.632 | compact_mma_occupancy7_split2 |
+| IQ3_S expert | 17.853 | 8.189 | compact_mma_prefetch_occupancy7_split10 |
+| IQ2_S expert | 19.085 | 10.382 | compact_mma_staged_occupancy7_split10 |
+| Flash gate | 20.202 | 13.684 | compact_mma_prefetch_occupancy7_split10 |
+| Flash output | 17.384 | 13.148 | compact_mma_prefetch_occupancy7_split4 |
+
+The gate M16 winner is the plain packet decoder with the seven-CTA budget
+and split2. It uses 72 registers/thread with no stack allocation. Node
+profiling records 9,757,152 main-node DRAM read bytes, 20.86% active warps,
+32.55% long-scoreboard stall and 10.40% math-pipe throttle. Register occupancy
+limit is seven CTAs/SM; actual occupancy remains lower with this grid.
+The FP32 split reduction reads another 559,520 bytes. These counters include
+non-weight traffic and remain separate from unprofiled wall time.
+
+## Flash dense prefill attribution and TN candidate
+
+A matched cold-cache node capture at Flash gate M512 (`N=1536, K=2560`)
+identifies the current dequantization/cuBLAS cost:
+
+| Node | Profiled µs | DRAM read bytes |
+| --- | ---: | ---: |
+| Canonical fused GEMM | 120.928 | 4,637,056 |
+| Equal-byte dequantization | 20.384 | 1,696,640 |
+| cuBLAS NN GEMM | 106.176 | 14,592,352 |
+| cuBLAS FP32 split-K reduction | 16.128 | 6,295,328 |
+
+The unprofiled complete paths remain about 90/127 µs. Profiling perturbs
+node durations, so the rows above are attribution rather than a replacement
+wall-time comparison. The NN GEMM selects a 64×64 Volta kernel plus split-K
+reduction; dequantization is not the dominant gap.
+
+The next candidate writes the temporary FP16 workspace in natural `[N,K]`
+row order using aligned 128-bit stores and calls cuBLAS TN. It retains the
+NN candidate and the same FP32 computation/reduction policy. Temporary
+workspace byte size is unchanged; persistent weights remain equal-byte
+packets. Changed-input graphs and exact workspace comparisons cover both
+layouts before speed selection. Validation of TN remains pending.
