@@ -70,8 +70,26 @@ GPU tests pass, including replay with changed inputs and all 63,488 finite
 FP16 gate values against native activation. The installed wheel SHA256 is
 `bd774a8c6b25bf8da90efdd9f5f426954ddd5f83cd8a878826bea2b935118be8`.
 
-Matched C1 distribution and natural task-quality gates, endpoint per-step
-timing, a short C4 health check and the graph-node trace remain pending.
-No model speedup or phase-target claim is accepted yet. In-projection,
+The same-artifact C1 focus compared 32 valid-vocabulary positions. Disabled
+admissions were zero on all four ranks; enabled M=1 admissions were
+36/38/35/34 matrices. Top-1 agreement was 100%, but the initial distribution
+gate failed:
+
+| Stratum | Mean KL | p99 KL | Max logit error |
+| --- | ---: | ---: | ---: |
+| All | 0.0011553 | 0.0135292 | 0.8359375 |
+| English | 0.0022305 | 0.0153994 | 0.8359375 |
+| Chinese | 0.0000800 | 0.0010405 | 0.5693359 |
+
+Serial and pair-first product folding, and alternate lane reduction trees,
+were checked against retained real inputs without finding a better match.
+Further layout trials are stopped. The complete natural quality suite and
+768-position distribution comparison are an investigation of the initial
+thresholds, not admission under relaxed limits. Thresholds remain unchanged;
+promotion requires a documented, evidence-based contract decision.
+
+Matched natural task-quality results, endpoint per-step timing, a short C4
+health check and the graph-node trace remain pending. No model speedup or
+phase-target claim is accepted yet. In-projection,
 out-projection, LM head, MTP, dense quantization and communication algorithms
 are outside this change.

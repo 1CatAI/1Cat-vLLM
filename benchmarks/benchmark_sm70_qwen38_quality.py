@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import regex as re
@@ -284,6 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--disable-kernel", help="Existing kernel-registry ablation")
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
@@ -308,19 +310,23 @@ if __name__ == "__main__":
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
         TORCH_EXTENSIONS_DIR=str(cache / "extensions"),
     )
-    with open("/tmp/gpu0-3.lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        import subprocess
-
-        if subprocess.check_output(
-            [
-                "nvidia-smi",
-                "-i",
-                "0,1,2,3",
-                "--query-compute-apps=pid",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        ).strip():
-            raise SystemExit("GPU 0-3 have other consumers; gate not launched")
-        run(args)
+    if args.disable_kernel:
+        os.environ["VLLM_DISABLED_KERNELS"] = args.disable_kernel
+    while True:
+        with open("/tmp/gpu0-3.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            consumers = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "-i",
+                    "0,1,2,3",
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+            ).strip()
+            if not consumers:
+                run(args)
+                break
+        print("GPU 0-3 occupied; released lock and waiting", flush=True)
+        time.sleep(10)
