@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
+    fused_sigmoid_gating_delta_rule_update,
     fused_sigmoid_gating_delta_rule_update_mixed_qkv,
 )
 
@@ -64,7 +65,21 @@ def test_strided_qkv_output_and_fp32_state_graph(requests, feature_stride):
         accepted.fill_(replay + 1)
         for state in states:
             state.copy_(seed)
-        expected = run(contiguous, states[0])
+        q, k, v = torch.split(contiguous, [512, 512, 1536], dim=-1)
+        expected = fused_sigmoid_gating_delta_rule_update(
+            A_log=a_log,
+            a=a,
+            b=b,
+            dt_bias=bias,
+            q=q.contiguous().view(1, tokens, 4, 128),
+            k=k.contiguous().view(1, tokens, 4, 128),
+            v=v.contiguous().view(1, tokens, 12, 128),
+            initial_state=states[0],
+            cu_seqlens=cu,
+            ssm_state_indices=indices,
+            num_accepted_tokens=accepted,
+            use_qk_l2norm_in_kernel=True,
+        )[0]
         graph.replay()
         assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
         assert torch.equal(states[0].view(torch.int32), states[1].view(torch.int32))
