@@ -46,8 +46,31 @@ source is `3769638467`, with wheel SHA256
 the native core remains unchanged. The failed process supplies no latency
 or acceptance result.
 
-Complete-round latency, acceptance and the Flash-Next ring comparison remain
-pending. The 27B C1 improvement is a smoke check and is not a Flash-Next
+## Initial measured C1
+
+The ring-disabled 8K-input greedy cohort records 57 trimmed steady intervals:
+
+| Measurement | Result |
+|---|---:|
+| Complete engine round, mean | 46.822 ms |
+| Pure decode | 71.566 tok/s |
+| Mean acceptance length | 3.427 tokens |
+| Draft rounds / proposed / accepted tokens | 75 / 300 / 182 |
+| Position 1 / 2 / 3 / 4 acceptance | 0.800 / 0.640 / 0.560 / 0.427 |
+
+All four natural prompts stop normally: Paris, arithmetic, Chinese translation
+and a complete Chinese explanation. This measures the complete engine
+interval, not the target-only CUDA-event phase. The larger-capacity and
+multi-prompt acceptance comparison is still pending.
+
+At batch budget 512, four 8K prompts prefill in succession and requests finish
+before a steady four-request decode cohort forms. That case has zero valid
+C4 intervals and supplies no C4 speed evidence. The C4 smoke therefore uses
+128 input tokens per request in both arms, retaining the same capacity,
+sequence slots, graph policy and model. C1 continues to use 8K input.
+
+The Flash-Next ring comparison remains pending. The 27B C1 improvement is a
+smoke check and is not a Flash-Next
 latency estimate. Ring merging requires matched Flash-Next C1/C4, output
 identity and natural termination. Follow-up optimization starts with the
 actual trace and packed PLE pinned-UVA reading.
