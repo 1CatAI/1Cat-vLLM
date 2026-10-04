@@ -304,6 +304,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             or self.world_size
             > NCCL_SYMM_MEM_ALL_REDUCE_CONFIG["always_use_above_world_size"]
         )
+        if self.ring_comm.status["enabled"]:
+            enabled_ar_backends.append("SM70_RING")
         if (
             self.pynccl_comm is not None
             and not self.pynccl_comm.disabled
@@ -312,8 +314,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
-        if self.ring_comm.status["enabled"]:
-            enabled_ar_backends.append("SM70_RING")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
@@ -339,6 +339,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        ring_out = self.ring_comm.all_reduce(input_)
+        if ring_out is not None:
+            _trace_all_reduce_path(self, "sm70_ring", input_)
+            return ring_out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -348,10 +352,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if out is not None:
                 _trace_all_reduce_path(self, "nccl_symmetric", input_)
                 return out
-        ring_out = self.ring_comm.all_reduce(input_)
-        if ring_out is not None:
-            _trace_all_reduce_path(self, "sm70_ring", input_)
-            return ring_out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm

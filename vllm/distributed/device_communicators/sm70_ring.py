@@ -148,6 +148,9 @@ class Sm70RingCommunicator:
             self.counters = torch.zeros(
                 self.capacity, dtype=torch.int32, device=self.device
             )
+            torch.accelerator.synchronize()
+        # No rank may publish while another is still zeroing its receive slots.
+        dist.barrier(group=self.group)
         self.status.update(
             rank_order=list(order), direct_nvlink=direct, dtype="float16"
         )

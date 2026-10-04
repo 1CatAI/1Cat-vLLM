@@ -57,3 +57,30 @@ def test_policy_cannot_admit_uncalibrated_payload():
     assert Sm70RingConfig().enabled
     with pytest.raises(ValueError):
         Sm70RingConfig(max_bytes=25602)
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_dispatch_prefers_admitted_ring_and_preserves_fallback(monkeypatch, admitted):
+    from vllm.distributed.device_communicators import cuda_communicator as cuda
+
+    output = object()
+    input_ = object()
+    comm = cuda.CudaCommunicator.__new__(cuda.CudaCommunicator)
+    comm.ring_comm = SimpleNamespace(all_reduce=lambda _: output if admitted else None)
+    comm.pynccl_comm = SimpleNamespace(world_size=4)
+    visited = []
+    monkeypatch.setattr(cuda, "_trace_all_reduce_path", lambda *args: None)
+
+    def symmetric_guard(*args):
+        visited.append("fallback")
+        return True
+
+    monkeypatch.setattr(cuda, "should_nccl_symm_mem_allreduce", symmetric_guard)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "all_reduce_symmetric_with_copy",
+        lambda _: output,
+        raising=False,
+    )
+    assert comm.all_reduce(input_) is output
+    assert visited == ([] if admitted else ["fallback"])

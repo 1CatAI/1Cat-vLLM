@@ -305,7 +305,8 @@ def worker(rank, args, order, port):
                 "M": m,
                 "input_bytes": size * 2,
                 "packet_store_bytes_per_rank": ((size + 1) // 2) * 8 * stages,
-                "grid_blocks": (size + 255) // 256,
+                "grid_blocks": (size + 2 * args.kernel_threads - 1)
+                // (2 * args.kernel_threads),
                 "samples_us": samples,
                 "median_us": [statistics.median(s) for s in samples],
             }
@@ -349,6 +350,9 @@ def main():
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--hidden", type=int, default=2560)
     parser.add_argument("--calls", type=int, default=96)
+    parser.add_argument(
+        "--kernel-threads", type=int, choices=(64, 96, 128), default=128
+    )
     parser.add_argument("--block-packets", action="store_true")
     args = parser.parse_args()
     check_exclusive()
@@ -370,6 +374,7 @@ def main():
         "direct_nvlink": direct,
         "hidden": args.hidden,
         "calls_per_graph": args.calls,
+        "kernel_threads": args.kernel_threads,
         "block_packets": args.block_packets,
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
