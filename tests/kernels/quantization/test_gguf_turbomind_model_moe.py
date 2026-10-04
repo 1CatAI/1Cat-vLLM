@@ -197,6 +197,7 @@ def test_mixed_canonical_experts_tp4_and_graph(m):
         method = object.__new__(GGUFTurboMindMoEMethod)
         method.num_experts, method.hidden_size = experts, hidden
         method.small_routing = False
+        method.raw_gate_up = False
         layer = SimpleNamespace(
             gguf_expert_banks=banks,
             expert_map=None,
