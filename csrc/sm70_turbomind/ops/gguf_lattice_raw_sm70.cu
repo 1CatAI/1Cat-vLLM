@@ -534,12 +534,14 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
 }
 
 template <int Type, class Output, bool Transpose, bool FullWidth = false,
-          bool PackedOutput = false>
+          bool PackedOutput = false, bool SharedParameters = false>
 __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
                                        int n, int k) {
   using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
   __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
-  Decode::initialize(grid);
+  __shared__ float shared_d[SharedParameters ? 32 : 1];
+  __shared__ uint64_t shared_scales[SharedParameters ? 32 : 1];
+  if constexpr (!SharedParameters) Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int first = blockIdx.x * 32,
             width = FullWidth ? 32 : min(32, n - first);
@@ -547,12 +549,27 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
   const auto* tile = weight + int64_t{first} * (k / 256) * Decode::kBlockBytes +
                      int64_t{block} * width * Decode::kBlockBytes;
   typename Decode::Parameters parameters{};
-  if (lane < width)
-    parameters = Decode::template parameters<FullWidth>(tile, width, lane);
+  if constexpr (!SharedParameters) {
+    if (lane < width)
+      parameters = Decode::template parameters<FullWidth>(tile, width, lane);
+  }
   const int warps = blockDim.x / 32;
   const int first_octet = warp + warps * blockIdx.z;
   const int step = warps * gridDim.z;
   auto current = Decode::template fetch<FullWidth>(tile, width, first_octet);
+  if constexpr (SharedParameters) {
+    static_assert(FullWidth && Transpose && !PackedOutput);
+    if (warp == 0) {
+      const auto loaded = Decode::template parameters<true>(tile, 32, lane);
+      shared_d[lane] = loaded.d;
+      shared_scales[lane] = loaded.scales;
+    }
+    // Publish original metadata using the existing codebook barrier. Other
+    // warps keep their first original packet fetch in registers across setup.
+    Decode::initialize(grid);
+    parameters.d = shared_d[lane];
+    parameters.scales = shared_scales[lane];
+  }
   for (int octet = first_octet; octet < 32; octet += step) {
     typename Decode::PacketWindow next{};
     if (octet + step < 32)
@@ -1204,12 +1221,10 @@ void gguf_lattice_compact_mma_sm70_out(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
-                                        torch::Tensor weight,
-                                        int64_t source_type,
-                                        torch::Tensor scratch,
-                                        bool natural_layout, int64_t algorithm,
-                                        int64_t dq_partitions) {
+void gguf_lattice_compact_blas_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor scratch, bool natural_layout,
+    int64_t algorithm, int64_t dq_partitions, bool shared_metadata) {
   TORCH_CHECK(
       algorithm == 99 || algorithm == 102,
       "Compact GGUF BLAS accepts only default or calibrated algorithm 2");
@@ -1228,16 +1243,29 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                   scratch.size(1) == (natural_layout ? k : n) &&
                   scratch.is_contiguous(),
               "Compact GGUF BLAS scratch must match its FP16 weight layout");
+  TORCH_CHECK(!shared_metadata || (!natural_layout && n % 32 == 0),
+              "Shared original metadata requires aligned [K,N] workspace");
   const dim3 grid((n + 31) / 32, k / 256, dq_partitions);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_BLAS_DQ(TYPE, FULL)                                           \
-  if (natural_layout)                                                         \
-    compact_dequant_natural_kernel<TYPE, FULL><<<grid, 128, 0, stream>>>(     \
-        reinterpret_cast<half*>(scratch.data_ptr()),                          \
-        weight.data_ptr<uint8_t>(), n, k);                                    \
-  else                                                                        \
-    compact_dequant_kernel<TYPE, half, true, FULL><<<grid, 256, 0, stream>>>( \
-        reinterpret_cast<half*>(scratch.data_ptr()),                          \
+#define COMPACT_BLAS_DQ(TYPE, FULL)                                            \
+  if (natural_layout)                                                          \
+    compact_dequant_natural_kernel<TYPE, FULL><<<grid, 128, 0, stream>>>(      \
+        reinterpret_cast<half*>(scratch.data_ptr()),                           \
+        weight.data_ptr<uint8_t>(), n, k);                                     \
+  else if constexpr (FULL) {                                                   \
+    if (shared_metadata)                                                       \
+      compact_dequant_kernel<TYPE, half, true, true, false, true>              \
+          <<<grid, 256, 0, stream>>>(                                          \
+              reinterpret_cast<half*>(scratch.data_ptr()),                     \
+              weight.data_ptr<uint8_t>(), n, k);                               \
+    else                                                                       \
+      compact_dequant_kernel<TYPE, half, true, true>                           \
+          <<<grid, 256, 0, stream>>>(                                          \
+              reinterpret_cast<half*>(scratch.data_ptr()),                     \
+              weight.data_ptr<uint8_t>(), n, k);                               \
+  } else                                                                       \
+    compact_dequant_kernel<TYPE, half, true, false><<<grid, 256, 0, stream>>>( \
+        reinterpret_cast<half*>(scratch.data_ptr()),                           \
         weight.data_ptr<uint8_t>(), n, k)
 #define COMPACT_BLAS_DQ_SELECT(TYPE) \
   if (n % 32 == 0) {                 \

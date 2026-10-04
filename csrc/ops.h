@@ -950,12 +950,10 @@ void gguf_lattice_compact_mma_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor partial, int64_t splits, bool prefetch,
     bool staged, int64_t row_tile, bool occupancy7, bool stage_activation);
-void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
-                                        torch::Tensor weight,
-                                        int64_t source_type,
-                                        torch::Tensor scratch,
-                                        bool natural_layout, int64_t algorithm,
-                                        int64_t dq_partitions);
+void gguf_lattice_compact_blas_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor scratch, bool natural_layout,
+    int64_t algorithm, int64_t dq_partitions, bool shared_metadata);
 
 void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                       torch::Tensor offsets,

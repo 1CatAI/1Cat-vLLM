@@ -1371,3 +1371,16 @@ cuBLAS algorithms 99/102, and dequantization partitions 1/2/4 times out waiting
 for the shared GPU lock before executing. It contributes no speed or numerical
 evidence. Recorded successful comparisons and unresolved prefill gates remain
 unchanged.
+
+The installed retained grouped artifact passes two additional E512 routing
+graph checks. Existing workspace combinations retain FP32 computation: best
+FP32 output/default cuBLAS/two DQ partitions is 93.983 us versus 89.888 us
+canonical; FP16 output/algorithm 2/two partitions is 94.956 us. A standard
+cuBLASLt support query finds no valid mixed FP32-C/FP16-D configurations on
+this runtime, so no mixed-output operator is added.
+
+The next DQ candidate stages the original d/small-scale planes once per CTA
+instead of loading them separately in all eight warps. It publishes through
+the existing codebook barrier and queues each warp's first original packet
+before setup. Shared planes retain original bits; there is no expanded FP16
+coefficient, persistent overhead, precision change, or model default.

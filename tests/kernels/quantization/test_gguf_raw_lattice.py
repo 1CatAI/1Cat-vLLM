@@ -694,3 +694,55 @@ def test_compact_grouped_offsets_and_changed_graph(kind, experts):
             .to(torch.int32)
         )
         torch.testing.assert_close(prefix.cpu(), expected_prefix, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_compact_blas_cooperative_original_metadata_graph(kind, dtype):
+    n, k, m = 160, 768, 512
+    data = packed(kind, n=n, k=k)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+    )
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        False,
+        99,
+        2,
+        True,
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out.float(), x.float() @ reference.float().T, rtol=0.003, atol=0.01
+    )
+    data.fill(0)
+    data.reshape(n, k // 256, -1)[:, :, :2] = np.array([2.0], dtype="<f2").view(
+        np.uint8
+    )
+    source.copy_(torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data))
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x.fill_(1024)
+    x[:, k // 2 :] = -1024
+    graph.replay()
+    torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
