@@ -374,3 +374,49 @@ def test_final_half_rounding_for_every_finite_block_scale(kind):
         torch.testing.assert_close(
             out.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_compact_blas_cancellation_retains_fp32_partials(kind):
+    _, size = quant_size(kind)
+    n, k = 1536, 2560
+    blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+    blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    data = blocks.reshape(n, -1)
+    # Grid index zero and zero small-scale bits reconstruct exactly one.
+    expected = gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    assert np.array_equal(expected, np.ones((n, k), dtype=np.float32))
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x = torch.full((512, k), 128.0, device="cuda", dtype=torch.float16)
+    x[:, k // 2 :] = -128.0
+    out = torch.empty((512, n), device="cuda", dtype=torch.float16)
+    for natural in (False, True):
+        scratch = torch.empty(
+            (n, k) if natural else (k, n), device="cuda", dtype=torch.float16
+        )
+        for algorithm in (99, 102):
+            run = partial(
+                torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                out,
+                x,
+                weight,
+                kind,
+                scratch,
+                natural,
+                algorithm,
+            )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            # Intermediate positive/negative partials exceed FP16 range,
+            # while the final dot product cancels exactly to zero.
+            graph.replay()
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+            x.neg_()
+            graph.replay()
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
