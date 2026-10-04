@@ -144,9 +144,9 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
   const int blocks = k / 256;
   const int begin = blocks * blockIdx.z / splits;
   const int end = blocks * (blockIdx.z + 1) / splits;
-  constexpr int kPacketWords = Packed::kPacketBytesPerRow * 32 / 8;
-  constexpr int kWordsPerThread = (kPacketWords + 127) / 128;
-  __shared__ uint64_t packets[Staged ? kPacketWords : 1];
+  constexpr int kStageWords = Packed::kBlockBytes * 32 / 8;
+  constexpr int kWordsPerThread = (kStageWords + 127) / 128;
+  __shared__ uint64_t packets[Staged ? kStageWords : 1];
   if constexpr (Staged) {
     static_assert(Compact && FullWidth && Prefetch);
     const auto* first_tile = reinterpret_cast<const uint64_t*>(
@@ -155,7 +155,7 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
 #pragma unroll
     for (int i = 0; i < kWordsPerThread; ++i) {
       const int word = threadIdx.x + i * 128;
-      if (word < kPacketWords) packets[word] = first_tile[word];
+      if (word < kStageWords) packets[word] = first_tile[word];
     }
   }
   for (int block = begin; block < end; ++block) {
@@ -163,7 +163,8 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
     if constexpr (Staged) {
       __syncthreads();
       // SM70 has no cp.async. Hold the following block in registers while
-      // every warp decodes and multiplies the current shared packet block.
+      // every warp decodes and multiplies the current shared block. Include
+      // original d/scales so reconstruction needs no serial metadata LDG.
       if (block + 1 < end) {
         const auto* next_tile = reinterpret_cast<const uint64_t*>(
             weight + int64_t{col_begin} * blocks * Packed::kBlockBytes +
@@ -171,7 +172,7 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
 #pragma unroll
         for (int i = 0; i < kWordsPerThread; ++i) {
           const int word = threadIdx.x + i * 128;
-          if (word < kPacketWords) next_words[i] = next_tile[word];
+          if (word < kStageWords) next_words[i] = next_tile[word];
         }
       }
     }
@@ -183,7 +184,9 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
       tile = weight + int64_t{col_begin} * blocks * Packed::kBlockBytes +
              int64_t{block} * width * Packed::kBlockBytes;
       if (FullWidth || col_begin + bcol < n)
-        parameters = Packed::template parameters<FullWidth>(tile, width, bcol);
+        parameters = Packed::template parameters<FullWidth>(
+            Staged ? reinterpret_cast<const uint8_t*>(packets) : tile, width,
+            bcol);
     } else {
       // All loaders in a warp read consecutive uint64 words of one source row.
       for (int row = warp; row < NT; row += 4) {
@@ -284,7 +287,7 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
 #pragma unroll
         for (int i = 0; i < kWordsPerThread; ++i) {
           const int word = threadIdx.x + i * 128;
-          if (word < kPacketWords) packets[word] = next_words[i];
+          if (word < kStageWords) packets[word] = next_words[i];
         }
       }
     } else if constexpr (!Compact) {

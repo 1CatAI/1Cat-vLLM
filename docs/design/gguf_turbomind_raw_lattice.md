@@ -402,3 +402,31 @@ only about 30% active warps in dense node counters. The benchmark exposes
 CTA targets as explicit command arguments, retains the one-split candidate,
 and records every resulting split count. This changes no arithmetic or
 persistent weight storage; model dispatch remains gated.
+
+## CTA coverage and remaining metadata loads
+
+With CTA targets of 4/8/16 per SM, higher split counts reduce dense M5/M8
+latency but do not improve M16. The core remains `bb42559ab8`; only benchmark
+arguments change. Graph timings retain the same bank and FP32 contract.
+
+| Projection | M | Canonical µs | Best compact µs | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 5 | 34.851 | 40.261 | compact_mma_prefetch_split10 |
+| 27B gate | 8 | 36.592 | 40.906 | compact_mma_prefetch_split5 |
+| 27B gate | 16 | 39.577 | 58.763 | compact_mma_staged_split3 |
+| 27B down | 5 | 31.667 | 40.525 | compact_mma_prefetch_split4 |
+| 27B down | 8 | 32.164 | 41.076 | compact_mma_prefetch_split4 |
+| 27B down | 16 | 37.817 | 62.493 | compact_mma_staged_split2 |
+
+A node capture of packet-only shared staging at gate M16/split3 records
+9,759,456 DRAM read bytes, 30.68% active warps, 80 registers per thread,
+52.29% long-scoreboard stall and 9.09% short-scoreboard stall. Barrier stall
+is 4.31%. Temporary shared memory is 13,568 bytes per CTA. These counters
+remain separate from unprofiled latency.
+
+Packet-only staging still loads the original d/scale planes from global
+memory once each block. The next candidate stages the complete equal-byte
+block, including both metadata planes. Its register prefetch has the same
+word count per thread because 110/82-byte blocks still fit within four/three
+coalesced uint64 words per thread. Persistent storage and arithmetic are
+unchanged. Numerical and speed validation of this extension is pending.
