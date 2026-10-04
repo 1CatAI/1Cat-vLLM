@@ -40,10 +40,8 @@ def test_original_payload_and_tp_slicing(kind):
 
 
 @pytest.mark.parametrize("kind", [21, 22])
-@pytest.mark.parametrize(
-    "factor_scale,float_grid", [(False, False), (True, False), (True, True)]
-)
-def test_raw_dequant_and_vector_graph(kind, factor_scale, float_grid):
+@pytest.mark.parametrize("factor_scale", [False, True])
+def test_raw_dequant_and_vector_graph(kind, factor_scale):
     data = packed(kind)
     raw = RawGGUFProjection.from_rows(data, kind)
     w = torch.from_numpy(raw.data).cuda()
@@ -63,7 +61,7 @@ def test_raw_dequant_and_vector_graph(kind, factor_scale, float_grid):
         for prefetch in (False, True):
             run = lambda splits=splits, prefetch=prefetch: (
                 torch.ops._C.gguf_lattice_raw_vec_sm70_out(
-                    out, x, w, kind, partial, splits, prefetch, factor_scale, float_grid
+                    out, x, w, kind, partial, splits, prefetch, factor_scale
                 )
             )
             for _ in range(3):
@@ -557,3 +555,83 @@ def test_compact_turbomind_fp16_workspace_graph(kind, cancellation, dq_partition
             torch.testing.assert_close(
                 out.float(), x.float() @ expected.float().T, rtol=0.003, atol=0.01
             )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("row_tile", [64, 128])
+@pytest.mark.parametrize("n", [32, 160])
+def test_compact_prefill_rows_and_fp32_partials_graph(kind, row_tile, n):
+    m, k = 513, 768
+    data = packed(kind, n=n, k=k)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+        .float()
+    )
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    temporary = torch.empty((3, m, n), device="cuda", dtype=torch.float32)
+    for splits in (1, 3):
+        run = partial(
+            torch.ops._C.gguf_lattice_compact_prefill_sm70_out,
+            out,
+            x,
+            weight,
+            kind,
+            temporary,
+            splits,
+            row_tile,
+        )
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), x.float() @ reference.T, rtol=0.003, atol=0.01
+        )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_compact_prefill_cancellation_uses_fp32_partials(kind):
+    n, k, m = 1536, 2560, 512
+    _, size = quant_size(kind)
+    blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+    blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    data = blocks.reshape(n, -1)
+    assert np.all(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)) == 1)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x = torch.full((m, k), 128.0, device="cuda", dtype=torch.float16)
+    x[:, k // 2 :] = -128.0
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    temporary = torch.empty((4, m, n), device="cuda", dtype=torch.float32)
+    for row_tile in (64, 128):
+        for splits in (1, 2, 4):
+            run = partial(
+                torch.ops._C.gguf_lattice_compact_prefill_sm70_out,
+                out,
+                x,
+                weight,
+                kind,
+                temporary,
+                splits,
+                row_tile,
+            )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            x.neg_()
+            graph.replay()
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)

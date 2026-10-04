@@ -340,7 +340,10 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
         (f"gguf_lattice_{layout}_blas_sm70_out", 512, None),
     )
     if layout == "compact":
-        bands += (("gguf_lattice_compact_tm_f16_sm70_out", 512, None),)
+        bands += (
+            ("gguf_lattice_compact_tm_f16_sm70_out", 512, None),
+            ("gguf_lattice_compact_prefill_sm70_out", 512, None),
+        )
     return tuple(
         GGUFOperatorCapability(
             decoder_family(source_type),
@@ -352,7 +355,12 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
             reason=reason
             or (
                 "fp16_workspace_requires_output_pack_alignment"
-                if operator == "gguf_lattice_compact_tm_f16_sm70_out" and n % 32
+                if operator
+                in (
+                    "gguf_lattice_compact_tm_f16_sm70_out",
+                    "gguf_lattice_compact_prefill_sm70_out",
+                )
+                and n % 32
                 else None
             )
             or (None if hasattr(torch.ops._C, operator) else "operator_unavailable"),

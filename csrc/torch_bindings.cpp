@@ -238,6 +238,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_lattice_compact_tm_f16_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_tm_f16_sm70_out);
   ops.def(
+      "gguf_lattice_compact_prefill_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, int source_type, Tensor(b!) partial, int splits=1, "
+      "int row_tile=64) -> ()");
+  ops.impl("gguf_lattice_compact_prefill_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_prefill_sm70_out);
+  ops.def(
       "gguf_lattice_raw_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, int "
       "tile_n=32) -> ()");
@@ -251,7 +257,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "gguf_lattice_raw_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
-      "prefetch=False, bool factor_scale=False, bool float_grid=False) -> ()");
+      "prefetch=False, bool factor_scale=False) -> ()");
   ops.impl("gguf_lattice_raw_vec_sm70_out", torch::kCUDA,
            &gguf_lattice_raw_vec_sm70_out);
   ops.def(
