@@ -53,6 +53,9 @@ def main():
     )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--profile", choices=("canonical", "raw"))
+    p.add_argument(
+        "--profile-route", help="Force the unprofiled raw winner for counters"
+    )
     a = p.parse_args()
     assert "site-packages" in vllm.__file__, vllm.__file__
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -131,6 +134,7 @@ def main():
         "n": n,
         "k": k,
         "graph": "FULL",
+        "profiled_run": bool(a.profile),
         "timing_cache_state": "distinct_weight_banks",
         "timing_weight_banks": banks,
         "l2_bytes": l2_bytes,
@@ -265,15 +269,28 @@ def main():
         )
         save()
         if a.profile:
+            selected = a.profile_route or best["route"]
+            if a.profile == "raw" and selected not in {name for name, _ in candidates}:
+                p.error(f"Unknown raw profile candidate: {selected}")
             call = (
                 old
                 if a.profile == "canonical"
-                else next(call for name, call in candidates if name == best["route"])
+                else next(call for name, call in candidates if name == selected)
             )
-            for _ in range(3):
-                call()
+            report["profile_operator"] = (
+                old_name if a.profile == "canonical" else selected
+            )
+            save()
+            # TurboMind workspaces are keyed by stream. Warm the same stream
+            # used for capture, otherwise workspace zeroing enters the graph.
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    call()
+            torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=stream):
                 call()
             graph.replay()
             torch.accelerator.synchronize()
