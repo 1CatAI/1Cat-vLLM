@@ -168,7 +168,10 @@ class Qwen35Adapter:
             if quantized and (not self.is_linear(name) or dense_fallback):
                 # Embeddings and convolution use the model's dense parameters.
                 data = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
-                weight = torch.from_numpy(data.copy())
+                # Dequantization already owns a new dense array. Retain it
+                # through Torch instead of duplicating the full vocabulary
+                # table in each TP worker before dtype conversion.
+                weight = torch.from_numpy(data)
             elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
                 data = tensor.data.view(np.uint16).copy()
                 weight = torch.from_numpy(data).view(torch.bfloat16)
