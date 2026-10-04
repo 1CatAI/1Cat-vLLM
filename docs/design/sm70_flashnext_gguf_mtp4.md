@@ -131,8 +131,9 @@ both arms: Paris, arithmetic, translation and a Chinese explanation. Worker
 reports confirm automatic direct-ring admission; large padded graph shapes
 report the calibrated-byte-range fallback. The C4 tensors exceed the small
 message limit. This is a dense-model check, not Flash-Next MTP4 latency.
-Startup and compilation are excluded from decode. The full fixed quality set,
-including long needles, is pending.
+Startup and compilation are excluded from decode. This smoke is complete.
+The collective merge check uses Flash-Next C1/C4, identical outputs and natural
+prompt termination; long-form model quality belongs to the model integration.
 
 Final model gates use 256K capacity, 8K input, greedy and temperature 0.7,
 teacher-forced distribution checks, eight prompts of at least 600 generated
