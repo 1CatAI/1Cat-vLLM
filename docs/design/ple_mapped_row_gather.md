@@ -65,3 +65,21 @@ or an unguarded spawn entry. Every launch writes a completion summary, including
 failures. Normal quality mode retains anomaly reports; a single anomalous output
 requires three different seeds in both arms before a candidate-specific failure
 can be established. Existing health detection alone is not that comparison.
+
+The normal installed SM70 wheel passes all fourteen CPU dispatch tests without
+skips. The same retained real-row cold/warm test gives the following results;
+no private operator binding is used in this measurement.
+
+| Installed CPU lookup | Warm us/case | Cold us/case | Cold payload GB/s | Byte error |
+| --- | ---: | ---: | ---: | ---: |
+| Reference row copies | 29.97 | 1502.12 | 0.00170 | 0 |
+| Native selected-page gather | 62.21 | 292.52 | 0.00875 | 0 |
+
+Each case copies exactly 2560 payload bytes (16 × 160). Its covering-page
+footprint averages 68352 bytes, ranging from 65536 to 73728; neither is a
+measurement of physical storage traffic. Payload GB/s is the copied bytes
+divided by CPU elapsed time, not GPU DRAM bandwidth or SSD throughput. Cold
+reference major faults average 16.69 per case; prefetch queues I/O before
+copying in the candidate. The warm regression is retained explicitly and the
+C1 endpoint gate remains pending. The first endpoint attempt correctly failed
+before model loading because another task held the GPU lock.
