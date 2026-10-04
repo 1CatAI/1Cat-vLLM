@@ -16,9 +16,19 @@ measured limits rather than assuming an improvement at every concurrency.
 The previous volatile-vector packet prototype is not admitted: its data/tag
 visibility and atomicity were not established. The system-fenced block variant
 is a retained negative result. The new research protocol uses naturally aligned
-64-bit atomic packets containing FP32 payload bits and a generation tag, with
-system release stores and acquire loads. Intermediate sums remain FP32 and
+64-bit atomic packets containing two losslessly encoded FP32 values and a
+two-bit generation tag, with system-scoped relaxed stores and loads. Each
+packet contains its entire payload, so it does not publish a separate memory
+object. Intermediate sums remain FP32 and
 only the final output narrows to the existing FP16 activation boundary.
+
+FP16 inputs and partial sums of up to eight inputs have FP32 exponent codes
+0, 103–145 or 255. Renumbering the exponent takes six bits; all 23 mantissa
+bits and the sign remain intact. Two 30-bit values fit alongside the tag.
+Double buffering and independent counters for active value pairs prevent
+stale packets when graph widths shrink and grow. A block-wide counter failed
+that check and was rejected. The implementation unrolls peer exchanges and
+does not require a CUDA 12.8 atomic builtin.
 
 [NVIDIA's memory model](https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/memory_model.html)
 requires native peer atomic support for system-scoped atomic accesses to GPU
@@ -32,6 +42,46 @@ changed/poisoned replay and shrinking/growing widths. Report maximum-rank
 latency; per-rank service is not complete-round latency. HC all-gather and the
 MoE reduction epilogue will use the same communication implementation after
 basic allreduce is qualified.
+
+### Operator screen
+
+Four V100 SXM2 32 GB GPUs at 300 W, CUDA 12.8.93, Torch 2.10.0+cu128,
+FP16 input/output and FP32 partial sums. Each point uses six alternating
+samples and 96 collectives per CUDA graph. Times below are the largest
+per-rank median. These are research-extension results; installed framework
+validation is still pending.
+
+| M | Input bytes | Ring µs | NCCL µs | Remote packet stores per rank |
+|---|---:|---:|---:|---:|
+| 1 | 5,120 | 3.522 | 13.626 | 20,480 B |
+| 2 | 10,240 | 3.606 | 13.349 | 40,960 B |
+| 4 | 20,480 | 4.545 | 15.882 | 81,920 B |
+| 5 | 25,600 | 4.999 | 16.652 | 102,400 B |
+| 8 | 40,960 | 7.258 | 18.408 | 163,840 B |
+| 16 | 81,920 | 13.130 | 18.926 | 327,680 B |
+
+All four ranks passed 31 replay checks, including odd tails, changed and
+poisoned outputs, width changes, subnormals and an independent FP64 oracle.
+Packet-store bandwidth is 5.814 GB/s at M1 and 20.484 GB/s at M5; this excludes
+polling and read traffic. Each 100 nonoverlapped calls projects a 1.010 ms M1
+or 1.165 ms M5 saving. Actual speculative-round call counts and overlap have
+not yet been collected, so no complete-round speedup is inferred.
+
+A second screen using explicit PTX system-scoped accesses passed the same 31
+checks per rank. Maximum-rank medians were 3.734 µs at M1 and 5.024 µs at M5;
+the M5 result is slightly above the target and requires further validation.
+
+The framework enables only a four-rank SM70 direct NVLink ring with native
+peer atomics, contiguous local FP16 input and a payload of at most 25,600
+bytes. Other hardware, full-mesh groups, larger inputs and batch-invariant
+reduction retain existing dispatch. Startup observations report admission
+and fallback reasons. HC all-gather and the weighted MoE epilogue are pending.
+The focused capability and existing acceleration-report suite passes 48 tests.
+Formal source compilation and installed graph/lifecycle checks are pending.
+
+Rejected variants remain useful bounds: uncompressed release/acquire packets
+took about 26.7/44.1 µs at M1/M5; relaxed uncompressed packets took about
+6.0/17.9 µs. Neither met the small-message target.
 
 ## Model and measurement gates
 
@@ -56,5 +106,10 @@ needles, and a C4 regression smoke. Numerical limits are mean/p99/max KL
 against FP32 dequantization of the same GGUF checkpoint. Rejection sampling
 must preserve the reference target distribution.
 
-Current status: research protocol compilation and model integration checks
-are in progress. No new collective speedup or IQ3_S MTP4 baseline is claimed.
+The separate draft loader has passed focused sharing and quantization
+configuration tests in a clean installed wheel. The original checkpoint
+contains 31 BF16 MTP tensors, totaling 5,214,301,696 bytes. All values are
+finite, but converting to FP16 changes 583,979 values. The draft path must
+retain BF16 weights and use a compatible reader before model measurements.
+An IQ3_S MTP4 baseline, acceptance statistics and model quality gates remain
+pending.

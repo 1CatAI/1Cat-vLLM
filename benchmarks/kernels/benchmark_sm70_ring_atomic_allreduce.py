@@ -89,17 +89,31 @@ def worker(rank, args, order, port):
         world_size=world,
         timeout=datetime.timedelta(seconds=120),
     )
-    torch.ops.load_library(str(args.library.resolve()))
+    if args.library:
+        torch.ops.load_library(str(args.library.resolve()))
     stages = world.bit_length() - 1
     capacity = (16 * args.hidden + 1) // 2
-    blocks = (2 * capacity + 255) // 256
     logical = order.index(rank)
     neighbors = {order[logical ^ (1 << bit)] for bit in range(stages)} | {rank}
-    pointers = CustomAllreduce.create_shared_buffer(
-        2 * stages * capacity * 16 + 2 * stages * blocks * 4,
-        group=dist.group.WORLD,
-        peer_ranks=neighbors,
-    )
+    ring = None
+    if args.library:
+        pointers = CustomAllreduce.create_shared_buffer(
+            2 * stages * capacity * 8,
+            group=dist.group.WORLD,
+            peer_ranks=neighbors,
+        )
+    else:
+        from vllm.distributed.device_communicators.sm70_ring import (
+            Sm70RingCommunicator,
+        )
+
+        ring = Sm70RingCommunicator(
+            dist.group.WORLD, torch.device(f"cuda:{rank}"), "screen", True
+        )
+        if not ring.status["enabled"]:
+            raise RuntimeError(f"Framework rejected transport: {ring.status}")
+        pointers = ring.pointers
+        capacity = ring.capacity
     # System-scoped atomic operations on peer device memory require native
     # atomics on every accessed edge, in addition to direct NVLink access.
     cudart = ctypes.CDLL(str(Path(os.environ["CUDA_HOME"]) / "lib64/libcudart.so"))
@@ -110,8 +124,16 @@ def worker(rank, args, order, port):
         )
         if status or supported.value != 1:
             raise RuntimeError(f"Native peer atomics unavailable: {rank}->{peer}")
-    addresses = torch.tensor(pointers, dtype=torch.int64, device="cuda")
-    counters = torch.zeros(blocks, dtype=torch.int32, device="cuda")
+    addresses = (
+        ring.addresses
+        if ring
+        else torch.tensor(pointers, dtype=torch.int64, device="cuda")
+    )
+    counters = (
+        ring.counters
+        if ring
+        else torch.zeros(capacity, dtype=torch.int32, device="cuda")
+    )
     nccl = PyNcclCommunicator(dist.group.WORLD, device=rank)
     if not nccl.available or nccl.disabled:
         raise RuntimeError("No PyNCCL control")
@@ -129,6 +151,10 @@ def worker(rank, args, order, port):
             8 * args.hidden,
             16 * args.hidden,
         ):
+            if ring and size * 2 > ring.policy.max_bytes:
+                rejected = torch.empty(size, device="cuda", dtype=torch.float16)
+                assert ring.all_reduce(rejected) is None
+                continue
             x = torch.empty(size, device="cuda", dtype=torch.float16)
             candidate = torch.empty_like(x)
             x.fill_(rank + 1)
@@ -146,19 +172,26 @@ def worker(rank, args, order, port):
             torch.cuda.synchronize()
             expected = world * (world + 1) / 2
             if not bool((candidate == expected).all()):
-                raise RuntimeError("Initial transport arithmetic mismatch")
+                raise RuntimeError(
+                    f"Initial transport arithmetic mismatch rank={rank} size={size}: "
+                    f"{candidate[:8].cpu().tolist()} expected={expected}"
+                )
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                torch.ops._C.sm70_ring_atomic_allreduce_out(
-                    candidate,
-                    x,
-                    addresses,
-                    counters,
-                    order,
-                    rank,
-                    capacity,
-                    args.block_packets,
-                )
+                if ring:
+                    candidate = ring.all_reduce(x)
+                    assert candidate is not None
+                else:
+                    torch.ops._C.sm70_ring_atomic_allreduce_out(
+                        candidate,
+                        x,
+                        addresses,
+                        counters,
+                        order,
+                        rank,
+                        capacity,
+                        args.block_packets,
+                    )
             graphs[size] = (graph, x, candidate)
 
         # Exercise odd tails and independently counted inactive blocks when
@@ -214,6 +247,8 @@ def worker(rank, args, order, port):
 
         for m in (1, 2, 4, 5, 8, 16):
             size = m * args.hidden
+            if ring and size * 2 > ring.policy.max_bytes:
+                continue
             inputs = [
                 torch.randn(size, device="cuda", dtype=torch.float16)
                 for _ in range(args.calls)
@@ -269,7 +304,7 @@ def worker(rank, args, order, port):
             case = {
                 "M": m,
                 "input_bytes": size * 2,
-                "packet_store_bytes_per_rank": size * 8 * stages,
+                "packet_store_bytes_per_rank": ((size + 1) // 2) * 8 * stages,
                 "grid_blocks": (size + 255) // 256,
                 "samples_us": samples,
                 "median_us": [statistics.median(s) for s in samples],
@@ -286,14 +321,30 @@ def worker(rank, args, order, port):
         graphs.clear()
         torch.cuda.synchronize()
         dist.barrier()
-        CustomAllreduce.free_shared_buffer(pointers, rank=rank)
+        if ring:
+            ring.close()
+            for _ in range(2):
+                reopened = Sm70RingCommunicator(
+                    dist.group.WORLD, torch.device(f"cuda:{rank}"), "reopen", True
+                )
+                output = reopened.all_reduce(
+                    torch.full((257,), rank + 1, device="cuda", dtype=torch.float16)
+                )
+                assert output is not None and bool((output == 10).all())
+                reopened.close()
+        else:
+            CustomAllreduce.free_shared_buffer(pointers, rank=rank)
         nccl.destroy()
         dist.destroy_process_group()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument(
+        "--library",
+        type=Path,
+        help="Research extension; omit to validate the installed framework",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--hidden", type=int, default=2560)
@@ -310,20 +361,26 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "complete": False,
-        "research_only": True,
+        "research_only": args.library is not None,
         "endpoint": False,
         "world": len(devices),
         "devices": devices,
         "uuid": uuids,
         "rank_order": order,
         "direct_nvlink": direct,
-        "library_sha256": hashlib.sha256(args.library.read_bytes()).hexdigest(),
         "hidden": args.hidden,
         "calls_per_graph": args.calls,
         "block_packets": args.block_packets,
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
     }
+    if args.library:
+        library = args.library
+    else:
+        import vllm._C
+
+        library = Path(vllm._C.__file__)
+    report["library_sha256"] = hashlib.sha256(library.read_bytes()).hexdigest()
     args.out.write_text(json.dumps(report, indent=2) + "\n")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

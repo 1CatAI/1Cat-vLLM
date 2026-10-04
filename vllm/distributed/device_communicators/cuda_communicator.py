@@ -198,6 +198,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     scope="global",
                 )
 
+        from .sm70_ring import Sm70RingCommunicator
+
+        self.ring_comm = Sm70RingCommunicator(
+            self.cpu_group, self.device, self.unique_name, use_custom_allreduce
+        )
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -275,6 +280,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """
         all_potential_ar_backends = [
             "NCCL_SYMM_MEM",
+            "SM70_RING",
             "QUICK_REDUCE",
             "FLASHINFER",
             "CUSTOM",
@@ -306,6 +312,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and nccl_symm_ws_ok
         ):
             enabled_ar_backends.append("NCCL_SYMM_MEM")
+        if self.ring_comm.status["enabled"]:
+            enabled_ar_backends.append("SM70_RING")
         if self.qr_comm is not None and not self.qr_comm.disabled:
             enabled_ar_backends.append("QUICK_REDUCE")
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
@@ -340,6 +348,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if out is not None:
                 _trace_all_reduce_path(self, "nccl_symmetric", input_)
                 return out
+        ring_out = self.ring_comm.all_reduce(input_)
+        if ring_out is not None:
+            _trace_all_reduce_path(self, "sm70_ring", input_)
+            return ring_out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
@@ -617,6 +629,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        ring_comm = getattr(self, "ring_comm", None)
+        if ring_comm is not None:
+            ring_comm.close()
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
