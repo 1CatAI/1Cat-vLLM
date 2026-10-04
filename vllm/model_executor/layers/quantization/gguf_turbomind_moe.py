@@ -16,6 +16,9 @@ from vllm.model_executor.kernels.gguf import (
     lattice_grouped_capabilities,
     select_lattice_grouped_capability,
 )
+from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
+    SM70_SMALL_ROUTING,
+)
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
@@ -235,10 +238,25 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             bank.finalize()
             banks[shard] = bank
         layer.gguf_expert_banks = banks
+        self.small_routing = bool(
+            self.native_enabled
+            and self.params_dtype == torch.float16
+            and self.num_experts == 512
+            and self.hidden_size == 2560
+            and layer.ep_size == 1
+        )
         self.native_admission = {
             "enabled": True,
             "tp_size": layer.tp_size,
             "ep_size": layer.ep_size,
+            "routing": {
+                **asdict(SM70_SMALL_ROUTING),
+                "enabled": self.small_routing,
+                "reason": None
+                if self.small_routing
+                else "requires_fp16_512_experts_hidden2560_without_ep",
+                "outside_m_band": "legacy_alignment_and_fp32_weighted_sum",
+            },
             "projections": {
                 name: {
                     "source_type": quant_type_name(bank.source_type),
@@ -261,24 +279,33 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             )
         if x.shape[0] == 0:
             return torch.empty_like(x)
-        ids = topk_ids.long()
+        ids = topk_ids
         mask = None
         if layer.expert_map is not None:
             ids = layer.expert_map[ids]
             mask = ids >= 0
             ids = ids.clamp_min(0)
         tokens, top_k = ids.shape
-        sorted_ids, order = ids.reshape(-1).sort()
-        boundaries = torch.arange(
-            self.num_experts + 1, device=x.device, dtype=torch.int64
-        )
-        offsets = torch.searchsorted(sorted_ids, boundaries).to(torch.int32)
-        routed = x[torch.div(order, top_k, rounding_mode="floor")].contiguous()
+        small_routing = self.small_routing and layer.expert_map is None
+        if small_routing:
+            routed, offsets, sorted_ids, inverse = (
+                torch.ops.vllm.sm70_small_expert_route(x, topk_ids, self.num_experts)
+            )
+        else:
+            ids = ids.long()
+            sorted_ids, order = ids.reshape(-1).sort()
+            boundaries = torch.arange(
+                self.num_experts + 1, device=x.device, dtype=torch.int64
+            )
+            offsets = torch.searchsorted(sorted_ids, boundaries).to(torch.int32)
+            routed = x[torch.div(order, top_k, rounding_mode="floor")].contiguous()
         bank = layer.gguf_expert_banks
         gate = bank["w1"](routed, offsets, sorted_ids)
         up = bank["w3"](routed, offsets, sorted_ids)
         hidden = torch.nn.functional.silu(gate) * up
         down = bank["w2"](hidden.contiguous(), offsets, sorted_ids)
+        if small_routing:
+            return torch.ops.vllm.sm70_small_expert_unroute(down, inverse, topk_weights)
         restored = down[order.argsort()].view(tokens, top_k, self.hidden_size)
         if mask is not None:
             restored = torch.where(mask[..., None], restored, 0)
