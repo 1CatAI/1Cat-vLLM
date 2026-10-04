@@ -125,7 +125,7 @@ __global__ void reduce_vec(half* out, const float* partial, int n, int splits) {
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
 __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int m, int n, int k,
                                int stride, int splits) {
@@ -144,7 +144,37 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
   const int blocks = k / 256;
   const int begin = blocks * blockIdx.z / splits;
   const int end = blocks * (blockIdx.z + 1) / splits;
+  constexpr int kPacketWords = Packed::kPacketBytesPerRow * 32 / 8;
+  constexpr int kWordsPerThread = (kPacketWords + 127) / 128;
+  __shared__ uint64_t packets[Staged ? kPacketWords : 1];
+  if constexpr (Staged) {
+    static_assert(Compact && FullWidth && Prefetch);
+    const auto* first_tile = reinterpret_cast<const uint64_t*>(
+        weight + int64_t{col_begin} * blocks * Packed::kBlockBytes +
+        int64_t{begin} * 32 * Packed::kBlockBytes);
+#pragma unroll
+    for (int i = 0; i < kWordsPerThread; ++i) {
+      const int word = threadIdx.x + i * 128;
+      if (word < kPacketWords) packets[word] = first_tile[word];
+    }
+  }
   for (int block = begin; block < end; ++block) {
+    uint64_t next_words[kWordsPerThread]{};
+    if constexpr (Staged) {
+      __syncthreads();
+      // SM70 has no cp.async. Hold the following block in registers while
+      // every warp decodes and multiplies the current shared packet block.
+      if (block + 1 < end) {
+        const auto* next_tile = reinterpret_cast<const uint64_t*>(
+            weight + int64_t{col_begin} * blocks * Packed::kBlockBytes +
+            int64_t{block + 1} * 32 * Packed::kBlockBytes);
+#pragma unroll
+        for (int i = 0; i < kWordsPerThread; ++i) {
+          const int word = threadIdx.x + i * 128;
+          if (word < kPacketWords) next_words[i] = next_tile[word];
+        }
+      }
+    }
     const int width = FullWidth ? 32 : min(NT, n - col_begin);
     const uint8_t* tile = nullptr;
     typename Packed::Parameters parameters{};
@@ -170,7 +200,10 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
     }
     if constexpr (Compact && Prefetch) {
       const bool valid = FullWidth || col_begin + bcol < n;
-      auto current = Packed::template fetch<FullWidth>(tile, width, warp * 8);
+      const auto* packet_tile =
+          Staged ? reinterpret_cast<const uint8_t*>(packets) : tile;
+      auto current =
+          Packed::template fetch<FullWidth>(packet_tile, width, warp * 8);
       typename MMA::FragA activation[MT / 8]{};
 #pragma unroll
       for (int index = 0; index < MT / 8; ++index) {
@@ -185,7 +218,7 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
         typename Packed::PacketWindow next{};
         typename MMA::FragA next_activation[MT / 8]{};
         if (step < 56) {
-          next = Packed::template fetch<FullWidth>(tile, width,
+          next = Packed::template fetch<FullWidth>(packet_tile, width,
                                                    warp * 8 + step / 8 + 1);
 #pragma unroll
           for (int index = 0; index < MT / 8; ++index) {
@@ -245,7 +278,18 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
         }
       }
     }
-    if constexpr (!Compact) __syncthreads();
+    if constexpr (Staged) {
+      __syncthreads();
+      if (block + 1 < end) {
+#pragma unroll
+        for (int i = 0; i < kWordsPerThread; ++i) {
+          const int word = threadIdx.x + i * 128;
+          if (word < kPacketWords) packets[word] = next_words[i];
+        }
+      }
+    } else if constexpr (!Compact) {
+      __syncthreads();
+    }
   }
   const auto origin = MMA::thread_offset_C();
   constexpr auto offsets = MMA::static_offset_C();
@@ -436,12 +480,12 @@ __global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
 void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
                 torch::Tensor partial, int splits, cudaStream_t stream) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   const dim3 grid((n + NT - 1) / NT, (m + MT - 1) / MT, splits);
-  raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch>
+  raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>
       <<<grid, 128, 0, stream>>>(
           reinterpret_cast<half*>(out.data_ptr()),
           splits > 1 ? partial.data_ptr<float>() : nullptr,
@@ -794,7 +838,7 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
                                        torch::Tensor partial, int64_t splits,
-                                       bool prefetch) {
+                                       bool prefetch, bool staged) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -807,24 +851,32 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                     partial.is_contiguous() &&
                     partial.numel() >= splits * m * n,
                 "Compact MMA requires FP32 partial storage");
+  TORCH_CHECK(!staged || n % 32 == 0,
+              "Compact shared staging requires complete N32 tiles");
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_MMA(TYPE, FULL, PREFETCH)                                      \
-  if (m <= 8)                                                                  \
-    launch_mma<TYPE, 32, 8, true, FULL, PREFETCH>(out, input, weight, partial, \
-                                                  splits, stream);             \
-  else if (m <= 16)                                                            \
-    launch_mma<TYPE, 32, 16, true, FULL, PREFETCH>(out, input, weight,         \
-                                                   partial, splits, stream);   \
-  else                                                                         \
-    launch_mma<TYPE, 32, 32, true, FULL, PREFETCH>(out, input, weight,         \
-                                                   partial, splits, stream)
-#define COMPACT_SELECT(TYPE, FULL)  \
-  if (prefetch) {                   \
-    COMPACT_MMA(TYPE, FULL, true);  \
-  } else {                          \
-    COMPACT_MMA(TYPE, FULL, false); \
+#define COMPACT_MMA(TYPE, FULL, PREFETCH, STAGED)           \
+  if (m <= 8)                                               \
+    launch_mma<TYPE, 32, 8, true, FULL, PREFETCH, STAGED>(  \
+        out, input, weight, partial, splits, stream);       \
+  else if (m <= 16)                                         \
+    launch_mma<TYPE, 32, 16, true, FULL, PREFETCH, STAGED>( \
+        out, input, weight, partial, splits, stream);       \
+  else                                                      \
+    launch_mma<TYPE, 32, 32, true, FULL, PREFETCH, STAGED>( \
+        out, input, weight, partial, splits, stream)
+#define COMPACT_SELECT(TYPE, FULL)         \
+  if (prefetch) {                          \
+    COMPACT_MMA(TYPE, FULL, true, false);  \
+  } else {                                 \
+    COMPACT_MMA(TYPE, FULL, false, false); \
   }
-  if (source_type == 21) {
+  if (staged) {
+    if (source_type == 21) {
+      COMPACT_MMA(21, true, true, true);
+    } else {
+      COMPACT_MMA(22, true, true, true);
+    }
+  } else if (source_type == 21) {
     if (n % 32 == 0) {
       COMPACT_SELECT(21, true);
     } else {

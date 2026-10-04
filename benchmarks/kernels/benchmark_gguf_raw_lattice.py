@@ -360,6 +360,23 @@ def main():
                             ),
                         )
                     )
+                    if n % 32 == 0:
+                        candidates.append(
+                            (
+                                f"compact_mma_staged_split{split}",
+                                partial(
+                                    torch.ops._C.gguf_lattice_compact_mma_sm70_out,
+                                    out,
+                                    x,
+                                    compact,
+                                    kind,
+                                    tmp,
+                                    split,
+                                    True,
+                                    True,
+                                ),
+                            )
+                        )
             else:
                 candidates.append(
                     (

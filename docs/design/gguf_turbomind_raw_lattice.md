@@ -47,7 +47,7 @@ the initial capability records.
 
 ## Validation and performance status
 
-All 12 focused checks pass, including official dequantization, split-K,
+All 20 focused checks pass, including official dequantization, split-K,
 N tails, and changed-input CUDA graph replay. The four real projections
 also have zero FP32 dequantization error. Across all tested candidates the
 maximum output relative L2 error is 0.000217, including the final FP16 output
@@ -139,8 +139,8 @@ expanded scale or index cache belongs to the format. A warp reads 13/9
 consecutive uint64 packet words per K octet and uses shuffle to extract its
 26/18-bit packet. Original scales are loaded once per 256-value block and
 multiplied in FP32. This removes per-block raw staging barriers from MMA.
-The new operators are compiled in the same normal extension. GPU numerical,
-bit-for-bit inverse, and speed checks for this candidate are still pending.
+The new operators are compiled in the same normal extension. The numerical,
+bit-for-bit inverse and real-shape speed results follow below.
 
 The first counter experiment exposed a harness issue: its canonical graph
 captured a 32 MiB workspace initialization because warmup used a different
@@ -323,3 +323,43 @@ still fail parity. Expert projections improve at all measured M. Flash gate
 M512 and output M16/M512 remain gaps. Original-byte storage is proven; speed
 parity across the required shapes is not. No model default or persistent
 canonical storage removal is justified yet.
+
+## Prefetch counters and rejected vector variant
+
+Post-prefetch node counters use the same cold-cache capture contract and
+`compact_mma_prefetch_split3`. Core SHA256 is
+`ef268dee78f95e4e56dbe8510d6c257356ab83ea143d6199dcdf0c3928cf26fc`.
+The additional vector change in this build does not alter these MMA kernels.
+The counters measure the main MMA node, excluding the FP32 split reduction.
+
+| 27B gate M | DRAM read bytes | Active warps | Registers/thread | Long scoreboard | Before prefetch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 | 9,674,720 | 30.10% | 56 | 48.17% | 65.42% |
+| 16 | 9,758,432 | 30.48% | 72 | 62.81% | 67.60% |
+
+Main-node reads are close to the 9,574,400-byte weight payload and remain
+below canonical main-node reads. Remaining traffic includes activations and
+codebooks; reduction-node traffic is additional. Prefetch reduces the stall
+but leaves substantial global load latency, particularly at M16.
+
+A separate next-block prefetch experiment for warp-parallel K vector decode
+(`3a01698a25`) passes all 20 checks in 5.89 s but does not improve dense M1.
+It is reverted rather than selected by default. Its matched full-graph M1
+results are retained below. The existing original-row vector remains an
+independent candidate.
+
+| Projection | Canonical µs | Compact row-vector prefetch µs |
+| --- | ---: | ---: |
+| 27B gate | 33.775 | 40.539 |
+| 27B down | 30.877 | 40.275 |
+| IQ3_S expert | 16.233 | 6.952 |
+| IQ2_S expert | 18.097 | 9.618 |
+| Flash gate | 18.233 | 11.110 |
+| Flash output | 15.288 | 10.220 |
+
+The next MMA candidate stages a complete equal-byte packet block in shared
+memory. It holds the next block's coalesced 64-bit words in registers while
+computing the current block. Two CTA barriers protect reuse of shared packet
+storage. This adds only temporary storage, retains the original d/scale
+planes, and preserves FP32 reconstruction and accumulation. Full N32 tiles
+are initially required; an unsupported N tail returns a specific reason.
