@@ -117,28 +117,28 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     return value & ((uint32_t{1} << kPacketBits) - 1);
   }
 
-  __device__ static turbomind::Array<float, 8> fragment(Parameters parameters,
-                                                        uint32_t packet,
-                                                        int octet,
-                                                        const uint8_t* grid) {
+  template <class Output = float>
+  __device__ static turbomind::Array<Output, 8> fragment(Parameters parameters,
+                                                         uint32_t packet,
+                                                         int octet,
+                                                         const uint8_t* grid) {
     uint64_t packed;
     uint32_t signs;
-    float scale;
+    int nibble;
     if constexpr (Type == 21) {
-      const int nibble = (parameters.scales >> (4 * (octet / 4))) & 15;
-      scale = parameters.d * (1 + 2 * nibble);
+      nibble = (parameters.scales >> (4 * (octet / 4))) & 15;
       const uint32_t first = packet & 511, second = (packet >> 9) & 511;
       packed = *reinterpret_cast<const uint32_t*>(grid + first * 4) |
                (uint64_t{*reinterpret_cast<const uint32_t*>(grid + second * 4)}
                 << 32);
       signs = packet >> 18;
     } else {
-      const int nibble = (parameters.scales >> (4 * (octet / 2))) & 15;
-      scale = (parameters.d * (0.5f + nibble)) * 0.25f;
+      nibble = (parameters.scales >> (4 * (octet / 2))) & 15;
       packed = *reinterpret_cast<const uint64_t*>(grid + (packet & 1023) * 8);
       signs = packet >> 10;
     }
-    return LatticeRawDecoder<Type>::table_values(packed, signs, scale);
+    return LatticeRawDecoder<Type>::template table_fragment<Output>(
+        packed, signs, parameters.d, nibble);
   }
 };
 }  // namespace vllm::sm70_gguf

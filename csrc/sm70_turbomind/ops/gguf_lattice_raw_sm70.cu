@@ -37,7 +37,7 @@ __global__ void raw_dequant_kernel(Output* out, const uint8_t* weight, int n,
   if (row >= n) return;
   const uint8_t* data = stage_block<Type>(
       raw[warp], weight + (int64_t)row * stride, block, stride);
-  const auto values = Decode::fragment(data, lane * 8, grid);
+  const auto values = Decode::template fragment<Output>(data, lane * 8, grid);
 #pragma unroll
   for (int i = 0; i < 8; ++i)
     out[(int64_t)row * k + block * 256 + lane * 8 + i] =
@@ -59,10 +59,9 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
     if (first + row < n) {
       const uint8_t* data = stage_block<Type>(
           raw[warp], weight + (int64_t)(first + row) * stride, block, stride);
-      const auto values = Decode::fragment(data, lane * 8, grid);
+      const auto values = Decode::template fragment<half>(data, lane * 8, grid);
 #pragma unroll
-      for (int j = 0; j < 8; ++j)
-        decoded[row][lane * 8 + j] = __float2half_rn(values[j]);
+      for (int j = 0; j < 8; ++j) decoded[row][lane * 8 + j] = values[j];
       __syncwarp();
     }
   }
@@ -257,10 +256,10 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
         const uint32_t packet = Packed::extract(current, valid ? bcol : 0);
         typename MMA::FragB b{};
         if (valid) {
-          const auto values =
-              Packed::fragment(parameters, packet, warp * 8 + step / 8, grid);
+          const auto values = Packed::template fragment<half>(
+              parameters, packet, warp * 8 + step / 8, grid);
 #pragma unroll
-          for (int j = 0; j < 8; ++j) b[j] = __float2half_rn(values[j]);
+          for (int j = 0; j < 8; ++j) b[j] = values[j];
         }
 #pragma unroll
         for (int index = 0; index < MT / 8; ++index) {
@@ -279,16 +278,16 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
           const uint32_t packet = Packed::template packet<FullWidth>(
               tile, width, base / 8, valid ? bcol : 0);
           if (valid) {
-            const auto values =
-                Packed::fragment(parameters, packet, base / 8, grid);
+            const auto values = Packed::template fragment<half>(
+                parameters, packet, base / 8, grid);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) b[i] = __float2half_rn(values[i]);
+            for (int i = 0; i < 8; ++i) b[i] = values[i];
           }
         } else if (bcol < NT && col_begin + bcol < n) {
-          const auto values = Decode::fragment(
+          const auto values = Decode::template fragment<half>(
               raw[bcol] + (block * Decode::kBlockBytes & 7), base, grid);
 #pragma unroll
-          for (int i = 0; i < 8; ++i) b[i] = __float2half_rn(values[i]);
+          for (int i = 0; i < 8; ++i) b[i] = values[i];
         }
 #pragma unroll
         for (int tile = 0; tile < MT / 8; ++tile) {
@@ -410,7 +409,8 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
     const auto packet =
         Decode::packet(tile, width, octet, lane < width ? lane : 0);
     if (lane < width) {
-      const auto values = Decode::fragment(parameters, packet, octet, grid);
+      const auto values =
+          Decode::template fragment<Output>(parameters, packet, octet, grid);
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const int logical_k = block * 256 + octet * 8 + j, row = first + lane;

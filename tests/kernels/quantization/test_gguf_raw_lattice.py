@@ -289,3 +289,72 @@ def test_all_codebook_entries_and_signs(kind):
             out, storage, kind
         )
         torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        rounded = torch.empty_like(reference, dtype=torch.float16)
+        getattr(torch.ops._C, f"gguf_lattice_{layout}_dequantize_sm70_out")(
+            rounded, storage, kind
+        )
+        torch.testing.assert_close(
+            rounded.view(torch.int16),
+            reference.half().view(torch.int16),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_final_half_rounding_for_every_finite_block_scale(kind):
+    # Include signed zero, every subnormal, overflow boundaries and both signs.
+    bits = np.arange(65536, dtype=np.uint16)
+    bits = bits[(bits & 0x7C00) != 0x7C00]
+    count = len(bits)
+    _, size = quant_size(kind)
+    blocks = 2 if kind == 21 else 1
+    data = np.zeros((count, blocks, size), dtype=np.uint8)
+    data[:, :, :2] = bits.view(np.uint8).reshape(count, 1, 2)
+    quant = getattr(gguf.quants, "IQ3_S" if kind == 21 else "IQ2_S")
+    quant.init_grid()
+    grid = quant.grid.reshape(-1, 4 if kind == 21 else 8)
+    if kind == 21:
+        indices = [
+            int(np.flatnonzero(np.any(grid == value, axis=1))[0])
+            for value in np.unique(grid)
+        ]
+        for block in range(blocks):
+            for octet in range(32):
+                first, second = indices[(2 * octet) % 8], indices[(2 * octet + 1) % 8]
+                data[:, block, 2 + 2 * octet] = first & 255
+                data[:, block, 3 + 2 * octet] = second & 255
+                data[:, block, 66 + octet // 4] |= (
+                    (first >> 8) << (2 * (octet % 4))
+                ) | ((second >> 8) << (2 * (octet % 4) + 1))
+            data[:, block, 74:106] = 0x55
+            for byte in range(4):
+                low = block * 8 + byte * 2
+                data[:, block, 106 + byte] = low | ((low + 1) << 4)
+    else:
+        index = next(i for i, row in enumerate(grid) if len(np.unique(row)) == 3)
+        data[:, :, 2:34] = index & 255
+        data[:, :, 66:74] = (index >> 8) * 85
+        data[:, :, 34:66] = 0x55
+        for byte in range(8):
+            data[:, :, 74 + byte] = 2 * byte | ((2 * byte + 1) << 4)
+    data = data.reshape(count, -1)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    weight = torch.from_numpy(raw.data).cuda()
+    compact = torch.empty((data.nbytes + 7) // 8 * 8, dtype=torch.uint8, device="cuda")
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+        compact, weight, kind, raw.logical_k
+    )
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+    )
+    for layout, storage in (("raw", weight), ("compact", compact)):
+        out = torch.empty_like(reference)
+        getattr(torch.ops._C, f"gguf_lattice_{layout}_dequantize_sm70_out")(
+            out, storage, kind
+        )
+        torch.testing.assert_close(
+            out.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0
+        )

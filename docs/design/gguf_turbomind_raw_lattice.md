@@ -545,3 +545,58 @@ This holds only the following original word in registers; it does not expand
 metadata or prefetch a decoded coefficient/activation bundle. The existing
 vector candidate and its accumulation order remain unchanged. Numerical
 and speed validation of both candidates is pending.
+
+## Original vector prefetch and row-tile measurements
+
+Source `9a70e6b2f3`, core SHA256
+`d5cff734aeeb692b062cfd71f4b3c5076b0a1809f40dd8b07e721f3d07d1d8ed`,
+whole-wheel SHA256
+`d5d8c7a689ab8f4c0079ffab5bc3caee53496273ef93bf5a14f6b16ba4319e31`.
+All 22 checks pass (6.82 s), including original-word prefetch and changed-input
+M16/eight-row graph replay. M1 and M16 are the only remeasured points.
+
+| Projection | M | Canonical µs | Best original/equal-byte µs | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 1 | 31.956 | 33.012 | vec_prefetch_split1 |
+| 27B gate | 16 | 39.530 | 51.731 | compact_mma_staged_split3 |
+| 27B down | 1 | 30.740 | 31.379 | vec_prefetch_split1 |
+| 27B down | 16 | 37.998 | 50.504 | compact_mma_staged_split2 |
+| IQ3_S expert | 1 | 16.695 | 6.776 | vec_prefetch_split8 |
+| IQ3_S expert | 16 | 17.457 | 8.524 | compact_mma_staged_rows8_split10 |
+| IQ2_S expert | 1 | 18.156 | 9.496 | vec_split8 |
+| IQ2_S expert | 16 | 19.537 | 10.952 | compact_mma_staged_rows8_split10 |
+| Flash gate | 1 | 17.915 | 9.235 | vec_prefetch_split1 |
+| Flash gate | 16 | 20.235 | 14.068 | compact_mma_prefetch_split10 |
+| Flash output | 1 | 16.783 | 8.883 | vec_prefetch_split1 |
+| Flash output | 16 | 17.097 | 13.620 | compact_mma_prefetch_split6 |
+
+Original-word prefetch brings dense M1 within about 2–3% of canonical here.
+Eight-row tiles help the individual M16 experts but lose on dense 27B.
+Dense M16 remains a speed gap. Node profiling of the gate M1 vector records
+9,734,688 DRAM read bytes versus 9,574,400 weight payload bytes, 54.82% active
+warps, 38 registers/thread, 24.94% long-scoreboard stall and 17.55% math-pipe
+throttle. The counter includes activation/codebook/instruction traffic;
+its 41.024 µs profiled duration is not the unprofiled 33.012 µs graph time.
+
+## Exact final FP16 operand formation candidate
+
+IQ3_S grid magnitudes are 1/3/5/7/9/11/13/15; its small coefficient is an odd
+integer at most 31. Their product is an integer no larger than 465, exactly
+representable in FP16. IQ2_S grid magnitudes are 8/25/43 and its coefficient
+is an odd integer divided by eight; their product is at most 1333/8 and is
+also exactly representable in FP16. Original d remains in its source width.
+
+For these two formats, the product of finite FP16 d and that exact factor
+has at most 22 significant binary bits, so the official FP32 dequantization
+product is exact. Forming the final FP16 operand with one half2 multiply
+therefore has the same final rounding as FP32 dequantization followed by
+conversion to FP16. This introduces no expanded/rounded scale coefficient.
+FP32 dequantization, vector FMA and all accumulation remain in FP32.
+
+A CPU exhaustive check covers all 63,488 finite FP16 d encodings, every small
+coefficient, grid magnitude and sign: 16,252,928 IQ3_S and 6,094,848 IQ2_S
+weights. Every exact-factor and final-output bit comparison matches. This
+proof does not substitute for device validation: the new focused GPU checks
+cover every finite block scale, signed zero, subnormals, overflow boundaries
+and all small coefficients against the official reader. Numerical and speed
+validation of this candidate remains pending.
