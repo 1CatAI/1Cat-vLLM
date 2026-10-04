@@ -130,6 +130,34 @@ def test_release_profile_accepts_local_gguf_draft(tmp_path, monkeypatch, capsys)
     assert "revision" not in config
 
 
+def test_text_gguf_target_qualifies_the_same_dflash_pipeline():
+    from vllm.model_executor.models.config import sm70_dflash2_verifier_qualified
+
+    model = SimpleNamespace(
+        architectures=["Qwen3_5ForCausalLM"],
+        dtype=torch.float16,
+        hf_text_config=SimpleNamespace(
+            hidden_size=5120,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            head_dim=256,
+        ),
+    )
+    spec = SimpleNamespace(
+        method="dflash",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(
+            hf_config=gguf_config_from_metadata(metadata())
+        ),
+    )
+    parallel = SimpleNamespace(
+        pipeline_parallel_size=1, enable_dbo=False, ubatch_size=1
+    )
+    assert sm70_dflash2_verifier_qualified(model, spec, parallel)
+    model.hf_text_config.head_dim = 128
+    assert not sm70_dflash2_verifier_qualified(model, spec, parallel)
+
+
 def test_dense_auxiliaries_decode_without_qwen35_norm_offsets():
     adapter = get_gguf_adapter(gguf_config_from_metadata(metadata()), tp_size=4)
     data = gguf.quants.quantize(
