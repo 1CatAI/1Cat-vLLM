@@ -81,3 +81,32 @@ def test_replicated_hc_packing_preserves_dense_weights():
     packed_up = hc._pack_hc_batch_weight(up, "up", None)
     restored_up = packed_up.permute(3, 0, 4, 1, 2, 5).reshape(10240, 320)
     torch.testing.assert_close(restored_up, up, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "m,expected",
+    [(16, True), (17, False), (18, False), (19, False), (20, True), (21, False)],
+)
+def test_replicated_m20_admission_does_not_interpolate(m, expected, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_QWEN38_BATCH_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    from vllm import envs
+
+    envs.disable_envs_cache()
+    backend = torch.backends.cuda.matmul
+    reduced, accumulation = (
+        backend.allow_fp16_reduced_precision_reduction,
+        backend.allow_fp16_accumulation,
+    )
+    try:
+        backend.allow_fp16_reduced_precision_reduction = False
+        backend.allow_fp16_accumulation = False
+        x = torch.empty(m, 10240, dtype=torch.float16)
+        down = torch.empty(11, 640, 2, 32, 8, dtype=x.dtype)
+        up = torch.empty(320, 20, 2, 4, 8, 8, dtype=x.dtype)
+        monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        assert hc._replicated_runtime_ok(x, down, up, True) == expected
+    finally:
+        backend.allow_fp16_reduced_precision_reduction = reduced
+        backend.allow_fp16_accumulation = accumulation
+        envs.disable_envs_cache()
