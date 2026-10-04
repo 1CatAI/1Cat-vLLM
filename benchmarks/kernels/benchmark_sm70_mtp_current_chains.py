@@ -27,14 +27,16 @@ def samples(graph):
     return [elapsed(graph) for _ in range(7)]
 
 
-def hc(model):
+def hc(model, local_only=False):
     from benchmarks.kernels.benchmark_sm70_hc_tp4 import load_weights
+    from vllm import _custom_ops as native_ops
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
     from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import _pack_hc_batch_weight
 
     rank = int(os.environ["LOCAL_RANK"])
-    dist.init_process_group("gloo")
-    assert dist.get_world_size() == 4
+    if not local_only:
+        dist.init_process_group("gloo")
+        assert dist.get_world_size() == 4
     raw = load_weights(model)
     names = [f"layer {i} {role}" for i in range(48) for role in ("attn", "mlp")]
     packed = [
@@ -52,6 +54,28 @@ def hc(model):
         )
         for _ in packed
     ]
+    if local_only:
+        packets = [s[0].new_empty(5, 336) for s in state]
+        full_outputs = [s[0].new_empty(5, 2560) for s in state]
+        for s in state:
+            s[2].normal_(0, 0.03)
+
+        def down():
+            for (w, _), s, packet in zip(packed, state, packets):
+                native_ops.sm70_qwen38_hc_down_local(s[0], w, s[1], packet, rank)
+
+        def up():
+            for (_, w), s, output in zip(packed, state, full_outputs):
+                native_ops.sm70_qwen38_hc_up_local(s[2], w, s[0], output, rank)
+
+        graphs = [capture(fn) for fn in (down, up)]
+        times = [samples(g) for g in graphs]
+        return dict(
+            timing_order=["down+local packet", "up+mix+output clear"],
+            samples_ms=times,
+            medians_ms=[statistics.median(t) for t in times],
+            exclusions="all TP transport, combine/norm, final mixer",
+        )
     comm = CustomAllreduce(dist.group.WORLD, device=rank)
     assert comm.can_sm70_qwen38_hc_batch(state[0][0])
     torch.accelerator.synchronize()
@@ -151,7 +175,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--workload", choices=("hc", "moe"), required=True)
+    parser.add_argument("--workload", choices=("hc", "hc-local", "moe"), required=True)
     args = parser.parse_args()
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(rank)
@@ -161,7 +185,11 @@ def main():
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     assert torch.cuda.get_device_capability() == (7, 0)
     root = Path(__file__).resolve().parents[2]
-    result = hc(args.model) if args.workload == "hc" else moe(args.model, rank)
+    result = (
+        hc(args.model, local_only=args.workload == "hc-local")
+        if args.workload.startswith("hc")
+        else moe(args.model, rank)
+    )
     report = dict(
         complete=True,
         model_admission=False,
