@@ -512,7 +512,15 @@ def _get_ple_embedding_quant_method(
     *,
     force_fp8_storage: bool = False,
 ) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+    """Select an embedding implementation that preserves checkpoint storage."""
+
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+        GGUFEmbeddingMethod,
+    )
+
+    if isinstance(quant_config, GGUFConfig):
+        return GGUFEmbeddingMethod(quant_config)
 
     if force_fp8_storage:
         return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -1053,6 +1061,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         self.head_dim = embedding_dim // self.ngram_heads
         self.eos_token_id = int(config.eos_token_id)
+        self.eos_token_id = int(
+            getattr(config, "gguf_ple_eos_token_id", self.eos_token_id)
+        )
         self.unigram_vocab_size = int(config.vocab_size)
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         if self.split_ngram_parts <= 0:
@@ -1082,6 +1093,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             sizes.append(size)
             offsets.append(offset)
             offset += size
+        if (constants := getattr(config, "gguf_ple_constants", None)) is not None:
+            # A GGUF converter preserves the checkpoint's exact integer
+            # constants. Never regenerate them from an assumed random seed.
+            multipliers = constants["layer_multipliers"]
+            sizes = constants["ngram_heads_vocab_sizes"]
+            offsets = constants["ngram_heads_offsets"]
+            self.layer_multipliers.copy_(
+                torch.tensor(
+                    multipliers,
+                    dtype=torch.int64,
+                    device=self.layer_multipliers.device,
+                )
+            )
+            offset = offsets[-1] + sizes[-1]
         self.register_buffer(
             "ngram_heads_vocab_sizes",
             torch.tensor(sizes, dtype=torch.long),
@@ -1170,7 +1195,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.split_ngram_parts,
                 num_threads,
             )
-        elif _should_use_pinned_host_ple(config):
+        elif getattr(
+            config, "gguf_architecture", None
+        ) != "qwen4exp" and _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"
