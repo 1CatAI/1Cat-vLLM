@@ -78,19 +78,14 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
   }
 }
 
-template <int Type, bool Split, bool Prefetch = false, bool FactorScale = false,
-          bool FloatGrid = false>
+template <int Type, bool Split, bool Prefetch = false, bool FactorScale = false>
 __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int n, int k, int stride,
                                int splits) {
   using Decode = vllm::sm70_gguf::LatticeRawDecoder<Type>;
-  __shared__ __align__(16)
-      uint8_t grid[Decode::kCodebookBytes * (FloatGrid ? sizeof(float) : 1)];
+  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
   __shared__ __align__(16) uint8_t raw[4][120];
-  if constexpr (FloatGrid)
-    Decode::initialize_float(reinterpret_cast<float*>(grid));
-  else
-    Decode::initialize(grid);
+  Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int row = blockIdx.x * 4 + warp;
   if (row >= n) return;
@@ -118,13 +113,8 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
       data = raw[warp] + (block * bytes & 7);
     else
       data = stage_block<Type>(raw[warp], row_data, block, stride);
-    turbomind::Array<float, 8> values;
-    if constexpr (FloatGrid)
-      values = Decode::float_grid_fragment(
-          data, lane * 8, reinterpret_cast<const float*>(grid));
-    else
-      values =
-          Decode::template fragment<float, !FactorScale>(data, lane * 8, grid);
+    const auto values =
+        Decode::template fragment<float, !FactorScale>(data, lane * 8, grid);
     // K is block aligned and each lane owns eight adjacent half values.
     // One 128-bit load replaces eight strided 16-bit memory instructions.
     const uint4 loaded =
@@ -752,10 +742,7 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch, bool factor_scale,
-                                   bool float_grid) {
-  TORCH_CHECK(!float_grid || factor_scale,
-              "FP32 codebooks require factored FP32 vector scales");
+                                   bool prefetch, bool factor_scale) {
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() &&
                   input.scalar_type() == torch::kFloat16 &&
@@ -775,45 +762,34 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                 "Raw GGUF split-K requires FP32 partial storage");
   const dim3 grid((n + 3) / 4, splits);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define RAW_VEC(TYPE, PREFETCH, FACTOR, FLOAT_GRID)                    \
-  if (splits == 1)                                                     \
-    raw_vec_kernel<TYPE, false, PREFETCH, FACTOR, FLOAT_GRID>          \
-        <<<grid, 128, 0, stream>>>(                                    \
-            reinterpret_cast<half*>(out.data_ptr()), nullptr,          \
-            reinterpret_cast<const half*>(input.data_ptr()),           \
-            weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits); \
-  else                                                                 \
-    raw_vec_kernel<TYPE, true, PREFETCH, FACTOR, FLOAT_GRID>           \
-        <<<grid, 128, 0, stream>>>(                                    \
-            reinterpret_cast<half*>(out.data_ptr()),                   \
-            partial.data_ptr<float>(),                                 \
-            reinterpret_cast<const half*>(input.data_ptr()),           \
-            weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
-#define SELECT_RAW_VEC(TYPE, FACTOR, FLOAT_GRID) \
-  if (prefetch) {                                \
-    RAW_VEC(TYPE, true, FACTOR, FLOAT_GRID);     \
-  } else {                                       \
-    RAW_VEC(TYPE, false, FACTOR, FLOAT_GRID);    \
+#define RAW_VEC(TYPE, PREFETCH, FACTOR)                                      \
+  if (splits == 1)                                                           \
+    raw_vec_kernel<TYPE, false, PREFETCH, FACTOR><<<grid, 128, 0, stream>>>( \
+        reinterpret_cast<half*>(out.data_ptr()), nullptr,                    \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits);           \
+  else                                                                       \
+    raw_vec_kernel<TYPE, true, PREFETCH, FACTOR><<<grid, 128, 0, stream>>>(  \
+        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),  \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
+#define SELECT_RAW_VEC(TYPE, FACTOR) \
+  if (prefetch) {                    \
+    RAW_VEC(TYPE, true, FACTOR);     \
+  } else {                           \
+    RAW_VEC(TYPE, false, FACTOR);    \
   }
   if (source_type == 21) {
     if (factor_scale) {
-      if (float_grid) {
-        SELECT_RAW_VEC(21, true, true);
-      } else {
-        SELECT_RAW_VEC(21, true, false);
-      }
+      SELECT_RAW_VEC(21, true);
     } else {
-      SELECT_RAW_VEC(21, false, false);
+      SELECT_RAW_VEC(21, false);
     }
   } else {
     if (factor_scale) {
-      if (float_grid) {
-        SELECT_RAW_VEC(22, true, true);
-      } else {
-        SELECT_RAW_VEC(22, true, false);
-      }
+      SELECT_RAW_VEC(22, true);
     } else {
-      SELECT_RAW_VEC(22, false, false);
+      SELECT_RAW_VEC(22, false);
     }
   }
 #undef SELECT_RAW_VEC

@@ -1208,3 +1208,9 @@ per CTA. It removes repeated byte unpacking/conversion; original weights/scales
 are unchanged. The larger shared table may reduce occupancy, so it is optional
 and requires measured dispatch. Scale formation, local FMA and reductions
 remain FP32.
+
+The FP32 shared-codebook experiment passes all 44 checks but slows 27B gate/down
+M1 to 36.131/34.335 us. Complete FP32-scale factoring remains faster at
+32.814/30.931 us in that run. The expanded shared-codebook implementation and
+its argument are reverted; numerical precision and persistent byte budgets
+were unchanged throughout the experiment.

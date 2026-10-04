@@ -925,8 +925,7 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch, bool factor_scale,
-                                   bool float_grid);
+                                   bool prefetch, bool factor_scale);
 void gguf_lattice_raw_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor weight, int64_t source_type,
                                     torch::Tensor scratch);
