@@ -148,7 +148,9 @@ def test_disk_only_placement_never_gathers_missing_resident_rows(monkeypatch):
     )
     empty = torch.empty
     monkeypatch.setattr(
-        torch, "empty", lambda *args, **kwargs: empty(*args, **{**kwargs, "device": "cpu"})
+        torch,
+        "empty",
+        lambda *args, **kwargs: empty(*args, **{**kwargs, "device": "cpu"}),
     )
     ids = torch.tensor([[7, 9], [9, 1]])
     # Exercise the GPU dispatch decision using CPU buffers. Any resident gather
