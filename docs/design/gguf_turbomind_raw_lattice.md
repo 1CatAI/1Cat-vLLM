@@ -1247,3 +1247,9 @@ CPU metadata prepared before graph capture, without persistent caches; FP16
 dequantization and the library workspace remain caller-owned GPU scratch.
 Numerical tests cover every returned algorithm with changed-input graphs and
 partials above FP16 range. No precision reduction or model default is implied.
+
+The first cuBLASLt build triggers an nvcc internal assertion in GCC 13
+`stl_construct.h` while compiling the new host heuristic containers. Algorithm
+preparation and library descriptor management are moved to a normal C++ source
+in the same CMake extension; CUDA packet decoding remains in its CUDA source.
+No private library or runtime overlay is introduced.
