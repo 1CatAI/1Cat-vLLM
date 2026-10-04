@@ -121,3 +121,27 @@ These two entries have CPU compilation and SASS evidence only. They have no
 GPU correctness, speed, or model evidence and are not admitted production
 routes. The signed public API itself remains an experiment. No GPU tests are
 run until its shared screening supports the next implementation decision.
+
+## Fixed 13-bit signed-index candidate
+
+The next CPU candidate consumes the shared lossless signed-index layout.
+Each 13-bit ID contains the original nine-bit codebook index and four sign
+bits. It reuses the shared constexpr record reader and
+`fragment_signed<half, true>`; static table copies use uint4, the original
+base half2 is cached per block, and small scales stay in their original u32
+bitfield. No scale precision changes are introduced.
+
+The mixed operator retains 160 CTAs and 512 threads per CTA. Its full K128
+loop compiles to 564 static instructions, including 128 HMMA instructions,
+or **70.5 instructions per K16**. It uses 52 registers, no spills, and
+32,768 bytes of shared memory. The table and FP32 partials occupy a union;
+a barrier after all MMAs protects the transition from table reads to partial
+writes. The floating tail returns before table initialization.
+
+The operator requests carveout 66. Its actual hardware shared-memory
+configuration has not been measured; this request must not be reported as
+proof of a 64 KiB configuration. The shared CPU converter independently
+recovers every original QKVZ byte from its unchanged 9,011,200-byte payload.
+Partition coverage remains complete. GPU numerical and speed qualification
+are pending, so the entry remains research-only and contributes no claimed
+model or per-round saving.
