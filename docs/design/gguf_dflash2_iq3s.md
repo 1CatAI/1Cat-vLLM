@@ -233,6 +233,11 @@ The corrected producer inserts token IDs between the embedded chat prefix and
 suffix; CPU checks with the actual tokenizer verify exactly 1024/8192 tokens
 and preserve the thinking-disabled assistant suffix.
 
+The following standalone measurements are exploratory: their wrappers used an
+incorrect single-GPU lease filename. They checked for an idle device before
+launch, but require repetition under the prescribed lease before performance
+conclusions are accepted. The wrappers are corrected.
+
 Independent CUDA extensions preserve FP16 weight reconstruction and FP32 MMA
 accumulation. Probes use actual checkpoint rank-0 TP4 slices and M=1/2/4/8/16.
 The reference is official FP32 GGUF dequantization plus FP32 cuBLAS. Each graph
@@ -253,13 +258,60 @@ Their canonical streams are 11141120 bytes each; head streams are 198656000
 bytes and context FC streams are 36864000 bytes. Research relative L2 errors
 are about 0.00036 for lattice, 0.00072 for head and 0.00030 for FC. These
 validate only operator reconstruction/accumulation, not model distribution.
-Normal/raw head reference errors still need a focused comparison.
+A focused M8 head comparison against official FP32 dequantization and FP32
+cuBLAS gives relative L2 0.0007174 for canonical and 0.0161201 for raw, with
+maximum absolute errors 0.004103 and 0.064516. These sampled activations do not
+replace the model-level KL gate.
 
 The first research kernels lose to the existing canonical paths and are not
 promoted. Their intrablock split increases warps, not CTA count; FC has only
-40 CTAs. Hardware counters must distinguish occupancy, loads and decoding
-before the next kernel change. Canonical head saves about 347 us per M8 call
+40 CTAs. Nsight Compute reached the kernel but reported insufficient GPU counter
+permissions. Static cubin resources show no local-memory spills; runtime
+occupancy, stalls and physical DRAM traffic are not measured. Canonical head saves about 347 us per M8 call
 against the current raw GGUF head. M1 differs: canonical 340.992 us versus raw
 243.712 us. Routing must therefore be measured by M range. Footprint/elapsed
 bandwidth is useful effective throughput, not measured DRAM traffic. Calls
 per complete round and model-level savings remain unverified.
+
+## Graph-linked exact-input baseline
+
+The profiled run uses exactly 1024 input tokens, 64 output tokens, max length
+32768 and the same TP4/FP16 KV/FP32 SSM configuration above. Fifteen observed
+verification output intervals average 48.8762 ms. GPU target graph submissions
+are asynchronous: after the first rounds, CPU submission precedes execution
+by one round. CPU NVTX start intervals therefore mix adjacent GPU rounds.
+Attribution uses the worker's `cudaGraphLaunch` correlation ID and successive
+GPU graph starts, discarding boundary rounds.
+
+All four ranks agree: complete-round GPU intervals average 48.965–48.969 ms,
+and the target graph envelope averages 44.390–44.397 ms. Each target graph has
+1430 kernel nodes. These are verification rounds, not individual output-token
+latencies. A matched unprofiled exact-input run is still required before
+calibrating profiler overhead; multiplying by 0.9 remains an initial estimate.
+
+| Rank-0 kernel group | Calls/round | Service ms/round |
+| --- | ---: | ---: |
+| Small CUTLASS FP16 matrix products, one CTA | 96 | 10.208 |
+| IQ3_S dequantization, grid 10880 | 46 | 4.262 |
+| FP16 wide XQA attention | 16 | 3.767 |
+| CUTLASS matrix products following dequantization | 29 | 2.645 |
+| cuBLAS Volta split-K matrix products | 22 | 1.797 |
+| TP push reductions, grid 40 | 140 | 1.666 |
+| Raw Q4_K vocabulary projection | 2 | 1.195 |
+
+Service times can overlap and are not an additive wall-time decomposition.
+For each IQ3_S dequantization of a 4352×5120 matrix, known buffers comprise
+11,141,120 packed bytes and 44,564,480 output bytes. At 750 GB/s this is a
+74.274 us footprint floor, excluding activation and later GEMM traffic. The
+46 calls total 3.417 ms at that floor versus 4.262 ms observed. Other kernel
+traffic remains unspecified until its tensor descriptor is established.
+
+Generated AOT code fixes the Python prefill branches during initial tracing,
+then reuses them for M=8 with shape guards dropped. This causes 46 IQ3_S and
+five affine projections to dequantize full matrices during verification.
+Aliased shared scratch also generates large clone/copyback kernels. Runtime
+projection dispatch keeps the family and capability bands but checks M inside
+an opaque operator; shared scratch is resolved internally from its prepared
+workspace. CPU tests verify branch selection and a single dynamic graph across
+M=512/8/16. GPU route, accuracy and timing checks remain pending; no speedup is
+claimed and the installed model wheel remains unchanged.
