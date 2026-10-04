@@ -4299,7 +4299,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
 
-            if self.gqa_interleaved_layout:
+            from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+                _can_fuse_gdn_projection_split,
+                _split_gdn_projection_tails,
+            )
+
+            if (
+                not self.gqa_interleaved_layout
+                and not self.disable_tp_for_ba_proj
+                and mixed_qkvz.shape[0] in (5, 20)
+                and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
+                and self.value_dim // self.tp_size == 1536
+                and _can_fuse_gdn_projection_split(mixed_qkvz, ba)
+            ):
+                z = mixed_qkvz.new_empty((num_tokens, 12, 128))
+                mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z)
+                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                    mixed_qkv = mixed_qkv.contiguous()
+                _log_runtime_route_once(
+                    "SM70 default GDN projection tail-copy route hit."
+                )
+            elif self.gqa_interleaved_layout:
                 # Qwen3-Next: unpack the interleaved GQA layout
                 query, key, value, z, b, a = self.fix_query_key_value_ordering(
                     mixed_qkvz, ba
