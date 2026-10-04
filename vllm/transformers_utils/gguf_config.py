@@ -20,6 +20,7 @@ _ARCHITECTURES = {
     "qwen3": ("qwen3", "Qwen3ForCausalLM"),
     "qwen35": ("qwen3_5_text", "Qwen3_5ForCausalLM"),
     "qwen35moe": ("qwen3_5_moe_text", "Qwen3_5MoeForCausalLM"),
+    "dflash": ("qwen3", "DFlash2DraftModel"),
 }
 
 
@@ -124,6 +125,73 @@ def gguf_config_dict(metadata: dict[str, Any]) -> dict[str, Any]:
     rope["partial_rotary_factor"] = rotary_dim / head_dim
     config["partial_rotary_factor"] = rotary_dim / head_dim
     config["rope_parameters"] = rope
+    if arch == "dflash":
+        target_layers = required("target_layers")
+        if (
+            not isinstance(target_layers, list)
+            or not target_layers
+            or any(
+                isinstance(i, bool) or not isinstance(i, int) or i <= 0
+                for i in target_layers
+            )
+            or target_layers != sorted(set(target_layers))
+        ):
+            raise ValueError("GGUF dflash.target_layers must be ordered 1-based IDs")
+        mask_id = metadata.get("tokenizer.ggml.mask_token_id")
+        if (
+            isinstance(mask_id, bool)
+            or not isinstance(mask_id, int)
+            or not 0 <= mask_id < vocab_size
+        ):
+            raise ValueError("GGUF DFlash requires a mask token within the vocabulary")
+        draft: dict[str, Any] = {
+            key: positive(key)
+            for key in (
+                "block_size",
+                "conv_kernel_size",
+                "conv_group_size",
+                "selector_rank",
+                "selector_top_k",
+            )
+        }
+        if draft["block_size"] < 2 or hidden % draft["conv_group_size"]:
+            raise ValueError("GGUF DFlash block/group dimensions are incompatible")
+        draft.update(
+            mask_token_id=mask_id,
+            # llama.cpp writes extraction positions as layer index + 1.
+            target_layer_ids=[i - 1 for i in target_layers],
+        )
+        for source, destination in {
+            "logit_scale": "output_multiplier",
+            "final_logit_softcapping": "final_logit_softcapping",
+            "embedding_scale": "input_embedding_scale",
+            "attention.value_scale": "attention_value_scale",
+        }.items():
+            if (value := optional(source)) is not None:
+                draft[destination] = value
+        window = optional("attention.sliding_window")
+        pattern = optional("attention.sliding_window_pattern", [False] * layers)
+        if len(pattern) != layers or any(not isinstance(i, bool) for i in pattern):
+            raise ValueError("GGUF DFlash sliding-window pattern must match layers")
+        if any(pattern) and (
+            isinstance(window, bool) or not isinstance(window, int) or window <= 0
+        ):
+            raise ValueError("GGUF DFlash sliding layers require a positive window")
+        causal = optional("attention.causal", False)
+        if not isinstance(causal, bool):
+            raise ValueError("GGUF DFlash attention.causal must be boolean")
+        config.update(
+            torch_dtype="bfloat16",
+            is_causal=causal,
+            dflash_config=draft,
+            sliding_window=window,
+            use_sliding_window=any(pattern),
+            max_window_layers=layers,
+            layer_types=[
+                "sliding_attention" if sliding else "full_attention"
+                for sliding in pattern
+            ],
+        )
     if arch.startswith("qwen35"):
         for key, target in {
             "ssm.conv_kernel": "linear_conv_kernel_dim",

@@ -862,7 +862,7 @@ def sm70_dflash2_verifier_qualified(
     hf_text_config = getattr(model_config, "hf_text_config", None)
     architectures = set(getattr(model_config, "architectures", ()) or ())
     return bool(
-        "Qwen3_5ForConditionalGeneration" in architectures
+        architectures & {"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"}
         and getattr(model_config, "dtype", None) == torch.float16
         and getattr(hf_text_config, "hidden_size", None) == 5120
         and getattr(hf_text_config, "num_attention_heads", None) == 24
