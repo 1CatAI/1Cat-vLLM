@@ -123,8 +123,82 @@ def health_failures(records):
         if health["line_repetition"] >= 3:
             reasons.append("repeated_final_answer_line")
         if reasons:
-            failures.append({"id": record["id"], "reasons": reasons})
+            failure = {"id": record["id"], "reasons": reasons}
+            if "seed" in record:
+                failure["seed"] = record["seed"]
+            failures.append(failure)
     return failures
+
+
+def compare_quality(reference, candidate):
+    """Compare three-seed task and health counts under a frozen contract."""
+    for key in ("contract", "sampling", "suite_sha256", "quality_seed_bases"):
+        if reference[key] != candidate[key]:
+            raise ValueError(f"Quality arms differ in {key}")
+    if len(set(reference["quality_seed_bases"])) != 3:
+        raise ValueError("Quality admission requires three distinct seed bases")
+    arms = []
+    for report in (reference, candidate):
+        if not report["complete"] or not report["quality_evaluated"]:
+            raise ValueError("Quality arms must be complete")
+        indexed = {(r["id"], r["seed"]): r for r in report["quality"]}
+        if len(indexed) != len(report["quality"]):
+            raise ValueError("Duplicate case/seed records")
+        arms.append(indexed)
+    if not arms[0] or arms[0].keys() != arms[1].keys():
+        raise ValueError("Quality arms require the same case/seed records")
+    for key, baseline in arms[0].items():
+        tested = arms[1][key]
+        for field in ("category", "input_tokens", "prompt_token_sha256"):
+            if baseline[field] != tested[field]:
+                raise ValueError(f"Quality prefix differs in {field}: {key}")
+    for case_id in {key[0] for key in arms[0]}:
+        if sum(key[0] == case_id for key in arms[0]) != 3:
+            raise ValueError(f"Case requires three seeds: {case_id}")
+    needles = [
+        r["input_tokens"] for r in reference["quality"] if r["category"] == "needle"
+    ]
+    if not any(130000 <= n < 140000 for n in needles) or not any(
+        257000 <= n < 262144 for n in needles
+    ):
+        raise ValueError("Quality admission requires 128K and 258K needle inputs")
+    rows = []
+    for category in sorted({r["category"] for r in arms[0].values()}):
+        counts = []
+        for arm in arms:
+            records = [r for r in arm.values() if r["category"] == category]
+            failures = health_failures(records)
+            counts.append(
+                {
+                    "passed": sum(r["score"]["passed"] for r in records),
+                    "total": len(records),
+                    "unhealthy": len(failures),
+                    "reasons": {
+                        reason: sum(reason in f["reasons"] for f in failures)
+                        for reason in (
+                            "not_natural_eos",
+                            "empty_final_answer",
+                            "replacement_characters",
+                            "repeated_final_answer_line",
+                        )
+                    },
+                }
+            )
+        baseline, tested = counts
+        accepted = (
+            tested["passed"] >= baseline["passed"]
+            and tested["unhealthy"] <= baseline["unhealthy"]
+            and all(tested["reasons"][k] <= v for k, v in baseline["reasons"].items())
+        )
+        rows.append(
+            {
+                "category": category,
+                "reference": baseline,
+                "candidate": tested,
+                "passed": accepted,
+            }
+        )
+    return {"passed": all(r["passed"] for r in rows), "categories": rows}
 
 
 def prompt_token_ids(case, tok):
@@ -172,6 +246,7 @@ def run(args):
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     import vllm
     from vllm import LLM, SamplingParams
+    from vllm.config.kernel import KernelConfig
 
     report = {
         "complete": False,
@@ -190,6 +265,8 @@ def run(args):
         else None,
         "quality_evaluated": not args.timing_only,
         "quality_seed_base": args.quality_seed,
+        "quality_seed_bases": args.quality_seeds or [args.quality_seed],
+        "disabled_kernels": args.disable_kernel,
         "quality_case_ids": args.case_id,
         "sampling": suite["sampling"],
         "contract": {
@@ -219,6 +296,11 @@ def run(args):
             "benchmarks.qwen38_ple_phase_probe.PlePhaseWorkerExtension"
         )
         os.chdir(out)
+    kernel_config = {"ple_result_transport": args.ple_result_transport}
+    if "ple_disk_row_gather" in KernelConfig.__dataclass_fields__:
+        kernel_config["ple_disk_row_gather"] = not args.disable_ple_row_gather
+    elif args.disable_ple_row_gather:
+        raise RuntimeError("Installed runtime lacks the requested PLE reader control")
     llm = LLM(
         model=model,
         tensor_parallel_size=4,
@@ -234,10 +316,7 @@ def run(args):
         speculative_config=None,
         disable_log_stats=not REQUEST_METRICS_ENABLED,
         **diagnostic,
-        kernel_config={
-            "ple_result_transport": args.ple_result_transport,
-            "ple_disk_row_gather": not args.disable_ple_row_gather,
-        },
+        kernel_config=kernel_config,
     )
     try:
         cfg = llm.llm_engine.vllm_config
@@ -282,39 +361,44 @@ def run(args):
             if args.case_id and case["id"] not in args.case_id:
                 continue
             prompt_ids = prompt_token_ids(case, tok)
-            o = llm.generate(
-                [{"prompt_token_ids": prompt_ids}],
-                SamplingParams(
-                    temperature=1,
-                    top_p=0.95,
-                    top_k=20,
-                    seed=args.quality_seed + i,
-                    max_tokens=4096,
-                ),
-                use_tqdm=False,
-            )[0]
-            record = {
-                "id": case["id"],
-                "category": case["category"],
-                "seed": args.quality_seed + i,
-                "input_tokens": len(prompt_ids),
-                "prompt_token_sha256": hashlib.sha256(
-                    json.dumps(prompt_ids).encode()
-                ).hexdigest(),
-                **metrics(o),
-            }
-            text = final_text(record["text"])
-            lines = [s.strip() for s in text.splitlines() if len(s.strip()) > 24]
-            record["health"] = {
-                "natural_eos": record["finish_reason"] == "stop",
-                "nonempty_final": bool(text),
-                "replacement_characters": text.count("\ufffd"),
-                "line_repetition": max((lines.count(s) for s in set(lines)), default=0),
-            }
-            record["score"] = check(case, record["text"])
-            report["quality"].append(record)
-            save()
-            print("QUALITY", case["id"], record["score"], record["health"], flush=True)
+            for seed_base in args.quality_seeds or [args.quality_seed]:
+                o = llm.generate(
+                    [{"prompt_token_ids": prompt_ids}],
+                    SamplingParams(
+                        temperature=1,
+                        top_p=0.95,
+                        top_k=20,
+                        seed=seed_base + i,
+                        max_tokens=4096,
+                    ),
+                    use_tqdm=False,
+                )[0]
+                record = {
+                    "id": case["id"],
+                    "category": case["category"],
+                    "seed": seed_base + i,
+                    "input_tokens": len(prompt_ids),
+                    "prompt_token_sha256": hashlib.sha256(
+                        json.dumps(prompt_ids).encode()
+                    ).hexdigest(),
+                    **metrics(o),
+                }
+                text = final_text(record["text"])
+                lines = [s.strip() for s in text.splitlines() if len(s.strip()) > 24]
+                record["health"] = {
+                    "natural_eos": record["finish_reason"] == "stop",
+                    "nonempty_final": bool(text),
+                    "replacement_characters": text.count("\ufffd"),
+                    "line_repetition": max(
+                        (lines.count(s) for s in set(lines)), default=0
+                    ),
+                }
+                record["score"] = check(case, record["text"])
+                report["quality"].append(record)
+                save()
+                print(
+                    "QUALITY", case["id"], record["score"], record["health"], flush=True
+                )
         report["summary"] = {
             category: {
                 "passed": sum(
@@ -340,7 +424,7 @@ def run(args):
         report["complete"] = True
         report["health_triage_required"] = bool(report["health_failures"])
         save()
-        if report["health_passed"] is False:
+        if report["health_passed"] is False and not args.quality_seeds:
             raise SystemExit(
                 "Output anomaly requires three candidate and three baseline seeds; "
                 "see report"
@@ -457,6 +541,13 @@ def main():
     modes.add_argument("--timing-only", action="store_true")
     modes.add_argument("--quality-only", action="store_true")
     parser.add_argument("--quality-seed", type=int, default=4201)
+    parser.add_argument(
+        "--quality-seeds",
+        type=int,
+        nargs="+",
+        help="Run all seed bases with one loaded engine",
+    )
+    parser.add_argument("--disable-kernel", action="append", default=[])
     parser.add_argument("--case-id", action="append")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-free-gib", type=float, default=8)
@@ -471,6 +562,10 @@ def main():
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
     args = parser.parse_args()
+    if args.quality_seeds is not None and (
+        len(args.quality_seeds) != 3 or len(set(args.quality_seeds)) != 3
+    ):
+        parser.error("--quality-seeds requires exactly three distinct seed bases")
     if args.timing_repeats < 2:
         parser.error("--timing-repeats must be at least 2")
     if args.ple_phase_probe and args.reference_timing is not None:
@@ -512,6 +607,8 @@ def main():
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
         TORCH_EXTENSIONS_DIR=str(cache / "extensions"),
     )
+    if args.disable_kernel:
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(args.disable_kernel)
     summary = {"complete": False, "output": str(args.output)}
     summary_path = args.output.with_suffix(".summary.json")
     try:
@@ -531,7 +628,7 @@ def main():
                 cpu_row_readers=[
                     rank["ple_disk_row_readers"]
                     for rank in report["worker_routes"]
-                    if rank["ple_disk_row_readers"]
+                    if rank.get("ple_disk_row_readers")
                 ],
                 route_report=str(args.output),
                 instrumented=report["instrumented"],

@@ -126,3 +126,20 @@ and cannot be compared as endpoint speed evidence. `--runtime-cache` permits
 reuse of the compatible compiled baseline graphs for this CPU-only policy;
 `--timing-repeats 2` limits the diagnostic cohort. Completion summaries keep
 compact CPU-reader decisions and link to the full route report.
+
+## Three-seed requalification and lookup calibration
+
+The updated admission contract requires matched three-seed task and health
+results for this PR, including 128K and 258048-token needles. Previous
+byte-preserving scheduling admission and single-seed evidence do not complete
+this requested requalification.
+
+A diagnostic control run records 1057 single-token CPU requests: only 45
+requests (4.26%) incur mmap major faults. Median mmap gather is 112.223 us,
+gather plus staging 188.567 us, key computation 105.974 us, previous-consumer
+wait 33.826 us, and complete CPU request 683.796 us. Four flag publications
+per request have a per-publication median of 8.483 us. These nested timings
+must not be summed. Python observation overhead is present; this instrumented
+run is not speed admission and does not establish GPU exposed wait. The
+previous 0.629-ms projection applied cold-page reduction to all requests;
+cache residency and overlap must be accounted for before further projection.
