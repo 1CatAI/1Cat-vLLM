@@ -123,7 +123,9 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
-        "config": config,
+        # Engine initialization mutates nested speculative config in place.
+        # Retain the JSON input contract before it contains ModelConfig objects.
+        "config": json.loads(json.dumps(config)),
         "decode_contract": {
             "input_len": args.input_len,
             "output_len": args.output_len,
@@ -144,7 +146,9 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        args.output.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n"
+        )
 
     save()
     llm = LLM(**config)
