@@ -129,6 +129,8 @@ def conv_gate_zero(
         a.shape == b.shape == (tokens, 12) and a.is_contiguous() and b.is_contiguous()
     )
     assert state_indices.shape == accepted.shape == (1,) and cu.shape == (2,)
+    # Match causal_conv1d_update: speculative history uses width-1 plus
+    # tokens-1 entries even when the physical cache has a longer stride.
     g = torch.empty((1, tokens, 12), dtype=torch.float32, device=qkv.device)
     beta = torch.empty_like(g)
     _conv_gate_zero_kernel[(1, triton.cdiv(2560, channel_tile))](
@@ -150,9 +152,9 @@ def conv_gate_zero(
         *state.stride(),
         state.shape[0],
         tokens,
-        state.shape[2],
+        tokens + 2,
         triton.next_power_of_2(tokens),
-        triton.next_power_of_2(state.shape[2]),
+        triton.next_power_of_2(tokens + 2),
         channel_tile,
         num_warps=num_warps,
     )
