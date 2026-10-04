@@ -1704,7 +1704,7 @@ static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 // All 40 CTAs fit on SM70. The row leader waits only for four local
 // partial reductions; no grid-wide synchronization is required.
 template <typename WeightT>
-__global__ __launch_bounds__(128, 1) void sm70_push_gemma_rms_norm(
+__global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
     const WeightT* weight, half* output, float* residual_out, int rank,
     float epsilon) {
@@ -2302,7 +2302,7 @@ class CustomAllreduce {
     if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
       if (num_tokens == kSm70PushNormRows && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
-        sm70_push_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
+        sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
             sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
             residual_out, rank_, epsilon);
         return;
