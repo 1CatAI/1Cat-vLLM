@@ -1466,3 +1466,10 @@ store passes 68 checks but leaves the full FP32-output path at 92.449 versus
 90.070 µs canonical (2.6% gap). It is removed because it adds shared memory
 without a confirmed speed benefit. The original compact workspace schedule
 and precision contract are retained. End-to-end integration remains pending.
+
+A bounded thread-layout comparison checks 128/256/512 DQ threads with valid
+one/two/four-way partitions, keeping the original byte layout and exact
+workspace values. The normal merged wheel passes 126 checks. Flash dense gate
+M512 full graphs remain fastest with 256 threads/two partitions: 92.326 versus
+90.060 µs canonical. The alternatives range from 92.338 to 96.293 µs and do
+not close the speed gap. No thread-count default changes.
