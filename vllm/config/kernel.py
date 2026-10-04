@@ -370,6 +370,17 @@ class Sm70GgufConfig:
 
 
 @config
+class Sm70RingConfig:
+    """Small FP16 collectives on a verified four-GPU NVLink ring."""
+
+    enabled: bool = True
+    """Admit the ring operator when topology and peer atomics are supported."""
+
+    max_bytes: int = Field(default=25600, gt=0, le=25600)
+    """Largest calibrated input payload; larger messages retain NCCL."""
+
+
+@config
 class Sm70SparseConfig:
     """Per-engine sparse attention policy; individual operators guard layouts."""
 
@@ -470,6 +481,14 @@ class KernelConfig:
     sm70_gguf: Sm70GgufConfig = Field(default_factory=Sm70GgufConfig)
     """Native GGUF admission and Volta tensor-core prefill policy."""
 
+    sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
+    """SM70 ring collective policy, resolved from actual peer capabilities."""
+
+    collective_kernel_selections: dict[str, Any] = Field(
+        default_factory=dict, init=False
+    )
+    """Observed per-group collective capabilities and rejection reasons."""
+
     sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
     """SM70 sparse attention policy; admission uses actual tensor capabilities."""
 
@@ -542,6 +561,7 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
+            "collective_kernel_selections",
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
