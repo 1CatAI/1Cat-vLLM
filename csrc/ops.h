@@ -933,6 +933,10 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
                                    bool prefetch);
+void gguf_lattice_raw_grouped_gate_up_sm70_out(
+    torch::Tensor gate, torch::Tensor up, torch::Tensor input,
+    torch::Tensor gate_weights, torch::Tensor up_weights, torch::Tensor offsets,
+    torch::Tensor ids, int64_t source_type, int64_t top_k);
 void gguf_lattice_raw_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor weight, int64_t source_type,
                                     torch::Tensor scratch);
