@@ -152,3 +152,51 @@ Whole wheel SHA256:
 `50f9c856415b3ccbdf428d678bd7664c57ad523b1bc78112f2958aa8b100dc63`.
 Loaded native `_C` SHA256:
 `2259d5e8591b06c8fa58aa274cbaf3293f05e9c477fdd86b146ca10e9504589f`.
+
+## Node trace after operator integration
+
+Nsight Systems 2024.6.2 captures the already qualified
+`1.5.2.dev560+g22e3ff90d` package. Graph 14 is the target verifier;
+graphs 26 and 38 are draft graphs. Each of four workers has 75 complete
+target launches with 2175 nodes, versus 3194 nodes in the original trace.
+Analysis uses the middle 59 target-to-next-target intervals per worker,
+excluding eight transitions on either end. The immutable raw SQLite is
+retained separately from the derived target-replay selection.
+
+| Target category | Calls per rank/round | Mean rank service (ms) |
+| --- | ---: | ---: |
+| HC combine and gates | 386 | 3.580 |
+| TP ring, including readiness waits | 98 | 3.415 |
+| Bitplane projections | 131 | 3.026 |
+| Canonical down vectors | 48 | 2.002 |
+| Joint original-block gate/up | 30 | 1.973 |
+| Remaining lattice projections | 34 | 1.870 |
+| LUT4 projections | 87 | 1.622 |
+| QSA/indexer | 72 | 1.609 |
+| Router/shared gate | 144 | 1.145 |
+| Copy/cast | 273 | 0.931 |
+| Index/reduce/scatter | 145 | 0.727 |
+| Fused expert route/unroute | 96 | 0.553 |
+| FP16 row GEMV | 36 | 0.122 |
+| Packed PLE UVA gather | 1 | 0.100 |
+| PLE n-gram IDs | 1 | 0.003 |
+
+Original-block type22/type21 gate/up, canonical type20/type42 down vectors,
+fused expert route/unroute, row GEMV, FP32 batch HC, router top-k, QSA and
+packed PLE UVA are present in actual nodes. Remaining type18 gate/up uses
+34 canonical vector launches per target round. It was excluded from dual
+original storage because that adds 2.55 GiB per rank for a smaller measured
+M5 benefit.
+
+The target activity envelope averages 29.800 ms per rank and draft graph
+service averages 4.226 ms in this capture. These values include profiler
+perturbation and cannot replace the unprofiled 26.668 ms complete-round
+baseline. Category service can overlap and readiness waits are embedded in
+collectives; neither the category table nor per-rank maxima form an additive
+wall-clock decomposition.
+
+The remaining copy/scatter work and HC/QSA/router calls merit targeted
+operator checks. The packed PLE gather is already using pinned host UVA;
+its 0.100 ms service does not establish that it causes host replay skew or
+first-collective waiting. Dense quantized GEMV tuning remains in the separate
+GGUF kernel work.
