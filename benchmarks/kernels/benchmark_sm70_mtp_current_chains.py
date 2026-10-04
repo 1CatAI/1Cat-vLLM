@@ -28,17 +28,18 @@ def samples(graph):
 
 
 def hc(model):
-    from benchmarks.kernels.benchmark_sm70_hc_batch_native_tp4 import weights
+    from benchmarks.kernels.benchmark_sm70_hc_tp4 import load_weights
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
     from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import _pack_hc_batch_weight
 
     rank = int(os.environ["LOCAL_RANK"])
     dist.init_process_group("gloo")
     assert dist.get_world_size() == 4
-    names, raw = weights(model, 96, rank)
+    raw = load_weights(model)
+    names = [f"layer {i} {role}" for i in range(48) for role in ("attn", "mlp")]
     packed = [
         (_pack_hc_batch_weight(d, "down", rank), _pack_hc_batch_weight(u, "up", rank))
-        for d, u, _, _ in raw
+        for d, u in raw
     ]
     state = [
         (
