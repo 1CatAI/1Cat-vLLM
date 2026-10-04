@@ -408,21 +408,36 @@ __global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
   const int width = FullWidth ? 32 : min(32, n - first), col = row - first;
   const int blocks = k / 256, begin = blocks * blockIdx.y / splits;
   const int end = blocks * (blockIdx.y + 1) / splits;
-  float sum = 0.f;
-  for (int block = begin; block < end; ++block) {
+  struct Bundle {
+    typename Decode::Parameters parameters;
+    typename Decode::ScalarWindow packet;
+    uint4 activation;
+  };
+  auto fetch = [&](int block) {
     const auto* tile = weight + int64_t{first} * blocks * Decode::kBlockBytes +
                        int64_t{block} * width * Decode::kBlockBytes;
-    const auto parameters =
+    Bundle result;
+    result.parameters =
         Decode::template parameters<FullWidth>(tile, width, col);
-    const auto packet = Decode::scalar_packet(tile, width, lane, col);
-    const auto values = Decode::fragment(parameters, packet, lane, grid);
-    const uint4 loaded =
+    result.packet = Decode::scalar_fetch(tile, width, lane, col);
+    result.activation =
         *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
+    return result;
+  };
+  Bundle current = fetch(begin);
+  float sum = 0.f;
+  for (int block = begin; block < end; ++block) {
+    Bundle next{};
+    if (block + 1 < end) next = fetch(block + 1);
+    const auto packet = Decode::scalar_extract(current.packet);
+    const auto values =
+        Decode::fragment(current.parameters, packet, lane, grid);
     const auto& activation =
-        reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
+        reinterpret_cast<const turbomind::Array<half, 8>&>(current.activation);
 #pragma unroll
     for (int j = 0; j < 8; ++j)
       sum = fmaf(__half2float(activation[j]), values[j], sum);
+    current = next;
   }
 #pragma unroll
   for (int distance = 16; distance > 0; distance /= 2)
