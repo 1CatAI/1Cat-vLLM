@@ -1063,3 +1063,33 @@ Whole-wheel SHA256:
 `47f3683cbc85816effdd796bd0ce2a8e0dc0b5d64a403865d686ee0f3c7a12a0`.
 The package/Python source versions agree and all 210 installed dependencies
 are compatible. Persistent payload bytes and alignment budgets are unchanged.
+
+## Register activation lookahead on remaining M16 shapes
+
+The same installed binary completes all four remaining Flash M16
+comparisons without repeating numerical checks:
+
+| Projection | Canonical µs | Best equal-byte µs | Schedule |
+| --- | ---: | ---: | --- |
+| IQ3_S expert | 18.364 | 8.190 | activation prefetch, split10 |
+| IQ2_S expert | 19.554 | 10.285 | activation prefetch, split10 |
+| Flash gate | 22.259 | 13.619 | prior seven-CTA packet prefetch, split10 |
+| Flash output | 17.403 | 12.392 | activation prefetch, split4 |
+
+All six measured M16 shapes are now faster than their same-run canonical
+control. This is a shape-dependent selection: the earlier Flash gate
+schedule remains preferable, so activation staging is not enabled globally.
+
+The matched 27B gate activation-lookahead split3 NCU main node reads
+9,748,192 DRAM bytes, 1,122,209 L1 global-load sectors and 854,936 L2 read
+sectors. Active warps are 21.15%, long-scoreboard stall is 36.83%, and
+register count is 119 with no stack. The FP32 reduction reads another
+835,744 bytes. Lower occupancy does not negate the demonstrated wall-time
+gain; node durations remain separate from the unprofiled comparison.
+
+The next prefill candidate separates packet fetch from extraction in the
+FP32/natural-output and FP16 transposed dequantization loop. It reads the
+following packet window into registers while reconstructing and storing
+the current one. Persistent byte size, official scale formulas and output
+layouts are unchanged. The full numerical suite and one Flash gate M512
+complete-path comparison must validate it before broadening.
