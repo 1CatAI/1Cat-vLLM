@@ -169,7 +169,8 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
                                              const half* x,
                                              const uint8_t* weight, int m,
                                              int n, int k, int stride,
-                                             int splits) {
+                                             int splits, int col_override = -1,
+                                             int row_override = -1) {
   using Decode = vllm::sm70_gguf::LatticeRawDecoder<Type>;
   using Packed = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
   using MMA = turbomind::gemm::SM70_MMA_884;
@@ -181,7 +182,8 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
                 (Compact && NT == 32 && MT == 16 && !Staged));
   Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  const int col_begin = blockIdx.x * NT, row_begin = blockIdx.y * MT;
+  const int col_begin = col_override >= 0 ? col_override : blockIdx.x * NT;
+  const int row_begin = row_override >= 0 ? row_override : blockIdx.y * MT;
   const int bcol = lane / 16 * 4 + (lane & 12) * 2 + lane % 4;
   const int arow = lane / 16 * 4 + lane % 4;
   typename MMA::FragC accum[MT / 8]{};
@@ -425,6 +427,60 @@ __global__ __launch_bounds__(128, 7) void bounded_mma_kernel(
     int n, int k, int stride, int splits) {
   raw_mma_body<Type, 32, 16, true, FullWidth, Prefetch, Staged>(
       out, partial, x, weight, m, n, k, stride, splits);
+}
+
+// Exclusive expert tile counts, prepared on-device on every graph replay.
+// Routing offsets are monotone and span [0, total routed rows].
+__global__ void compact_grouped_tile_prefix_kernel(int* prefix,
+                                                   const int* offsets,
+                                                   int experts) {
+  __shared__ int counts[1024];
+  for (int i = threadIdx.x; i < 1024; i += blockDim.x)
+    counts[i] = i < experts ? (offsets[i + 1] - offsets[i] + 15) / 16 : 0;
+  __syncthreads();
+  for (int stride = 1; stride < 1024; stride *= 2) {
+    for (int i = (threadIdx.x + 1) * 2 * stride - 1; i < 1024;
+         i += blockDim.x * 2 * stride)
+      counts[i] += counts[i - stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    prefix[experts] = counts[1023];
+    counts[1023] = 0;
+  }
+  __syncthreads();
+  for (int stride = 512; stride > 0; stride /= 2) {
+    for (int i = (threadIdx.x + 1) * 2 * stride - 1; i < 1024;
+         i += blockDim.x * 2 * stride) {
+      const int left = counts[i - stride];
+      counts[i - stride] = counts[i];
+      counts[i] += left;
+    }
+    __syncthreads();
+  }
+  for (int i = threadIdx.x; i < experts; i += blockDim.x) prefix[i] = counts[i];
+}
+
+template <int Type>
+__global__ void compact_grouped_mma_kernel(half* out, const half* x,
+                                           const uint8_t* weights,
+                                           const int* offsets,
+                                           const int* prefix, int experts,
+                                           int n, int k, int64_t expert_bytes) {
+  const int tile = blockIdx.x;
+  if (tile >= prefix[experts]) return;
+  int lo = 0, hi = experts;
+  while (lo < hi) {
+    const int mid = (lo + hi) / 2;
+    if (prefix[mid + 1] <= tile)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  const int row = offsets[lo] + (tile - prefix[lo]) * 16;
+  raw_mma_body<Type, 32, 16, true, true, true, false, true>(
+      out, nullptr, x, weights + int64_t{lo} * expert_bytes, offsets[lo + 1], n,
+      k, 0, 1, blockIdx.y * 32, row);
 }
 
 template <int Type>
@@ -1258,4 +1314,59 @@ void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
                                    weight.data_ptr<uint8_t>(), n, k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   gguf_lattice_lt_matmul_sm70_out(out, input, scratch, workspace, algorithm);
+}
+
+void gguf_lattice_compact_grouped_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    torch::Tensor offsets, torch::Tensor tile_prefix, int64_t source_type) {
+  TORCH_CHECK(weight.is_cuda() && weight.scalar_type() == torch::kUInt8 &&
+                  weight.dim() == 2 && weight.is_contiguous() &&
+                  weight.size(0) > 0 && weight.size(0) <= 1024 &&
+                  (source_type == 21 || source_type == 22),
+              "Compact grouped GGUF requires IQ3_S/IQ2_S expert packets");
+  const c10::cuda::CUDAGuard guard(weight.device());
+  TORCH_CHECK(input.device() == weight.device() &&
+                  out.device() == weight.device() && input.dim() == 2 &&
+                  out.dim() == 2 && input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  input.is_contiguous() && out.is_contiguous() &&
+                  input.size(0) > 0 && input.size(0) <= INT_MAX - 1024 &&
+                  out.size(0) == input.size(0) && input.size(1) > 0 &&
+                  input.size(1) <= INT_MAX && input.size(1) % 256 == 0 &&
+                  out.size(1) > 0 && out.size(1) <= INT_MAX &&
+                  out.size(1) % 32 == 0,
+              "Compact grouped GGUF requires aligned FP16 matrices");
+  const int experts = weight.size(0), n = out.size(1), k = input.size(1);
+  const int64_t bytes = int64_t{n} * (k / 256) * (source_type == 21 ? 110 : 82);
+  TORCH_CHECK(
+      weight.size(1) == (bytes + 7) / 8 * 8 &&
+          offsets.device() == weight.device() &&
+          offsets.scalar_type() == torch::kInt32 && offsets.dim() == 1 &&
+          offsets.numel() == experts + 1 && offsets.is_contiguous() &&
+          tile_prefix.device() == weight.device() &&
+          tile_prefix.scalar_type() == torch::kInt32 &&
+          tile_prefix.dim() == 1 && tile_prefix.numel() == experts + 1 &&
+          tile_prefix.is_contiguous(),
+      "Compact grouped GGUF requires original-byte experts and GPU routing "
+      "scratch");
+  TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major == 7 &&
+                  at::cuda::getCurrentDeviceProperties()->minor == 0,
+              "Compact grouped GGUF requires SM70");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  compact_grouped_tile_prefix_kernel<<<1, 256, 0, stream>>>(
+      tile_prefix.data_ptr<int>(), offsets.data_ptr<int>(), experts);
+  const dim3 grid((input.size(0) + 15) / 16 + experts - 1, n / 32);
+#define GROUPED_COMPACT(TYPE)                                 \
+  compact_grouped_mma_kernel<TYPE><<<grid, 128, 0, stream>>>( \
+      reinterpret_cast<half*>(out.data_ptr()),                \
+      reinterpret_cast<const half*>(input.data_ptr()),        \
+      weight.data_ptr<uint8_t>(), offsets.data_ptr<int>(),    \
+      tile_prefix.data_ptr<int>(), experts, n, k, bytes)
+  if (source_type == 21) {
+    GROUPED_COMPACT(21);
+  } else {
+    GROUPED_COMPACT(22);
+  }
+#undef GROUPED_COMPACT
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

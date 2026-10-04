@@ -1280,3 +1280,12 @@ is removed; existing raw vector schedules and storage remain unchanged. The
 canonical controls in this comparison are 33.926/31.370 us; earlier paired
 measurements still show process/tactic variability, so M1 is not declared
 unconditionally closed from this one run.
+
+Original-byte grouped MMA now prepares exclusive expert tile counts on GPU
+and resolves each tile by binary search over that prefix. The graph launch
+bound is ceil(total routed rows/16)+E-1; empty experts do not initialize a
+codebook or run MMA. Valid tiles reuse the measured N32/M16 register-lookahead
+body with FP32 accumulators and original scale bits. Routing offsets and
+caller-owned prefix scratch may change between graph replays. No CPU routing
+synchronization, per-token expert launch, persistent FP16 weight, or default
+model dispatch is added. Numeric and grouped timing gates remain pending.

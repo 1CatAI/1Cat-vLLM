@@ -975,3 +975,7 @@ void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
                                       torch::Tensor workspace,
                                       torch::Tensor algorithm,
                                       int64_t dq_partitions);
+
+void gguf_lattice_compact_grouped_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    torch::Tensor offsets, torch::Tensor tile_prefix, int64_t source_type);

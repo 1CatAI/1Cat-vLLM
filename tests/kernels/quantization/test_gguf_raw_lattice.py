@@ -615,3 +615,82 @@ def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
             torch.testing.assert_close(
                 out.float(), x.float() @ reference.T, rtol=0.003, atol=0.01
             )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("experts", [1, 7, 512, 1024])
+def test_compact_grouped_offsets_and_changed_graph(kind, experts):
+    n, k = 32, 768
+    data = [packed(kind, n=n, k=k) for _ in range(experts)]
+    for index, raw in enumerate(data):
+        blocks = raw.reshape(n, k // 256, -1)
+        scales = blocks[:, :, :2].copy().view("<f2")
+        scales *= 1 + (index % 31) / 32
+        blocks[:, :, :2] = scales.view(np.uint8)
+    original = [
+        torch.from_numpy(RawGGUFProjection.from_rows(d, kind).data).cuda() for d in data
+    ]
+    weight = torch.empty((experts, data[0].nbytes), device="cuda", dtype=torch.uint8)
+    reference = []
+    for index, (source, raw) in enumerate(zip(original, data)):
+        torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+            weight[index], source, kind, k
+        )
+        reference.append(
+            torch.from_numpy(
+                gguf.quants.dequantize(raw, gguf.GGMLQuantizationType(kind))
+            )
+            .half()
+            .cuda()
+        )
+    # Uneven expert rows, zero-row experts, and more than one tile per expert.
+    first = [0] * experts
+    first[0] = 17
+    first[-1] += 19
+    total = sum(first)
+    x = torch.randn((total, k), device="cuda", dtype=torch.float16)
+    out = torch.empty((total, n), device="cuda", dtype=torch.float16)
+    offsets = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
+    prefix = torch.empty_like(offsets)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_grouped_sm70_out,
+        out,
+        x,
+        weight,
+        offsets,
+        prefix,
+        kind,
+    )
+
+    def routing(counts):
+        cpu = torch.tensor([0, *counts], dtype=torch.int32).cumsum(0).to(torch.int32)
+        offsets.copy_(cpu)
+        return cpu.tolist()
+
+    routing(first)
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    second = [0] * experts
+    second[experts // 2] = total
+    third = [total // experts + (index < total % experts) for index in range(experts)]
+    for counts in (first, second, third):
+        boundaries = routing(counts)
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        expected = torch.empty_like(out, dtype=torch.float32)
+        for index in range(experts):
+            start, end = boundaries[index : index + 2]
+            if end > start:
+                expected[start:end] = x[start:end].float() @ reference[index].float().T
+        torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.01)
+        expected_prefix = (
+            torch.tensor(
+                [0, *[(count + 15) // 16 for count in counts]], dtype=torch.int32
+            )
+            .cumsum(0)
+            .to(torch.int32)
+        )
+        torch.testing.assert_close(prefix.cpu(), expected_prefix, rtol=0, atol=0)
