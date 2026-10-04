@@ -18,7 +18,9 @@ def operator(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("kind,expected", [(21, [1, 5, 20]), (22, [1, 5])])
+@pytest.mark.parametrize(
+    "kind,expected", [(18, [1, 5, 20]), (21, [1, 5, 20]), (22, [1, 5])]
+)
 def test_only_measured_original_batches_are_admitted(operator, kind, expected):
     caps = raw_grouped_gate_up_capabilities(
         kind, 2560, 160, 512, torch.float16, is_sm70=True
@@ -37,13 +39,13 @@ def test_only_measured_original_batches_are_admitted(operator, kind, expected):
     "kind,k,n,experts,dtype,hardware,reason",
     [
         (
-            18,
+            17,
             2560,
             160,
             512,
             torch.float16,
             True,
-            "raw_grouped_source_format_has_no_calibration",
+            "raw_grouped_source_format_unavailable",
         ),
         (21, 2560, 160, 512, torch.float32, True, "requires_fp16_activations"),
         (
@@ -73,3 +75,16 @@ def test_missing_packaged_operator_is_rejected(monkeypatch):
         21, 2560, 160, 512, torch.float16, is_sm70=True
     )
     assert all(c.reason.startswith("operator_missing:") for c in caps)
+
+
+def test_nonretained_original_bank_reports_storage_reason(operator):
+    caps = raw_grouped_gate_up_capabilities(
+        18,
+        2560,
+        160,
+        512,
+        torch.float16,
+        is_sm70=True,
+        original_storage_available=False,
+    )
+    assert all(c.reason == "original_expert_bank_not_retained" for c in caps)

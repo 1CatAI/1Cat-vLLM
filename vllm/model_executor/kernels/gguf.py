@@ -185,6 +185,7 @@ def raw_grouped_gate_up_capabilities(
     *,
     is_sm70: bool,
     enabled: bool = True,
+    original_storage_available: bool = True,
 ) -> tuple[GGUFOperatorCapability, ...]:
     """Joint raw projections; M denotes original tokens before top-k routing.
 
@@ -206,8 +207,8 @@ def raw_grouped_gate_up_capabilities(
         reason = "raw_grouped_shape_has_no_calibration"
     elif not hasattr(torch.ops._C, operator):
         reason = f"operator_missing:{operator}"
-    elif source_type == 18:
-        reason = "raw_grouped_source_format_has_no_calibration"
+    elif not original_storage_available:
+        reason = "original_expert_bank_not_retained"
     return tuple(
         GGUFOperatorCapability(
             decoder_family(source_type),
