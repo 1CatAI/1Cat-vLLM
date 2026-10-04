@@ -52,12 +52,21 @@ def main():
         help="Distinct banks per graph; default exceeds twice L2",
     )
     p.add_argument("--include-compact", action="store_true")
+    p.add_argument(
+        "--mma-cta-per-sm",
+        type=int,
+        nargs="+",
+        default=[4],
+        help="Target CTA count per SM for compact MMA split-K candidates",
+    )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--profile", choices=("canonical", "raw"))
     p.add_argument(
         "--profile-route", help="Force the unprofiled raw winner for counters"
     )
     a = p.parse_args()
+    if any(target < 1 for target in a.mma_cta_per_sm):
+        p.error("--mma-cta-per-sm values must be positive")
     assert "site-packages" in vllm.__file__, vllm.__file__
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -170,6 +179,7 @@ def main():
         "l2_bytes": l2_bytes,
         "counter_cache_state": "64_MiB_eviction_before_profiled_replay",
         "accumulation": "FP32",
+        "mma_cta_per_sm": a.mma_cta_per_sm,
         "row_padding_bytes": raw.padding_bytes_per_row,
         "original_payload_bytes": n * raw.payload_bytes_per_row,
         "raw_weight_bytes": original.numel(),
@@ -318,18 +328,12 @@ def main():
                     )
             elif m <= 64:
                 mt = 8 if m <= 8 else 16 if m <= 16 else 32
-                auto = min(
-                    k // 256,
-                    max(
-                        1,
-                        math.ceil(
-                            4
-                            * report["sm_count"]
-                            / (math.ceil(n / 32) * math.ceil(m / mt))
-                        ),
-                    ),
-                )
-                for split in sorted({1, auto}):
+                ctas = math.ceil(n / 32) * math.ceil(m / mt)
+                split_candidates = {1} | {
+                    min(k // 256, max(1, math.ceil(target * report["sm_count"] / ctas)))
+                    for target in a.mma_cta_per_sm
+                }
+                for split in sorted(split_candidates):
                     tmp = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
                     candidates.append(
                         (

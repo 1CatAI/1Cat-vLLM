@@ -363,3 +363,42 @@ computing the current block. Two CTA barriers protect reuse of shared packet
 storage. This adds only temporary storage, retains the original d/scale
 planes, and preserves FP32 reconstruction and accumulation. Full N32 tiles
 are initially required; an unsupported N tail returns a specific reason.
+
+## Shared packet staging measurements
+
+Source `bb42559ab8`, core SHA256
+`e5042c7779ecfda96bd6ebcab02a6eae64fea2a333a82e7f4dc0b868c30e7bd3`,
+whole-wheel SHA256
+`de20a18c209b0ed7f213bc3657f6ab331d4bd8e0ebb01a9391e4f589f2003a84`.
+All 20 checks pass (6.17 s), including shared staging with split-K and
+changed-input graph replay. The matched M5/8/16 sweep retains all original,
+compact and prefetch candidates. Shared staging helps M16 dense shapes but
+has no universal advantage. Times are µs/projection.
+
+| Projection | M | Canonical | Best equal-byte | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 5 | 32.970 | 46.552 | compact_mma_prefetch_split3 |
+| 27B gate | 8 | 33.385 | 47.491 | compact_mma_prefetch_split3 |
+| 27B gate | 16 | 39.702 | 59.090 | compact_mma_staged_split3 |
+| 27B down | 5 | 36.017 | 48.505 | compact_mma_staged_split2 |
+| 27B down | 8 | 33.902 | 50.194 | compact_mma_staged_split2 |
+| 27B down | 16 | 37.851 | 62.033 | compact_mma_staged_split2 |
+| IQ3_S expert | 5 | 17.351 | 9.382 | compact_mma_staged_split10 |
+| IQ3_S expert | 8 | 17.730 | 9.444 | compact_mma_staged_split10 |
+| IQ3_S expert | 16 | 17.880 | 10.216 | compact_mma_staged_split10 |
+| IQ2_S expert | 5 | 19.374 | 10.958 | compact_mma_staged_split10 |
+| IQ2_S expert | 8 | 21.540 | 11.027 | compact_mma_staged_split10 |
+| IQ2_S expert | 16 | 19.133 | 11.878 | compact_mma_split10 |
+| Flash gate | 5 | 18.829 | 15.502 | compact_mma_prefetch_split7 |
+| Flash gate | 8 | 19.364 | 15.728 | compact_mma_prefetch_split7 |
+| Flash gate | 16 | 20.235 | 18.036 | compact_mma_staged_split7 |
+| Flash output | 5 | 16.940 | 14.513 | compact_mma_prefetch_split4 |
+| Flash output | 8 | 15.855 | 14.913 | compact_mma_prefetch_split4 |
+| Flash output | 16 | 17.385 | 16.993 | compact_mma_staged_split4 |
+
+Dense 27B parity remains unmet. The next narrow experiment increases CTA
+coverage through whole-block split-K. Existing four-CTA-per-SM targets yield
+only about 30% active warps in dense node counters. The benchmark exposes
+CTA targets as explicit command arguments, retains the one-split candidate,
+and records every resulting split count. This changes no arithmetic or
+persistent weight storage; model dispatch remains gated.
