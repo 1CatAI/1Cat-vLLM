@@ -484,3 +484,66 @@ def test_compact_blas_fp32_output_and_final_cast_graph(kind):
         expected = x.float() @ reference.float().T
         torch.testing.assert_close(result, expected, rtol=5e-5, atol=0.001)
         torch.testing.assert_close(out, result.half(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_turbomind_fp16_workspace_graph(kind, cancellation):
+    n, k, m = (1536, 2560, 512) if cancellation else (64, 768, 512)
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        data.fill(0)
+        data.reshape(n, k // 256, -1)[:, :, :2] = np.array([1.0], dtype="<f2").view(
+            np.uint8
+        )
+    expected = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+    )
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    scratch = torch.empty_like(expected)
+    official = torch.empty_like(expected)
+    torch.ops._C.gguf_workspace_f16_prepare_sm70_out(official, expected)
+    oracle = expected.reshape(n // 32, 32, k // 8, 8).permute(0, 2, 1, 3)
+    torch.testing.assert_close(official.flatten(), oracle.flatten(), rtol=0, atol=0)
+    pointers, _ = torch.ops._C.awq_moe_build_strided_ptrs(
+        scratch.unsqueeze(0), scratch.unsqueeze(0), k * 32, k * 32, 1
+    )
+    offsets = torch.tensor([0, m], device="cuda", dtype=torch.int32)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(128.0)
+        x[:, k // 2 :] = -128.0
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_tm_f16_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        offsets,
+        pointers,
+    )
+    for _ in range(3):
+        run()
+    torch.testing.assert_close(scratch, official, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        if cancellation:
+            x.neg_()
+        else:
+            x.copy_(torch.randn_like(x))
+        graph.replay()
+        if cancellation:
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                out.float(), x.float() @ expected.float().T, rtol=0.003, atol=0.01
+            )

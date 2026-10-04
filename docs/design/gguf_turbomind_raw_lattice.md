@@ -1093,3 +1093,18 @@ following packet window into registers while reconstructing and storing
 the current one. Persistent byte size, official scale formulas and output
 layouts are unchanged. The full numerical suite and one Flash gate M512
 complete-path comparison must validate it before broadening.
+
+### Temporary packed FP16 workspace candidate
+
+An additional prefill candidate decodes the equal-byte IQ3_S/IQ2_S packet layout
+straight into TurboMind's existing FP16 operand layout, then invokes its SM70
+FP32-accumulating GEMM with a single grouped descriptor. The workspace is
+`[N/32, K/8, 32, 8]` with contiguous eight-element fragments. It is temporary
+and does not alter persistent weight storage or expand stored scales.
+
+The focused checks compare this layout against both the TurboMind converter and
+an independent tensor permutation, replay graphs with changed activations, and
+exercise cancellation where intermediate partial sums exceed the FP16 range.
+Correctness and speed remain unvalidated until the packaged runtime passes
+these checks and the complete M=512 graph comparison. This candidate has no
+model dispatch registration.

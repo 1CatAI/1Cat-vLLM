@@ -8,6 +8,10 @@
 #include "gguf_lattice_compact.cuh"
 #include "src/turbomind/kernels/gemm/arch/mma_sm70.h"
 
+void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor offsets,
+                                      torch::Tensor weight_ptrs);
+
 namespace {
 // One warp cooperatively stages one original block. Row padding is the only
 // persistent storage overhead; unaligned block starts are stitched in shared.
@@ -459,7 +463,8 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
       out[i] = 0;
 }
 
-template <int Type, class Output, bool Transpose, bool FullWidth = false>
+template <int Type, class Output, bool Transpose, bool FullWidth = false,
+          bool PackedOutput = false>
 __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
                                        int n, int k) {
   using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
@@ -484,8 +489,13 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
       const auto values =
           Decode::template fragment<Output>(parameters, packet, octet, grid);
       if constexpr (std::is_same_v<Output, half> && !Transpose) {
+        static_assert(!PackedOutput || FullWidth);
         const int64_t index =
-            int64_t{first + lane} * k + block * 256 + octet * 8;
+            PackedOutput
+                ? ((int64_t{first / 32} * (k / 8) + block * 32 + octet) * 32 +
+                   lane) *
+                      8
+                : int64_t{first + lane} * k + block * 256 + octet * 8;
         *reinterpret_cast<uint4*>(out + index) =
             *reinterpret_cast<const uint4*>(&values);
       } else {
@@ -1160,4 +1170,31 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
 #undef COMPACT_BLAS_DQ
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   lattice_blas_accumulate(out, input, scratch, natural_layout, algorithm);
+}
+
+void gguf_lattice_compact_tm_f16_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor scratch, torch::Tensor offsets,
+    torch::Tensor weight_ptrs) {
+  validate_compact_io(out, input, weight);
+  const c10::cuda::CUDAGuard guard(weight.device());
+  const int n = out.size(1), k = input.size(1);
+  validate_compact(weight, source_type, n, k);
+  TORCH_CHECK(n % 32 == 0 && scratch.device() == weight.device() &&
+                  scratch.scalar_type() == torch::kFloat16 &&
+                  scratch.dim() == 2 && scratch.size(0) == n &&
+                  scratch.size(1) == k && scratch.is_contiguous(),
+              "Compact GGUF TurboMind requires an aligned FP16 workspace");
+  const dim3 grid(n / 32, k / 256);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (source_type == 21)
+    compact_dequant_kernel<21, half, false, true, true>
+        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
+  else
+    compact_dequant_kernel<22, half, false, true, true>
+        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  gguf_workspace_f16_gemm_sm70_out(out, input, offsets, weight_ptrs);
 }

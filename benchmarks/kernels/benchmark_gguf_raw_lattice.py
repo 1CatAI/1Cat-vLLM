@@ -422,6 +422,31 @@ def main():
                         ),
                     )
                 )
+                if n % 32 == 0:
+                    tm_scratch = torch.empty((n, k), device="cuda", dtype=torch.float16)
+                    offsets = torch.tensor([0, m], device="cuda", dtype=torch.int32)
+                    tm_ptrs, _ = torch.ops._C.awq_moe_build_strided_ptrs(
+                        tm_scratch.unsqueeze(0),
+                        tm_scratch.unsqueeze(0),
+                        k * 32,
+                        k * 32,
+                        1,
+                    )
+                    candidates.append(
+                        (
+                            "compact_dequant_turbomind_f16",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_tm_f16_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tm_scratch,
+                                offsets,
+                                tm_ptrs,
+                            ),
+                        )
+                    )
                 natural_scratch = torch.empty(
                     (n, k), device="cuda", dtype=torch.float16
                 )

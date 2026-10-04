@@ -955,3 +955,13 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         int64_t source_type,
                                         torch::Tensor scratch,
                                         bool natural_layout, int64_t algorithm);
+
+void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor offsets,
+                                      torch::Tensor weight_ptrs);
+void gguf_workspace_f16_prepare_sm70_out(torch::Tensor out,
+                                         torch::Tensor input);
+void gguf_lattice_compact_tm_f16_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor scratch, torch::Tensor offsets,
+    torch::Tensor weight_ptrs);
