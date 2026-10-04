@@ -115,6 +115,25 @@ report stream overlap separately. End-to-end runs occur at merge gates or
 when accumulated estimated savings exceed about one millisecond. Investigate
 projection errors above 15% before using the cost model for the next change.
 
+### Matched dense-model check
+
+On Qwen3.8-27B UD-Q4_K_M, TP4, FP16 activation/KV, graph execution,
+8,320-token capacity and four sequence slots, a 1,024-in/128-out synthetic
+cohort gives the following pure decode means across two repeats:
+
+| Concurrency | Ring disabled tok/s | Default ring tok/s | Change |
+|---|---:|---:|---:|
+| C1 | 59.880 | 66.462 | +10.991% |
+| C4 | 221.019 | 221.001 | -0.008% |
+
+Four natural greedy prompts retain identical token IDs and natural EOS in
+both arms: Paris, arithmetic, translation and a Chinese explanation. Worker
+reports confirm automatic direct-ring admission; large padded graph shapes
+report the calibrated-byte-range fallback. The C4 tensors exceed the small
+message limit. This is a dense-model check, not Flash-Next MTP4 latency.
+Startup and compilation are excluded from decode. The full fixed quality set,
+including long needles, is pending.
+
 Final model gates use 256K capacity, 8K input, greedy and temperature 0.7,
 teacher-forced distribution checks, eight prompts of at least 600 generated
 tokens for acceptance statistics, the fixed quality set including 128K/258K
