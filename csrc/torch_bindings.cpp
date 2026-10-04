@@ -239,14 +239,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &gguf_lattice_compact_tm_f16_sm70_out);
   ops.def(
       "gguf_lattice_compact_lt_sm70_prepare(Tensor input, Tensor out, "
-      "int max_candidates=32, bool natural_layout=False) -> Tensor[]");
+      "int max_candidates=32) -> Tensor[]");
   ops.impl("gguf_lattice_compact_lt_sm70_prepare", torch::kCUDA,
            &gguf_lattice_compact_lt_sm70_prepare);
   ops.def(
       "gguf_lattice_compact_lt_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) scratch, Tensor(c!) workspace, "
-      "Tensor algorithm, int dq_partitions=1, bool natural_layout=False) -> "
-      "()");
+      "Tensor algorithm, int dq_partitions=1) -> ()");
   ops.impl("gguf_lattice_compact_lt_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_lt_sm70_out);
   ops.def(

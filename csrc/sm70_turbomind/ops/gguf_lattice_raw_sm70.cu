@@ -15,8 +15,7 @@ void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_lattice_lt_matmul_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor scratch,
                                      torch::Tensor workspace,
-                                     torch::Tensor algorithm,
-                                     bool natural_layout);
+                                     torch::Tensor algorithm);
 
 namespace {
 // One warp cooperatively stages one original block. Row padding is the only
@@ -1286,10 +1285,12 @@ void gguf_lattice_compact_tm_f16_sm70_out(
   gguf_workspace_f16_gemm_sm70_out(out, input, offsets, weight_ptrs);
 }
 
-void gguf_lattice_compact_lt_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
-    int64_t source_type, torch::Tensor scratch, torch::Tensor workspace,
-    torch::Tensor algorithm, int64_t dq_partitions, bool natural_layout) {
+void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weight, int64_t source_type,
+                                      torch::Tensor scratch,
+                                      torch::Tensor workspace,
+                                      torch::Tensor algorithm,
+                                      int64_t dq_partitions) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -1297,32 +1298,22 @@ void gguf_lattice_compact_lt_sm70_out(
   TORCH_CHECK(
       m >= 512 && n % 32 == 0 && scratch.device() == weight.device() &&
           scratch.scalar_type() == torch::kFloat16 && scratch.dim() == 2 &&
-          scratch.size(0) == (natural_layout ? n : k) &&
-          scratch.size(1) == (natural_layout ? k : n) &&
+          scratch.size(0) == k && scratch.size(1) == n &&
           scratch.is_contiguous() &&
-          (dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4) &&
-          (!natural_layout || dq_partitions == 1),
+          (dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4),
       "Compact cuBLASLt requires aligned prefill scratch and partitions");
   const auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(n / 32, k / 256, dq_partitions);
-#define LT_DQ(TYPE)                                                           \
-  if (natural_layout)                                                         \
-    compact_dequant_natural_kernel<TYPE, true><<<grid, 128, 0, stream>>>(     \
-        reinterpret_cast<half*>(scratch.data_ptr()),                          \
-        weight.data_ptr<uint8_t>(), n, k);                                    \
-  else                                                                        \
-    compact_dequant_kernel<TYPE, half, true, true><<<grid, 256, 0, stream>>>( \
-        reinterpret_cast<half*>(scratch.data_ptr()),                          \
-        weight.data_ptr<uint8_t>(), n, k)
-  if (source_type == 21) {
-    LT_DQ(21);
-  } else {
-    LT_DQ(22);
-  }
-#undef LT_DQ
+  if (source_type == 21)
+    compact_dequant_kernel<21, half, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
+  else
+    compact_dequant_kernel<22, half, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  gguf_lattice_lt_matmul_sm70_out(out, input, scratch, workspace, algorithm,
-                                  natural_layout);
+  gguf_lattice_lt_matmul_sm70_out(out, input, scratch, workspace, algorithm);
 }
 
 void gguf_lattice_compact_grouped_sm70_out(

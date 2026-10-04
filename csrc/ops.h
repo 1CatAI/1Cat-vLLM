@@ -968,12 +968,13 @@ void gguf_lattice_compact_tm_f16_sm70_out(
     torch::Tensor weight_ptrs, int64_t dq_partitions);
 
 std::vector<torch::Tensor> gguf_lattice_compact_lt_sm70_prepare(
-    torch::Tensor input, torch::Tensor out, int64_t max_candidates,
-    bool natural_layout);
-void gguf_lattice_compact_lt_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
-    int64_t source_type, torch::Tensor scratch, torch::Tensor workspace,
-    torch::Tensor algorithm, int64_t dq_partitions, bool natural_layout);
+    torch::Tensor input, torch::Tensor out, int64_t max_candidates);
+void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weight, int64_t source_type,
+                                      torch::Tensor scratch,
+                                      torch::Tensor workspace,
+                                      torch::Tensor algorithm,
+                                      int64_t dq_partitions);
 
 void gguf_lattice_compact_grouped_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,

@@ -1347,3 +1347,11 @@ not. The same NONE/COMPUTE_TYPE reduction admission remains enforced, and
 natural dequantization uses its existing single-partition shared transpose.
 Both layouts receive changed-input graph and FP16-overflow cancellation tests.
 No model default or precision change is made from this unmeasured candidate.
+
+Natural-workspace cuBLASLt passes 58 focused checks in 13.47 s, including
+overflow cancellation and changed-input graphs for both formats/layouts.
+Eighty valid FP32 configurations from algorithms 3/21/23 are tested on the
+Flash gate M512 shape; best is algorithm 21, tile 15, stage 0, no split:
+104.300 us versus 89.683 us canonical, relative L2 0.0002070. Natural-layout
+Lt support is removed; the existing cuBLAS layout controls and original Lt
+interface remain. No precision or persistent-storage change is introduced.
