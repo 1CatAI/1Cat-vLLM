@@ -152,3 +152,45 @@ def test_q8000_q8192_share_scores_and_preserve_graph_replay():
         combined.replay()
         for _, out, reference, *_ in cases:
             torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("query_len", "op_name"),
+    [
+        (8000, "sm70_d256_gqa_architecture_fwd"),
+        (8192, "sm70_d256_gqa_architecture_q8192_fwd"),
+    ],
+)
+@torch.inference_mode()
+def test_missed_tail_peak_does_not_overflow_numerator(query_len, op_name):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 CUDA test")
+    from vllm.vllm_flash_attn.flash_attn_interface import load_fa2_library
+
+    load_fa2_library(torch.device("cuda"))
+    if not hasattr(torch.ops._vllm_fa2_C, op_name):
+        pytest.skip("SM70 architecture operator was not built")
+
+    kv_len = 2 * query_len
+    q = torch.zeros(1, query_len, 6, 256, device="cuda", dtype=torch.float16)
+    k = torch.zeros(1, kv_len, 1, 256, device="cuda", dtype=torch.float16)
+    v = torch.zeros_like(k)
+    q[..., 0] = 16
+    k[..., 0] = -6.25
+    v[..., 194] = -1
+    # A captured model row had a peak near 10.7, but the stride-eight sample
+    # saw only -6.3. Correlate the missed keys with V to grow the unnormalized
+    # numerator across fine-PV rounds; the normalized result still fits FP16.
+    k[:, 10::16, :, 0] = 10.75
+    v[:, 10::16, :, 194] = 1
+    output = torch.empty_like(q)
+    getattr(torch.ops._vllm_fa2_C, op_name)(q, k, v, output, 0.0625, True)
+    assert torch.isfinite(output).all()
+    rows = torch.tensor([0, 63, 64, query_len // 2, query_len - 1], device="cuda")
+    scores = torch.einsum("rhd,kd->hrk", q[0, rows].float(), k[0, :, 0].float()) / 16
+    keys = torch.arange(kv_len, device="cuda")
+    scores.masked_fill_(
+        keys[None, None, :] > (kv_len - query_len + rows)[None, :, None], -torch.inf
+    )
+    reference = (scores.softmax(-1) @ v[0, :, 0].float()).permute(1, 0, 2)
+    torch.testing.assert_close(output[0, rows].float(), reference, rtol=0.01, atol=0.01)
