@@ -588,9 +588,6 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
   __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
   __shared__ float shared_d[SharedParameters ? 32 : 1];
   __shared__ uint64_t shared_scales[SharedParameters ? 32 : 1];
-  constexpr bool VectorStores =
-      SharedParameters && Transpose && std::is_same_v<Output, half>;
-  __shared__ __align__(16) half store_tile[VectorStores ? 8 : 1][8][40];
   if constexpr (!SharedParameters) Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int first = blockIdx.x * 32,
@@ -638,16 +635,6 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
                 : int64_t{first + lane} * k + block * 256 + octet * 8;
         *reinterpret_cast<uint4*>(out + index) =
             *reinterpret_cast<const uint4*>(&values);
-      } else if constexpr (VectorStores) {
-#pragma unroll
-        for (int j = 0; j < 8; ++j) store_tile[warp][j][lane] = values[j];
-        __syncwarp();
-        const int j = lane / 4, row = first + (lane % 4) * 8;
-        const int64_t index = int64_t{block * 256 + octet * 8 + j} * n + row;
-        *reinterpret_cast<uint4*>(out + index) =
-            *reinterpret_cast<const uint4*>(
-                &store_tile[warp][j][(lane % 4) * 8]);
-        __syncwarp();
       } else {
 #pragma unroll
         for (int j = 0; j < 8; ++j) {

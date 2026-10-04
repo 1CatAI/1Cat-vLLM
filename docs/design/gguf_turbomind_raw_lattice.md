@@ -1426,3 +1426,43 @@ versus 89.942 us same-run canonical on the real Flash gate M512 shape, with
 relative L2 0.0002074. The remaining speed gap is 2.6%; no model default or
 step savings are claimed. FP16-output algorithm 11 remains explicitly rejected.
 The public benchmark includes this measured FP32-only candidate.
+
+### Equal-byte TurboMind planes
+
+An additional lossless GPU permutation puts low grid indices/sign packets in
+TurboMind's existing U2 MMA carrier order. Separate original-bit planes retain
+FP16 block d, packed scale nibbles, high index bits and IQ3_S signs. They total
+110/82 bytes per block for IQ3_S/IQ2_S, with no expanded persistent coefficient
+array. The ordinary SM70 mainloop reconstructs its metadata carrier only in
+registers/shared memory. The original small factor times grid is exact in FP16;
+the final FP16 operand matches official FP32 dequantization rounded to FP16.
+MMA accumulation and split reductions remain FP32.
+
+The normal wheel passes 68 checks, including independent byte-for-byte inverse,
+comparison of U2 carriers with the existing converter, changed-input full
+captures and official FP16-weight/FP32-dot oracles. Six real TP4 shapes at
+M1/5/8/16/512 have relative L2 0.000202–0.000223. Eight distinct banks are
+replayed in full CUDA graphs on V100-SXM2-32GB, Torch 2.10.0+cu128 and CUDA 12.8.
+
+| TP4 projection | M512 planes (µs) | Same-run canonical (µs) |
+|---|---:|---:|
+| 27B IQ3_S gate N4352 K5120 | 531.431 | 496.522 |
+| 27B IQ3_S down N5120 K4352 | 447.723 | 378.257 |
+| Flash IQ3_S expert N160 K2560 | 37.710 | 68.123 |
+| Flash IQ2_S expert N160 K2560 | 37.054 | 63.015 |
+| Flash IQ3_S dense gate N1536 K2560 | 108.252 | 89.491 |
+| Flash IQ3_S output N2560 K1536 | 99.157 | 81.673 |
+
+Small-M plane GEMMs regress; the existing vector and compact grouped candidates
+remain preferable. No model default selects this prototype. After cache
+ eviction, Flash dense gate NCU selects M128/N256/K32 with 144 CTAs, 254 registers,
+65,552 dynamic shared bytes and 12.47% active warps. It reads 4,509,440 DRAM bytes
+versus the 1,689,600-byte source payload, including activation/output/reduction
+traffic. These counters do not establish model step savings. Additional
+N128/M64 candidates do not improve the gate: 108.208 versus 89.786 µs.
+
+A warp transpose to replace eight scalar workspace stores with one vector
+store passes 68 checks but leaves the full FP32-output path at 92.449 versus
+90.070 µs canonical (2.6% gap). It is removed because it adds shared memory
+without a confirmed speed benefit. The original compact workspace schedule
+and precision contract are retained. End-to-end integration remains pending.
