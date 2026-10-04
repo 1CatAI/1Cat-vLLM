@@ -90,3 +90,41 @@ Loading and route preparation have focused CPU regressions, including mixed
 format rejection, layout rejection, shard order, storage sharing and router
 FP32 admission. The combined HC/dense model C1/C4 comparison remains pending.
 No end-to-end speedup is claimed here.
+
+## First combined model comparison
+
+Flash-Next GSQ-RCO IQ3_S with FP16 MTP4, TP4 on the partial NVLink topology,
+FP16 KV and FP32 SSM state; Torch 2.10 CUDA 12.8, FULL decode graphs,
+max length 8704, batch budget 512, four sequence slots and memory utilization
+0.9. C1 uses 8192 input and 256 forced output tokens. C4 uses 128 input and
+1024 forced output tokens. Fixed timing cohorts ignore EOS; the separate
+natural prompts respect EOS.
+
+Candidate source `39442cce7b`, ordinary runtime
+`1.5.2.dev525+g39442cce7.precompiled`, combines floating restoration, router
+FP32 admission, replicated HC and the merged GGUF runtime dispatch fix.
+Quantized LM head and fused expert alignment are not included. The comparison
+does not isolate the floating changes from the runtime dispatch fix.
+
+| Workload | Old round (ms) | New round (ms) | Old decode (tokens/s) | New decode (tokens/s) | Old full acceptance length | New full acceptance length |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C1 | 41.499 | 36.747 | 75.212 | 93.788 | 3.036 | 3.459 |
+| C4 | 65.624 | 66.061 | 262.269 | 202.019 | 3.830 | 3.055 |
+
+Candidate measurements use three repeats. The previous C1 measurement has
+one repeat; the previous C4 measurement has three. All candidate repeats
+have identical token IDs and acceptance counters within each workload.
+Candidate steady emitted tokens per request and round are 3.446 at C1 and
+3.336 at C4. End-to-end throughput includes the acceptance change and must
+not be reported as a pure kernel speedup.
+
+Runtime logs confirm replicated FP32 HC, M=5/10 a/b row GEMV, packed FP32
+router and router top-k selection. All four natural greedy prompts have
+the same token IDs as the previous ring-enabled runtime and finish at EOS.
+
+C4 fails the throughput nonregression check, despite its nearly unchanged
+round time. Promotion remains blocked on localizing the acceptance change.
+The M=20 a/b projection currently leaves the row path and uses a combined
+dense GEMM, whereas the old floating shards use separate GEMMs. An extended
+row screen checks whether M=20/32 can preserve the M1 arithmetic exactly;
+the model result for that follow-up is not yet available.
