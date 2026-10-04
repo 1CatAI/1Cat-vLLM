@@ -347,3 +347,131 @@ only for actual M=8, preserving masked loads for M1–7. A fresh build of the
 owned source passes eager and three graph replays at M1/2/4/7/8, with
 bitwise equality to the original shared-coefficient pair. Its M8 cold graph
 median is 65.536 us. It remains research-only, without model dispatch.
+
+The next optimization sequence targets instruction issue. Static inspection of
+this M8 loop reports approximately 138 instructions per K16 segment, including
+74 integer instructions, 32 FP16 instructions and 16 HMMA instructions.
+Register lookahead, decoded-operand pipelines and instruction interleaving are
+stopped: none removes this instruction work. The revised gate+up target is
+40 us under a matched cold-L2 graph cohort, with native NVFP4 measured in the
+same process. Earlier 30 us targets above describe the previous experiments.
+
+First verify issue activity and executed/issued instructions with NCU on the
+retained M8 source. Then test a 32 KiB shared signed IQ3_S codebook; hoisted
+pointer increments with aligned, warp-interleaved 16-byte original-bit records;
+block-level half2 scale reuse; and an 80/160-CTA persistent scheduler. Each
+step requires static loop instruction counts, an official dequantization oracle
+and a matched graph timing. Expanded FP16 scale rounding needs separate error
+and quality evidence before use. Until then the exact two-stage operand
+formation and FP32 accumulation remain in force. QKVZ with FP16 alpha/beta is
+being developed separately and does not wait for the gated-pair target.
+
+The retained M8 NCU run executes 13,168,064 warp instructions and issues
+13,188,535. With 2,176 launched warps, this is 6,051.5 executed instructions
+per launched warp, including initialization and the epilogue. Issue activity
+is 59.02% per active cycle and 50.99% of peak over elapsed cycles. Profiled
+duration is 63.744 us, registers 56 and shared memory 18,432 bytes. These
+counters show substantial instruction work, without establishing saturated
+issue slots over the whole kernel.
+
+The signed book preserves every actual gate/up weight bitwise in both FP32
+and FP16, and the gated output is bitwise equal. Its complete K64 backedge
+contains 478 instructions (119.5 per K16), versus 589 (147.25 per K16) for
+the retained exact-M8 specialization. Counts include control and padding
+instructions. It uses 50 registers, no spills and 49,152 shared bytes;
+preferred shared carveout is 96 KiB. Matched SM1290/MEM877 cold graph ABBA
+is retained/signed/signed/retained = 66.560/73.728/73.728/65.536 us.
+The signed book regresses despite lower loop instruction count.
+
+An equal-byte aligned layout groups each lane's K128 low indices and signs
+into three 16-byte records, interleaved by warp. High index bits and original
+metadata remain in separate planes. An independent inverse recovers every
+source byte; each projection remains 9,574,400 bytes. All actual weights are
+bitwise official in FP32/FP16; the gated output is bitwise retained. Its K128
+backedge has 746 instructions (93.25 per K16), 60 registers and no spills.
+The matched signed/aligned/aligned/signed cohort measures
+75.776/70.656/69.632/73.728 us; retained is 65.536 us and native NVFP4
+51.200–52.224 us. It remains slower than retained (source bandwidth
+271–275 versus 292 GB/s). A scoped three-variant NCU run is required to
+localize the regression before accepting either decoder/layout.
+
+The three-variant NCU comparison confirms reduced executed instructions:
+retained 13.168 million, signed 11.291 million, aligned 9.025 million.
+However elapsed issue activity falls from 50.40% to 39.02% and 33.97%.
+Profiled durations are 62.528/70.528/67.040 us respectively. The signed
+variants request and receive 96 KiB shared carveout with two CTA occupancy
+limits; the retained variant uses 64 KiB. Long-scoreboard not-issued samples
+rise from 331 to 1,033 for signed, including 229 in signed-table initialization.
+Aligned has 529 long-scoreboard samples (202 at initialization) and 517
+LG-throttle samples, predominantly at vector/activation loads. These are
+sample counts and cannot be converted directly into elapsed-time shares.
+
+An exact base-half2 cache, Type21 u32 scale field and direct high-byte PRMT
+selectors lower the K128 loop from 746 to 711 instructions (88.875 per
+K16), with 52 registers and no spills. Every actual FP32/FP16 weight and
+GEMM output remains bitwise equivalent. Matched timing is unchanged at
+70.656 us. A generated fixed signed table replaces per-CTA sign computation
+with coalesced uint4 copies; its matched timing is 67.584 us, versus retained
+65.536 us and NVFP4 51.200–52.224 us. Neither is accepted. There is no
+FP16 combined-scale rounding in these candidates.
+
+A 13-bit signed-index record permutation folds the original 9-bit index and
+4-bit sign nibble into a direct signed-book index. Each lane reads three
+aligned uint4 records plus a u32 tail per K128, still exactly 52 payload
+bytes. Fixed PRMT windows extract crossing fields without dynamic
+26-bit funnel shifts. The independent inverse recovers every source byte.
+All actual FP32/FP16 weights are bitwise official, and gated outputs are
+bitwise retained. Its K128 loop is 562 instructions, **70.25 per K16**, with
+51 registers, 32 KiB shared union and no spills. Matched ABBA is
+separate-index/sign 66.560, signed-index 62.464, signed-index 62.464,
+separate-index/sign 66.560 us; retained is 65.536 us and native NVFP4
+51.200–52.224 us. Source bandwidth is 306.56 GB/s. It reaches the
+instruction-count objective but still fails the 40 us latency target.
+
+The union allows codebook storage to become partial-sum storage after a
+CTA barrier. A previous 67% carveout request actually selected 96 KiB on
+Volta; it must not be described as measured 64 KiB. NCU verifies that 66%
+selects 64 KiB. Matched graph timing changes only from 67.584–68.096 to
+66.560 us, without beating the retained source on its own.
+
+NCU on signed-index K128 executes 6.541 million warp instructions, versus
+7.518/7.596 million for native NVFP4 with one/two accumulator chains. NVFP4
+uses 1,024-thread CTAs and 32 KiB carveout, versus 512 threads and 64 KiB
+for this IQ3 path. Profiled duration is 59.008 versus 47.808/48.288 us;
+elapsed issue activity is 27.18% versus 39.23%/39.01%. Actual profiled DRAM
+throughput is 356.02 versus 535.50/530.16 GB/s. These counters reject total
+instruction count as the sole remaining explanation. The native single-chain
+control also rules out accumulator-chain count as the primary remaining gap.
+
+K64 direct signed-index records use one uint4, one uint2 and a uint16 per
+lane, preserving 26 payload bytes. Official all-weight FP32/FP16 dequantization
+passes; split8 gated outputs are bitwise retained. Its loop contains 301
+instructions (75.25 per K16). Matching the native streaming weight-load hint
+preserves numerical results but has no timing benefit for K128: both cached
+and streaming measure 62.464 us. K64 split8 measures 63.488 us; split16
+cached/streaming is 67.584/66.560 us. The isolated split16 carveout check requests 32 KiB instead of 64 KiB
+without changing decoder, layout or precision. Matched ABBA is
+66.560/67.584/67.584/67.072 us, so it is rejected as well.
+
+## Signed-index source checkpoint
+
+The research-only `gguf_iq3_signed_pair_sm70.cu` records the measured
+70.25-instruction/K16 implementation separately from the retained packet
+kernel. `gguf_iq3_signed_records.py` contains the same-byte host permutation
+and independent full inverse check. The common raw/compact decoder headers
+come from #897 at `c64a8d7c2f9fde305c96ae222442a36734b432fa`, with signed
+lookup, exact base caching and fixed PRMT selectors; scale decoding stays in
+that shared family. The fixed signed book retains the original MIT provenance.
+No normal build registration or model dispatch is enabled by this checkpoint.
+
+In the latest NCU source attribution, 916,060 excessive shared wavefronts
+are concentrated in signed-book LDS instructions. Long-scoreboard not-issued
+samples include 122 at signed-book initialization and 117 at the first
+index-to-book address dependency; total samples are 577. LG-throttle has
+435 samples, including both activation and payload vector loads. These
+counts identify dependencies for isolation, not additive time fractions.
+The next isolated test changes only signed-book placement to the read-only
+cache, removing per-CTA initialization and shared bank serialization while
+retaining the aligned payload, exact operands and FP32 accumulation. The
+earlier unsigned-book global-table result cannot validate this signed-index
+implementation, which has a different instruction count and lookup footprint.
