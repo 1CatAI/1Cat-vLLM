@@ -925,3 +925,10 @@ void gguf_lattice_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                 torch::Tensor weight, torch::Tensor stats,
                                 int64_t source_type, torch::Tensor scratch,
                                 int64_t group_size);
+
+void gguf_small_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor offsets,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs,
+                                     int64_t source_type, int64_t num_experts,
+                                     int64_t group_size);
