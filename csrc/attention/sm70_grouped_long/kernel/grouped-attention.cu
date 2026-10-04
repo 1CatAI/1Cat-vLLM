@@ -3319,6 +3319,130 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   }
 }
 
+// FP16 KV verifier: one context read serves all query rows. Keep the
+// softmax probability, PV products, numerator and partition state in FP32.
+// Padded rows retain their explicit zero lengths throughout graph replay.
+__global__
+__launch_bounds__(kGroupedVerifyThreads, 1)
+void flash_attention_grouped_verify_fp16_fp32_partial_kernel(
+    const __half* q, const void* k, const void* v, const int* blocks,
+    const int* lengths, float* partial, float* lse, int query_len,
+    int max_blocks, int page, int64_t kb, int64_t kt, int64_t kh,
+    int64_t vb, int64_t vt, int64_t vh, float scale) {
+  const int split = blockIdx.x, request = blockIdx.y;
+  lengths += request * 8;
+  blocks += request * max_blocks;
+  q += request * query_len * 6 * 256;
+  partial += static_cast<int64_t>(request) * 80 * 8 * 6 * 256;
+  lse += static_cast<int64_t>(request) * 80 * 8 * 6 * 2;
+  int total = 0;
+  for (int r = 0; r < query_len; r++) total = max(total, lengths[r]);
+  if (total <= 0) return;
+  const int active = grouped_verify_active_splits<8, false>(total);
+  if (split >= active) return;
+  const int tiles = (total + 31) / 32, base = tiles / active,
+            extra = tiles % active;
+  const int first = (split * base + min(split, extra)) * 32;
+  const int last = min(total, first + (base + (split < extra)) * 32);
+  extern __shared__ char raw[];
+  GroupedVerifySmem& smem = *reinterpret_cast<GroupedVerifySmem*>(raw);
+  auto sq = smem.storage.compute.q;
+  auto kv = smem.storage.compute.kv;
+  auto scores = smem.storage.compute.scores;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  for (int i = tid; i < 48 * 32; i += 512) {
+    const int row = i / 32, col = i % 32;
+    reinterpret_cast<uint4*>(sq)[row * 33 + col] =
+        row / 6 < query_len ? reinterpret_cast<const uint4*>(q)[row * 32 + col]
+                            : make_uint4(0, 0, 0, 0);
+  }
+  if (tid < 48) {
+    smem.row_max[tid] = kXQANegInf;
+    smem.row_sum[tid] = 0;
+    smem.row_scale[tid] = 1;
+  }
+  float accum[3][8] = {};
+  __syncthreads();
+  for (int tile = first; tile < last; tile += 32) {
+    const int valid = min(32, last - tile);
+    load_xqa_tc_kv_panel<0, false, 512, flash_v100::KV_CACHE_DTYPE_FP16, false>(
+        kv, k, blocks, valid, 32, 33, tile, 0, page, 0, kb, kt, kh, 0, tid);
+    for (int i = tid + valid * 33; i < 32 * 33; i += 512)
+      reinterpret_cast<uint4*>(kv)[i] = make_uint4(0, 0, 0, 0);
+    __syncthreads();
+    grouped_verify_qk<false>(sq, kv, scores, scale,
+                             (1 << ((query_len * 6 + 15) / 16)) - 1);
+    __syncthreads();
+#pragma unroll
+    for (int rr = 0; rr < 3; rr++) {
+      const int row = warp + rr * 16;
+      const bool visible =
+          row / 6 < query_len && lane < valid && tile + lane < lengths[row / 6];
+      const float score = visible ? scores[row * 32 + lane] : kXQANegInf;
+      const float tilemax = __shfl_sync(0xffffffffu, warp_reduce_max(score), 0);
+      const float oldmax = smem.row_max[row], newmax = fmaxf(oldmax, tilemax);
+      const float probability =
+          visible ? __expf(fmaxf(score - newmax, -80.f)) : 0.f;
+      const float sum =
+          __shfl_sync(0xffffffffu, warp_reduce_sum(probability), 0);
+      const float diff = sum > 0 ? __expf(fmaxf(oldmax - newmax, -80.f)) : 1.f;
+      scores[row * 32 + lane] = probability;
+      __syncwarp();
+      if (lane == 0) {
+        if (sum > 0) {
+          smem.row_sum[row] = fmaf(smem.row_sum[row], diff, sum);
+          smem.row_max[row] = newmax;
+        }
+        smem.row_scale[row] = diff;
+      }
+#pragma unroll
+      for (int d = 0; d < 8; d++) accum[rr][d] *= diff;
+    }
+    __syncthreads();
+    load_xqa_tc_kv_panel<0, false, 512, flash_v100::KV_CACHE_DTYPE_FP16, false>(
+        kv, v, blocks, valid, 32, 33, tile, 0, page, 0, vb, vt, vh, 0, tid);
+    __syncthreads();
+#pragma unroll
+    for (int rr = 0; rr < 3; rr++) {
+      const int row = warp + rr * 16;
+      if (row / 6 < query_len) {
+#pragma unroll
+        for (int token = 0; token < 32; token++) {
+          if (token >= valid) break;
+          const float probability = scores[row * 32 + token];
+#pragma unroll
+          for (int d = 0; d < 4; d++) {
+            const float2 value =
+                __half22float2(reinterpret_cast<const __half2*>(
+                    kv + token * 264)[lane + d * 32]);
+            accum[rr][2 * d] = fmaf(probability, value.x, accum[rr][2 * d]);
+            accum[rr][2 * d + 1] =
+                fmaf(probability, value.y, accum[rr][2 * d + 1]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int rr = 0; rr < 3; rr++) {
+    const int row = warp + rr * 16;
+    if (row / 6 < query_len) {
+#pragma unroll
+      for (int d = 0; d < 4; d++) {
+        const int64_t offset = (static_cast<int64_t>(split) * 48 + row) * 256 +
+                               (lane + d * 32) * 2;
+        partial[offset] = accum[rr][2 * d];
+        partial[offset + 1] = accum[rr][2 * d + 1];
+      }
+      if (lane == 0) {
+        const int off = (split * 48 + row) * 2;
+        lse[off] = smem.row_sum[row] > 0 ? smem.row_max[row] : kXQANegInf;
+        lse[off + 1] = smem.row_sum[row];
+      }
+    }
+  }
+}
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY, typename PARTIAL_T = __half,
           bool ROW_SEQLENS = false>
 __global__
@@ -5071,6 +5195,98 @@ at::Tensor private_grouped_e4m3_fp32_paged(
 }
 
 
+at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
+                                           const at::Tensor& k,
+                                           const at::Tensor& v, at::Tensor& out,
+                                           const at::Tensor& block_table,
+                                           const at::Tensor& row_lengths,
+                                           at::Tensor& partial, at::Tensor& lse,
+                                           float scale) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
+                  q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
+                  q.size(1) == 6 && q.size(2) == 256,
+              "FP16 grouped FP32 requires contiguous CUDA FP16 Q [rows,6,256]");
+  TORCH_CHECK(
+      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 && k.size(1) > 0 &&
+          k.size(1) % 16 == 0 && k.scalar_type() == at::kHalf &&
+          v.scalar_type() == at::kHalf && v.sizes() == k.sizes(),
+      "FP16 grouped FP32 requires supported FP16 paged KV [pages,page,1,256]");
+  const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
+  TORCH_CHECK(
+      block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
+          block_table.is_contiguous() &&
+          block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
+          block_table.size(1) * k.size(1) <= 266240 &&
+          q.size(0) % batch_size == 0 &&
+          (batch_size == 1 ? (q.size(0) >= 2 && q.size(0) <= 8)
+                           : q.size(0) == batch_size * 8) &&
+          row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
+          row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
+      "FP16 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "and per-query int32 lengths");
+  TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
+                  out.scalar_type() == at::kHalf,
+              "FP16 grouped FP32 output must be contiguous FP16 and Q-shaped");
+  const bool workspace_shapes =
+      batch_size == 1
+          ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
+          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+  TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
+                  partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
+                  lse.scalar_type() == at::kFloat,
+              "FP16 grouped FP32 requires request-major FP32 numerator "
+              "and max/sum workspaces");
+  TORCH_CHECK(std::isfinite(scale),
+              "FP16 grouped FP32 requires finite attention scale");
+  for (const auto* t :
+       {&k, &v, static_cast<const at::Tensor*>(&out), &block_table,
+        &row_lengths, static_cast<const at::Tensor*>(&partial),
+        static_cast<const at::Tensor*>(&lse)}) {
+    TORCH_CHECK(t->device() == q.device(),
+                "FP16 grouped tensors must share device");
+  }
+  for (const auto* t : {&k, &v}) {
+    // The FP16 loader reads eight half elements per aligned vector.
+    TORCH_CHECK(t->stride(3) == 1 &&
+                    reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "FP16 grouped KV requires aligned contiguous head dimension");
+    for (int i = 0; i < 3; ++i)
+      TORCH_CHECK(t->stride(i) % 8 == 0,
+                  "FP16 grouped KV strides must be multiples of 8");
+  }
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0,
+              "FP16 grouped Q must be aligned for vector loads");
+  c10::cuda::CUDAGuard guard(q.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "FP16 grouped FP32 supports SM70 only");
+  TORCH_CHECK(properties->sharedMemPerBlockOptin >= sizeof(GroupedVerifySmem),
+              "FP16 grouped workspace exceeds opt-in shared memory");
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      flash_attention_grouped_verify_fp16_fp32_partial_kernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(GroupedVerifySmem)));
+  const int query_len = static_cast<int>(q.size(0) / batch_size);
+  flash_attention_grouped_verify_fp16_fp32_partial_kernel<<<
+      dim3(80, static_cast<unsigned>(batch_size)), kGroupedVerifyThreads,
+      sizeof(GroupedVerifySmem), stream>>>(
+      reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
+      block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
+      partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
+      block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
+      v.stride(0), v.stride(1), v.stride(2), scale);
+  flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
+      <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+         kGroupedVerifyHeadDim, 0, stream>>>(
+          partial.data_ptr<float>(), lse.data_ptr<float>(),
+          row_lengths.data_ptr<int>(),
+          reinterpret_cast<__half*>(out.data_ptr()), query_len,
+          row_lengths.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
 // Registered into the shipped FA2 extension rather than a private pybind
 // module, so the long-context route is available by default instead of
 // requiring an externally built DSO selected by an environment variable.
@@ -5088,9 +5304,23 @@ at::Tensor sm70_grouped_long_entry(
       static_cast<float>(scale), static_cast<float>(k_scale),
       static_cast<float>(v_scale));
 }
+at::Tensor sm70_grouped_fp16_entry(const at::Tensor& q, const at::Tensor& k,
+                                   const at::Tensor& v, at::Tensor& out,
+                                   const at::Tensor& block_table,
+                                   const at::Tensor& row_lengths,
+                                   at::Tensor& partial, at::Tensor& lse,
+                                   double scale) {
+  return private_grouped_fp16_fp32_paged(q, k, v, out, block_table, row_lengths,
+                                         partial, lse,
+                                         static_cast<float>(scale));
+}
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  ops.def(
+      "sm70_grouped_fp16_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
+      "Tensor block_table, Tensor row_lengths, Tensor(b!) partial, "
+      "Tensor(c!) lse, float scale) -> Tensor(a!)");
   // The runtime-page specialization is compiled alongside the fixed pages.
   // Python uses this capability to avoid widening admission for stale DSOs.
   ops.def("sm70_grouped_long_page_revision() -> int",
@@ -5105,5 +5335,6 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
       "Tensor(a!) lse, float scale, float k_scale, float v_scale) -> Tensor(a!)");
 }
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
+  ops.impl("sm70_grouped_fp16_fwd", &sm70_grouped_fp16_entry);
   ops.impl("sm70_grouped_long_fwd", &sm70_grouped_long_entry);
 }

@@ -231,13 +231,16 @@ __global__ void fp8_qpn8_sm70_kernel(
     if (tile >= qpn_tiles) {
       constexpr int kBARowsPerBlock = 2;
       constexpr int kBAThreadsPerRow = 256;
-      const int ba_block = tile - qpn_tiles;
+      const int ba_blocks_per_token = (ba_n + 1) / kBARowsPerBlock;
+      const int token = M1Only ? 0 : (tile - qpn_tiles) / ba_blocks_per_token;
+      const int ba_block = (tile - qpn_tiles) % ba_blocks_per_token;
       const int ba_group = threadIdx.x / kBAThreadsPerRow;
       const int ba_thread = threadIdx.x % kBAThreadsPerRow;
       const int ba_warp = ba_thread >> 5;
       const int ba_row = ba_block * kBARowsPerBlock + ba_group;
       float value = 0.0f;
-      const half2* input2 = reinterpret_cast<const half2*>(input);
+      const half2* input2 = reinterpret_cast<const half2*>(
+          input + static_cast<size_t>(token) * k);
       const half2* weight2 = reinterpret_cast<const half2*>(
           ba_weight + static_cast<size_t>(ba_row) * k);
       for (int pair = ba_thread; pair < k / 2; pair += kBAThreadsPerRow) {
@@ -263,12 +266,15 @@ __global__ void fp8_qpn8_sm70_kernel(
         if (lane == 0 && ba_row < ba_n) {
           if constexpr (SplitOutputs) {
             if (ba_row < ba_n / 2) {
-              b_output[ba_row] = __float2half(value);
+              b_output[static_cast<size_t>(token) * (ba_n / 2) + ba_row] =
+                  __float2half(value);
             } else {
-              a_output[ba_row - ba_n / 2] = __float2half(value);
+              a_output[static_cast<size_t>(token) * (ba_n / 2) + ba_row -
+                       ba_n / 2] = __float2half(value);
             }
           } else {
-            ba_output[ba_row] = __float2half(value);
+            ba_output[static_cast<size_t>(token) * ba_n + ba_row] =
+                __float2half(value);
           }
         }
       }
@@ -427,8 +433,19 @@ __global__ void fp8_qpn8_sm70_kernel(
       const int output_row = element >> 5;
       const int output_col = element & 31;
       if (output_row < m) {
-        output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
-            __float2half(value);
+        const int col = tile * 32 + output_col;
+        if constexpr (SplitOutputs) {
+          if (col < qkv_n) {
+            output[static_cast<size_t>(output_row) * qkv_n + col] =
+                __float2half(value);
+          } else {
+            z_output[static_cast<size_t>(output_row) * (n - qkv_n) + col -
+                     qkv_n] = __float2half(value);
+          }
+        } else {
+          output[static_cast<size_t>(output_row) * n + col] =
+              __float2half(value);
+        }
       }
     }
   }
@@ -1768,6 +1785,27 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
     });
     fp8_qpn8_gemm_ba_split_sm70_out(qkv_out, z_out, b_out, a_out, input, codes,
                                     group_scales, ba_weight);
+    return;
+  }
+
+  if (m == 8 && k == 5120) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    // Preserve the ordinary M8 QPN8 accumulation order. The appended CTAs
+    // compute b/a and write contiguous split outputs in the same launch.
+    fp8_qpn8_sm70_kernel<16, 2, true, false, false, true, true>
+        <<<(n / 32 + m * ba_n / 2), 512, 0, at::cuda::getCurrentCUDAStream()>>>(
+            codes.data_ptr<uint8_t>(),
+            reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(qkv_out.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(z_out.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(ba_weight.data_ptr<at::Half>()),
+            nullptr, reinterpret_cast<half*>(b_out.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(a_out.data_ptr<at::Half>()),
+            static_cast<int>(ba_n), static_cast<int>(qkv_n),
+            static_cast<int>(n), static_cast<int>(k), static_cast<int>(m),
+            true);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
 

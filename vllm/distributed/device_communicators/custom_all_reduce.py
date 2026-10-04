@@ -622,7 +622,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Explicit benchmark-only TP4 path; no automatic runtime dispatch."""
+        """Fuse the eight-row push collective, residual add, and Gemma norm."""
         if not self.can_sm70_tp4_all_reduce_gemma_rms_norm(inp, residual, weight):
             raise RuntimeError("SM70 TP4 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
