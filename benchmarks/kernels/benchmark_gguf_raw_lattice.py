@@ -88,6 +88,8 @@ def main():
         "n": n,
         "k": k,
         "graph": "FULL",
+        "timing_cache_state": "repeated_same_projection",
+        "counter_cache_state": "64_MiB_eviction_before_profiled_replay",
         "accumulation": "FP32",
         "row_padding_bytes": raw.padding_bytes_per_row,
         "original_payload_bytes": n * raw.payload_bytes_per_row,
@@ -233,6 +235,11 @@ def main():
             with torch.cuda.graph(graph):
                 call()
             graph.replay()
+            torch.accelerator.synchronize()
+            # Small experts fit in V100 L2. Evict before counters so their
+            # DRAM traffic is not hidden by the repeated-shape timing warmup.
+            eviction = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+            eviction.zero_()
             torch.accelerator.synchronize()
             torch.cuda.cudart().cudaProfilerStart()
             graph.replay()

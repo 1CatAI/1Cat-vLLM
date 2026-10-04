@@ -52,6 +52,10 @@ and performance measurements are pending after a shared-lock timeout. No speed p
 claim or model default change follows from compiling these operators.
 The benchmark uses complete CUDA graph capture and replay for both raw and
 canonical candidates; uncaptured calls only initialize kernels and handles.
+Repeated-shape timings reuse one projection and can hit L2 for small
+experts. Counter capture evicts L2 with a 64 MiB fill before the selected
+replay; the eviction is outside the profiled region. Promotion also needs
+representative expert-bank traffic, rather than only a cache-resident case.
 It compares the existing canonical dispatcher, including its measured
 shape-specific dequantization/cuBLAS bands.
 
