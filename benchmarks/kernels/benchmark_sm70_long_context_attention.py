@@ -25,6 +25,10 @@ def load_operator(path: Path):
     spec = importlib.util.spec_from_file_location(manifest["module_name"], library)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    decoded = module.decoder_check()
+    manifest["all_e4m3_codes_bitwise_decode"] = torch.equal(decoded[0], decoded[1])
+    if not manifest["all_e4m3_codes_bitwise_decode"]:
+        raise AssertionError("E4M3 direct decoding differs from the lookup oracle")
     return module.run, manifest
 
 

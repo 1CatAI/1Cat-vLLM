@@ -83,6 +83,7 @@ def main() -> None:
         required=True,
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--source-sha", help="Revision of a transferred source archive")
     parser.add_argument("--build", action="store_true")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
@@ -92,9 +93,27 @@ def main() -> None:
     # Avoid duplicate registration when reference/candidates share a process.
     source = source[: source.index("// Registered into the shipped FA2 extension")]
     source = "#include <torch/extension.h>\n" + source
+    source += r"""
+__global__ void private_check_e4m3_decoders(uint32_t* out) {
+  const unsigned int i = threadIdx.x;
+  const uint16_t pair = static_cast<uint16_t>(i | ((255u - i) << 8));
+  out[i] = fp8_e4m3fn_pair_to_half2_bits(pair);
+  out[256 + i] = fp8_e4m3fn_pair_to_half2_bits_fast(pair);
+}
+
+at::Tensor private_e4m3_decoder_check() {
+  auto out = at::empty({2, 256}, at::TensorOptions().device(at::kCUDA).dtype(at::kInt));
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  private_check_e4m3_decoders<<<1, 256, 0, stream>>>(
+      reinterpret_cast<uint32_t*>(out.data_ptr<int>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+"""
     source += (
         "\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n"
-        '  m.def("run", &private_grouped_e4m3_fp32_paged);\n}\n'
+        '  m.def("run", &private_grouped_e4m3_fp32_paged);\n'
+        '  m.def("decoder_check", &private_e4m3_decoder_check);\n}\n'
     )
     directory = args.output_dir.resolve()
     sources = directory / "sources"
@@ -121,7 +140,8 @@ def main() -> None:
         "-Xptxas=-v",
     ]
     manifest = {
-        "source_sha": subprocess.check_output(
+        "source_sha": args.source_sha
+        or subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True
         ).strip(),
         "variant": args.variant,
