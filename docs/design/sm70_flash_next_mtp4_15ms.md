@@ -35,9 +35,7 @@ C4 short concurrency must not regress.
 ## Rebuild the baseline before optimization
 
 The campaign has been rebased onto current main. #831 and #832 are merged;
-
 PRs #859 and #885 were still open when checked on 2026-10-05. Record their actual
-
 merge state rather than treating either candidate as a main dependency.
 Include #914's batched PLE n-gram implementation. Freeze the final main SHA
 before recording any new timings. The previous 22--24-ms results are historical
@@ -119,6 +117,29 @@ single-card cache mechanisms are outside this TP4 scope.
 
 ## Current status
 
-Source/default repairs and diagnostic tooling are prepared. New main baseline,
-node attribution, traffic table, quality/acceptance and C4 admission remain
-pending. No new 15-ms or structural-kernel speed claim is made.
+### Unprofiled main baseline, 2026-10-05
+
+Integration base: `c60bbe1194403cb5c36404bc35bc2580d8ee72a0`.
+Measured source: `e65592623899f1da9b1267c8cae44d5bcd03240e`.
+Normal source-built native components; Python 3.12.14, Torch 2.10.0+cu128,
+CUDA 12.8, driver 580.173.02. TP4 V100-SXM2-32GB, full NV2, 300 W per card.
+FP16 computation/KV, FP32 SSM state, NVFP4 target experts, FP16 draft experts.
+PLE disk mmap, fixed MTP4, max length 262144, input 8192, one request, 4-GiB
+KV cache per rank. No profiler or user-supplied VLLM variables.
+
+| Fixture | Complete round mean | Repetitions / rounds | Decode tokens/s | Draft acceptance | Tokens/round | Finish |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Historical fixed8k, greedy | 21.835 ms | 3 / 933 | 75.40 | 16.16% | 1.646 | length, deliberately ignore EOS |
+| Chinese natural8k/0, T=1, p=.95, k=20 | 24.304 ms | 3 / 363 | 172.40 | 79.75% | 4.190 | EOS in all repeats |
+
+Round means divide total endpoint decode elapsed time by total speculative
+rounds. The fixed fixture samples are 21.820, 21.849 and 21.835 ms; the natural
+fixture samples are 24.379, 24.274 and 24.260 ms. Outputs match across repeats
+within each fixture. The Chinese arithmetic answer gives 240 km and 68.57 km/h;
+this is an output-health check, not quality-set or numerical admission.
+Speed results come from `benchmark_sm70_mtp4_round.py`; its JSON preserves
+prompt hashes, complete token IDs, sampling, request timestamps and counters.
+
+Both fixtures fail the 15-ms target. Node attribution, measured traffic,
+quality/distribution and C4 admission remain pending. No structural-kernel
+speed claim is made.
