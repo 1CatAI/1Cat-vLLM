@@ -321,6 +321,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
+  ops.def(
+      "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);
+  ops.def(
+      "sm70_dflash2_fp16_dispatch_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, Tensor weight, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
+           &sm70_dflash2_fp16_dispatch_out);
+
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
 

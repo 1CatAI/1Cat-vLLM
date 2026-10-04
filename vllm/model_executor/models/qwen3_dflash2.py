@@ -247,6 +247,24 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
 
+        if (
+            self.use_sm70_bf16_emulation
+            and get_tensor_model_parallel_world_size() == 4
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+        ):
+            for projection in (
+                self.self_attn.qkv_proj,
+                self.self_attn.o_proj,
+                self.mlp.gate_up_proj,
+                self.mlp.down_proj,
+                self.attention_conv.kernel_projection,
+                self.mlp_conv.kernel_projection,
+            ):
+                if isinstance(projection.quant_method, UnquantizedLinearMethod):
+                    projection._sm70_dflash2_fp16_m8 = True
+
     def forward(
         self,
         positions: torch.Tensor,
