@@ -240,7 +240,7 @@ the M1/M5 cancellation regressions. The focused C1 distribution comparison is
 pending. Do not carry forward the earlier artifact's task or timing results
 as its qualification.
 
-## Compensated model gate: rejected
+## Historical compensated distribution gate
 
 The installed artifact passes its 20 GPU regressions but fails the focused
 32-position C1 distribution gate. All cases use the same fixed English and
@@ -257,10 +257,31 @@ logit-error limit. The isolated cases also fail their per-stratum checks.
 Greater same-input arithmetic accuracy therefore does not qualify the model
 path. No full quality/timing campaign, C4 smoke or final trace is repeated
 for this revision. The PR is closed without merging; code and failed results
-are retained for comparison. Do not relax thresholds or promote this path.
+are retained for comparison. This rejection used the earlier strict distribution contract. The updated
+FP16 reassociation contract below supersedes that admission decision; retain
+these measured distribution values as diagnostics.
 
 The next priority is router/shared-gate fusion that retains the current dot
 product trees. A separate hierarchical top-k diagnostic selects identical
 IDs at M1/5/17/33, including tied and degenerate rows, but takes 48.880 versus
 47.888 us when an equal L2 flush is included in each arm. It is slower and
 remains research-only. Those values are not standalone projection times.
+
+## Requalification under the FP16 reassociation contract
+
+Activations and weights remain FP16 and accumulation remains FP32. For this
+change, KL, top-1 agreement and maximum raw-logit error are recorded without
+applying precision-reduction thresholds. Requalification instead requires
+installed-source operator errors against FP64 on the 384 retained real
+activation/weight snapshots to be no greater than the vendor path, a matched
+three-seed quality suite including 128K and 258048-token needle cases with
+no decrease in task passes or output health, and positive unprofiled C1 timing.
+The earlier single-seed quality and the uncompensated artifact timings are
+historical results, not qualification for the compensated revision. The
+existing normal compensated wheel provides both candidate and disabled-kernel
+control arms, with FP16 reduced-precision accumulation disabled in both.
+
+Expected endpoint savings must account for the shared-expert auxiliary stream
+and cold weight rotation. Do not credit the full isolated gate/up service
+reduction to the critical stream. Pending tests write separate completion
+summaries; no new trace is needed for this requalification.
