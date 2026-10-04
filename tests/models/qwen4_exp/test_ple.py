@@ -1289,6 +1289,7 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
 ) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
+    module._packed_gguf = False
     module.embedding_dim = 1
     module.head_dim = 1
     module.ngram_size = 2
@@ -1389,6 +1390,7 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
 ) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
+    module._packed_gguf = False
     module.embedding_dim = 2
     module.head_dim = 2
     module.ngram_size = 2
