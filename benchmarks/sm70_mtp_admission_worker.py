@@ -4,6 +4,16 @@
 
 
 class MtpAdmissionExtension:
+    def install_mtp_phase_events(self):
+        from benchmarks.sm70_mtp_phase_events import install
+
+        return install(self)
+
+    def flush_mtp_phase_events(self):
+        from benchmarks.sm70_mtp_phase_events import flush
+
+        return flush(self)
+
     def install_mtp_node_annotations(self, folder):
         from benchmarks.sm70_mtp_node_trace import install
 

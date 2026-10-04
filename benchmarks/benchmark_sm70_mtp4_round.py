@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--diagnostics-only", action="store_true")
     parser.add_argument("--fixture", action="append")
     parser.add_argument("--node-trace", action="store_true")
+    parser.add_argument("--phase-events", action="store_true")
     args = parser.parse_args()
     if args.diagnostics_only and not (
         args.teacher_forcing_manifest or args.quality_manifest
@@ -48,6 +49,8 @@ def main() -> None:
         raise ValueError("At least three measured repetitions are required")
     if args.node_trace and (args.diagnostics_only or not args.fixture):
         parser.error("node-trace requires an explicit fixture and a generation")
+    if args.phase_events and (args.node_trace or args.diagnostics_only):
+        parser.error("phase-events requires an independent unprofiled generation")
     # AOT compilation uses this root in addition to CompilationConfig.cache_dir.
     os.environ["VLLM_CACHE_ROOT"] = str(args.out.parent.resolve() / "vllm_cache")
     from benchmarks.benchmark_sm70_model_tokens import (
@@ -139,7 +142,7 @@ def main() -> None:
     }
     if args.node_trace:
         engine["profiler_config"] = {"profiler": "cuda"}
-    if args.teacher_forcing_manifest or args.node_trace:
+    if args.teacher_forcing_manifest or args.node_trace or args.phase_events:
         engine["worker_extension_cls"] = (
             "benchmarks.sm70_mtp_admission_worker.MtpAdmissionExtension"
         )
@@ -157,7 +160,11 @@ def main() -> None:
         "complete": False,
         "startup_diagnostics": args.startup_diagnostics,
         "measurement_kind": (
-            "diagnostic_node_trace" if args.node_trace else "unprofiled_complete_round"
+            "diagnostic_node_trace"
+            if args.node_trace
+            else "diagnostic_cuda_events"
+            if args.phase_events
+            else "unprofiled_complete_round"
         ),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +208,10 @@ def main() -> None:
                 llm.reset_prefix_cache()
                 before = _metric_snapshot(llm)
                 traced = args.node_trace and repeat >= 0
+                phase_events = args.phase_events and repeat >= 0
+                phase_records = None
+                if phase_events:
+                    llm.collective_rpc("install_mtp_phase_events")
                 if traced:
                     llm.collective_rpc(
                         "install_mtp_node_annotations",
@@ -214,6 +225,8 @@ def main() -> None:
                         use_tqdm=False,
                     )[0]
                 finally:
+                    if phase_events:
+                        phase_records = llm.collective_rpc("flush_mtp_phase_events")
                     if traced:
                         llm.stop_profile()
                         llm.collective_rpc("uninstall_mtp_node_annotations")
@@ -250,6 +263,8 @@ def main() -> None:
                     * metrics["decode_time"]
                     / spec["num_drafts"],
                 }
+                if phase_records is not None:
+                    row["phase_events"] = phase_records
                 report["cases"].append(row)
                 save()
                 print(
@@ -267,7 +282,9 @@ def main() -> None:
                     ),
                     flush=True,
                 )
-        report["speed_complete"] = not args.diagnostics_only and not args.node_trace
+        report["speed_complete"] = not (
+            args.diagnostics_only or args.node_trace or args.phase_events
+        )
         report["latency_passed"] = report["speed_complete"] and all(
             row["complete_round_ms"] <= 15 for row in report["cases"]
         )
