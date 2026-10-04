@@ -173,6 +173,10 @@ and overlap before calibrating the projected saving.
 Four 8K inputs do not form a stable C4 cohort with batch budget 512. Both C4
 arms instead use 128 input tokens per request, preserving all model and
 execution settings. The default-ring arm records 37 steady intervals,
-66.413 ms per engine round and 240.918 aggregate tok/s; the matching control
-is pending. Final larger-capacity acceptance and model quality measurements
-remain separate follow-ups.
+66.413 ms per engine round and 240.918 aggregate tok/s. The matching control
+records 66.615 ms and 253.171 tok/s, with mean acceptance 3.920 versus 3.861.
+The trimmed cohorts emit 624 versus 592 tokens. This first C4 point decreases
+pure decode 4.840% and does not pass non-regression; retain it as a negative
+result. A 1024-output-token, three-repeat comparison with complete token
+recording precedes the admission decision. Final larger-capacity acceptance
+and model quality measurements remain separate follow-ups.
