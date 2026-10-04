@@ -225,3 +225,171 @@ text checks, but this does not substitute for the common quality set, which
 remains pending. Investigate the C4 graph kernel breakdown before choosing a
 decode optimization. Trace instrumentation is separate from accepted unprofiled
 throughput and does not change the kernel precision policy.
+
+## Compatible projection coalescing
+
+C4 graph-node traces contain 127 complete replays across four TP ranks, using
+125 middle steps for aggregate analysis. Graph-node coverage is 97.5% for GGUF
+and 96.5% for NVFP4. The leading TurboMind kernels account for approximately
+15.15/9.00 ms of rank-average GPU service and 590/256 launches per step in
+GGUF/NVFP4. Attention and GDN decode service are approximately 1.00/0.67 ms in
+both. GPU service sums describe work and cannot be added into wall critical
+path; unprofiled C4 step time remains 22.424/15.920 ms. The generic parser labels
+FP4 GEMM as MoE, but this model is dense; the comparison above uses actual
+TurboMind kernel names rather than that generic label.
+
+Coalesce adjacent shards with identical source type, packed input width, dtype
+and device before canonical preparation. Keep mixed types as independent
+projections and preserve the original row order. Startup reports retain each
+source output size. This reduces repeated launches without adding a decoder,
+changing activations, or storing duplicate prepared copies.
+
+Real TP4 projection sweeps below use FP16 activation/reconstruction and FP32
+accumulation, 100 ms warmup and 100 graph iterations. QKV spans and gate rows
+come from the named source tensors; numerical reference uses official source
+dequantization. The alpha/beta cache descriptor N=24/K=5120 admits all measured
+M=1..8192, with the existing FP32 matmul policy guard. Its N=12 predecessor
+retains its narrower calibration. Large merged affine shapes use canonical
+DQ+FP32 cuBLAS only after their measured crossover; direct fusion alone can
+regress prefill.
+
+| Bits/group | K | N | Minimum M for DQ+FP32 BLAS |
+| ---: | ---: | ---: | ---: |
+| 4/32 | 5120 | 2560 | 2048 |
+| 4/32 | 5120 | 4096 | 512 |
+| 4/32 | 5120 | 8704 | 512 |
+| 5/32 | 5120 | 2560 | 2048 |
+| 5/32 | 5120 | 4096 | 512 |
+
+All other measured merged descriptors below retain fused MMA. Output relative
+L2 versus the official FP16 weight oracle stays below 0.00081 in these sweeps.
+No lower activation or accumulation precision is introduced. Model throughput
+and quality after coalescing still need installed-wheel validation.
+
+### gdn_qkvz (N=4096, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 93.92 | 32.71 | 182.14 | 32.71 |
+| 2 | 94.87 | 32.85 | 162.10 | 32.85 |
+| 4 | 97.14 | 33.11 | 189.99 | 33.11 |
+| 8 | 103.15 | 35.85 | 162.85 | 35.85 |
+| 16 | 105.25 | 36.73 | 191.26 | 36.73 |
+| 32 | 117.41 | 45.77 | 177.72 | 45.77 |
+| 64 | 214.02 | 76.40 | 198.46 | 76.40 |
+| 128 | 407.59 | 118.78 | 244.10 | 118.78 |
+| 512 | 555.17 | 423.55 | 395.60 | 395.60 |
+| 2048 | 1600.88 | 1763.39 | 1422.14 | 1422.14 |
+| 8192 | 4938.86 | 6117.05 | 5007.00 | 5007.00 |
+
+### gdn_alpha_beta (N=24, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8.94 | 19.01 | 4.61 | 4.61 |
+| 2 | 40.16 | 20.14 | 5.34 | 5.34 |
+| 4 | 35.45 | 18.53 | 5.39 | 5.39 |
+| 8 | 36.99 | 19.69 | 5.59 | 5.59 |
+| 16 | 40.34 | 20.35 | 6.08 | 6.08 |
+| 32 | 16.54 | 19.81 | 6.41 | 6.41 |
+| 64 | 14.39 | 66.35 | 6.83 | 6.83 |
+| 128 | 16.27 | 112.04 | 6.89 | 6.89 |
+| 512 | 30.72 | 111.75 | 12.23 | 12.23 |
+| 2048 | 89.67 | 105.15 | 40.67 | 40.67 |
+| 8192 | 308.03 | 328.55 | 142.64 | 142.64 |
+
+### ffn_gate_up (N=8704, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 61.39 | 43.33 | — | 43.33 |
+| 2 | 62.41 | 45.28 | — | 45.28 |
+| 4 | 59.59 | 45.52 | — | 45.52 |
+| 8 | 66.33 | 46.86 | — | 46.86 |
+| 16 | 67.87 | 53.61 | — | 53.61 |
+| 32 | 96.13 | 78.26 | — | 78.26 |
+| 64 | 177.52 | 137.50 | — | 137.50 |
+| 128 | 250.05 | 221.90 | — | 221.90 |
+| 512 | 987.94 | 837.47 | — | 837.47 |
+| 2048 | 3340.85 | 2874.37 | — | 2874.37 |
+| 8192 | 12178.69 | 11885.67 | — | 11885.67 |
+
+### qkvz_q4k (N=4096, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 67.82 | 26.46 | 175.95 | 26.46 |
+| 2 | 68.35 | 26.49 | 169.99 | 26.49 |
+| 4 | 69.01 | 26.51 | 157.46 | 26.51 |
+| 8 | 73.64 | 27.29 | 170.84 | 27.29 |
+| 16 | 81.14 | 32.02 | 158.91 | 32.02 |
+| 32 | 92.52 | 40.93 | 186.33 | 40.93 |
+| 64 | 172.24 | 57.15 | 161.74 | 57.15 |
+| 128 | 365.80 | 99.53 | 253.55 | 99.53 |
+| 512 | 477.57 | 377.97 | 367.84 | 367.84 |
+| 2048 | 1583.04 | 1538.95 | 1446.89 | 1446.89 |
+| 8192 | 5800.51 | 5122.84 | 5000.23 | 5000.23 |
+
+### qkv_q4k (N=2560, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 53.07 | 21.65 | 88.10 | 21.65 |
+| 2 | 51.02 | 21.10 | 97.08 | 21.10 |
+| 4 | 51.26 | 21.14 | 98.54 | 21.14 |
+| 8 | 54.53 | 21.87 | 100.36 | 21.87 |
+| 16 | 58.85 | 26.42 | 103.73 | 26.42 |
+| 32 | 65.77 | 33.27 | 101.62 | 33.27 |
+| 64 | 130.66 | 48.57 | 107.71 | 48.57 |
+| 128 | 279.76 | 93.58 | 201.09 | 93.58 |
+| 512 | 337.12 | 200.79 | 302.34 | 200.79 |
+| 2048 | 996.15 | 756.03 | 615.67 | 615.67 |
+| 8192 | 3850.63 | 3169.34 | 2425.79 | 2425.79 |
+
+### qkv_q5k (N=2560, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 70.91 | 27.35 | 90.36 | 27.35 |
+| 2 | 70.50 | 27.32 | 99.28 | 27.32 |
+| 4 | 70.61 | 27.29 | 100.87 | 27.29 |
+| 8 | 75.90 | 28.87 | 102.59 | 28.87 |
+| 16 | 77.37 | 29.89 | 105.93 | 29.89 |
+| 32 | 82.33 | 36.62 | 103.54 | 36.62 |
+| 64 | 164.14 | 56.20 | 110.11 | 56.20 |
+| 128 | 304.87 | 102.04 | 202.86 | 102.04 |
+| 512 | 381.66 | 235.98 | 304.12 | 235.98 |
+| 2048 | 1030.77 | 912.94 | 613.81 | 613.81 |
+| 8192 | 3492.54 | 3884.11 | 2426.44 | 2426.44 |
+
+### qkvz_lut4 (N=4096, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 87.85 | 28.36 | — | 28.36 |
+| 2 | 88.85 | 28.35 | — | 28.35 |
+| 4 | 88.57 | 28.52 | — | 28.52 |
+| 8 | 94.95 | 31.21 | — | 31.21 |
+| 16 | 99.05 | 32.82 | — | 32.82 |
+| 32 | 107.19 | 42.77 | — | 42.77 |
+| 64 | 215.65 | 74.58 | — | 74.58 |
+| 128 | 381.45 | 108.16 | — | 108.16 |
+| 512 | 506.05 | 408.25 | — | 408.25 |
+| 2048 | 1711.99 | 1665.93 | — | 1665.93 |
+| 8192 | 6203.41 | 5585.90 | — | 5585.90 |
+
+### ffn_gate_up_q4k (N=8704, K=5120)
+
+| M | Separate (us) | Fused MMA (us) | FP16 cache or DQ+FP32 BLAS (us) | Selected (us) |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 57.68 | 43.54 | 392.09 | 43.54 |
+| 2 | 57.82 | 43.88 | 309.55 | 43.88 |
+| 4 | 57.59 | 43.97 | 314.80 | 43.97 |
+| 8 | 59.25 | 44.73 | 317.70 | 44.73 |
+| 16 | 68.68 | 50.55 | 330.13 | 50.55 |
+| 32 | 88.54 | 65.77 | 346.15 | 65.77 |
+| 64 | 142.66 | 111.25 | 370.55 | 111.25 |
+| 128 | 241.31 | 214.21 | 350.21 | 214.21 |
+| 512 | 757.39 | 781.03 | 734.51 | 734.51 |
+| 2048 | 2534.52 | 2628.16 | 2228.99 | 2228.99 |
+| 8192 | 8798.97 | 10979.79 | 8413.24 | 8413.24 |

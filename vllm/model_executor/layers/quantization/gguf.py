@@ -573,7 +573,7 @@ class GGUFLinearMethod(LinearMethodBase):
         ):
             qweight = layer.qweight
             from vllm.model_executor.layers.quantization.gguf_turbomind import (
-                GGUFPreparedProjection,
+                prepare_gguf_projections,
             )
 
             if qweight.data_container:
@@ -593,16 +593,9 @@ class GGUFLinearMethod(LinearMethodBase):
                 ]
             else:
                 sources = [(qweight, layer.qweight_type.weight_type)]
-            projections = [
-                GGUFPreparedProjection(
-                    weight,
-                    weight_type,
-                    self.params_dtype,
-                    self.native_enabled,
-                    self.prefill_min_m,
-                )
-                for weight, weight_type in sources
-            ]
+            projections = prepare_gguf_projections(
+                sources, self.params_dtype, self.native_enabled, self.prefill_min_m
+            )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]

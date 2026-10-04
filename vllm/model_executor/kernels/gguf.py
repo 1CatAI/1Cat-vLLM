@@ -83,7 +83,7 @@ def dense_fp16_cache_capabilities(
         reason = "disabled_by_kernel_config"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"
-    elif (source_type, k, n) != (8, 5120, 12):
+    elif (source_type, k, n) not in ((8, 5120, 12), (8, 5120, 24)):
         reason = "small_projection_cache_shape_has_no_calibration"
     elif (
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
@@ -100,7 +100,7 @@ def dense_fp16_cache_capabilities(
             max_m=maximum,
             reason=reason,
         )
-        for minimum, maximum in ((1, 1), (32, 8192))
+        for minimum, maximum in (((1, 8192),) if n == 24 else ((1, 1), (32, 8192)))
     )
 
 

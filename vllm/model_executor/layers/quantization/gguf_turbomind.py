@@ -44,6 +44,35 @@ from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_na
 _AFFINE_TYPES = AFFINE_GROUP32_TYPES | AFFINE_U2_TYPES | AFFINE_BITPLANE_TYPES
 
 
+def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
+    """Coalesce adjacent compatible shards without changing projection order."""
+    groups: list[tuple[list[torch.Tensor], int]] = []
+    for weight, source_type in sources:
+        if (
+            groups
+            and source_type in _AFFINE_TYPES | LUT4_TYPES | LATTICE_TYPES
+            and source_type == groups[-1][1]
+            and weight.shape[1:] == groups[-1][0][0].shape[1:]
+            and weight.dtype == groups[-1][0][0].dtype
+            and weight.device == groups[-1][0][0].device
+        ):
+            groups[-1][0].append(weight)
+        else:
+            groups.append(([weight], source_type))
+    projections = []
+    for weights, source_type in groups:
+        projection = GGUFPreparedProjection(
+            weights[0] if len(weights) == 1 else torch.cat(weights, dim=0),
+            source_type,
+            act_dtype,
+            enabled,
+            prefill_min_m,
+        )
+        projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
+        projections.append(projection)
+    return projections
+
+
 class GGUFPreparedProjection(Module):
     """One mixed projection; canonical preparation never changes its row order."""
 
@@ -54,6 +83,7 @@ class GGUFPreparedProjection(Module):
         self.prefill_min_m = prefill_min_m
         self.kernel = None
         self.logical_output_size = weight.shape[0]
+        self.source_output_sizes = (self.logical_output_size,)
         self.output_padding = 0
         self.cache_capabilities: tuple[GGUFOperatorCapability, ...] = ()
         self.register_parameter("fp16_cache", None)
@@ -163,6 +193,7 @@ class GGUFPreparedProjection(Module):
         result = {
             "source_type": quant_type_name(self.source_type),
             "reason": self.rejection_reason,
+            "source_output_sizes": list(self.source_output_sizes),
         }
         if self.kernel is not None:
             result["kernel"] = type(self.kernel).__name__
