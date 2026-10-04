@@ -625,6 +625,19 @@ class Sm70Tp4PushGemmaRMSNormPattern(BasePattern):
             extra_check=_sm70_ar_gemma_rms_match,
         )
 
+        # Final normalization can discard its residual output.
+        def normalized_only(fn):
+            return lambda a, b, c: fn(a, b, c)[0]
+
+        pm.register_replacement(
+            normalized_only(pattern),
+            normalized_only(replacement),
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_sm70_ar_gemma_rms_match,
+        )
+
 
 class Sm70Tp4LongPrefillFusedNormPattern(BasePattern):
     """Fuse TP4 AR plus the accepted opaque mixed-dtype Gemma norm."""
