@@ -605,7 +605,8 @@ class Qwen3NextAttention(nn.Module):
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
             q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            if not self.sm70_qk_rope_prep:
+                gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         v = _sm70_dump_qwen_layer_tensor(
@@ -618,10 +619,12 @@ class Qwen3NextAttention(nn.Module):
         if self.sm70_qk_rope_prep:
             q = torch.empty((qkv.shape[0], 1536), device=qkv.device, dtype=qkv.dtype)
             k = torch.empty((qkv.shape[0], 256), device=qkv.device, dtype=qkv.dtype)
+            gate = torch.empty_like(q)
             torch.ops.vllm.sm70_qwen38_qk_norm_rope_cache(
                 qkv,
                 q,
                 k,
+                gate,
                 self.q_norm.weight,
                 self.k_norm.weight,
                 positions,

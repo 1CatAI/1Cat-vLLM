@@ -67,6 +67,7 @@ def test_strided_positions_and_paged_cache(tokens):
     scale = torch.tensor([0.7], device="cuda", dtype=torch.float32)
     q_dest = torch.empty(tokens, 1536, device="cuda", dtype=torch.float16)
     k_dest = torch.empty(tokens, 256, device="cuda", dtype=torch.float16)
+    gate_dest = torch.empty_like(q_dest)
     q, k = qk_norm_rope(
         qkv,
         qw,
@@ -80,7 +81,10 @@ def test_strided_positions_and_paged_cache(tokens):
         v_scale=scale,
         q_out=q_dest,
         k_out=k_dest,
+        gate_out=gate_dest,
     )
+    expected_gate = qkv[:, :3072].view(tokens, 6, 512)[:, :, 256:].reshape(tokens, 1536)
+    assert torch.equal(gate_dest.view(torch.int16), expected_gate.view(torch.int16))
     assert q.data_ptr() == q_dest.data_ptr() and k.data_ptr() == k_dest.data_ptr()
     for raw, weight, actual in [
         (qkv[:, :3072].view(tokens, 6, 512)[:, :, :256], qw, q),

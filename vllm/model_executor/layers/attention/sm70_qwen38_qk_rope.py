@@ -34,6 +34,8 @@ def _qk_norm_rope(
     Cache,
     QOut,
     KOut,
+    GateOut,
+    STORE_GATE: tl.constexpr,
     Slots,
     KCache,
     VCache,
@@ -63,6 +65,10 @@ def _qk_norm_rope(
         source = QKV + token * ROW + 3072
         weight = KW
         destination = KOut + token * 256
+    if STORE_GATE:  # noqa: SIM102 - eliminate the optional pointer at compile time
+        if head < 6:
+            gate = tl.load(QKV + token * ROW + head * 512 + 256 + col)
+            tl.store(GateOut + token * 1536 + head * 256 + col, gate)
     values = tl.load(source + col).to(tl.float32)
     variance = tl.sum(values * values, 0) / 256.0
     inverse = tl.rsqrt(variance + EPS)
@@ -123,6 +129,7 @@ def qk_norm_rope(
     v_scale=None,
     q_out=None,
     k_out=None,
+    gate_out=None,
 ):
     assert qkv.ndim == 2 and qkv.shape[1] == 3584 and qkv.dtype == torch.float16
     tokens = qkv.shape[0]
@@ -162,6 +169,8 @@ def qk_norm_rope(
         cache,
         q,
         k,
+        gate_out,
+        gate_out is not None,
         slots,
         key_cache,
         value_cache,
@@ -186,7 +195,16 @@ def qk_norm_rope(
 
 
 def _prepare_with_cache(
-    qkv, q_out, k_out, q_weight, k_weight, positions, cache, epsilon, layer_name
+    qkv,
+    q_out,
+    k_out,
+    gate_out,
+    q_weight,
+    k_weight,
+    positions,
+    cache,
+    epsilon,
+    layer_name,
 ):
     from vllm.model_executor.layers.attention.attention import get_attention_context
     from vllm.utils.torch_utils import _resolve_layer_name
@@ -225,6 +243,7 @@ def _prepare_with_cache(
         epsilon,
         q_out=q_out,
         k_out=k_out,
+        gate_out=gate_out,
         **cache_args,
     )
     if slots is not None and not cache_args:
@@ -242,6 +261,7 @@ def sm70_qwen38_qk_norm_rope_cache(
     qkv: torch.Tensor,
     q_out: torch.Tensor,
     k_out: torch.Tensor,
+    gate_out: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     positions: torch.Tensor,
@@ -252,7 +272,16 @@ def sm70_qwen38_qk_norm_rope_cache(
     # Keep compiler-owned destinations, as in unified attention. Query/key
     # dependencies order the context-owned KV update before attention.
     _prepare_with_cache(
-        qkv, q_out, k_out, q_weight, k_weight, positions, cache, epsilon, layer_name
+        qkv,
+        q_out,
+        k_out,
+        gate_out,
+        q_weight,
+        k_weight,
+        positions,
+        cache,
+        epsilon,
+        layer_name,
     )
 
 
@@ -260,6 +289,7 @@ def sm70_qwen38_qk_norm_rope_cache_fake(
     qkv: torch.Tensor,
     q_out: torch.Tensor,
     k_out: torch.Tensor,
+    gate_out: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     positions: torch.Tensor,
@@ -274,5 +304,5 @@ direct_register_custom_op(
     op_name="sm70_qwen38_qk_norm_rope_cache",
     op_func=sm70_qwen38_qk_norm_rope_cache,
     fake_impl=sm70_qwen38_qk_norm_rope_cache_fake,
-    mutates_args=["q_out", "k_out"],
+    mutates_args=["q_out", "k_out", "gate_out"],
 )
