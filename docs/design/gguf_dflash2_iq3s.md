@@ -111,3 +111,29 @@ IQ2_XS grows from 0.2890625 to 0.5. These are CPU format predictions for
 aligned projections, excluding norms, codebook loads, inputs/outputs and
 workspace traffic. Verify them against the loaded GPU buffers before using
 them in a bandwidth or complete-round speed claim.
+
+## Sampled reconstruction accuracy
+
+An installed-wheel CPU audit reads the first eight actual rows of each unique
+checkpoint quantization type and full shape: 55 cases across both files.
+Compare canonical dequantization against `gguf.quants.dequantize` in FP32,
+then separately include FP16 weight reconstruction. All samples are finite.
+The table reports the worst relative L2 within each type.
+
+| Type | Cases | Canonical relative L2 | FP16 reconstructed relative L2 |
+| --- | ---: | ---: | ---: |
+| IQ1_M | 1 | 0.0002155 | 0.0003067 |
+| IQ2_S | 5 | 0.0002143 | 0.0002898 |
+| IQ2_XS | 3 | 0.0002133 | 0.0002908 |
+| IQ2_XXS | 3 | 0.0002092 | 0.0002861 |
+| IQ3_S | 7 | 0.0002186 | 0.0003044 |
+| IQ3_XXS | 7 | 0.0002145 | 0.0003027 |
+| IQ4_XS | 7 | 0.0001954 | 0.0002876 |
+| Q2_K | 5 | 0.0005346 | 0.0005486 |
+| Q4_K | 8 | 0.0006983 | 0.0007226 |
+| Q8_0 | 9 | 0 | 0.0002176 |
+
+The largest sampled absolute canonical error is 0.0001231 for IQ2_S.
+These results audit the existing coefficient expansion and weight
+reconstruction. They exclude MMA accumulation, unsampled rows and model
+propagation; the teacher-forcing distribution gate remains required.
