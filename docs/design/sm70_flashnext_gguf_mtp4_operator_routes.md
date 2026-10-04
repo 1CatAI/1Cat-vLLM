@@ -248,3 +248,53 @@ up counter sample motivated a next-group weight-lookahead screen. The
 candidate preserves intermediate bits but does not improve M5 and regresses
 M20; it is reverted in #930. Its counter and ordinary operator timings are
 recorded in `sm70_hc_weight_prefetch_screen.md` without model admission.
+
+## Combined GDN copy measurement
+
+Source `3b07077f7318f5947e8771080beeee9d6f4830e5`, ordinary package
+`1.5.2.dev915+g3b07077f7`, includes default projection-tail materialization
+(#936), row-strided recurrent input (#928), direct recurrent output (#929),
+and the existing joint experts. The worker reports actual FULL decode and
+PIECEWISE mixed graphs independently; all four ranks captured 5/10/15/20
+token FULL graphs. KV pages are 816 tokens, FP16 KV and FP32 SSM state;
+MTP weights remain FP16. Hardware and timing lengths match the earlier
+TP4 composition: C1 I8192/O256 and C4 I128/O1024, three repetitions.
+
+| Metric | Previous joint experts | Combined GDN copies | Change |
+| --- | ---: | ---: | ---: |
+| C1 round ms | 26.668 | 26.072 | -0.596 |
+| C1 aggregate decode tokens/s | 90.544 | 92.267 | +1.90% |
+| C1 steady emitted/request/round | 2.415 | 2.405 | |
+| C4 round ms | 54.748 | 52.059 | -2.689 |
+| C4 aggregate decode tokens/s | 258.709 | 280.441 | +8.40% |
+| C4 steady emitted/request/round | 3.541 | 3.650 | |
+
+C1 repetitions are 25.782/26.314/26.120 ms; C4 repetitions are
+51.658/52.070/52.450 ms. Full-run acceptance length is 2.783 at C1
+(92 drafts, 368 proposed tokens, 164 accepted) and 3.020 at C4
+(1357 drafts, 5428 proposed tokens, 2741 accepted). These counters include
+request tails and are distinct from steady-cohort emitted/request/round.
+Within this version, all three repeated output token sequences and acceptance
+counters agree exactly. Fixed-length timing sequences differ from the prior
+composition, so the full latency difference cannot be attributed entirely to
+copy operators. No activation or accumulation precision was reduced.
+
+The four natural EOS prompts retain all original token IDs, including the
+63-token Chinese explanation. They finish normally. Against the initial
+GGUF MTP4 baseline, C1 throughput increases 22.68% and C4 6.93%; the previous
+small C4 regression is removed. C1 round duration is 1.328 ms below the
+separately recorded 27.4 ms NVFP4 reference, which is not a matched throughput
+or quality comparison. The 15–17 ms target remains unachieved.
+
+Whole wheel SHA256:
+`5b862ec1771891b6ed4a448488e9bbf6775af36b945f0fdd729d1f929db9c726`.
+Packaged core SHA256:
+`6ee54f6fe296eb6a68f027b6e6611243914bccc7140508829d1132a6b1aac527`.
+All 213 package dependencies and six installed worker/RPC serializer checks
+pass. The actual standard string RPC records worker graph modes without
+allowing insecure callable deserialization.
+
+Two preceding model attempts produced no natural or timing results: one
+lacked the worker graph-report field, the other used a callable rejected by
+the default Msgpack serializer. Their logs are retained separately; neither
+is counted as a benchmark. No additional trace was collected for this run.
