@@ -22,6 +22,11 @@ reference. Operator tests use constructed inputs for numerical coverage and
 make no performance claim. Timed measurements require real prompt activations,
 cold L2 and the actual TP4 shapes.
 
+The seven numerical cases pass on V100 in the independent research extension.
+They cover M1..5 underflow preservation, changing graph inputs and two FP64
+dot-product checks. A normal installed build remains required before model
+integration or performance qualification.
+
 MoE grouped reading, checkpoint allocation, HC and norm integration, real
 activation measurements, and model distribution/acceptance checks are
 pending. Model integration must preserve the original BF16 parameters; it
