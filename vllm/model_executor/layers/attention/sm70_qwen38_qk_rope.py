@@ -91,10 +91,11 @@ def _qk_norm_rope(
     sine = tl.load(Cache + position * 64 + 32 + frequency)
     # The compiled target keeps normalized rotary channels in FP32 until
     # the final rotary store. Do not insert an intermediate FP16 rounding.
-    first = normalized.to(tl.float32) * cosine.to(tl.float32)
-    second = pn.to(tl.float32) * sine.to(tl.float32)
-    sign = tl.where(col < 32, -1.0, 1.0)
-    rotated = (first.to(tl.float32) + sign * second.to(tl.float32)).to(tl.float16)
+    second = pn * sine.to(tl.float32)
+    signed_second = tl.where(col < 32, -second, second)
+    # Match the compiler's first-product FMA rather than rounding both
+    # products before the addition/subtraction.
+    rotated = tl.fma(normalized, cosine.to(tl.float32), signed_second).to(tl.float16)
     # Cache encoding must consume the same FP16 value published to KOut,
     # including the non-rotary channels whose normalization stays in FP32.
     processed = tl.where(col < 64, rotated, normalized).to(tl.float16)
@@ -190,7 +191,9 @@ def qk_norm_rope(
         qkv.stride(0),
         1 if positions.ndim == 1 else 3,
         eps,
-        num_warps=4,
+        # Two warps with four contiguous channels per lane reproduce the
+        # compiled norm's local partial sum and shuffle reduction order.
+        num_warps=2,
         enable_fp_fusion=True,
     )
     return q, k
