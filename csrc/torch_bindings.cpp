@@ -216,7 +216,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &gguf_lattice_compact_mma_sm70_out);
   ops.def(
       "gguf_lattice_compact_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor "
-      "weight, int source_type, Tensor(b!) scratch, bool natural_layout=False) "
+      "weight, int source_type, Tensor(b!) scratch, bool natural_layout=False, "
+      "int algorithm=99) "
       "-> ()");
   ops.impl("gguf_lattice_compact_blas_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_blas_sm70_out);

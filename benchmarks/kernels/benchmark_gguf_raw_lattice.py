@@ -426,6 +426,24 @@ def main():
                         ),
                     )
                 )
+                for natural, scratch in ((False, raw_scratch), (True, natural_scratch)):
+                    candidates.append(
+                        (
+                            "compact_dequant_cublas"
+                            + ("_tn" if natural else "")
+                            + "_algo2",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                scratch,
+                                natural,
+                                102,
+                            ),
+                        )
+                    )
         old()
         old_error = errors(out, expected)
 

@@ -620,8 +620,8 @@ void launch_dequant(torch::Tensor out, torch::Tensor weight,
         out.size(0), out.size(1), weight.size(1));
 }
 void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
-                             torch::Tensor scratch,
-                             bool natural_layout = false) {
+                             torch::Tensor scratch, bool natural_layout = false,
+                             int64_t algorithm = 99) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   auto handle = at::cuda::getCurrentCUDABlasHandle();
   cublasMath_t saved;
@@ -635,7 +635,7 @@ void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
       handle, natural_layout ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
       &alpha, scratch.data_ptr(), CUDA_R_16F, natural_layout ? k : n,
       input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(), CUDA_R_16F, n,
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      CUBLAS_COMPUTE_32F, static_cast<cublasGemmAlgo_t>(algorithm));
   const auto restore = cublasSetMathMode(handle, saved);
   TORCH_CUDABLAS_CHECK(status);
   TORCH_CUDABLAS_CHECK(restore);
@@ -1026,7 +1026,11 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,
                                         torch::Tensor scratch,
-                                        bool natural_layout) {
+                                        bool natural_layout,
+                                        int64_t algorithm) {
+  TORCH_CHECK(
+      algorithm == 99 || algorithm == 102,
+      "Compact GGUF BLAS accepts only default or calibrated algorithm 2");
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
@@ -1060,5 +1064,5 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
           weight.data_ptr<uint8_t>(), n, k);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  lattice_blas_accumulate(out, input, scratch, natural_layout);
+  lattice_blas_accumulate(out, input, scratch, natural_layout, algorithm);
 }

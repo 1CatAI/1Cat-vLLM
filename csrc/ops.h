@@ -956,4 +956,4 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,
                                         torch::Tensor scratch,
-                                        bool natural_layout);
+                                        bool natural_layout, int64_t algorithm);
