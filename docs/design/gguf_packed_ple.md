@@ -27,9 +27,6 @@ range rejection without clipping. The filtered loader iterator removes mapped
 names before entering the adapter; the PLE worker admits this loader alongside
 the existing default and dummy loaders.
 
-These checks cover the CPU reader only. Hybrid resident-table loading, row
-transport and GPU replay integration are not complete yet.
-
 ## Installed row and transport checks
 
 The normal wheel contains the row reader, GGUF loader filter, PLE registration
@@ -45,3 +42,13 @@ retained. CUDA 12.8, Torch 2.10.0+cu128, V100 SM70, FP16 row outputs; no private
 extension or preload is used. These are layer checks, not Flash-Next model
 correctness or throughput evidence. The full CPU offload process and model
 integration still need validation.
+
+## Cascade capability checks
+
+The configuration capability accepts file-backed GGUF shards in addition to
+safetensors. Its embedding-method check admits packed GGUF rows without an
+E4M3 storage hint and retains the existing dtype, worker topology, PP layer
+layout and explicit-placement guards. Missing checkpoint storage information
+still rejects the route with a reason. All 21 source configuration checks
+pass, including GGUF activation and unsupported embedding metadata; installed
+configuration and full offload-process checks remain pending.
