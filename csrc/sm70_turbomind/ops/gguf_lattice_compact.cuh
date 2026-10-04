@@ -138,13 +138,7 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
       packed = *reinterpret_cast<const uint64_t*>(grid + (packet & 1023) * 8);
       signs = packet >> 10;
     }
-    turbomind::Array<float, 8> result;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float value = static_cast<int>((packed >> (8 * i)) & 255) - 128;
-      result[i] = scale * value * ((signs >> i) & 1 ? -1.f : 1.f);
-    }
-    return result;
+    return LatticeRawDecoder<Type>::table_values(packed, signs, scale);
   }
 };
 }  // namespace vllm::sm70_gguf

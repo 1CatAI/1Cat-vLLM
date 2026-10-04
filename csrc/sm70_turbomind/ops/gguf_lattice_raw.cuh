@@ -24,6 +24,31 @@ struct LatticeRawDecoder {
     __syncthreads();
   }
 
+  // The biased byte grid consists of exact integers. This TurboMind PRMT
+  // construction and half2 subtraction reconstruct them exactly: 1024+b
+  // and 1152 are representable for every byte b, as is b-128. Only integer
+  // unpacking uses half2; the original two-level scale and weight product
+  // are still FP32. Sign restoration is an exact bit flip.
+  __device__ static turbomind::Array<float, 8> table_values(uint64_t packed,
+                                                            uint32_t signs,
+                                                            float scale) {
+    turbomind::Array<float, 8> result;
+#pragma unroll
+    for (int i = 0; i < 8; i += 2) {
+      constexpr uint32_t magic = 0x64006400U, bias = 0x64806480U;
+      const uint32_t bytes = static_cast<uint32_t>(packed >> (i * 8));
+      const uint32_t pair = __byte_perm(bytes, magic, 0x7170);
+      half2 values = __hsub2((const half2&)pair, (const half2&)bias);
+      const uint32_t mask =
+          (((signs >> i) & 1) << 15) | (((signs >> (i + 1)) & 1) << 31);
+      (uint32_t&)values ^= mask;
+      const float2 exact = __half22float2(values);
+      result[i] = scale * exact.x;
+      result[i + 1] = scale * exact.y;
+    }
+    return result;
+  }
+
   // Eight consecutive K values. Both scales are multiplied in FP32 before
   // multiplying grid values. No FP16 expanded coefficient exists in storage.
   __device__ static turbomind::Array<float, 8> fragment(const uint8_t* block,
@@ -45,11 +70,7 @@ struct LatticeRawDecoder {
       const uint32_t a = *reinterpret_cast<const uint32_t*>(grid + first * 4);
       const uint32_t b = *reinterpret_cast<const uint32_t*>(grid + second * 4);
       const uint64_t packed = a | (static_cast<uint64_t>(b) << 32);
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const float value = static_cast<int>((packed >> (8 * i)) & 255) - 128;
-        values[i] = scale * value * ((signs >> i) & 1 ? -1.f : 1.f);
-      }
+      values = table_values(packed, signs, scale);
     } else {
       const int nibble =
           (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
@@ -58,11 +79,7 @@ struct LatticeRawDecoder {
           block[2 + octet] | (((high >> (2 * (octet % 4))) & 3) << 8);
       const uint64_t packed =
           *reinterpret_cast<const uint64_t*>(grid + index * 8);
-#pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        const float value = static_cast<int>((packed >> (8 * i)) & 255) - 128;
-        values[i] = scale * value * ((signs >> i) & 1 ? -1.f : 1.f);
-      }
+      values = table_values(packed, signs, scale);
     }
     return values;
   }

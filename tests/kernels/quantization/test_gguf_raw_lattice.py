@@ -247,3 +247,34 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
             torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.01)
             if m == 512:
                 torch.testing.assert_close(scratch, reference.half().T, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_all_codebook_entries_and_signs(kind):
+    count = 512 if kind == 21 else 1024
+    _, size = quant_size(kind)
+    data = np.zeros((count * 2, size), dtype=np.uint8)
+    data[:, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    for row in range(count * 2):
+        index = row % count
+        if kind == 21:
+            data[row, 2:66] = index & 255
+            data[row, 66:74] = 255 if index & 256 else 0
+            data[row, 74:106] = 255 if row >= count else 0
+        else:
+            data[row, 2:34] = index & 255
+            data[row, 66:74] = (index >> 8) * 85
+            data[row, 34:66] = 255 if row >= count else 0
+    raw = RawGGUFProjection.from_rows(data, kind)
+    weight = torch.from_numpy(raw.data).cuda()
+    compact = torch.empty((data.nbytes + 7) // 8 * 8, dtype=torch.uint8, device="cuda")
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(compact, weight, kind, 256)
+    reference = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    ).cuda()
+    for layout, storage in (("raw", weight), ("compact", compact)):
+        out = torch.empty_like(reference)
+        getattr(torch.ops._C, f"gguf_lattice_{layout}_dequantize_sm70_out")(
+            out, storage, kind
+        )
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)

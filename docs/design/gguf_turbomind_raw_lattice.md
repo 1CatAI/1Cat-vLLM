@@ -430,3 +430,46 @@ block, including both metadata planes. Its register prefetch has the same
 word count per thread because 110/82-byte blocks still fit within four/three
 coalesced uint64 words per thread. Persistent storage and arithmetic are
 unchanged. Numerical and speed validation of this extension is pending.
+
+## Complete-block staging measurements
+
+Source `3dc27805ef`, core SHA256
+`a853192e62999c9aa4329c8c361d168da9d2efce98c5210b7613fa4719a8c71c`,
+whole-wheel SHA256
+`cc81a5175f850ee5a4fa4dbaecc722dbd878a718d78941a002ff922b9360518f`.
+All 20 checks pass (5.61 s). Matched graph results use CTA targets 4/8/16 and
+preserve every candidate. Times below are µs/projection.
+
+| Projection | M | Canonical | Best equal-byte | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 5 | 33.041 | 40.437 | compact_mma_prefetch_split10 |
+| 27B gate | 8 | 33.332 | 41.108 | compact_mma_prefetch_split5 |
+| 27B gate | 16 | 39.439 | 57.315 | compact_mma_staged_split3 |
+| 27B down | 5 | 32.692 | 40.563 | compact_mma_prefetch_split4 |
+| 27B down | 8 | 32.141 | 40.989 | compact_mma_prefetch_split4 |
+| 27B down | 16 | 37.866 | 60.609 | compact_mma_staged_split2 |
+| IQ3_S expert | 5 | 17.787 | 9.090 | compact_mma_staged_split10 |
+| IQ3_S expert | 8 | 19.772 | 9.151 | compact_mma_staged_split10 |
+| IQ3_S expert | 16 | 17.870 | 9.811 | compact_mma_staged_split10 |
+| IQ2_S expert | 5 | 19.321 | 10.689 | compact_mma_staged_split10 |
+| IQ2_S expert | 8 | 19.391 | 10.799 | compact_mma_staged_split10 |
+| IQ2_S expert | 16 | 18.990 | 11.872 | compact_mma_split10 |
+| Flash gate | 5 | 18.817 | 12.270 | compact_mma_prefetch_split10 |
+| Flash gate | 8 | 18.518 | 12.344 | compact_mma_prefetch_split10 |
+| Flash gate | 16 | 20.185 | 15.074 | compact_mma_staged_split10 |
+| Flash output | 5 | 15.938 | 12.031 | compact_mma_prefetch_split6 |
+| Flash output | 8 | 15.772 | 12.151 | compact_mma_prefetch_split6 |
+| Flash output | 16 | 17.317 | 14.901 | compact_mma_staged_split6 |
+
+Including metadata modestly improves staged M16, while higher CTA coverage
+remains the best dense M5/M8 option. Dense 27B parity is still not reached.
+
+SASS for the staged IQ3_S M16 main loop contains 130 FMUL, 64 FSEL and 66
+I2F instructions across its unrolled body. The next decoder reuses the
+TurboMind PRMT/half2 technique to unpack biased grid bytes into exact integer
+values in pairs, restoring signs by XOR rather than multiplying by ±1.
+Every intermediate integer is exactly representable: 1024+b, 1152 and b-128
+for all byte values b. After unpacking, original scale reconstruction and
+weight multiplication remain FP32. No coefficient or weight rounding is
+introduced before the existing MMA/workspace FP16 boundary. Exhaustive
+codebook-entry/sign tests and the official FP32 oracle gate this change.
