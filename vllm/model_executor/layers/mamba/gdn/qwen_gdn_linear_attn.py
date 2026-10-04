@@ -5294,6 +5294,73 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and core_attn_out.is_contiguous()
         )
 
+    def _can_use_sm70_gdn_preprocess(self, mixed_qkv, a, b, conv_state, metadata):
+        # Restrict the first admission to a complete single-request verifier.
+        # Mixed batches, padding with fewer actual tokens, and trees retain the
+        # existing convolution/gating path.
+        return bool(
+            self.enable_sm70_dflash2_fused_gdn_verify
+            and current_platform.is_device_capability(70)
+            and self.tp_size == 4
+            and self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+            and not self.gqa_interleaved_layout
+            and self.conv1d.bias is None
+            and self.activation in ("silu", "swish")
+            and metadata.num_prefills == metadata.num_decodes == 0
+            and metadata.num_spec_decodes == 1
+            and metadata.num_actual_tokens == 8
+            and metadata.spec_sequence_masks is not None
+            and metadata.ddtree_parent_ids is None
+            and metadata.spec_query_start_loc is not None
+            and metadata.spec_query_start_loc.shape == (2,)
+            and metadata.spec_state_indices_tensor is not None
+            and metadata.spec_state_indices_tensor.shape == (1, 8)
+            and metadata.spec_state_slot_selectors is not None
+            and metadata.spec_state_slot_selectors.shape == (1,)
+            and mixed_qkv.is_cuda
+            and mixed_qkv.dtype == a.dtype == b.dtype == torch.float16
+            and mixed_qkv.shape == (8, 2560)
+            and mixed_qkv.stride(1) == 1
+            and a.shape == b.shape == (8, 12)
+            and a.is_contiguous()
+            and b.is_contiguous()
+            and conv_state.dtype == torch.float16
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == 2560
+            and conv_state.shape[2] >= 10
+            and self.conv1d.weight.shape == (2560, 1, 4)
+            and self.conv1d.weight.dtype == torch.float16
+        )
+
+    def _allocate_core_attn_out(self, mixed_qkv, a, b, hidden_states):
+        factory = torch.zeros
+        # The full-forward opaque operator executes this code outside Dynamo.
+        # In traced paths, keep the existing zero allocation. Never expose an
+        # uninitialized buffer to a fallback or profiling warmup.
+        if not torch.compiler.is_compiling():
+            metadata_raw = get_forward_context().attn_metadata
+            if isinstance(metadata_raw, dict):
+                metadata = metadata_raw.get(self.prefix)
+                if isinstance(metadata, GDNAttentionMetadata):
+                    cache = getattr(self, "kv_cache", None)
+                    if cache is not None:
+                        conv_state = (
+                            cache[0]
+                            if is_conv_state_dim_first()
+                            else cache[0].transpose(-1, -2)
+                        )
+                        if self._can_use_sm70_gdn_preprocess(
+                            mixed_qkv, a, b, conv_state, metadata
+                        ):
+                            factory = torch.empty
+        return factory(
+            (mixed_qkv.shape[0], self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
     def _forward_dflash2_packed_gdn_verify(
         self,
         *,
@@ -5306,14 +5373,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_state_indices_tensor: torch.Tensor,
         spec_state_slot_selectors: torch.Tensor,
         num_spec_decodes: int,
+        precomputed_gating: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
         # Match the ordinary speculative verifier's FP32 beta materialization.
         # The gating helper otherwise defaults to the FP16 dtype of b.
-        g, beta = fused_gdn_gating(
-            self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
-        )
+        if precomputed_gating is None:
+            g, beta = fused_gdn_gating(
+                self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
+            )
+        else:
+            g, beta = precomputed_gating
         fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             A_log=self.A_log,
             a=a,
@@ -5485,8 +5556,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "core",
             )
 
+        precomputed_gating = None
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
+        if self._can_use_sm70_gdn_preprocess(
+            mixed_qkv, a, b, conv_state, attn_metadata
+        ):
+            assert spec_state_indices_tensor is not None
+            assert spec_state_slot_selectors is not None
+            assert spec_query_start_loc is not None
+            from vllm.model_executor.layers.mamba.gdn.sm70_preprocess import (
+                conv_gate_zero,
+            )
+
+            mixed_qkv_spec, g, beta = conv_gate_zero(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                spec_state_indices_tensor[:, 0],
+                spec_state_slot_selectors,
+                spec_query_start_loc,
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+                core_attn_out,
+            )
+            precomputed_gating = (g, beta)
+            _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
+        elif spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -5867,6 +5964,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     spec_state_indices_tensor=spec_state_indices_tensor,
                     spec_state_slot_selectors=spec_state_slot_selectors,
                     num_spec_decodes=attn_metadata.num_spec_decodes,
+                    precomputed_gating=precomputed_gating,
                 )
                 last_recurrent_state = ssm_state
                 _log_runtime_route_once(
@@ -6918,18 +7016,45 @@ def qwen_gdn_attention_core_spec_commit(
                 "core_out", layer_name, core_attn_out, metadata_source
             )
             return core_attn_out
-        mixed_qkv_spec = causal_conv1d_update(
-            mixed_qkv,
-            conv_state,
-            conv_weights,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=spec_state_indices_tensor[:, 0],
-            num_accepted_tokens=spec_state_slot_selectors,
-            query_start_loc=spec_query_start_loc,
-            max_query_len=spec_state_indices_tensor.size(-1),
-            validate_data=False,
-        )
+        precomputed_gating = None
+        if self._can_use_sm70_gdn_preprocess(
+            mixed_qkv, a, b, conv_state, attn_metadata
+        ):
+            assert spec_state_indices_tensor is not None
+            assert spec_state_slot_selectors is not None
+            assert spec_query_start_loc is not None
+            from vllm.model_executor.layers.mamba.gdn.sm70_preprocess import (
+                conv_gate_zero,
+            )
+
+            mixed_qkv_spec, g, beta = conv_gate_zero(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                spec_state_indices_tensor[:, 0],
+                spec_state_slot_selectors,
+                spec_query_start_loc,
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+                core_attn_out,
+            )
+            precomputed_gating = (g, beta)
+            _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
+        else:
+            mixed_qkv_spec = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0],
+                num_accepted_tokens=spec_state_slot_selectors,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
         if isinstance(self, QwenGatedDeltaNetAttention) and (
             self._can_use_dflash2_packed_gdn_verify(
                 mixed_qkv=mixed_qkv_spec,
@@ -6950,6 +7075,7 @@ def qwen_gdn_attention_core_spec_commit(
                 spec_state_indices_tensor=spec_state_indices_tensor,
                 spec_state_slot_selectors=spec_state_slot_selectors,
                 num_spec_decodes=attn_metadata.num_spec_decodes,
+                precomputed_gating=precomputed_gating,
             )
             _log_runtime_route_once(
                 "SM70 DFlash2 packed GDN target-verification route hit."

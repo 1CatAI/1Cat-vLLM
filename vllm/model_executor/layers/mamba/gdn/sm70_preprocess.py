@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SM70 verifier preprocessing prototype; production dispatch is not connected."""
+"""SM70 single-request verifier convolution, gating and output initialization."""
 
 import torch
 
@@ -109,10 +109,10 @@ def conv_gate_zero(
     b,
     bias,
     core_out,
-    channel_tile=256,
-    num_warps=4,
+    channel_tile=64,
+    num_warps=2,
 ):
-    """Exact-shape research entry; the caller proves the verifier layout."""
+    """Exact-shape entry; dispatch proves the verifier and state layouts."""
     assert qkv.shape == (8, 2560) and qkv.stride(1) == 1
     assert qkv.dtype == state.dtype == weight.dtype == torch.float16
     assert weight.shape == (2560, 4)

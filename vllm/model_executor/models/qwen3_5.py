@@ -547,11 +547,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         b = b.contiguous()
         a = a.contiguous()
 
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        core_attn_out = self._allocate_core_attn_out(mixed_qkv, a, b, hidden_states)
         conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
             layer_name,
             core_attn_out,
