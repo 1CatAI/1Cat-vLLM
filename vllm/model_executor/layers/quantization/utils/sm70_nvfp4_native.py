@@ -8,7 +8,25 @@ from vllm import _sm70_ops as sm70_ops
 from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
     _get_sm70_fp8_prefill_exact_dense_workspace,
 )
+from vllm.model_executor.layers.quantization.utils.nvfp4_qpn2_dequant import (
+    _e4m3_value,
+)
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+_scale_workspaces: dict[int, torch.Tensor] = {}
+
+
+@triton.jit
+def _restore_prefill_scales(Codes, Out, GlobalScale, Count: tl.constexpr):
+    index = tl.program_id(0) * 1024 + tl.arange(0, 1024)
+    raw = tl.load(Codes + index, index < Count, other=0)
+    # Match decode's FP32 group/global product followed by FP16 rounding.
+    # QPN4's existing scale-code converter assumes normal, nonzero E4M3
+    # scales and combines the global factor differently. Padded zero scales
+    # and subnormals must retain their exact weights on the new prefill route.
+    effective = (_e4m3_value(raw) * GlobalScale).to(tl.float16).to(tl.float32)
+    tl.store(Out + index, effective * 16384.0, index < Count)
 
 
 def _dispatch(
@@ -36,6 +54,19 @@ def _dispatch(
     workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
     if workspace is None or workspace.numel() < k * n:
         raise RuntimeError("Native QPN2 prefill workspace is unavailable")
+    device = codes.device.index
+    scale_workspace = _scale_workspaces.get(device)
+    if scale_workspace is None:
+        scale_workspace = torch.empty(
+            workspace.numel() // 16, dtype=torch.float16, device=codes.device
+        )
+        _scale_workspaces[device] = scale_workspace
+    _restore_prefill_scales[(triton.cdiv(scales.numel(), 1024),)](
+        scales.view(torch.uint8),
+        scale_workspace,
+        global_scale,
+        scales.numel(),
+    )
     # Resolve the pointer inside the operator, never in an AOT artifact. The
     # serialized layer chain shares FP8's bounded per-device FP16 scratch.
     sm70_ops.nvfp4_qpn4_prefill_sm70_out(
@@ -43,9 +74,9 @@ def _dispatch(
         workspace.data_ptr(),
         x,
         codes.view(k, n // 2),
-        scales.view(k // 16, n),
+        scale_workspace[: k * n // 16].view(k // 16, n),
         global_scale,
-        True,
+        False,
         gated_silu,
     )
 

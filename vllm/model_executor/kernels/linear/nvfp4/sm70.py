@@ -199,6 +199,10 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         if (
             self.config.policy.qualified
             and self.config.policy.prefill
+            # QPN4's FP4 representation scales FP16 group factors by 2**14.
+            # Preserve generic fallback if even the largest E4M3 scale could
+            # overflow that representation.
+            and 0 < float(layer.weight_global_scale.item()) < 65504 / (448 * 16384)
             and current_platform.is_device_capability(70)
             and hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out")
         ):
