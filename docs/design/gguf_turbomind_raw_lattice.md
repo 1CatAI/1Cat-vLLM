@@ -731,3 +731,40 @@ changes warp ownership for the output copy. Each warp then writes contiguous
 K vectors with aligned 128-bit stores. Padding belongs only to temporary
 shared storage; both workspace and persistent weight byte sizes remain
 unchanged. NN is retained and TN numerical/performance checks run again.
+
+## Coalesced natural workspace
+
+Source `57c614fc33` passes all 24 checks (8.07 s). This includes official
+FP32 dequantization equality, exact FP16 workspace values for both layouts,
+and changed-input full CUDA graphs. The padded shared tile changes only
+output-copy ownership; persistent packet and workspace byte sizes are unchanged.
+
+| Projection | Canonical µs | Compact NN µs | Coalesced compact TN µs |
+| --- | ---: | ---: | ---: |
+| 27B gate | 366.867 | 363.066 | 386.360 |
+| 27B down | 341.748 | 336.033 | 351.894 |
+| IQ3_S expert | 69.209 | 27.254 | 48.237 |
+| IQ2_S expert | 64.371 | 30.255 | 50.275 |
+| Flash gate | 94.161 | 126.231 | 113.438 |
+| Flash output | 81.841 | 87.671 | 81.270 |
+
+These are unprofiled full-graph replay times with distinct weight banks
+exceeding twice V100 L2, 100 replays and eight bank sweeps per graph. NN
+remains preferable for the 27B projections and single-expert shapes. TN
+reaches parity for Flash output but remains 20.5% slower for Flash gate.
+This result does not satisfy the complete promotion gate.
+
+Cold-cache node profiling of Flash gate records 25.696 µs and 1,697,664
+DRAM read bytes for coalesced dequantization, versus 100.064 µs and
+4,540,096 bytes for the earlier strided writer. The cuBLAS TN node records
+109.472 µs, 10,512,480 read bytes, 250 registers/thread and 6.25% active
+warps. Profiled node times are attribution, not the wall-time comparison.
+The next bounded experiment compares cuBLAS GEMM algorithm choices with
+FP32 computation and reduced-precision reductions disabled; no precision
+change is proposed.
+
+The installed wheel SHA256 is
+`abe02a1520497f0dbfb634014d213ac70dca89b95b0aec67600cfd5cdb65c9e2`;
+its installed core SHA256 is
+`0b7e3ecde6192dd394761129adb6f20bc97d8a2a0b9f8de546f433155d34ba87`.
+All 210 installed dependency packages are compatible.
