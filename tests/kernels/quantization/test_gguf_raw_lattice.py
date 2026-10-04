@@ -559,7 +559,8 @@ def test_compact_turbomind_fp16_workspace_graph(kind, cancellation, dq_partition
 
 @pytest.mark.parametrize("kind", [21, 22])
 @pytest.mark.parametrize("cancellation", [False, True])
-def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
+@pytest.mark.parametrize("natural_layout", [False, True])
+def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation, natural_layout):
     n, k, m = (1536, 2560, 512) if cancellation else (160, 768, 512)
     data = packed(kind, n=n, k=k)
     if cancellation:
@@ -582,9 +583,13 @@ def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
         x.fill_(128.0)
         x[:, k // 2 :] = -128.0
     out = torch.empty((m, n), device="cuda", dtype=torch.float16)
-    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    scratch = torch.empty(
+        (n, k) if natural_layout else (k, n), device="cuda", dtype=torch.float16
+    )
     workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
-    algorithms, sizes = torch.ops._C.gguf_lattice_compact_lt_sm70_prepare(x, out)
+    algorithms, sizes = torch.ops._C.gguf_lattice_compact_lt_sm70_prepare(
+        x, out, 32, natural_layout
+    )
     assert len(algorithms) > 0
     assert int(sizes.max()) <= workspace.numel()
     for algorithm in algorithms:
@@ -597,7 +602,8 @@ def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
             scratch,
             workspace,
             algorithm,
-            2,
+            1 if natural_layout else 2,
+            natural_layout,
         )
         for _ in range(3):
             run()

@@ -28,15 +28,23 @@ struct LatticeLtDescriptors {
   }
 };
 
-void create_lattice_lt(LatticeLtDescriptors& descriptors, int m, int n, int k) {
+void create_lattice_lt(LatticeLtDescriptors& descriptors, int m, int n, int k,
+                       bool natural_layout) {
   check_lattice_lt(cublasLtMatmulDescCreate(&descriptors.operation,
                                             CUBLAS_COMPUTE_32F, CUDA_R_32F),
                    "create FP32 matmul");
   // Column-major views match the existing [K,N] dequantization workspace
   // and row-major activation/output storage without an additional transpose.
-  check_lattice_lt(
-      cublasLtMatrixLayoutCreate(&descriptors.a, CUDA_R_16F, n, k, n),
-      "create weight layout");
+  const cublasOperation_t transpose =
+      natural_layout ? CUBLAS_OP_T : CUBLAS_OP_N;
+  check_lattice_lt(cublasLtMatmulDescSetAttribute(
+                       descriptors.operation, CUBLASLT_MATMUL_DESC_TRANSA,
+                       &transpose, sizeof(transpose)),
+                   "set weight transpose");
+  check_lattice_lt(cublasLtMatrixLayoutCreate(
+                       &descriptors.a, CUDA_R_16F, natural_layout ? k : n,
+                       natural_layout ? n : k, natural_layout ? k : n),
+                   "create weight layout");
   check_lattice_lt(
       cublasLtMatrixLayoutCreate(&descriptors.b, CUDA_R_16F, k, m, k),
       "create input layout");
@@ -77,7 +85,8 @@ void validate_lattice_lt_matrices(torch::Tensor out, torch::Tensor input) {
 }  // namespace
 
 std::vector<torch::Tensor> gguf_lattice_compact_lt_sm70_prepare(
-    torch::Tensor input, torch::Tensor out, int64_t max_candidates) {
+    torch::Tensor input, torch::Tensor out, int64_t max_candidates,
+    bool natural_layout) {
   validate_lattice_lt_matrices(out, input);
   TORCH_CHECK(max_candidates > 0 && max_candidates <= 64,
               "GGUF cuBLASLt candidate count must be 1 to 64");
@@ -88,7 +97,8 @@ std::vector<torch::Tensor> gguf_lattice_compact_lt_sm70_prepare(
   TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
               "Prepare GGUF cuBLASLt plans before graph capture");
   LatticeLtDescriptors descriptors;
-  create_lattice_lt(descriptors, input.size(0), out.size(1), input.size(1));
+  create_lattice_lt(descriptors, input.size(0), out.size(1), input.size(1),
+                    natural_layout);
   check_lattice_lt(cublasLtMatmulPreferenceCreate(&descriptors.preference),
                    "create matmul preference");
   const uint64_t workspace_bytes = 32 * 1024 * 1024;
@@ -136,28 +146,30 @@ std::vector<torch::Tensor> gguf_lattice_compact_lt_sm70_prepare(
 void gguf_lattice_lt_matmul_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor scratch,
                                      torch::Tensor workspace,
-                                     torch::Tensor algorithm) {
+                                     torch::Tensor algorithm,
+                                     bool natural_layout) {
   validate_lattice_lt_matrices(out, input);
   const c10::cuda::CUDAGuard guard(input.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
-  TORCH_CHECK(scratch.device() == input.device() &&
-                  scratch.scalar_type() == torch::kFloat16 &&
-                  scratch.dim() == 2 && scratch.size(0) == k &&
-                  scratch.size(1) == n && scratch.is_contiguous() &&
-                  workspace.device() == input.device() &&
-                  workspace.scalar_type() == torch::kUInt8 &&
-                  workspace.is_contiguous() && algorithm.device().is_cpu() &&
-                  algorithm.scalar_type() == torch::kUInt8 &&
-                  algorithm.is_contiguous() &&
-                  algorithm.numel() == sizeof(cublasLtMatmulAlgo_t),
-              "GGUF cuBLASLt requires prepared CPU plans and CUDA workspaces");
+  TORCH_CHECK(
+      scratch.device() == input.device() &&
+          scratch.scalar_type() == torch::kFloat16 && scratch.dim() == 2 &&
+          scratch.size(0) == (natural_layout ? n : k) &&
+          scratch.size(1) == (natural_layout ? k : n) &&
+          scratch.is_contiguous() && workspace.device() == input.device() &&
+          workspace.scalar_type() == torch::kUInt8 &&
+          workspace.is_contiguous() && algorithm.device().is_cpu() &&
+          algorithm.scalar_type() == torch::kUInt8 &&
+          algorithm.is_contiguous() &&
+          algorithm.numel() == sizeof(cublasLtMatmulAlgo_t),
+      "GGUF cuBLASLt requires prepared CPU plans and CUDA workspaces");
   cublasLtMatmulAlgo_t plan;
   std::memcpy(&plan, algorithm.data_ptr<uint8_t>(), sizeof(plan));
   TORCH_CHECK(
       lattice_lt_fp32_reduction(plan),
       "GGUF cuBLASLt rejects output-type or in-place split-K reduction");
   LatticeLtDescriptors descriptors;
-  create_lattice_lt(descriptors, m, n, k);
+  create_lattice_lt(descriptors, m, n, k, natural_layout);
   auto handle = at::cuda::getCurrentCUDABlasLtHandle();
   cublasLtMatmulHeuristicResult_t checked{};
   check_lattice_lt(

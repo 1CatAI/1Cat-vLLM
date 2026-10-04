@@ -1339,3 +1339,11 @@ numerical oracle (relative L2 0.0002036) and measures 65.684 us raw versus
 94.024 us canonical with 20 replays. Earlier 50-replay raw timing is 57.563 us;
 that cross-process variation is retained rather than hidden. Both comparisons
 improve over their matched canonical controls.
+
+The next FP32 cuBLASLt comparison exposes the existing coalesced natural
+[N,K] temporary workspace as well as [K,N]. Descriptor transpose and leading
+dimensions change together; persistent weights and decoded operand bits do
+not. The same NONE/COMPUTE_TYPE reduction admission remains enforced, and
+natural dequantization uses its existing single-partition shared transpose.
+Both layouts receive changed-input graph and FP16-overflow cancellation tests.
+No model default or precision change is made from this unmeasured candidate.
