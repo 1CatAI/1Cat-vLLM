@@ -23,6 +23,7 @@ def test_get_draft_quant_config_with_draft_model():
     mock_load_config = Mock(spec=LoadConfig)
     mock_speculative_config = Mock(spec=SpeculativeConfig)
     mock_speculative_config.draft_model_config = mock_draft_model_config
+    mock_speculative_config.draft_load_config = None
 
     mock_vllm_config = Mock(spec=VllmConfig)
     mock_vllm_config.speculative_config = mock_speculative_config
@@ -52,6 +53,19 @@ def test_get_draft_quant_config_without_draft_model():
     result = get_draft_quant_config(mock_vllm_config)
 
     assert result is None
+
+
+def test_get_draft_quant_config_uses_independent_load_configuration():
+    draft = Mock(spec=ModelConfig)
+    speculative = Mock(spec=SpeculativeConfig)
+    speculative.draft_model_config = draft
+    speculative.draft_load_config = LoadConfig(load_format="safetensors")
+    config = Mock(spec=VllmConfig)
+    config.speculative_config = speculative
+    config.load_config = LoadConfig(load_format="gguf")
+    with patch.object(VllmConfig, "get_quantization_config", return_value=None) as get:
+        assert get_draft_quant_config(config) is None
+    get.assert_called_once_with(draft, speculative.draft_load_config)
 
 
 @torch.inference_mode()
