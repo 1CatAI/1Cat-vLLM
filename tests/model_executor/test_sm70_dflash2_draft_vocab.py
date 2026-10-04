@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Vocabulary trimming must retain CJK byte pieces and original IDs."""
+"""Vocabulary trimming must retain ASCII/CJK byte pieces and original IDs."""
 
 import pytest
 
@@ -19,6 +19,8 @@ def test_complete_cjk_and_byte_fragments_with_original_ids():
     vocab = {
         token(b"common"): 3,
         token(b"rareword"): 101,
+        token(b"foo_bar123()\n\t"): 104,
+        token("\u03b1".encode()): 109,
         token("hello中文".encode()): 702,
         token("かな".encode()): 47,
         token("한글".encode()): 904,
@@ -38,6 +40,8 @@ def test_complete_cjk_and_byte_fragments_with_original_ids():
         3,
         27,
         47,
+        101,
+        104,
         201,
         206,
         308,
