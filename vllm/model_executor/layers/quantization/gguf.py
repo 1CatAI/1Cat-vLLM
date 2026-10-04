@@ -64,6 +64,7 @@ class GGUFConfig(QuantizationConfig):
         self.unquantized_modules = unquantized_modules or []
         self.linear_layouts: dict[str, GGUFLinearLayout] = {}
         self.fallback_reasons: dict[str, str] = {}
+        self.native_expert_storage = False
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -119,6 +120,12 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedEmbeddingMethod()
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
+            if self.native_expert_storage:
+                from vllm.model_executor.layers.quantization.gguf_moe import (
+                    GGUFNativeMoEMethod,
+                )
+
+                return GGUFNativeMoEMethod(self, layer.moe_config)
             # TODO: Select UnquantizedFusedMoEMethod on unquantized layers.
             return GGUFMoEMethod(self, layer.moe_config)
         return None
@@ -456,7 +463,7 @@ def _apply_gguf_embedding_fake(
     dtype: torch.dtype | None = None,
     native_enabled: bool = True,
 ) -> torch.Tensor:
-    return torch.empty(x.shape[0], hidden_size, dtype=dtype, device=x.device)
+    return torch.empty((*x.shape, hidden_size), dtype=dtype, device=x.device)
 
 
 try:
@@ -489,6 +496,7 @@ class GGUFLinearMethod(LinearMethodBase):
         self.native_enabled = policy.enabled if policy is not None else True
         self.prefill_min_m = policy.prefill_min_m if policy is not None else 8
         self.native_prepared = False
+        self.canonical_projections = ()
 
     def create_weights(
         self,
@@ -571,6 +579,46 @@ class GGUFLinearMethod(LinearMethodBase):
             and not isinstance(self, GGUFEmbeddingMethod)
         ):
             qweight = layer.qweight
+            from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                prepare_gguf_projections,
+            )
+
+            if qweight.data_container:
+                ids = (
+                    ["q", "k", "v"]
+                    if "q" in qweight.shard_id
+                    else sorted(qweight.shard_id)
+                )
+                sources = [
+                    (
+                        qweight.data_container[qweight.shard_id_map[index]].to(
+                            device=qweight.device
+                        ),
+                        layer.qweight_type.shard_weight_type[index],
+                    )
+                    for index in ids
+                ]
+            else:
+                sources = [(qweight, layer.qweight_type.weight_type)]
+            projections = prepare_gguf_projections(
+                sources, self.params_dtype, self.native_enabled, self.prefill_min_m
+            )
+            self.native_admission["canonical_projections"] = [
+                projection.admission() for projection in projections
+            ]
+            if any(projection.kernel is not None for projection in projections):
+                layer.gguf_tm_projections = torch.nn.ModuleList(projections)
+                self.canonical_projections = layer.gguf_tm_projections
+                qweight.data_container.clear()
+                # Replace this layer's parameter rather than mutating shared
+                # checkpoint storage (for example a tied embedding parameter).
+                empty = Parameter(
+                    torch.empty(0, dtype=self.params_dtype, device=qweight.device),
+                    requires_grad=False,
+                )
+                set_weight_attrs(empty, vars(qweight))
+                layer.register_parameter("qweight", empty)
+                return
             if qweight.data_container:
                 ids = (
                     ["q", "k", "v"]
@@ -681,6 +729,12 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
+        if self.canonical_projections:
+            outputs = [projection(x) for projection in layer.gguf_tm_projections]
+            out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+            if bias is not None:
+                out.add_(bias)
+            return out
         if hasattr(layer, "gguf_native_shard_weights"):
             weights = layer.gguf_native_shard_weights
             types = layer.gguf_native_shard_types
