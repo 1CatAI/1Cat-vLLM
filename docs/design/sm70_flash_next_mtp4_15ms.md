@@ -218,7 +218,7 @@ This is a trace reliability check, not a numerical gate or endpoint speed
 admission. Missing controls cannot pass. Per-rank nested intervals are counted
 once, with mean/p50/p90/p99 and an explicit boundary residual. GPU event origins
 are independent across ranks. Never maximize each phase separately and add them.
-The six focused observer/analysis CPU tests pass; GPU calibration remains pending.
+The six focused observer/analysis CPU tests pass. GPU calibration is reported in the final-source section below.
 
 The earlier reset-cache node capture at source `7778083c3f` provides these rank-0
 native weight-read audits, sorted by service minus the weight-only floor.
@@ -314,9 +314,8 @@ The next screen reuses existing channel-QPN8 preparation and M2-M8 dispatch
 for actual checkpoint GDN/output projections, comparing the current native
 FP16 chains, not a slow vendor-only control. HC remains FP16. No defaults change
 until shared full-vocabulary distribution, task quality, acceptance and C4
-checks pass. Expert-plan snapshots now record actual valid groups without
-per-round CPU synchronization; measured traffic/floor ranking remains pending
-those GPU data rather than assuming all 50 routes read distinct experts.
+checks pass. Expert-plan snapshots record actual valid groups without per-round CPU
+synchronization; the measured traffic qualification follows below.
 
 ### Traffic qualification and QPN8 screen
 
@@ -346,3 +345,24 @@ a candidate, with only 0.252 ms measured operator saving. Neither arm has model
 numerical/quality admission; FP8 operator relative L2 errors reach about 2.7%
 versus FP64, so operator timing cannot justify enabling it by default. No FP8
 runtime defaults change and no model test is credited to these microbenchmarks.
+
+### Production-chain qualification
+
+Source `06aa730e6b`, unchanged normal native binary. These microbenchmarks
+use real checkpoint weights and synthetic activations; they do not measure
+model-round latency or admit a numerical change. Seven unprofiled CUDA-graph
+trials, no dispatch overrides or candidate parameter sweeps:
+
+- TP4 current three-kernel HC projection/transport chain over all 96 pairs:
+  critical-rank median 2.273 ms. Its 346,030,080 issued weight bytes have a
+  0.461-ms weight-only floor. Combine/norm and the final mixer are excluded.
+  The difference includes both compute and transport, not just HBM reads.
+- Current grouped NVFP4 layer with a 30-group M5 density fixture: plan/W13/
+  SwiGLU 30.46–30.47 us; W2/ordered reduction 12.96–12.98 us; whole chain
+  43.27–43.29 us. Independent expert-bank offsets agree. Weight plus scale
+  floors are 20.48 and 10.24 us. This fixture does not preserve captured route
+  multiplicities and cannot replace actual whole-model timing.
+
+HC has the larger confirmed gap; isolate its local projection work from TP
+transport and inspect counters before choosing a structural change. Avoid
+retesting rejected cooperative HC or local split-K implementations.

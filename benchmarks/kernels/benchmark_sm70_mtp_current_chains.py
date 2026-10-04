@@ -27,7 +27,7 @@ def samples(graph):
     return [elapsed(graph) for _ in range(7)]
 
 
-def hc(model, local_only=False):
+def hc(model, local_only=False, prefetch_screen=False):
     from benchmarks.kernels.benchmark_sm70_hc_tp4 import load_weights
     from vllm import _custom_ops as native_ops
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
@@ -81,24 +81,73 @@ def hc(model, local_only=False):
     torch.accelerator.synchronize()
     dist.barrier()
 
-    def chain():
+    def chain(prefetch=False):
         for (down, up), (x, partials, lora, local, output, injection) in zip(
             packed, state
         ):
-            comm.sm70_qwen38_hc_batch(
-                x, down, up, partials, lora, local, output, injection, fused_chain=True
-            )
+            if prefetch:
+                native_ops._custom_ar_owner_namespace().sm70_qwen38_hc_batch(
+                    comm._ptr,
+                    x,
+                    down,
+                    up,
+                    partials,
+                    lora,
+                    local,
+                    output,
+                    injection,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                )
+            else:
+                comm.sm70_qwen38_hc_batch(
+                    x,
+                    down,
+                    up,
+                    partials,
+                    lora,
+                    local,
+                    output,
+                    injection,
+                    fused_chain=True,
+                )
 
     graph = capture(chain)
     graph.replay()
     torch.accelerator.synchronize()
     assert all(torch.isfinite(t).all() for s in state for t in s[2:])
+    candidate = None
+    errors = []
+    if prefetch_screen:
+        candidate = capture(lambda: chain(True))
+        for scale in (0.0, 0.03, 0.1, 1.0, 3.0):
+            for s in state:
+                s[0].normal_(0, scale)
+            graph.replay()
+            # Comparison snapshots are outside capture and timing. In-stream
+            # clones preserve control outputs before candidate writes them.
+            expected = [tuple(t.clone() for t in s[2:]) for s in state]
+            candidate.replay()
+            torch.accelerator.synchronize()
+            assert all(torch.isfinite(t).all() for s in state for t in s[2:])
+            delta = max(
+                (actual.float() - ref.float()).abs().max().item()
+                for s, refs in zip(state, expected)
+                for actual, ref in zip(s[2:], refs)
+            )
+            errors.append(dict(scale=scale, max_abs=delta))
     trials = []
-    for _ in range(7):
-        dist.barrier()
-        times = [None] * 4
-        dist.all_gather_object(times, elapsed(graph))
-        trials.append(times)
+    candidate_trials = []
+    for trial in range(7):
+        arms = (0,) if candidate is None else ((0, 1) if trial % 2 else (1, 0))
+        for arm in arms:
+            dist.barrier()
+            times = [None] * 4
+            dist.all_gather_object(times, elapsed((graph, candidate)[arm]))
+            (trials, candidate_trials)[arm].append(times)
     down_bytes = sum(d.numel() * d.element_size() for d, _ in packed)
     up_bytes = sum(u.numel() * u.element_size() for _, u in packed)
     result = dict(
@@ -110,6 +159,16 @@ def hc(model, local_only=False):
         weight_floor_ms=(down_bytes + up_bytes) / 750e6,
         exclusions="combine/norm, final mixer, other model work",
     )
+    if candidate is not None:
+        all_errors = [None] * 4
+        dist.all_gather_object(all_errors, errors)
+        result.update(
+            candidate_rank_samples_ms=candidate_trials,
+            candidate_rank_max_median_ms=statistics.median(
+                max(t) for t in candidate_trials
+            ),
+            operator_errors=all_errors,
+        )
     dist.barrier()
     comm.close()
     dist.destroy_process_group()
@@ -176,7 +235,10 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--workload", choices=("hc", "hc-local", "moe"), required=True)
+    parser.add_argument("--hc-prefetch-screen", action="store_true")
     args = parser.parse_args()
+    if args.hc_prefetch_screen and args.workload != "hc":
+        parser.error("HC prefetch comparison requires the complete TP4 HC chain")
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(rank)
     torch.set_num_threads(1)
@@ -186,7 +248,11 @@ def main():
     assert torch.cuda.get_device_capability() == (7, 0)
     root = Path(__file__).resolve().parents[2]
     result = (
-        hc(args.model, local_only=args.workload == "hc-local")
+        hc(
+            args.model,
+            local_only=args.workload == "hc-local",
+            prefetch_screen=args.hc_prefetch_screen,
+        )
         if args.workload.startswith("hc")
         else moe(args.model, rank)
     )
