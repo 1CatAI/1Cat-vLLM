@@ -162,3 +162,29 @@ cycles, 47.5% of warp issue cycles, to L1TEX scoreboard dependencies. Its
 This motivates testing the existing raw vector's next-block software prefetch
 inside grouped projection. FP32 FMA/reduction order and stored blocks remain
 unchanged; that candidate still needs an unprofiled speed screen.
+
+The prefetch screen from `27db2cdd6b`, ordinary package `1.5.2.dev552`,
+passes the same twelve GPU checks, including bitwise FP32 dequantization and
+raw-vector output. The whole wheel SHA256 is
+`2533d7abe0e0ad0780447db1cf256614d56ec7b4d53f79cfb4b9169675f16617`;
+its core SHA256 is
+`8471aa2ea122cefd892d9b57851be433feb40dbc54234c1c69f6483aa3d0b53e`.
+
+| Type | M | Canonical gate/up (µs) | Prefetched original-block gate/up (µs) |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS | 1 | 46.501 | 14.688 |
+| IQ3_XXS | 5 | 75.140 | 61.533 |
+| IQ3_XXS | 20 | 287.181 | 204.927 |
+| IQ2_S | 1 | 121.934 | 16.709 |
+| IQ2_S | 5 | 159.033 | 71.027 |
+| IQ2_S | 20 | 213.728 | 235.095 |
+| IQ3_S | 1 | 147.138 | 14.819 |
+| IQ3_S | 5 | 186.113 | 62.830 |
+| IQ3_S | 20 | 287.981 | 209.994 |
+
+The prefetch is retained. IQ2_S M=20 still rejects vector dispatch. The
+30 IQ2_S/IQ3_S layers project 2.993 ms less M=5 gate/up service. These are
+operator results with synthetic routing, separate from model throughput.
+The kernel capability also admits measured IQ3_XXS M=1/5/20 when an original
+bank is retained; missing storage reports `original_expert_bank_not_retained`.
+Nine CPU capability tests cover the measured points and fallback reasons.
