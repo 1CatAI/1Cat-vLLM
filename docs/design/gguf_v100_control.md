@@ -293,3 +293,16 @@ range recovery is tracked in #875, separately from GGUF weight preparation.
 The tiny-model 23-token Chinese difference is still open. Flash-Next remains
 TP4; its model integration, canonical MoE preparation and packed PLE offloading
 remain separate unfinished work.
+
+### Corrected long-context model check
+
+PR #875 is merged. Both GGUF and NVFP4 now pass all four frozen needle cases,
+including the previous 128K/258048 failures, with unchanged prompt hashes,
+sampling and natural EOS. The 32 preceding short code/math/Chinese cases were
+already passing on unchanged attention routes. Updated GGUF decode is
+59.49/207.22/394.61/674.61 tok/s; the lower C4 full-sweep mean includes long
+intervals despite a faster median. A matched four-repeat C4-only confirmation
+is 215.44 tok/s, within 0.6% of the preceding run. 8K/32K engine prefill is
+2.4323/10.3453 seconds versus the updated NVFP4 2.4666/10.4106. All four greedy
+sequences and EOS remain identical. Full raw measurements and remaining gaps
+are recorded in `gguf_turbomind_model.md`; Flash-Next integration remains TP4.

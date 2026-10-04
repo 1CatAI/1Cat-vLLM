@@ -419,8 +419,8 @@ All four natural greedy token sequences and finish reasons match the preceding
 GGUF measurement and its llama.cpp reference. Prefill improves rather than
 regressing, and decode throughput improves by 21–24%. Decode remains 12–19%
 below the native NVFP4 control, so this is an improvement rather than a claim
-of complete performance parity. The frozen common quality set is running
-separately; its scores are still pending.
+of complete performance parity. The common quality comparison and affected
+long-context rerun are recorded below.
 
 Updated wheel fingerprint:
 `ff173a2e75d44de5fb14fe9507963f2ab0d8d0c0596770d1d6e96a7238d8aa6e`.
@@ -450,12 +450,48 @@ on the second 8192-token prefill chunk; its inputs and preceding layer outputs
 are finite. All 248320 final logits are nonfinite. Investigation now targets
 the shared Flash-V100 chunked prefill route.
 
-Small standalone Q8192 attention checks with uniform values, uniform large
-Q/K and varied Q/K remain finite. They reject simple magnitude-only overflow
-explanations; the next diagnostic retains real attention inputs and the KV
-prefix from the failing call. No kernel correction has been validated yet.
+Small standalone checks with uniform or varied Q/K remain finite. Captured
+real Q/K/V reproduce 34 positive infinities in rank 3, layer 15. The sampled
+tail maximum misses the complete peak by about 17. The existing margin does
+not protect the FP16 numerator. #875 bounds this shift using the complete
+maximum when needed, preserving FP16 operands and FP32 accumulation. The
+normal FA2 correction passes Q8000/Q8192 regression, graph and 16 real-group
+FP32 reference checks, and is now in main.
 
 Worker capability reports confirm 592 original dense projection shards become
 383 canonical projections, including 48 admitted N=24 FP16 caches. They report
 278 affine, 101 LUT4 and four lattice projections, with mixed source boundaries
 and calibrated fallback reasons retained.
+
+## Model checks with corrected prefill
+
+The ordinary combined wheel keeps the canonical core fingerprint unchanged and
+contains the corrected FA2 extension. All four affected frozen needle cases
+pass for both GGUF and NVFP4 with natural EOS, identical prompt token hashes,
+original seeds, sampling and limits. This rerun covers the affected 8K, 32K,
+128K and 258048-token cases; the preceding 32 short code/math/Chinese cases
+already passed and use unchanged attention routes.
+
+| Measurement | Updated GGUF | Updated NVFP4 |
+|---|---:|---:|
+| C1 pure decode tok/s | 59.49 | 65.55 |
+| C4 pure decode tok/s, full sweep | 207.22 | 249.03 |
+| C4 pure decode tok/s, four-repeat confirmation | 215.44 | — |
+| C8 pure decode tok/s | 394.61 | 471.15 |
+| C16 pure decode tok/s | 674.61 | 831.07 |
+| 8K engine prefill seconds | 2.4323 | 2.4666 |
+| 32K engine prefill seconds | 10.3453 | 10.4106 |
+
+Four natural greedy bodies and EOS remain identical to the preceding GGUF run
+and its llama.cpp reference. All complete-cohort runs use TP4, FP16, no MTP,
+I1024/O128, FULL_AND_PIECEWISE graphs, max length 33024, batch 8192, 16 sequence
+slots and memory utilization 0.7. The isolated C4 confirmation retains these
+limits and sampling, measures only C4, and does not repeat prefill. Its four
+results are 216.92/215.11/216.30/213.44 tok/s. The full-sweep C4 median is
+18.10 ms versus 18.45 ms previously, but occasional long intervals lower its
+mean throughput; the complete lower result is retained rather than discarded.
+The confirmation is within 0.6% of the preceding 216.73 tok/s run. Decode still
+trails the native route; model performance parity remains unfinished.
+
+Combined wheel fingerprint:
+`482280f954cdc327cd489fe321440a717e481a2a11819891b183cc560f83a8dd`.
