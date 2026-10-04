@@ -56,7 +56,7 @@ def worker_decode_routes(worker):
                 desc.num_tokens
                 for desc in manager.graphs
                 if desc.cg_mode.name == "FULL"
-                and desc.uniform_token_count == manager.decode_query_len
+                and desc.uniform_token_count in (None, manager.decode_query_len)
             }
         )
     return report
