@@ -100,6 +100,29 @@ def metrics(o):
     }
 
 
+def health_failures(records):
+    """Screen natural-EOS outputs separately from task scores.
+
+    Three occurrences of a long identical final-answer line require review;
+    a passing code test cannot override this or a token-limit termination.
+    """
+    failures = []
+    for record in records:
+        health = record["health"]
+        reasons = []
+        if not health["natural_eos"]:
+            reasons.append("not_natural_eos")
+        if not health["nonempty_final"]:
+            reasons.append("empty_final_answer")
+        if health["replacement_characters"]:
+            reasons.append("replacement_characters")
+        if health["line_repetition"] >= 3:
+            reasons.append("repeated_final_answer_line")
+        if reasons:
+            failures.append({"id": record["id"], "reasons": reasons})
+    return failures
+
+
 def prompt_token_ids(case, tok):
     prompt = case.get("prompt")
     if case["category"] == "needle":
@@ -273,8 +296,12 @@ def run(args):
         report["median_tpot_ms"] = statistics.median(
             r["tpot_ms"] for r in report["timing"]
         )
+        report["health_failures"] = health_failures(report["quality"])
+        report["health_passed"] = not report["health_failures"]
         report["complete"] = True
         save()
+        if not report["health_passed"]:
+            raise SystemExit("Output health gate failed; see health_failures in report")
     finally:
         llm.llm_engine.engine_core.shutdown()
 
