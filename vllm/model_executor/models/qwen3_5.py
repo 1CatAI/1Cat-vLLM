@@ -423,7 +423,20 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             "gdn_hidden_states", layer_name, hidden_states
         )
 
-        if _sm70_gdn_qpn8_ba_dispatch_eligible(
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _sm70_gdn_projection_dump_requested,
+        )
+        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+            apply_gdn_ba_verify,
+        )
+
+        fused_verify_projection = None
+        if not _sm70_gdn_projection_dump_requested(layer_name):
+            fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        if fused_verify_projection is not None:
+            mixed_qkv, z, b, a = fused_verify_projection
+            z = z.reshape(num_tokens, -1, self.head_v_dim)
+        elif _sm70_gdn_qpn8_ba_dispatch_eligible(
             self,
             hidden_states,
             layer_name,

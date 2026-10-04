@@ -58,6 +58,57 @@ def test_verify_fusion_reaches_opaque_input_boundaries(monkeypatch, boundary):
     assert torch.all(z == 2)
 
 
+def test_verify_fusion_reaches_qwen35_override(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+    from vllm.model_executor.layers.quantization import sm70_gdn_ba_verify as ba
+    from vllm.model_executor.models import qwen3_5
+
+    monkeypatch.setattr(gdn, "_sm70_gdn_projection_dump_requested", lambda name: False)
+    monkeypatch.setattr(qwen3_5, "_encode_layer_name", lambda name: name)
+    monkeypatch.setattr(
+        qwen3_5, "_sm70_dump_gdn_projection_tensor", lambda label, name, value: value
+    )
+    monkeypatch.setattr(
+        qwen3_5, "_resolve_qwen_gdn_kv_cache_args", lambda *args: (None, None)
+    )
+    x = torch.zeros(8, 5120, dtype=torch.float16)
+    q, z = x.new_full((8, 2560), 1), x.new_full((8, 1536), 2)
+    b, a = x.new_full((8, 12), 3), x.new_full((8, 12), 4)
+    layer = SimpleNamespace(
+        key_dim=2048,
+        value_dim=6144,
+        tp_size=4,
+        num_v_heads=48,
+        head_v_dim=128,
+        prefix="test.layer",
+    )
+    calls = []
+
+    def fused(actual_layer, hidden):
+        assert actual_layer is layer and hidden is x
+        calls.append(True)
+        return q, z, b, a
+
+    def recurrent(actual_layer, **kwargs):
+        assert actual_layer is layer
+        assert kwargs["mixed_qkv"] is q
+        assert kwargs["b"] is b and kwargs["a"] is a
+        return kwargs["core_attn_out"]
+
+    def project(core, actual_z, output, rows):
+        assert actual_z.data_ptr() == z.data_ptr()
+        assert actual_z.shape == (8, 12, 128) and rows == 8
+        return core
+
+    layer._output_projection = project
+    monkeypatch.setattr(ba, "apply_gdn_ba_verify", fused)
+    monkeypatch.setattr(qwen3_5, "_qwen_gdn_run_recurrent_core", recurrent)
+    result = qwen3_5.Qwen3_5GatedDeltaNet.forward_cuda(layer, x, None)
+    assert result.shape == (8, 12, 128) and calls == [True]
+
+
 @pytest.mark.parametrize("amplitude", [0.0, 0.125, 1.0])
 @torch.inference_mode()
 def test_m8_qkvz_is_bitwise_and_ba_matches_dense64(amplitude):
