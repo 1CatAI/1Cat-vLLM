@@ -80,3 +80,38 @@ M=2/5/10/16 GPU tests also exercise the replicated FP32 reference and graph
 replay. The complete-pack alternative improves both measured verifier
 batch sizes, so it qualifies for the combined dense-route C1/C4 model check.
 That model comparison remains pending; the table is not a model-round gain.
+
+## M=20 verifier screen
+
+C4 MTP4 verification supplies 20 rows. The existing replicated FP32 MMA
+already tiles arbitrary rows in groups of eight; its host and Python guards
+previously stopped at 16. Extend only the replicated operator to 20, retaining
+its original arithmetic and packing. Python admits the existing 2–16 interval
+plus the measured M=20 point; 17–19 and batches above 20 retain dense fallback.
+Local/IPC paths keep their prior boundaries.
+
+One additional M=20 GPU case passes FP32 projection and gated-output checks,
+changed-input graph replay and exact repeated replay. The eight real HC pairs
+and four-rank graph timing method match the earlier screens.
+
+| M | Maximum-rank dense chain µs | Maximum-rank replicated chain µs | Estimated saving for 96 pairs ms |
+| --- | ---: | ---: | ---: |
+| 20 | 359.741 | 253.911 | 1.270 |
+
+Old/new per-rank medians are 347.976/251.075, 341.555/246.579,
+359.741/253.266 and 358.257/253.911 µs. Maximum absolute output error is
+6.1035e-5 and relative L2 is 3.0341e-5 on every rank. Products and partial
+reduction remain FP32. These results are an operator-chain estimate, not a
+measured C4 model-round improvement. No additional model restart or trace
+was performed for this change.
+
+Ordinary installed wheel: `1.5.2.dev490+g642d274bf`; benchmark's full
+`--batch-sizes` option is the subsequent CLI-only correction `f6ee8e58af`.
+The initial `--m` option conflicts with torchrun abbreviation parsing; that
+failed launch is retained and contains no timing data. All 211 dependencies
+pass. Native `_C` has no RPATH/RUNPATH or private dependency. Wheel SHA256:
+`903f74db003708a19a7c089782e106a2576fa85ce375d5a7960685bb787bbd23`.
+Native `_C` SHA256:
+`1f0490621e543f43f8a9419faa573df800b7787220709d6f368751c23208f2e6`.
+
+Reproduce the four-rank benchmark with `--replicated --batch-sizes 20`.
