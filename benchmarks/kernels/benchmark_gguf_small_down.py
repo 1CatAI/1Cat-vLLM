@@ -97,8 +97,8 @@ def main():
             for bank in banks:
                 new(bank)
 
-        old_us = elapsed(cold_old, 100) / len(banks)
-        new_us = elapsed(cold_new, 100) / len(banks)
+        old_us = elapsed(cold_old, 100, capture=True) / len(banks)
+        new_us = elapsed(cold_new, 100, capture=True) / len(banks)
         old()
         new()
         route_ids = sorted_ids.cpu().tolist()
