@@ -964,6 +964,8 @@ class Worker(WorkerBase):
         return {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
+            "compilation_mode": self.compilation_config.mode.name,
+            "cudagraph_mode": self.compilation_config.cudagraph_mode.name,
             "linear_kernel_selections": selections,
             "ple_result_transports": transports,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),

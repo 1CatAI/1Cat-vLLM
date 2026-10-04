@@ -143,6 +143,12 @@ def main():
             "get_sm70_acceleration_report", timeout=30
         )
         save()
+        for worker in report["worker_routes"]:
+            if worker["cudagraph_mode"] != "FULL":
+                raise RuntimeError(
+                    f"Rank {worker['rank']} downgraded FULL CUDA graph to "
+                    f"{worker['cudagraph_mode']}; no timing results recorded"
+                )
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
         if args.record_first_logprobs:
