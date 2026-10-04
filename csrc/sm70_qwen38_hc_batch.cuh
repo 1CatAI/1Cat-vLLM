@@ -37,7 +37,7 @@ __device__ __forceinline__ float sigmoid(float x) {
 // PairRows shares the same 16-byte weight load across two independent M8
 // accumulators. The K sequence in each accumulator is unchanged.
 template <bool PairRows, int Warps, int Unroll, bool FuseMix,
-          bool FullOutput = false>
+          bool FullOutput = false, bool Prefetch = false>
 __device__ __forceinline__ void hc_up_batch_body(
     const half* __restrict__ lora, const half* __restrict__ packed,
     const half* __restrict__ branches, half* __restrict__ out, int rows,
@@ -52,11 +52,27 @@ __device__ __forceinline__ void hc_up_batch_body(
   const int col = branch * 8 + r;
   const half* w = packed + static_cast<size_t>(tile) * 320 * 32;
   float accum[PairRows ? 2 : 1][8] = {};
+  uint4 pending_lo{}, pending_hi{};
+  if constexpr (Prefetch) {
+    pending_lo = *reinterpret_cast<const uint4*>(w + col * 8);
+    pending_hi = *reinterpret_cast<const uint4*>(w + (32 + col) * 8);
+  }
 #pragma unroll Unroll
   for (int g = 0; g < 20; ++g) {
-    const uint4 lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
-    const uint4 hi =
-        *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
+    uint4 lo, hi;
+    if constexpr (Prefetch) {
+      lo = pending_lo;
+      hi = pending_hi;
+      if (g + 1 < 20) {
+        pending_lo =
+            *reinterpret_cast<const uint4*>(w + ((g + 1) * 64 + col) * 8);
+        pending_hi =
+            *reinterpret_cast<const uint4*>(w + ((g + 1) * 64 + 32 + col) * 8);
+      }
+    } else {
+      lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
+      hi = *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
+    }
 #pragma unroll
     for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
       const int row = (group + p) * 8 + r;
@@ -110,11 +126,11 @@ __device__ __forceinline__ void hc_up_batch_body(
 }
 
 template <bool PairRows, int Warps, int Unroll, bool FuseMix,
-          bool FullOutput = false>
+          bool FullOutput = false, bool Prefetch = false>
 __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
     const half* lora, const half* packed, const half* branches, half* out,
     int rows, int hidden, int hidden_offset) {
-  hc_up_batch_body<PairRows, Warps, Unroll, FuseMix, FullOutput>(
+  hc_up_batch_body<PairRows, Warps, Unroll, FuseMix, FullOutput, Prefetch>(
       lora, packed, branches, out, rows, hidden, hidden_offset, blockIdx.x,
       blockIdx.y);
 }
