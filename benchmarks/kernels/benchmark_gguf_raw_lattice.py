@@ -265,7 +265,7 @@ def main():
                     )
                 )
                 for prefetch in (False, True):
-                    prefix = "vec_factor_base" + ("_prefetch" if prefetch else "")
+                    prefix = "vec_factor_scale" + ("_prefetch" if prefetch else "")
                     candidates.append(
                         (
                             f"{prefix}_split{split}",

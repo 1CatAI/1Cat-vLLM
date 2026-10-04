@@ -78,7 +78,7 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
   }
 }
 
-template <int Type, bool Split, bool Prefetch = false, bool FactorBase = false>
+template <int Type, bool Split, bool Prefetch = false, bool FactorScale = false>
 __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int n, int k, int stride,
                                int splits) {
@@ -114,14 +114,14 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
     else
       data = stage_block<Type>(raw[warp], row_data, block, stride);
     const auto values =
-        Decode::template fragment<float, !FactorBase>(data, lane * 8, grid);
+        Decode::template fragment<float, !FactorScale>(data, lane * 8, grid);
     // K is block aligned and each lane owns eight adjacent half values.
     // One 128-bit load replaces eight strided 16-bit memory instructions.
     const uint4 loaded =
         *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
     const auto& activation =
         reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
-    if constexpr (FactorBase) {
+    if constexpr (FactorScale) {
       float local = 0.f;
 #pragma unroll
       for (int i = 0; i < 8; ++i)
@@ -743,7 +743,7 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch, bool factor_base) {
+                                   bool prefetch, bool factor_scale) {
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() &&
                   input.scalar_type() == torch::kFloat16 &&
@@ -781,13 +781,13 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
     RAW_VEC(TYPE, false, FACTOR);    \
   }
   if (source_type == 21) {
-    if (factor_base) {
+    if (factor_scale) {
       SELECT_RAW_VEC(21, true);
     } else {
       SELECT_RAW_VEC(21, false);
     }
   } else {
-    if (factor_base) {
+    if (factor_scale) {
       SELECT_RAW_VEC(22, true);
     } else {
       SELECT_RAW_VEC(22, false);

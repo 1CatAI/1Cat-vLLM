@@ -1175,3 +1175,14 @@ base-scale FMA and final reductions all use FP32. The alternative changes the
 summation order, so it requires the same official-weight dot-product error gate;
 FP32 dequantization and final MMA operand formation are unchanged. The existing
 vector schedule remains the default until a measured candidate passes.
+
+The d-only factoring candidate passes 42 checks but is slower: gate/down
+34.745/32.748 us versus the retained original-word prefetch 33.076/31.409 us
+and canonical 31.779/30.894 us. That branch is replaced by full-scale factoring:
+compute original d and small-scale multiplication in FP32, accumulate eight
+activation/grid products in FP32, then apply the combined FP32 scale by FMA.
+This removes per-weight FP32 scale multiplies while retaining both scale levels
+and FP32 accumulation. It changes grouping, so the same official-weight numerical
+and changed-input graph gates apply. The original schedule remains the default.
+The existing vector NCU trace reports 17.55% math-pipe throttle, supporting this
+instruction-count experiment.
