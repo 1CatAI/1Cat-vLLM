@@ -111,7 +111,11 @@ class GGUFConfig(QuantizationConfig):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
-                return UnquantizedLinearMethod()
+                return (
+                    UnquantizedEmbeddingMethod()
+                    if isinstance(layer, ParallelLMHead)
+                    else UnquantizedLinearMethod()
+                )
             method = GGUFLinearMethod(self, self.linear_layouts.get(prefix))
             method.fallback_reason = self.fallback_reasons.get(prefix)
             return method

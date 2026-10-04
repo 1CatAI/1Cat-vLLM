@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.gguf import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 
@@ -34,3 +35,10 @@ def test_gguf_token_embedding_retains_lookup_method():
         empty_layer(VocabParallelEmbedding), "model.embed_tokens"
     )
     assert type(method) is GGUFEmbeddingMethod
+
+
+def test_unquantized_head_keeps_its_existing_method():
+    method = GGUFConfig(["lm_head"]).get_quant_method(
+        empty_layer(ParallelLMHead), "lm_head"
+    )
+    assert type(method) is UnquantizedEmbeddingMethod
