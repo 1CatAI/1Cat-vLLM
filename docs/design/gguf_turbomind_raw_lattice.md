@@ -1225,3 +1225,13 @@ this candidate avoids the global FP16 workspace pass. It is declared alongside
 the existing workspace candidates, with an N-pack alignment rejection. No
 model default or speed claim is implied before the packaged checks and complete
 M512 graph comparison.
+
+The first fused prefill build passes 52 checks, including FP32 cancellation.
+For Flash gate M512, its best complete path is 147.802 us (64 rows, split 1),
+versus 93.665 us canonical and 94.264 us for the best workspace candidate.
+Other fused tiles/splits are slower. It therefore has no speed eligibility.
+NCU reports 4,497,888 DRAM read bytes, 128 registers, 14.99% active warps,
+43.36% long-scoreboard stall and 10.42% short-scoreboard stall. Tensor-pipe
+instruction count is 7,864,320. The next experiment queues activation vectors
+in registers before independent IQ decoding, then commits the shared activation
+tile before MMA, preserving all operand bits and FP32 accumulation.

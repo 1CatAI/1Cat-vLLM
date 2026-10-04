@@ -506,14 +506,15 @@ __global__ void compact_prefill_kernel(half* out, float* partial,
     }
 #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
-      for (int index = threadIdx.x; index < TileM * 8; index += 256) {
+      uint4 pending_activation[TileM / 32]{};
+#pragma unroll
+      for (int copy = 0; copy < TileM / 32; ++copy) {
+        const int index = threadIdx.x + copy * 256;
         const int row = index / 8, octet = index % 8;
-        uint4 value{};
         if (row_begin + row < m)
-          value = *reinterpret_cast<const uint4*>(
+          pending_activation[copy] = *reinterpret_cast<const uint4*>(
               input + int64_t{row_begin + row} * k + block * 256 + chunk * 64 +
               octet * 8);
-        *reinterpret_cast<uint4*>(&activations[row][octet * 8]) = value;
       }
 #pragma unroll
       for (int octet = warp % 2; octet < 8; octet += 2) {
@@ -527,6 +528,14 @@ __global__ void compact_prefill_kernel(half* out, float* partial,
         *reinterpret_cast<uint4*>(
             &weights[decode_group * 32 + physical_col][octet * 8]) =
             *reinterpret_cast<const uint4*>(&values);
+      }
+      // SM70 software overlap: activation loads stay in registers while
+      // independent IQ packet decode fills the shared weight tile.
+#pragma unroll
+      for (int copy = 0; copy < TileM / 32; ++copy) {
+        const int index = threadIdx.x + copy * 256;
+        *reinterpret_cast<uint4*>(&activations[index / 8][(index % 8) * 8]) =
+            pending_activation[copy];
       }
       __syncthreads();
 #pragma unroll
