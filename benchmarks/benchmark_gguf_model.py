@@ -48,6 +48,8 @@ def main():
     parser.add_argument("--prefill", type=int, nargs="*", default=[8192, 32768])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--max-batch", type=int, default=8192)
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--max-seqs", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     args = parser.parse_args()
     if args.require_installed and "site-packages" not in vllm.__file__:
@@ -64,14 +66,18 @@ def main():
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     maximum_input = max([args.input_len, *args.prefill])
+    model_len = args.max_model_len or maximum_input + args.output_len + 128
+    max_seqs = args.max_seqs or max(args.widths)
+    if model_len < maximum_input + args.output_len or max_seqs < max(args.widths):
+        raise ValueError("Model limits cannot contain the requested cohort")
     config = dict(
         model=str(args.model),
         tensor_parallel_size=4,
         dtype="half",
         kv_cache_dtype="auto",
-        max_model_len=maximum_input + args.output_len + 128,
+        max_model_len=model_len,
         max_num_batched_tokens=args.max_batch,
-        max_num_seqs=max(args.widths),
+        max_num_seqs=max_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
         disable_log_stats=False,
