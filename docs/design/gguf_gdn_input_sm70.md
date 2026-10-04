@@ -174,3 +174,42 @@ partition reduction produces relative L2 differences of 0.000020029 and
 difference, with the same weight operands and FP32 accumulation. Both b/a
 outputs remain bitwise equal to the old implementation and to the FP64 dense
 reference rounded to F16 for this input. Graph replay remains stable.
+
+## Exact HFMA unpack and N32 K64 ownership
+
+The next candidate uses the shared exact HFMA2 unpack helper and lossless K64
+records. The helper fuses biased-byte subtraction and the small-scale multiply,
+while retaining the original separate d and unchanged F32 decode. Each CTA
+owns one N32 output tile with sixteen K warps, so K5120 is divided into five
+K64 records per warp. The quantized grid grows from 64 to 128 CTAs; the same
+96 b/a CTAs bring the combined launch to 224. The original sixteen-partition
+FP32 reduction order is restored. No prefetch or register pipeline is added.
+
+Its K64 loop contains 272 static instructions and 64 HMMA instructions,
+or **68 instructions per K16**, with 52 registers, no spills, and the same
+32 KiB shared union. CPU inverse reconstruction covers every original byte
+and all 80 K64 records per output tile.
+
+A matched operator screen on another V100-SXM2-32GB host records stable
+1290 MHz SM and 877 MHz memory clocks before and after every point. All
+actual QKVZ F32/F16 weight bits match the official reader through both the
+new unpack oracle and the K64 record reader. QKV, Z, b, and a outputs are
+bitwise equal to the original 224-CTA implementation. Official-reference
+projection errors therefore remain unchanged.
+
+| Projection | Median microseconds | Source GB/s |
+| --- | ---: | ---: |
+| Original mixed 224 CTAs, first control | 41.984 | 220.49 |
+| HFMA K64 mixed 224 CTAs, first candidate | 37.888 | 244.32 |
+| HFMA K64 mixed 224 CTAs, second candidate | 37.888 | 244.32 |
+| Original mixed 224 CTAs, second control | 43.008 | 215.24 |
+| Previous K128 mixed 160 CTAs | 38.912 | 237.89 |
+| Native NVFP4 QKVZ | 27.648 | 426.67 |
+| Native NVFP4 QKVZ plus independent dense b/a | 34.816 | 345.88 |
+
+The local saving is 4.096-5.120 microseconds against the original mixed
+operator, and 1.024 microseconds against the previous fixed-index candidate.
+Only eight same-type GDN layers are admitted, yielding a projection of
+0.032768-0.040960 milliseconds per round against the original operator.
+The 20-microsecond target remains unmet. The route stays research-only, with
+no model changes, endpoint benchmarks, or traces.
