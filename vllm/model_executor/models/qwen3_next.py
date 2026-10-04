@@ -572,6 +572,7 @@ class Qwen3NextAttention(nn.Module):
             and getattr(self.rotary_emb, "mrope_interleaved", False)
             and getattr(self.rotary_emb, "mrope_section", None) == [11, 11, 10]
             and self.rotary_emb.cos_sin_cache.dtype == torch.float16
+            and not self.attn.calculate_kv_scales
             and self.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
             and self.attn.kv_sharing_target_layer_name is None
         )
