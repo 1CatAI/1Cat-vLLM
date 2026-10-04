@@ -23,6 +23,8 @@ def load_operator(path: Path):
     if hashlib.sha256(library.read_bytes()).hexdigest() != manifest["library_sha256"]:
         raise ValueError("Library digest differs from its build manifest")
     spec = importlib.util.spec_from_file_location(manifest["module_name"], library)
+    if spec is None or spec.loader is None:
+        raise ValueError("Cannot load the benchmark library")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     decoded = module.decoder_check()
