@@ -392,12 +392,16 @@ def test_compact_blas_cancellation_retains_fp32_partials(kind):
     torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
     x = torch.full((512, k), 128.0, device="cuda", dtype=torch.float16)
     x[:, k // 2 :] = -128.0
-    out = torch.empty((512, n), device="cuda", dtype=torch.float16)
     for natural in (False, True):
         scratch = torch.empty(
             (n, k) if natural else (k, n), device="cuda", dtype=torch.float16
         )
-        for algorithm in (99, 102):
+        for algorithm, dtype in [
+            (algo, dtype)
+            for algo in (99, 102)
+            for dtype in (torch.float16, torch.float32)
+        ]:
+            out = torch.empty((512, n), device="cuda", dtype=dtype)
             run = partial(
                 torch.ops._C.gguf_lattice_compact_blas_sm70_out,
                 out,
@@ -420,3 +424,48 @@ def test_compact_blas_cancellation_retains_fp32_partials(kind):
             x.neg_()
             graph.replay()
             torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_compact_blas_fp32_output_and_final_cast_graph(kind):
+    data = packed(kind, n=37, k=2560)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty((data.nbytes + 7) // 8 * 8, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, 2560)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn((512, 2560), device="cuda", dtype=torch.float16)
+    result = torch.empty((512, 37), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(result, dtype=torch.float16)
+    for natural in (False, True):
+        scratch = torch.empty(
+            reference.shape if natural else reference.T.shape,
+            device="cuda",
+            dtype=torch.float16,
+        )
+
+        def run(scratch=scratch, natural=natural):
+            torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+                result,
+                x,
+                weight,
+                kind,
+                scratch,
+                natural,
+            )
+            out.copy_(result)
+
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        expected = x.float() @ reference.float().T
+        torch.testing.assert_close(result, expected, rtol=5e-5, atol=0.001)
+        torch.testing.assert_close(out, result.half(), rtol=0, atol=0)

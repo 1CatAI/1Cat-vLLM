@@ -444,6 +444,43 @@ def main():
                             ),
                         )
                     )
+                fp32_result = torch.empty((m, n), device="cuda", dtype=torch.float32)
+
+                def fp32_blas(
+                    output,
+                    activation,
+                    packets,
+                    source_type,
+                    workspace,
+                    natural,
+                    temporary,
+                ):
+                    torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+                        temporary,
+                        activation,
+                        packets,
+                        source_type,
+                        workspace,
+                        natural,
+                    )
+                    output.copy_(temporary)
+
+                for natural, scratch in ((False, raw_scratch), (True, natural_scratch)):
+                    candidates.append(
+                        (
+                            "compact_dequant_cublas_f32" + ("_tn" if natural else ""),
+                            partial(
+                                fp32_blas,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                scratch,
+                                natural,
+                                fp32_result,
+                            ),
+                        )
+                    )
         old()
         old_error = errors(out, expected)
 

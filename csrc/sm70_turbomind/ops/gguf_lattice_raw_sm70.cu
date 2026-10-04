@@ -638,7 +638,8 @@ void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
   const auto status = cublasGemmEx(
       handle, natural_layout ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
       &alpha, scratch.data_ptr(), CUDA_R_16F, natural_layout ? k : n,
-      input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(), CUDA_R_16F, n,
+      input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
+      out.scalar_type() == torch::kFloat32 ? CUDA_R_32F : CUDA_R_16F, n,
       CUBLAS_COMPUTE_32F, static_cast<cublasGemmAlgo_t>(algorithm));
   const auto restore = cublasSetMathMode(handle, saved);
   TORCH_CUDABLAS_CHECK(status);
@@ -815,14 +816,16 @@ void validate_compact(torch::Tensor weight, int type, int64_t n, int64_t k) {
               "Compact GGUF requires SM70");
 }
 void validate_compact_io(torch::Tensor out, torch::Tensor input,
-                         torch::Tensor weight) {
+                         torch::Tensor weight, bool allow_fp32_output = false) {
   TORCH_CHECK(
       input.device() == weight.device() && out.device() == weight.device() &&
           input.scalar_type() == torch::kFloat16 &&
-          out.scalar_type() == torch::kFloat16 && input.dim() == 2 &&
-          out.dim() == 2 && input.size(0) == out.size(0) && input.size(0) > 0 &&
-          input.is_contiguous() && out.is_contiguous(),
-      "Compact GGUF requires contiguous FP16 activations/output");
+          (out.scalar_type() == torch::kFloat16 ||
+           (allow_fp32_output && out.scalar_type() == torch::kFloat32)) &&
+          input.dim() == 2 && out.dim() == 2 && input.size(0) == out.size(0) &&
+          input.size(0) > 0 && input.is_contiguous() && out.is_contiguous(),
+      "Compact GGUF requires contiguous FP16 activations and admitted output "
+      "dtype");
 }
 }  // namespace
 
@@ -1043,7 +1046,7 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(
       algorithm == 99 || algorithm == 102,
       "Compact GGUF BLAS accepts only default or calibrated algorithm 2");
-  validate_compact_io(out, input, weight);
+  validate_compact_io(out, input, weight, true);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
   validate_compact(weight, source_type, n, k);
