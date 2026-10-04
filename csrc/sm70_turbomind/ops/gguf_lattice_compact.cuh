@@ -59,7 +59,7 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
   }
 
   struct PacketWindow {
-    uint64_t loaded;
+    uint32_t loaded;
     int bias;
   };
 
@@ -71,26 +71,25 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     const int lane = threadIdx.x % 32;
     if constexpr (FullWidth) {
       const auto* words =
-          reinterpret_cast<const uint64_t*>(tile) + octet * (kPacketBits / 2);
-      return {lane < kPacketBits / 2 ? words[lane] : 0, 0};
+          reinterpret_cast<const uint32_t*>(tile) + octet * kPacketBits;
+      return {lane < kPacketBits ? words[lane] : 0, 0};
     } else {
       const auto address = reinterpret_cast<uintptr_t>(tile);
       const int64_t bit =
-          (address & 7) * 8 + int64_t{octet} * width * kPacketBits;
+          (address & 3) * 8 + int64_t{octet} * width * kPacketBits;
       const auto* words =
-          reinterpret_cast<const uint64_t*>(address & ~uintptr_t{7});
-      const int bias = bit % 64, count = (bias + width * kPacketBits + 63) / 64;
-      return {lane < count ? words[bit / 64 + lane] : 0, bias};
+          reinterpret_cast<const uint32_t*>(address & ~uintptr_t{3});
+      const int bias = bit % 32, count = (bias + width * kPacketBits + 31) / 32;
+      return {lane < count ? words[bit / 32 + lane] : 0, bias};
     }
   }
 
   __device__ static uint32_t extract(PacketWindow window, int col) {
     const int bit = window.bias + col * kPacketBits;
-    const int source = bit / 64, shift = bit % 64;
-    const uint64_t low = __shfl_sync(0xffffffffU, window.loaded, source);
-    const uint64_t high = __shfl_sync(0xffffffffU, window.loaded, source + 1);
-    const uint64_t value =
-        shift ? (low >> shift) | (high << (64 - shift)) : low;
+    const int source = bit / 32, shift = bit % 32;
+    const uint32_t low = __shfl_sync(0xffffffffU, window.loaded, source);
+    const uint32_t high = __shfl_sync(0xffffffffU, window.loaded, source + 1);
+    const uint32_t value = __funnelshift_r(low, high, shift);
     return value & ((uint32_t{1} << kPacketBits) - 1);
   }
 
