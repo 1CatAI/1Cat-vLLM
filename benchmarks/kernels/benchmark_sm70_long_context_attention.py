@@ -133,8 +133,9 @@ def main():
                 make_layer(batch, length, args.page_size) for _ in range(args.layers)
             ]
             buffers = []
-            for _ in loaded:
-                shape = (80, 8, 6) if batch == 1 else (batch, 80, 8, 6)
+            for _, manifest in loaded:
+                splits = manifest["splits"]
+                shape = (splits, 8, 6) if batch == 1 else (batch, splits, 8, 6)
                 buffers.append(
                     (
                         torch.empty_like(layers[0][0]),
@@ -192,6 +193,10 @@ def main():
                         layer[1].numel() * 2 for layer in layers
                     ),
                     "per_arm_scratch_bytes": sum(t.nbytes for t in buffers[0][1:]),
+                    "scratch_bytes_by_variant": {
+                        manifest["variant"]: sum(t.nbytes for t in buffer[1:])
+                        for (_, manifest), buffer in zip(loaded, buffers)
+                    },
                     "one_pass_logical_kv_bytes_per_layer": kv_bytes,
                     "ideal_kv_us_at_800_GB_s": kv_bytes / 800e3,
                     "timings": [

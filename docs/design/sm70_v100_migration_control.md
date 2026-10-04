@@ -49029,3 +49029,53 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+### Qwen3.8 long-context attention screening, 2026-10-05
+
+The current E4M3 q8 verifier already uses single-pass online softmax, 80 KV
+splits, and Volta tensor cores for QK and PV. Do not repeat a two-pass-to-online
+conversion against this source. An isolated 256K kernel read 134.24 MB from
+DRAM, matching one K/V scan. Its measured DRAM rate was 190 GB/s; 128 registers
+per thread and 72,192 bytes of dynamic shared memory plus 512 static bytes
+limited it to one CTA per SM and 25% occupancy. Barrier stalls accounted for
+23.5% of sampled warp states. These counter samples used unfixed clocks and
+are not end-to-end timing.
+
+Captured sixteen-layer KV working sets measured approximately 674 us/layer at
+C1 256K and 393 us/layer at C4 32K, including split reduction. The numerical
+oracle uses FP64 QK, softmax, and PV on the same quantized physical KV layout.
+Direct E4M3 bit decoding was bitwise identical for all encoding patterns and
+attention outputs, but about 6% slower. Q swizzling gave no improvement, and
+narrower KV loads regressed by about 6%. A global-Q prototype with smaller
+shared storage and 160 splits regressed C1 256K to 1,434 us/layer. None of these
+variants is admitted. The next prototype retains resident Q and reuses dead
+K/V and score/probability storage; register and barrier effects still require
+GPU validation.
+
+The new machine baseline uses four V100-SXM2-16GB GPUs with NV2 links between
+every pair, one NUMA node, 300 W limits, Torch 2.10.0+cu128, and CUDA 12.8.
+The model is QUASAR Qwen3.8-27B NVFP4 with DFlash2 draft7, TP4, target E4M3 KV,
+and FP16 draft KV. Max length is 262,144, prefill budget 8,192, and max requests
+four. At memory utilization 0.90 the startup check rejected 256K: 2.57 GiB KV
+was required but only 2.32 GiB available. Utilization 0.92 retains graph memory
+estimation and starts successfully, with about 267,721 KV tokens. C4 128K
+therefore needs a separate capacity check; do not substitute a three-request
+window for C4.
+
+Initial complete GPU-round means are 14.855 ms at 1K, 15.484 ms at 8K,
+16.445 ms at 32K, and 17.815 ms at 64K. These are the maximum TP-rank intervals
+from target graph start through draft proposal, with ten rounds trimmed at
+both ends. Each length uses eight prompts, 600 output tokens, temperature
+1.0, top-p 0.95, top-k 20, and fixed per-prompt seeds; EOS is ignored only in
+the fixed-output timing fixture. Three separate natural completions stopped
+normally. Mean emitted tokens per round are 3.591, 3.680, 3.613, and 3.521;
+their prompt-level 95% confidence intervals overlap. The 128K/256K curve,
+C4 evidence, teacher-forcing logits, and needle checks remain pending.
+
+The draft specialization keeps H8/Hkv2/D128, q8, and the inclusive noncausal
+window `(2047,2047)`. CPU partition enumeration covers both sides of the 2048
+boundary and 128K/256K endpoints. This does not prove the production metadata
+contract; runtime query positions, lengths, and mask output must be checked
+before promotion. Its proposed FP32 split workspace is about 1.26 MiB/request.
+The target 160-split workspace adds 3.78 MiB at C1 or 15.12 MiB at C4 per
+workspace; captured-model retention must be included in the memory budget.
