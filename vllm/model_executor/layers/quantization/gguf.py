@@ -15,6 +15,10 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.gguf import (
+    GGUFOperatorCapability,
+    decoder_family,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -44,6 +48,7 @@ from vllm.model_executor.layers.quantization.gguf_native import (
     pad_weight_tail,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -119,6 +124,8 @@ class GGUFConfig(QuantizationConfig):
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
                 return UnquantizedEmbeddingMethod()
+            if isinstance(layer, ParallelLMHead):
+                return GGUFLMHeadMethod(self)
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
             if self.native_expert_storage:
@@ -632,7 +639,10 @@ class GGUFLinearMethod(LinearMethodBase):
         if (
             ready
             and layer.qweight.device.type == "cuda"
-            and not isinstance(self, GGUFEmbeddingMethod)
+            and (
+                not isinstance(self, GGUFEmbeddingMethod)
+                or getattr(self, "canonical_lm_head", False)
+            )
         ):
             qweight = layer.qweight
             from vllm.model_executor.layers.quantization.gguf_turbomind import (
@@ -972,6 +982,128 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
             dtype=self.params_dtype,
             native_enabled=self.native_enabled,
         )
+
+
+def _gguf_lm_head_projection(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    k_ld: int,
+    q_ld: int,
+    minimum_m: int,
+    maximum_m: int,
+    native_enabled: bool,
+    prefill_min_m: int,
+) -> torch.Tensor:
+    rows = x.numel() // x.shape[-1]
+    if minimum_m <= rows <= maximum_m:
+        return torch.ops.vllm.prepared_gguf_projection(
+            x,
+            codes,
+            stats,
+            None,
+            0,
+            4,
+            32,
+            k_ld,
+            q_ld,
+            raw.shape[0],
+            raw.shape[0],
+            [],
+            [],
+        )
+    return fused_mul_mat_gguf(
+        x, raw, int(WeightType.Q4_K), native_enabled, prefill_min_m
+    )
+
+
+def _gguf_lm_head_projection_fake(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    k_ld: int,
+    q_ld: int,
+    minimum_m: int,
+    maximum_m: int,
+    native_enabled: bool,
+    prefill_min_m: int,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], raw.shape[0]), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="gguf_lm_head_projection",
+    op_func=_gguf_lm_head_projection,
+    fake_impl=_gguf_lm_head_projection_fake,
+)
+
+
+class GGUFLMHeadMethod(GGUFEmbeddingMethod):
+    """Vocabulary projection policy with separate embedding storage semantics."""
+
+    def process_weights_after_loading(self, layer):
+        weight_type = layer.qweight_type.weight_type
+        raw = layer.qweight.detach()
+        reason = None
+        if not self.native_enabled:
+            reason = "disabled_by_kernel_config"
+        elif self.params_dtype != torch.float16:
+            reason = "requires_fp16_activations"
+        elif raw.device.type != "cuda" or not current_platform.is_device_capability(70):
+            reason = "requires_sm70"
+        elif weight_type != int(WeightType.Q4_K) or tuple(raw.shape) != (62080, 2880):
+            reason = "lm_head_shape_or_format_has_no_calibration"
+        self.canonical_lm_head = reason is None
+        self.lm_head_capability = GGUFOperatorCapability(
+            decoder_family(weight_type),
+            quant_type_name(weight_type),
+            "gguf_lm_head_projection",
+            True,
+            min_m=2,
+            max_m=16,
+            reason=reason,
+        )
+        super().process_weights_after_loading(layer)
+        if self.canonical_lm_head and self.canonical_projections:
+            # Keep the faster M1 route and unmeasured M intervals. This raw
+            # parameter is separate from the canonical streams and embedding.
+            layer.register_parameter(
+                "gguf_lm_head_raw", Parameter(pad_weight_tail(raw, weight_type), False)
+            )
+            self.native_admission["lm_head"] = {
+                "operator": self.lm_head_capability.operator,
+                "min_m": 2,
+                "max_m": 16,
+                "reason": None,
+                "raw_fallback": "outside_measured_m_band",
+            }
+        else:
+            self.native_admission["lm_head"] = {
+                "operator": self.lm_head_capability.operator,
+                "min_m": 2,
+                "max_m": 16,
+                "reason": reason or "canonical_kernel_unavailable",
+            }
+
+    def apply(self, layer, x, bias=None):
+        if hasattr(layer, "gguf_lm_head_raw"):
+            projection = layer.gguf_tm_projections[0]
+            output = torch.ops.vllm.gguf_lm_head_projection(
+                x,
+                layer.gguf_lm_head_raw,
+                projection.codes,
+                projection.stats,
+                projection.gguf_tm_k_ld,
+                projection.gguf_tm_q_ld,
+                self.lm_head_capability.min_m,
+                self.lm_head_capability.max_m,
+                self.native_enabled,
+                self.prefill_min_m,
+            )
+            return output if bias is None else output + bias
+        return super().apply(layer, x, bias)
 
 
 class GGUFUninitializedParameter(UninitializedParameter):
