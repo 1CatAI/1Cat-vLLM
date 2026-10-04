@@ -974,3 +974,38 @@ weight bytes, original small scales and FP32 accumulation. Weight staging
 and the seven-CTA register-budget variant remain separate controls. Changed
 input/split-K/tail checks and two 27B dense M16 comparisons must pass before
 this candidate is selected. Numerical and performance validation is pending.
+
+## Contiguous activation staging result
+
+Source `11d6db5e68` passes all 28 checks (7.77 s), including activation
+staging on both formats, N tails, split1/split3 and changed-input full graphs.
+The initial run waited for the shared GPU lock and exited with resource
+status 75 twice; those attempts did not execute GPU tests. The completed
+run holds the common and four per-device locks throughout verification.
+
+| 27B M16 projection | Canonical µs | Best prior path µs | Activation-prefetch winner µs | Split |
+| --- | ---: | ---: | ---: | ---: |
+| Gate | 39.528 | 46.990 | 43.323 | 5 |
+| Down | 37.952 | 43.038 | 42.049 | 2 |
+
+These are complete unprofiled full-graph paths at the same TP4 shapes.
+Activation staging reduces gate time by 7.8% and down by 2.3% relative to
+the same-run prior candidates, but retains gaps of 9.6% and 10.8% versus
+canonical. It does not satisfy the full speed gate. Plain activation
+staging without register prefetch is substantially slower; the two changes
+are not selected independently. Other shapes are not promoted from these
+two results. Matched split3 and winning split5 NCU captures will distinguish
+request reduction from synchronization/occupancy effects.
+
+The IQ3_S complete-tile prefetch variant uses 66 registers/thread, no stack
+and 18,688 bytes of shared memory. The prior prefetch variant retains
+70 registers, no stack and 10,240 shared bytes; unused activation storage
+is eliminated when staging is disabled.
+
+Installed core SHA256:
+`ba8209ae4efe61ea74ff9d6a93fd8856380b919b6ffbc9f27ecfe9706c384dec`.
+Whole-wheel SHA256:
+`7ac4b557bfb0578097d78fbf3b0871b2582a5314a1017365760134ea0d280a88`.
+The package/Python source versions agree and all 210 installed dependencies
+are compatible. Root profiling disables Python bytecode writes to avoid
+creating root-owned cache directories in the task runtime.
