@@ -472,6 +472,109 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
       out[i] = 0;
 }
 
+// Decode one compressed tile for all row groups in a CTA. Temporary FP16
+// fragments match official FP32 dequantization followed by the final cast.
+template <int Type, int TileM>
+__global__ void compact_prefill_kernel(half* out, float* partial,
+                                       const half* input, const uint8_t* weight,
+                                       int m, int n, int k, int splits) {
+  using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
+  using MMA = turbomind::gemm::SM70_MMA_884;
+  constexpr int WarpRows = TileM / 4;
+  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
+  __shared__ __align__(16) half activations[TileM][72];
+  __shared__ __align__(16) half weights[128][72];
+  Decode::initialize(grid);
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int col_begin = blockIdx.x * 128, row_begin = blockIdx.y * TileM;
+  const int decode_group = warp / 2, first_col = col_begin + decode_group * 32;
+  const int physical_col =
+      (lane & 3) | ((lane & 4) << 2) | ((lane & 8) >> 1) | ((lane & 16) >> 1);
+  const int row_group = warp / 2, col_group = warp % 2;
+  const int arow = lane / 16 * 4 + lane % 4;
+  typename MMA::FragC accum[WarpRows / 8][2]{};
+  const int blocks = k / 256;
+  const int begin = blocks * blockIdx.z / splits;
+  const int end = blocks * (blockIdx.z + 1) / splits;
+  for (int block = begin; block < end; ++block) {
+    const uint8_t* tile = nullptr;
+    typename Decode::Parameters parameters{};
+    if (first_col < n) {
+      tile = weight + int64_t{first_col} * blocks * Decode::kBlockBytes +
+             int64_t{block} * 32 * Decode::kBlockBytes;
+      parameters = Decode::template parameters<true>(tile, 32, lane);
+    }
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+      for (int index = threadIdx.x; index < TileM * 8; index += 256) {
+        const int row = index / 8, octet = index % 8;
+        uint4 value{};
+        if (row_begin + row < m)
+          value = *reinterpret_cast<const uint4*>(
+              input + int64_t{row_begin + row} * k + block * 256 + chunk * 64 +
+              octet * 8);
+        *reinterpret_cast<uint4*>(&activations[row][octet * 8]) = value;
+      }
+#pragma unroll
+      for (int octet = warp % 2; octet < 8; octet += 2) {
+        __align__(16) turbomind::Array<half, 8> values{};
+        if (first_col < n) {
+          const uint32_t packet =
+              Decode::template packet<true>(tile, 32, chunk * 8 + octet, lane);
+          values = Decode::template fragment<half>(parameters, packet,
+                                                   chunk * 8 + octet, grid);
+        }
+        *reinterpret_cast<uint4*>(
+            &weights[decode_group * 32 + physical_col][octet * 8]) =
+            *reinterpret_cast<const uint4*>(&values);
+      }
+      __syncthreads();
+#pragma unroll
+      for (int step = 0; step < 64; step += 8) {
+        typename MMA::FragA a[WarpRows / 8];
+        typename MMA::FragB b[2];
+#pragma unroll
+        for (int i = 0; i < WarpRows / 8; ++i)
+          *reinterpret_cast<uint4*>(&a[i]) = *reinterpret_cast<const uint4*>(
+              &activations[row_group * WarpRows + i * 8 + arow][step]);
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+          *reinterpret_cast<uint4*>(&b[j]) = *reinterpret_cast<const uint4*>(
+              &weights[(col_group * 2 + j) * 32 + lane][step]);
+#pragma unroll
+        for (int i = 0; i < WarpRows / 8; ++i)
+#pragma unroll
+          for (int j = 0; j < 2; ++j)
+            MMA::fma(accum[i][j], a[i], b[j], accum[i][j]);
+      }
+      __syncthreads();
+    }
+  }
+  const auto origin = MMA::thread_offset_C();
+  constexpr auto offsets = MMA::static_offset_C();
+#pragma unroll
+  for (int i = 0; i < WarpRows / 8; ++i)
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+      for (int pair = 0; pair < 4; ++pair)
+#pragma unroll
+        for (int item = 0; item < 2; ++item) {
+          const int row = row_begin + row_group * WarpRows + i * 8 + origin.x +
+                          offsets[pair].x;
+          const int col = col_begin + col_group * 64 + j * 32 + origin.y +
+                          offsets[pair].y + item;
+          if (row < m && col < n) {
+            const int64_t index = int64_t{row} * n + col;
+            const float value = accum[i][j][pair * 2 + item];
+            if (splits == 1)
+              out[index] = __float2half_rn(value);
+            else
+              partial[int64_t{blockIdx.z} * m * n + index] = value;
+          }
+        }
+}
+
 template <int Type, class Output, bool Transpose, bool FullWidth = false,
           bool PackedOutput = false>
 __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
@@ -1222,4 +1325,52 @@ void gguf_lattice_compact_tm_f16_sm70_out(
                                    weight.data_ptr<uint8_t>(), n, k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   gguf_workspace_f16_gemm_sm70_out(out, input, offsets, weight_ptrs);
+}
+
+void gguf_lattice_compact_prefill_sm70_out(torch::Tensor out,
+                                           torch::Tensor input,
+                                           torch::Tensor weight,
+                                           int64_t source_type,
+                                           torch::Tensor partial,
+                                           int64_t splits, int64_t row_tile) {
+  validate_compact_io(out, input, weight);
+  const c10::cuda::CUDAGuard guard(weight.device());
+  const int m = input.size(0), n = out.size(1), k = input.size(1);
+  validate_compact(weight, source_type, n, k);
+  TORCH_CHECK(m >= 512 && n % 32 == 0 && (row_tile == 64 || row_tile == 128) &&
+                  splits >= 1 && splits <= k / 256 && int64_t{m} * n <= INT_MAX,
+              "Compact prefill requires aligned output rows and valid split-K");
+  if (splits > 1)
+    TORCH_CHECK(partial.device() == weight.device() &&
+                    partial.scalar_type() == torch::kFloat32 &&
+                    partial.is_contiguous() &&
+                    partial.numel() >= splits * int64_t{m} * n,
+                "Compact prefill requires FP32 partial storage");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid((n + 127) / 128, (m + row_tile - 1) / row_tile, splits);
+#define COMPACT_PREFILL(TYPE, ROWS)                             \
+  compact_prefill_kernel<TYPE, ROWS><<<grid, 256, 0, stream>>>( \
+      reinterpret_cast<half*>(out.data_ptr()),                  \
+      splits > 1 ? partial.data_ptr<float>() : nullptr,         \
+      reinterpret_cast<const half*>(input.data_ptr()),          \
+      weight.data_ptr<uint8_t>(), m, n, k, splits)
+  if (source_type == 21) {
+    if (row_tile == 64) {
+      COMPACT_PREFILL(21, 64);
+    } else {
+      COMPACT_PREFILL(21, 128);
+    }
+  } else {
+    if (row_tile == 64) {
+      COMPACT_PREFILL(22, 64);
+    } else {
+      COMPACT_PREFILL(22, 128);
+    }
+  }
+#undef COMPACT_PREFILL
+  if (splits > 1)
+    reduce_vec<<<(m * n + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),
+        m * n, splits);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

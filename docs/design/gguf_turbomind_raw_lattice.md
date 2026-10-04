@@ -1214,3 +1214,14 @@ M1 to 36.131/34.335 us. Complete FP32-scale factoring remains faster at
 32.814/30.931 us in that run. The expanded shared-codebook implementation and
 its argument are reverted; numerical precision and persistent byte budgets
 were unchanged throughout the experiment.
+
+A second prefill candidate performs original-packet dequantization in shared
+memory and reuses the decoded tile for 64 or 128 activation rows in a CTA.
+Eight warps cooperatively decode N=128/K=64 slices, then run Volta mma884 with
+FP32 accumulation. The final FP16 weights retain the exact official conversion
+contract. Split-K stores and reductions use FP32, including cancellation when
+partials exceed the FP16 range. Original persistent storage is unchanged, and
+this candidate avoids the global FP16 workspace pass. It is declared alongside
+the existing workspace candidates, with an N-pack alignment rejection. No
+model default or speed claim is implied before the packaged checks and complete
+M512 graph comparison.
