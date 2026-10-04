@@ -202,19 +202,13 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
         out = torch.empty((m, n), device="cuda", dtype=torch.float16)
         scratch = torch.empty(reference.T.shape, dtype=torch.float16, device="cuda")
         plans = (
-            [
-                (split, variant, False, False)
-                for split in (1, 3)
-                for variant in (False, True)
-            ]
+            [(split, variant, False) for split in (1, 3) for variant in (False, True)]
             if m <= 64
-            else [(1, False, False, False)]
+            else [(1, False, False)]
         )
         if 1 < m <= 64 and n % 32 == 0:
-            plans += [(split, True, True, False) for split in (1, 3)]
-        if 1 < m <= 64:
-            plans += [(split, True, False, True) for split in (1, 3)]
-        for split, variant, staged, columns in plans:
+            plans += [(split, True, True) for split in (1, 3)]
+        for split, variant, staged in plans:
             partials = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
             if m == 512:
                 run = partial(
@@ -240,7 +234,7 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
                     partials,
                     split,
                     variant,
-                    *([staged, columns] if m != 1 else []),
+                    *([staged] if m != 1 else []),
                 )
             for _ in range(3):
                 run()
