@@ -841,7 +841,8 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
                                        torch::Tensor partial, int64_t splits,
-                                       bool prefetch, bool staged) {
+                                       bool prefetch, bool staged,
+                                       int64_t row_tile) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -854,14 +855,18 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                     partial.is_contiguous() &&
                     partial.numel() >= splits * m * n,
                 "Compact MMA requires FP32 partial storage");
+  TORCH_CHECK(
+      row_tile == 0 || row_tile == 8 || row_tile == 16 || row_tile == 32,
+      "Compact MMA row tile must be auto, 8, 16, or 32");
+  const int mt = row_tile ? row_tile : m <= 8 ? 8 : m <= 16 ? 16 : 32;
   TORCH_CHECK(!staged || n % 32 == 0,
               "Compact shared staging requires complete N32 tiles");
   const auto stream = at::cuda::getCurrentCUDAStream();
 #define COMPACT_MMA(TYPE, FULL, PREFETCH, STAGED)           \
-  if (m <= 8)                                               \
+  if (mt == 8)                                              \
     launch_mma<TYPE, 32, 8, true, FULL, PREFETCH, STAGED>(  \
         out, input, weight, partial, splits, stream);       \
-  else if (m <= 16)                                         \
+  else if (mt == 16)                                        \
     launch_mma<TYPE, 32, 16, true, FULL, PREFETCH, STAGED>( \
         out, input, weight, partial, splits, stream);       \
   else                                                      \

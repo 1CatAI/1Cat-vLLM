@@ -949,7 +949,8 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
                                        torch::Tensor partial, int64_t splits,
-                                       bool prefetch, bool staged);
+                                       bool prefetch, bool staged,
+                                       int64_t row_tile);
 void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,

@@ -473,3 +473,66 @@ for all byte values b. After unpacking, original scale reconstruction and
 weight multiplication remain FP32. No coefficient or weight rounding is
 introduced before the existing MMA/workspace FP16 boundary. Exhaustive
 codebook-entry/sign tests and the official FP32 oracle gate this change.
+
+## Exact paired-grid decoder measurements
+
+Source `2431c8cd3b`, core SHA256
+`0bf22ad1ff3ccb02ca2abf30ffac336b088a807e321f55b90c54679767e96339`,
+whole-wheel SHA256
+`19ffe9b8fdeee54403d02b6f612fdda3bf8b2686014b8ff4057a41dcd0b1eecf`.
+All 22 checks pass (5.61 s), including exhaustive IQ3_S/IQ2_S codebook indices
+with both sign polarities. FP32 dequantization remains exact. SASS confirms
+FMUL 130→66, I2F 66→2 and elimination of 64 FSEL instructions in the IQ3_S
+staged M16 loop. There are no local-memory spills. Matched full-graph timing
+covers M1/5/8/16/512; CTA targets remain 4/8/16.
+
+| Projection | M | Canonical µs | Best original/equal-byte µs | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 1 | 33.836 | 36.883 | compact_row_vec_split1 |
+| 27B gate | 5 | 33.081 | 34.069 | compact_mma_prefetch_split10 |
+| 27B gate | 8 | 34.843 | 36.619 | compact_mma_prefetch_split3 |
+| 27B gate | 16 | 42.455 | 51.898 | compact_mma_staged_split3 |
+| 27B gate | 512 | 366.732 | 370.124 | compact_dequant_cublas |
+| 27B down | 1 | 30.812 | 34.852 | vec_split1 |
+| 27B down | 5 | 31.793 | 32.854 | compact_mma_prefetch_split4 |
+| 27B down | 8 | 31.944 | 33.306 | compact_mma_prefetch_split4 |
+| 27B down | 16 | 37.942 | 50.806 | compact_mma_staged_split2 |
+| 27B down | 512 | 340.309 | 342.554 | compact_dequant_cublas |
+| IQ3_S expert | 1 | 17.021 | 6.946 | vec_split8 |
+| IQ3_S expert | 5 | 19.389 | 7.686 | compact_mma_staged_split10 |
+| IQ3_S expert | 8 | 17.575 | 7.729 | compact_mma_staged_split10 |
+| IQ3_S expert | 16 | 17.301 | 8.796 | compact_mma_staged_split10 |
+| IQ3_S expert | 512 | 68.691 | 27.632 | compact_dequant_cublas |
+| IQ2_S expert | 1 | 18.302 | 9.524 | vec_split8 |
+| IQ2_S expert | 5 | 19.173 | 9.844 | compact_mma_staged_split10 |
+| IQ2_S expert | 8 | 19.234 | 9.893 | compact_mma_staged_split10 |
+| IQ2_S expert | 16 | 18.932 | 11.188 | compact_mma_staged_split10 |
+| IQ2_S expert | 512 | 64.294 | 30.379 | compact_dequant_cublas |
+| Flash gate | 1 | 17.760 | 10.773 | vec_split1 |
+| Flash gate | 5 | 18.354 | 10.925 | compact_mma_prefetch_split10 |
+| Flash gate | 8 | 18.478 | 11.008 | compact_mma_prefetch_split10 |
+| Flash gate | 16 | 21.281 | 14.056 | compact_mma_prefetch_split10 |
+| Flash gate | 512 | 90.025 | 126.685 | compact_dequant_cublas |
+| Flash output | 1 | 15.237 | 9.127 | vec_split1 |
+| Flash output | 5 | 15.695 | 10.874 | compact_mma_prefetch_split6 |
+| Flash output | 8 | 15.767 | 10.931 | compact_mma_prefetch_split6 |
+| Flash output | 16 | 17.778 | 13.618 | compact_mma_prefetch_split6 |
+| Flash output | 512 | 81.793 | 87.810 | compact_dequant_cublas |
+
+Dense 27B M5/M8 is within about 3–5% of canonical in this run, but M1/M16
+still loses and Flash dense prefill gaps remain. These data do not justify
+removing canonical model storage or claiming a model step speedup.
+
+The column-owned warp experiment (`1763f30013`) passes all 22 checks in
+5.58 s but gives no dense improvement. Relative to existing compact
+candidates it loses about 4–21% on the individual experts. Dense Flash
+changes are within about 2%. This candidate is reverted; its measurements
+are retained as a rejected layout/scheduling choice.
+
+The next narrow experiment selects an eight-row MMA tile at M16. This uses
+already compiled TurboMind m8n8k4 variants, doubles M-direction CTA coverage
+and reduces per-thread accumulator registers. Split-K still partitions
+whole source blocks and computes FP32 partials. Repeated weight requests
+from neighboring M tiles must be distinguished from physical DRAM reads;
+new counter collection is required if this candidate wins. Numerical and
+speed gates remain pending, with the original automatic row tile retained.

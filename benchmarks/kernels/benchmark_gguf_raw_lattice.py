@@ -59,6 +59,13 @@ def main():
         default=[4],
         help="Target CTA count per SM for compact MMA split-K candidates",
     )
+    p.add_argument(
+        "--mma-row-tiles",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Compact MMA row tiles: 0 selects automatically",
+    )
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--profile", choices=("canonical", "raw"))
     p.add_argument(
@@ -67,6 +74,8 @@ def main():
     a = p.parse_args()
     if any(target < 1 for target in a.mma_cta_per_sm):
         p.error("--mma-cta-per-sm values must be positive")
+    if any(tile not in (0, 8, 16, 32) for tile in a.mma_row_tiles):
+        p.error("--mma-row-tiles values must be 0, 8, 16, or 32")
     assert "site-packages" in vllm.__file__, vllm.__file__
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -180,6 +189,7 @@ def main():
         "counter_cache_state": "64_MiB_eviction_before_profiled_replay",
         "accumulation": "FP32",
         "mma_cta_per_sm": a.mma_cta_per_sm,
+        "mma_row_tiles": a.mma_row_tiles,
         "row_padding_bytes": raw.padding_bytes_per_row,
         "original_payload_bytes": n * raw.payload_bytes_per_row,
         "raw_weight_bytes": original.numel(),
@@ -327,60 +337,42 @@ def main():
                         )
                     )
             elif m <= 64:
-                mt = 8 if m <= 8 else 16 if m <= 16 else 32
-                ctas = math.ceil(n / 32) * math.ceil(m / mt)
-                split_candidates = {1} | {
-                    min(k // 256, max(1, math.ceil(target * report["sm_count"] / ctas)))
-                    for target in a.mma_cta_per_sm
-                }
-                for split in sorted(split_candidates):
-                    tmp = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
-                    candidates.append(
-                        (
-                            f"compact_mma_split{split}",
-                            partial(
-                                torch.ops._C.gguf_lattice_compact_mma_sm70_out,
-                                out,
-                                x,
-                                compact,
-                                kind,
-                                tmp,
-                                split,
-                            ),
+                for row_tile in a.mma_row_tiles:
+                    mt = row_tile or (8 if m <= 8 else 16 if m <= 16 else 32)
+                    ctas = math.ceil(n / 32) * math.ceil(m / mt)
+                    split_candidates = {1} | {
+                        min(
+                            k // 256,
+                            max(1, math.ceil(target * report["sm_count"] / ctas)),
                         )
-                    )
-                    candidates.append(
-                        (
-                            f"compact_mma_prefetch_split{split}",
-                            partial(
-                                torch.ops._C.gguf_lattice_compact_mma_sm70_out,
-                                out,
-                                x,
-                                compact,
-                                kind,
-                                tmp,
-                                split,
-                                True,
-                            ),
+                        for target in a.mma_cta_per_sm
+                    }
+                    for split in sorted(split_candidates):
+                        tmp = torch.empty(
+                            (split, m, n), dtype=torch.float32, device="cuda"
                         )
-                    )
-                    if n % 32 == 0:
-                        candidates.append(
-                            (
-                                f"compact_mma_staged_split{split}",
-                                partial(
-                                    torch.ops._C.gguf_lattice_compact_mma_sm70_out,
-                                    out,
-                                    x,
-                                    compact,
-                                    kind,
-                                    tmp,
-                                    split,
-                                    True,
-                                    True,
-                                ),
+                        variants = [("", False, False), ("_prefetch", True, False)]
+                        if n % 32 == 0:
+                            variants.append(("_staged", True, True))
+                        for name, prefetch, staged in variants:
+                            tile_name = f"_rows{row_tile}" if row_tile else ""
+                            candidates.append(
+                                (
+                                    f"compact_mma{name}{tile_name}_split{split}",
+                                    partial(
+                                        torch.ops._C.gguf_lattice_compact_mma_sm70_out,
+                                        out,
+                                        x,
+                                        compact,
+                                        kind,
+                                        tmp,
+                                        split,
+                                        prefetch,
+                                        staged,
+                                        row_tile,
+                                    ),
+                                )
                             )
-                        )
             else:
                 candidates.append(
                     (
