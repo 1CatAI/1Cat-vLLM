@@ -512,11 +512,12 @@ def _get_ple_embedding_quant_method(
 
     from vllm.model_executor.layers.quantization.gguf import (
         GGUFConfig,
-        GGUFEmbeddingMethod,
     )
 
     if isinstance(quant_config, GGUFConfig):
-        return GGUFEmbeddingMethod(quant_config)
+        from .gguf_embedding import Qwen4ExpPLEGGUFEmbeddingMethod
+
+        return Qwen4ExpPLEGGUFEmbeddingMethod(quant_config)
 
     if force_fp8_storage:
         return Qwen4ExpPLEFp8EmbeddingMethod()
@@ -752,7 +753,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         the rows beyond device and host are read from the mapped checkpoint on
         disk -- instead of overcommitting the device.
         """
-        row_bytes = self.embedding_dim
+        row_bytes = getattr(self, "_storage_dim", self.embedding_dim)
         total_rows = self._meta_weight_shape[0]
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
@@ -1145,7 +1146,23 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         )
         self._disk_executor: ThreadPoolExecutor | None = None
-        if self._file_backed_shards:
+        from .gguf_embedding import (
+            Qwen4ExpPackedGGUFEmbedding,
+            Qwen4ExpPLEGGUFEmbeddingMethod,
+        )
+
+        self._packed_gguf = isinstance(quant_method, Qwen4ExpPLEGGUFEmbeddingMethod)
+        if self._packed_gguf:
+            self._file_backed_shards = False
+            self.ngram_embedding = Qwen4ExpPackedGGUFEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype,
+                divisor,
+                embedding_prefix,
+                quant_method,
+            )
+        elif self._file_backed_shards:
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp PLE file-backed shards require FP8 checkpoint storage"
@@ -1191,9 +1208,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.split_ngram_parts,
                 num_threads,
             )
-        elif getattr(
-            config, "gguf_architecture", None
-        ) != "qwen4exp" and _should_use_pinned_host_ple(config):
+        elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"
@@ -1709,7 +1724,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 if output.dtype == torch.uint8
                 else output
             )
-            if getattr(self, "_cascade", False):
+            if self._packed_gguf:
+                ids = ngram_ids.reshape(-1)
+                target = embedding_output.reshape(-1, self.head_dim)
+                if self._cascade:
+                    mask = torch.from_numpy(
+                        ple_disk_mask(ids.numpy(), self._disk_segments)
+                    )
+                    target[mask] = self.ngram_embedding.embedding_lookup(ids[mask])
+                else:
+                    target.copy_(self.ngram_embedding.embedding_lookup(ids))
+            elif getattr(self, "_cascade", False):
                 self._remote_lookup(ngram_ids, embedding_output)
             elif getattr(self, "_disk_offload", False):
                 self._disk_embedding_lookup(ngram_ids, embedding_output)
@@ -1731,6 +1756,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Transport quantized lookup results as opaque E4M3FN bytes."""
         embedding = getattr(self, "ngram_embedding", None)
+        if getattr(self, "_packed_gguf", False):
+            assert embedding is not None
+            return embedding._output_dtype
         weight = getattr(embedding, "weight", None)
         if weight is not None and weight.dtype == torch.float8_e4m3fn:
             return torch.uint8
