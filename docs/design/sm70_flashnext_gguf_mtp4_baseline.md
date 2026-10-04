@@ -93,8 +93,14 @@ must use actual trace call counts and account for the changed acceptance.
 
 The automatic-ring C4 smoke has 37 steady four-request intervals: 66.413 ms
 per engine round, 240.918 aggregate tok/s and 3.861 mean acceptance length.
-The matched ring-disabled C4 run is pending, so no C4 gain or non-regression
-is established yet. The 27B result remains a separate smoke check. Ring merging
-requires the complete Flash-Next C1/C4 comparison and natural output checks.
+The matched ring-disabled C4 run records 66.615 ms and 253.171 aggregate
+tok/s over 37 steady intervals, with 3.920 mean acceptance length. Thus the
+observed engine round changes by -0.202 ms while pure decode decreases 4.840%.
+The trimmed cohorts emit 624 and 592 tokens respectively. All natural token
+lists still match and stop normally, but this C4 point does not establish
+non-regression. Retain it as a negative result and compare three repeats with
+1024 output tokens, saving complete output lists before deciding admission.
+The 27B result remains a separate smoke check. Ring merging requires a
+passing Flash-Next C4 comparison and natural output checks.
 Follow-up optimization starts with the actual trace and packed PLE pinned-UVA
 reading.
