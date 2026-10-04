@@ -1285,6 +1285,13 @@ def get_requirements() -> list[str]:
             and torch.version.cuda == "12.8"
         )
         torch_cu128_urls = _onecat_torch_cu128_urls() if pin_torch_cu128 else {}
+        if pin_torch_cu128:
+            # NVRTC is supplied by Torch. TileLang also needs NVIDIA's matching
+            # compiler and CCCL headers, without a system CUDA Toolkit.
+            requirements += [
+                "nvidia-cuda-nvcc-cu12==12.8.93",
+                "nvidia-cuda-cccl-cu12==12.8.90",
+            ]
         modified_requirements = []
         for req in requirements:
             if pin_torch_cu128:
