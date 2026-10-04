@@ -126,7 +126,7 @@ def snapshot_layer(
         )
 
     def dispatch(name):
-        def run(*args):
+        def run(*args, **kwargs):
             # Record the opaque native entry and its scalar plan, not tensor addresses.
             # Shared weights omit the separate TurboMind weight argument.
             gated_index = 11 if name == "nvfp4_qpn2_tm_dispatch_sm70_out" else 12

@@ -165,6 +165,8 @@ class Sm70NvFp4Config:
     remain with the linear kernels. Explicit fields override deprecated envs.
     """
 
+    activation_pack: bool = True
+    """Pack FP16 QPN2 activations when the native shape/device gate admits it."""
     dense_qpn2: bool = True
     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None

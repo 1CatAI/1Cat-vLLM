@@ -135,6 +135,20 @@ def _op(name: str):
     return getattr(torch.ops._C, name)
 
 
+@torch.compiler.assume_constant_result
+def has_qpn2_activation_pack(name: str) -> bool:
+    """Older extensions keep their original route without the new argument."""
+    op = getattr(torch.ops._C, name, None)
+    schema = getattr(getattr(op, "default", None), "_schema", None)
+    return schema is not None and any(
+        arg.name == "activation_pack" for arg in schema.arguments
+    )
+
+
+def _qpn2_pack_args(name: str, enabled: bool) -> list[bool]:
+    return [enabled] if has_qpn2_activation_pack(name) else []
+
+
 def _qwen38_qpn8_op(name: str):
     """Prefer the task sidecar, then fall back to the production namespace."""
     sidecar = torch.ops._C_qwen38
@@ -1481,6 +1495,7 @@ def nvfp4_qpn2_tm_dispatch_sm70_out(
     gated_silu: bool,
     min_prefill_m: int,
     prescaled_scales: bool = False,
+    activation_pack: bool = True,
 ) -> None:
     """Use shared TurboMind codes for QPN2, TurboMind and dense prefill."""
     _op("nvfp4_qpn2_tm_dispatch_sm70_out")(
@@ -1497,7 +1512,13 @@ def nvfp4_qpn2_tm_dispatch_sm70_out(
         tm_q_ld,
         gated_silu,
         min_prefill_m,
-        *([True] if prescaled_scales else []),
+        *(
+            [prescaled_scales]
+            if prescaled_scales
+            or has_qpn2_activation_pack("nvfp4_qpn2_tm_dispatch_sm70_out")
+            else []
+        ),
+        *_qpn2_pack_args("nvfp4_qpn2_tm_dispatch_sm70_out", activation_pack),
     )
 
 
@@ -1519,6 +1540,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_tm_dispatch_sm70_out"):
         gated_silu: bool,
         min_prefill_m: int,
         prescaled_scales: bool = False,
+        activation_pack: bool = True,
     ) -> None:
         return None
 
@@ -1531,6 +1553,7 @@ def nvfp4_qpn2_gemm_sm70_out(
     global_scale: float,
     split_k: int,
     accumulator_chains: int,
+    activation_pack: bool = True,
 ) -> None:
     _op("nvfp4_qpn2_gemm_sm70_out")(
         out,
@@ -1540,6 +1563,7 @@ def nvfp4_qpn2_gemm_sm70_out(
         global_scale,
         split_k,
         accumulator_chains,
+        *_qpn2_pack_args("nvfp4_qpn2_gemm_sm70_out", activation_pack),
     )
 
 
@@ -1554,6 +1578,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_gemm_sm70_out"):
         global_scale: float,
         split_k: int,
         accumulator_chains: int,
+        activation_pack: bool = True,
     ) -> None:
         return None
 
@@ -1566,6 +1591,7 @@ def nvfp4_qpn2_gated_sm70_out(
     global_scale: float,
     split_k: int,
     accumulator_chains: int,
+    activation_pack: bool = True,
 ) -> None:
     _op("nvfp4_qpn2_gated_sm70_out")(
         out,
@@ -1575,6 +1601,7 @@ def nvfp4_qpn2_gated_sm70_out(
         global_scale,
         split_k,
         accumulator_chains,
+        *_qpn2_pack_args("nvfp4_qpn2_gated_sm70_out", activation_pack),
     )
 
 
@@ -1589,6 +1616,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_gated_sm70_out"):
         global_scale: float,
         split_k: int,
         accumulator_chains: int,
+        activation_pack: bool = True,
     ) -> None:
         return None
 
@@ -1607,6 +1635,7 @@ def nvfp4_qpn2_dispatch_sm70_out(
     tm_k_ld: int,
     tm_q_ld: int,
     gated_silu: bool,
+    activation_pack: bool = True,
 ) -> None:
     """Select QPN2 for M<=32 and TurboMind for larger dynamic M."""
     _op("nvfp4_qpn2_dispatch_sm70_out")(
@@ -1623,6 +1652,7 @@ def nvfp4_qpn2_dispatch_sm70_out(
         tm_k_ld,
         tm_q_ld,
         gated_silu,
+        *_qpn2_pack_args("nvfp4_qpn2_dispatch_sm70_out", activation_pack),
     )
 
 
@@ -1643,6 +1673,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_dispatch_sm70_out"):
         tm_k_ld: int,
         tm_q_ld: int,
         gated_silu: bool,
+        activation_pack: bool = True,
     ) -> None:
         return None
 
@@ -1662,6 +1693,7 @@ def nvfp4_qpn2_prefill_dispatch_sm70_out(
     tm_q_ld: int,
     gated_silu: bool,
     min_prefill_m: int,
+    activation_pack: bool = True,
 ) -> None:
     """Keep QPN2 decode and QPN2-packed prefill behind one opaque op."""
     _op("nvfp4_qpn2_prefill_dispatch_sm70_out")(
@@ -1679,6 +1711,7 @@ def nvfp4_qpn2_prefill_dispatch_sm70_out(
         tm_q_ld,
         gated_silu,
         min_prefill_m,
+        *_qpn2_pack_args("nvfp4_qpn2_prefill_dispatch_sm70_out", activation_pack),
     )
 
 
@@ -1700,6 +1733,7 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_prefill_dispatch_sm70_out"):
         tm_q_ld: int,
         gated_silu: bool,
         min_prefill_m: int,
+        activation_pack: bool = True,
     ) -> None:
         return None
 

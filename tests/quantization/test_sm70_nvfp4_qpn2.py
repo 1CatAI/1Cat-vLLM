@@ -231,7 +231,7 @@ def test_nvfp4_qpn2_dispatch_crops_padded_output_before_bias(monkeypatch):
     )
     seen_shapes = []
 
-    def fake_dispatch(*args):
+    def fake_dispatch(*args, activation_pack=True):
         seen_shapes.append(tuple(args[0].shape))
         args[0].fill_(3)
 
@@ -357,7 +357,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
 
     monkeypatch.setattr(nvfp4_scheme.sm70_tm, "prepare_nvfp4_linear", fake_prepare)
 
-    def fake_dispatch(*args):
+    def fake_dispatch(*args, activation_pack=True):
         calls.append(args)
         args[0].fill_(3)
 
@@ -366,7 +366,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
     )
     combined_calls = []
 
-    def fake_combined_dispatch(*args):
+    def fake_combined_dispatch(*args, activation_pack=True):
         combined_calls.append(args)
         args[0].fill_(5 if args[1].shape[0] >= args[-1] else 3)
 
@@ -376,7 +376,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
         fake_combined_dispatch,
     )
 
-    def fake_shared_dispatch(*args):
+    def fake_shared_dispatch(*args, activation_pack=True):
         assert shared
         state = getattr(layer, sm70_tm.STATE_ATTR)
         assert args[2] is state.weight
