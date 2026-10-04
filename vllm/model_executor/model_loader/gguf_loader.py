@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from typing import TYPE_CHECKING, cast
 
 import gguf
@@ -433,12 +433,28 @@ class GGUFModelLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
 
-    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+    def get_all_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+        *,
+        skip_weight: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Filter mapped names before the adapter touches tensor payloads."""
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
-        model.load_weights(
-            self._get_weights_iterator(model_config, local_model_path, gguf_weights_map)
+        if skip_weight is not None:
+            gguf_weights_map = {
+                raw: name
+                for raw, name in gguf_weights_map.items()
+                if not skip_weight(name)
+            }
+        yield from self._get_weights_iterator(
+            model_config, local_model_path, gguf_weights_map
         )
+
+    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        model.load_weights(self.get_all_weights(model_config, model))
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
