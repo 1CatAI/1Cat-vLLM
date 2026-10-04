@@ -925,3 +925,41 @@ void gguf_lattice_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                 torch::Tensor weight, torch::Tensor stats,
                                 int64_t source_type, torch::Tensor scratch,
                                 int64_t group_size);
+
+void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
+                                          torch::Tensor weight,
+                                          int64_t source_type);
+void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, int64_t source_type,
+                                   torch::Tensor partial, int64_t splits,
+                                   bool prefetch);
+void gguf_lattice_raw_blas_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor weight, int64_t source_type,
+                                    torch::Tensor scratch);
+
+void gguf_lattice_raw_mma_sm70_out(torch::Tensor out, torch::Tensor input,
+                                   torch::Tensor weight, int64_t source_type,
+                                   torch::Tensor partial, int64_t splits,
+                                   int64_t tile_n);
+
+void gguf_lattice_compact_reorder_sm70_out(torch::Tensor out, torch::Tensor raw,
+                                           int64_t source_type,
+                                           int64_t logical_k);
+void gguf_lattice_compact_dequantize_sm70_out(torch::Tensor out,
+                                              torch::Tensor weight,
+                                              int64_t source_type);
+void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weight,
+                                       int64_t source_type,
+                                       torch::Tensor partial, int64_t splits,
+                                       bool row_wise);
+void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weight,
+                                       int64_t source_type,
+                                       torch::Tensor partial, int64_t splits,
+                                       bool prefetch, bool staged,
+                                       int64_t row_tile, bool occupancy7);
+void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
+                                        torch::Tensor weight,
+                                        int64_t source_type,
+                                        torch::Tensor scratch);
