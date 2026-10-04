@@ -58,6 +58,25 @@ Reproduce with `benchmarks/kernels/benchmark_gguf_fp16_ba.py MODEL.gguf
 --rank 0 --output RESULT.json`. Use `--projection router` for the independent
 router projection comparison.
 
+## Router operator measurements
+
+Source `8a649367f0`, packaged runtime `1.5.2.dev466+g8a649367f.precompiled`;
+hardware and dependencies match the a/b comparison. All 48 real BF16 router
+matrices are loaded as FP16. Their working set exceeds V100's L2 cache.
+The old path uses dense GEMM; the candidate selects the existing row GEMV
+at M=1 and the packed FP32 router at M=5/10. Route checks reject dense
+fallback in those admitted cases.
+
+| M | Old chain (µs) | New chain (µs) | Saved per chain (µs) | Maximum absolute error | Maximum relative L2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 390.472 | 244.654 | 145.818 | 2.44e-4 | 4.45e-5 |
+| 5 | 539.628 | 336.169 | 203.459 | 2.44e-4 | 3.69e-5 |
+| 10 | 543.222 | 371.077 | 172.145 | 2.44e-4 | 3.59e-5 |
+
+M=16/20 retain dense GEMM, with about 0.2% timing variation between arms.
+The M=5 chain suggests another 0.20 ms less projection work per verifier
+round. This comparison does not alter or measure router top-k selection.
+
 ## HC and remaining checks
 
 The existing trace already contains 48 target router top-k calls per round.
@@ -69,5 +88,5 @@ admitted TP collective is a separate change.
 
 Loading and route preparation have focused CPU regressions, including mixed
 format rejection, layout rejection, shard order, storage sharing and router
-FP32 admission. Router operator timing and the combined HC/dense model C1/C4
-comparison remain pending. No end-to-end speedup is claimed here.
+FP32 admission. The combined HC/dense model C1/C4 comparison remains pending.
+No end-to-end speedup is claimed here.
