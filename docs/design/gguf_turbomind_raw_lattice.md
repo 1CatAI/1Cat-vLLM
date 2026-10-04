@@ -1009,3 +1009,31 @@ Whole-wheel SHA256:
 The package/Python source versions agree and all 210 installed dependencies
 are compatible. Root profiling disables Python bytecode writes to avoid
 creating root-owned cache directories in the task runtime.
+
+## Activation staging attribution
+
+The matched gate M16 split3 capture confirms fewer memory requests with
+staging, but shows that synchronous tile preparation offsets the benefit:
+
+| Counter | Prior packet prefetch | Synchronous activation staging |
+| --- | ---: | ---: |
+| L1 global-load sectors | 1,798,846 | 1,137,935 |
+| L2 read sectors | 965,893 | 766,095 |
+| L1 throughput / sustained peak | 70.60% | 36.84% |
+| Long-scoreboard stall | 65.48% | 47.28% |
+| Active warps | 30.43% | 28.55% |
+| Main-node profiled µs | 54.752 | 63.200 |
+
+The staging split5 wall-time winner records 1,158,021 L1 sectors, 740,137
+L2 sectors, 27.45% active warps, 47.47% long-scoreboard stall and 4.58%
+barrier stall. Main-node DRAM reads are 9,747,296 bytes; the FP32 reduction
+reads another 1,392,800 bytes. Node times remain separate from full-graph wall
+time. The lower request count alone is not evidence of a speed win.
+
+The next candidate preloads the first activation tile into shared memory
+and keeps the following complete tile in registers while decoding and
+multiplying the current one. CTA barriers protect shared reuse; SM70 does
+not require an unavailable asynchronous-copy instruction. The storage
+budget and every numerical operation remain unchanged. The same extended
+checks and two dense M16 wall comparisons must validate this candidate
+before it is selected.
