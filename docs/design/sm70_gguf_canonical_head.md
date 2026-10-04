@@ -62,7 +62,25 @@ preserve that same object and vocabulary layout. Model integration follows
 the dense/HC complete-round measurement and is checked with natural greedy
 output and the later combined C1/C4 comparison.
 
-Use `--lm-head-method` to additionally exercise actual LM-head post-load
-preparation and dispatch in the operator benchmark. That packaged GPU
-route check remains pending; the table above measures the underlying
-canonical projection directly.
+## LM-head method measurement
+
+The `--lm-head-method` comparison additionally exercises real LM-head
+post-load preparation and dispatch, rather than calling the projection
+directly. Source `ae536e80ae`, ordinary precompiled package version
+`1.5.2.dev498` built from that commit, uses the same hardware, tensor and graph
+timing method. The measured Q6_K route prepares canonical 4+2 bit planes
+and admits every tested M. Top-1 matches the official FP32 reference for
+all tested rows.
+
+| M | Dense FP16 (µs) | Packed LM-head method (µs) |
+| --- | ---: | ---: |
+| 1 | 449.608 | 252.201 |
+| 5 | 455.137 | 208.558 |
+| 8 | 458.619 | 211.671 |
+| 20 | 472.330 | 289.751 |
+
+The M=5 verifier plus four M=1 draft calls estimates 1.036 ms less service
+per round. Q6_K projection relative L2 is 3.51e-4 at M=5, compared with
+2.98e-4 for dense FP16. Original packed fallback plus canonical data remains
+289,292,800 bytes per rank; admitted projections read only the canonical
+stream. Complete-round measurements must account for acceptance separately.
