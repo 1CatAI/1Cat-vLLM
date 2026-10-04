@@ -83,19 +83,19 @@ struct LatticeRawDecoder {
       const float small =
           Type == 21 ? float(1 + 2 * nibble) : (0.5f + nibble) * 0.25f;
       const half2 factor = __float2half2_rn(small);
+      // The correction is exact in half: multiples of 128 for IQ3_S and
+      // 144 for IQ2_S. Fusing bias removal preserves the rounded operand.
+      const half2 correction = __hmul2(factor, __float2half2_rn(-1152.0f));
       const half2 base = CachedBase ? cached_base : __float2half2_rn(d);
       turbomind::Array<half, 8> result;
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
-        constexpr uint32_t magic = 0x64006400U, bias = 0x64806480U;
+        constexpr uint32_t magic = 0x64006400U;
         const uint32_t bytes = static_cast<uint32_t>(packed >> ((i / 4) * 32));
         const uint32_t pair =
             __byte_perm(bytes, magic, (i % 4) ? 0x7372 : 0x7170);
-        half2 values = __hsub2((const half2&)pair, (const half2&)bias);
-        const uint32_t mask =
-            (((signs >> i) & 1) << 15) | (((signs >> (i + 1)) & 1) << 31);
-        (uint32_t&)values ^= mask;
-        const half2 exact_factor = __hmul2(values, factor);
+        const half2 exact_factor =
+            __hfma2((const half2&)pair, factor, correction);
         (half2&)result[i] = __hmul2(exact_factor, base);
       }
       return result;

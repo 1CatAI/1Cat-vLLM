@@ -475,3 +475,104 @@ cache, removing per-CTA initialization and shared bank serialization while
 retaining the aligned payload, exact operands and FP32 accumulation. The
 earlier unsigned-book global-table result cannot validate this signed-index
 implementation, which has a different instruction count and lookup footprint.
+
+The signed-book read-only-cache isolation passes bitwise retained outputs but
+regresses to 99.328 us in both ABBA arms, versus shared-book 62.464 us and
+native NVFP4 51.200–52.224 us. Its loop has 78.375 instructions/K16,
+54 registers, 16 KiB partial storage and no spills. It is rejected.
+
+A CPU bank model over all 348,160 actual gate/up warp lookups predicts
+881,244 codebook excessive wavefronts. Adding the measured 34,816 reduction
+wavefronts exactly reproduces NCU's total 916,060. Searching all 1,287 choices
+of five bank bits on a sample and validating the six best over the full
+data reduces conflicts by only 0.042%; no GPU experiment is justified.
+The next CPU/build isolation encodes each signed odd grid value in a nibble,
+reducing the signed book from 32 to 16 KiB without changing source records
+or numerical precision. Exact integers remain in [-15, 15]. Reconstructing
+(q - 7.5) times twice the original small scale preserves the exact
+intermediate; original d remains separate and accumulation stays FP32.
+
+The nibble-book arithmetic check exhausts all 63,488 finite FP16 d bit
+patterns, all 16 signed odd grid integers and all 16 small scales. All
+16,252,928 final FP16 results match the official FP32 formula rounded to
+FP16 bitwise, including overflow and signed zero. This transformation
+introduces no combined-scale rounding. The first compiled candidate has
+74.25 instructions/K16, 52 registers, 16 KiB shared storage and zero spills.
+Its actual-weight device oracle fails on exactly half the elements before
+timing: the 1031.5 FP16 low-nibble bias rounds to 1032. The corrected path
+uses only the exact 64/71.5 construction and shifts low nibbles by four.
+It has 78.125 instructions/K16, 51 registers and zero spills. The actual
+all-weight device FP16 oracle passes bitwise, and outputs are bitwise retained.
+On a second V100 host at the same 1290/877 MHz, matched shared32/nibble16/
+nibble16/shared32 graph timing is 62.464 us in every arm; native NVFP4 is
+51.200–52.224 us. The smaller codebook has no independent timing gain.
+Both shared and individual GPU locks are held for this microbenchmark;
+the first host queue is canceled before the second-host launch.
+
+A two-N32-tile, two-K-partition persistent candidate keeps the signed book
+live across tasks instead of reinitializing it. Its 73-register build cannot
+keep two 512-thread CTAs resident and is not GPU-tested. A bounded-32-bit
+address/launch-bound build is the next compilation gate. This is a scheduling
+experiment; the rejected register-prefetch/pipeline variants stay disabled.
+
+Bounded 32-bit task addressing and a 512-thread/two-CTA launch bound reduce
+the persistent candidate to 64 registers without spills. The inner K loop
+is 78.375 instructions/K16; the outer task backedge includes epilogue and
+atomic completion work and must not be mislabeled as the dequant/MMA loop.
+Both fixed grids pass official GEMM, changed-input graph replay and counter
+wrap/reset checks with FP32 accumulation. In the matched second-host
+cohort, fixed160 measures 62.464 us twice; fixed80 measures
+65.536/66.048 us. The shared32 control changes from 62.464 to 65.536 us,
+so there is no accepted stable gain. Native NVFP4 remains 51.200–52.224 us.
+
+The next CPU/build isolation places the same signed book behind a texture
+object, testing the separate TEX lookup queue against shared LDS and the
+already-rejected ordinary read-only LDG implementation. Host initialization
+is outside capture/timing; records, scale arithmetic and accumulation are
+unchanged. This remains research-only, with no normal dispatch change.
+
+Texture lookup compiles to 74 instructions/K16, 59 registers, 16 KiB
+partials and no spills. The actual texture object returns all 8,192 book
+words bitwise, and gated outputs are bitwise retained. Matched ABBA is
+shared 63.488, texture 106.496, texture 106.496, shared 62.464 us; native
+NVFP4 is 51.200–52.224 us. TEX lookup is rejected.
+
+K32 postscale with explicit output-column scales and exact integer MMA
+operands spills at the 64-register launch bound. Caching original d as
+half2 and removing redundant first-MMA zero initialization still spills;
+neither candidate is GPU-timed.
+
+The next decoder arithmetic isolation replaces `(biased - 1152) * small`
+with `hfma2(biased, small, -1152 * small)`, retaining the separate original
+d multiply. Every negative bias product is exactly representable in half
+for both Type21 and Type22. Exhaustive 256 biased bytes ×16 small scales
+match the retained half intermediate bitwise for both types. The compiled
+IQ3_S loop has 62.625 instructions/K16, 50 registers, 32 KiB union and
+no spills. The Float decoder formula stays unchanged. Every actual Float/Half
+weight matches official dequantization bitwise; gated outputs also match
+retained bitwise. Matched ABBA is retained 63.488, HFMA 62.464, HFMA
+62.464, retained 63.488 us. This cohort has a 1.024 us difference, but
+HFMA does not improve the earlier 62.464 us best. Native NVFP4 is
+51.200–52.224 us; the 40 us target remains unmet.
+
+A scoped Nsight Compute 2022.4.1 run on the second host confirms 5,877,376
+executed warp instructions for HFMA, 28.48% active-cycle issue activity,
+59.584 us profiled duration and 352.28 GB/s DRAM throughput. Read-only
+lookup executes 7,161,216 instructions with 21.25% issue activity and
+97.344 us profiled duration. Its L1 sector hit rate is already 86.72%,
+versus 55.22% for shared HFMA. However global-load sectors increase from
+2,092,883 to 12,940,961; cache misses increase from 931,524 to 1,757,023.
+High hit rate alone cannot explain or fix the random-gather request load.
+A streaming-weight/smaller-carveout control is still needed to bound the
+cache-policy contribution. These counter durations remain separate from
+the unprofiled cold-L2 graph timings.
+
+The parallel qkvz/a/b N32, sixteen-K-warp candidate compiles to
+68 instructions/K16, 52 registers and no spills. It uses 128 quantized
+CTAs plus 96 existing FP16 ba CTAs. Actual Float/Half dequantization and
+all qkv/z/b/a outputs match the earlier 224-CTA implementation bitwise.
+Matched old/new/new/old is 41.984/37.888/37.888/43.008 us; native NVFP4
+quantized qkvz is 27.648 us, or 34.816 us with separate ba. The current
+37.888 us candidate still fails its 20 us target. Only eight GDN layers
+have both quantized segments in the supported type, so the local saving
+corresponds to 0.032768–0.040960 ms per round, not a full-model result.
