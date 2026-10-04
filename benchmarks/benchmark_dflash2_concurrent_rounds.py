@@ -101,6 +101,8 @@ async def request(client, args, prompt, index, barrier, progress=None):
         raise ValueError(f"Request {index}: emitted {emitted}, expected fixed length")
     if not usage or usage["completion_tokens"] != emitted:
         raise ValueError(f"Request {index}: missing or inconsistent usage")
+    if usage["prompt_tokens"] != args.input_tokens:
+        raise ValueError(f"Request {index}: prompt length differs from the contract")
     return {
         "request_index": index,
         "response_id": response_id,
@@ -152,13 +154,19 @@ async def run(args):
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         },
-        "common_decode_window": common_window(requests, args.trim_chunks),
         "raw_requests": requests,
         "measurement_mode": (
             "profiled" if args.profile_after_chunks is not None else "unprofiled"
         ),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2))
+    try:
+        result["common_decode_window"] = common_window(requests, args.trim_chunks)
+    except ValueError as error:
+        result["measurement_error"] = str(error)
+        args.output.write_text(json.dumps(result, indent=2))
+        raise
     args.output.write_text(json.dumps(result, indent=2))
     print(json.dumps(result["common_decode_window"], indent=2))
 
