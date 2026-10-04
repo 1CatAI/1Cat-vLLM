@@ -39,29 +39,6 @@ finally:
     sys.path[:] = _original_path
 
 
-def worker_decode_routes(worker):
-    report = worker.get_sm70_acceleration_report()
-    config = worker.model_runner.compilation_config
-    manager = getattr(worker.model_runner, "cudagraph_manager", None)
-    mode = config.cudagraph_mode if manager is None else manager.cudagraph_mode
-    report.update(
-        compilation_mode=config.mode.name,
-        cudagraph_mode=mode.name,
-        decode_cudagraph_mode=mode.decode_mode().name,
-        mixed_cudagraph_mode=mode.mixed_mode().name,
-    )
-    if manager is not None:
-        report["captured_full_decode_tokens"] = sorted(
-            {
-                desc.num_tokens
-                for desc in manager.graphs
-                if desc.cg_mode.name == "FULL"
-                and desc.uniform_token_count in (None, manager.decode_query_len)
-            }
-        )
-    return report
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -215,7 +192,9 @@ def main():
                 "FULL decode CUDA graph is unavailable with "
                 f"{resolved.cudagraph_mode.name}; no timing results recorded"
             )
-        report["worker_routes"] = llm.collective_rpc(worker_decode_routes, timeout=30)
+        report["worker_routes"] = llm.collective_rpc(
+            "get_sm70_acceleration_report", timeout=30
+        )
         save()
         for worker in report["worker_routes"]:
             if not args.eager and worker["decode_cudagraph_mode"] != "FULL":
