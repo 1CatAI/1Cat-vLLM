@@ -749,6 +749,28 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         # Split the independent V columns across more CTAs for this q8 case.
         BV = 2
     if (
+        (N, T, H, HV, K, V) == (1, 8, 4, 12, 128, 128)
+        and (BV, num_warps) == (8, 1)
+        and match_recurrent_schedule
+        and match_recurrent_numerics
+        and use_precomputed_gating
+        and kernel_a.dtype == kernel_b.dtype == torch.float32
+        and initial_state.dtype == torch.float32
+        and mixed_qkv.dtype == out.dtype == torch.float16
+        and num_accepted_tokens is not None
+        and use_qk_l2norm_in_kernel
+        and not quantize_state_each_step
+        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+    ):
+        from .fused_recurrent import _SM70_FLA_HAS_LEGACY_OVERRIDE
+
+        if not _SM70_FLA_HAS_LEGACY_OVERRIDE:
+            # Independent V tiles share the unchanged K128 reduction. Smaller
+            # one-warp tiles shorten the single-request verifier's register
+            # dependency chains; output and all eight snapshots stay bitwise
+            # identical. Batched requests retain their qualified geometry.
+            BV = 2
+    if (
         4 <= N <= 32
         and (T, H, HV, K, V) == (N * 8, 4, 12, 128, 128)
         and (BV, num_warps) == (32, 1)

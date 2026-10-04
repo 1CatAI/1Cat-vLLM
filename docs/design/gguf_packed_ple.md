@@ -50,5 +50,14 @@ safetensors. Its embedding-method check admits packed GGUF rows without an
 E4M3 storage hint and retains the existing dtype, worker topology, PP layer
 layout and explicit-placement guards. Missing checkpoint storage information
 still rejects the route with a reason. All 21 source configuration checks
-pass, including GGUF activation and unsupported embedding metadata; installed
-configuration and full offload-process checks remain pending.
+pass from source and the normal combined wheel, including GGUF activation and
+unsupported embedding metadata. The actual Flash-Next PLE worker starts and
+loads all five required checkpoint entries; two materialized parameters pass
+its completeness check. Whole-model generation and remote request handling
+remain pending.
+
+Selected first, middle, final and repeated rows from the real 320,001,536-row
+IQ4_NL table produce finite values without copying the table. The packed view
+shares its checkpoint mmap, and FP16 results equal rounded FP32 values. The
+maximum absolute FP16 rounding error on those six selected rows is 1.12057e-5.
+This is a storage-boundary check, not a full-table numerical measurement.

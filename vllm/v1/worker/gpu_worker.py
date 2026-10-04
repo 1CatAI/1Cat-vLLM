@@ -537,7 +537,9 @@ class Worker(WorkerBase):
             with warmup_allocator:
                 self.model_runner.profile_run()
         except torch.AcceleratorError:
-            stats = torch.accelerator.memory_stats(self.device)
+            stats = {}
+            with suppress(Exception):
+                stats = torch.accelerator.memory_stats(self.device)
             free: int | None = None
             total: int | None = None
             with suppress(Exception):
@@ -964,14 +966,6 @@ class Worker(WorkerBase):
         return {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
-            "compilation_mode": self.compilation_config.mode.name,
-            "cudagraph_mode": self.compilation_config.cudagraph_mode.name,
-            "decode_cudagraph_mode": (
-                self.compilation_config.cudagraph_mode.decode_mode().name
-            ),
-            "mixed_cudagraph_mode": (
-                self.compilation_config.cudagraph_mode.mixed_mode().name
-            ),
             "linear_kernel_selections": selections,
             "collective_kernel_selections": (
                 self.vllm_config.kernel_config.collective_kernel_selections

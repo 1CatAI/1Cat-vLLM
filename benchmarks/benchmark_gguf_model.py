@@ -14,7 +14,6 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import vllm._C as core
 
@@ -61,9 +60,6 @@ def main():
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--max-seqs", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
-    parser.add_argument("--kv-cache-dtype", default="auto")
-    parser.add_argument("--ssm-state-dtype")
-    parser.add_argument("--record-first-logprobs", action="store_true")
     args = parser.parse_args()
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Benchmark requires an ordinary installed wheel")
@@ -102,7 +98,7 @@ def main():
         model=str(args.model),
         tensor_parallel_size=4,
         dtype="half",
-        kv_cache_dtype=args.kv_cache_dtype,
+        kv_cache_dtype="auto",
         max_model_len=model_len,
         max_num_batched_tokens=args.max_batch,
         max_num_seqs=max_seqs,
@@ -155,7 +151,6 @@ def main():
             "no_mtp": args.mtp_draft is None,
         },
         "natural_greedy": [],
-        "first_logprobs": [],
         "decode": [],
         "prefill": [],
         "complete": False,
@@ -169,7 +164,6 @@ def main():
             json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n"
         )
 
-    save()
     llm = LLM(**config)
     try:
         report["collectives"] = [
@@ -204,35 +198,6 @@ def main():
                 )
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
-        if args.record_first_logprobs:
-            first = llm.generate(
-                [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
-                SamplingParams(temperature=0, max_tokens=1, logprobs=-1),
-                use_tqdm=False,
-            )
-            for index, output in enumerate(first):
-                entries = output.outputs[0].logprobs[0]
-                values = np.full(len(tokenizer), np.nan, dtype=np.float32)
-                for token_id, entry in entries.items():
-                    values[token_id] = entry.logprob
-                if not np.isfinite(values).all():
-                    raise RuntimeError("Incomplete or nonfinite first-logprob vector")
-                path = args.output.with_name(
-                    f"{args.output.stem}.prompt-{index}.logprobs.npy"
-                )
-                np.save(path, values)
-                top = np.argsort(values)[-10:][::-1]
-                report["first_logprobs"].append(
-                    {
-                        "index": index,
-                        "path": str(path),
-                        "vocabulary": len(values),
-                        "representation": "log_softmax(raw_logits)",
-                        "top10_ids": top.tolist(),
-                        "top10_logprobs": values[top].tolist(),
-                    }
-                )
-            save()
         natural = llm.generate(
             [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
             SamplingParams(temperature=0, max_tokens=64),

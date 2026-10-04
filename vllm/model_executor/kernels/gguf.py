@@ -334,11 +334,16 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
         reason = "requires_fp16_activations"
     elif k <= 0 or k % 256 or n <= 0:
         reason = "raw_shape_cuts_source_block"
-    bands = (
+    bands: tuple[tuple[str, int, int | None], ...] = (
         (f"gguf_lattice_{layout}_vec_sm70_out", 1, 1),
         (f"gguf_lattice_{layout}_mma_sm70_out", 2, 64),
         (f"gguf_lattice_{layout}_blas_sm70_out", 512, None),
     )
+    if layout == "compact":
+        bands += (
+            ("gguf_lattice_compact_tm_f16_sm70_out", 512, None),
+            ("gguf_lattice_compact_prefill_sm70_out", 512, None),
+        )
     return tuple(
         GGUFOperatorCapability(
             decoder_family(source_type),
@@ -348,6 +353,16 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
             min_m=minimum,
             max_m=maximum,
             reason=reason
+            or (
+                "fp16_workspace_requires_output_pack_alignment"
+                if operator
+                in (
+                    "gguf_lattice_compact_tm_f16_sm70_out",
+                    "gguf_lattice_compact_prefill_sm70_out",
+                )
+                and n % 32
+                else None
+            )
             or (None if hasattr(torch.ops._C, operator) else "operator_unavailable"),
         )
         for operator, minimum, maximum in bands

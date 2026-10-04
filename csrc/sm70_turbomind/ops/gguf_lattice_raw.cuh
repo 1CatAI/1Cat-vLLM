@@ -91,12 +91,27 @@ struct LatticeRawDecoder {
     }
   }
 
+  // Preserve the official multiplication order for both original scale levels.
+  __device__ static float block_scale(const uint8_t* block, int base) {
+    const float d = __half2float(*reinterpret_cast<const half*>(block));
+    if constexpr (Type == 21) {
+      const int nibble =
+          (block[106 + base / 64] >> (4 * ((base / 32) % 2))) & 15;
+      return d * (1 + 2 * nibble);
+    } else {
+      const int nibble =
+          (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
+      return (d * (0.5f + nibble)) * 0.25f;
+    }
+  }
+
   // Eight consecutive K values. Both scales are multiplied in FP32 before
   // multiplying grid values. No FP16 expanded coefficient exists in storage.
-  template <class Output = float>
+  template <class Output = float, bool ApplyScale = true>
   __device__ static turbomind::Array<Output, 8> fragment(const uint8_t* block,
                                                          int base,
                                                          const uint8_t* grid) {
+    static_assert(Type != 18 || ApplyScale);
     const float d = __half2float(*reinterpret_cast<const half*>(block));
     const int octet = base / 8;
     if constexpr (Type == 18) {
@@ -130,7 +145,12 @@ struct LatticeRawDecoder {
       const uint32_t a = *reinterpret_cast<const uint32_t*>(grid + first * 4);
       const uint32_t b = *reinterpret_cast<const uint32_t*>(grid + second * 4);
       const uint64_t packed = a | (static_cast<uint64_t>(b) << 32);
-      values = table_fragment<Output>(packed, signs, d, nibble);
+      if constexpr (ApplyScale) {
+        values = table_fragment<Output>(packed, signs, d, nibble);
+      } else {
+        static_assert(std::is_same_v<Output, float>);
+        values = table_values(packed, signs, 1.f);
+      }
     } else {
       const int nibble =
           (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
@@ -138,7 +158,12 @@ struct LatticeRawDecoder {
           block[2 + octet] | (((high >> (2 * (octet % 4))) & 3) << 8);
       const uint64_t packed =
           *reinterpret_cast<const uint64_t*>(grid + index * 8);
-      values = table_fragment<Output>(packed, signs, d, nibble);
+      if constexpr (ApplyScale) {
+        values = table_fragment<Output>(packed, signs, d, nibble);
+      } else {
+        static_assert(std::is_same_v<Output, float>);
+        values = table_values(packed, signs, 1.f);
+      }
     }
     return values;
   }

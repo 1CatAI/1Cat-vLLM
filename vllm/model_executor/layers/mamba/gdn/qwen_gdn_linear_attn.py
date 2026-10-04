@@ -2311,6 +2311,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        # Runtime forward/capture need not retain the initialization config.
+        # Capture LoRA exclusion while the owning configuration is available.
+        self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -3967,6 +3970,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -4033,7 +4037,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        proj_out, _ = self.out_proj(core_attn_out)
+        if output is None:
+            proj_out, _ = self.out_proj(core_attn_out)
+        else:
+            # The caller guards the bias-free, non-reducing SM70 FP8 route.
+            # Write the compiler-owned destination within the original opaque
+            # operator; do not publish a hidden allocator-owned intermediate.
+            proj_out = self.out_proj.scheme.apply_weights(
+                self.out_proj, core_attn_out, output=output
+            )
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_out_proj",
@@ -4057,9 +4069,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens: int,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A16Fp8,
+        )
+
+        direct_write = bool(
+            output is not None
+            and self.enable_sm70_dflash2_fused_gdn_verify
+            and current_platform.is_device_capability(70)
+            and self.tp_size == 4
+            and num_tokens == 8
+            and output.shape == (8, 5120)
+            and output.dtype == torch.float16
+            and output.is_contiguous()
+            and self.out_proj.bias is None
+            and not self.out_proj.reduce_results
+            and getattr(self.out_proj, "sm70_fp8_qpn8", False)
+            and isinstance(self.out_proj.scheme, CompressedTensorsW8A16Fp8)
+        )
+        proj_out = self._compute_output_projection(
+            core_attn_out, z, num_tokens, output if direct_write else None
+        )
         if output is not None:
-            output[:num_tokens] = proj_out
+            if not direct_write:
+                output[:num_tokens] = proj_out
             _sm70_gdn_graph_buffer_copy(
                 "proj_output_after_write",
                 layer_name,
@@ -4240,7 +4273,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and use_sm70_decode_graph_semantics()
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        if use_qwen38_fused_input:
+        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+            apply_gdn_ba_verify,
+        )
+
+        fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        if fused_verify_projection is not None:
+            mixed_qkv, z, b, a = fused_verify_projection
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+        elif use_qwen38_fused_input:
             assert self.in_proj_ba is not None
             mixed_qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
                 hidden_states,
@@ -5283,6 +5324,80 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and core_attn_out.is_contiguous()
         )
 
+    def _can_use_sm70_gdn_preprocess(self, mixed_qkv, a, b, conv_state, metadata):
+        # Restrict the first admission to a complete single-request verifier.
+        # Mixed batches, padding with fewer actual tokens, and trees retain the
+        # existing convolution/gating path.
+        return bool(
+            self.enable_sm70_dflash2_fused_gdn_verify
+            and current_platform.is_device_capability(70)
+            and self.tp_size == 4
+            and self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+            and not self.gqa_interleaved_layout
+            and self.conv1d.bias is None
+            and self.activation in ("silu", "swish")
+            and metadata.num_prefills == metadata.num_decodes == 0
+            and metadata.num_spec_decodes == 1
+            and metadata.num_actual_tokens == 8
+            and metadata.spec_sequence_masks is not None
+            and metadata.ddtree_parent_ids is None
+            and metadata.spec_query_start_loc is not None
+            and metadata.spec_query_start_loc.ndim == 1
+            and metadata.spec_query_start_loc.numel() >= 2
+            and metadata.spec_state_indices_tensor is not None
+            and metadata.spec_state_indices_tensor.ndim == 2
+            and metadata.spec_state_indices_tensor.shape[0] >= 1
+            and metadata.spec_state_indices_tensor.shape[1] == 8
+            and metadata.spec_state_slot_selectors is not None
+            and metadata.spec_state_slot_selectors.ndim == 1
+            and metadata.spec_state_slot_selectors.numel() >= 1
+            and metadata.spec_query_start_loc.dtype == torch.int32
+            and metadata.spec_state_indices_tensor.dtype == torch.int32
+            and metadata.spec_state_slot_selectors.dtype == torch.int32
+            and mixed_qkv.is_cuda
+            and mixed_qkv.dtype == a.dtype == b.dtype == torch.float16
+            and mixed_qkv.shape == (8, 2560)
+            and mixed_qkv.stride(1) == 1
+            and a.shape == b.shape == (8, 12)
+            and a.is_contiguous()
+            and b.is_contiguous()
+            and conv_state.dtype == torch.float16
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == 2560
+            and conv_state.shape[2] >= 10
+            and self.conv1d.weight.shape == (2560, 1, 4)
+            and self.conv1d.weight.dtype == torch.float16
+        )
+
+    def _allocate_core_attn_out(self, mixed_qkv, a, b, hidden_states):
+        factory = torch.zeros
+        # The full-forward opaque operator executes this code outside Dynamo.
+        # In traced paths, keep the existing zero allocation. Never expose an
+        # uninitialized buffer to a fallback or profiling warmup.
+        if not torch.compiler.is_compiling():
+            metadata_raw = get_forward_context().attn_metadata
+            if isinstance(metadata_raw, dict):
+                metadata = metadata_raw.get(self.prefix)
+                if isinstance(metadata, GDNAttentionMetadata):
+                    cache = getattr(self, "kv_cache", None)
+                    if cache is not None:
+                        conv_state = (
+                            cache[0]
+                            if is_conv_state_dim_first()
+                            else cache[0].transpose(-1, -2)
+                        )
+                        if self._can_use_sm70_gdn_preprocess(
+                            mixed_qkv, a, b, conv_state, metadata
+                        ):
+                            factory = torch.empty
+        return factory(
+            (mixed_qkv.shape[0], self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
     def _forward_dflash2_packed_gdn_verify(
         self,
         *,
@@ -5295,14 +5410,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_state_indices_tensor: torch.Tensor,
         spec_state_slot_selectors: torch.Tensor,
         num_spec_decodes: int,
+        precomputed_gating: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
         # Match the ordinary speculative verifier's FP32 beta materialization.
         # The gating helper otherwise defaults to the FP16 dtype of b.
-        g, beta = fused_gdn_gating(
-            self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
-        )
+        if precomputed_gating is None:
+            g, beta = fused_gdn_gating(
+                self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
+            )
+        else:
+            g, beta = precomputed_gating
         fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             A_log=self.A_log,
             a=a,
@@ -5474,8 +5593,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "core",
             )
 
+        precomputed_gating = None
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
+        if self._can_use_sm70_gdn_preprocess(
+            mixed_qkv, a, b, conv_state, attn_metadata
+        ):
+            assert spec_state_indices_tensor is not None
+            assert spec_state_slot_selectors is not None
+            assert spec_query_start_loc is not None
+            from vllm.model_executor.layers.mamba.gdn.sm70_preprocess import (
+                conv_gate_zero,
+            )
+
+            mixed_qkv_spec, g, beta = conv_gate_zero(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                spec_state_indices_tensor[:1, 0],
+                spec_state_slot_selectors[:1],
+                spec_query_start_loc[:2],
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+                core_attn_out,
+            )
+            precomputed_gating = (g, beta)
+            _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
+        elif spec_sequence_masks is not None and not ddtree_tree_gdn_pure_spec:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -5856,6 +6001,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     spec_state_indices_tensor=spec_state_indices_tensor,
                     spec_state_slot_selectors=spec_state_slot_selectors,
                     num_spec_decodes=attn_metadata.num_spec_decodes,
+                    precomputed_gating=precomputed_gating,
                 )
                 last_recurrent_state = ssm_state
                 _log_runtime_route_once(
@@ -6907,18 +7053,45 @@ def qwen_gdn_attention_core_spec_commit(
                 "core_out", layer_name, core_attn_out, metadata_source
             )
             return core_attn_out
-        mixed_qkv_spec = causal_conv1d_update(
-            mixed_qkv,
-            conv_state,
-            conv_weights,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=spec_state_indices_tensor[:, 0],
-            num_accepted_tokens=spec_state_slot_selectors,
-            query_start_loc=spec_query_start_loc,
-            max_query_len=spec_state_indices_tensor.size(-1),
-            validate_data=False,
-        )
+        precomputed_gating = None
+        if self._can_use_sm70_gdn_preprocess(
+            mixed_qkv, a, b, conv_state, attn_metadata
+        ):
+            assert spec_state_indices_tensor is not None
+            assert spec_state_slot_selectors is not None
+            assert spec_query_start_loc is not None
+            from vllm.model_executor.layers.mamba.gdn.sm70_preprocess import (
+                conv_gate_zero,
+            )
+
+            mixed_qkv_spec, g, beta = conv_gate_zero(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                spec_state_indices_tensor[:1, 0],
+                spec_state_slot_selectors[:1],
+                spec_query_start_loc[:2],
+                self.A_log,
+                a,
+                b,
+                self.dt_bias,
+                core_attn_out,
+            )
+            precomputed_gating = (g, beta)
+            _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
+        else:
+            mixed_qkv_spec = causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0],
+                num_accepted_tokens=spec_state_slot_selectors,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
         if isinstance(self, QwenGatedDeltaNetAttention) and (
             self._can_use_dflash2_packed_gdn_verify(
                 mixed_qkv=mixed_qkv_spec,
@@ -6939,6 +7112,7 @@ def qwen_gdn_attention_core_spec_commit(
                 spec_state_indices_tensor=spec_state_indices_tensor,
                 spec_state_slot_selectors=spec_state_slot_selectors,
                 num_spec_decodes=attn_metadata.num_spec_decodes,
+                precomputed_gating=precomputed_gating,
             )
             _log_runtime_route_once(
                 "SM70 DFlash2 packed GDN target-verification route hit."
@@ -7453,7 +7627,27 @@ def qwen_gdn_input_projection_core(
         layer_name,
         hidden_states,
     )
-    if _sm70_gdn_qpn8_ba_split_eligible(
+    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+        apply_gdn_ba_verify,
+    )
+
+    fused_verify_projection = None
+    if hidden_states.shape == (8, 5120) and not _sm70_gdn_projection_dump_requested(
+        layer_name
+    ):
+        fused_verify_projection = apply_gdn_ba_verify(
+            self,
+            hidden_states,
+            outputs=(
+                hidden_states.new_empty((8, 2560)),
+                z_out.view(8, 1536) if z_out.shape == (8, 12, 128) else z_out,
+                hidden_states.new_empty((8, 12)),
+                hidden_states.new_empty((8, 12)),
+            ),
+        )
+    if fused_verify_projection is not None:
+        mixed_qkv, _, b, a = fused_verify_projection
+    elif _sm70_gdn_qpn8_ba_split_eligible(
         self,
         hidden_states,
         z_out,
@@ -7488,7 +7682,29 @@ def qwen_gdn_input_projection_core(
         )
         ba = _sm70_dump_gdn_projection_tensor("input_core_in_proj_ba", layer_name, ba)
 
-        if self.gqa_interleaved_layout:
+        from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+            _can_fuse_gdn_projection_split,
+            _split_gdn_projection_tails,
+        )
+
+        copied_tails = (
+            not self.gqa_interleaved_layout
+            and not self.disable_tp_for_ba_proj
+            and mixed_qkvz.shape[0] in (5, 20)
+            and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
+            and self.value_dim // self.tp_size == 1536
+            and z_out.shape == (mixed_qkvz.shape[0], 12, 128)
+            and z_out.dtype == mixed_qkvz.dtype
+            and z_out.is_contiguous()
+            and z_out.device == mixed_qkvz.device
+            and _can_fuse_gdn_projection_split(mixed_qkvz, ba)
+        )
+        if copied_tails:
+            mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z_out)
+            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                mixed_qkv = mixed_qkv.contiguous()
+            _log_runtime_route_once("SM70 GDN projection tail-copy route hit.")
+        elif self.gqa_interleaved_layout:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 mixed_qkvz,
                 ba,
@@ -7517,11 +7733,13 @@ def qwen_gdn_input_projection_core(
             b = b.contiguous()
             a = a.contiguous()
 
-        if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
-            70
-        ):
-            z = z.contiguous()
-        z_out.copy_(z)
+        if not copied_tails:
+            if (
+                envs.VLLM_SM70_GDN_Z_CONTIGUOUS
+                and current_platform.is_device_capability(70)
+            ):
+                z = z.contiguous()
+            z_out.copy_(z)
 
     _qwen_gdn_run_recurrent_core(
         self,
@@ -7566,6 +7784,25 @@ def qwen_gdn_input_projection(
         layer_name,
         hidden_states,
     )
+    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+        apply_gdn_ba_verify,
+    )
+
+    if hidden_states.shape == (8, 5120) and not _sm70_gdn_projection_dump_requested(
+        layer_name
+    ):
+        fused_verify_projection = apply_gdn_ba_verify(
+            self,
+            hidden_states,
+            outputs=(
+                mixed_qkv_out,
+                z_out.view(8, 1536) if z_out.shape == (8, 12, 128) else z_out,
+                b_out,
+                a_out,
+            ),
+        )
+        if fused_verify_projection is not None:
+            return
     if _sm70_gdn_qpn8_ba_split_eligible(
         self,
         hidden_states,

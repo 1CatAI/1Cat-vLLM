@@ -211,14 +211,38 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "gguf_lattice_compact_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
       "prefetch=False, bool staged=False, int row_tile=0, bool "
-      "occupancy7=False) -> ()");
+      "occupancy7=False, bool stage_activation=False) -> ()");
   ops.impl("gguf_lattice_compact_mma_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_mma_sm70_out);
   ops.def(
       "gguf_lattice_compact_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor "
-      "weight, int source_type, Tensor(b!) scratch) -> ()");
+      "weight, int source_type, Tensor(b!) scratch, bool natural_layout=False, "
+      "int algorithm=99, int dq_partitions=1) "
+      "-> ()");
   ops.impl("gguf_lattice_compact_blas_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_blas_sm70_out);
+  ops.def(
+      "gguf_workspace_f16_prepare_sm70_out(Tensor(a!) out, Tensor input) -> "
+      "()");
+  ops.impl("gguf_workspace_f16_prepare_sm70_out", torch::kCUDA,
+           &gguf_workspace_f16_prepare_sm70_out);
+  ops.def(
+      "gguf_workspace_f16_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs) -> ()");
+  ops.impl("gguf_workspace_f16_gemm_sm70_out", torch::kCUDA,
+           &gguf_workspace_f16_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_tm_f16_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, int source_type, Tensor(b!) scratch, Tensor offsets, "
+      "Tensor weight_ptrs, int dq_partitions=1) -> ()");
+  ops.impl("gguf_lattice_compact_tm_f16_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_tm_f16_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_prefill_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, int source_type, Tensor(b!) partial, int splits=1, "
+      "int row_tile=64) -> ()");
+  ops.impl("gguf_lattice_compact_prefill_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_prefill_sm70_out);
   ops.def(
       "gguf_lattice_raw_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, int "
@@ -233,7 +257,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "gguf_lattice_raw_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
-      "prefetch=False) -> ()");
+      "prefetch=False, bool factor_scale=False) -> ()");
   ops.impl("gguf_lattice_raw_vec_sm70_out", torch::kCUDA,
            &gguf_lattice_raw_vec_sm70_out);
   ops.def(
@@ -383,6 +407,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+
+  ops.def(
+      "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);
+  ops.def(
+      "sm70_dflash2_fp16_dispatch_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, Tensor weight, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
+           &sm70_dflash2_fp16_dispatch_out);
 
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);

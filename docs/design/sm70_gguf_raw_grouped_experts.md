@@ -97,9 +97,21 @@ GPU checks but provides no material improvement. The row change is reverted.
 | IQ3_S | 5 | 186.065 | 68.976 |
 | IQ3_S | 20 | 288.036 | 220.812 |
 
-The token-pair implementation is retained. IQ2_S at M=20 still uses the
-canonical operator when scheduling is connected. A single-kernel counter
-sample precedes further changes; no model restart follows these tile screens.
+The token-pair implementation is retained. The central kernel capability
+declaration admits measured original batches M=1/5 for IQ2_S and M=1/5/20
+for IQ3_S. IQ2_S M=20 reports
+`measured_slower_than_canonical_grouped_gemm`; unmeasured batches and shapes
+retain canonical scheduling. Seven CPU capability tests pass. The rejection
+uses original token count, before top-k routing expands it.
+
+The current ordinary package is `1.5.2.dev548` from `4331761a4f`. Its core
+SHA256 is
+`efc4cb077ae69c45848c187a048b09683f71a3a007c8fdc2623114f0834941c7`;
+the whole wheel SHA256 is
+`eeeca72f392165b292e0fd1bc70a39b15d8247ac1a1b40dd142b266d41ee1ee1`.
+Native source matches the tested token-pair revision. Fresh-process package
+import and dependency checks pass without private library overrides.
+No model restart follows these tile screens.
 
 The checkpoint contains IQ3_XXS in 17 gate/up layers, IQ2_S in 20, IQ3_S in
 10 and IQ4_XS in one. This operator currently covers the 30 IQ2_S/IQ3_S
@@ -150,3 +162,48 @@ cycles, 47.5% of warp issue cycles, to L1TEX scoreboard dependencies. Its
 This motivates testing the existing raw vector's next-block software prefetch
 inside grouped projection. FP32 FMA/reduction order and stored blocks remain
 unchanged; that candidate still needs an unprofiled speed screen.
+
+The prefetch screen from `27db2cdd6b`, ordinary package `1.5.2.dev552`,
+passes the same twelve GPU checks, including bitwise FP32 dequantization and
+raw-vector output. The whole wheel SHA256 is
+`2533d7abe0e0ad0780447db1cf256614d56ec7b4d53f79cfb4b9169675f16617`;
+its core SHA256 is
+`8471aa2ea122cefd892d9b57851be433feb40dbc54234c1c69f6483aa3d0b53e`.
+
+| Type | M | Canonical gate/up (µs) | Prefetched original-block gate/up (µs) |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS | 1 | 46.501 | 14.688 |
+| IQ3_XXS | 5 | 75.140 | 61.533 |
+| IQ3_XXS | 20 | 287.181 | 204.927 |
+| IQ2_S | 1 | 121.934 | 16.709 |
+| IQ2_S | 5 | 159.033 | 71.027 |
+| IQ2_S | 20 | 213.728 | 235.095 |
+| IQ3_S | 1 | 147.138 | 14.819 |
+| IQ3_S | 5 | 186.113 | 62.830 |
+| IQ3_S | 20 | 287.981 | 209.994 |
+
+The prefetch is retained. IQ2_S M=20 still rejects vector dispatch. The
+30 IQ2_S/IQ3_S layers project 2.993 ms less M=5 gate/up service. These are
+operator results with synthetic routing, separate from model throughput.
+The kernel capability also admits measured IQ3_XXS M=1/5/20 when an original
+bank is retained; missing storage reports `original_expert_bank_not_retained`.
+Nine CPU capability tests cover the measured points and fallback reasons.
+
+## Decoder interface synchronization
+
+Source `39de67b1dd` synchronizes the lattice decoder dependency at
+`7418b9af4f` and retains the joint grouped operator alongside compact prefill.
+The removed vector scale option does not alter the grouped FP32 arithmetic.
+The ordinary source-containing package `1.5.2.dev816+g39de67b1d` passes
+16 GPU checks: twelve joint grouped cases and four vector/dequantization
+cases. All 18 raw/grouped-down CPU capability checks pass, as do 213 package
+dependency checks. Fresh import resolves the shipped core and standard
+Torch/CUDA libraries without preload or a private build dependency.
+
+Whole wheel SHA256:
+`09d298f5a2434c67d5b37d1c6fcae578329d53c4252206f3887d0b4658d822d3`.
+Core SHA256:
+`9908f739bba208ba7b5b8210956e0a7c8ccf8cd8bd213d2ab42c44f42290fb03`.
+This interface synchronization adds no new speed measurement; the cold-bank
+operator results above and the separately documented model composition retain
+their original source and artifact provenance.

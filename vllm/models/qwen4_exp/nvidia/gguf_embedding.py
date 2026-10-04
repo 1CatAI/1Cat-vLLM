@@ -225,6 +225,16 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
         remote = ids >= self._device_rows + self._host_rows
         if remote_rows is None and self._disk_rows:
             raise ValueError("PLE GGUF disk rows require offloader output")
+        if self._device_rows == 0 and self._host_rows == 0:
+            if (
+                remote_rows is None
+                or remote_rows.dtype != self._output_dtype
+                or remote_rows.numel() != ids.numel() * self.embedding_dim
+            ):
+                raise ValueError("PLE GGUF remote rows have invalid dtype or width")
+            # There is no resident row zero to gather in a disk-only placement.
+            # Retain independent output storage from the offloader's buffer.
+            return remote_rows.reshape(*input_.shape, self.embedding_dim).clone()
         if remote_rows is not None:
             ids = torch.where(remote, 0, ids)
         packet = torch.empty(
