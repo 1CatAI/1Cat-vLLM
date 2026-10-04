@@ -906,3 +906,30 @@ reductions disabled. The benchmark captures a temporary `[M,N]` FP32 result
 and its final FP16 copy in the same graph as temporary dequantization.
 Persistent weights retain the original equal-byte budget. Numerical checks
 and complete-path Flash gate M512 timing remain pending.
+
+## FP32 output workspace complete-path result
+
+Source `790cf01988` passes all 28 checks (8.88 s), including FP32 output
+with final FP16 conversion, tails, changed-input graphs and exact cancellation
+for both output dtypes. The Flash gate M512 complete-path result is:
+
+| Path | Unprofiled full-graph µs | Output relative L2 |
+| --- | ---: | ---: |
+| Canonical fused lattice GEMM | 93.852 | 0.0004092 |
+| Compact default NN, FP16 output | 125.834 | 0.0002072 |
+| Compact algorithm 2 NN, FP16 output | 97.277 | 0.0002072 |
+| Compact default NN, FP32 output plus FP16 conversion | 97.105 | 0.0002072 |
+| Compact default TN, FP32 output plus FP16 conversion | 103.958 | 0.0002072 |
+
+The screening margin does not survive complete-path timing: FP32 workspace
+output is effectively tied with algorithm 2 FP16 output and remains 3.5%
+slower than this canonical control. No model/default switch or expansion to
+other shapes follows this result. The FP32 result remains a correctness
+control; there is no persistent storage change.
+
+The measured core SHA256 is
+`11f8495b6c40551302bd269ce84aa54401e478faf52c11354f048f3175910c0a`.
+The wheel's distribution version and Python version string differed because
+a documentation commit landed between packaging phases. The binary source
+was unchanged. A clean fixed-commit repackaging must reconcile the version
+strings and preserve this core hash before publishing the package.
