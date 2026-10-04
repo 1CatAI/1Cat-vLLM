@@ -51,10 +51,14 @@ A fixture selector reduces work while keeping the frozen prompt unchanged.
 
 Then collect one node trace with `--node-trace --fixture <same fixture>` and
 Nsight Systems `--trace=cuda,nvtx --sample=none
---cuda-graph-trace=node:host-only --capture-range=cudaProfilerApi`.
+--cuda-graph-trace=node:host-only --cpuctxsw=none
+--capture-range=cudaProfilerApi`.
 Trace admission is always false. Annotations are installed after graph capture;
 they preserve FULL graphs and distinguish target M5, draft step 0 at its real
 width, draft steps 1--3, target head/sample, preparation and handoff.
+Reset the prefix cache before both control and traced requests: cached GDN
+prefill/chunk boundaries can change outputs. Require matching token tapes and
+round counts before treating a trace as matched.
 Report the profiled endpoint round mean beside the unprofiled control. Do not
 rescale kernel service sums to make them equal to unprofiled wall time.
 
@@ -143,3 +147,9 @@ prompt hashes, complete token IDs, sampling, request timestamps and counters.
 Both fixtures fail the 15-ms target. Node attribution, measured traffic,
 quality/distribution and C4 admission remain pending. No structural-kernel
 speed claim is made.
+
+The initial node capture reused the warm prefix cache, produced a different
+token tape and measured 28.107 ms over 300 rounds. It is a rejected comparison;
+its service times do not decompose the 21.835-ms control. The diagnostic harness
+now resets the prefix cache exactly as speed admission does, and the recapture
+disables CPU context-switch tracing. Calibration remains pending.

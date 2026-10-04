@@ -196,8 +196,9 @@ def main() -> None:
             )
             # Warm this exact prompt/shape before measuring its requests.
             for repeat in range(-1, args.repeats):
-                if not args.node_trace or repeat < 0:
-                    llm.reset_prefix_cache()
+                # Keep prefill/chunk boundaries identical to the speed control.
+                # Reusing a cached GDN state can change the greedy token tape.
+                llm.reset_prefix_cache()
                 before = _metric_snapshot(llm)
                 traced = args.node_trace and repeat >= 0
                 if traced:
