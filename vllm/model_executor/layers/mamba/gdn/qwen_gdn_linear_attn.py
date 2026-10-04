@@ -4240,7 +4240,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and use_sm70_decode_graph_semantics()
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        if use_qwen38_fused_input:
+        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+            apply_gdn_ba_verify,
+        )
+
+        fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        if fused_verify_projection is not None:
+            mixed_qkv, z, b, a = fused_verify_projection
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+        elif use_qwen38_fused_input:
             assert self.in_proj_ba is not None
             mixed_qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
                 hidden_states,
