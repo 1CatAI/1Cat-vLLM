@@ -64,5 +64,11 @@ I1024/O128, two repeats, max length 33024, batch 8192 and 16 sequence slots:
 Prefill reports engine prefill time separately from wall/queue/decode. The
 decode differences are within 1.8%; prefill does not regress. This is a
 matched model measurement, not a claim based on kernel service-time sums.
-The four frozen needle quality cases are still running with the original
-prompts, seeds, sampling, natural EOS and 262144-token model limit.
+All four frozen needle quality cases pass at targets 8192, 32768, 131072 and
+258048, with natural EOS. Prompt token hashes match the preceding run exactly;
+temperature 1, top-p 0.95, top-k 20, original seeds, output limit 4096 and
+262144-token model limit are preserved. The previous 128K/258048 failures
+emitted 4096 repeated `!` tokens; the corrected route returns both keys.
+This rerun covers the four affected long-context cases. The preceding 32
+short code, arithmetic and Chinese cases used unchanged attention routes.
+GGUF model integration will repeat the needle checks with its corrected wheel.
