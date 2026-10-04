@@ -600,3 +600,56 @@ proof does not substitute for device validation: the new focused GPU checks
 cover every finite block scale, signed zero, subnormals, overflow boundaries
 and all small coefficients against the official reader. Numerical and speed
 validation of this candidate remains pending.
+
+## Exact operand device and graph results
+
+Source `f2de1df460`, core SHA256
+`01558584aeaaf91c23dd00a8434c77e82481f4ed63234c9d8c86384be6a2ca91`,
+whole-wheel SHA256
+`0364b5822501bb7a4e0e2f49415562f8635491886c98a874f963eb9540da467d`.
+All 24 checks pass (7.84 s). The GPU final-weight bit comparisons match the
+official FP32 reader conversion for every finite FP16 block-scale encoding,
+all small coefficients and both signs, including subnormal/overflow boundaries.
+Float output and vector FMA preserve the original FP32 path. The four changed
+M points below retain the graph/bank/CTA contract. Times are µs/projection.
+
+| Projection | M | Canonical | Best original/equal-byte | Candidate |
+| --- | ---: | ---: | ---: | --- |
+| 27B gate | 5 | 33.031 | 31.743 | compact_mma_prefetch_split3 |
+| 27B gate | 8 | 33.174 | 33.433 | compact_mma_prefetch_split3 |
+| 27B gate | 16 | 39.463 | 50.704 | compact_mma_staged_split3 |
+| 27B gate | 512 | 366.340 | 364.399 | compact_dequant_cublas |
+| 27B down | 5 | 31.849 | 28.706 | compact_mma_prefetch_split4 |
+| 27B down | 8 | 34.416 | 30.010 | compact_mma_prefetch_split4 |
+| 27B down | 16 | 37.903 | 51.207 | compact_mma_staged_split2 |
+| 27B down | 512 | 340.191 | 337.450 | compact_dequant_cublas |
+| IQ3_S expert | 5 | 17.354 | 7.420 | compact_mma_staged_split10 |
+| IQ3_S expert | 8 | 17.735 | 7.452 | compact_mma_staged_split10 |
+| IQ3_S expert | 16 | 17.326 | 8.640 | compact_mma_staged_split10 |
+| IQ3_S expert | 512 | 69.081 | 26.942 | compact_dequant_cublas |
+| IQ2_S expert | 5 | 19.915 | 9.567 | compact_mma_staged_split10 |
+| IQ2_S expert | 8 | 19.942 | 9.605 | compact_mma_staged_split10 |
+| IQ2_S expert | 16 | 20.097 | 10.954 | compact_mma_staged_split10 |
+| IQ2_S expert | 512 | 64.113 | 30.441 | compact_dequant_cublas |
+| Flash gate | 5 | 20.948 | 10.039 | compact_mma_prefetch_split10 |
+| Flash gate | 8 | 18.515 | 10.317 | compact_mma_prefetch_split10 |
+| Flash gate | 16 | 21.358 | 14.038 | compact_mma_prefetch_split10 |
+| Flash gate | 512 | 90.160 | 126.530 | compact_dequant_cublas |
+| Flash output | 5 | 15.870 | 9.900 | compact_mma_prefetch_split6 |
+| Flash output | 8 | 15.855 | 10.232 | compact_mma_prefetch_split6 |
+| Flash output | 16 | 17.606 | 13.625 | compact_mma_prefetch_split6 |
+| Flash output | 512 | 81.825 | 87.589 | compact_dequant_cublas |
+
+Dense 27B M5/M8 and M512 reach approximate parity or improve, but M16 is
+still 28–35% slower. Flash dense M512 still loses. No model default or storage
+removal is promoted from these partial results.
+
+A current M16 node recapture is deferred after a shared GPU lock timeout;
+that timeout is not a numerical failure. Existing staged-node counters show
+the register limit admits six CTAs/SM while shared memory permits seven.
+The current compiled staged kernel still uses 78 registers/thread. The next
+candidate retains the same inlined computation body but constrains register
+allocation to admit seven CTAs/SM. Its original entry point remains the
+comparison. An eight-CTA budget produces an eight-byte stack allocation and
+is rejected before GPU timing. The seven-CTA variant must pass resource,
+FP32 numerical and matched full-graph performance checks before selection.

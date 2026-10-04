@@ -219,7 +219,10 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
             plans += [(split, True, False, 8) for split in (1, 3)]
             if n % 32 == 0:
                 plans += [(split, True, True, 8) for split in (1, 3)]
-        for split, variant, staged, row_tile in plans:
+        bounded_plans = [(*plan, False) for plan in plans]
+        if m == 16:
+            bounded_plans += [(*plan, True) for plan in plans if plan[3] == 0]
+        for split, variant, staged, row_tile, bounded in bounded_plans:
             partials = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
             if m == 512:
                 run = partial(
@@ -245,7 +248,7 @@ def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
                     partials,
                     split,
                     variant,
-                    *([staged, row_tile] if m != 1 else []),
+                    *([staged, row_tile, bounded] if m != 1 else []),
                 )
             for _ in range(3):
                 run()

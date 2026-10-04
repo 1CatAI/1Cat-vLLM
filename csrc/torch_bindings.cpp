@@ -210,7 +210,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "gguf_lattice_compact_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
       "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
-      "prefetch=False, bool staged=False, int row_tile=0) -> ()");
+      "prefetch=False, bool staged=False, int row_tile=0, bool "
+      "occupancy7=False) -> ()");
   ops.impl("gguf_lattice_compact_mma_sm70_out", torch::kCUDA,
            &gguf_lattice_compact_mma_sm70_out);
   ops.def(

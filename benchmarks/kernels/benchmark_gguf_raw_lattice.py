@@ -66,6 +66,7 @@ def main():
         default=[0],
         help="Compact MMA row tiles: 0 selects automatically",
     )
+    p.add_argument("--include-occupancy7", action="store_true")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--profile", choices=("canonical", "raw"))
     p.add_argument(
@@ -369,8 +370,13 @@ def main():
                         variants = [("", False, False), ("_prefetch", True, False)]
                         if n % 32 == 0:
                             variants.append(("_staged", True, True))
-                        for name, prefetch, staged in variants:
+                        variants = [(*variant, False) for variant in variants]
+                        if a.include_occupancy7 and mt == 16:
+                            variants += [(*variant[:3], True) for variant in variants]
+                        for name, prefetch, staged, bounded in variants:
                             tile_name = f"_rows{row_tile}" if row_tile else ""
+                            if bounded:
+                                tile_name += "_occupancy7"
                             candidates.append(
                                 (
                                     f"compact_mma{name}{tile_name}_split{split}",
@@ -385,6 +391,7 @@ def main():
                                         prefetch,
                                         staged,
                                         row_tile,
+                                        bounded,
                                     ),
                                 )
                             )

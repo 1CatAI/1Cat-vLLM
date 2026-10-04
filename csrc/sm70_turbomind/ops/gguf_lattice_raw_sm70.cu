@@ -146,9 +146,11 @@ __global__ void reduce_vec(half* out, const float* partial, int n, int splits) {
 
 template <int Type, int NT, int MT, bool Compact = false,
           bool FullWidth = false, bool Prefetch = false, bool Staged = false>
-__global__ void raw_mma_kernel(half* out, float* partial, const half* x,
-                               const uint8_t* weight, int m, int n, int k,
-                               int stride, int splits) {
+__device__ __forceinline__ void raw_mma_body(half* out, float* partial,
+                                             const half* x,
+                                             const uint8_t* weight, int m,
+                                             int n, int k, int stride,
+                                             int splits) {
   using Decode = vllm::sm70_gguf::LatticeRawDecoder<Type>;
   using Packed = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
   using MMA = turbomind::gemm::SM70_MMA_884;
@@ -342,6 +344,23 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
   }
 }
 
+template <int Type, int NT, int MT, bool Compact = false,
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+__global__ void raw_mma_kernel(half* out, float* partial, const half* x,
+                               const uint8_t* weight, int m, int n, int k,
+                               int stride, int splits) {
+  raw_mma_body<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>(
+      out, partial, x, weight, m, n, k, stride, splits);
+}
+
+template <int Type, bool FullWidth, bool Prefetch, bool Staged>
+__global__ __launch_bounds__(128, 7) void bounded_mma_kernel(
+    half* out, float* partial, const half* x, const uint8_t* weight, int m,
+    int n, int k, int stride, int splits) {
+  raw_mma_body<Type, 32, 16, true, FullWidth, Prefetch, Staged>(
+      out, partial, x, weight, m, n, k, stride, splits);
+}
+
 template <int Type>
 __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
                                        int n, int blocks, int stride,
@@ -504,18 +523,29 @@ __global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool Bounded = false>
 void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
                 torch::Tensor partial, int splits, cudaStream_t stream) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   const dim3 grid((n + NT - 1) / NT, (m + MT - 1) / MT, splits);
-  raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>
-      <<<grid, 128, 0, stream>>>(
-          reinterpret_cast<half*>(out.data_ptr()),
-          splits > 1 ? partial.data_ptr<float>() : nullptr,
-          reinterpret_cast<const half*>(input.data_ptr()),
-          weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
-          splits);
+  if constexpr (Bounded && MT == 16) {
+    static_assert(Compact && NT == 32);
+    bounded_mma_kernel<Type, FullWidth, Prefetch, Staged>
+        <<<grid, 128, 0, stream>>>(
+            reinterpret_cast<half*>(out.data_ptr()),
+            splits > 1 ? partial.data_ptr<float>() : nullptr,
+            reinterpret_cast<const half*>(input.data_ptr()),
+            weight.data_ptr<uint8_t>(), m, n, k, 0, splits);
+  } else {
+    raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>
+        <<<grid, 128, 0, stream>>>(
+            reinterpret_cast<half*>(out.data_ptr()),
+            splits > 1 ? partial.data_ptr<float>() : nullptr,
+            reinterpret_cast<const half*>(input.data_ptr()),
+            weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
+            splits);
+  }
 }
 void validate_raw(torch::Tensor w, int type, int64_t n, int64_t k) {
   TORCH_CHECK(type == 21 || type == 22, "Unsupported raw GGUF lattice type");
@@ -872,7 +902,7 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                                        int64_t source_type,
                                        torch::Tensor partial, int64_t splits,
                                        bool prefetch, bool staged,
-                                       int64_t row_tile) {
+                                       int64_t row_tile, bool occupancy7) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -889,44 +919,53 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
       row_tile == 0 || row_tile == 8 || row_tile == 16 || row_tile == 32,
       "Compact MMA row tile must be auto, 8, 16, or 32");
   const int mt = row_tile ? row_tile : m <= 8 ? 8 : m <= 16 ? 16 : 32;
+  TORCH_CHECK(!occupancy7 || mt == 16,
+              "Seven-CTA calibration requires a 16-row tile");
   TORCH_CHECK(!staged || n % 32 == 0,
               "Compact shared staging requires complete N32 tiles");
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_MMA(TYPE, FULL, PREFETCH, STAGED)           \
-  if (mt == 8)                                              \
-    launch_mma<TYPE, 32, 8, true, FULL, PREFETCH, STAGED>(  \
-        out, input, weight, partial, splits, stream);       \
-  else if (mt == 16)                                        \
-    launch_mma<TYPE, 32, 16, true, FULL, PREFETCH, STAGED>( \
-        out, input, weight, partial, splits, stream);       \
-  else                                                      \
-    launch_mma<TYPE, 32, 32, true, FULL, PREFETCH, STAGED>( \
+#define COMPACT_MMA(TYPE, FULL, PREFETCH, STAGED, BOUNDED)           \
+  if (mt == 8)                                                       \
+    launch_mma<TYPE, 32, 8, true, FULL, PREFETCH, STAGED, BOUNDED>(  \
+        out, input, weight, partial, splits, stream);                \
+  else if (mt == 16)                                                 \
+    launch_mma<TYPE, 32, 16, true, FULL, PREFETCH, STAGED, BOUNDED>( \
+        out, input, weight, partial, splits, stream);                \
+  else                                                               \
+    launch_mma<TYPE, 32, 32, true, FULL, PREFETCH, STAGED, BOUNDED>( \
         out, input, weight, partial, splits, stream)
-#define COMPACT_SELECT(TYPE, FULL)         \
-  if (prefetch) {                          \
-    COMPACT_MMA(TYPE, FULL, true, false);  \
-  } else {                                 \
-    COMPACT_MMA(TYPE, FULL, false, false); \
+#define COMPACT_SELECT(TYPE, FULL, BOUNDED)         \
+  if (prefetch) {                                   \
+    COMPACT_MMA(TYPE, FULL, true, false, BOUNDED);  \
+  } else {                                          \
+    COMPACT_MMA(TYPE, FULL, false, false, BOUNDED); \
   }
-  if (staged) {
-    if (source_type == 21) {
-      COMPACT_MMA(21, true, true, true);
-    } else {
-      COMPACT_MMA(22, true, true, true);
-    }
-  } else if (source_type == 21) {
-    if (n % 32 == 0) {
-      COMPACT_SELECT(21, true);
-    } else {
-      COMPACT_SELECT(21, false);
-    }
+#define COMPACT_DISPATCH(BOUNDED)                 \
+  if (staged) {                                   \
+    if (source_type == 21) {                      \
+      COMPACT_MMA(21, true, true, true, BOUNDED); \
+    } else {                                      \
+      COMPACT_MMA(22, true, true, true, BOUNDED); \
+    }                                             \
+  } else if (source_type == 21) {                 \
+    if (n % 32 == 0) {                            \
+      COMPACT_SELECT(21, true, BOUNDED);          \
+    } else {                                      \
+      COMPACT_SELECT(21, false, BOUNDED);         \
+    }                                             \
+  } else {                                        \
+    if (n % 32 == 0) {                            \
+      COMPACT_SELECT(22, true, BOUNDED);          \
+    } else {                                      \
+      COMPACT_SELECT(22, false, BOUNDED);         \
+    }                                             \
+  }
+  if (occupancy7) {
+    COMPACT_DISPATCH(true);
   } else {
-    if (n % 32 == 0) {
-      COMPACT_SELECT(22, true);
-    } else {
-      COMPACT_SELECT(22, false);
-    }
+    COMPACT_DISPATCH(false);
   }
+#undef COMPACT_DISPATCH
 #undef COMPACT_SELECT
 #undef COMPACT_MMA
   if (splits > 1)
