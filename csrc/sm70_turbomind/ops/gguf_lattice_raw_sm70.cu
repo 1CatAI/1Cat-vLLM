@@ -78,7 +78,7 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
   }
 }
 
-template <int Type, bool Split, bool Prefetch = false>
+template <int Type, bool Split, bool Prefetch = false, bool FactorBase = false>
 __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int n, int k, int stride,
                                int splits) {
@@ -113,16 +113,26 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
       data = raw[warp] + (block * bytes & 7);
     else
       data = stage_block<Type>(raw[warp], row_data, block, stride);
-    const auto values = Decode::fragment(data, lane * 8, grid);
+    const auto values =
+        Decode::template fragment<float, !FactorBase>(data, lane * 8, grid);
     // K is block aligned and each lane owns eight adjacent half values.
     // One 128-bit load replaces eight strided 16-bit memory instructions.
     const uint4 loaded =
         *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
     const auto& activation =
         reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
+    if constexpr (FactorBase) {
+      float local = 0.f;
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      sum = fmaf(__half2float(activation[i]), values[i], sum);
+      for (int i = 0; i < 8; ++i)
+        local = fmaf(__half2float(activation[i]), values[i], local);
+      sum =
+          fmaf(__half2float(*reinterpret_cast<const half*>(data)), local, sum);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        sum = fmaf(__half2float(activation[i]), values[i], sum);
+    }
     __syncwarp();
     if constexpr (Prefetch) {
       if (load_next) reinterpret_cast<uint64_t*>(raw[warp])[lane] = next_word;
@@ -733,7 +743,7 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch) {
+                                   bool prefetch, bool factor_base) {
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() &&
                   input.scalar_type() == torch::kFloat16 &&
@@ -753,30 +763,37 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                 "Raw GGUF split-K requires FP32 partial storage");
   const dim3 grid((n + 3) / 4, splits);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define RAW_VEC(TYPE, PREFETCH)                                             \
-  if (splits == 1)                                                          \
-    raw_vec_kernel<TYPE, false, PREFETCH><<<grid, 128, 0, stream>>>(        \
-        reinterpret_cast<half*>(out.data_ptr()), nullptr,                   \
-        reinterpret_cast<const half*>(input.data_ptr()),                    \
-        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits);          \
-  else                                                                      \
-    raw_vec_kernel<TYPE, true, PREFETCH><<<grid, 128, 0, stream>>>(         \
-        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), \
-        reinterpret_cast<const half*>(input.data_ptr()),                    \
+#define RAW_VEC(TYPE, PREFETCH, FACTOR)                                      \
+  if (splits == 1)                                                           \
+    raw_vec_kernel<TYPE, false, PREFETCH, FACTOR><<<grid, 128, 0, stream>>>( \
+        reinterpret_cast<half*>(out.data_ptr()), nullptr,                    \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits);           \
+  else                                                                       \
+    raw_vec_kernel<TYPE, true, PREFETCH, FACTOR><<<grid, 128, 0, stream>>>(  \
+        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),  \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
         weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
-  if (prefetch) {
-    if (source_type == 21) {
-      RAW_VEC(21, true);
+#define SELECT_RAW_VEC(TYPE, FACTOR) \
+  if (prefetch) {                    \
+    RAW_VEC(TYPE, true, FACTOR);     \
+  } else {                           \
+    RAW_VEC(TYPE, false, FACTOR);    \
+  }
+  if (source_type == 21) {
+    if (factor_base) {
+      SELECT_RAW_VEC(21, true);
     } else {
-      RAW_VEC(22, true);
+      SELECT_RAW_VEC(21, false);
     }
   } else {
-    if (source_type == 21) {
-      RAW_VEC(21, false);
+    if (factor_base) {
+      SELECT_RAW_VEC(22, true);
     } else {
-      RAW_VEC(22, false);
+      SELECT_RAW_VEC(22, false);
     }
   }
+#undef SELECT_RAW_VEC
 #undef RAW_VEC
   if (splits > 1)
     reduce_vec<<<(n + 255) / 256, 256, 0, stream>>>(

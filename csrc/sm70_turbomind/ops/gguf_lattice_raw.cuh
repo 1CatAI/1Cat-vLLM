@@ -90,11 +90,13 @@ struct LatticeRawDecoder {
 
   // Eight consecutive K values. Both scales are multiplied in FP32 before
   // multiplying grid values. No FP16 expanded coefficient exists in storage.
-  template <class Output = float>
+  template <class Output = float, bool ApplyBaseScale = true>
   __device__ static turbomind::Array<Output, 8> fragment(const uint8_t* block,
                                                          int base,
                                                          const uint8_t* grid) {
-    const float d = __half2float(*reinterpret_cast<const half*>(block));
+    const float d = ApplyBaseScale
+                        ? __half2float(*reinterpret_cast<const half*>(block))
+                        : 1.f;
     const int octet = base / 8;
     const uint8_t high = block[66 + base / 32];
     const uint8_t signs = block[(Type == 21 ? 74 : 34) + octet];

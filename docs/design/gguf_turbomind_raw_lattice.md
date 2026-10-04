@@ -1161,3 +1161,17 @@ additional FP16 registry tiles also provide no measured workspace improvement
 and are removed. The experimental FP16 workspace operator remains a declared
 compact-layout capability at M>=512, with an explicit output-pack alignment
 rejection for N tails; declaring support does not select a model default.
+
+The cleaned normal wheel passes 40 checks. NCU for the two-partition Flash gate
+dequantizer reports 1,731,392 DRAM read bytes, 72.01% active warps and 42.73%
+long-scoreboard stall, versus 1,696,064 bytes, 32.66% and 75.64% for the earlier
+four-warp single-partition reference. Metadata/cache traffic increases slightly;
+persistent storage remains 1,689,600 bytes. Its cuBLAS node reads 10,505,600 bytes
+and remains at 7.67% active warps. Profiled service times are not TPOT.
+
+The next M1 candidate factors the original block d out of each lane's
+eight-element local dot product. Small-scale/grid coefficients, local FMA,
+base-scale FMA and final reductions all use FP32. The alternative changes the
+summation order, so it requires the same official-weight dot-product error gate;
+FP32 dequantization and final MMA operand formation are unchanged. The existing
+vector schedule remains the default until a measured candidate passes.
