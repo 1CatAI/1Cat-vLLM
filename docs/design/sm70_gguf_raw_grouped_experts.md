@@ -115,3 +115,38 @@ python benchmarks/kernels/benchmark_gguf_raw_grouped.py MODEL.gguf \
 python benchmarks/kernels/benchmark_gguf_raw_grouped.py MODEL.gguf \
   --layer 17 --rank 0 --m 1 5 20 --output IQ3_S.json
 ```
+
+## IQ3_XXS and counter follow-up
+
+IQ3_XXS extends the same decoder family with its original four-bit scale and
+seven-bit sign index; the eighth sign is parity. Its shared grid is the
+existing TurboMind codebook. Twelve packaged GPU checks pass for the three
+formats at M=1/5/20/32, including bitwise FP32 dequantization against the
+official reader, bitwise raw-vector projection and graph replay.
+Source `9ac70e3988`, ordinary package `1.5.2.dev551`, core SHA256
+`c91aa91eedd66dced71b1eb3af7be84a66fde37f9128ddc26969c31c91fd6f35`.
+
+Layer 0 provides the real IQ3_XXS gate/up pair. The same six-bank cold sweep
+selects the existing canonical vector at M=1/5 and grouped GEMM at M=20.
+
+| Type | M | Canonical gate/up (µs) | Joint original-block gate/up (µs) |
+| --- | ---: | ---: | ---: |
+| IQ3_XXS | 1 | 45.394 | 14.170 |
+| IQ3_XXS | 5 | 75.175 | 62.690 |
+| IQ3_XXS | 20 | 286.525 | 208.448 |
+
+At M=5, maximum projection relative L2 decreases from 3.65e-4 to 2.09e-4.
+Across 17 corresponding layers, the M=5 saving projects only 0.212 ms;
+M=20 projects 1.327 ms. Retaining both original and canonical banks adds
+approximately 2.55 GiB per TP4 rank for these layers. Default model dispatch
+has not admitted this storage tradeoff; unsupported batches retain canonical
+storage and operators.
+
+An isolated Nsight Compute sample of IQ2_S M=5 reports 147.79 GB/s memory
+throughput, 16.64% DRAM throughput, 62.19% SM throughput, theoretical occupancy
+62.50% and achieved occupancy 58.48%. The issue-stall rule attributes 6.9
+cycles, 47.5% of warp issue cycles, to L1TEX scoreboard dependencies. Its
+87.584 µs duration is instrumented and must not replace the graph benchmark.
+This motivates testing the existing raw vector's next-block software prefetch
+inside grouped projection. FP32 FMA/reduction order and stored blocks remain
+unchanged; that candidate still needs an unprofiled speed screen.
