@@ -174,5 +174,11 @@ The loading rerun reached the correct DFlash2 constructor and enabled the
 TP4 output-sharded 25600-to-5120 context projection and existing
 range-preserving arithmetic. It then stopped when the local GGUF filename
 was passed to a repository lookup. The fix passes the installed-wheel CPU
-suite; complete draft loading, generation, speed and numerical gates remain
-pending.
+suite. Full target and draft loading and engine warmup now complete on all
+four ranks, with about 4.99 GiB of model allocation per rank. Startup takes
+485 seconds; this is initialization time, not inference latency. A diagnostic
+call stopped the probe before generation because safe serialization rejects
+function-valued RPC arguments. Use the existing worker-extension interface
+and a named RPC for the read-only buffer inventory. Secure message encoding,
+method-name compatibility and spawned extension import pass CPU checks.
+Generation, graph speed and numerical gates remain pending.
