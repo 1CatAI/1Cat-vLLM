@@ -128,7 +128,42 @@ def test_loader_filters_before_payload_iteration(monkeypatch):
     assert len(names) == 2
 
 
-@pytest.mark.parametrize("placement", ["device", "host", "split_disk"])
+def test_disk_only_placement_never_gathers_missing_resident_rows(monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import gguf_embedding as packed
+
+    module = object.__new__(packed.Qwen4ExpPackedGGUFEmbedding)
+    torch.nn.Module.__init__(module)
+    module._device_rows = module._host_rows = 0
+    module._disk_rows = 128
+    module._output_dtype = torch.float16
+    module.embedding_dim = 4
+    module._storage_dim = 8
+    module.layer_name = "ple.missing.resident"
+
+    def unexpected_gather(*_args):
+        raise AssertionError("Disk-only placement has no resident pointer")
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "qwen4_exp_ple_packed_gather", unexpected_gather
+    )
+    ids = torch.tensor([[7, 9], [9, 1]])
+    # Exercise the GPU dispatch decision using CPU buffers. Any resident gather
+    # would need missing pointers and must be skipped before allocation.
+    request = SimpleNamespace(
+        device=torch.device("cuda"), reshape=ids.reshape, shape=ids.shape
+    )
+    rows = torch.arange(16, dtype=torch.float16).reshape(4, 4)
+    actual = module.embedding_lookup(request, rows)
+    torch.testing.assert_close(actual, rows.reshape(2, 2, 4), rtol=0, atol=0)
+    assert actual.data_ptr() != rows.data_ptr()
+    for invalid in (rows.float(), rows[:, :3]):
+        with pytest.raises(ValueError, match="invalid dtype or width"):
+            module.embedding_lookup(request, invalid)
+    with pytest.raises(ValueError, match="require offloader output"):
+        module.embedding_lookup(request)
+
+
+@pytest.mark.parametrize("placement", ["device", "host", "split_disk", "disk"])
 def test_gpu_packets_match_cpu_and_changed_graph_ids(monkeypatch, tmp_path, placement):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA test")
@@ -148,14 +183,14 @@ def test_gpu_packets_match_cpu_and_changed_graph_ids(monkeypatch, tmp_path, plac
     module = packed.Qwen4ExpPackedGGUFEmbedding(
         128, 160, torch.float16, 128, "ple.gpu.rows", method
     )
-    host_rows = {"device": 0, "host": 128, "split_disk": 64}[placement]
-    vram_budget = 32 * 90 if placement == "split_disk" else None
+    host_rows = {"device": 0, "host": 128, "split_disk": 64, "disk": 0}[placement]
+    vram_budget = {"split_disk": 32 * 90, "disk": 0}.get(placement)
     plan = plan_ple_placement(
         total_rows=128,
         row_bytes=90,
         host_budget_bytes=host_rows * 90,
         vram_budget_bytes=vram_budget,
-        disk_allowed=placement == "split_disk",
+        disk_allowed=placement in ("split_disk", "disk"),
     )
     monkeypatch.setattr(module, "_plan_placement", lambda _: plan)
     monkeypatch.setattr(
