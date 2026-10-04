@@ -27,7 +27,7 @@ def load_weights(model, role, rank):
     suffix = (
         ".mlp.gate.weight"
         if role == "router"
-        else ".mlp.shared_expert.gate_up_proj.weight"
+        else ".mlp.shared_expert.gate_proj.weight"
     )
     names = sorted(n for n in index if "mtp" not in n and n.endswith(suffix))
     assert len(names) == 48
@@ -42,13 +42,16 @@ def load_weights(model, role, rank):
                 )
             w = handles[file].get_tensor(name)
             if role == "shared":
-                assert tuple(w.shape) == (1280, 2560)
-                w = torch.cat(
-                    (
-                        w[rank * 160 : (rank + 1) * 160],
-                        w[640 + rank * 160 : 640 + (rank + 1) * 160],
+                up_name = name.replace(".gate_proj.weight", ".up_proj.weight")
+                up_file = index[up_name]
+                if up_file not in handles:
+                    handles[up_file] = stack.enter_context(
+                        safe_open(model / up_file, framework="pt")
                     )
-                )
+                up = handles[up_file].get_tensor(up_name)
+                assert tuple(w.shape) == tuple(up.shape) == (640, 2560)
+                lo, hi = rank * 160, (rank + 1) * 160
+                w = torch.cat((w[lo:hi], up[lo:hi]))
             result.append(w.to(device="cuda", dtype=torch.float16).contiguous())
     return names, result
 
