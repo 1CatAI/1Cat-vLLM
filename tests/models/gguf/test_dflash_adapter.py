@@ -192,3 +192,37 @@ def test_dense_auxiliaries_decode_without_qwen35_norm_offsets():
     )
     assert "layers.0.self_attn.q_proj.qweight_type" in weights
     assert "candidate_selector.predecessor_codebook.qweight_type" not in weights
+
+
+def test_gguf_loader_honors_draft_model_config(monkeypatch):
+    from vllm.model_executor.model_loader import gguf_loader
+    from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+
+    target = SimpleNamespace(name="target")
+    draft = SimpleNamespace(dtype=torch.float16, hf_config=SimpleNamespace())
+    engine = SimpleNamespace(
+        model_config=target,
+        device_config=SimpleNamespace(device="cpu"),
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        quant_config=SimpleNamespace(unquantized_modules=[]),
+    )
+    loader = GGUFModelLoader.__new__(GGUFModelLoader)
+    monkeypatch.setattr(loader, "_prepare_weights", lambda *_: "draft.gguf")
+    monkeypatch.setattr(loader, "_get_gguf_weights_map", lambda *_: {})
+    monkeypatch.setattr(loader, "_get_all_gguf_files", lambda *_: [])
+    monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *_: {})
+    loaded = []
+    monkeypatch.setattr(
+        loader, "load_weights", lambda model, config: loaded.append(config)
+    )
+
+    def initialize(*, vllm_config, model_config, prefix):
+        assert vllm_config.model_config is target
+        assert model_config is draft
+        assert prefix == "draft"
+        return torch.nn.Module()
+
+    monkeypatch.setattr(gguf_loader, "initialize_model", initialize)
+    monkeypatch.setattr(gguf_loader, "process_weights_after_loading", lambda *_: None)
+    loader.load_model(engine, draft, prefix="draft")
+    assert loaded == [draft]
