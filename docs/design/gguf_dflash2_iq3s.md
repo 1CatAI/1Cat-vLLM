@@ -74,7 +74,7 @@ results remain pending.
 
 ## Installed loading checks and storage budget
 
-The installed normal wheel passes 69 CPU checks on Python 3.12.14,
+The installed normal wheel passes 71 CPU checks on Python 3.12.14,
 Torch 2.10.0+cu128 and CUDA 12.8. Eight changed modules match the source,
 wheel members and installed files exactly; all sixteen native libraries match
 the qualified normal base wheel. The release profile accepts local GGUF draft
@@ -137,3 +137,19 @@ The largest sampled absolute canonical error is 0.0001231 for IQ2_S.
 These results audit the existing coefficient expansion and weight
 reconstruction. They exclude MMA accumulation, unsampled rows and model
 propagation; the teacher-forcing distribution gate remains required.
+
+## Embedding loading memory
+
+The first full TP4 weight-loading probe exhausted host RAM. The kernel OOM
+record identifies rank 0 as the killed process; the four workers held roughly
+13–17 GB RSS each. Whole-table IQ2_S dequantization and finite-range checks
+produce temporary arrays proportional to the full vocabulary in every worker.
+
+Decode dense vocabulary tables in 1024-row chunks, convert each chunk to the
+requested dtype and perform the same finite-range overflow check before
+copying into the final global table. The existing TP loader still owns row
+sharding. Regression tests check bounded decode batches, exact converted
+values and FP16 overflow rejection. Sixteen actual IQ2_S embedding rows,
+decoded in three-row chunks, match the official FP32 dequantization followed
+by FP16 conversion bit for bit, with maximum difference zero. The rerun of
+full loading and its measured memory peak remain pending.
