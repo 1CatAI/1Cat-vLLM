@@ -977,3 +977,10 @@ void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_lattice_compact_grouped_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     torch::Tensor offsets, torch::Tensor tile_prefix, int64_t source_type);
+
+void gguf_lattice_planar_reorder_sm70_out(torch::Tensor out, torch::Tensor raw,
+                                          int64_t source_type,
+                                          int64_t logical_k);
+void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weight,
+                                       int64_t source_type);

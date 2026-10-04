@@ -801,3 +801,85 @@ def test_compact_blas_algorithm11_requires_float_output_and_graph(kind, cancella
             result, x.float() @ expected.float().T, rtol=5e-5, atol=0.001
         )
         torch.testing.assert_close(out, result.half(), rtol=0, atol=0)
+
+
+def restore_planar(blob, kind, n, k):
+    """Independent byte inverse for the equal-byte MMA planes."""
+    blocks = k // 256
+    size = 110 if kind == 21 else 82
+    groups = 8 if kind == 21 else 16
+    count = n * blocks
+    result = np.empty((n, blocks, size), dtype=np.uint8)
+    codes = blob[: count * 64].view("<u2")
+    scales = blob[count * 66 : count * (70 if kind == 21 else 74)]
+    high = blob[count * (70 if kind == 21 else 74) :]
+    for row in range(n):
+        for block in range(blocks):
+            raw = result[row, block]
+            raw[:2] = blob[
+                count * 64 + (block * n + row) * 2 : count * 64
+                + (block * n + row + 1) * 2
+            ]
+            for octet in range(32):
+                packet = int(
+                    codes[
+                        ((row // 32 * blocks * 32 + block * 32 + octet) * 32) + row % 32
+                    ]
+                )
+                if kind == 21:
+                    raw[2 + octet * 2 : 4 + octet * 2] = [packet & 255, packet >> 8]
+                else:
+                    raw[2 + octet], raw[34 + octet] = packet & 255, packet >> 8
+            for group in range(groups):
+                index = (block * groups + group) * n + row
+                small = (int(scales[index // 2]) >> (4 * (index % 2))) & 15
+                offset = (106 if kind == 21 else 74) + group // 2
+                if group % 2 == 0:
+                    raw[offset] = small
+                else:
+                    raw[offset] |= small << 4
+                if kind == 21:
+                    raw[66 + group] = high[index]
+                    raw[74 + group * 4 : 78 + group * 4] = high[
+                        count * 8 + index * 4 : count * 8 + index * 4 + 4
+                    ]
+                else:
+                    hi = (int(high[index // 2]) >> (4 * (index % 2))) & 15
+                    offset = 66 + group // 2
+                    if group % 2 == 0:
+                        raw[offset] = hi
+                    else:
+                        raw[offset] |= hi << 4
+    return result.reshape(n, -1)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("m", [5, 16, 512])
+def test_planar_equal_bytes_official_values_and_graph(kind, m):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    n, k = 160, 768
+    data = packed(kind, n=n, k=k)
+    raw = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_planar_reorder_sm70_out(weight, raw, kind, k)
+    assert np.array_equal(restore_planar(weight.cpu().numpy(), kind, n, k), data)
+    expected = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(torch.ops._C.gguf_lattice_planar_gemm_sm70_out, out, x, weight, kind)
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), x.float() @ expected.float().T, rtol=0.001, atol=0.003
+        )

@@ -32,8 +32,14 @@ inline __device__ void _Ld(Array<T, N>& dst, const T* src) {
 }
 
 template <class T, class Map, class SmemLayout, Pack kPack, Order kOrder,
-          bool AlignedC, bool AlignedS, Striding mode, class Policy_>
+          bool AlignedC, bool AlignedS, Striding mode, class Policy_, int OriginalType = 0>
 struct GmemIteratorSm70 {
+  static constexpr bool kOriginalStats = OriginalType != 0;
+  static_assert(!kOriginalStats || (mode != Striding::kIndexed &&
+      (OriginalType == 21 || OriginalType == 22)));
+  const uint8_t* original_data_{};
+  int original_n_{}, original_blocks_{}, original_row_{}, original_group_{};
+
   using ThreadMap = Map;
 
   using AccessType = Array<T, Map::kAccessC>;
@@ -101,8 +107,13 @@ struct GmemIteratorSm70 {
     const int lane_id = threadIdx.x % WARP_SIZE;
 
     const uintptr_t tagged_ptr = reinterpret_cast<uintptr_t>(mat.ptr.ptr);
-    const int ld = mat.ptr.stride;
-    if constexpr (std::is_same_v<T, uint32_t>) {
+    const int ld = kOriginalStats ? mat.ptr.stride & 65535 : mat.ptr.stride;
+    if constexpr (kOriginalStats) {
+      original_data_ = reinterpret_cast<const uint8_t*>(mat.ptr.ptr);
+      original_n_ = ld;
+      original_blocks_ = static_cast<unsigned>(mat.ptr.stride) >> 16;
+    }
+    if constexpr (std::is_same_v<T, uint32_t> && !kOriginalStats) {
       compact_awq_stats_ = (tagged_ptr & uintptr_t{1}) != 0;
     }
     const uintptr_t data_ptr =
@@ -114,6 +125,11 @@ struct GmemIteratorSm70 {
 
     offset_c_ = offsets.x;
     offset_s_ = offsets.y;
+    if constexpr (kOriginalStats) {
+      const int2 cs = to_cs(pack(offset));
+      original_row_ = cs.x + offsets.x;
+      original_group_ = cs.y + offsets.y;
+    }
 
     // auto src_ptr = reinterpret_cast<const char*>((T*)data);
 
@@ -202,6 +218,7 @@ struct GmemIteratorSm70 {
   __device__ void Advance() {
     if constexpr (!is_indexed) {
       if (!g_mask) {
+        if constexpr (kOriginalStats) original_group_ -= Map::kDimS;
         src_data_ -= _src_step_k();
       }
     }
@@ -229,8 +246,18 @@ struct GmemIteratorSm70 {
 
       PRAGMA_UNROLL
       for (int c = 0; c < Map::kIterC; ++c) {
-        Copy2(frags[s][c], src_data_ + src_step_c_ * c,
-              tile_mask && g_mask && pred_(s, c));
+        if constexpr (kOriginalStats) {
+          if (tile_mask && g_mask && pred_(s, c)) {
+            PRAGMA_UNROLL
+            for (int i = 0; i < Map::kAccessC; ++i)
+              frags[s][c][i] = LoadOriginal(
+                  original_row_ + c * Map::kDeltaC + i,
+                  original_group_ + s * Map::kDeltaS);
+          }
+        } else {
+          Copy2(frags[s][c], src_data_ + src_step_c_ * c,
+                tile_mask && g_mask && pred_(s, c));
+        }
       }
 
       if constexpr (is_indexed) {
@@ -243,6 +270,7 @@ struct GmemIteratorSm70 {
         }
       }
     }
+    if constexpr (kOriginalStats) original_group_ += Map::kDimS;
   }
 
   __device__ void Store(Fragments& frags) {
@@ -263,6 +291,27 @@ struct GmemIteratorSm70 {
           turbomind::Store(dst, frags[s][c]);
         }
       }
+    }
+  }
+
+  // Persistent planes contain only original GGUF bits. Reconstruct the
+  // existing MMA metadata carrier in registers/shared memory for this tile.
+  __device__ T LoadOriginal(int row, int group) const {
+    const int64_t count = int64_t{original_n_} * original_blocks_;
+    constexpr int groups = OriginalType == 21 ? 8 : 16;
+    const auto* d = reinterpret_cast<const uint16_t*>(original_data_ + count * 64);
+    const auto* scales = original_data_ + count * 66;
+    const int64_t index = int64_t{group} * original_n_ + row;
+    const uint32_t small = (__ldg(scales + index / 2) >> (4 * (index & 1))) & 15;
+    const uint64_t bits = __ldg(d + int64_t{group / groups} * original_n_ + row);
+    const auto* high = scales + count * (OriginalType == 21 ? 4 : 8);
+    if constexpr (OriginalType == 21) {
+      const auto* signs = reinterpret_cast<const uint32_t*>(high + count * 8);
+      return bits | (uint64_t{__ldg(signs + index)} << 16) |
+             (uint64_t{__ldg(high + index)} << 48) | (uint64_t{small} << 56);
+    } else {
+      const uint32_t hi = (__ldg(high + index / 2) >> (4 * (index & 1))) & 15;
+      return bits | (hi << 16) | (small << 20);
     }
   }
 
@@ -303,6 +352,18 @@ struct IteratorSm70 {
             bool AlignedC, bool AlignedS>
   using Type = GmemIteratorSm70<T, Map, SmemLayout, kPack, kOrder, AlignedC,
                                 AlignedS, mode, Policy>;
+};
+
+template <int SourceType, Striding mode, class Policy, bool FullTiles>
+struct IteratorSm70Original {
+  template <class T, class Map, class SmemLayout, Pack kPack, Order kOrder,
+            bool AlignedC, bool AlignedS>
+  using Type_ = GmemIteratorSm70<T, Map, SmemLayout, kPack, kOrder,
+      FullTiles || AlignedC, FullTiles || AlignedS, mode, Policy,
+      (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) ? SourceType : 0>;
+  template <class T, class Map, class SmemLayout, Pack kPack, Order kOrder,
+            bool AlignedC, bool AlignedS>
+  using Type = Type_<T, Map, SmemLayout, kPack, kOrder, AlignedC, AlignedS>;
 };
 
 // Exact-shape kernels may promise that every CTA covers a complete M/N/K tile.

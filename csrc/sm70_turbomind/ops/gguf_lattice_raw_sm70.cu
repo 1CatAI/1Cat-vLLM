@@ -483,6 +483,53 @@ __global__ void compact_grouped_mma_kernel(half* out, const half* x,
       k, 0, 1, blockIdx.y * 32, row);
 }
 
+// Equal-byte planes: U2 MMA carriers, original d, packed small scales,
+// original index high bits, and (IQ3_S only) original signs.
+template <int Type>
+__global__ void planar_reorder_kernel(uint8_t* out, const uint8_t* source,
+                                      int n, int blocks, int stride) {
+  constexpr int bytes = Type == 21 ? 110 : 82;
+  constexpr int groups = Type == 21 ? 8 : 16;
+  const int row = blockIdx.x * 32 + threadIdx.x;
+  const int block = blockIdx.y;
+  if (row >= n) return;
+  const int64_t count = int64_t{n} * blocks;
+  const auto* raw = source + int64_t{row} * stride + block * bytes;
+  auto* codes = reinterpret_cast<uint16_t*>(out);
+  for (int octet = 0; octet < 32; ++octet) {
+    const int64_t slot =
+        ((int64_t{row / 32} * blocks * 32 + block * 32 + octet) * 32) +
+        row % 32;
+    codes[slot] = Type == 21 ? raw[2 + 2 * octet] | (raw[3 + 2 * octet] << 8)
+                             : raw[2 + octet] | (raw[34 + octet] << 8);
+  }
+  reinterpret_cast<uint16_t*>(out + count * 64)[int64_t{block} * n + row] =
+      *reinterpret_cast<const uint16_t*>(raw);
+  auto* scales = out + count * 66;
+  auto* high = scales + count * (Type == 21 ? 4 : 8);
+  for (int group = 0; group < groups; ++group) {
+    const int64_t index = int64_t{block * groups + group} * n + row;
+    if (row % 2 == 0) {
+      const auto* next = raw + stride;
+      const int offset = (Type == 21 ? 106 : 74) + group / 2;
+      const int shift = (group % 2) * 4;
+      scales[index / 2] =
+          ((raw[offset] >> shift) & 15) | (((next[offset] >> shift) & 15) << 4);
+      if constexpr (Type == 22) {
+        high[index / 2] = ((raw[66 + group / 2] >> shift) & 15) |
+                          (((next[66 + group / 2] >> shift) & 15) << 4);
+      }
+    }
+    if constexpr (Type == 21) {
+      high[index] = raw[66 + group];
+      auto* signs = reinterpret_cast<uint32_t*>(high + count * 8);
+      const auto* v = raw + 74 + group * 4;
+      signs[index] = uint32_t{v[0]} | (uint32_t{v[1]} << 8) |
+                     (uint32_t{v[2]} << 16) | (uint32_t{v[3]} << 24);
+    }
+  }
+}
+
 template <int Type>
 __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
                                        int n, int blocks, int stride,
@@ -1007,6 +1054,29 @@ void gguf_lattice_compact_reorder_sm70_out(torch::Tensor out, torch::Tensor raw,
     compact_reorder_kernel<22><<<grid, 128, 0, stream>>>(
         out.data_ptr<uint8_t>(), raw.data_ptr<uint8_t>(), n, k / 256,
         raw.size(1), out.numel());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gguf_lattice_planar_reorder_sm70_out(torch::Tensor out, torch::Tensor raw,
+                                          int64_t source_type,
+                                          int64_t logical_k) {
+  TORCH_CHECK(out.device() == raw.device() && raw.dim() == 2,
+              "Planar reorder requires original CUDA GGUF rows");
+  const c10::cuda::CUDAGuard guard(raw.device());
+  const int n = raw.size(0), k = logical_k;
+  validate_raw(raw, source_type, n, k);
+  validate_compact(out, source_type, n, k);
+  TORCH_CHECK(n % 32 == 0, "Planar GGUF requires complete N32 tiles");
+  const dim3 grid(n / 32, k / 256);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (source_type == 21)
+    planar_reorder_kernel<21><<<grid, 32, 0, stream>>>(out.data_ptr<uint8_t>(),
+                                                       raw.data_ptr<uint8_t>(),
+                                                       n, k / 256, raw.size(1));
+  else
+    planar_reorder_kernel<22><<<grid, 32, 0, stream>>>(out.data_ptr<uint8_t>(),
+                                                       raw.data_ptr<uint8_t>(),
+                                                       n, k / 256, raw.size(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

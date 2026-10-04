@@ -3888,6 +3888,62 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(result == 0, "GGUF lattice TurboMind GEMM failed");
 }
 
+void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weight,
+                                       int64_t source_type) {
+  TORCH_CHECK(source_type == 21 || source_type == 22,
+              "Planar GGUF supports IQ3_S and IQ2_S");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  weight.device() == input.device() && input.dim() == 2 &&
+                  out.dim() == 2 && input.is_contiguous() &&
+                  out.is_contiguous() && weight.is_contiguous() &&
+                  weight.dim() == 1 && input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kUInt8,
+              "Planar GGUF requires FP16 matrices and a uint8 payload");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  const int group = source_type == 21 ? 32 : 16;
+  const int bytes = source_type == 21 ? 110 : 82;
+  // The private original-statistics iterator encodes two bounded dimensions
+  // in its stride; ordinary packed descriptors retain their existing ABI.
+  TORCH_CHECK(m > 0 && m <= INT_MAX && n > 0 && n <= 65535 && n % 32 == 0 &&
+                  k > 0 && k % 256 == 0 && k / 256 <= 32767 &&
+                  k * 32 <= INT_MAX && out.size(0) == m &&
+                  weight.numel() == n * (k / 256) * bytes,
+              "Planar GGUF shape or descriptor is unsupported");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "Planar GGUF requires SM70");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  auto layouts = gguf_lattice_layouts(n, k, source_type, group);
+  layouts[0].ld = k * 32;
+  layouts[1].ld = n | ((k / 256) << 16);
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  turbomind::gemm::Operation operation{};
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, group, stream,
+      static_cast<TuneKeyKind>(source_type == 21 ? 26 : 27), true, false,
+      INT_MAX);
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.quant_b = {source_type == 21
+                           ? turbomind::gemm::QuantType::kOriginalIQ3S
+                           : turbomind::gemm::QuantType::kOriginalIQ2S,
+                       group};
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
+      layouts[0], weight.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "Planar GGUF TurboMind GEMM failed");
+}
+
 void gguf_lattice_grouped_gemm_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
     torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
