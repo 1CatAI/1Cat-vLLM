@@ -27,4 +27,25 @@ four-unit margin bounds the complete maximum; otherwise use the complete
 maximum plus the same margin. This is the tail condition proposed in #844
 (commit `8e4d24e4b4c`), isolated from its finite-score recovery threshold change.
 No workspace expansion or accumulation precision change is needed for this
-candidate. GPU validation is pending.
+candidate. The installed operator checks are recorded below.
+
+## Operator validation
+
+CUDA 12.8, Torch 2.10.0+cu128, V100 SM70, normal FA2 CMake target and whole
+wheel, with no private binary or Python-path override:
+
+- The new correlated-value regression fails on the preceding installed wheel
+  for both Q8000 and Q8192, producing nonfinite output.
+- All 11 stability, rejection, shared-workspace and graph-replay checks pass
+  on the corrected installed wheel.
+- All 16 captured GQA groups from four ranks and four model layers produce
+  finite output. FP32 reference checks include every formerly nonfinite query.
+  The formerly failing group has relative L2 error 0.000450 and maximum
+  absolute error 0.00351 over the selected query rows.
+
+The core extension is unchanged. The corrected normal FA2 fingerprint is
+`485c7a25f03ef15304f18735794edfa1814831f6e69cfc5a5df9b096483c1001`;
+the whole-wheel fingerprint is
+`c1c3a5fc063ec70280761a80e4a5f43068ec81b7c32637c7c1edbd306c108411`.
+Its dependencies resolve to the declared Torch/CUDA/cuBLAS libraries.
+Model concurrency, 8K/32K prefill and the four frozen needle cases are running.
