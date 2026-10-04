@@ -162,3 +162,17 @@ the entire decode model in one graph; mixed-batch/prefill graph coverage is a
 separate field, not reported as FULL. Each TP worker must report FULL decode
 support. No eager comparison or activation/accumulation precision change is
 introduced.
+
+## Driver headroom before GDN warmup
+
+The explicit FULL retry loads all ranks at 16.41 GiB and reaches cold GDN
+warmup, then fails before capturing graphs. Rank 3 reports 18,034,868,736
+allocated bytes, 33,046,921,216 reserved bytes, 334,085,632 inactive split bytes,
+and only 1,572,864 driver-free bytes out of 34,072,559,616. Rank 0 also fails
+in Triton module loading. No model distributions or speeds are counted.
+
+Release unused allocator cache before the first GDN warmup for a shape, as
+already done after warmup. External CUDA/Triton module loading cannot directly
+reuse PyTorch's cached blocks. This changes initialization allocation lifetime,
+not tensors, math or capture settings. The same TP4/FULL/8192-token workload
+must verify that this restores driver headroom; the result remains pending.

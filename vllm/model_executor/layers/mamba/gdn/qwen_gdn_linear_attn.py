@@ -4652,6 +4652,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
         _SM70_GDN_PREFILL_WARMUP_KEYS.add(warmup_key)
 
+        # Compilation can leave large unused allocations cached. Triton and
+        # CUDA module loading need driver memory outside PyTorch's allocator.
+        torch.accelerator.empty_cache()
+
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Also run the
         # conv1d prefill kernel once; otherwise Qwen3.5/Next can still JIT
