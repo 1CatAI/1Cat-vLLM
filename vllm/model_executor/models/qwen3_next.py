@@ -752,9 +752,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         use_direct_attention_output = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-            or getattr(self, "sm70_dflash2_direct_attention_output", False)
-        ) and torch.compiler.is_compiling()
+            (
+                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+                or getattr(self, "sm70_dflash2_direct_attention_output", False)
+            )
+            and torch.compiler.is_compiling()
+            and self.layer_type == "full_attention"
+        )
         self_attention_output = (
             None if use_direct_attention_output else torch.empty_like(hidden_states)
         )
