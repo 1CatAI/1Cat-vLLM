@@ -175,6 +175,8 @@ def run(args):
 
     report = {
         "complete": False,
+        "instrumented": args.ple_phase_probe,
+        "speed_acceptance": not args.ple_phase_probe,
         "runtime": vllm.__version__,
         "runtime_path": vllm.__file__,
         "torch": str(torch.__version__),
@@ -211,6 +213,12 @@ def run(args):
 
     save()
     tok = AutoTokenizer.from_pretrained(model)
+    diagnostic = {}
+    if args.ple_phase_probe:
+        diagnostic["worker_extension_cls"] = (
+            "benchmarks.qwen38_ple_phase_probe.PlePhaseWorkerExtension"
+        )
+        os.chdir(out)
     llm = LLM(
         model=model,
         tensor_parallel_size=4,
@@ -225,6 +233,7 @@ def run(args):
         language_model_only=True,
         speculative_config=None,
         disable_log_stats=not REQUEST_METRICS_ENABLED,
+        **diagnostic,
         kernel_config={
             "ple_result_transport": args.ple_result_transport,
             "ple_disk_row_gather": not args.disable_ple_row_gather,
@@ -253,7 +262,7 @@ def run(args):
                 SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                 use_tqdm=False,
             )
-            for i in range(6):
+            for i in range(args.timing_repeats):
                 o = llm.generate(
                     [{"prompt_token_ids": ids}],
                     SamplingParams(
@@ -326,6 +335,8 @@ def run(args):
         report["health_passed"] = (
             not report["health_failures"] if not args.timing_only else None
         )
+        if args.ple_phase_probe:
+            report["ple_phases"] = llm.collective_rpc("ple_phase_records")
         report["complete"] = True
         report["health_triage_required"] = bool(report["health_failures"])
         save()
@@ -340,6 +351,8 @@ def run(args):
 
 def compare_timing(reference, candidate, expected_saving_ms):
     """Check the matched contract before calibrating an endpoint estimate."""
+    if reference.get("instrumented") or candidate.get("instrumented"):
+        raise ValueError("Instrumented runs cannot establish endpoint savings")
     for key in ("runtime", "torch", "cuda", "source_native", "contract"):
         if reference[key] != candidate[key]:
             raise ValueError(f"Timing arms differ in {key}")
@@ -448,6 +461,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-free-gib", type=float, default=8)
     parser.add_argument("--gpu-lock-fd", type=int)
+    parser.add_argument("--runtime-cache", type=Path)
+    parser.add_argument("--ple-phase-probe", action="store_true")
+    parser.add_argument("--timing-repeats", type=int, default=6)
     parser.add_argument("--reference-timing", type=Path)
     parser.add_argument("--expected-saving-ms", type=float)
     parser.add_argument("--disable-ple-row-gather", action="store_true")
@@ -455,6 +471,10 @@ def main():
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
     args = parser.parse_args()
+    if args.timing_repeats < 2:
+        parser.error("--timing-repeats must be at least 2")
+    if args.ple_phase_probe and args.reference_timing is not None:
+        parser.error("Instrumented phases cannot be endpoint speed acceptance")
     if args.min_free_gib < 8:
         parser.error("--min-free-gib must be at least 8")
     if args.reference_timing is not None:
@@ -474,7 +494,11 @@ def main():
             ("VLLM_", "TRITON_", "TORCHINDUCTOR_", "FLASH_QLA_", "ONECAT_", "SM70_")
         ) or key in ("PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH"):
             del os.environ[key]
-    cache = args.output.parent / "runtime"
+    cache = (
+        args.runtime_cache.resolve()
+        if args.runtime_cache is not None
+        else args.output.parent / "runtime"
+    )
     os.environ.update(
         CUDA_VISIBLE_DEVICES="0,1,2,3",
         CUDA_DEVICE_ORDER="PCI_BUS_ID",
@@ -504,7 +528,14 @@ def main():
                 median_tpot_ms=report["median_tpot_ms"],
                 quality_evaluated=report["quality_evaluated"],
                 health_triage_required=report["health_triage_required"],
-                worker_routes=report["worker_routes"],
+                cpu_row_readers=[
+                    rank["ple_disk_row_readers"]
+                    for rank in report["worker_routes"]
+                    if rank["ple_disk_row_readers"]
+                ],
+                route_report=str(args.output),
+                instrumented=report["instrumented"],
+                speed_acceptance=report["speed_acceptance"],
             )
     except BaseException as error:
         summary["error"] = f"{type(error).__name__}: {error}"

@@ -127,3 +127,8 @@ def test_inherited_descriptor_must_match_required_lock(tmp_path):
         pytest.raises(RuntimeError, match="required GPU lock"),
     ):
         endpoint.open_gpu_lock(other.fileno(), path)
+
+
+def test_instrumented_phases_cannot_establish_endpoint_savings():
+    with pytest.raises(ValueError, match="Instrumented"):
+        endpoint.compare_timing({"instrumented": True}, {}, 0.63)

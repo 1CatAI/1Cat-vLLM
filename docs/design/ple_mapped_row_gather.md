@@ -90,3 +90,39 @@ required lock and takes a nonblocking exclusive lock on that same open file
 description. The caller keeps its original descriptor open until both arms
 finish. This avoids a release/reacquire race while preserving the ordinary
 entry's fail-fast behavior and GPU-idle check. Normal launches need no option.
+
+The normal installed-artifact C1 pair completed with FP16 dense/KV, FP32 state,
+NVFP4 experts, TP4, CUDA graphs, disk ngrams, no MTP, 262144 startup capacity,
+8192 input tokens and 513 fixed-length output tokens. Both arms use the same
+wheel and six samples; only `ple_disk_row_gather` changes. The candidate's
+CPU-worker report selects `MappedRowGatherKernel` with a passing byte check;
+the control reports `disabled_by_policy`.
+
+| C1 pure decode | Median ms/token | Range ms/token |
+| --- | ---: | ---: |
+| Reference reader | 11.014752 | 10.932574–11.068880 |
+| Native reader | 10.869117 | 10.773957–10.975267 |
+
+The measured saving is **0.145635 ms/token (1.32%)**, against the pre-recorded
+0.629101 ms estimate: a **76.85% relative estimation error**. Sample ranges
+overlap; this is one matched installed-artifact comparison, not a guarantee
+for every prompt or cache state. Numerical operations are unchanged and all
+fourteen native byte tests pass; no distribution or task-quality campaign was
+run for this scheduling change under the graded policy.
+
+The estimate incorrectly applies a forced-cold CPU lookup ratio directly to
+an older GPU pre-copy wait. Startup's actual mapped-row warm sample already
+shows a different ratio: 156.90 us reference versus 77.30 us native for 64
+rows. Neither startup ratio nor forced-cold service time establishes the
+fraction of a normal decode's GPU wait that can be removed. A short observer
+run is pending to quantify per-request page faults and gather/staging time
+under the same repeated-input C1 contract before closing calibration.
+Future I/O estimates must retain cache-state and critical-path uncertainty;
+use 0.146 ms as this workload's measured benefit rather than 0.629 ms.
+
+Use `--ple-phase-probe` in the maintained endpoint entry for diagnostic phases
+and faults. Such reports set `instrumented=true` and `speed_acceptance=false`
+and cannot be compared as endpoint speed evidence. `--runtime-cache` permits
+reuse of the compatible compiled baseline graphs for this CPU-only policy;
+`--timing-repeats 2` limits the diagnostic cohort. Completion summaries keep
+compact CPU-reader decisions and link to the full route report.
