@@ -74,14 +74,23 @@ results remain pending.
 
 ## Installed loading checks and storage budget
 
-The installed normal wheel passes 45 CPU checks on Python 3.12.14,
-Torch 2.10.0+cu128 and CUDA 12.8. Seven changed modules match the source,
+The installed normal wheel passes 69 CPU checks on Python 3.12.14,
+Torch 2.10.0+cu128 and CUDA 12.8. Eight changed modules match the source,
 wheel members and installed files exactly; all sixteen native libraries match
 the qualified normal base wheel. The release profile accepts local GGUF draft
 files. Packed context projections expose their declared operand dtype to
 auxiliary-state conversion without changing the existing runtime transport.
 These are package and CPU checks; they do not establish GPU model quality or
 throughput.
+
+The verifier capability gate admits both the multimodal wrapper and native
+text-only Qwen3.5 architecture with the same dtype, head dimensions, draft
+width and scheduling guards. Previously a standalone GGUF text model missed
+this gate and disabled the quantized LM head and sharded context projection.
+The initial loading probe was stopped before generation; its logs remain a
+negative result. Positive and incompatible-head-dimension CPU cases cover the
+corrected gate. The expanded policy suite also required adding the existing
+local argmax field to its speculative-hash test fixture.
 
 The actual target has 40 mixed gate/up layers and 35 mixed GDN qkv/z layers.
 There are 72 distinct checkpoint role/type/TP4-shape combinations across the
