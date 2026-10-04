@@ -768,3 +768,53 @@ The installed wheel SHA256 is
 its installed core SHA256 is
 `0b7e3ecde6192dd394761129adb6f20bc97d8a2a0b9f8de546f433155d34ba87`.
 All 210 installed dependency packages are compatible.
+
+## cuBLAS algorithm comparison with overflow gate
+
+A same-precision algorithm probe found that explicitly requesting tensor
+algorithm 10 with FP16 output can overflow intermediate split partials even
+with reduced-precision reductions disabled. A cancellation workload with
+FP16 all-one weights, K=2560 and activations +128 for the first half and
+-128 for the second has exact final output zero. Default and tensor
+algorithm 2 remain finite and exact; algorithm 10 produces infinity for
+both NN and TN. FP32 output removes that overflow. The FP16 algorithm 10
+candidate is rejected rather than changing the numerical contract.
+
+Source `81700e4c74` exposes only default and algorithm 2 for calibration.
+All 26 checks pass (7.59 s), including original-format IQ3_S/IQ2_S
+cancellation workloads in both layouts and changed-input full graphs.
+
+| Projection | Canonical µs | Compact default NN µs | Compact default TN µs | Compact algo2 NN µs | Compact algo2 TN µs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 27B gate | 367.179 | 365.779 | 388.633 | 447.735 | 528.049 |
+| 27B down | 340.546 | 335.970 | 350.843 | 396.105 | 445.426 |
+| IQ3_S expert | 69.211 | 27.235 | 48.245 | 56.859 | 57.225 |
+| IQ2_S expert | 64.406 | 30.248 | 50.274 | 59.478 | 58.852 |
+| Flash gate | 91.896 | 126.308 | 114.272 | 97.719 | 107.057 |
+| Flash output | 85.270 | 87.684 | 81.563 | 74.480 | 83.712 |
+
+Complete-path full-graph timing narrows the Flash gate M512 gap to 6.3%
+and makes Flash output faster. Algorithm 2 regresses the other shapes and
+is not selected globally. The provisional winners retain the default NN
+algorithm for 27B and experts and algorithm 2 NN for these Flash dense
+shapes. Promotion still requires dense M16 and remaining storage/operator
+coverage. Kernel-only synthetic GEMM timing is not used as that gate.
+
+The installed wheel SHA256 is
+`ab49a0b0bb3e88dc657eba658f4384fca463dcd0cdce72852ab3a174b154eb0f`;
+its installed core SHA256 is
+`1e25499da47451c85409831d01b8f4a8435d44baefe96773503d033d8f8356e6`.
+The dependency check passes for all 210 packages. The [cuBLAS numerical
+behavior documentation](https://docs.nvidia.com/cuda/cublas/index.html#gemm-algorithms-numerical-behavior)
+explains why intermediate split reductions need explicit numerical checks.
+
+## Narrow packet fetch candidate
+
+The next candidate keeps the same equal-byte bit permutation but fetches
+one 32-bit word per participating lane instead of 64 bits. A 26-bit IQ3_S
+or 18-bit IQ2_S packet spans at most two such words. Two 32-bit shuffles
+and a funnel shift replace four shuffles and 64-bit stitching. Warp reads
+remain consecutive and cover exactly the original packet bits; FP32 scale
+formulas and accumulator precision are unchanged. This candidate requires
+the existing inverse, all-grid, boundary, graph and real-shape speed checks
+before selection.
