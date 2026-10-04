@@ -393,3 +393,34 @@ and quality after coalescing still need installed-wheel validation.
 | 512 | 757.39 | 781.03 | 734.51 | 734.51 |
 | 2048 | 2534.52 | 2628.16 | 2228.99 | 2228.99 |
 | 8192 | 8798.97 | 10979.79 | 8413.24 | 8413.24 |
+
+## Installed model result after coalescing
+
+The updated ordinary wheel passes all 12 targeted coalescing, cache and
+crossover GPU checks in a fresh environment. Source Python, wheel members and
+installed Python match exactly; the CUDA core fingerprint is unchanged. Reuse
+the matched native NVFP4 control because its implementation and runtime are
+unchanged. Model workload and sampling remain the same as the preceding
+unprofiled measurement.
+
+| Concurrency | Previous GGUF (tok/s) | Coalesced GGUF (tok/s) | Native NVFP4 (tok/s) | GGUF improvement | Gap to native |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 47.51 | 58.88 | 66.75 | +24.0% | -11.8% |
+| 4 | 178.38 | 216.73 | 251.26 | +21.5% | -13.7% |
+| 8 | 319.63 | 396.87 | 470.88 | +24.2% | -15.7% |
+| 16 | 555.05 | 671.47 | 830.51 | +21.0% | -19.1% |
+
+| Input tokens | Previous GGUF prefill (s) | Coalesced GGUF (s) | Native NVFP4 (s) |
+| ---: | ---: | ---: | ---: |
+| 8192 | 2.5154 | 2.4228 | 2.5089 |
+| 32768 | 10.6431 | 10.2626 | 10.4705 |
+
+All four natural greedy token sequences and finish reasons match the preceding
+GGUF measurement and its llama.cpp reference. Prefill improves rather than
+regressing, and decode throughput improves by 21–24%. Decode remains 12–19%
+below the native NVFP4 control, so this is an improvement rather than a claim
+of complete performance parity. The frozen common quality set is running
+separately; its scores are still pending.
+
+Updated wheel fingerprint:
+`ff173a2e75d44de5fb14fe9507963f2ab0d8d0c0596770d1d6e96a7238d8aa6e`.
