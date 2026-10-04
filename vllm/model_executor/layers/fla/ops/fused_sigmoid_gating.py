@@ -504,6 +504,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     num_accepted_tokens: torch.Tensor | None = None,
     ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
     if mixed_qkv.ndim != 2:
@@ -542,7 +543,17 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = mixed_qkv.new_empty(NK, B, T, HV, V)
+    if out is None:
+        o = mixed_qkv.new_empty(NK, B, T, HV, V)
+    else:
+        if (
+            out.shape != (B, T, HV, V)
+            or not out.is_contiguous()
+            or out.dtype != mixed_qkv.dtype
+            or out.device != mixed_qkv.device
+        ):
+            raise ValueError("out must be a contiguous matching [B, T, HV, V] buffer")
+        o = out.unsqueeze(0)
     if inplace_final_state:
         final_state = initial_state
     else:
