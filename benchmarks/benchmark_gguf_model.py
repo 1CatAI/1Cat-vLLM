@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import vllm._C as core
 
@@ -51,6 +52,9 @@ def main():
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--max-seqs", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--kv-cache-dtype", default="auto")
+    parser.add_argument("--ssm-state-dtype")
+    parser.add_argument("--record-first-logits", action="store_true")
     args = parser.parse_args()
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Benchmark requires an ordinary installed wheel")
@@ -74,7 +78,7 @@ def main():
         model=str(args.model),
         tensor_parallel_size=4,
         dtype="half",
-        kv_cache_dtype="auto",
+        kv_cache_dtype=args.kv_cache_dtype,
         max_model_len=model_len,
         max_num_batched_tokens=args.max_batch,
         max_num_seqs=max_seqs,
@@ -86,6 +90,10 @@ def main():
     )
     if args.model.suffix.lower() == ".gguf":
         config["quantization"] = "gguf"
+    if args.ssm_state_dtype:
+        config["mamba_ssm_cache_dtype"] = args.ssm_state_dtype
+    if args.record_first_logits:
+        config.update(max_logprobs=-1, logprobs_mode="raw_logits")
     report = {
         "vllm_version": vllm.__version__,
         "vllm_origin": vllm.__file__,
@@ -106,6 +114,7 @@ def main():
             "no_mtp": True,
         },
         "natural_greedy": [],
+        "first_logits": [],
         "decode": [],
         "prefill": [],
         "complete": False,
@@ -120,6 +129,34 @@ def main():
     try:
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
+        if args.record_first_logits:
+            first = llm.generate(
+                [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
+                SamplingParams(temperature=0, max_tokens=1, logprobs=-1),
+                use_tqdm=False,
+            )
+            for index, output in enumerate(first):
+                entries = output.outputs[0].logprobs[0]
+                values = np.full(len(tokenizer), np.nan, dtype=np.float32)
+                for token_id, entry in entries.items():
+                    values[token_id] = entry.logprob
+                if not np.isfinite(values).all():
+                    raise RuntimeError("Incomplete or nonfinite first-logit vector")
+                path = args.output.with_name(
+                    f"{args.output.stem}.prompt-{index}.logits.npy"
+                )
+                np.save(path, values)
+                top = np.argsort(values)[-10:][::-1]
+                report["first_logits"].append(
+                    {
+                        "index": index,
+                        "path": str(path),
+                        "vocabulary": len(values),
+                        "top10_ids": top.tolist(),
+                        "top10_logits": values[top].tolist(),
+                    }
+                )
+            save()
         natural = llm.generate(
             [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
             SamplingParams(temperature=0, max_tokens=64),
