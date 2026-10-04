@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.gguf import (
@@ -87,3 +88,27 @@ def test_head_compilation_keeps_actual_m_inside_operator():
         "gguf_lm_head_projection" in str(n.target) for n in graphs[0].graph.nodes
     )
     torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("weight_type", [0, 1, 9, 30])
+def test_uncalibrated_head_preserves_legacy_method(monkeypatch, weight_type):
+    from vllm.model_executor.layers.quantization.gguf import GGUFLinearMethod
+
+    method = GGUFLMHeadMethod(GGUFConfig())
+    method.params_dtype = torch.float16
+    layer = torch.nn.Module()
+    layer.register_parameter("qweight", torch.nn.Parameter(torch.empty(4, 32)))
+    layer.register_parameter("qweight_type", torch.nn.Parameter(torch.empty(1)))
+    layer.qweight_type.weight_type = weight_type
+
+    def legacy_prepare(self, target):
+        self.native_admission = {}
+
+    monkeypatch.setattr(
+        GGUFLinearMethod, "process_weights_after_loading", legacy_prepare
+    )
+    method.process_weights_after_loading(layer)
+    assert not method.canonical_lm_head
+    assert method.lm_head_capability is None
+    assert not hasattr(layer, "gguf_lm_head_raw")
+    assert method.native_admission["lm_head"]["reason"] == "requires_sm70"

@@ -1056,17 +1056,21 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
         elif weight_type != int(WeightType.Q4_K) or tuple(raw.shape) != (62080, 2880):
             reason = "lm_head_shape_or_format_has_no_calibration"
         self.canonical_lm_head = reason is None
-        self.lm_head_capability = GGUFOperatorCapability(
-            decoder_family(weight_type),
-            quant_type_name(weight_type),
-            "gguf_lm_head_projection",
-            True,
-            min_m=2,
-            max_m=16,
-            reason=reason,
+        self.lm_head_capability = (
+            GGUFOperatorCapability(
+                decoder_family(weight_type),
+                quant_type_name(weight_type),
+                "gguf_lm_head_projection",
+                True,
+                min_m=2,
+                max_m=16,
+            )
+            if self.canonical_lm_head
+            else None
         )
         super().process_weights_after_loading(layer)
         if self.canonical_lm_head and self.canonical_projections:
+            assert self.lm_head_capability is not None
             # Keep the faster M1 route and unmeasured M intervals. This raw
             # parameter is separate from the canonical streams and embedding.
             layer.register_parameter(
@@ -1081,7 +1085,7 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
             }
         else:
             self.native_admission["lm_head"] = {
-                "operator": self.lm_head_capability.operator,
+                "operator": "gguf_lm_head_projection",
                 "min_m": 2,
                 "max_m": 16,
                 "reason": reason or "canonical_kernel_unavailable",
@@ -1089,6 +1093,7 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
 
     def apply(self, layer, x, bias=None):
         if hasattr(layer, "gguf_lm_head_raw"):
+            assert self.lm_head_capability is not None
             projection = layer.gguf_tm_projections[0]
             output = torch.ops.vllm.gguf_lm_head_projection(
                 x,
