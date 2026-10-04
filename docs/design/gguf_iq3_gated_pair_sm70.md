@@ -220,3 +220,30 @@ Exact half-integer codebook caching passes the GEMM oracle but measures
 78.848 us versus the same-cohort canonical 79.872 us and NVFP4 49.152 us.
 It is slower than the K64 prototype, so its proposed API refactor is not
 required for the retained path and will not be promoted on this evidence.
+
+The two-CTA K64 partition experiment also fails to improve the retained
+kernel: best 74.752 us, versus same-cohort canonical 82.944 us and NVFP4
+48.128 us. Replayed graphs reset the completion counters correctly.
+
+NCU on retained K64 reports 66.656 us separately, 64 registers and 41.41%
+achieved occupancy. Excessive shared wavefronts remain 842,649. Not-issued
+sampling totals include long scoreboard 214, math-pipe throttle 134,
+no-instruction 109, and short scoreboard 30. The largest remaining sampled
+waits are at packet extraction and the scale-field shift/read. These counts
+are not duration estimates. A follow-up stores the four-byte IQ3_S scale
+field in `uint32_t` (IQ2_S retains `uint64_t`) and compares K32/K64 chunks;
+it changes neither the source bits nor the numerical formula.
+
+The four-byte scale-field specialization passes bitwise comparison with
+both original K64 accumulator policies. At M8, K32 and K64 both measure
+61.440 us (311.67 source-weight GB/s), versus same-cohort canonical 75.776
+us and native NVFP4 48.128 us. Official GEMM-oracle relative L2 remains
+0.00049515; maximum output difference remains 0.00390625. The original
+source bitstream and arithmetic are unchanged. The common decoder change
+has been reported on #897 and remains a research dependency until packaged
+validation; it still does not pass the 30 us gate.
+
+The next isolated pipeline test compares one versus four K16 packet windows
+in registers, with one or two FP32 accumulation chains. Its four-window,
+single-chain build uses 59 registers and no spills; the two-chain build
+uses 67 registers. Both retain the original byte-codebook interface.
