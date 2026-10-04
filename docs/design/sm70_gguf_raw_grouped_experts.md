@@ -188,3 +188,22 @@ operator results with synthetic routing, separate from model throughput.
 The kernel capability also admits measured IQ3_XXS M=1/5/20 when an original
 bank is retained; missing storage reports `original_expert_bank_not_retained`.
 Nine CPU capability tests cover the measured points and fallback reasons.
+
+## Decoder interface synchronization
+
+Source `39de67b1dd` synchronizes the lattice decoder dependency at
+`7418b9af4f` and retains the joint grouped operator alongside compact prefill.
+The removed vector scale option does not alter the grouped FP32 arithmetic.
+The ordinary source-containing package `1.5.2.dev816+g39de67b1d` passes
+16 GPU checks: twelve joint grouped cases and four vector/dequantization
+cases. All 18 raw/grouped-down CPU capability checks pass, as do 213 package
+dependency checks. Fresh import resolves the shipped core and standard
+Torch/CUDA libraries without preload or a private build dependency.
+
+Whole wheel SHA256:
+`09d298f5a2434c67d5b37d1c6fcae578329d53c4252206f3887d0b4658d822d3`.
+Core SHA256:
+`9908f739bba208ba7b5b8210956e0a7c8ccf8cd8bd213d2ab42c44f42290fb03`.
+This interface synchronization adds no new speed measurement; the cold-bank
+operator results above and the separately documented model composition retain
+their original source and artifact provenance.
