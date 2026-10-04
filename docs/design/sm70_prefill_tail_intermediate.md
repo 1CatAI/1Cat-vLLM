@@ -18,3 +18,13 @@ Q8000/Q8192 stability checks, and matched model prefill and long-context quality
 Results will be recorded after the normal FA2 extension and wheel are built.
 
 Integration base: `f551e0afea0736a636bf9e288da79c53aed56f6d`.
+
+The 34 affected rows have complete tail maxima 10.53–10.77, but stride-eight
+samples near -6.3. The gap is 16.77–17.03. Sampling therefore selects a shift
+near -2.3; exponent clipping and the FP16 numerator are unsafe even though the
+normalized result is small. Use the sampled shift only when its existing
+four-unit margin bounds the complete maximum; otherwise use the complete
+maximum plus the same margin. This is the tail condition proposed in #844
+(commit `8e4d24e4b4c`), isolated from its finite-score recovery threshold change.
+No workspace expansion or accumulation precision change is needed for this
+candidate. GPU validation is pending.
