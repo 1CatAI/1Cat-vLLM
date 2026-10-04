@@ -529,6 +529,7 @@ class PleOffloadWorker:
                 {
                     "status": PleOffloadWorker.READY_STR,
                     "layer_names": sorted(runner.layer_names),
+                    "row_readers": vllm_config.kernel_config.ple_disk_row_readers,
                 }
             )
             ready_writer.close()

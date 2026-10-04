@@ -911,6 +911,10 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        int64_t source_type, int64_t num_experts,
                                        int64_t group_size);
 
+void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                        int64_t shard_size, int64_t num_rows, int64_t row_bytes,
+                        torch::Tensor out);
+
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
                                       torch::Tensor stats, int64_t source_type,
                                       int64_t group_size);

@@ -27,6 +27,10 @@ from vllm.config import (
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.disk_rows import (
+    MappedRowGatherKernel,
+    prepare_mapped_row_gather,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -1113,6 +1117,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_shard_arrays: list[np.ndarray] = []
         self._disk_shard_pointers: list[int] = []
         self._disk_mapped_paths: set[str] = set()
+        self._disk_row_kernel: MappedRowGatherKernel | None = None
         runtime = get_current_vllm_config_or_none()
         self._release_disk_pages = bool(
             getattr(
@@ -1547,6 +1552,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         """
         if any(shard is None for shard in self._disk_shards):
             raise RuntimeError("PLE disk lookup started before every shard was loaded")
+        if self._disk_row_kernel is not None:
+            rows = torch.empty(
+                (flat_ids.size, self.head_dim), dtype=torch.uint8, device="cpu"
+            )
+            self._disk_row_kernel.apply(torch.from_numpy(flat_ids), rows)
+            if self._release_disk_pages:
+                for index in np.unique(flat_ids // self._disk_shard_size):
+                    shard = self._disk_shards[int(index)]
+                    assert shard is not None
+                    self._release_mapped_pages(shard)
+            return rows.numpy()
         shard_size = self._disk_shard_size
 
         # Decode moves only a few dozen rows. Per-shard NumPy dispatch and the
@@ -1630,8 +1646,16 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         flat_ids = ngram_ids.reshape(-1).numpy()
         if flat_ids.size == 0:
             return
-        rows = self._gather_mapped_rows(flat_ids)
-        output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
+        if self._disk_row_kernel is not None:
+            self._disk_row_kernel.apply(ngram_ids, output.view(torch.uint8))
+            if self._release_disk_pages:
+                for index in np.unique(flat_ids // self._disk_shard_size):
+                    shard = self._disk_shards[int(index)]
+                    assert shard is not None
+                    self._release_mapped_pages(shard)
+        else:
+            rows = self._gather_mapped_rows(flat_ids)
+            output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
         if profile:
             faults_after = resource.getrusage(resource.RUSAGE_SELF)
             logger.info(
@@ -1849,6 +1873,17 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             self._disk_shard_pointers = [
                 array.ctypes.data for array in self._disk_shard_arrays
             ]
+            runtime = get_current_vllm_config()
+            self._disk_row_kernel, row_admission = prepare_mapped_row_gather(
+                pointers=self._disk_shard_pointers,
+                shard_size=self._disk_shard_size,
+                num_rows=self.ngram_embedding.org_vocab_size,
+                row_bytes=self.head_dim,
+                file_backed=bool(self._disk_mapped_paths),
+                enabled=runtime.kernel_config.ple_disk_row_gather,
+            )
+            runtime.kernel_config.ple_disk_row_readers[self.layer_name] = row_admission
+            logger.info("PLE mapped row-reader admission: %s", row_admission)
             mapped_gib = (
                 sum(
                     shard.numel() * shard.element_size()

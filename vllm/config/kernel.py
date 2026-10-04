@@ -506,6 +506,12 @@ class KernelConfig:
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
+    ple_disk_row_gather: bool = True
+    """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
+    ple_disk_row_readers: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed CPU row-reader admission and startup byte/performance checks."""
     ple_disk_cascade_active: bool = Field(default=False, init=False)
     """Resolved FP8 storage, dtype and pipeline capability admission."""
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
@@ -547,6 +553,8 @@ class KernelConfig:
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+            "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
         }
         if not self.sm70_skinny_moe_applicable:
