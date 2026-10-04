@@ -32,8 +32,9 @@ def _conv_gate_zero_kernel(
     STATE_DIM: tl.constexpr,
     STATE_TOKEN: tl.constexpr,
     CACHE_LINES: tl.constexpr,
+    CHANNEL_TILE: tl.constexpr,
 ):
-    feature = tl.program_id(1) * 256 + tl.arange(0, 256)
+    feature = tl.program_id(1) * CHANNEL_TILE + tl.arange(0, CHANNEL_TILE)
     token = tl.arange(0, 8)
     # The old allocation zeroes padded output rows too. Keep that contract,
     # including invalid state slots, before the convolution's early returns.
@@ -92,12 +93,24 @@ def _conv_gate_zero_kernel(
         IS_SPEC_DECODING=True,
         NP2_STATELEN=16,
         USE_PAD_SLOT=True,
-        BLOCK_N=256,
+        BLOCK_N=CHANNEL_TILE,
     )
 
 
 def conv_gate_zero(
-    qkv, state, weight, state_indices, accepted, cu, a_log, a, b, bias, core_out
+    qkv,
+    state,
+    weight,
+    state_indices,
+    accepted,
+    cu,
+    a_log,
+    a,
+    b,
+    bias,
+    core_out,
+    channel_tile=256,
+    num_warps=4,
 ):
     """Exact-shape research entry; the caller proves the verifier layout."""
     assert qkv.shape == (8, 2560) and qkv.stride(1) == 1
@@ -109,7 +122,7 @@ def conv_gate_zero(
     assert state_indices.shape == accepted.shape == (1,) and cu.shape == (2,)
     g = torch.empty((1, 8, 12), dtype=torch.float32, device=qkv.device)
     beta = torch.empty_like(g)
-    _conv_gate_zero_kernel[(1, 10)](
+    _conv_gate_zero_kernel[(1, triton.cdiv(2560, channel_tile))](
         qkv,
         weight,
         state,
@@ -127,6 +140,7 @@ def conv_gate_zero(
         *weight.stride(),
         *state.stride(),
         state.shape[0],
-        num_warps=4,
+        channel_tile,
+        num_warps=num_warps,
     )
     return qkv, g, beta
