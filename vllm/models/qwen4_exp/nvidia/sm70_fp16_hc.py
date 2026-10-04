@@ -400,6 +400,38 @@ def _qwen38_sm70_fp16_fused_hc(
                 concurrent_batch,
             )
             return block, injection
+        # Local MMA does not require a fully-connected IPC topology. For the
+        # FP32-partial policy, transport disjoint Half output rows through the
+        # TP group's admitted collective (including the verified-edge ring).
+        # Each element has one contributor, preserving its Half value without
+        # narrowing a sum of live contributions.
+        from vllm import _custom_ops as ops
+
+        group = get_tp_group()
+        if concurrent_batch and group.world_size == 4:
+            if ops.supports_sm70_qwen38_hc_local():
+                m = x.shape[0]
+                partials = x.new_empty((20, m, 96), dtype=torch.float32)
+                local_down = x.new_empty((m, 336))
+                ops.sm70_qwen38_hc_down_local(
+                    x, packed_down, partials, local_down, group.rank_in_group
+                )
+                gathered = group.all_reduce(local_down)
+                lora = gathered[:, :320].contiguous()
+                local_block = x.new_empty((m, 2560))
+                ops.sm70_qwen38_hc_up_local(
+                    lora, packed_up, x, local_block, group.rank_in_group
+                )
+                block = group.all_reduce(local_block)
+                logger.info_once(
+                    "SM70 TP4 batch HC uses local FP32 MMA and the admitted "
+                    "TP collective; fully-connected IPC is unavailable."
+                )
+                return block, gathered[:, 320:324].contiguous()
+            logger.warning_once(
+                "SM70 TP4 local batch HC unavailable: packaged local operators "
+                "missing; retaining dense HC projections."
+            )
     if not _runtime_ok(x, down_weight, up_weight):
         # Preserve the ordinary projection and FP16 materialization boundaries
         # for prefill and any unsupported runtime shape. This fallback lives

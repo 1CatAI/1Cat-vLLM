@@ -1167,6 +1167,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "()");
   custom_ar.impl("sm70_qwen38_hc_batch", torch::kCUDA, &sm70_qwen38_hc_batch);
   custom_ar.def(
+      "sm70_qwen38_hc_down_local(Tensor input, Tensor packed, "
+      "Tensor(a!) partials, Tensor(b!) output, int rank) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_down_local", torch::kCUDA,
+                 &sm70_qwen38_hc_down_local);
+  custom_ar.def(
+      "sm70_qwen38_hc_up_local(Tensor lora, Tensor packed, Tensor branches, "
+      "Tensor(a!) output, int rank) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_up_local", torch::kCUDA,
+                 &sm70_qwen38_hc_up_local);
+  custom_ar.def(
       "sm70_qwen38_hc_gate_mix(int fa, Tensor local_gate, Tensor branches, "
       "Tensor! out) -> ()");
   custom_ar.impl("sm70_qwen38_hc_gate_mix", torch::kCUDA,

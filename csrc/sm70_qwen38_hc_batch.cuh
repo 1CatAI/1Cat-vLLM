@@ -36,7 +36,8 @@ __device__ __forceinline__ float sigmoid(float x) {
 // for a hidden column live at identical lane offsets in the four quad pairs.
 // PairRows shares the same 16-byte weight load across two independent M8
 // accumulators. The K sequence in each accumulator is unchanged.
-template <bool PairRows, int Warps, int Unroll, bool FuseMix>
+template <bool PairRows, int Warps, int Unroll, bool FuseMix,
+          bool FullOutput = false>
 __device__ __forceinline__ void hc_up_batch_body(
     const half* __restrict__ lora, const half* __restrict__ packed,
     const half* __restrict__ branches, half* __restrict__ out, int rows,
@@ -97,7 +98,9 @@ __device__ __forceinline__ void hc_up_batch_body(
           mixed = fmaf(gs, x, mixed);
         }
         if (branch == 0 && row < rows) {
-          out[row * hidden + h] = __float2half_rn(div_full(mixed, 4.0f));
+          const int offset =
+              FullOutput ? row * 2560 + hidden_offset + h : row * hidden + h;
+          out[offset] = __float2half_rn(div_full(mixed, 4.0f));
         }
       } else if (row < rows) {
         out[row * 4 * hidden + branch * hidden + h] = gate;
@@ -106,11 +109,12 @@ __device__ __forceinline__ void hc_up_batch_body(
   }
 }
 
-template <bool PairRows, int Warps, int Unroll, bool FuseMix>
+template <bool PairRows, int Warps, int Unroll, bool FuseMix,
+          bool FullOutput = false>
 __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
     const half* lora, const half* packed, const half* branches, half* out,
     int rows, int hidden, int hidden_offset) {
-  hc_up_batch_body<PairRows, Warps, Unroll, FuseMix>(
+  hc_up_batch_body<PairRows, Warps, Unroll, FuseMix, FullOutput>(
       lora, packed, branches, out, rows, hidden, hidden_offset, blockIdx.x,
       blockIdx.y);
 }
@@ -183,6 +187,31 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_down_partials(
     const half* x, const half* packed, float* partials, int rows) {
   hc_down_partials_body<PairRows, Warps, WarpM16, N, RoundPartials>(
       x, packed, partials, rows, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+
+// Disjoint dense packets can use any graph-safe TP collective. Keep the
+// arithmetic identical to gather_body<true>, including its Half boundaries.
+__global__ void down_local_packet(const float* partials, half* output, int rank,
+                                  int rows) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= rows * 336) return;
+  const int row = index / 336, column = index % 336;
+  const int local = column - rank * 80;
+  const bool lora = local >= 0 && local < 80;
+  const bool injection = rank == 3 && column >= 320 && column < 324;
+  half value = __float2half_rn(0.0f);
+  if (lora || injection) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int split = 0; split < 20; ++split)
+      acc = __fadd_rn(acc, partials[(split * rows + row) * 96 + local]);
+    value = __float2half_rn(acc);
+    if (lora) {
+      const float x = div_full(__half2float(value), 4.0f);
+      value = __float2half_rn(__fmul_rn(x, sigmoid(x)));
+    }
+  }
+  output[index] = value;
 }
 
 template <bool Down>
