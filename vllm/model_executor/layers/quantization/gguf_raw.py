@@ -8,7 +8,7 @@ import numpy as np
 
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
-RAW_LATTICE_TYPES = frozenset((21, 22))
+RAW_LATTICE_TYPES = frozenset((18, 21, 22))
 
 
 @dataclass(frozen=True)

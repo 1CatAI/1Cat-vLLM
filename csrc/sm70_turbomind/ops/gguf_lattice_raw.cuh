@@ -13,9 +13,9 @@
 namespace vllm::sm70_gguf {
 template <int Type>
 struct LatticeRawDecoder {
-  static_assert(Type == 21 || Type == 22);
+  static_assert(Type == 18 || Type == 21 || Type == 22);
   using Codebook = turbomind::gemm::LatticeCodebook<Type>;
-  static constexpr int kBlockBytes = Type == 21 ? 110 : 82;
+  static constexpr int kBlockBytes = Type == 18 ? 98 : Type == 21 ? 110 : 82;
   static constexpr int kCodebookBytes = Codebook::kBytes;
 
   __device__ static void initialize(uint8_t* grid) {
@@ -52,7 +52,8 @@ struct LatticeRawDecoder {
 
   // Exact final FP16 operand formation, not an expanded coefficient. The
   // small coefficient times a grid integer is exactly representable in half
-  // (IQ3_S <= 465, IQ2_S <= 1333/8). Original d has <= 11 significant bits,
+  // (IQ3_XXS <= 480.5, IQ3_S <= 465, IQ2_S <= 1333/8).
+  // Original d has <= 11 significant bits,
   // so the reference FP32 product is exact too. One final half2 multiply
   // therefore matches FP32 dequantization followed by round-to-nearest half.
   // Float output and vector FMA still use the original FP32 scale formula.
@@ -62,8 +63,9 @@ struct LatticeRawDecoder {
                                                                float d,
                                                                int nibble) {
     if constexpr (std::is_same_v<Output, half>) {
-      const float small =
-          Type == 21 ? float(1 + 2 * nibble) : (0.5f + nibble) * 0.25f;
+      const float small = Type == 21
+                              ? float(1 + 2 * nibble)
+                              : (0.5f + nibble) * (Type == 18 ? 0.5f : 0.25f);
       const half2 factor = __float2half2_rn(small);
       const half2 base = __float2half2_rn(d);
       turbomind::Array<half, 8> result;
@@ -83,7 +85,8 @@ struct LatticeRawDecoder {
     } else {
       static_assert(std::is_same_v<Output, float>);
       const float scale =
-          Type == 21 ? d * (1 + 2 * nibble) : (d * (0.5f + nibble)) * 0.25f;
+          Type == 21 ? d * (1 + 2 * nibble)
+                     : (d * (0.5f + nibble)) * (Type == 18 ? 0.5f : 0.25f);
       return table_values(packed, signs, scale);
     }
   }
@@ -96,6 +99,24 @@ struct LatticeRawDecoder {
                                                          const uint8_t* grid) {
     const float d = __half2float(*reinterpret_cast<const half*>(block));
     const int octet = base / 8;
+    if constexpr (Type == 18) {
+      // Each group of 32 values has four seven-bit sign indices and a
+      // four-bit scale. Its eighth sign is the parity of the first seven.
+      // Byte loads also handle the original word's two-byte alignment.
+      const int offset = 66 + 4 * (base / 32);
+      const uint32_t aux = uint32_t(block[offset]) |
+                           (uint32_t(block[offset + 1]) << 8) |
+                           (uint32_t(block[offset + 2]) << 16) |
+                           (uint32_t(block[offset + 3]) << 24);
+      const uint32_t sign_index = (aux >> (7 * (octet % 4))) & 127;
+      const uint32_t signs = sign_index | ((__popc(sign_index) & 1) << 7);
+      const uint32_t a =
+          *reinterpret_cast<const uint32_t*>(grid + block[2 + 2 * octet] * 4);
+      const uint32_t b =
+          *reinterpret_cast<const uint32_t*>(grid + block[3 + 2 * octet] * 4);
+      return table_fragment<Output>(a | (uint64_t(b) << 32), signs, d,
+                                    aux >> 28);
+    }
     const uint8_t high = block[66 + base / 32];
     const uint8_t signs = block[(Type == 21 ? 74 : 34) + octet];
     turbomind::Array<Output, 8> values;

@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.gguf_raw import RawGGUFProjection
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("m", [1, 5, 20, 32])
 def test_raw_grouped_gate_up_official_reference_and_graph(kind, m):
     torch.manual_seed(4321 + m)
@@ -34,6 +34,13 @@ def test_raw_grouped_gate_up_official_reference_and_graph(kind, m):
             )
             .reshape(experts, n, k)
             .cuda()
+        )
+        decoded = torch.empty((experts * n, k), device="cuda", dtype=torch.float32)
+        torch.ops._C.gguf_lattice_raw_dequantize_sm70_out(
+            decoded, weights[-1].view(experts * n, -1), kind
+        )
+        torch.testing.assert_close(
+            decoded, references[-1].view(experts * n, k), rtol=0, atol=0
         )
     ids = torch.stack((torch.zeros(m, dtype=torch.int64), torch.arange(1, m + 1)), 1)
     sorted_ids, order = ids.flatten().cuda().sort(stable=True)

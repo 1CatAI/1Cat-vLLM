@@ -44,8 +44,8 @@ def main():
     names = [f"blk.{a.layer}.ffn_{name}_exps.weight" for name in ("gate", "up")]
     tensors = [next(t for t in reader.tensors if t.name == name) for name in names]
     kind = int(tensors[0].tensor_type)
-    if kind not in (21, 22) or int(tensors[1].tensor_type) != kind:
-        p.error("This grouped decoder requires matching IQ3_S or IQ2_S gate/up")
+    if kind not in (18, 21, 22) or int(tensors[1].tensor_type) != kind:
+        p.error("Grouped decoder requires matching IQ3_XXS, IQ3_S or IQ2_S gate/up")
     experts = tensors[0].data.shape[0]
     raw_banks, canonical_banks, sources = [], [], []
     for tensor in tensors:
@@ -71,7 +71,7 @@ def main():
         )
         canonical_banks.append((weights, stats, *pointers))
     n, k = raw.shape
-    group = 32 if kind == 21 else 16
+    group = 16 if kind == 22 else 32
     capabilities = lattice_grouped_capabilities(kind, k, n, experts, torch.float16)
     # Rotating addresses prevents the M=1 active expert working set from
     # fitting entirely in L2. Every replica contains the same real weights.
