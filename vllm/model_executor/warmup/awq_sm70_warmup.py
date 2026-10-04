@@ -14,6 +14,7 @@ import torch
 import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import _QPN8_MAX_M
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _use_qwen38_active_grouped_decode,
@@ -333,6 +334,17 @@ def _iter_unique_fp8_dense_layers(
             or getattr(layer, "sm70_modelopt_fp8_turbomind", False)
         ):
             continue
+        if hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes"):
+            # Block QPN8 serves M <= 8 from static configurations. Only its
+            # Volta TurboMind copy, which serves larger M, has tuning to warm.
+            if not hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight"):
+                continue
+            k_dim = int(layer._sm70_block_fp8_turbomind_packed_weight.shape[0])
+            key = (k_dim, int(layer._qpn8_out_features), False)
+            if key not in seen:
+                seen.add(key)
+                yield layer, False
+            continue
         if getattr(layer, "sm70_fp8_qpn8", False):
             # The small-M QPN8 path is static, but its prepared batch layout
             # switches to TurboMind above M32. Include that layout in the
@@ -561,7 +573,14 @@ def _warmup_fp8_dense_layers(
         batch_qpn8 = getattr(layer, "sm70_fp8_qpn8", False) and getattr(
             layer, "sm70_fp8_batch_tm", False
         )
-        if batch_qpn8:
+        block_qpn8 = hasattr(layer, "_sm70_block_fp8_qpn8_packed_codes")
+        if block_qpn8:
+            weight = layer._sm70_block_fp8_turbomind_packed_weight
+            scales = layer._sm70_block_fp8_turbomind_packed_scales
+            k_ld = int(layer._qpn8_fallback_k_ld)
+            q_ld = int(layer._qpn8_fallback_q_ld)
+            n_dim = int(layer._qpn8_out_features)
+        elif batch_qpn8:
             weight = layer.sm70_fp8_batch_tm_weight
             scales = layer.sm70_fp8_batch_tm_scales
             k_ld = int(layer.sm70_fp8_batch_tm_k_ld)
@@ -602,6 +621,8 @@ def _warmup_fp8_dense_layers(
         k_dim = int(weight.shape[0])
         for m_dim in m_values:
             if batch_qpn8 and not 32 < m_dim <= 64:
+                continue
+            if block_qpn8 and m_dim <= _QPN8_MAX_M:
                 continue
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
