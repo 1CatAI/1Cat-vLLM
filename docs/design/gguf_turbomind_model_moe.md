@@ -117,3 +117,27 @@ against both official Q2_0 decoding and the previous lossless Q4_1 transcode.
 All sampled values are finite. This confirms coefficient/value preservation
 on the sampled checkpoint rows; full-model accumulation and distributions
 are measured separately.
+
+## Startup memory localization
+
+All four ranks load the corrected checkpoint with approximately 16.41 GiB of
+model weights. The first graph run fails during the 8192-token profiling pass,
+at initial GDN warmup after cold compilation. No throughput or distribution
+results are counted from this failed run.
+
+A smaller test reproduces the FFN geometry independently: E=512, H=2560,
+local intermediate=160, top-10, and a 16 GiB constant allocation simulating
+the other model weights. One real expert's weights are replicated across the
+512 physical slots; this tests memory behavior rather than distinct-expert
+throughput. Concentrated and balanced assignments pass at M=512 and M=8192,
+including 81,920 routed rows. All eight eager/compiled cases are finite and
+compiled results match eager with rtol=0.025/atol=0.002. At M=8192, additional
+peak allocation is 2.81 GiB eager versus 0.47 GiB compiled. The single FFN
+does not reproduce the full-model failure.
+
+Record allocated, reserved, inactive split and driver free/total bytes when
+profiling fails; preserve the original accelerator error even if querying
+the driver fails. Both CPU cases pass from source and the installed wheel.
+This diagnostic changes neither precision nor kernel dispatch. The same
+8192-token full-model retry must establish whether cold compilation, retained
+allocations or another source accounts for the OOM before changing budgets.
