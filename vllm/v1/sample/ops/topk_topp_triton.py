@@ -1178,9 +1178,10 @@ def apply_top_k_top_p_triton(
     if batch_size == 0 or not (topk_enabled or topp_enabled):
         return logits
 
-    # Sampling normally runs outside the model graphs. Keep direct graph
-    # callers correct without introducing a device-to-host fence in capture.
-    if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+    # The pivot kernel can miss split ties in a single grammar-masked row.
+    # Keep direct callers on the same reference route as the public sampler.
+    # Graph callers also need a route without a device-to-host fence.
+    if batch_size == 1 or (logits.is_cuda and torch.cuda.is_current_stream_capturing()):
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         reference_logits = apply_top_k_top_p_pytorch(logits, k, p)

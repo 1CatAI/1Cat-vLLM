@@ -349,3 +349,60 @@ work. This is a prediction, not an end-to-end result. Full-model C1 1K/8K and
 C4 checks follow integration; the next full trace follows the shared dense
 GDN a/b loading fix. Independent IQ3_S, Q8_0 and tiny-dense kernel prototypes
 are stopped in favor of the shared GGUF kernel and loading work.
+
+## Runtime-dispatch integration measurement
+
+The normal wheel at source `7fd188f4a23a0db8c03e9ac66b0391f4bb51eaa3`
+selects canonical projection kernels from the actual M inside the graph
+operator. A three-projection real-weight Inductor segment, first compiled at
+M=512 and replayed at M=8/16, matches eager output exactly. Its M=8 replay
+contains no lattice/affine dequantization, s884 GEMM or large workspace copy.
+
+The subsequent unprofiled model run uses TP4 on four 300 W V100s with all
+pairs connected by NVLink, CUDA 12.8, Torch 2.10.0+cu128, maximum length
+262144, four sequence slots, batch token budget 1024, FP16 activation/KV and
+FP32 SSM state. DFlash2 uses the Q8_0 draft with seven speculative tokens;
+CUDA graphs and async scheduling are enabled, with prefix caching disabled.
+Sampling uses temperature 0.7, top-p 0.9, top-k 20, seed 123 and thinking off.
+
+Eight shared prompts per input size are exactly 1024 or 8192 token IDs.
+Each emits 600 tokens with EOS ignored only for the fixed-length measurement.
+The steady estimator omits the first twenty full verification rounds and
+averages equally across prompts. It measures complete engine output rounds,
+including target verification, sampling and draft work, not target kernel
+service alone.
+
+| Input | Full round ms | Emitted tokens/full round | 95% prompt-bootstrap interval |
+| ---: | ---: | ---: | ---: |
+| 1024 | 34.940 | 3.0288 | 2.9092–3.1878 |
+| 8192 | 35.398 | 2.9204 | 2.7753–3.0929 |
+
+The counter estimator `1 + accepted drafts / draft rounds`, averaged equally
+across prompts before dropping warmup, is 3.0204 and 2.8950. The emitted
+full-round estimator before dropping warmup is 3.0179 and 2.8926. These
+closely agree; the earlier 3.97/4.27 measurements used a different prompt,
+sampling policy and shorter outputs, so they cannot establish an acceptance
+advantage over the NVFP4 target. A 10,000-resample whole-prompt bootstrap with
+seed 123 supplies the intervals above. Using the same steady emitted-token estimator on the saved NVFP4 baseline
+cohort gives 2.7588 tokens per round at 1K, versus 3.0288 for GGUF. The paired
+whole-prompt bootstrap interval for the difference is [0.0914, 0.4996]. The
+latest measured NVFP4 arm gives 2.7987, with difference interval
+[0.0558, 0.4833]. Both cohorts use the same eight input texts and sampling
+parameters, but target weights, KV dtype and draft representation differ.
+These results cannot isolate draft quantization or establish a quality
+advantage. This is not a Q8_0-versus-BF16 draft comparison; that control remains
+pending.
+
+Four concurrent natural prompts produce nonempty, reasonable output in
+5.053 seconds with a 96-token limit. All stop at the length limit. This is a
+C4 execution smoke, not an EOS-quality test or proof of throughput parity.
+The earlier short natural prompts completed normally under the loading gate.
+
+The earlier unprofiled baseline was about 47 ms per round at different
+context/capacity and prompt contracts; the graph-linked profiled ledger was
+48.965 ms. The new 34.94/35.40 ms results support removal of the wrong
+prefill route, but do not define a matched A/B speedup or a calibrated profiler
+correction. Retain the roughly 11 ms saving as a projection, and use a new
+same-contract graph ledger after the shared floating-projection loading fix.
+No additional full-model run or trace is needed between those integration
+boundaries. The below-12-ms objective remains unmet.
