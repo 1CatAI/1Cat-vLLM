@@ -7464,7 +7464,27 @@ def qwen_gdn_input_projection_core(
         layer_name,
         hidden_states,
     )
-    if _sm70_gdn_qpn8_ba_split_eligible(
+    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+        apply_gdn_ba_verify,
+    )
+
+    fused_verify_projection = None
+    if hidden_states.shape == (8, 5120) and not _sm70_gdn_projection_dump_requested(
+        layer_name
+    ):
+        fused_verify_projection = apply_gdn_ba_verify(
+            self,
+            hidden_states,
+            outputs=(
+                hidden_states.new_empty((8, 2560)),
+                z_out.view(8, 1536) if z_out.shape == (8, 12, 128) else z_out,
+                hidden_states.new_empty((8, 12)),
+                hidden_states.new_empty((8, 12)),
+            ),
+        )
+    if fused_verify_projection is not None:
+        mixed_qkv, _, b, a = fused_verify_projection
+    elif _sm70_gdn_qpn8_ba_split_eligible(
         self,
         hidden_states,
         z_out,
@@ -7577,6 +7597,25 @@ def qwen_gdn_input_projection(
         layer_name,
         hidden_states,
     )
+    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+        apply_gdn_ba_verify,
+    )
+
+    if hidden_states.shape == (8, 5120) and not _sm70_gdn_projection_dump_requested(
+        layer_name
+    ):
+        fused_verify_projection = apply_gdn_ba_verify(
+            self,
+            hidden_states,
+            outputs=(
+                mixed_qkv_out,
+                z_out.view(8, 1536) if z_out.shape == (8, 12, 128) else z_out,
+                b_out,
+                a_out,
+            ),
+        )
+        if fused_verify_projection is not None:
+            return
     if _sm70_gdn_qpn8_ba_split_eligible(
         self,
         hidden_states,
