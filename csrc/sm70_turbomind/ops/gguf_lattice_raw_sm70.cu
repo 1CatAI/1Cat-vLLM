@@ -889,7 +889,7 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
     RAW_VEC(TYPE, false, FACTOR);    \
   }
   if (source_type == 18) {
-    SELECT_RAW_VEC(18, false, false);
+    SELECT_RAW_VEC(18, false);
   } else if (source_type == 21) {
     if (factor_scale) {
       SELECT_RAW_VEC(21, true);
