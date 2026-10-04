@@ -995,6 +995,9 @@ def _gguf_lm_head_projection(
     maximum_m: int,
     native_enabled: bool,
     prefill_min_m: int,
+    source_type: int = int(WeightType.Q4_K),
+    bits: int = 4,
+    group_size: int = 32,
 ) -> torch.Tensor:
     rows = x.numel() // x.shape[-1]
     if minimum_m <= rows <= maximum_m:
@@ -1004,8 +1007,8 @@ def _gguf_lm_head_projection(
             stats,
             None,
             0,
-            4,
-            32,
+            bits,
+            group_size,
             k_ld,
             q_ld,
             raw.shape[0],
@@ -1013,9 +1016,7 @@ def _gguf_lm_head_projection(
             [],
             [],
         )
-    return fused_mul_mat_gguf(
-        x, raw, int(WeightType.Q4_K), native_enabled, prefill_min_m
-    )
+    return fused_mul_mat_gguf(x, raw, source_type, native_enabled, prefill_min_m)
 
 
 def _gguf_lm_head_projection_fake(
@@ -1029,6 +1030,9 @@ def _gguf_lm_head_projection_fake(
     maximum_m: int,
     native_enabled: bool,
     prefill_min_m: int,
+    source_type: int = int(WeightType.Q4_K),
+    bits: int = 4,
+    group_size: int = 32,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], raw.shape[0]), dtype=x.dtype, device=x.device)
 
@@ -1046,6 +1050,11 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
     def process_weights_after_loading(self, layer):
         weight_type = layer.qweight_type.weight_type
         raw = layer.qweight.detach()
+        calibration = {
+            (int(WeightType.Q4_K), (62080, 2880)): (2, 16),
+            (int(WeightType.Q6_K), (62080, 2100)): (1, 20),
+        }.get((weight_type, tuple(raw.shape)))
+        minimum_m, maximum_m = calibration or (2, 16)
         reason = None
         if not self.native_enabled:
             reason = "disabled_by_kernel_config"
@@ -1053,7 +1062,7 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
             reason = "requires_fp16_activations"
         elif raw.device.type != "cuda" or not current_platform.is_device_capability(70):
             reason = "requires_sm70"
-        elif weight_type != int(WeightType.Q4_K) or tuple(raw.shape) != (62080, 2880):
+        elif calibration is None:
             reason = "lm_head_shape_or_format_has_no_calibration"
         self.canonical_lm_head = reason is None
         self.lm_head_capability = (
@@ -1062,8 +1071,8 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
                 quant_type_name(weight_type),
                 "gguf_lm_head_projection",
                 True,
-                min_m=2,
-                max_m=16,
+                min_m=minimum_m,
+                max_m=maximum_m,
             )
             if self.canonical_lm_head
             else None
@@ -1078,16 +1087,16 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
             )
             self.native_admission["lm_head"] = {
                 "operator": self.lm_head_capability.operator,
-                "min_m": 2,
-                "max_m": 16,
+                "min_m": minimum_m,
+                "max_m": maximum_m,
                 "reason": None,
                 "raw_fallback": "outside_measured_m_band",
             }
         else:
             self.native_admission["lm_head"] = {
                 "operator": "gguf_lm_head_projection",
-                "min_m": 2,
-                "max_m": 16,
+                "min_m": minimum_m,
+                "max_m": maximum_m,
                 "reason": reason or "canonical_kernel_unavailable",
             }
 
@@ -1106,6 +1115,9 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
                 self.lm_head_capability.max_m,
                 self.native_enabled,
                 self.prefill_min_m,
+                projection.source_type,
+                projection.kernel.bits,
+                projection.kernel.config.group_size,
             )
             return output if bias is None else output + bias
         return super().apply(layer, x, bias)

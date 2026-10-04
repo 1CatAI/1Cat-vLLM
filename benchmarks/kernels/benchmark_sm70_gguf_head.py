@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--lm-head-method", action="store_true")
     args = parser.parse_args()
     assert args.tp > 0 and 0 <= args.rank < args.tp
     assert torch.cuda.get_device_capability() == (7, 0)
@@ -71,17 +72,38 @@ def main():
     assert projection.kernel is not None, projection.admission()
     assert projection.fp16_cache is None, "Vocabulary head must remain packed"
     assert not hasattr(projection, "weight")
+    if args.lm_head_method:
+        from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+        from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+        layer = ParallelLMHead.__new__(ParallelLMHead)
+        torch.nn.Module.__init__(layer)
+        method = GGUFConfig().get_quant_method(layer, "lm_head")
+        method.create_weights(
+            layer, official.shape[1], [n], official.shape[1], n, torch.float16
+        )
+        layer.qweight.materialize(data.shape, device="cuda", dtype=torch.uint8)
+        layer.qweight.data.copy_(torch.from_numpy(data).cuda())
+        layer.qweight_type.weight_type = source_type
+        method.process_weights_after_loading(layer)
+        assert method.canonical_lm_head, method.native_admission
+        assert len(layer.gguf_tm_projections) == 1
+        del projection
+        projection = layer.gguf_tm_projections[0]
+        project = lambda x: method.apply(layer, x)
+    else:
+        project = projection
     results = []
     for m in (1, 5, 8, 20):
         torch.manual_seed(20261004 + m)
         x = (torch.randn(m, official.shape[1], device="cuda") * 0.125).half()
         reference = x.float() @ official_gpu.T
         old = torch.nn.functional.linear(x, dense)
-        new = projection(x)
+        new = project(x)
         old_error = old.float() - reference
         new_error = new.float() - reference
         old_us = graph_us(lambda x=x: torch.nn.functional.linear(x, dense))
-        new_us = graph_us(lambda x=x: projection(x))
+        new_us = graph_us(lambda x=x: project(x))
         results.append(
             {
                 "m": m,
