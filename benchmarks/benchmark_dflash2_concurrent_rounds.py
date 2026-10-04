@@ -135,18 +135,21 @@ async def run(args):
             ):
                 profile_task = asyncio.create_task(start_profile())
 
-        requests = await asyncio.gather(
-            *(
-                request(client, args, prompts[index], index, barrier, progress)
-                for index in range(args.concurrency)
+        try:
+            requests = await asyncio.gather(
+                *(
+                    request(client, args, prompts[index], index, barrier, progress)
+                    for index in range(args.concurrency)
+                )
             )
-        )
+        finally:
+            if profile_task is not None:
+                await profile_task
+                response = await client.post(args.base_url + "/stop_profile")
+                response.raise_for_status()
         if args.profile_after_chunks is not None:
             if profile_task is None:
                 raise ValueError("Cohort completed before profiling could start")
-            await profile_task
-            response = await client.post(args.base_url + "/stop_profile")
-            response.raise_for_status()
     result = {
         "contract": {
             key: str(value) if isinstance(value, Path) else value

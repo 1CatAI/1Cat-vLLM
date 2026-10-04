@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,3 +47,38 @@ def test_common_window_rejects_nonoverlapping_requests():
         _MODULE.common_window(
             [cohort([0, 1, 2, 3, 4]), cohort([10, 11, 12, 13, 14], 1)], trim=1
         )
+
+
+def test_profile_stops_when_a_stream_fails(monkeypatch, tmp_path):
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def post(self, url):
+            calls.append(url.rsplit("/", 1)[-1])
+            return SimpleNamespace(raise_for_status=lambda: None)
+
+    async def failed_request(client, args, prompt, index, barrier, progress):
+        await barrier.wait()
+        progress(index, 1)
+        raise RuntimeError("stream failed")
+
+    monkeypatch.setattr(_MODULE.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(_MODULE, "request", failed_request)
+    fixture = tmp_path / "inputs.json"
+    fixture.write_text(json.dumps({"8192": ["prompt"]}))
+    args = SimpleNamespace(
+        inputs=fixture,
+        input_tokens=8192,
+        concurrency=1,
+        base_url="https://benchmark.example",
+        profile_after_chunks=1,
+    )
+    with pytest.raises(RuntimeError, match="stream failed"):
+        asyncio.run(_MODULE.run(args))
+    assert calls == ["start_profile", "stop_profile"]
