@@ -373,7 +373,19 @@ def main():
                         variants = [(*variant, False) for variant in variants]
                         if a.include_occupancy7 and mt == 16:
                             variants += [(*variant[:3], True) for variant in variants]
-                        for name, prefetch, staged, bounded in variants:
+                        variants = [(*variant, False) for variant in variants]
+                        if mt == 16:
+                            variants += [
+                                ("_activation", False, False, False, True),
+                                ("_prefetch_activation", True, False, False, True),
+                            ]
+                        for (
+                            name,
+                            prefetch,
+                            staged,
+                            bounded,
+                            stage_activation,
+                        ) in variants:
                             tile_name = f"_rows{row_tile}" if row_tile else ""
                             if bounded:
                                 tile_name += "_occupancy7"
@@ -392,6 +404,7 @@ def main():
                                         staged,
                                         row_tile,
                                         bounded,
+                                        stage_activation,
                                     ),
                                 )
                             )

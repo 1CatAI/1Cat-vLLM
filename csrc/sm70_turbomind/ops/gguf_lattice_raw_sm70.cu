@@ -145,7 +145,8 @@ __global__ void reduce_vec(half* out, const float* partial, int n, int splits) {
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool StageActivation = false>
 __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
                                              const half* x,
                                              const uint8_t* weight, int m,
@@ -157,6 +158,9 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
   __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
   __shared__ __align__(16) uint8_t raw[NT][120];
   __shared__ float sums[4][MT][NT];
+  __shared__ __align__(16) half activations[StageActivation ? MT : 1][264];
+  static_assert(!StageActivation ||
+                (Compact && NT == 32 && MT == 16 && !Staged));
   Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int col_begin = blockIdx.x * NT, row_begin = blockIdx.y * MT;
@@ -198,6 +202,19 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
         }
       }
     }
+    if constexpr (StageActivation) {
+      // Each warp copies a complete contiguous K row in aligned vectors.
+      // Padding rotates row banks for the MMA fragment's shared loads.
+      for (int index = threadIdx.x; index < MT * 32; index += blockDim.x) {
+        const int row = index / 32, octet = index % 32;
+        uint4 value{};
+        if (row_begin + row < m)
+          value = *reinterpret_cast<const uint4*>(
+              x + int64_t{row_begin + row} * k + block * 256 + octet * 8);
+        *reinterpret_cast<uint4*>(&activations[row][octet * 8]) = value;
+      }
+      __syncthreads();
+    }
     const int width = FullWidth ? 32 : min(NT, n - col_begin);
     const uint8_t* tile = nullptr;
     typename Packed::Parameters parameters{};
@@ -235,8 +252,10 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
         const int row = row_begin + index * 8 + arow;
         if (row < m)
           *reinterpret_cast<uint4*>(&activation[index]) =
-              *reinterpret_cast<const uint4*>(x + int64_t{row} * k +
-                                              block * 256 + warp * 64);
+              *reinterpret_cast<const uint4*>(
+                  StageActivation
+                      ? &activations[index * 8 + arow][warp * 64]
+                      : x + int64_t{row} * k + block * 256 + warp * 64);
       }
 #pragma unroll
       for (int step = 0; step < 64; step += 8) {
@@ -250,9 +269,11 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
             const int row = row_begin + index * 8 + arow;
             if (row < m)
               *reinterpret_cast<uint4*>(&next_activation[index]) =
-                  *reinterpret_cast<const uint4*>(x + int64_t{row} * k +
-                                                  block * 256 + warp * 64 +
-                                                  step + 8);
+                  *reinterpret_cast<const uint4*>(
+                      StageActivation
+                          ? &activations[index * 8 + arow][warp * 64 + step + 8]
+                          : x + int64_t{row} * k + block * 256 + warp * 64 +
+                                step + 8);
           }
         }
         const uint32_t packet = Packed::extract(current, valid ? bcol : 0);
@@ -297,7 +318,8 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
           const int row = row_begin + tile * 8 + arow;
           if (row < m) {
             *reinterpret_cast<uint4*>(&a) = *reinterpret_cast<const uint4*>(
-                x + (int64_t)row * k + block * 256 + base);
+                StageActivation ? &activations[tile * 8 + arow][base]
+                                : x + (int64_t)row * k + block * 256 + base);
           }
           MMA::fma(accum[tile], a, b, accum[tile]);
         }
@@ -312,7 +334,7 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
           if (word < kStageWords) packets[word] = next_words[i];
         }
       }
-    } else if constexpr (!Compact) {
+    } else if constexpr (!Compact || StageActivation) {
       __syncthreads();
     }
   }
@@ -345,12 +367,14 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool StageActivation = false>
 __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int m, int n, int k,
                                int stride, int splits) {
-  raw_mma_body<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>(
-      out, partial, x, weight, m, n, k, stride, splits);
+  raw_mma_body<Type, NT, MT, Compact, FullWidth, Prefetch, Staged,
+               StageActivation>(out, partial, x, weight, m, n, k, stride,
+                                splits);
 }
 
 template <int Type, bool FullWidth, bool Prefetch, bool Staged>
@@ -573,7 +597,7 @@ __global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
 
 template <int Type, int NT, int MT, bool Compact = false,
           bool FullWidth = false, bool Prefetch = false, bool Staged = false,
-          bool Bounded = false>
+          bool Bounded = false, bool StageActivation = false>
 void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
                 torch::Tensor partial, int splits, cudaStream_t stream) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -587,13 +611,13 @@ void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
             reinterpret_cast<const half*>(input.data_ptr()),
             weight.data_ptr<uint8_t>(), m, n, k, 0, splits);
   } else {
-    raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>
-        <<<grid, 128, 0, stream>>>(
-            reinterpret_cast<half*>(out.data_ptr()),
-            splits > 1 ? partial.data_ptr<float>() : nullptr,
-            reinterpret_cast<const half*>(input.data_ptr()),
-            weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
-            splits);
+    raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged,
+                   StageActivation><<<grid, 128, 0, stream>>>(
+        reinterpret_cast<half*>(out.data_ptr()),
+        splits > 1 ? partial.data_ptr<float>() : nullptr,
+        reinterpret_cast<const half*>(input.data_ptr()),
+        weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
+        splits);
   }
 }
 void validate_raw(torch::Tensor w, int type, int64_t n, int64_t k) {
@@ -959,12 +983,10 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
-                                       torch::Tensor weight,
-                                       int64_t source_type,
-                                       torch::Tensor partial, int64_t splits,
-                                       bool prefetch, bool staged,
-                                       int64_t row_tile, bool occupancy7) {
+void gguf_lattice_compact_mma_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor partial, int64_t splits, bool prefetch,
+    bool staged, int64_t row_tile, bool occupancy7, bool stage_activation) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -1022,7 +1044,34 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
       COMPACT_SELECT(22, false, BOUNDED);         \
     }                                             \
   }
-  if (occupancy7) {
+  if (stage_activation) {
+    TORCH_CHECK(mt == 16 && !staged && !occupancy7,
+                "Activation staging requires an unbounded M16 tile without "
+                "weight staging");
+#define COMPACT_ACT(TYPE, FULL, PREF)                             \
+  launch_mma<TYPE, 32, 16, true, FULL, PREF, false, false, true>( \
+      out, input, weight, partial, splits, stream)
+#define COMPACT_ACT_PREF(TYPE, FULL) \
+  if (prefetch) {                    \
+    COMPACT_ACT(TYPE, FULL, true);   \
+  } else {                           \
+    COMPACT_ACT(TYPE, FULL, false);  \
+  }
+#define COMPACT_ACT_SELECT(TYPE)   \
+  if (n % 32 == 0) {               \
+    COMPACT_ACT_PREF(TYPE, true);  \
+  } else {                         \
+    COMPACT_ACT_PREF(TYPE, false); \
+  }
+    if (source_type == 21) {
+      COMPACT_ACT_SELECT(21);
+    } else {
+      COMPACT_ACT_SELECT(22);
+    }
+#undef COMPACT_ACT_SELECT
+#undef COMPACT_ACT_PREF
+#undef COMPACT_ACT
+  } else if (occupancy7) {
     COMPACT_DISPATCH(true);
   } else {
     COMPACT_DISPATCH(false);
