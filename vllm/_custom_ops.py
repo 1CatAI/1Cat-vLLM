@@ -4253,3 +4253,19 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+if hasattr(torch.ops._C, "sm70_ring_atomic_allreduce_out"):
+
+    @register_fake("_C::sm70_ring_atomic_allreduce_out")
+    def _sm70_ring_allreduce_fake(
+        output,
+        input,
+        addresses,
+        counters,
+        rank_order,
+        rank,
+        capacity,
+        block_packets=False,
+    ) -> None:
+        return None

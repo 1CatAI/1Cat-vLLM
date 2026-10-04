@@ -365,6 +365,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
   if (SM70_TURBOMIND_ARCHS)
+    list(APPEND VLLM_EXT_SRC "csrc/sm70_ring_collectives.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "csrc/sm70_ring_collectives.cu"
+      CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
     set(VLLM_SM70_TURBOMIND_ROOT
         "${CMAKE_CURRENT_LIST_DIR}/csrc/sm70_turbomind")
     set(VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT

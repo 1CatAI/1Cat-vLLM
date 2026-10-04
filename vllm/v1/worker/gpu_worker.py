@@ -948,6 +948,9 @@ class Worker(WorkerBase):
             "rank": self.rank,
             "scope": "loaded_layer_selection",
             "linear_kernel_selections": selections,
+            "collective_kernel_selections": (
+                self.vllm_config.kernel_config.collective_kernel_selections
+            ),
             "ple_result_transports": transports,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),

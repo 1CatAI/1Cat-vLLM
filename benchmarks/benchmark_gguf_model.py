@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--cuda-profiler-capture", action="store_true")
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--ring", choices=("auto", "disabled"), default="auto")
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 4, 8, 16])
@@ -86,6 +87,8 @@ def main():
     )
     if args.model.suffix.lower() == ".gguf":
         config["quantization"] = "gguf"
+    if args.ring == "disabled":
+        config["kernel_config"] = {"sm70_ring": {"enabled": False}}
     report = {
         "vllm_version": vllm.__version__,
         "vllm_origin": vllm.__file__,
@@ -110,6 +113,7 @@ def main():
         "prefill": [],
         "complete": False,
         "cuda_profiler_capture": args.cuda_profiler_capture,
+        "ring_policy": args.ring,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -118,6 +122,13 @@ def main():
 
     llm = LLM(**config)
     try:
+        report["collectives"] = [
+            {
+                "rank": row["rank"],
+                "selections": row.get("collective_kernel_selections", {}),
+            }
+            for row in llm.collective_rpc("get_sm70_acceleration_report")
+        ]
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
         natural = llm.generate(
