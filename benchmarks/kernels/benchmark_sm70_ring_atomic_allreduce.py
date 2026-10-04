@@ -17,6 +17,7 @@ import os
 import socket
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
 import pynvml
@@ -38,7 +39,11 @@ def check_exclusive():
     )
     foreign = {int(p) for p in pids.split()} - {os.getpid()}
     if foreign:
-        raise RuntimeError(f"Foreign GPU processes invalidate this run: {foreign}")
+        print(
+            f"GPU lease is not exclusive; retry after processes exit: {foreign}",
+            file=sys.stderr,
+        )
+        raise SystemExit(75)
 
 
 def discover_order(devices):
