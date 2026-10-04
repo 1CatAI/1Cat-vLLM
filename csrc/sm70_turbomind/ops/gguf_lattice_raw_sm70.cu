@@ -94,12 +94,7 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
   const int begin = blocks * blockIdx.y / splits;
   const int end = blocks * (blockIdx.y + 1) / splits;
   const auto* row_data = weight + int64_t{row} * stride;
-  uint4 current_activation{};
-  if constexpr (Prefetch) {
-    stage_block<Type>(raw[warp], row_data, begin, stride);
-    current_activation =
-        *reinterpret_cast<const uint4*>(x + begin * 256 + lane * 8);
-  }
+  if constexpr (Prefetch) stage_block<Type>(raw[warp], row_data, begin, stride);
   for (int block = begin; block < end; ++block) {
     constexpr int bytes = Decode::kBlockBytes;
     const int next_start = (block + 1) * bytes;
@@ -108,11 +103,7 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
     const bool load_next =
         block + 1 < end && lane < words && aligned + lane * 8 < stride;
     uint64_t next_word = 0;
-    uint4 next_activation{};
     if constexpr (Prefetch) {
-      if (block + 1 < end)
-        next_activation =
-            *reinterpret_cast<const uint4*>(x + (block + 1) * 256 + lane * 8);
       if (load_next)
         next_word =
             *reinterpret_cast<const uint64_t*>(row_data + aligned + lane * 8);
@@ -126,8 +117,7 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
     // K is block aligned and each lane owns eight adjacent half values.
     // One 128-bit load replaces eight strided 16-bit memory instructions.
     const uint4 loaded =
-        Prefetch ? current_activation
-                 : *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
+        *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
     const auto& activation =
         reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
 #pragma unroll
@@ -136,7 +126,6 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
     __syncwarp();
     if constexpr (Prefetch) {
       if (load_next) reinterpret_cast<uint64_t*>(raw[warp])[lane] = next_word;
-      current_activation = next_activation;
       __syncwarp();
     }
   }

@@ -1153,3 +1153,11 @@ slower at 101.732/103.567 us. No prefill default changes follow from these
 results. The next independent M1 experiment prefetches the next FP16 activation
 fragment alongside the next original weight word, retaining the identical FP32
 FMA order and original-byte vector layout.
+
+The M1 activation-lookahead candidate passes 40 checks but regresses both 27B
+projections: gate/down 36.081/34.132 us versus 31.846/30.805 us canonical.
+It is reverted, restoring the earlier original-word prefetch schedule. The two
+additional FP16 registry tiles also provide no measured workspace improvement
+and are removed. The experimental FP16 workspace operator remains a declared
+compact-layout capability at M>=512, with an explicit output-pack alignment
+rejection for N tails; declaring support does not select a model default.

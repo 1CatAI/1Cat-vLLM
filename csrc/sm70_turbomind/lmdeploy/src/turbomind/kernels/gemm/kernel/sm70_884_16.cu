@@ -23,9 +23,6 @@ void Registry::sm70_884_16()
         Add<C::Type< 96,  64,  32, 2, 2, 1, D, D, 2, true, 1, 1>>();
         Add<C::Type< 64, 128,  32, 1, 4, 1, D, S, 2, true, 1, 1>>();
         Add<C::Type< 64,  64,  64, 2, 2, 1, D, S, 2, true, 1, 1>>();
-        // Smaller accumulation tiles limit register pressure for FP16 workspaces.
-        Add<C::Type<128,  64,  16, 2, 2, 1, D, S, 2, true, 1, 1>>();
-        Add<C::Type< 64,  64,  32, 2, 2, 1, D, S, 2, true, 1, 1>>();
         Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 1>>();
         Add<C::Type< 16, 128,  64, 1, 4, 1, D, S, 2, true, 1, 1>>();
         Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 1>>();
