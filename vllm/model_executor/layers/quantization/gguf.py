@@ -109,17 +109,11 @@ class GGUFConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
-        # A vocabulary head consumes activations as a linear projection. It
-        # needs canonical linear preparation, not embedding row lookup.
-        if isinstance(layer, (LinearBase, ParallelLMHead)):
+        if isinstance(layer, LinearBase):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
-                return (
-                    UnquantizedEmbeddingMethod()
-                    if isinstance(layer, ParallelLMHead)
-                    else UnquantizedLinearMethod()
-                )
+                return UnquantizedLinearMethod()
             method = GGUFLinearMethod(self, self.linear_layouts.get(prefix))
             method.fallback_reason = self.fallback_reasons.get(prefix)
             return method

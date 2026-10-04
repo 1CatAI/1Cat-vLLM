@@ -10,7 +10,7 @@ import torch
 from vllm.model_executor.layers.quantization.gguf import (
     GGUFConfig,
     GGUFEmbeddingMethod,
-    GGUFLinearMethod,
+    GGUFLMHeadMethod,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -27,7 +27,7 @@ def empty_layer(cls):
 
 def test_gguf_vocabulary_projection_uses_linear_preparation():
     method = GGUFConfig().get_quant_method(empty_layer(ParallelLMHead), "lm_head")
-    assert type(method) is GGUFLinearMethod
+    assert type(method) is GGUFLMHeadMethod
     layer = empty_layer(ParallelLMHead)
     method.create_weights(layer, 2560, [62080], 2560, 248320, torch.float16)
     assert layer.qweight.tensor_shape == (62080, 2560)
