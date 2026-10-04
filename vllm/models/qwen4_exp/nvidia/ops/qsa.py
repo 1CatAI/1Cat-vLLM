@@ -2090,6 +2090,47 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     return out
 
 
+def qsa_dcp_grouped_page4_config_reason(
+    *,
+    sharded: bool,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    kv_cache_dtype: str,
+    selection_width: int,
+    max_rows: int,
+) -> str | None:
+    """Explain static admission; tensor layout remains a runtime guard."""
+    if not sharded:
+        return "cache_not_dcp_sharded"
+    if not current_platform.is_device_capability(70):
+        return "requires_sm70"
+    if not (_SM70_QSA_XQA_PAGE4 and _SM70_QSA_GROUPED_PAGE4):
+        return "disabled_by_configuration"
+    if dtype != torch.float16 or kv_cache_dtype not in (
+        "auto",
+        "float16",
+        "fp8",
+        "fp8_e4m3",
+    ):
+        return "requires_fp16_queries_and_fp16_or_e4m3_cache"
+    if query_heads <= 0 or query_heads % 6 or kv_heads != 1 or head_dim != 256:
+        return "requires_six_head_groups_one_kv_head_and_dim256"
+    if selection_width != 2051:
+        return "requires_grouped_page4_selection_width2051"
+    if max_rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
+        return "prefill_budget_below_grouped_route_threshold"
+    try:
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+    except ImportError:
+        return "grouped_page4_operator_missing"
+    cache = "fp8_e4m3" if kv_cache_dtype in ("fp8", "fp8_e4m3") else "auto"
+    if not _qsa_grouped_page4_supported(flash_attn_v100_cuda, cache):
+        return "grouped_page4_operator_or_cache_abi_missing"
+    return None
+
+
 def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     q: torch.Tensor,
     k_cache: torch.Tensor,

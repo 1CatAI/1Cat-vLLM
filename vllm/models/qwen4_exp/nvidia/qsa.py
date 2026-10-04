@@ -641,6 +641,30 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             max_tokens=max_tokens,
             topk_indices_buffer=topk_indices_buffer,
         )
+        from .ops import qsa as qsa_ops
+
+        self._sm70_qsa_dcp_grouped_page4_reason = (
+            qsa_ops.qsa_dcp_grouped_page4_config_reason(
+                sharded=self.qsa_dcp_sharded,
+                query_heads=(
+                    self.num_heads * parallel_config.decode_context_parallel_size
+                ),
+                kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                dtype=model_config.dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
+                selection_width=self.topk_indices_buffer.shape[1],
+                max_rows=max_tokens,
+            )
+        )
+        self._sm70_qsa_dcp_grouped_page4 = (
+            self._sm70_qsa_dcp_grouped_page4_reason is None
+        )
+        qsa_ops.logger.info_once(
+            "SM70 QSA DCP grouped page4 capability: %s; row alignment, "
+            "batch size and tensor strides are checked at execution.",
+            self._sm70_qsa_dcp_grouped_page4_reason or "available",
+        )
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:

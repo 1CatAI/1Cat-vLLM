@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -18,6 +21,58 @@ pytestmark = pytest.mark.skip_global_cleanup
 
 TOPK, RATIO, WORLD, INTERLEAVE = 2048, 4, 2, 1
 WIDTH = TOPK + RATIO - 1
+
+
+@pytest.mark.parametrize("heads", [6, 12, 18])
+@pytest.mark.parametrize("cache", ["auto", "fp8_e4m3"])
+def test_startup_capability_admits_native_head_groups(monkeypatch, heads, cache):
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(qsa_ops, "_qsa_grouped_page4_supported", lambda *_: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100.flash_attn_interface",
+        SimpleNamespace(flash_attn_v100_cuda=object()),
+    )
+    assert (
+        qsa_ops.qsa_dcp_grouped_page4_config_reason(
+            sharded=True,
+            query_heads=heads,
+            kv_heads=1,
+            head_dim=256,
+            dtype=torch.float16,
+            kv_cache_dtype=cache,
+            selection_width=2051,
+            max_rows=8192,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"sharded": False}, "cache_not_dcp_sharded"),
+        ({"query_heads": 8}, "requires_six_head_groups_one_kv_head_and_dim256"),
+        ({"kv_heads": 2}, "requires_six_head_groups_one_kv_head_and_dim256"),
+        ({"head_dim": 128}, "requires_six_head_groups_one_kv_head_and_dim256"),
+        ({"dtype": torch.bfloat16}, "requires_fp16_queries_and_fp16_or_e4m3_cache"),
+        ({"selection_width": 1027}, "requires_grouped_page4_selection_width2051"),
+        ({"max_rows": 255}, "prefill_budget_below_grouped_route_threshold"),
+    ],
+)
+def test_startup_capability_reports_rejection(monkeypatch, change, reason):
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: True)
+    config = dict(
+        sharded=True,
+        query_heads=12,
+        kv_heads=1,
+        head_dim=256,
+        dtype=torch.float16,
+        kv_cache_dtype="auto",
+        selection_width=2051,
+        max_rows=8192,
+    )
+    assert qsa_ops.qsa_dcp_grouped_page4_config_reason(**(config | change)) == reason
 
 
 def test_small_batches_stay_on_triton():
