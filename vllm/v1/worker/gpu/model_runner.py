@@ -1318,6 +1318,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sample_hidden_states,
                 input_batch,
                 grammar_output,
+                allow_graph=self.lora_config is None,
             )
             if isinstance(sparse_result, DFlash2LogitsFallback):
                 cached_logits = sparse_result

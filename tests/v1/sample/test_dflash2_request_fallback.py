@@ -15,6 +15,131 @@ from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tie_width", [21, 24, 63, 64, 80])
+@pytest.mark.parametrize("use_fp64", [False, True])
+@torch.inference_mode()
+def test_single_request_cutoff_ties_preserve_dense_tokens(
+    monkeypatch, tie_width, use_fp64
+):
+    """One q8 request follows the eight-row reference, including tie order."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("Compact target rejection is SM70-only")
+    torch.manual_seed(20261004)
+    rows, vocab, slots, steps = 8, 248320, 10, 7
+    target = torch.full((rows, vocab), -20.0, device="cuda")
+    # FP16 head logits can put more than twenty tokens on the cutoff. Keep
+    # all of them, split the nucleus using vocabulary order, and retain dense
+    # fallback when even the wide probe truncates the support.
+    target[:, :tie_width] = 2.0
+    draft_ids = torch.arange(16, device="cuda").expand(slots, steps, 16).contiguous()
+    draft_scores = torch.randn(slots, steps, 16, device="cuda") * 0.5
+    draft_dense = torch.full((slots, steps, vocab), -float("inf"), device="cuda")
+    draft_dense.scatter_(2, draft_ids, draft_scores)
+    mapping_np = np.array([7])
+    mapping = torch.tensor(mapping_np, dtype=torch.int32, device="cuda")
+    expanded = mapping.expand(rows).contiguous()
+    local = torch.arange(rows, dtype=torch.int32, device="cuda")
+    positions = local.long() + 8192
+    inputs = local.clone()
+    cu_np = np.array([0, rows], dtype=np.int32)
+    cu = torch.tensor(cu_np, device="cuda")
+    temp_np = np.full(slots, 0.7, dtype=np.float32)
+    p_np = np.full(slots, 0.9, dtype=np.float32)
+    temperatures = torch.tensor(temp_np, device="cuda")
+    top_ps = torch.tensor(p_np, device="cuda")
+    seeds = torch.arange(slots, device="cuda", dtype=torch.int64) + 20261004
+
+    def process(logits, expanded_idx, *_):
+        result = logits.float().clone()
+        apply_temperature(result, expanded_idx, temperatures)
+        return apply_top_k_top_p(
+            result,
+            torch.full((result.shape[0],), 20, dtype=torch.int32, device="cuda"),
+            top_ps[expanded_idx],
+        )
+
+    states = SimpleNamespace(
+        vocab_size=vocab,
+        temperature=SimpleNamespace(np=temp_np, gpu=temperatures),
+        top_p=SimpleNamespace(np=p_np, gpu=top_ps),
+        seeds=SimpleNamespace(gpu=seeds),
+    )
+    sampler = SimpleNamespace(
+        sampling_states=states, use_fp64_gumbel=use_fp64, apply_sampling_params=process
+    )
+    rejection = SimpleNamespace(sampler=sampler, num_speculative_steps=steps)
+    batch = SimpleNamespace(
+        has_structured_output_reqs=False,
+        idx_mapping_np=mapping_np,
+        idx_mapping=mapping,
+        cu_num_logits_np=cu_np,
+        cu_num_logits=cu,
+        expanded_idx_mapping=expanded,
+        expanded_local_pos=local,
+        logits_indices=local.long(),
+        input_ids=inputs,
+        positions=positions,
+        num_tokens=rows,
+    )
+
+    class Speculator:
+        draft_logits = draft_dense
+
+        def get_sparse_draft_logits(self):
+            return draft_ids, draft_scores
+
+    monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
+    monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *args: True)
+    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
+    monkeypatch.setattr(
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
+    )
+    fallback = Mock(return_value=target)
+
+    def project(hidden, k):
+        values, ids = target.topk(k, dim=-1)
+        return ids, values, fallback
+
+    model = SimpleNamespace(
+        get_topk_tokens_and_logits=lambda hidden, k: project(hidden, k)[:2],
+        get_topk_tokens_and_logits_with_fallback=project,
+    )
+    for iteration in range(32):
+        seeds.add_(17)
+        actual = sparse_rejection.try_dflash2_sparse_target_rejection(
+            model,
+            Speculator(),
+            rejection,
+            torch.empty(rows, 4, device="cuda"),
+            batch,
+            None,
+        )
+        if tie_width >= 64:
+            assert isinstance(actual, sparse_rejection.DFlash2LogitsFallback)
+            assert actual.logits is target
+            continue
+        assert actual is not None
+        expected, count = rejection_sample(
+            process(target, expanded),
+            draft_dense,
+            inputs,
+            cu,
+            positions,
+            mapping,
+            expanded,
+            local,
+            temperatures,
+            seeds,
+            steps,
+            use_fp64=use_fp64,
+        )
+        assert torch.equal(actual.num_sampled, count)
+        valid = torch.arange(rows, device="cuda")[None] < count[:, None]
+        assert torch.equal(actual.sampled_token_ids[valid], expected[valid])
+    assert fallback.call_count == (32 if tie_width >= 64 else 0)
+
+
 def test_reference_mask_keeps_safe_rows():
     probe = torch.arange(21, 0, -1, dtype=torch.float32)[None].repeat(4, 1) / 8
     probe[2, -1] = probe[2, -2]
