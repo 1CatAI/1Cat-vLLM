@@ -136,8 +136,12 @@ def _qwen38_fp16_row_gemv_kernel(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     LOAD_POLICY: tl.constexpr,
+    N: tl.constexpr = 0,
 ):
     row = tl.program_id(0)
+    token = tl.program_id(1)
+    x_ptr += token * K
+    out_ptr += token * N
     offsets = tl.arange(0, BLOCK_K)
     acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
     for block_start in tl.static_range(0, K, BLOCK_K):
@@ -336,7 +340,8 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         and packed.dtype == x.dtype
         and packed.is_contiguous()
         and packed.data_ptr() % 16 == 0
-        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        # This kernel keeps all four partials and their ordered sum in FP32.
+        # The cuBLAS reduced-precision switch does not describe its arithmetic.
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
     )
 
@@ -360,20 +365,43 @@ def _qwen38_sm70_fp16_gemv(
         return out
     shape = (weight.shape[0], weight.shape[1])
     plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
-    if plan is None or not _runtime_ok(x, weight):
+    small_ba = bool(
+        role.endswith(_GDN_BA_SUFFIX)
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 32
+        and x.shape[1] == 2560
+        and 0 < weight.shape[0] <= 32
+        and _is_packed_row_major(x)
+        and _is_packed_row_major(weight)
+        and x.dtype == weight.dtype == torch.float16
+        and x.is_cuda
+        and weight.device == x.device
+        and current_platform.is_device_capability(70)
+    )
+    if plan is None or not (_runtime_ok(x, weight) or small_ba):
         return torch.nn.functional.linear(x, weight)
 
-    out = torch.empty((1, weight.shape[0]), dtype=x.dtype, device=x.device)
-    _qwen38_fp16_row_gemv_kernel[(weight.shape[0],)](
+    out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    _qwen38_fp16_row_gemv_kernel[(weight.shape[0], x.shape[0])](
         x,
         weight,
         out,
         K=weight.shape[1],
+        N=weight.shape[0],
         BLOCK_K=plan.block_k,
         LOAD_POLICY=plan.load_policy,
         num_warps=plan.num_warps,
     )
-    logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
+    if small_ba:
+        logger.info_once(
+            "SM70 checkpoint-FP16 batch a/b row GEMV enabled (M=%d, N=%d).",
+            x.shape[0],
+            weight.shape[0],
+        )
+    else:
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
     return out
 
 
@@ -552,7 +580,9 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
     # configure it before preparing weights, not during graph replay.
     matmul = torch.backends.cuda.matmul
     reason = None
-    if not matmul.allow_fp16_reduced_precision_reduction:
+    # Router partials and their ordered sum stay FP32. Its preparation must
+    # match _router_batch_runtime_ok rather than the cuBLAS reduction switch.
+    if role != "router" and not matmul.allow_fp16_reduced_precision_reduction:
         reason = "fp16_reduced_precision_reduction_disabled"
     elif matmul.allow_fp16_accumulation:
         reason = "fp16_accumulation_enabled"

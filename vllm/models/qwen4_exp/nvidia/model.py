@@ -918,6 +918,20 @@ class Qwen4ExpForCausalLM(
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
+    def prepare_loaded_linear_weights(self) -> None:
+        """Prepare dense routes discovered by checkpoint format loaders."""
+        previous = {
+            module: getattr(module, "quant_method", None) for module in self.modules()
+        }
+        enable_qwen38_sm70_fp16_gemv(self, self.model_config.dtype, self.vllm_config)
+        enable_qwen38_sm70_fp16_fused_hc(
+            self, self.model_config.dtype, self.vllm_config
+        )
+        for module in self.modules():
+            method = getattr(module, "quant_method", None)
+            if method is not None and method is not previous.get(module):
+                method.process_weights_after_loading(module)
+
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
