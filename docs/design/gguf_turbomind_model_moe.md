@@ -19,3 +19,14 @@ mixed-family FFN outputs in eager and changed-input graph replay. Real model
 concurrency and prefill measurements follow operator/layer validation.
 
 Integration base: `99bbedf135190d3ae94c7164bdbcb241b904222c`.
+
+## Initial installed layer checks
+
+The normal wheel passes the source/member/installed checks for all changed
+Python modules; the canonical core and corrected FA2 fingerprints are unchanged.
+All five focused cases pass on V100: Q2_0 source retention, mixed IQ3_XXS gate /
+IQ4_NL up / Q2_0 down FFNs at M=1/8/32/512, four TP partitions and changed-input
+CUDA graph replay. The down bank uses u2/group32 with local K=160. FP16 operands
+and FP32 accumulation are preserved; references use official GGUF decoding.
+These are layer checks. Full Flash-Next model loading, logits and throughput
+are still pending.
