@@ -1137,7 +1137,8 @@ def _apply_top_k_top_p_compact(
         # Dense sorting creates an int64 index for every vocabulary entry.
         # Bound the temporary working set when many verifier rows need the
         # reference, while preserving each row's full-vocabulary operation.
-        for chunk in rows.split(32):
+        max_reference_rows = 16 if rows.numel() > 32 else 32
+        for chunk in rows.split(max_reference_rows):
             reference = apply_top_k_top_p_pytorch(
                 logits.index_select(0, chunk),
                 k.index_select(0, chunk),

@@ -238,7 +238,7 @@ def test_compact_dense_fallback_bounds_temporary_rows(monkeypatch, rows):
     actual = _apply_top_k_top_p_compact(logits, k, p, -float("inf"))
     assert torch.equal(actual, expected)
     assert sum(dense_batch_sizes) == rows
-    assert max(dense_batch_sizes) <= 32
+    assert max(dense_batch_sizes) <= 16
 
 
 @pytest.mark.parametrize("rows", [2, 8, 32])
