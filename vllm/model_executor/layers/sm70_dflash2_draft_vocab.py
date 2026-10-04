@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Original FP8 draft head over an English/code and complete CJK subset."""
+"""Original FP8 draft head over complete ASCII/code and CJK token subsets."""
 
 import hashlib
 import json
@@ -48,7 +48,7 @@ def _byte_decoder() -> dict[str, int]:
 
 
 def build_draft_token_ids(tokenizer: dict, base_ids: list[int]) -> list[int]:
-    """Keep original IDs, complete CJK scripts, byte fragments and specials."""
+    """Keep original IDs, all ASCII/code, CJK, byte fragments and specials."""
     if (
         tokenizer["model"]["type"] != "BPE"
         or tokenizer["decoder"]["type"] != "ByteLevel"
@@ -68,7 +68,11 @@ def build_draft_token_ids(tokenizer: dict, base_ids: list[int]) -> list[int]:
             # rare CJK characters. Conservatively retain every such fragment.
             selected.add(token_id)
             continue
-        if any(any(low <= ord(c) <= high for low, high in _CJK_RANGES) for c in text):
+        # A frequency-selected English seed omits rare words and code pieces.
+        # Retain every ASCII token independently of that seed's corpus.
+        if text.isascii() or any(
+            any(low <= ord(c) <= high for low, high in _CJK_RANGES) for c in text
+        ):
             selected.add(token_id)
     return sorted(selected)
 
@@ -177,7 +181,7 @@ def maybe_prepare_draft_vocab(draft, vllm_config) -> None:
     )
     logger.info(
         "SM70 DFlash2 original-FP8 draft vocabulary enabled: %d global tokens, "
-        "%d local tokens; complete CJK/UTF-8-fragment coverage.",
+        "%d local tokens; complete ASCII/CJK/UTF-8-fragment coverage.",
         len(selected),
         logical_rows,
     )
