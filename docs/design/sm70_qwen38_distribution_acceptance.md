@@ -79,6 +79,14 @@ answer appears earlier. Record baseline cap failures separately. Keep counts,
 full outputs and reproducible checking code. This small suite is an admission
 screen, not a claim about all model capabilities.
 
+The quality runner records `health_passed` and per-case `health_failures`
+separately from task scores, and exits unsuccessfully on an unhealthy output.
+Its automatic screen flags a missing natural EOS, an empty final answer, a
+replacement character, or three occurrences of the same final-answer line
+longer than 24 characters. Repeated-line flags require inspection; a clean
+screen does not replace manual review for other repetition or invalid text.
+The fixed-length timing requests are excluded from this natural-EOS screen.
+
 Use ordinary installed source-complete wheels, the same model revision, GPUs,
 TP, graph, KV/state dtype, prompts, sequence lengths, disk placement and
 sampling contract in paired arms. Report decode separately from TTFT/prefill.
