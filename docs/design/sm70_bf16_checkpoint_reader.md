@@ -32,7 +32,10 @@ E512, H2560, TP4 I160, top-10 and M1/M5. It changes the weight decoder while
 retaining the sequential FP32 FMA order and router weighting before the Half
 projection output. It adds no model dispatch. This reference retains the
 existing per-route structure; it does not establish grouped-MoE performance.
-BF16 route and replay checks are pending.
+The four BF16 route/replay cases and four FP16-specialization bitwise
+comparisons against the accepted installed kernel pass in the research
+extension. Together with the dense reader, 15 numerical cases pass. No
+expert throughput claim is made.
 
 Optimized MoE grouped reading, checkpoint allocation, HC and norm integration, real
 activation measurements, and model distribution/acceptance checks are
