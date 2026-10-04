@@ -508,7 +508,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
-    if not mixed_qkv.is_contiguous():
+    if mixed_qkv.stride(1) != 1:
         mixed_qkv = mixed_qkv.contiguous()
 
     T = mixed_qkv.shape[0]
@@ -520,10 +520,11 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     q_size = H * K
     k_size = H * K
     v_size = HV * V
-    qkv_stride = q_size + k_size + v_size
-    if mixed_qkv.shape[1] != qkv_stride:
+    qkv_width = q_size + k_size + v_size
+    qkv_stride = mixed_qkv.stride(0)
+    if mixed_qkv.shape[1] != qkv_width:
         raise ValueError(
-            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_stride}."
+            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_width}."
         )
 
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
