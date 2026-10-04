@@ -247,3 +247,25 @@ The next isolated pipeline test compares one versus four K16 packet windows
 in registers, with one or two FP32 accumulation chains. Its four-window,
 single-chain build uses 59 registers and no spills; the two-chain build
 uses 67 registers. Both retain the original byte-codebook interface.
+
+Follow-up measurement caveat: the identical retained scale32 K64 binary
+measures 70.656 us in the deeper-prefetch cohort, versus 61.440 us in the
+preceding cohort. Its canonical control also changes from 75.776 to 82.944
+us while NVFP4 stays near 48.128 us. The scale-storage change is numerically
+bitwise equivalent, but its isolated speed effect is not established by
+these separate cohorts. A same-process old/new/new/old comparison with GPU
+clock and temperature records is pending before attributing the difference.
+
+Four-window packet lookahead is bitwise equivalent to one-window lookahead
+but measures the same 73.728 us with one accumulator chain. Two chains
+raise register use above 64 and regress to 86.016 us. Deeper lookahead is
+therefore rejected in this form; no model route has changed.
+
+The matched old/new/new/old scale-field test resolves the attribution:
+62.464 / 61.440 / 61.440 / 61.440 us at recorded SM 1530 MHz, memory
+877 MHz and 41 C. Outputs are bitwise equal. Narrower scale storage has no
+established independent speed benefit, so the earlier separate-cohort
+approximately 9 us difference must not be attributed to that change. The
+retained original-interface pair is about 61–62 us at this workload, versus
+canonical 75.776 us / native NVFP4 48.128 us. It still misses the 30 us goal;
+no scale-width or model-route change is promoted on these data.
