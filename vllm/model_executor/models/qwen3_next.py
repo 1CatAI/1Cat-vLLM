@@ -62,9 +62,10 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import _encode_layer_name, direct_register_custom_op
 
 from .interfaces import (
     EagleModelMixin,
@@ -549,6 +550,38 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _is_dflash2_spec_config,
+        )
+
+        self.sm70_qk_rope_prep = bool(
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(
+                70, device_id=torch.accelerator.current_device_index()
+            )
+            and tp_size == 4
+            and model_config is not None
+            and model_config.dtype == torch.float16
+            and model_config.quantization == "compressed-tensors"
+            and config.model_type == "qwen3_5_text"
+            and _is_dflash2_spec_config(get_current_vllm_config())
+            and self.attn_output_gate
+            and self.num_heads == 6
+            and self.num_kv_heads == 1
+            and self.head_dim == 256
+            and getattr(self.rotary_emb, "rotary_dim", None) == 64
+            and getattr(self.rotary_emb, "mrope_interleaved", False)
+            and getattr(self.rotary_emb, "mrope_section", None) == [11, 11, 10]
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float16
+            and not self.attn.calculate_kv_scales
+            and self.attn.attn_backend.get_name() == "FLASH_ATTN_V100"
+            and self.attn.kv_sharing_target_layer_name is None
+        )
+        if self.sm70_qk_rope_prep:
+            # Register the opaque preparation operator before compilation.
+            from vllm.model_executor.layers.attention import sm70_qwen38_qk_rope
+
+            _ = sm70_qwen38_qk_rope
 
     def forward(
         self,
@@ -582,14 +615,29 @@ class Qwen3NextAttention(nn.Module):
             v,
         )
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
+        if self.sm70_qk_rope_prep:
+            q = torch.empty((qkv.shape[0], 1536), device=qkv.device, dtype=qkv.dtype)
+            k = torch.empty((qkv.shape[0], 256), device=qkv.device, dtype=qkv.dtype)
+            torch.ops.vllm.sm70_qwen38_qk_norm_rope_cache(
+                qkv,
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                _encode_layer_name(self.attn.layer_name),
+            )
+        else:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
 
-        q, k = self.rotary_emb(positions, q, k)
+            q, k = self.rotary_emb(positions, q, k)
         q = _sm70_dump_qwen_layer_tensor(
             "full_attn_q_rot",
             self.layer_idx,
@@ -603,7 +651,7 @@ class Qwen3NextAttention(nn.Module):
             k,
         )
 
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, kv_cache_updated=self.sm70_qk_rope_prep)
         attn_output = _sm70_dump_qwen_layer_tensor(
             "full_attn_core_out",
             self.layer_idx,
