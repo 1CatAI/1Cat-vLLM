@@ -231,6 +231,40 @@ def compact_lattice_capabilities(
     return _lattice_storage_capabilities("compact", source_type, k, n, dtype, enabled)
 
 
+def compact_lattice_grouped_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Admit original-byte grouped MMA without reading routed rows on CPU."""
+    reason = None
+    operator = "gguf_lattice_compact_grouped_sm70_out"
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif source_type not in (21, 22):
+        reason = "raw_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif k <= 0 or k % 256 or n <= 0 or n % 32:
+        reason = "raw_grouped_shape_cuts_source_block_or_output_pack"
+    elif not 1 <= num_experts <= 1024:
+        reason = "raw_grouped_expert_count_unavailable"
+    elif not hasattr(torch.ops._C, operator):
+        reason = "operator_unavailable"
+    return (
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            reason=reason,
+        ),
+    )
+
+
 def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
     reason = None
     if not enabled:
