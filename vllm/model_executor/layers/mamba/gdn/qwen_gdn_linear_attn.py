@@ -2311,6 +2311,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        # Runtime forward/capture need not retain the initialization config.
+        # Capture LoRA exclusion while the owning configuration is available.
+        self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -4240,7 +4243,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and use_sm70_decode_graph_semantics()
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        if use_qwen38_fused_input:
+        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+            apply_gdn_ba_verify,
+        )
+
+        fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
+        if fused_verify_projection is not None:
+            mixed_qkv, z, b, a = fused_verify_projection
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+        elif use_qwen38_fused_input:
             assert self.in_proj_ba is not None
             mixed_qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
                 hidden_states,
@@ -7453,7 +7464,27 @@ def qwen_gdn_input_projection_core(
         layer_name,
         hidden_states,
     )
-    if _sm70_gdn_qpn8_ba_split_eligible(
+    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+        apply_gdn_ba_verify,
+    )
+
+    fused_verify_projection = None
+    if hidden_states.shape == (8, 5120) and not _sm70_gdn_projection_dump_requested(
+        layer_name
+    ):
+        fused_verify_projection = apply_gdn_ba_verify(
+            self,
+            hidden_states,
+            outputs=(
+                hidden_states.new_empty((8, 2560)),
+                z_out.view(8, 1536) if z_out.shape == (8, 12, 128) else z_out,
+                hidden_states.new_empty((8, 12)),
+                hidden_states.new_empty((8, 12)),
+            ),
+        )
+    if fused_verify_projection is not None:
+        mixed_qkv, _, b, a = fused_verify_projection
+    elif _sm70_gdn_qpn8_ba_split_eligible(
         self,
         hidden_states,
         z_out,
@@ -7566,6 +7597,25 @@ def qwen_gdn_input_projection(
         layer_name,
         hidden_states,
     )
+    from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
+        apply_gdn_ba_verify,
+    )
+
+    if hidden_states.shape == (8, 5120) and not _sm70_gdn_projection_dump_requested(
+        layer_name
+    ):
+        fused_verify_projection = apply_gdn_ba_verify(
+            self,
+            hidden_states,
+            outputs=(
+                mixed_qkv_out,
+                z_out.view(8, 1536) if z_out.shape == (8, 12, 128) else z_out,
+                b_out,
+                a_out,
+            ),
+        )
+        if fused_verify_projection is not None:
+            return
     if _sm70_gdn_qpn8_ba_split_eligible(
         self,
         hidden_states,

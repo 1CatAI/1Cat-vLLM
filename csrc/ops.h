@@ -198,6 +198,13 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        bool gated_silu,
                        bool preserve_default_partition = false);
 
+void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
+                              torch::Tensor packed, int64_t tile,
+                              int64_t warps);
+void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
+                                    torch::Tensor packed, torch::Tensor weight,
+                                    int64_t tile, int64_t warps);
+
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales);
 
