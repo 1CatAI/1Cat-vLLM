@@ -75,6 +75,7 @@ async def request(client, args, prompt, index, barrier):
     events = []
     usage = None
     ttft_ms = None
+    response_id = None
     async with client.stream(
         "POST", args.base_url + "/v1/chat/completions", json=body
     ) as response:
@@ -83,6 +84,7 @@ async def request(client, args, prompt, index, barrier):
             if not line.startswith("data: ") or line[6:] == "[DONE]":
                 continue
             chunk = json.loads(line[6:])
+            response_id = chunk.get("id") or response_id
             if chunk.get("error"):
                 raise RuntimeError(chunk["error"])
             usage = chunk.get("usage") or usage
@@ -99,6 +101,7 @@ async def request(client, args, prompt, index, barrier):
         raise ValueError(f"Request {index}: missing or inconsistent usage")
     return {
         "request_index": index,
+        "response_id": response_id,
         "events": events,
         "usage": usage,
         "ttft_ms": ttft_ms,
