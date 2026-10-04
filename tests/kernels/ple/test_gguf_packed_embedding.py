@@ -121,7 +121,9 @@ def test_loader_filters_before_payload_iteration(monkeypatch):
 
     monkeypatch.setattr(loader, "_get_weights_iterator", iterator)
     result = list(
-        loader.get_all_weights(None, None, skip_weight=lambda name: ".ple." not in name)
+        loader.get_all_weights(
+            SimpleNamespace(), None, skip_weight=lambda name: ".ple." not in name
+        )
     )
     assert touched == ["table"]
     assert result[0][0] == names["table"]
