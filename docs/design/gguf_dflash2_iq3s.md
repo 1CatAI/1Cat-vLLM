@@ -181,4 +181,33 @@ call stopped the probe before generation because safe serialization rejects
 function-valued RPC arguments. Use the existing worker-extension interface
 and a named RPC for the read-only buffer inventory. Secure message encoding,
 method-name compatibility and spawned extension import pass CPU checks.
-Generation, graph speed and numerical gates remain pending.
+The named-RPC rerun completes three natural prompts at temperature 0.7 and
+seed 123 with thinking disabled: Paris, 4 and a coherent Chinese explanation
+of Rayleigh scattering. All stop naturally (2, 2 and 55 output tokens). This
+is a basic loading/generation check, not the fixed quality or acceptance gate.
+Graph speed and distribution/acceptance/quality gates remain pending.
+
+## Loaded TP4 projection buffers
+
+The read-only worker inventory agrees across all four ranks. Every draft
+range-preserving flag observed is enabled (six modules per rank).
+
+| Buffer group | Per-rank bytes |
+| --- | ---: |
+| Target canonical projection streams | 3174973440 |
+| Draft canonical projection streams including context FC | 486604800 |
+| TP4 context FC, included in draft streams | 36864000 |
+| Ten dense convolution projections | 131072000 |
+| Two dense selector tables, stored | 254279680 |
+| Selector hidden projection | 2621440 |
+
+The context FC partition has K=25600 and N=1280. Selector tables are read by
+selected rows; their complete storage size is not per-round traffic. These
+figures describe allocated weight buffers, excluding codebook constants,
+activations, outputs, workspaces and other parameters. Calls and physical DRAM
+traffic still require the baseline trace and operator counters.
+
+The 8192-token loading probe rejects the grouped verifier capability because
+its minimum model length is 32768. Short graph baselines use max length 32768;
+the final comparison remains 262144. FP16 activation/KV and FP32 SSM state
+remain the same.
