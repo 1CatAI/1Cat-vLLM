@@ -62,7 +62,7 @@ def dense_reference(layer):
         values = values.view(torch.float8_e4m3fn).double() * 1.25
         q = query[request * 8 : (request + 1) * 8].double()
         scores = torch.einsum("qhd,kd->qhk", q, keys) * 0.0625
-        positions = torch.arange(keys.shape[0], device="cuda")
+        positions = torch.arange(keys.shape[0], device=query.device)
         visible = positions[None, :] < lengths[request * 8 : (request + 1) * 8, None]
         scores.masked_fill_(~visible[:, None, :], -torch.inf)
         probabilities = scores.softmax(-1)
