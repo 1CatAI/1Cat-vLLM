@@ -1355,3 +1355,19 @@ Flash gate M512 shape; best is algorithm 21, tile 15, stage 0, no split:
 104.300 us versus 89.683 us canonical, relative L2 0.0002070. Natural-layout
 Lt support is removed; the existing cuBLAS layout controls and original Lt
 interface remain. No precision or persistent-storage change is introduced.
+
+The complete Flash checkpoint header inventory contains 75,828,974,080 tensor
+bytes (70.62 GiB) across fourteen storage types, including IQ3_XXS, IQ3_S,
+IQ2_XXS/XS/S, IQ4_NL/XS, Q2_0, Q4_K/Q5_K/Q6_K and F16/BF16/F32. The BF16
+source-bit scan covers 763,944,960 elements across 484 tensors: zero nonfinite
+values and zero finite values above FP16 range. No clamping or conversion is
+applied by the scan. This is an input-overflow check, not a model quality gate.
+TP block-boundary inventory remains conditional on the actual adapter axis;
+column-parallel projections must not be rejected because their unused K-split
+would cut a source block.
+
+A follow-up full-graph comparison of existing FP16/FP32 output workspaces,
+cuBLAS algorithms 99/102, and dequantization partitions 1/2/4 times out waiting
+for the shared GPU lock before executing. It contributes no speed or numerical
+evidence. Recorded successful comparisons and unresolved prefill gates remain
+unchanged.
