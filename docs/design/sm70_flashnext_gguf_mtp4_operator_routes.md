@@ -209,3 +209,30 @@ reduces the mean to 629.091 us. CPU replay-entry spread has median
 653.734 us, consistent with skew before target graph entry. The profiler's
 4.4–6.0 ms graph-launch API durations are instrumented values and do not
 establish ordinary host cost. PLE causality remains unproven.
+
+## GDN copy follow-up
+
+Projection-tail materialization is merged in #927 and row-strided mixed-QKV
+verification in #928. The former writes Z/b/a in one launch while retaining
+the QKV view; the latter consumes that physical row stride and avoids the
+split/concatenate preparation. Both are restricted to the measured M5/M20
+model geometry and preserve FP32 recurrence and state snapshots.
+
+| Local chain, 36 layers | M5 saving ms | M20 saving ms |
+| --- | ---: | ---: |
+| Projection tails | 0.225 | 0.202 |
+| Strided recurrent input | 0.494 | 0.545 |
+| Direct recurrent output candidate | 0.080 | 0.060 |
+
+The direct output candidate passes changed-input graph comparisons for output,
+convolution state and all FP32 SSM snapshots, including destination canaries.
+These synthetic exact-layout chain timings are separate operator measurements
+and cannot be summed into a complete-model result. The qualified model remains
+the 26.668 ms C1 / 54.748 ms C4 composition above until the next combined run.
+
+A launch-geometry screen of HC combine/norm finds no faster bitwise M5 choice;
+the current tile and warp policy is retained. Changing tile width produces
+some FP16 output bit differences. The existing rejected QSA score-tile screen
+is also retained as a negative result rather than repeated. A replicated HC
+up counter sample motivates a separate next-group weight-lookahead screen;
+it does not yet establish candidate speed or model admission.
