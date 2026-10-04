@@ -69,8 +69,32 @@ C4 intervals and supplies no C4 speed evidence. The C4 smoke therefore uses
 128 input tokens per request in both arms, retaining the same capacity,
 sequence slots, graph policy and model. C1 continues to use 8K input.
 
-The Flash-Next ring comparison remains pending. The 27B C1 improvement is a
-smoke check and is not a Flash-Next
-latency estimate. Ring merging requires matched Flash-Next C1/C4, output
-identity and natural termination. Follow-up optimization starts with the
-actual trace and packed PLE pinned-UVA reading.
+## Initial ring comparison
+
+Both C1 arms use the same installed package, model and 8K-input workload.
+Four natural prompts produce identical complete token lists and stop at EOS.
+
+| C1 measurement | Ring disabled | Ring automatic |
+|---|---:|---:|
+| Complete engine round, mean | 46.822 ms | 41.499 ms |
+| Complete engine round, p50 / p99 | 46.303 / 61.817 ms | 41.483 / 41.788 ms |
+| Pure decode | 71.566 tok/s | 75.212 tok/s |
+| Mean acceptance length | 3.427 | 3.036 |
+| Draft rounds / proposed / accepted | 75 / 300 / 182 | 84 / 336 / 171 |
+| Position 1 / 2 / 3 / 4 acceptance | .800 / .640 / .560 / .427 | .643 / .536 / .452 / .405 |
+| Trimmed timing intervals | 57 | 66 |
+
+The observed round-mean reduction is 5.323 ms, and pure decode improves
+5.095%. Acceptance differs in the synthetic timing request, so this is an
+endpoint observation rather than an isolated communication saving. Complete
+synthetic token lists were not retained in this initial harness; output identity
+is established for the separate natural prompts. The per-round cost model
+must use actual trace call counts and account for the changed acceptance.
+
+The automatic-ring C4 smoke has 37 steady four-request intervals: 66.413 ms
+per engine round, 240.918 aggregate tok/s and 3.861 mean acceptance length.
+The matched ring-disabled C4 run is pending, so no C4 gain or non-regression
+is established yet. The 27B result remains a separate smoke check. Ring merging
+requires the complete Flash-Next C1/C4 comparison and natural output checks.
+Follow-up optimization starts with the actual trace and packed PLE pinned-UVA
+reading.
