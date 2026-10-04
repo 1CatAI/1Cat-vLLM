@@ -1145,3 +1145,11 @@ checks: the initial packet prefetch used octet `warp` instead of the partition's
 first octet. Constant-weight cancellation tests cannot detect that indexing
 error. The prefetch address is corrected before collecting any speed evidence;
 the failed build has no timing result or model eligibility.
+
+The corrected partition build passes 40 checks. Flash gate M512 reaches
+94.991 us with two dequantization partitions, versus 91.551 us canonical;
+four partitions regress to 96.219 us. The TurboMind workspace variants remain
+slower at 101.732/103.567 us. No prefill default changes follow from these
+results. The next independent M1 experiment prefetches the next FP16 activation
+fragment alongside the next original weight word, retaining the identical FP32
+FMA order and original-byte vector layout.
