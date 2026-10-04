@@ -381,6 +381,33 @@ def main():
                                 ),
                             )
                         )
+                column_ctas = math.ceil(n / 128) * math.ceil(m / mt)
+                column_splits = {1} | {
+                    min(
+                        k // 256,
+                        max(1, math.ceil(target * report["sm_count"] / column_ctas)),
+                    )
+                    for target in a.mma_cta_per_sm
+                }
+                for split in sorted(column_splits):
+                    tmp = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
+                    candidates.append(
+                        (
+                            f"compact_mma_columns_split{split}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_mma_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tmp,
+                                split,
+                                True,
+                                False,
+                                True,
+                            ),
+                        )
+                    )
             else:
                 candidates.append(
                     (

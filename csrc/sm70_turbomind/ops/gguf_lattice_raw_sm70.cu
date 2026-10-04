@@ -125,7 +125,8 @@ __global__ void reduce_vec(half* out, const float* partial, int n, int splits) {
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool ColumnWarps = false>
 __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int m, int n, int k,
                                int stride, int splits) {
@@ -137,7 +138,14 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
   __shared__ float sums[4][MT][NT];
   Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  const int col_begin = blockIdx.x * NT, row_begin = blockIdx.y * MT;
+  static_assert(!ColumnWarps || (Compact && Prefetch && !Staged && NT == 32));
+  const int col_begin =
+      blockIdx.x * NT * (ColumnWarps ? 4 : 1) + (ColumnWarps ? warp * NT : 0);
+  const int row_begin = blockIdx.y * MT;
+  if constexpr (ColumnWarps) {
+    if (col_begin >= n) return;  // Uniform warp exit after codebook barrier.
+  }
+  const int k_warp = ColumnWarps ? 0 : warp;
   const int bcol = lane / 16 * 4 + (lane & 12) * 2 + lane % 4;
   const int arow = lane / 16 * 4 + lane % 4;
   typename MMA::FragC accum[MT / 8]{};
@@ -206,7 +214,7 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
       const auto* packet_tile =
           Staged ? reinterpret_cast<const uint8_t*>(packets) : tile;
       auto current =
-          Packed::template fetch<FullWidth>(packet_tile, width, warp * 8);
+          Packed::template fetch<FullWidth>(packet_tile, width, k_warp * 8);
       typename MMA::FragA activation[MT / 8]{};
 #pragma unroll
       for (int index = 0; index < MT / 8; ++index) {
@@ -214,22 +222,22 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
         if (row < m)
           *reinterpret_cast<uint4*>(&activation[index]) =
               *reinterpret_cast<const uint4*>(x + int64_t{row} * k +
-                                              block * 256 + warp * 64);
+                                              block * 256 + k_warp * 64);
       }
 #pragma unroll
-      for (int step = 0; step < 64; step += 8) {
+      for (int step = 0; step < (ColumnWarps ? 256 : 64); step += 8) {
         typename Packed::PacketWindow next{};
         typename MMA::FragA next_activation[MT / 8]{};
-        if (step < 56) {
+        if (step < (ColumnWarps ? 248 : 56)) {
           next = Packed::template fetch<FullWidth>(packet_tile, width,
-                                                   warp * 8 + step / 8 + 1);
+                                                   k_warp * 8 + step / 8 + 1);
 #pragma unroll
           for (int index = 0; index < MT / 8; ++index) {
             const int row = row_begin + index * 8 + arow;
             if (row < m)
               *reinterpret_cast<uint4*>(&next_activation[index]) =
                   *reinterpret_cast<const uint4*>(x + int64_t{row} * k +
-                                                  block * 256 + warp * 64 +
+                                                  block * 256 + k_warp * 64 +
                                                   step + 8);
           }
         }
@@ -237,7 +245,7 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
         typename MMA::FragB b{};
         if (valid) {
           const auto values =
-              Packed::fragment(parameters, packet, warp * 8 + step / 8, grid);
+              Packed::fragment(parameters, packet, k_warp * 8 + step / 8, grid);
 #pragma unroll
           for (int j = 0; j < 8; ++j) b[j] = __float2half_rn(values[j]);
         }
@@ -296,6 +304,28 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
   }
   const auto origin = MMA::thread_offset_C();
   constexpr auto offsets = MMA::static_offset_C();
+  if constexpr (ColumnWarps) {
+    // Each warp owns disjoint N columns and the complete local K interval.
+    // There is no shared cross-warp K reduction or duplicate metadata load.
+#pragma unroll
+    for (int tile = 0; tile < MT / 8; ++tile)
+#pragma unroll
+      for (int pair = 0; pair < 4; ++pair)
+#pragma unroll
+        for (int item = 0; item < 2; ++item) {
+          const int row = row_begin + tile * 8 + origin.x + offsets[pair].x;
+          const int col = col_begin + origin.y + offsets[pair].y + item;
+          if (row < m && col < n) {
+            const int64_t index = int64_t{row} * n + col;
+            const float value = accum[tile][pair * 2 + item];
+            if (splits == 1)
+              out[index] = __float2half_rn(value);
+            else
+              partial[int64_t{blockIdx.z} * m * n + index] = value;
+          }
+        }
+    return;
+  }
 #pragma unroll
   for (int tile = 0; tile < MT / 8; ++tile)
 #pragma unroll
@@ -483,18 +513,20 @@ __global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool ColumnWarps = false>
 void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
                 torch::Tensor partial, int splits, cudaStream_t stream) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
-  const dim3 grid((n + NT - 1) / NT, (m + MT - 1) / MT, splits);
-  raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>
-      <<<grid, 128, 0, stream>>>(
-          reinterpret_cast<half*>(out.data_ptr()),
-          splits > 1 ? partial.data_ptr<float>() : nullptr,
-          reinterpret_cast<const half*>(input.data_ptr()),
-          weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
-          splits);
+  constexpr int cta_n = NT * (ColumnWarps ? 4 : 1);
+  const dim3 grid((n + cta_n - 1) / cta_n, (m + MT - 1) / MT, splits);
+  raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged,
+                 ColumnWarps><<<grid, 128, 0, stream>>>(
+      reinterpret_cast<half*>(out.data_ptr()),
+      splits > 1 ? partial.data_ptr<float>() : nullptr,
+      reinterpret_cast<const half*>(input.data_ptr()),
+      weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
+      splits);
 }
 void validate_raw(torch::Tensor w, int type, int64_t n, int64_t k) {
   TORCH_CHECK(type == 21 || type == 22, "Unsupported raw GGUF lattice type");
@@ -841,7 +873,8 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
                                        int64_t source_type,
                                        torch::Tensor partial, int64_t splits,
-                                       bool prefetch, bool staged) {
+                                       bool prefetch, bool staged,
+                                       bool column_warps) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -854,10 +887,12 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
                     partial.is_contiguous() &&
                     partial.numel() >= splits * m * n,
                 "Compact MMA requires FP32 partial storage");
+  TORCH_CHECK(!(staged && column_warps),
+              "Column-owned warps use register packet prefetch");
   TORCH_CHECK(!staged || n % 32 == 0,
               "Compact shared staging requires complete N32 tiles");
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_MMA(TYPE, FULL, PREFETCH, STAGED)           \
+#define COMPACT_MMA(TYPE, FULL, PREFETCH, STAGED, COLUMNS)  \
   if (m <= 8)                                               \
     launch_mma<TYPE, 32, 8, true, FULL, PREFETCH, STAGED>(  \
         out, input, weight, partial, splits, stream);       \
@@ -867,17 +902,31 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
   else                                                      \
     launch_mma<TYPE, 32, 32, true, FULL, PREFETCH, STAGED>( \
         out, input, weight, partial, splits, stream)
-#define COMPACT_SELECT(TYPE, FULL)         \
-  if (prefetch) {                          \
-    COMPACT_MMA(TYPE, FULL, true, false);  \
-  } else {                                 \
-    COMPACT_MMA(TYPE, FULL, false, false); \
+#define COMPACT_SELECT(TYPE, FULL)                \
+  if (prefetch) {                                 \
+    COMPACT_MMA(TYPE, FULL, true, false, false);  \
+  } else {                                        \
+    COMPACT_MMA(TYPE, FULL, false, false, false); \
   }
-  if (staged) {
+  if (column_warps) {
     if (source_type == 21) {
-      COMPACT_MMA(21, true, true, true);
+      if (n % 32 == 0) {
+        COMPACT_MMA(21, true, true, false, true);
+      } else {
+        COMPACT_MMA(21, false, true, false, true);
+      }
     } else {
-      COMPACT_MMA(22, true, true, true);
+      if (n % 32 == 0) {
+        COMPACT_MMA(22, true, true, false, true);
+      } else {
+        COMPACT_MMA(22, false, true, false, true);
+      }
+    }
+  } else if (staged) {
+    if (source_type == 21) {
+      COMPACT_MMA(21, true, true, true, false);
+    } else {
+      COMPACT_MMA(22, true, true, true, false);
     }
   } else if (source_type == 21) {
     if (n % 32 == 0) {
