@@ -50,6 +50,19 @@ semantics: both must be off to disable packed GDN. Runtime checks determine
 whether loaded projections actually prepare these buffers. For other layouts
 the report omits the estimate rather than guessing their memory consumption.
 
+Router/shared packing also requires the worker's runtime precision policy:
+FP16 reduced-precision reductions enabled and FP16 accumulation disabled. A
+worker that disables reduced reductions never uses these packed kernels and
+now skips their 199.0625 MiB/rank of copies in the reference TP4 MTP layout.
+The configured memory estimate remains conditional on those precision guards;
+the loaded-worker `sm70_preparations` report records the actual packed bytes
+and `_sm70_mtp_{router,shared}_batch_reason` when preparation is skipped.
+Loading also emits an INFO message once per process, role and rejection reason,
+so the precision-policy skip is visible without parsing the full route report.
+Set the precision policy before loading weights. This does not change forward
+hooks, runtime dispatch, fallback arithmetic, or GDN/HC preparation, and does
+not lazily allocate missing packs during CUDA graph replay.
+
 ## Regression command
 
 ```bash
