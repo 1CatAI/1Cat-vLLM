@@ -11,6 +11,7 @@ import torch
 def load_script(name):
     path = Path(__file__).resolve().parents[2] / "benchmarks/kernels" / name
     spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
