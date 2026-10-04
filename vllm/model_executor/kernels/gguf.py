@@ -401,3 +401,49 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
         )
         for operator, minimum, maximum in bands
     )
+
+
+def planar_lattice_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Select equal-byte MMA planes only for a measured faster descriptor."""
+    operator = "gguf_lattice_planar_gemm_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif source_type not in (21, 22):
+        reason = "raw_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif k <= 0 or k % 256 or n <= 0 or n % 32:
+        reason = "raw_shape_cuts_source_block_or_output_pack"
+    elif n > 65535 or k // 256 > 32767 or k * 32 > 2**31 - 1:
+        reason = "planar_descriptor_exceeds_dimension_encoding"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    elif (n, k) != (160, 2560):
+        reason = (
+            "measured_slower_than_canonical_gemm"
+            if source_type == 21
+            and (n, k) in ((4352, 5120), (5120, 4352), (1536, 2560), (2560, 1536))
+            else "planar_shape_has_no_calibration"
+        )
+    return (
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=512,
+            max_m=512,
+            reason=reason,
+        ),
+    )

@@ -1473,3 +1473,13 @@ workspace values. The normal merged wheel passes 126 checks. Flash dense gate
 M512 full graphs remain fastest with 256 threads/two partitions: 92.326 versus
 90.060 µs canonical. The alternatives range from 92.338 to 96.293 µs and do
 not close the speed gap. No thread-count default changes.
+
+Packed-integer IQ3_S workspace factor formation is mathematically exact:
+130,023,424 CPU weight comparisons and 126 installed checks show zero changed
+FP16 weight bits. Its complete graph remains 92.268 versus 90.028 µs canonical,
+so it is removed. The original shared-metadata path remains unchanged.
+
+Plane capabilities admit only the measured faster N160/K2560 expert at M512.
+Dense descriptors report measured regression, uncalibrated shapes report that
+reason, and unavailable operators, hardware, types and dimensions explain
+fallback. This is operator admission; model storage is not promoted by it.

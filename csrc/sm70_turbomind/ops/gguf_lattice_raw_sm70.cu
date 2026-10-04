@@ -623,8 +623,8 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
       next = Decode::template fetch<FullWidth>(tile, width, octet + step);
     const auto packet = Decode::extract(current, lane < width ? lane : 0);
     if (lane < width) {
-      const auto values = Decode::template fragment<Output, SharedParameters>(
-          parameters, packet, octet, grid);
+      const auto values =
+          Decode::template fragment<Output>(parameters, packet, octet, grid);
       if constexpr (std::is_same_v<Output, half> && !Transpose) {
         static_assert(!PackedOutput || FullWidth);
         const int64_t index =
