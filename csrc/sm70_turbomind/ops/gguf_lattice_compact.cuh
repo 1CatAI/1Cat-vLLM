@@ -102,33 +102,19 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     return extract(fetch<FullWidth>(tile, width, octet), col);
   }
 
-  struct ScalarWindow {
-    uint64_t low;
-    uint64_t high;
-    int shift;
-  };
-
   // Warp-parallel K for vector decode: lanes read different K octets.
-  __device__ static ScalarWindow scalar_fetch(const uint8_t* tile, int width,
-                                              int octet, int col) {
+  __device__ static uint32_t scalar_packet(const uint8_t* tile, int width,
+                                           int octet, int col) {
     const auto address = reinterpret_cast<uintptr_t>(tile);
     const int64_t bit =
         (address & 7) * 8 + (int64_t{octet} * width + col) * kPacketBits;
     const auto* words =
         reinterpret_cast<const uint64_t*>(address & ~uintptr_t{7});
-    return {words[bit / 64], words[bit / 64 + 1], int(bit % 64)};
-  }
-
-  __device__ static uint32_t scalar_extract(ScalarWindow window) {
-    const auto [low, high, shift] = window;
+    const uint64_t low = words[bit / 64], high = words[bit / 64 + 1];
+    const int shift = bit % 64;
     const uint64_t value =
         shift ? (low >> shift) | (high << (64 - shift)) : low;
     return value & ((uint32_t{1} << kPacketBits) - 1);
-  }
-
-  __device__ static uint32_t scalar_packet(const uint8_t* tile, int width,
-                                           int octet, int col) {
-    return scalar_extract(scalar_fetch(tile, width, octet, col));
   }
 
   __device__ static turbomind::Array<float, 8> fragment(Parameters parameters,
