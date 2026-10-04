@@ -412,6 +412,12 @@ void shared_up_batch(torch::Tensor output, torch::Tensor partial,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void shared_up_batch_fp32(torch::Tensor output, torch::Tensor partial,
+                          torch::Tensor x, torch::Tensor packed) {
+  TORCH_CHECK(partial.scalar_type() == at::kFloat, "FP32 partials required");
+  shared_up_batch(output, partial, x, packed);
+}
+
 void shared_gate_mul(torch::Tensor output, torch::Tensor logits,
                      torch::Tensor source) {
   TORCH_CHECK(source.is_cuda() && source.dim() == 2 &&
@@ -444,6 +450,10 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "qwen38_shared_up_batch_sm70_out(Tensor(a!) out, Tensor(b!) partial, "
       "Tensor x, Tensor packed) -> ()");
   m.def(
+      "qwen38_shared_up_batch_fp32_sm70_out(Tensor(a!) out, Tensor(b!) "
+      "partial, "
+      "Tensor x, Tensor packed) -> ()");
+  m.def(
       "qwen38_shared_gate_mul_sm70_out(Tensor(a!) out, Tensor logits, "
       "Tensor source) -> ()");
   m.def(
@@ -458,6 +468,7 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_shared_up_batch_sm70_out", &shared_up_batch);
+  m.impl("qwen38_shared_up_batch_fp32_sm70_out", &shared_up_batch_fp32);
   m.impl("qwen38_shared_gate_mul_sm70_out", &shared_gate_mul);
   m.impl("qwen38_router_batch_sm70_out", &router_batch);
   m.impl("qwen38_dense_batch_sm70_out", &dense_batch);
