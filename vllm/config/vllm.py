@@ -668,8 +668,12 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
         )
 
     sm70_gemma_tp = (
-        envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
-        and cfg.parallel_config.tensor_parallel_size == 2
+        (
+            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+            and cfg.parallel_config.tensor_parallel_size == 2
+        )
+        # TP4 admission is checked against the active communicator by the pass.
+        or cfg.parallel_config.tensor_parallel_size == 4
     )
     if sm70_gemma_tp:
         return (
