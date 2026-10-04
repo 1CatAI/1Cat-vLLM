@@ -1253,3 +1253,22 @@ The first cuBLASLt build triggers an nvcc internal assertion in GCC 13
 preparation and library descriptor management are moved to a normal C++ source
 in the same CMake extension; CUDA packet decoding remains in its CUDA source.
 No private library or runtime overlay is introduced.
+
+The packaged cuBLASLt candidate passes 46 focused checks. Its two heuristic
+plans take 120.04/122.72 us versus 91.90 us canonical on the Flash gate M512
+shape. A standard-library configuration probe enumerates 273 valid FP32 plans
+with NONE or COMPUTE_TYPE reductions only. Best algorithm 21, tile 20, stage 0,
+split 1 takes 94.064 us including packet dequantization, versus 89.785 us
+canonical in the same process (4.8% slower). Distinct eight-bank full graphs
+and official FP16-weight/FP32-dot numerical comparisons are used. The probe
+does not establish a speed-eligible Lt default or model step savings.
+
+Flash M1 follow-up with the retained source passes its numerical gate: IQ3_S
+expert 6.756 versus 16.289 us, IQ2_S expert 9.027 versus 18.088 us, dense gate
+9.232 versus 17.996 us, output 8.762 versus 15.317 us. Shape-dependent original
+vector schedules remain necessary; full-scale factoring is not always best.
+
+The next dense-vector candidate interleaves four copies of the IQ3_S byte
+codebook across shared-memory banks. It changes only CTA-local lookup layout;
+original payload, scale reconstruction, FP32 FMA, and persistent storage stay
+unchanged. The single-copy schedule remains available for comparison.

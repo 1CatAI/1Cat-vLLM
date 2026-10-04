@@ -264,24 +264,27 @@ def main():
                         ),
                     )
                 )
-                for prefetch in (False, True):
-                    prefix = "vec_factor_scale" + ("_prefetch" if prefetch else "")
-                    candidates.append(
-                        (
-                            f"{prefix}_split{split}",
-                            partial(
-                                torch.ops._C.gguf_lattice_raw_vec_sm70_out,
-                                out,
-                                x,
-                                original,
-                                kind,
-                                tmp,
-                                split,
-                                prefetch,
-                                True,
-                            ),
+                for replicas in (1, 4) if kind == 21 else (1,):
+                    for prefetch in (False, True):
+                        prefix = "vec_factor_scale" + ("_prefetch" if prefetch else "")
+                        candidates.append(
+                            (
+                                f"{prefix}_split{split}"
+                                + (f"_grid{replicas}" if replicas > 1 else ""),
+                                partial(
+                                    torch.ops._C.gguf_lattice_raw_vec_sm70_out,
+                                    out,
+                                    x,
+                                    original,
+                                    kind,
+                                    tmp,
+                                    split,
+                                    prefetch,
+                                    True,
+                                    replicas,
+                                ),
+                            )
                         )
-                    )
         elif m <= 64:
             for tile in (8, 32):
                 mt = 8 if m <= 8 else 16 if m <= 16 else 32

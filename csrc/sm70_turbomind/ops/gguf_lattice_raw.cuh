@@ -11,17 +11,18 @@
 #include "src/turbomind/kernels/gemm/lattice_codebooks.h"
 
 namespace vllm::sm70_gguf {
-template <int Type>
+template <int Type, int Replicas = 1>
 struct LatticeRawDecoder {
   static_assert(Type == 21 || Type == 22);
+  static_assert(Replicas == 1 || (Type == 21 && Replicas == 4));
   using Codebook = turbomind::gemm::LatticeCodebook<Type>;
   static constexpr int kBlockBytes = Type == 21 ? 110 : 82;
-  static constexpr int kCodebookBytes = Codebook::kBytes;
+  static constexpr int kCodebookBytes = Codebook::kBytes * Replicas;
 
   __device__ static void initialize(uint8_t* grid) {
     auto* words = reinterpret_cast<uint32_t*>(grid);
     for (int i = threadIdx.x; i < kCodebookBytes / 4; i += blockDim.x)
-      words[i] = Codebook::word(i);
+      words[i] = Codebook::word(i / Replicas);
     __syncthreads();
   }
 
@@ -120,8 +121,10 @@ struct LatticeRawDecoder {
       const int first = block[2 + 2 * octet] | (((high >> (2 * sub)) & 1) << 8);
       const int second =
           block[3 + 2 * octet] | (((high >> (2 * sub + 1)) & 1) << 8);
-      const uint32_t a = *reinterpret_cast<const uint32_t*>(grid + first * 4);
-      const uint32_t b = *reinterpret_cast<const uint32_t*>(grid + second * 4);
+      const uint32_t a = *reinterpret_cast<const uint32_t*>(
+          grid + (first * Replicas + threadIdx.x % Replicas) * 4);
+      const uint32_t b = *reinterpret_cast<const uint32_t*>(
+          grid + (second * Replicas + threadIdx.x % Replicas) * 4);
       const uint64_t packed = a | (static_cast<uint64_t>(b) << 32);
       if constexpr (ApplyScale) {
         values = table_fragment<Output>(packed, signs, d, nibble);
