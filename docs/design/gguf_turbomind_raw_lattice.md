@@ -536,3 +536,12 @@ whole source blocks and computes FP32 partials. Repeated weight requests
 from neighboring M tiles must be distinguished from physical DRAM reads;
 new counter collection is required if this candidate wins. Numerical and
 speed gates remain pending, with the original automatic row tile retained.
+
+While the row-tile experiment waits for shared GPUs, an independent vector
+candidate prefetches one coalesced uint64 source word per participating lane
+from the next block. After the current FP32 FMA chain finishes, the warp
+reuses its original-block shared buffer. Two warp barriers protect reuse.
+This holds only the following original word in registers; it does not expand
+metadata or prefetch a decoded coefficient/activation bundle. The existing
+vector candidate and its accumulation order remain unchanged. Numerical
+and speed validation of both candidates is pending.

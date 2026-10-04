@@ -248,6 +248,21 @@ def main():
                         ),
                     )
                 )
+                candidates.append(
+                    (
+                        f"vec_prefetch_split{split}",
+                        partial(
+                            torch.ops._C.gguf_lattice_raw_vec_sm70_out,
+                            out,
+                            x,
+                            original,
+                            kind,
+                            tmp,
+                            split,
+                            True,
+                        ),
+                    )
+                )
         elif m <= 64:
             for tile in (8, 32):
                 mt = 8 if m <= 8 else 16 if m <= 16 else 32

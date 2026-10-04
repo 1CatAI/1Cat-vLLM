@@ -75,7 +75,7 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
   }
 }
 
-template <int Type, bool Split>
+template <int Type, bool Split, bool Prefetch = false>
 __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int n, int k, int stride,
                                int splits) {
@@ -90,9 +90,26 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
   const int blocks = k / 256;
   const int begin = blocks * blockIdx.y / splits;
   const int end = blocks * (blockIdx.y + 1) / splits;
+  const auto* row_data = weight + int64_t{row} * stride;
+  if constexpr (Prefetch) stage_block<Type>(raw[warp], row_data, begin, stride);
   for (int block = begin; block < end; ++block) {
-    const uint8_t* data = stage_block<Type>(
-        raw[warp], weight + (int64_t)row * stride, block, stride);
+    constexpr int bytes = Decode::kBlockBytes;
+    const int next_start = (block + 1) * bytes;
+    const int aligned = next_start & ~7, bias = next_start & 7;
+    const int words = (bias + bytes + 7) / 8;
+    const bool load_next =
+        block + 1 < end && lane < words && aligned + lane * 8 < stride;
+    uint64_t next_word = 0;
+    if constexpr (Prefetch) {
+      if (load_next)
+        next_word =
+            *reinterpret_cast<const uint64_t*>(row_data + aligned + lane * 8);
+    }
+    const uint8_t* data;
+    if constexpr (Prefetch)
+      data = raw[warp] + (block * bytes & 7);
+    else
+      data = stage_block<Type>(raw[warp], row_data, block, stride);
     const auto values = Decode::fragment(data, lane * 8, grid);
     // K is block aligned and each lane owns eight adjacent half values.
     // One 128-bit load replaces eight strided 16-bit memory instructions.
@@ -104,6 +121,10 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
     for (int i = 0; i < 8; ++i)
       sum = fmaf(__half2float(activation[i]), values[i], sum);
     __syncwarp();
+    if constexpr (Prefetch) {
+      if (load_next) reinterpret_cast<uint64_t*>(raw[warp])[lane] = next_word;
+      __syncwarp();
+    }
   }
 #pragma unroll
   for (int distance = 16; distance > 0; distance /= 2)
@@ -564,7 +585,8 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
-                                   torch::Tensor partial, int64_t splits) {
+                                   torch::Tensor partial, int64_t splits,
+                                   bool prefetch) {
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() &&
                   input.scalar_type() == torch::kFloat16 &&
@@ -584,21 +606,29 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                 "Raw GGUF split-K requires FP32 partial storage");
   const dim3 grid((n + 3) / 4, splits);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define RAW_VEC(TYPE)                                                       \
+#define RAW_VEC(TYPE, PREFETCH)                                             \
   if (splits == 1)                                                          \
-    raw_vec_kernel<TYPE, false><<<grid, 128, 0, stream>>>(                  \
+    raw_vec_kernel<TYPE, false, PREFETCH><<<grid, 128, 0, stream>>>(        \
         reinterpret_cast<half*>(out.data_ptr()), nullptr,                   \
         reinterpret_cast<const half*>(input.data_ptr()),                    \
         weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits);          \
   else                                                                      \
-    raw_vec_kernel<TYPE, true><<<grid, 128, 0, stream>>>(                   \
+    raw_vec_kernel<TYPE, true, PREFETCH><<<grid, 128, 0, stream>>>(         \
         reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), \
         reinterpret_cast<const half*>(input.data_ptr()),                    \
         weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
-  if (source_type == 21) {
-    RAW_VEC(21);
+  if (prefetch) {
+    if (source_type == 21) {
+      RAW_VEC(21, true);
+    } else {
+      RAW_VEC(22, true);
+    }
   } else {
-    RAW_VEC(22);
+    if (source_type == 21) {
+      RAW_VEC(21, false);
+    } else {
+      RAW_VEC(22, false);
+    }
   }
 #undef RAW_VEC
   if (splits > 1)

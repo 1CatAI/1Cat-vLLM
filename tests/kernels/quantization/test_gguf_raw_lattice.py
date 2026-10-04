@@ -57,19 +57,22 @@ def test_raw_dequant_and_vector_graph(kind):
     out = torch.empty((1, raw.shape[0]), device="cuda", dtype=torch.float16)
     partial = torch.empty((3, raw.shape[0]), device="cuda", dtype=torch.float32)
     for splits in (1, 3):
-        run = lambda splits=splits: torch.ops._C.gguf_lattice_raw_vec_sm70_out(
-            out, x, w, kind, partial, splits
-        )
-        for _ in range(3):
-            run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-        x.copy_(torch.randn_like(x))
-        graph.replay()
-        torch.testing.assert_close(
-            out.float(), x.float() @ expected.T, rtol=0.001, atol=0.002
-        )
+        for prefetch in (False, True):
+            run = lambda splits=splits, prefetch=prefetch: (
+                torch.ops._C.gguf_lattice_raw_vec_sm70_out(
+                    out, x, w, kind, partial, splits, prefetch
+                )
+            )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            torch.testing.assert_close(
+                out.float(), x.float() @ expected.T, rtol=0.001, atol=0.002
+            )
 
 
 @pytest.mark.parametrize("kind", [21, 22])
