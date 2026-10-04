@@ -888,3 +888,21 @@ The 210-package dependency check passes. A bounded FP32-output cuBLAS
 comparison is the next prefill screening experiment; it must include final
 FP16 conversion and provide enough headroom for dequantization before any
 complete-path implementation is added.
+
+## FP32 output workspace screening
+
+A cold-bank Flash gate GEMM-only full-graph probe includes final conversion
+to FP16. Default cuBLAS NN with FP32 output takes 79.782 µs, versus
+88.879 µs for algorithm 2 with FP16 output and its matched output copy.
+Both retain about 0.0002075 relative L2 error. This is screening evidence
+only: the FP16 probe copy is additional work compared with the existing
+complete-path operator, and dequantization is excluded. It provides enough
+headroom to justify one complete-path comparison but is not a speed claim.
+
+Source `790cf01988` permits FP32 output only in compact BLAS validation.
+Vector/MMA validation continues to require FP16 output. The cuBLAS output
+type follows the output tensor, with FP32 computation and reduced-precision
+reductions disabled. The benchmark captures a temporary `[M,N]` FP32 result
+and its final FP16 copy in the same graph as temporary dequantization.
+Persistent weights retain the original equal-byte budget. Numerical checks
+and complete-path Flash gate M512 timing remain pending.
