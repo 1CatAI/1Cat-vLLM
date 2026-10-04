@@ -848,3 +848,43 @@ Installed core SHA256:
 Whole-wheel SHA256:
 `45e62f62fc57cd77087b84240a4ea4d66bc2702c6de382886037db5264d54e85`.
 All 210 installed dependency packages are compatible.
+
+## Complete-tile dequantization specialization
+
+Source `2a745757b6` selects fixed N32 address arithmetic and aligned
+original metadata loads when N is divisible by 32. Partial tiles retain
+the general bitstream/byte-gather implementation. All 26 checks pass
+(7.99 s), covering exact FP32 and FP16 dequantization, both layouts, tails
+and FP32 partial overflow guards in changed-input full graphs.
+
+| Projection | Canonical µs | Compact default NN µs | Compact default TN µs | Compact algo2 NN µs |
+| --- | ---: | ---: | ---: | ---: |
+| 27B gate | 365.559 | 367.524 | 381.910 | 447.516 |
+| 27B down | 340.825 | 340.645 | 347.410 | 399.784 |
+| IQ3_S expert | 69.218 | 26.885 | 47.526 | 56.395 |
+| IQ2_S expert | 64.401 | 29.153 | 49.760 | 58.229 |
+| Flash gate | 93.396 | 125.793 | 111.878 | 97.236 |
+| Flash output | 84.994 | 87.721 | 79.579 | 74.245 |
+
+This is the same M512 complete-path full-graph comparison. The direct
+loading specialization has modest benefits on experts and natural workspace
+writing, but does not close Flash gate: algorithm 2 NN remains 4.1% slower
+than this run's canonical control. The canonical gate varies between
+approximately 90 and 94 µs across recorded runs; the compact path remains
+near 97 µs. That difference is retained rather than called a speed win.
+
+A matched NCU capture of the earlier 32-bit packet M16 kernel records
+9,756,896 main-node DRAM read bytes, 72 registers/thread, 20.57% active
+warps and 33.17% long-scoreboard stalls. ALU instruction count falls from
+4,368,320 to 4,172,480, but this same seven-CTA/split2 descriptor does not
+speed up materially. Reduction reads another 559,520 bytes. Narrow packet
+fetch therefore does not explain or solve the remaining dense M16 gap.
+
+Installed core SHA256:
+`f01a71c068c044ebbfbad1d0b827a861786725a0adbf39787961266fe4ac0c20`.
+Whole-wheel SHA256:
+`d071b5456f0f3773344e0a845a9795d653188cb1ff8ff8c41cc2c1414991cedf`.
+The 210-package dependency check passes. A bounded FP32-output cuBLAS
+comparison is the next prefill screening experiment; it must include final
+FP16 conversion and provide enough headroom for dequantization before any
+complete-path implementation is added.
