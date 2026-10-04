@@ -92,13 +92,9 @@ def test_strided_positions_and_paged_cache(tokens):
     ]:
         values = raw.float()
         normalized = (
-            (
-                values
-                * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
-                * (1.0 + weight.float())
-            )
-            .half()
-            .float()
+            values
+            * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+            * (1.0 + weight.float())
         )
         frequencies = torch.arange(32, device="cuda")
         planes = torch.zeros(32, device="cuda", dtype=torch.int64)

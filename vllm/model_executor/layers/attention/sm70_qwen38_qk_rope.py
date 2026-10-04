@@ -95,7 +95,9 @@ def _qk_norm_rope(
     second = pn.to(tl.float32) * sine.to(tl.float32)
     sign = tl.where(col < 32, -1.0, 1.0)
     rotated = (first.to(tl.float32) + sign * second.to(tl.float32)).to(tl.float16)
-    processed = tl.where(col < 64, rotated, normalized)
+    # Cache encoding must consume the same FP16 value published to KOut,
+    # including the non-rotary channels whose normalization stays in FP32.
+    processed = tl.where(col < 64, rotated, normalized).to(tl.float16)
     tl.store(destination + col, processed)
     if STORE_CACHE:
         slot = tl.load(Slots + token, mask=token < NUM_SLOTS, other=-1)
