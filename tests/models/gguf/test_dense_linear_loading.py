@@ -130,3 +130,50 @@ def test_fp32_router_does_not_require_fp16_partial_reduction(reduced, monkeypatc
     x = SimpleNamespace(ndim=2, shape=(5, 2560), **common)
     packed = SimpleNamespace(shape=(64, 40, 2, 4, 8, 8), **common)
     assert _router_batch_runtime_ok(x, packed)
+
+
+def test_loaded_dense_projection_prepares_existing_fp16_method(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm import envs
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+        Qwen38SM70FP16LinearMethod,
+        enable_qwen38_sm70_fp16_gemv,
+    )
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        UnquantizedLinearMethod, "process_weights_after_loading", lambda *_: None
+    )
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda *_: True)
+    for name, value in {
+        "VLLM_SM70_QWEN38_FP16_GEMV": True,
+        "VLLM_SM70_QWEN38_BATCH_FASTPATH": False,
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": False,
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16": False,
+        "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": False,
+    }.items():
+        monkeypatch.setattr(envs, name, value)
+    layer = LinearBase.__new__(LinearBase)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "model.layers.0.linear_attn.in_proj_ba"
+    method = GGUFLinearMethod(GGUFConfig())
+    method.create_weights(layer, 8, [24], 8, 24, torch.float16)
+    layer.quant_method = method
+    layer.qweight.materialize((24, 8), dtype=torch.float16)
+    layer.qweight.data.fill_(2)
+    layer.qweight_type.weight_type = 30
+    model = torch.nn.Module()
+    model.add_module("ba", layer)
+    model.model_config = SimpleNamespace(
+        dtype=torch.float16, architectures=["Qwen4ExpForCausalLM"]
+    )
+    model.vllm_config = SimpleNamespace(
+        model_config=model.model_config,
+        parallel_config=SimpleNamespace(),
+        speculative_config=SimpleNamespace(method="mtp"),
+    )
+    method.process_weights_after_loading(layer)
+    enable_qwen38_sm70_fp16_gemv(model, torch.float16, model.vllm_config)
+    assert isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod)
