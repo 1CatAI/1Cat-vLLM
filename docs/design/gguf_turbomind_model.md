@@ -424,3 +424,38 @@ separately; its scores are still pending.
 
 Updated wheel fingerprint:
 `ff173a2e75d44de5fb14fe9507963f2ab0d8d0c0596770d1d6e96a7238d8aa6e`.
+
+## Common quality comparison and long-context failure
+
+Both installed GGUF and native NVFP4 runs finish the same frozen 36-case set,
+with identical prompt-token hashes for every case. Sampling is temperature 1,
+top-p 0.95, top-k 20, seed 4201 plus case index, thinking enabled, maximum
+4096 generated tokens and natural EOS. Both use TP4, FP16 activation/KV,
+FP32 SSM state, maximum length 262144, batch budget 8192, one sequence,
+GPU memory utilization 0.9, prefix caching disabled and CUDA graphs.
+
+| Category | GGUF | Native NVFP4 |
+| --- | ---: | ---: |
+| MBPP execution checks | 12/12 | 12/12 |
+| GSM8K arithmetic | 12/12 | 12/12 |
+| Chinese checks | 8/8 | 8/8 |
+| Needle 8K and 32K | 2/2 | 2/2 |
+| Needle 128K and 258048 target | 0/2 | 0/2 |
+
+The two longer cases return token 0 (`!`) repeatedly until the 4096-token
+limit in both paths. This is a shared execution failure, not a passing
+long-context quality result. A one-output-token eager NVFP4 reproduction with
+layer finite checks finds the first nonfinite output in layer 15 self-attention
+on the second 8192-token prefill chunk; its inputs and preceding layer outputs
+are finite. All 248320 final logits are nonfinite. Investigation now targets
+the shared Flash-V100 chunked prefill route.
+
+Small standalone Q8192 attention checks with uniform values, uniform large
+Q/K and varied Q/K remain finite. They reject simple magnitude-only overflow
+explanations; the next diagnostic retains real attention inputs and the KV
+prefix from the failing call. No kernel correction has been validated yet.
+
+Worker capability reports confirm 592 original dense projection shards become
+383 canonical projections, including 48 admitted N=24 FP16 caches. They report
+278 affine, 101 LUT4 and four lattice projections, with mixed source boundaries
+and calibrated fallback reasons retained.
