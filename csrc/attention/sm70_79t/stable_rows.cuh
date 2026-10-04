@@ -187,9 +187,10 @@ __global__ void stable_finish_max(float const* partials, float* maxima,
     float sampled = -CUDART_INF_F;
     for (int tile = 0; tile < tiles; ++tile)
       sampled = fmaxf(sampled, partials[int64_t(tiles + tile) * rows + row]);
-    // Keep the established finite-score shift. This extraction repairs only
-    // nonfinite FP16 storage; finite-score precision changes stay separate.
-    if (isfinite(sampled)) shift_value = sampled;
+    // Keep the sampled shift only when its margin bounds every tail score.
+    // A missed peak can overflow the FP16 numerator before normalization.
+    if (isfinite(sampled) && value <= sampled + kStableScoreMargin)
+      shift_value = sampled;
   }
   maxima[row] = shift_value + kStableScoreMargin;
   // A prefix sample can miss a peak by at most kStableMaxExpInput without
