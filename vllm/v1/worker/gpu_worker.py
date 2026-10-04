@@ -537,7 +537,9 @@ class Worker(WorkerBase):
             with warmup_allocator:
                 self.model_runner.profile_run()
         except torch.AcceleratorError:
-            stats = torch.accelerator.memory_stats(self.device)
+            stats = {}
+            with suppress(Exception):
+                stats = torch.accelerator.memory_stats(self.device)
             free: int | None = None
             total: int | None = None
             with suppress(Exception):

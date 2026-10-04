@@ -10,8 +10,9 @@ from vllm.v1.worker import gpu_worker
 
 
 @pytest.mark.parametrize("driver_info_fails", [False, True])
+@pytest.mark.parametrize("allocator_info_fails", [False, True])
 def test_profile_failure_reports_memory_and_preserves_error(
-    monkeypatch, driver_info_fails
+    monkeypatch, driver_info_fails, allocator_info_fails
 ):
     failure = torch.AcceleratorError("CUDA error: out of memory")
 
@@ -25,15 +26,16 @@ def test_profile_failure_reports_memory_and_preserves_error(
 
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(gpu_worker.current_platform, "mem_get_info", driver_info)
-    monkeypatch.setattr(
-        torch.accelerator,
-        "memory_stats",
-        lambda device: {
+    def allocator_info(device):
+        if allocator_info_fails:
+            raise RuntimeError("allocator unavailable after accelerator failure")
+        return {
             "allocated_bytes.all.current": 123,
             "reserved_bytes.all.current": 456,
             "inactive_split_bytes.all.current": 789,
-        },
-    )
+        }
+
+    monkeypatch.setattr(torch.accelerator, "memory_stats", allocator_info)
     messages = []
     monkeypatch.setattr(
         gpu_worker.logger, "error", lambda fmt, *args: messages.append(fmt % args)
@@ -45,7 +47,12 @@ def test_profile_failure_reports_memory_and_preserves_error(
         worker.determine_available_memory()
     assert raised.value is failure
     assert len(messages) == 1
-    assert "allocated=123 reserved=456 inactive_split=789" in messages[0]
+    allocator_expected = (
+        "allocated=None reserved=None inactive_split=None"
+        if allocator_info_fails
+        else "allocated=123 reserved=456 inactive_split=789"
+    )
+    assert allocator_expected in messages[0]
     expected = (
         "driver_free=None driver_total=None"
         if driver_info_fails
