@@ -184,6 +184,18 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
       if (word < kStageWords) packets[word] = first_tile[word];
     }
   }
+  if constexpr (StageActivation) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int index = threadIdx.x + i * 128;
+      const int row = index / 32, octet = index % 32;
+      uint4 value{};
+      if (row_begin + row < m)
+        value = *reinterpret_cast<const uint4*>(
+            x + int64_t{row_begin + row} * k + begin * 256 + octet * 8);
+      *reinterpret_cast<uint4*>(&activations[row][octet * 8]) = value;
+    }
+  }
   for (int block = begin; block < end; ++block) {
     uint64_t next_words[kWordsPerThread]{};
     if constexpr (Staged) {
@@ -202,18 +214,19 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
         }
       }
     }
+    uint4 next_activations[StageActivation ? 4 : 1]{};
     if constexpr (StageActivation) {
-      // Each warp copies a complete contiguous K row in aligned vectors.
-      // Padding rotates row banks for the MMA fragment's shared loads.
-      for (int index = threadIdx.x; index < MT * 32; index += blockDim.x) {
-        const int row = index / 32, octet = index % 32;
-        uint4 value{};
-        if (row_begin + row < m)
-          value = *reinterpret_cast<const uint4*>(
-              x + int64_t{row_begin + row} * k + block * 256 + octet * 8);
-        *reinterpret_cast<uint4*>(&activations[row][octet * 8]) = value;
-      }
       __syncthreads();
+      // Keep the following contiguous activation tile in registers while
+      // the current shared tile feeds decoding/MMA. SM70 has no cp.async.
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int index = threadIdx.x + i * 128;
+        const int row = index / 32, octet = index % 32;
+        if (block + 1 < end && row_begin + row < m)
+          next_activations[i] = *reinterpret_cast<const uint4*>(
+              x + int64_t{row_begin + row} * k + (block + 1) * 256 + octet * 8);
+      }
     }
     const int width = FullWidth ? 32 : min(NT, n - col_begin);
     const uint8_t* tile = nullptr;
@@ -334,7 +347,18 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
           if (word < kStageWords) packets[word] = next_words[i];
         }
       }
-    } else if constexpr (!Compact || StageActivation) {
+    } else if constexpr (StageActivation) {
+      __syncthreads();
+      if (block + 1 < end) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int index = threadIdx.x + i * 128;
+          const int row = index / 32, octet = index % 32;
+          *reinterpret_cast<uint4*>(&activations[row][octet * 8]) =
+              next_activations[i];
+        }
+      }
+    } else if constexpr (!Compact) {
       __syncthreads();
     }
   }
