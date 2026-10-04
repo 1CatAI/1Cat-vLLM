@@ -79,7 +79,7 @@ def test_fused_routing_and_fp32_unroute(m, pattern, monkeypatch):
     routed, offsets, sorted_ids, inverse = _small_route(x, ids, 512)
     torch.testing.assert_close(routed, reference_routed, rtol=0, atol=0)
     torch.testing.assert_close(offsets, reference_offsets, rtol=0, atol=0)
-    torch.testing.assert_close(sorted_ids, reference_ids, rtol=0, atol=0)
+    torch.testing.assert_close(sorted_ids, reference_ids.long(), rtol=0, atol=0)
     torch.testing.assert_close(inverse.long(), order.argsort(), rtol=0, atol=0)
     down = torch.randn_like(routed)
     weights = torch.randn(m, 10, device="cuda")
@@ -94,6 +94,8 @@ def test_fused_routing_and_fp32_unroute(m, pattern, monkeypatch):
     with torch.cuda.graph(graph):
         packed = torch.ops.vllm.sm70_small_expert_route(x, ids, 512)
         out = torch.ops.vllm.sm70_small_expert_unroute(down, packed[3], weights)
+    graph.replay()
+    torch.testing.assert_close(out, reference, rtol=0.003, atol=0.0001)
     saved = out.clone()
     graph.replay()
     torch.testing.assert_close(out, saved, rtol=0, atol=0)
