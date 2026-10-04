@@ -31,7 +31,7 @@ and FP32 accumulation are preserved; references use official GGUF decoding.
 These are layer checks. Full Flash-Next logits, generation and throughput
 are still pending.
 
-## Full-checkpoint loading
+## Initial full-checkpoint loading with temporary Q4_1 reblocking
 
 The IQ3_XXS checkpoint loads with TP4 on V100 32 GB x4, CUDA 12.8,
 Torch 2.10.0+cu128, FP16 activation/KV, FP32 SSM state, no MTP, eager
@@ -85,3 +85,27 @@ graph execution, max length 33024, batch budget 8192, 16 sequence slots and
 GPU memory fraction 0.85. Decode uses input/output 1024/128 at C1/C4/C8/C16;
 prefill uses 8192/32768 tokens and one output token, with two measured repeats
 after warmup. GGUF and native NVFP4 use identical frozen prompt IDs.
+
+## Preserve preparation through loader iteration
+
+The first full-model report exposes 48 canonical MoE layers per rank with
+TP4/EP1, but 30 Q2_0 down projections still have the temporary Q4_1 source
+type. `get_all_weights` rebuilds the name map and replaces the native adapter
+after `load_model` has prepared its canonical-storage flag and layouts. The
+direct adapter test misses this second creation. The full-entry CPU regression
+fails on the original wheel with source types `[3, 3]` instead of `[42, 42]`.
+
+Cache the mapping for its model configuration and retain the prepared adapter.
+Filtering copies the mapping, so a filtered read cannot change later reads.
+Both CPU cases pass from source and the installed wheel; the full entry retains
+Q2_0 bytes, original mmap storage and the canonical flag through filtering and
+rereading. No CUDA operator changes. The normal corrected wheel has SHA256
+`e9d83a248efdfb408ab188f581156325191fbb716a9e703327b3f780a39eb4f1`;
+eight relevant source/wheel/installed modules match, and all 210 dependencies
+pass compatibility checking. New full-model numerical and timing results
+must verify all 30 Q2_0 down projections before being attributed to u2 storage.
+
+The earlier Q4_1 conversion is lossless and its generation results remain
+valid reference evidence. Its larger storage and load-time measurements do
+not characterize the final u2 route. Both measurement attempts stopped before
+producing timing data are retained.
