@@ -33,7 +33,7 @@ def hc(model, local_only=False):
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
     from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import _pack_hc_batch_weight
 
-    rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ.get("LOCAL_RANK", "0"))
     if not local_only:
         dist.init_process_group("gloo")
         assert dist.get_world_size() == 4
