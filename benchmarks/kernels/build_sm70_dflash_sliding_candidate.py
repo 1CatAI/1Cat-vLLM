@@ -141,6 +141,25 @@ def draft_source(source: str) -> str:
         + body[last:]
     )
     source = source[:start] + body + source[end:]
+    first = source.index("void flash_attention_grouped_verify_e5m2_combine_kernel(")
+    before, combine = source[:first], source[first:]
+    old = "  int total_kv = seq_lens[0];"
+    if combine.count(old) != 1:
+        raise ValueError("Expected one combine sequence length")
+    combine = combine.replace(
+        old,
+        old
+        + """
+  // A padded graph request leaves every partial unwritten. Do not read it.
+  if (total_kv <= 0) {
+    for (int d = threadIdx.x; d < kGroupedVerifyHeadDim; d += blockDim.x)
+      out[(token_idx * kGroupedVerifyHeads + head_idx) *
+          kGroupedVerifyHeadDim + d] = __float2half_rn(0.0f);
+    return;
+  }
+""",
+    )
+    source = before + combine
     source = "#include <torch/extension.h>\n" + source
     source += """
 at::Tensor private_dflash_sliding_fp16_paged(

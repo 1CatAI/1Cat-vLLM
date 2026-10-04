@@ -84,6 +84,34 @@ def main():
         "scope": "FP16 KV operator comparison, not model admission",
         "measurements": [],
     }
+    report["boundary_checks"] = []
+    for length in (8, 127, 128, 129, 1023, 1024, 1025, 2047, 2048, 2049, 2055, 4097):
+        layer = make_layer(1, length, args.page_size)
+        out = torch.empty_like(layer[0])
+        partial = torch.empty(1, 40, 8, 8, 128, device="cuda", dtype=torch.float32)
+        lse = torch.empty(1, 40, 8, 8, device="cuda", dtype=torch.float32)
+        q, k, v, blocks, lengths = layer
+        module.run(q, k, v, out, blocks, lengths, partial, lse, 128**-0.5)
+        oracle = dense_reference(layer)
+        torch.testing.assert_close(out.double(), oracle, atol=1e-3, rtol=1e-3)
+        report["boundary_checks"].append(
+            {"context": length, "max_abs": (out.double() - oracle).abs().max().item()}
+        )
+    layer = make_layer(4, 2055, args.page_size)
+    layer[-1][-1] = 0
+    out = torch.full_like(layer[0], float("nan"))
+    partial = torch.full(
+        (4, 40, 8, 8, 128), float("nan"), device="cuda", dtype=torch.float32
+    )
+    lse = torch.full((4, 40, 8, 8), float("nan"), device="cuda", dtype=torch.float32)
+    q, k, v, blocks, lengths = layer
+    module.run(q, k, v, out, blocks, lengths, partial, lse, 128**-0.5)
+    assert torch.isfinite(out).all() and torch.count_nonzero(out[-8:]) == 0
+    torch.testing.assert_close(
+        out.double(), dense_reference(layer), atol=1e-3, rtol=1e-3
+    )
+    report["zero_length_padding_pass"] = True
+    del layer, out, partial, lse, q, k, v, blocks, lengths, oracle
     for batch in (1, 4):
         for length in args.contexts:
             if batch == 4 and length > 131072:
