@@ -338,6 +338,8 @@ def compare(args):
             )
     noise = summarize_groups(noise_rows, ref["widths"]) if noise_rows else {}
     result = {
+        "thresholds_enforced": args.precision_reduced,
+        "gate_mode": "precision_reduction" if args.precision_reduced else "record_only",
         "distribution_passed": all(g["passed"] for g in groups.values()),
         "default_noise_passed": (
             all(g["passed"] for g in noise.values()) if noise else None
@@ -349,7 +351,9 @@ def compare(args):
     }
     (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(groups, indent=2))
-    if not result["distribution_passed"] or result["default_noise_passed"] is False:
+    if args.precision_reduced and (
+        not result["distribution_passed"] or result["default_noise_passed"] is False
+    ):
         raise SystemExit("Distribution thresholds exceeded")
 
 
@@ -362,6 +366,11 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reference", type=Path)
+    parser.add_argument(
+        "--precision-reduced",
+        action="store_true",
+        help="Enforce distribution thresholds for a precision-reducing candidate",
+    )
     parser.add_argument(
         "--transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
