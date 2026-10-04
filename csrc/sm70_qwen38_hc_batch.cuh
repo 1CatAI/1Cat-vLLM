@@ -17,47 +17,6 @@ __device__ __forceinline__ void mma(float (&d)[8], uint32_t a0, uint32_t a1,
       : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
 }
 
-// One warp per CTA cannot hide a dependent global load with another warp.
-// Hold the following K16 tile in registers while consuming the current tile.
-// The arithmetic and weight-read count remain unchanged (SM70 has no cp.async).
-template <int Groups>
-__device__ __forceinline__ void mma_prefetched(const half* x, int stride,
-                                               int row, int rows, const half* w,
-                                               int col, int first_group,
-                                               float (&accum)[8]) {
-  uint4 lo = *reinterpret_cast<const uint4*>(w + (first_group * 64 + col) * 8);
-  uint4 hi =
-      *reinterpret_cast<const uint4*>(w + (first_group * 64 + 32 + col) * 8);
-  uint4 a = make_uint4(0, 0, 0, 0), b = a;
-  if (row < rows) {
-    const half* input = x + row * stride + first_group * 16;
-    a = *reinterpret_cast<const uint4*>(input);
-    b = *reinterpret_cast<const uint4*>(input + 8);
-  }
-#pragma unroll 4
-  for (int g = 0; g < Groups; ++g) {
-    uint4 next_lo = {}, next_hi = {}, next_a = {}, next_b = {};
-    if (g + 1 < Groups) {
-      const int kg = first_group + g + 1;
-      next_lo = *reinterpret_cast<const uint4*>(w + (kg * 64 + col) * 8);
-      next_hi = *reinterpret_cast<const uint4*>(w + (kg * 64 + 32 + col) * 8);
-      if (row < rows) {
-        const half* input = x + row * stride + kg * 16;
-        next_a = *reinterpret_cast<const uint4*>(input);
-        next_b = *reinterpret_cast<const uint4*>(input + 8);
-      }
-    }
-    mma(accum, a.x, a.y, lo.x, lo.y);
-    mma(accum, a.z, a.w, lo.z, lo.w);
-    mma(accum, b.x, b.y, hi.x, hi.y);
-    mma(accum, b.z, b.w, hi.z, hi.w);
-    lo = next_lo;
-    hi = next_hi;
-    a = next_a;
-    b = next_b;
-  }
-}
-
 // Match the Triton HC post-op, not CUDA's --use_fast_math division.
 __device__ __forceinline__ float div_full(float a, float b) {
   float r;
@@ -161,7 +120,7 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch(
 }
 
 template <bool PairRows, int Warps, bool WarpM16, int N = 352,
-          bool RoundPartials = false, int Unroll = 4, bool Prefetch = false>
+          bool RoundPartials = false, int Unroll = 4>
 __device__ __forceinline__ void hc_down_partials_body(
     const half* __restrict__ x, const half* __restrict__ packed,
     float* __restrict__ partials, int rows, int block_x, int block_y,
@@ -179,32 +138,26 @@ __device__ __forceinline__ void hc_down_partials_body(
   const int row_base = WarpM16 ? (quad / 2) * 8 : group * 8;
   const half* w = packed + static_cast<size_t>(tile) * 10240 * TileN;
   float accum[PairRows ? 2 : 1][8] = {};
-  if constexpr (Prefetch) {
-    static_assert(!PairRows && !WarpM16);
-    mma_prefetched<32>(x, 10240, row_base + r, rows, w, col, split * 32,
-                       accum[0]);
-  } else {
 #pragma unroll Unroll
-    for (int g = 0; g < 32; ++g) {
-      const int kg = split * 32 + g;
-      const uint4 lo =
-          *reinterpret_cast<const uint4*>(w + (kg * 2 * TileN + col) * 8);
-      const uint4 hi = *reinterpret_cast<const uint4*>(
-          w + (kg * 2 * TileN + TileN + col) * 8);
+  for (int g = 0; g < 32; ++g) {
+    const int kg = split * 32 + g;
+    const uint4 lo =
+        *reinterpret_cast<const uint4*>(w + (kg * 2 * TileN + col) * 8);
+    const uint4 hi =
+        *reinterpret_cast<const uint4*>(w + (kg * 2 * TileN + TileN + col) * 8);
 #pragma unroll
-      for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
-        const int row = row_base + p * 8 + r;
-        uint4 a = make_uint4(0, 0, 0, 0), b = a;
-        if (row < rows) {
-          const half* input = x + row * 10240 + kg * 16;
-          a = *reinterpret_cast<const uint4*>(input);
-          b = *reinterpret_cast<const uint4*>(input + 8);
-        }
-        mma(accum[p], a.x, a.y, lo.x, lo.y);
-        mma(accum[p], a.z, a.w, lo.z, lo.w);
-        mma(accum[p], b.x, b.y, hi.x, hi.y);
-        mma(accum[p], b.z, b.w, hi.z, hi.w);
+    for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
+      const int row = row_base + p * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < rows) {
+        const half* input = x + row * 10240 + kg * 16;
+        a = *reinterpret_cast<const uint4*>(input);
+        b = *reinterpret_cast<const uint4*>(input + 8);
       }
+      mma(accum[p], a.x, a.y, lo.x, lo.y);
+      mma(accum[p], a.z, a.w, lo.z, lo.w);
+      mma(accum[p], b.x, b.y, hi.x, hi.y);
+      mma(accum[p], b.z, b.w, hi.z, hi.w);
     }
   }
 #pragma unroll
@@ -229,12 +182,11 @@ __device__ __forceinline__ void hc_down_partials_body(
 }
 
 template <bool PairRows, int Warps, bool WarpM16, int N = 352,
-          bool RoundPartials = false, bool Prefetch = false>
+          bool RoundPartials = false>
 __global__ __launch_bounds__(32 * Warps, 4) void hc_down_partials(
     const half* x, const half* packed, float* partials, int rows) {
-  hc_down_partials_body<PairRows, Warps, WarpM16, N, RoundPartials, 4,
-                        Prefetch>(x, packed, partials, rows, blockIdx.x,
-                                  blockIdx.y, blockIdx.z);
+  hc_down_partials_body<PairRows, Warps, WarpM16, N, RoundPartials>(
+      x, packed, partials, rows, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
 // Disjoint dense packets can use any graph-safe TP collective. Keep the
@@ -404,7 +356,7 @@ __global__ __launch_bounds__(32, 4) void hc_cooperative(
 }
 
 template <bool PairRows, int Warps, int Unroll, bool FuseMix,
-          bool FuseGather = false, bool Prefetch = false>
+          bool FuseGather = false>
 __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch_fused_gather(
     const half* __restrict__ lora, const half* __restrict__ packed,
     const half* __restrict__ branches, half* __restrict__ out, int rows,
@@ -421,29 +373,24 @@ __global__ __launch_bounds__(32 * Warps, 4) void hc_up_batch_fused_gather(
   const int col = branch * 8 + r;
   const half* w = packed + static_cast<size_t>(tile) * 320 * 32;
   float accum[PairRows ? 2 : 1][8] = {};
-  if constexpr (Prefetch) {
-    static_assert(!PairRows);
-    mma_prefetched<20>(lora, 320, group * 8 + r, rows, w, col, 0, accum[0]);
-  } else {
 #pragma unroll Unroll
-    for (int g = 0; g < 20; ++g) {
-      const uint4 lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
-      const uint4 hi =
-          *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
+  for (int g = 0; g < 20; ++g) {
+    const uint4 lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
+    const uint4 hi =
+        *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
 #pragma unroll
-      for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
-        const int row = (group + p) * 8 + r;
-        uint4 a = make_uint4(0, 0, 0, 0), b = a;
-        if (row < rows) {
-          const half* x = lora + row * 320 + g * 16;
-          a = *reinterpret_cast<const uint4*>(x);
-          b = *reinterpret_cast<const uint4*>(x + 8);
-        }
-        mma(accum[p], a.x, a.y, lo.x, lo.y);
-        mma(accum[p], a.z, a.w, lo.z, lo.w);
-        mma(accum[p], b.x, b.y, hi.x, hi.y);
-        mma(accum[p], b.z, b.w, hi.z, hi.w);
+    for (int p = 0; p < (PairRows ? 2 : 1); ++p) {
+      const int row = (group + p) * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < rows) {
+        const half* x = lora + row * 320 + g * 16;
+        a = *reinterpret_cast<const uint4*>(x);
+        b = *reinterpret_cast<const uint4*>(x + 8);
       }
+      mma(accum[p], a.x, a.y, lo.x, lo.y);
+      mma(accum[p], a.z, a.w, lo.z, lo.w);
+      mma(accum[p], b.x, b.y, hi.x, hi.y);
+      mma(accum[p], b.z, b.w, hi.z, hi.w);
     }
   }
 #pragma unroll
@@ -612,34 +559,19 @@ inline void launch(RankData buffers, int rank, const half* input,
                    float* partials, half* lora, half* local_output,
                    half* output, half* injection, int rows, bool round_partials,
                    bool cooperative, bool full_unroll, cudaStream_t stream,
-                   bool fused_chain, bool prefetch = false) {
-  TORCH_CHECK(!prefetch || fused_chain,
-              "HC prefetch requires the FP32 concurrent fused chain");
+                   bool fused_chain) {
   TORCH_CHECK(!fused_chain || (!round_partials && !cooperative),
               "Fused concurrent HC requires FP32 partials");
   if (fused_chain) {
-    if (prefetch) {
-      hc_down_partials<false, 1, false, 96, false, true>
-          <<<dim3(3, (rows + 7) / 8, 20), 32, 0, stream>>>(input, packed_down,
-                                                           partials, rows);
-    } else {
-      hc_down_partials<false, 1, false, 96>
-          <<<dim3(3, (rows + 7) / 8, 20), 32, 0, stream>>>(input, packed_down,
-                                                           partials, rows);
-    }
+    hc_down_partials<false, 1, false, 96>
+        <<<dim3(3, (rows + 7) / 8, 20), 32, 0, stream>>>(input, packed_down,
+                                                         partials, rows);
     down_gather_coalesced<<<(rows * 88 + 127) / 128, 128, 0, stream>>>(
         buffers, partials, lora, injection, rank, rows);
-    if (prefetch) {
-      hc_up_batch_fused_gather<false, 1, 4, true, true, true>
-          <<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
-              lora, packed_up, input, local_output, rows, 640, rank * 640,
-              buffers, rank, output);
-    } else {
-      hc_up_batch_fused_gather<false, 1, 4, true, true>
-          <<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
-              lora, packed_up, input, local_output, rows, 640, rank * 640,
-              buffers, rank, output);
-    }
+    hc_up_batch_fused_gather<false, 1, 4, true, true>
+        <<<dim3(80, (rows + 7) / 8), 32, 0, stream>>>(
+            lora, packed_up, input, local_output, rows, 640, rank * 640,
+            buffers, rank, output);
     return;
   }
   if (cooperative) {

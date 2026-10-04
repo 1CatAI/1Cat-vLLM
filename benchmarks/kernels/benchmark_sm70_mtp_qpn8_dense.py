@@ -81,7 +81,14 @@ def screen(model, role, rank, rows):
         for i, (x, (codes, scales)) in enumerate(zip(xs, quantized)):
             if not bas:
                 sm70_ops.fp8_qpn8_gemm_sm70_out(
-                    output[1][i], x, codes, scales, 12, 2, True, False
+                    output[1][i],
+                    x,
+                    codes,
+                    scales,
+                    8 if role == "head" else 12,
+                    2,
+                    True,
+                    False,
                 )
             else:
                 sm70_ops.fp8_qpn8_dispatch_ba_split_sm70_out(

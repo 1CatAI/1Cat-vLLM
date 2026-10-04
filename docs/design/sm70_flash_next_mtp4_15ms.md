@@ -366,3 +366,27 @@ trials, no dispatch overrides or candidate parameter sweeps:
 HC has the larger confirmed gap; isolate its local projection work from TP
 transport and inspect counters before choosing a structural change. Avoid
 retesting rejected cooperative HC or local split-K implementations.
+
+### HC local counters and rejected prefetch
+
+Unprofiled current local projection diagnostics measure 0.947 ms for 96 down
+projections plus local packet preparation, and 0.851 ms for 96 up/mix projections
+plus output clearing. They use extra local preparation kernels, so their sum
+cannot be subtracted exactly from the 2.273-ms transport chain.
+
+NCU captures of production local kernels (source `dbe942926f7973999cd50a663a03318b4c1ae5be`, after warmup,
+cold replay cache, unmodified clocks) contain seven actual metric rows each.
+Down/up read 2,072,480/1,676,288 DRAM bytes for weight packs of
+1,966,080/1,638,400 bytes. There is no duplicate full weight pass. CTA counts
+are 60/80 with one warp each; sampled active warps are 1.56%, global-memory
+long-scoreboard stalls 59.28%/38.49%, and registers/thread 86/90. This identifies
+limited latency hiding as an investigation target; NCU durations are excluded
+from steady performance results.
+
+A register-prefetch implementation keeps the following K16 weight/input tile
+live during the current MMA. Source `55125727fe`, ordinary source-built native
+binary, paired TP4 complete-chain graph trials: control 2.295 ms, prefetch
+2.614 ms (+13.91%). Changed inputs at five scales preserve outputs on all four
+ranks, but the speed regression rejects the implementation. Remove the unused
+kernel/API candidate, retain its source patch and raw results as artifacts,
+and do not launch a whole-model test or repeat parameter tuning for it.

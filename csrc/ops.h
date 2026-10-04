@@ -831,8 +831,7 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor partials, torch::Tensor lora,
                           torch::Tensor local_output, torch::Tensor output,
                           torch::Tensor injection, bool round_down_partials,
-                          bool cooperative, bool full_unroll, bool fused_chain,
-                          bool prefetch);
+                          bool cooperative, bool full_unroll, bool fused_chain);
 void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
                              torch::Tensor& branches, torch::Tensor& output);
 void sm70_qwen38_hc_down_local(torch::Tensor input, torch::Tensor packed,
