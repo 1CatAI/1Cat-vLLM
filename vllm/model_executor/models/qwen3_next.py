@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -751,9 +752,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         use_direct_attention_output = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-            or getattr(self, "sm70_dflash2_direct_attention_output", False)
-        ) and torch.compiler.is_compiling()
+            (
+                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+                or getattr(self, "sm70_dflash2_direct_attention_output", False)
+            )
+            and torch.compiler.is_compiling()
+            and self.layer_type == "full_attention"
+        )
         self_attention_output = (
             None if use_direct_attention_output else torch.empty_like(hidden_states)
         )
@@ -778,6 +783,8 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = projected_attention_output
         else:
             hidden_states = self_attention_output
+        if getattr(self, "sm70_gdn_outer_allreduce", False):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "attn_out",
             self.layer_idx,

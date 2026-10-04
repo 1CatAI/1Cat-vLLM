@@ -3970,6 +3970,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -4036,7 +4037,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        proj_out, _ = self.out_proj(core_attn_out)
+        if output is None:
+            proj_out, _ = self.out_proj(core_attn_out)
+        else:
+            # The caller guards the bias-free, non-reducing SM70 FP8 route.
+            # Write the compiler-owned destination within the original opaque
+            # operator; do not publish a hidden allocator-owned intermediate.
+            proj_out = self.out_proj.scheme.apply_weights(
+                self.out_proj, core_attn_out, output=output
+            )
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_out_proj",
@@ -4060,9 +4069,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens: int,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A16Fp8,
+        )
+
+        direct_write = bool(
+            output is not None
+            and self.enable_sm70_dflash2_fused_gdn_verify
+            and current_platform.is_device_capability(70)
+            and self.tp_size == 4
+            and num_tokens == 8
+            and output.shape == (8, 5120)
+            and output.dtype == torch.float16
+            and output.is_contiguous()
+            and self.out_proj.bias is None
+            and not self.out_proj.reduce_results
+            and getattr(self.out_proj, "sm70_fp8_qpn8", False)
+            and isinstance(self.out_proj.scheme, CompressedTensorsW8A16Fp8)
+        )
+        proj_out = self._compute_output_projection(
+            core_attn_out, z, num_tokens, output if direct_write else None
+        )
         if output is not None:
-            output[:num_tokens] = proj_out
+            if not direct_write:
+                output[:num_tokens] = proj_out
             _sm70_gdn_graph_buffer_copy(
                 "proj_output_after_write",
                 layer_name,
