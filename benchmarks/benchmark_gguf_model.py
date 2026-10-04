@@ -311,6 +311,9 @@ def main():
                         **summary,
                         "raw_steps": records,
                         "spec_decoding": spec_decoding,
+                        "output_token_ids": [
+                            list(o.outputs[0].token_ids) for o in outputs
+                        ],
                         "requests": [
                             _request_metrics_dict(
                                 o.metrics, len(o.outputs[0].token_ids)
