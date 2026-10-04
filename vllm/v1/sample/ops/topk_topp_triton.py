@@ -1134,12 +1134,16 @@ def _apply_top_k_top_p_compact(
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         rows = reference_rows.nonzero(as_tuple=True)[0]
-        reference = apply_top_k_top_p_pytorch(
-            logits.index_select(0, rows),
-            k.index_select(0, rows),
-            p.index_select(0, rows),
-        )
-        result.index_copy_(0, rows, reference)
+        # Dense sorting creates an int64 index for every vocabulary entry.
+        # Bound the temporary working set when many verifier rows need the
+        # reference, while preserving each row's full-vocabulary operation.
+        for chunk in rows.split(8):
+            reference = apply_top_k_top_p_pytorch(
+                logits.index_select(0, chunk),
+                k.index_select(0, chunk),
+                p.index_select(0, chunk),
+            )
+            result.index_copy_(0, chunk, reference)
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result
