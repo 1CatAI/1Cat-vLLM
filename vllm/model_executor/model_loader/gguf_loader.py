@@ -103,6 +103,20 @@ class GGUFModelLoader(BaseModelLoader):
         https://github.com/ggerganov/ggml/blob/master/docs/gguf.md for details.
         """
         config = model_config.hf_config
+        text_config = config.get_text_config()
+        if text_config.model_type == "qwen4_exp_text":
+            from vllm.transformers_utils.gguf_config import load_gguf_config
+
+            native_config = load_gguf_config(self._prepare_weights(model_config))
+            # HF dimensions remain authoritative. Add only checkpoint-specific
+            # hash/storage metadata absent from the supplied config.
+            for key in (
+                "gguf_architecture",
+                "gguf_ple_constants",
+                "gguf_ple_eos_token_id",
+            ):
+                if not hasattr(text_config, key):
+                    setattr(text_config, key, getattr(native_config, key))
         from vllm.transformers_utils.gguf_files import (
             gguf_shard_paths,
             gguf_tensor_index,
@@ -459,6 +473,9 @@ class GGUFModelLoader(BaseModelLoader):
                 adapter.needs_dense_fallback(name, self._native_tensors[raw])
             quant_config.fallback_reasons = adapter.fallback_reasons
             quant_config.linear_layouts = adapter.linear_layouts(gguf_weights_map)
+            quant_config.native_expert_storage = getattr(
+                adapter, "native_expert_storage", False
+            )
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)
