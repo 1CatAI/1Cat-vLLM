@@ -210,6 +210,16 @@ reduces the mean to 629.091 us. CPU replay-entry spread has median
 4.4–6.0 ms graph-launch API durations are instrumented values and do not
 establish ordinary host cost. PLE causality remains unproven.
 
+Rank0 is last to enter the target graph in 56 of the 59 captured rounds.
+CUDA API overlap between the earliest worker's entry and rank0's entry has
+median 319.470 us; excluding the one skew outlier gives mean 300.385 us.
+The remaining 58 windows contain about 8.88 APIs each, primarily elementwise
+and indexed launches plus asynchronous copies. These instrumented APIs
+account for part of the observed entry spread rather than an isolated PLE
+wait. Their durations are not ordinary host-time savings. Attribution below
+the Python/driver boundary requires further evidence before changing
+collective synchronization or assigning the wait to the offloader.
+
 ## GDN copy follow-up
 
 Projection-tail materialization is merged in #927 and row-strided mixed-QKV
@@ -222,9 +232,9 @@ model geometry and preserve FP32 recurrence and state snapshots.
 | --- | ---: | ---: |
 | Projection tails | 0.225 | 0.202 |
 | Strided recurrent input | 0.494 | 0.545 |
-| Direct recurrent output candidate | 0.080 | 0.060 |
+| Direct recurrent output | 0.080 | 0.060 |
 
-The direct output candidate passes changed-input graph comparisons for output,
+The direct output path merged in #929 passes changed-input graph comparisons for output,
 convolution state and all FP32 SSM snapshots, including destination canaries.
 These synthetic exact-layout chain timings are separate operator measurements
 and cannot be summed into a complete-model result. The qualified model remains
@@ -234,5 +244,7 @@ A launch-geometry screen of HC combine/norm finds no faster bitwise M5 choice;
 the current tile and warp policy is retained. Changing tile width produces
 some FP16 output bit differences. The existing rejected QSA score-tile screen
 is also retained as a negative result rather than repeated. A replicated HC
-up counter sample motivates a separate next-group weight-lookahead screen;
-it does not yet establish candidate speed or model admission.
+up counter sample motivated a next-group weight-lookahead screen. The
+candidate preserves intermediate bits but does not improve M5 and regresses
+M20; it is reverted in #930. Its counter and ordinary operator timings are
+recorded in `sm70_hc_weight_prefetch_screen.md` without model admission.
