@@ -70,6 +70,7 @@ class GGUFConfig(QuantizationConfig):
         self.linear_layouts: dict[str, GGUFLinearLayout] = {}
         self.fallback_reasons: dict[str, str] = {}
         self.native_expert_storage = False
+        self.canonical_expert_storage = False
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -128,6 +129,10 @@ class GGUFConfig(QuantizationConfig):
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
             if self.native_expert_storage:
+                if self.canonical_expert_storage:
+                    from .gguf_turbomind_moe import GGUFTurboMindMoEMethod
+
+                    return GGUFTurboMindMoEMethod(self, layer.moe_config)
                 from vllm.model_executor.layers.quantization.gguf_moe import (
                     GGUFNativeMoEMethod,
                 )

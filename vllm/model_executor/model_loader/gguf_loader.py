@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     gguf_quant_weights_iterator_multi,
 )
+from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -39,6 +40,9 @@ class GGUFModelLoader(BaseModelLoader):
     that are quantized with GGUF and saved in the GGUF format. This loader
     supports loading both full models and sharded models.
     """
+
+    _gguf_prepared_model_config: ModelConfig | None = None
+    _gguf_prepared_weights_map: dict[str, str]
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -442,7 +446,12 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Filter mapped names before the adapter touches tensor payloads."""
         local_model_path = self._prepare_weights(model_config)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
+        if getattr(self, "_gguf_prepared_model_config", None) is model_config:
+            gguf_weights_map = self._gguf_prepared_weights_map.copy()
+        else:
+            gguf_weights_map = self._get_gguf_weights_map(model_config)
+            self._gguf_prepared_model_config = model_config
+            self._gguf_prepared_weights_map = gguf_weights_map
         if skip_weight is not None:
             gguf_weights_map = {
                 raw: name
@@ -463,6 +472,8 @@ class GGUFModelLoader(BaseModelLoader):
         self._gguf_tp_size = vllm_config.parallel_config.tensor_parallel_size
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
+        self._gguf_prepared_model_config = model_config
+        self._gguf_prepared_weights_map = gguf_weights_map
         # we can only know if tie word embeddings after mapping weights
         gguf_files = self._get_all_gguf_files(local_model_path)
         all_extra_names = []
@@ -492,6 +503,14 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config.native_expert_storage = getattr(
                 adapter, "native_expert_storage", False
             )
+            quant_config.canonical_expert_storage = (
+                quant_config.native_expert_storage
+                and vllm_config.kernel_config.sm70_gguf.enabled
+                and model_config.dtype == torch.float16
+                and current_platform.get_device_capability() == (7, 0)
+                and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")
+            )
+            adapter.canonical_expert_storage = quant_config.canonical_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)
