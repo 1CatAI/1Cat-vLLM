@@ -42,8 +42,26 @@ All compared row bytes match. These numbers do not establish a model speedup.
 
 Fourteen research C++ correctness cases cover M=1/5/17/33, 17/160/8193-byte
 rows, shard/page boundaries, repeated IDs, buffer reuse and rejection of
-invalid or strided IDs. Installed-artifact dispatch, matched C1 distributions,
-fixed-input step timing, the natural quality suite and a short C4 smoke remain
-required before default promotion. UVA hot-row caching remains a separate
+invalid or strided IDs. This CPU scheduling change preserves gathered bytes
+and numerical operations. Promotion requires installed-artifact byte checks
+and one matched C1 timing comparison; distribution and quality suites are
+reserved for changes to accumulation or numerical boundaries. UVA hot-row caching remains a separate
 follow-up: the current 8192-row trace simulation has only 14.5% all-row hits,
 so its miss path must be efficient as well.
+
+Before the C1 experiment, the projected critical-path saving is
+`1 lookup/token × 873.7515 us pre-copy wait × 0.80 lookup reduction × 0.9`
+= **0.629 ms/token**. The 80% reduction is rounded from the cold real-row
+measurement, not from warm startup timings. This projection caps credit at
+the observed pre-copy GPU wait; CPU service time is not added to GPU time.
+The historical trace and the current cache state may differ. Compare the
+observed saving against this estimate and investigate deviations over 15%.
+
+The maintained endpoint entry is
+`benchmarks/benchmark_sm70_qwen38_quality.py --timing-only`. It takes the GPU
+lock without blocking and fails before model loading on busy GPUs, insufficient
+disk, missing checkpoint files, Python/header mismatch, disabled request metrics,
+or an unguarded spawn entry. Every launch writes a completion summary, including
+failures. Normal quality mode retains anomaly reports; a single anomalous output
+requires three different seeds in both arms before a candidate-specific failure
+can be established. Existing health detection alone is not that comparison.

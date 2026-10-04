@@ -74,8 +74,10 @@ from the diagnostic logit capture arm is an accepted performance result.
 Run the fixed GSM8K, Chinese QA, needle and MBPP cases with the existing seeded
 sampling recipe. Each stratum must score at least its matched default baseline.
 Inspect repetition, invalid text, premature termination and unfinished thinking;
-new candidate outputs that run to the token cap fail admission even if the
-answer appears earlier. Record baseline cap failures separately. Keep counts,
+a single output that runs to the token cap or repeats is an anomaly to triage,
+not an admission veto. Repeat the affected prompt with three different seeds
+in both the candidate and baseline before attributing a regression to the
+candidate. Record all six outputs and baseline cap failures separately. Keep counts,
 full outputs and reproducible checking code. This small suite is an admission
 screen, not a claim about all model capabilities.
 
@@ -92,9 +94,12 @@ TP, graph, KV/state dtype, prompts, sequence lengths, disk placement and
 sampling contract in paired arms. Report decode separately from TTFT/prefill.
 Use at least five steady-state C1 samples per arm; interleave matched samples
 where feasible and report median, range and ratios, not a best run. C1 speed
-and its single-step bottleneck determine performance admission. Before merging,
-run one short C4 end-to-end smoke and check normal execution/output health.
-Slower concurrent execution is not a rejection condition. Do not run dedicated
+and its single-step bottleneck determine performance admission. For scheduling
+changes that preserve numerical results bit for bit, an operator microbenchmark
+and one matched C1 timing comparison suffice; skip distribution, quality and
+acceptance-rate tests. Changes to accumulation order or numerical boundaries
+require teacher-forcing distribution checks and C1 timing, plus one quality
+suite before merge. Do not run dedicated
 C2–C16 throughput, distribution or budget campaigns. Kernels must remain correct
 at arbitrary supported batch widths, including M=5. Use shape capability and
 measurement for admission, never a hardcoded batch-width fallback rule.
@@ -105,6 +110,33 @@ with TP4, 262144 startup capacity,
 accumulation/state. Initial component targets are 95 us per GDN layer,
 150 us per QSA layer and 0.45 ms for LM head plus sampling. These are planning
 budgets, not measured results.
+
+## Iteration cost and expected benefit
+
+Before implementing a candidate, record calls per token from the existing
+trace, expected saving per call and `calls × saving × 0.9` as its projected
+endpoint benefit. The 0.9 correction applies to profiler-derived timing;
+retain unprofiled measurements as such. Bundle changes projected below
+0.1 ms/token into a larger segment change. After endpoint measurement,
+compare predicted and observed savings; investigate relative deviations over
+15% and correct the estimate before proceeding.
+
+Use three measurement tiers. Develop operator candidates in independent Torch
+JIT extensions with ccache. Rotate real layer weights to keep L2 cold, capture
+CUDA graphs and report addressed weight bytes, measured DRAM bytes when
+available, GB/s, grid and numerical error. Then capture a real layer or segment
+to measure dependency gaps and actual fusion savings. Run the endpoint only
+when accumulated projected saving reaches 0.5 ms/token or a PR is ready to
+merge. Compile changed extensions incrementally during development; build a
+normal source-complete wheel for merge, not for every candidate.
+
+Keep the C1 endpoint entry in `benchmark_sm70_qwen38_quality.py`; use
+`--timing-only` for scheduling changes. It checks disk space, Python and headers,
+the GPU lock, idle GPUs, request metrics and spawn protection before loading.
+Every completion writes a compact summary, including failed launches. Preserve
+raw evidence and clean only owned obsolete caches/build products. While GPUs
+are occupied, develop the next eligible kernel on CPU rather than repeatedly
+polling long jobs. Batch independent code/log reads.
 
 ## Current budget and required updates
 

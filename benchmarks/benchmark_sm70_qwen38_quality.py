@@ -15,14 +15,17 @@ import hashlib
 import json
 import os
 import resource
+import shutil
 import statistics
 import subprocess
 import sys
+import sysconfig
 import tempfile
-import time
 from pathlib import Path
 
 import regex as re
+
+REQUEST_METRICS_ENABLED = True
 
 
 def final_text(text):
@@ -156,7 +159,11 @@ def run(args):
     out = args.output.parent
     out.mkdir(parents=True, exist_ok=True)
     model = str(args.model)
-    suite = json.loads(args.cases.read_text())
+    suite = (
+        json.loads(args.cases.read_text())
+        if args.cases is not None
+        else {"sampling": {}, "cases": []}
+    )
     import torch
     from transformers import AutoTokenizer
 
@@ -176,7 +183,10 @@ def run(args):
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in Path(vllm.__file__).parent.glob("*.so")
         },
-        "suite_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest(),
+        "suite_sha256": hashlib.sha256(args.cases.read_bytes()).hexdigest()
+        if args.cases is not None
+        else None,
+        "quality_evaluated": not args.timing_only,
         "sampling": suite["sampling"],
         "contract": {
             "model": model,
@@ -212,7 +222,7 @@ def run(args):
         enable_prefix_caching=False,
         language_model_only=True,
         speculative_config=None,
-        disable_log_stats=False,
+        disable_log_stats=not REQUEST_METRICS_ENABLED,
         kernel_config={
             "ple_result_transport": args.ple_result_transport,
             "ple_disk_row_gather": not args.disable_ple_row_gather,
@@ -256,7 +266,7 @@ def run(args):
             report["timing"].append(metrics(o))
             save()
             print("TIMING", i, report["timing"][-1]["tpot_ms"], flush=True)
-        for i, case in enumerate(suite["cases"]):
+        for i, case in enumerate([] if args.timing_only else suite["cases"]):
             prompt_ids = prompt_token_ids(case, tok)
             o = llm.generate(
                 [{"prompt_token_ids": prompt_ids}],
@@ -301,25 +311,123 @@ def run(args):
             r["tpot_ms"] for r in report["timing"]
         )
         report["health_failures"] = health_failures(report["quality"])
-        report["health_passed"] = not report["health_failures"]
+        report["health_passed"] = (
+            not report["health_failures"] if not args.timing_only else None
+        )
         report["complete"] = True
+        report["health_triage_required"] = bool(report["health_failures"])
         save()
-        if not report["health_passed"]:
-            raise SystemExit("Output health gate failed; see health_failures in report")
+        if report["health_passed"] is False:
+            raise SystemExit(
+                "Output anomaly requires three candidate and three baseline seeds; "
+                "see report"
+            )
     finally:
         llm.llm_engine.engine_core.shutdown()
 
 
-if __name__ == "__main__":
+def compare_timing(reference, candidate, expected_saving_ms):
+    """Check the matched contract before calibrating an endpoint estimate."""
+    for key in ("runtime", "torch", "cuda", "source_native", "contract"):
+        if reference[key] != candidate[key]:
+            raise ValueError(f"Timing arms differ in {key}")
+    if not reference["complete"] or not candidate["complete"]:
+        raise ValueError("Timing arms must be complete")
+    baseline = reference["median_tpot_ms"]
+    observed = baseline - candidate["median_tpot_ms"]
+    error = abs(observed - expected_saving_ms) / expected_saving_ms
+    return {
+        "baseline_ms": baseline,
+        "candidate_ms": candidate["median_tpot_ms"],
+        "expected_saving_ms": expected_saving_ms,
+        "observed_saving_ms": observed,
+        "estimate_relative_error": error,
+        "calibration_required": error > 0.15,
+    }
+
+
+def preflight(args):
+    """Reject incomplete launch contracts before importing/loading the model."""
+    if sys.version_info[:2] != (3, 12):
+        raise RuntimeError("The frozen runtime requires Python 3.12")
+    header = Path(sysconfig.get_path("include")) / "Python.h"
+    if not header.is_file():
+        raise RuntimeError(f"Python development header is missing: {header}")
+    if not REQUEST_METRICS_ENABLED:
+        raise RuntimeError("Request metrics must be enabled")
+    tree = ast.parse(Path(__file__).read_text())
+    guard = ast.parse('if __name__ == "__main__": main()').body[0].test
+    if not any(
+        isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(guard)
+        for node in tree.body
+    ):
+        raise RuntimeError("The endpoint entry requires a spawn main guard")
+    if not (args.model / "config.json").is_file():
+        raise RuntimeError("Model config is missing")
+    index = args.model / "model.safetensors.index.json"
+    if not index.is_file():
+        raise RuntimeError("The sharded checkpoint index is missing")
+    shards = set(json.loads(index.read_text())["weight_map"].values())
+    missing = [name for name in sorted(shards) if not (args.model / name).is_file()]
+    if missing:
+        raise RuntimeError(f"Checkpoint shards missing: {missing[:3]}")
+    if not args.timing_only:
+        if args.cases is None or not args.cases.is_file():
+            raise RuntimeError("Quality mode requires the frozen cases JSON")
+        json.loads(args.cases.read_text())
+    if args.output.exists():
+        raise RuntimeError("Refusing to overwrite a retained result")
+    free = shutil.disk_usage(args.output.parent).free
+    if free < args.min_free_gib * 1024**3:
+        raise RuntimeError(f"Insufficient disk: {free / 1024**3:.2f} GiB free")
+    consumers = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            "0,1,2,3",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).strip()
+    if consumers:
+        raise RuntimeError(f"GPU 0-3 occupied by PIDs: {consumers}")
+    return {
+        "python": sys.version,
+        "header": str(header),
+        "free_bytes": free,
+        "gpu_idle": True,
+        "request_metrics": True,
+        "spawn_guard": True,
+        "gpu_lock": "/tmp/gpu0-3.lock",
+    }
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--cases", type=Path, required=True)
+    parser.add_argument("--cases", type=Path)
+    parser.add_argument("--timing-only", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--min-free-gib", type=float, default=8)
+    parser.add_argument("--reference-timing", type=Path)
+    parser.add_argument("--expected-saving-ms", type=float)
     parser.add_argument("--disable-ple-row-gather", action="store_true")
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
     args = parser.parse_args()
+    if args.min_free_gib < 8:
+        parser.error("--min-free-gib must be at least 8")
+    if args.reference_timing is not None:
+        if args.expected_saving_ms is None or args.expected_saving_ms <= 0:
+            parser.error("--reference-timing requires positive --expected-saving-ms")
+        reference = json.loads(args.reference_timing.read_text())
+    else:
+        reference = None
+    args.model = args.model.resolve()
+    args.output = args.output.resolve()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     # Resolve defaults in a fresh process, before importing the runtime.
     for key in list(os.environ):
         if key.startswith(
@@ -340,21 +448,34 @@ if __name__ == "__main__":
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
         TORCH_EXTENSIONS_DIR=str(cache / "extensions"),
     )
-    while True:
+    summary = {"complete": False, "output": str(args.output)}
+    summary_path = args.output.with_suffix(".summary.json")
+    try:
         with open("/tmp/gpu0-3.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            consumers = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "-i",
-                    "0,1,2,3",
-                    "--query-compute-apps=pid",
-                    "--format=csv,noheader,nounits",
-                ],
-                text=True,
-            ).strip()
-            if not consumers:
-                run(args)
-                break
-        print("GPU 0-3 occupied; released lock and waiting", flush=True)
-        time.sleep(10)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            summary["preflight"] = preflight(args)
+            run(args)
+            report = json.loads(args.output.read_text())
+            if reference is not None:
+                summary["estimate_comparison"] = compare_timing(
+                    reference, report, args.expected_saving_ms
+                )
+            summary.update(
+                complete=report["complete"],
+                median_tpot_ms=report["median_tpot_ms"],
+                quality_evaluated=report["quality_evaluated"],
+                health_triage_required=report["health_triage_required"],
+                worker_routes=report["worker_routes"],
+            )
+    except BaseException as error:
+        summary["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+        )
+        print("COMPLETION_SUMMARY", summary_path, flush=True)
+
+
+if __name__ == "__main__":
+    main()
