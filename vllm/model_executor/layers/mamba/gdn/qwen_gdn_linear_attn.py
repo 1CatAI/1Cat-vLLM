@@ -7697,7 +7697,29 @@ def qwen_gdn_input_projection_core(
         )
         ba = _sm70_dump_gdn_projection_tensor("input_core_in_proj_ba", layer_name, ba)
 
-        if self.gqa_interleaved_layout:
+        from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+            _can_fuse_gdn_projection_split,
+            _split_gdn_projection_tails,
+        )
+
+        copied_tails = (
+            not self.gqa_interleaved_layout
+            and not self.disable_tp_for_ba_proj
+            and mixed_qkvz.shape[0] in (5, 20)
+            and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
+            and self.value_dim // self.tp_size == 1536
+            and z_out.shape == (mixed_qkvz.shape[0], 12, 128)
+            and z_out.dtype == mixed_qkvz.dtype
+            and z_out.is_contiguous()
+            and z_out.device == mixed_qkvz.device
+            and _can_fuse_gdn_projection_split(mixed_qkvz, ba)
+        )
+        if copied_tails:
+            mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z_out)
+            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                mixed_qkv = mixed_qkv.contiguous()
+            _log_runtime_route_once("SM70 GDN projection tail-copy route hit.")
+        elif self.gqa_interleaved_layout:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 mixed_qkvz,
                 ba,
@@ -7726,11 +7748,13 @@ def qwen_gdn_input_projection_core(
             b = b.contiguous()
             a = a.contiguous()
 
-        if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
-            70
-        ):
-            z = z.contiguous()
-        z_out.copy_(z)
+        if not copied_tails:
+            if (
+                envs.VLLM_SM70_GDN_Z_CONTIGUOUS
+                and current_platform.is_device_capability(70)
+            ):
+                z = z.contiguous()
+            z_out.copy_(z)
 
     _qwen_gdn_run_recurrent_core(
         self,
