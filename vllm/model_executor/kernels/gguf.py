@@ -198,7 +198,7 @@ def raw_grouped_gate_up_capabilities(
         reason = "disabled_by_kernel_config"
     elif not is_sm70:
         reason = "requires_sm70"
-    elif source_type not in (21, 22):
+    elif source_type not in (18, 21, 22):
         reason = "raw_grouped_source_format_unavailable"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"
@@ -206,6 +206,8 @@ def raw_grouped_gate_up_capabilities(
         reason = "raw_grouped_shape_has_no_calibration"
     elif not hasattr(torch.ops._C, operator):
         reason = f"operator_missing:{operator}"
+    elif source_type == 18:
+        reason = "raw_grouped_source_format_has_no_calibration"
     return tuple(
         GGUFOperatorCapability(
             decoder_family(source_type),
