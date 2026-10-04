@@ -25,7 +25,11 @@ from vllm import LLM, SamplingParams
 _original_path = sys.path.copy()
 try:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from benchmarks.benchmark_sm70_model_tokens import _request_metrics_dict
+    from benchmarks.benchmark_sm70_model_tokens import (
+        _metric_snapshot,
+        _request_metrics_dict,
+        _spec_decoding_delta,
+    )
     from benchmarks.benchmark_sm70_qwen38_concurrency import (
         generate_cohort,
         summarize,
@@ -43,6 +47,8 @@ def main():
     parser.add_argument("--cuda-profiler-capture", action="store_true")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--ring", choices=("auto", "disabled"), default="auto")
+    parser.add_argument("--mtp-draft", type=Path)
+    parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 4, 8, 16])
@@ -87,6 +93,14 @@ def main():
     )
     if args.model.suffix.lower() == ".gguf":
         config["quantization"] = "gguf"
+    if args.mtp_draft is not None:
+        config["speculative_config"] = {
+            "method": "mtp",
+            "model": str(args.mtp_draft),
+            "num_speculative_tokens": 4,
+            "draft_load_config": {"load_format": "safetensors"},
+            "draft_sample_method": "greedy",
+        }
     if args.ring == "disabled":
         config["kernel_config"] = {"sm70_ring": {"enabled": False}}
     report = {
@@ -104,9 +118,9 @@ def main():
             "output_len": args.output_len,
             "synthetic": True,
             "ignore_eos": True,
-            "sampling": "greedy",
+            "temperature": args.temperature,
             "atomic_cohort": True,
-            "no_mtp": True,
+            "no_mtp": args.mtp_draft is None,
         },
         "natural_greedy": [],
         "decode": [],
@@ -157,7 +171,10 @@ def main():
 
         prompts = [fixed_prompt(args.input_len, i) for i in range(max(args.widths))]
         sampling = SamplingParams(
-            temperature=0, max_tokens=args.output_len, ignore_eos=True
+            temperature=args.temperature,
+            seed=4201,
+            max_tokens=args.output_len,
+            ignore_eos=True,
         )
         for width in args.widths:
             generate_cohort(llm, prompts[:width], sampling, atomic=True)
@@ -188,6 +205,7 @@ def main():
                     return output
 
                 client.get_output = observed
+                before = _metric_snapshot(llm)
                 capture = (
                     args.cuda_profiler_capture
                     and width == args.widths[0]
@@ -208,11 +226,13 @@ def main():
                 if any(len(o.outputs[0].token_ids) != args.output_len for o in outputs):
                     raise RuntimeError("Incomplete synthetic timing request")
                 summary = summarize(records, width)
+                spec_decoding = _spec_decoding_delta(before, _metric_snapshot(llm))
                 report["decode"].append(
                     {
                         "repeat": repeat,
                         **summary,
                         "raw_steps": records,
+                        "spec_decoding": spec_decoding,
                         "requests": [
                             _request_metrics_dict(
                                 o.metrics, len(o.outputs[0].token_ids)
