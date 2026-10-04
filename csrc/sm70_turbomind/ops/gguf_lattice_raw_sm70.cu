@@ -1005,8 +1005,8 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
 namespace {
 // One CTA owns two output rows from each projection of an active expert.
 // Repeated route slots return before initializing the shared codebook. Every
-// original block is decoded once per output row and reused for the expert's
-// actual tokens, with no tensor-core M tile padding.
+// original block is decoded once per token pair and output row, with no
+// tensor-core M tile padding. Larger expert intervals use additional pairs.
 template <int Type, int MaxTokens>
 __global__ void raw_grouped_gate_up_kernel(
     half* gate, half* up, const half* input, const uint8_t* gate_weights,
@@ -1026,34 +1026,37 @@ __global__ void raw_grouped_gate_up_kernel(
   const uint8_t* weights = warp < 2 ? gate_weights : up_weights;
   half* output = warp < 2 ? gate : up;
   const uint8_t* row_data = weights + (int64_t{expert} * n + row) * stride;
-  float sums[MaxTokens] = {};
-  for (int block = 0; block < k / 256; ++block) {
-    const auto* data = stage_block<Type>(raw[warp], row_data, block, stride);
-    const auto values = Decode::fragment(data, lane * 8, grid);
+  for (int chunk = begin; chunk < end; chunk += MaxTokens) {
+    float sums[MaxTokens] = {};
+    for (int block = 0; block < k / 256; ++block) {
+      const auto* data = stage_block<Type>(raw[warp], row_data, block, stride);
+      const auto values = Decode::fragment(data, lane * 8, grid);
+#pragma unroll
+      for (int token = 0; token < MaxTokens; ++token) {
+        if (chunk + token < end) {
+          const auto* x =
+              input + int64_t{chunk + token} * k + block * 256 + lane * 8;
+          const uint4 loaded = *reinterpret_cast<const uint4*>(x);
+          const auto& activation =
+              reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            sums[token] =
+                fmaf(__half2float(activation[i]), values[i], sums[token]);
+        }
+      }
+      __syncwarp();
+    }
 #pragma unroll
     for (int token = 0; token < MaxTokens; ++token) {
-      if (begin + token < end) {
-        const auto* x =
-            input + int64_t{begin + token} * k + block * 256 + lane * 8;
-        const uint4 loaded = *reinterpret_cast<const uint4*>(x);
-        const auto& activation =
-            reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
+      if (chunk + token < end) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
-          sums[token] =
-              fmaf(__half2float(activation[i]), values[i], sums[token]);
+        for (int distance = 16; distance > 0; distance /= 2)
+          sums[token] += __shfl_down_sync(0xffffffffU, sums[token], distance);
+        if (lane == 0)
+          output[int64_t{chunk + token} * n + row] =
+              __float2half_rn(sums[token]);
       }
-    }
-    __syncwarp();
-  }
-#pragma unroll
-  for (int token = 0; token < MaxTokens; ++token) {
-    if (begin + token < end) {
-#pragma unroll
-      for (int distance = 16; distance > 0; distance /= 2)
-        sums[token] += __shfl_down_sync(0xffffffffU, sums[token], distance);
-      if (lane == 0)
-        output[int64_t{begin + token} * n + row] = __float2half_rn(sums[token]);
     }
   }
 }
@@ -1084,16 +1087,8 @@ void dispatch_grouped_gate_up(torch::Tensor gate, torch::Tensor up,
                                     offsets, ids, stream)
   if (tokens <= 1) {
     GROUPED_CASE(1);
-  } else if (tokens <= 2) {
-    GROUPED_CASE(2);
-  } else if (tokens <= 4) {
-    GROUPED_CASE(4);
-  } else if (tokens <= 8) {
-    GROUPED_CASE(8);
-  } else if (tokens <= 16) {
-    GROUPED_CASE(16);
   } else {
-    GROUPED_CASE(32);
+    GROUPED_CASE(2);
   }
 #undef GROUPED_CASE
 }
