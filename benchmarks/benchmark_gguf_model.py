@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--mtp-draft", type=Path)
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--input-len", type=int, default=1024)
+    parser.add_argument("--concurrent-input-len", type=int)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--prefill", type=int, nargs="*", default=[8192, 32768])
@@ -70,13 +71,16 @@ def main():
         or min(args.widths) < 1
         or args.output_len < 64
         or args.input_len < 1
+        or (args.concurrent_input_len is not None and args.concurrent_input_len < 1)
         or args.repeats < 1
     ):
         raise ValueError("Invalid fixed-width timing workload")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
-    maximum_input = max([args.input_len, *args.prefill])
+    maximum_input = max(
+        [args.input_len, args.concurrent_input_len or args.input_len, *args.prefill]
+    )
     model_len = args.max_model_len or maximum_input + args.output_len + 128
     max_seqs = args.max_seqs or max(args.widths)
     if model_len < maximum_input + args.output_len or max_seqs < max(args.widths):
@@ -128,6 +132,7 @@ def main():
         "config": json.loads(json.dumps(config)),
         "decode_contract": {
             "input_len": args.input_len,
+            "concurrent_input_len": args.concurrent_input_len or args.input_len,
             "output_len": args.output_len,
             "synthetic": True,
             "ignore_eos": True,
@@ -238,7 +243,6 @@ def main():
             )
             return {"prompt_token_ids": (piece * (length // len(piece) + 1))[:length]}
 
-        prompts = [fixed_prompt(args.input_len, i) for i in range(max(args.widths))]
         sampling = SamplingParams(
             temperature=args.temperature,
             seed=4201,
@@ -246,7 +250,13 @@ def main():
             ignore_eos=True,
         )
         for width in args.widths:
-            generate_cohort(llm, prompts[:width], sampling, atomic=True)
+            length = (
+                args.concurrent_input_len
+                if width > 1 and args.concurrent_input_len
+                else args.input_len
+            )
+            cohort = [fixed_prompt(length, i) for i in range(width)]
+            generate_cohort(llm, cohort, sampling, atomic=True)
             for repeat in range(args.repeats):
                 records = []
                 client = llm.llm_engine.engine_core
@@ -284,9 +294,7 @@ def main():
                     if capture:
                         torch.accelerator.synchronize()
                         torch.cuda.cudart().cudaProfilerStart()
-                    outputs = generate_cohort(
-                        llm, prompts[:width], sampling, atomic=True
-                    )
+                    outputs = generate_cohort(llm, cohort, sampling, atomic=True)
                 finally:
                     if capture:
                         torch.accelerator.synchronize()
@@ -299,6 +307,7 @@ def main():
                 report["decode"].append(
                     {
                         "repeat": repeat,
+                        "input_len": length,
                         **summary,
                         "raw_steps": records,
                         "spec_decoding": spec_decoding,
