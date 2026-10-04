@@ -15,12 +15,14 @@ from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 from .sm70_gguf import _get_affine_blas_workspace
 
-# Matched Flash-Next TP4 sweeps; unmeasured descriptors retain fused MMA.
+# Matched Flash-Next and 27B TP4 sweeps; unmeasured descriptors retain fused MMA.
 # The narrow expert crossover is nonmonotonic, so it has two intervals.
 _LATTICE_BLAS_BANDS = {
     (17, 2560, 160): ((8, 1024), (4096, None)),
     (18, 2560, 160): ((8, 1024), (4096, None)),
     (21, 2560, 1536): ((2048, None),),
+    (21, 5120, 4352): ((512, None),),
+    (21, 4352, 5120): ((512, None),),
 }
 
 

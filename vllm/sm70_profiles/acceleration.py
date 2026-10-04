@@ -59,13 +59,20 @@ def loaded_linear_kernels(model) -> dict[str, Any]:
                     "operator_admission": admission,
                     "scope": "prepared_gguf_operator_capability",
                 }
-            for attribute in (
-                "kernel",
-                "fp8_linear",
-                "sm70_kernel",
-                "linear_kernel",
-            ):
-                kernel = getattr(holder, attribute, None)
+            kernels = [
+                getattr(holder, attribute, None)
+                for attribute in (
+                    "kernel",
+                    "fp8_linear",
+                    "sm70_kernel",
+                    "linear_kernel",
+                )
+            ]
+            kernels.extend(
+                projection.kernel
+                for projection in getattr(holder, "canonical_projections", ())
+            )
+            for kernel in kernels:
                 if not isinstance(
                     kernel, (MPLinearKernel, NvFp4LinearKernel, ScaledMMLinearKernel)
                 ):
@@ -118,17 +125,32 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
         if descriptor is not None and not types:
             types = [getattr(descriptor, "weight_type", None)]
         layout = getattr(method, "layout", None)
+        candidates = getattr(method, "native_admission", {}).get(
+            "canonical_projections", ()
+        )
         result[name] = {
             "method": type(method).__name__,
             "weight_types": types,
             "layout": type(layout).__name__ if layout is not None else None,
-            "separate_projection_storage": hasattr(layer, "gguf_shard_weights"),
+            "separate_projection_storage": hasattr(layer, "gguf_shard_weights")
+            or hasattr(layer, "gguf_tm_projections"),
             "native_operators": {
                 op: hasattr(torch.ops._C, op)
                 for op in ("ggml_dequantize", "ggml_mul_mat_vec_a8", "ggml_mul_mat_a8")
             },
             "storage_fallback_reason": getattr(method, "fallback_reason", None),
-            "acceleration_fallback_reason": "gguf_turbomind_repack_not_integrated",
+            "canonical_projections": [
+                projection.admission()
+                for projection in getattr(method, "canonical_projections", ())
+            ],
+            "acceleration_fallback_reason": (
+                None
+                if getattr(method, "canonical_projections", ())
+                else next(
+                    (p["reason"] for p in candidates if p.get("reason")),
+                    "gguf_turbomind_repack_not_integrated",
+                )
+            ),
             "scope": "prepared_gguf_storage_and_operator_capability",
         }
     return result
