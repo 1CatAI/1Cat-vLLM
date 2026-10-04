@@ -11,18 +11,25 @@ from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as mod
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 
-@pytest.mark.parametrize("batch,width", [(1, 2), (1, 5), (2, 5), (4, 4)])
+@pytest.mark.parametrize("batch,width", [(1, 2), (1, 5), (2, 5), (4, 4), (4, 5)])
 @pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("row_stride", [2560, 4096])
 def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
-    monkeypatch, batch, width, dim_first
+    monkeypatch, batch, width, dim_first, row_stride
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
 
+    if row_stride != 2560 and (batch, width) not in ((1, 5), (4, 5)):
+        pytest.skip("Only measured M5/M20 row-strided verifier batches")
+
     torch.manual_seed(20260927)
     device, dtype = "cuda", torch.float16
     tokens, slots = batch * width, batch * 8
-    inputs = [torch.empty(tokens, 2560, device=device, dtype=dtype) for _ in range(2)]
+    inputs = [
+        torch.empty(tokens, row_stride, device=device, dtype=dtype)[:, :2560]
+        for _ in range(2)
+    ]
     outputs = [
         torch.empty(tokens + 2, 12, 128, device=device, dtype=dtype) for _ in range(2)
     ]
@@ -79,6 +86,7 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
         A_log=torch.randn(12, device=device, dtype=torch.float32),
         dt_bias=torch.randn(12, device=device, dtype=dtype),
         _can_use_dflash2_packed_gdn_verify=lambda **kwargs: False,
+        _can_use_sm70_gdn_preprocess=lambda *args: False,
     )
     layers = [
         SimpleNamespace(**common, enable_sm70_fused_sigmoid_mixed_qkv=enabled)
