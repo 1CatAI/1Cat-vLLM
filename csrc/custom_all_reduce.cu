@@ -937,7 +937,7 @@ void sm70_qwen38_hc_replicated(torch::Tensor input, torch::Tensor packed_down,
       down_replicated_reduce<<<(m * 324 + 127) / 128, 128, 0, stream>>>(
           partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
           reinterpret_cast<half*>(injection.data_ptr()), m);
-  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true, false, true>
+  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true>
       <<<dim3(320, (m + 7) / 8), 32, 0, stream>>>(
           reinterpret_cast<const half*>(lora.data_ptr()),
           reinterpret_cast<const half*>(packed_up.data_ptr()),
