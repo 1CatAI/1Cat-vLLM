@@ -1037,3 +1037,29 @@ not require an unavailable asynchronous-copy instruction. The storage
 budget and every numerical operation remain unchanged. The same extended
 checks and two dense M16 wall comparisons must validate this candidate
 before it is selected.
+
+## Register activation lookahead reaches dense M16 parity
+
+Source `331e6234c9` passes all 28 extended checks (10.07 s). Preloading the
+following activation tile into registers changes no weight bits, activation
+values or FP32 accumulation operations. The two dense TP4 M16 comparisons are:
+
+| Projection | Canonical µs | Register activation-prefetch µs | Split |
+| --- | ---: | ---: | ---: |
+| 27B gate | 39.633 | 38.769 | 3 |
+| 27B down | 37.940 | 33.509 | 2 |
+
+The gate path is 2.2% faster and down is 11.7% faster in complete unprofiled
+full-graph replay. Earlier synchronous staging reached 43.323/42.049 µs.
+The new prefetch variant uses 119 registers/thread, no stack allocation and
+18,688 shared bytes, so its gain is demonstrated despite reduced CTA
+residency. Register count alone is not used to reject the measured winner.
+Other Flash M16 shapes and matched read-byte counters still require follow-up
+before a broader default decision.
+
+Installed core SHA256:
+`c86213d5a23f44eee18d8a58e48b252b4d2caee678e0f90496ac926656fe687c`.
+Whole-wheel SHA256:
+`47f3683cbc85816effdd796bd0ce2a8e0dc0b5d64a403865d686ee0f3c7a12a0`.
+The package/Python source versions agree and all 210 installed dependencies
+are compatible. Persistent payload bytes and alignment budgets are unchanged.
