@@ -214,6 +214,24 @@ __global__ void down_local_packet(const float* partials, half* output, int rank,
   output[index] = value;
 }
 
+__global__ void down_replicated_reduce(const float* partials, half* lora,
+                                       half* injection, int rows) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= rows * 324) return;
+  const int row = index / 324, col = index % 324;
+  float acc = 0.0f;
+#pragma unroll
+  for (int split = 0; split < 20; ++split)
+    acc = __fadd_rn(acc, partials[(split * rows + row) * 352 + col]);
+  const half value = __float2half_rn(acc);
+  if (col < 320) {
+    const float x = div_full(__half2float(value), 4.0f);
+    lora[row * 320 + col] = __float2half_rn(__fmul_rn(x, sigmoid(x)));
+  } else {
+    injection[row * 4 + col - 320] = value;
+  }
+}
+
 template <bool Down>
 __device__ __forceinline__ void gather_body(RankData buffers, const void* input,
                                             half* output, half* injection,

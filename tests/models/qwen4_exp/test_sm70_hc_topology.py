@@ -68,3 +68,16 @@ def test_legacy_fp16_partial_policy_is_not_replaced(monkeypatch):
         hc._qwen38_sm70_fp16_fused_hc(
             torch.empty(5, 10240), None, None, None, None, concurrent_batch=False
         )
+
+
+def test_replicated_hc_packing_preserves_dense_weights():
+    generator = torch.Generator().manual_seed(20261004)
+    down = torch.randn(336, 10240, generator=generator, dtype=torch.float16)
+    up = torch.randn(10240, 320, generator=generator, dtype=torch.float16)
+    packed_down = hc._pack_hc_batch_weight(down, "down", None)
+    restored_down = packed_down.permute(0, 3, 1, 2, 4).reshape(352, 10240)
+    torch.testing.assert_close(restored_down[:336], down, rtol=0, atol=0)
+    assert torch.count_nonzero(restored_down[336:]) == 0
+    packed_up = hc._pack_hc_batch_weight(up, "up", None)
+    restored_up = packed_up.permute(3, 0, 4, 1, 2, 5).reshape(10240, 320)
+    torch.testing.assert_close(restored_up, up, rtol=0, atol=0)

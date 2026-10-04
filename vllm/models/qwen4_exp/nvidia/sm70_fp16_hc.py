@@ -44,20 +44,28 @@ def _mtp_batch_runtime_contract(vllm_config=None) -> bool:
     )
 
 
-def _pack_hc_batch_weight(weight: torch.Tensor, role: str, rank: int) -> torch.Tensor:
-    """Lossless TP4 packs; keep checkpoint layout for M1 and prefill."""
-    if weight.dtype != torch.float16 or not 0 <= rank < 4:
+def _pack_hc_batch_weight(
+    weight: torch.Tensor, role: str, rank: int | None
+) -> torch.Tensor:
+    """Lossless batch packs; keep checkpoint layout for M1 and prefill."""
+    if weight.dtype != torch.float16 or (rank is not None and not 0 <= rank < 4):
         raise ValueError("HC batch packing requires FP16 and a TP4 rank")
     weight = weight.detach()
     if role == "down" and weight.shape == (336, 10240):
+        if rank is None:
+            padded = weight.new_zeros((352, 10240))
+            padded[:336].copy_(weight)
+            return padded.reshape(11, 32, 640, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
         padded = weight.new_zeros((96, 10240))
         padded[:88].copy_(weight[rank * 80 : rank * 80 + 88])
         return padded.reshape(3, 32, 640, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
     if role == "up" and weight.shape == (10240, 320):
-        shard = weight.reshape(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+        shard = weight.reshape(4, 2560, 320)
+        if rank is not None:
+            shard = shard[:, rank * 640 : (rank + 1) * 640]
         return (
             shard.contiguous()
-            .reshape(4, 80, 8, 20, 2, 8)
+            .reshape(4, 320 if rank is None else 80, 8, 20, 2, 8)
             .permute(1, 3, 4, 0, 2, 5)
             .contiguous()
         )
@@ -73,7 +81,14 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
         return
     if not ops.supports_sm70_qwen38_hc_batch():
         raise RuntimeError("Rebuild the SM70 extension for batched HC")
-    rank = get_tp_group().rank_in_group
+    rank: int | None = get_tp_group().rank_in_group
+    ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
+    if (
+        not (ca is not None and not ca.disabled and ca.fully_connected)
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and ops.supports_sm70_qwen38_hc_replicated()
+    ):
+        rank = None
     layer.register_buffer(
         "_sm70_qwen38_hc_batch_packed",
         _pack_hc_batch_weight(weight, layer._sm70_qwen38_hc_batch_role, rank),
@@ -90,6 +105,7 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
         if concurrent_batch
         else envs.VLLM_SM70_MTP_HC_BATCH and reduced and x.shape[0] in (5, 10)
     )
+
     return bool(
         admitted
         and not envs.VLLM_BATCH_INVARIANT
@@ -109,6 +125,34 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
             and w.is_contiguous()
             and w.data_ptr() % 16 == 0
             for w in (packed_down, packed_up)
+        )
+    )
+
+
+def _replicated_runtime_ok(x, down, up, concurrent_batch):
+    return bool(
+        concurrent_batch
+        and envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 16
+        and x.shape[1] == _HC_HIDDEN
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and down is not None
+        and up is not None
+        and down.shape == (11, 640, 2, 32, 8)
+        and up.shape == (320, 20, 2, 4, 8, 8)
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (down, up)
         )
     )
 
@@ -371,6 +415,20 @@ def _qwen38_sm70_fp16_fused_hc(
     concurrent_batch: bool = False,
     reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _replicated_runtime_ok(x, packed_down, packed_up, concurrent_batch):
+        from vllm import _custom_ops as ops
+
+        if ops.supports_sm70_qwen38_hc_replicated():
+            m = x.shape[0]
+            partials = x.new_empty((20, m, 352), dtype=torch.float32)
+            lora, block, injection = (x.new_empty((m, n)) for n in (320, 2560, 4))
+            ops.sm70_qwen38_hc_replicated(
+                x, packed_down, packed_up, partials, lora, block, injection
+            )
+            logger.info_once(
+                "SM70 batched HC uses replicated FP32 MMA without TP transport."
+            )
+            return block, injection
     if _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch):
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -408,7 +466,9 @@ def _qwen38_sm70_fp16_fused_hc(
         from vllm import _custom_ops as ops
 
         group = get_tp_group()
-        if concurrent_batch and group.world_size == 4:
+        # The local+collective screen regressed M10. Keep it as a reference;
+        # automatic non-mesh preparation uses the replicated FP32 route.
+        if concurrent_batch and group.world_size == 4 and x.shape[0] == 5:
             if ops.supports_sm70_qwen38_hc_local():
                 m = x.shape[0]
                 partials = x.new_empty((20, m, 96), dtype=torch.float32)

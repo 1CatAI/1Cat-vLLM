@@ -833,6 +833,10 @@ void sm70_qwen38_hc_down_local(torch::Tensor input, torch::Tensor packed,
 void sm70_qwen38_hc_up_local(torch::Tensor lora, torch::Tensor packed,
                              torch::Tensor branches, torch::Tensor output,
                              int64_t rank);
+void sm70_qwen38_hc_replicated(torch::Tensor input, torch::Tensor packed_down,
+                               torch::Tensor packed_up, torch::Tensor partials,
+                               torch::Tensor lora, torch::Tensor output,
+                               torch::Tensor injection);
 void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
                                      torch::Tensor& output);
 

@@ -51,6 +51,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--replicated", action="store_true")
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(rank)
@@ -58,6 +59,8 @@ def main():
     assert int(os.environ["WORLD_SIZE"]) == 4
     assert torch.cuda.get_device_capability() == (7, 0)
     assert ops.supports_sm70_qwen38_hc_local()
+    if args.replicated:
+        assert ops.supports_sm70_qwen38_hc_replicated()
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     dist.init_process_group("gloo")
@@ -106,8 +109,10 @@ def main():
                 (
                     down,
                     up,
-                    _pack_hc_batch_weight(down, "down", rank),
-                    _pack_hc_batch_weight(up, "up", rank),
+                    _pack_hc_batch_weight(
+                        down, "down", None if args.replicated else rank
+                    ),
+                    _pack_hc_batch_weight(up, "up", None if args.replicated else rank),
                 )
             )
     results = []
@@ -156,7 +161,10 @@ def main():
                 "max_abs_error": worst_abs,
                 "relative_l2": worst_l2,
                 "estimated_96_pairs_saved_us": (old_us - new_us) * 96 / len(weights),
-                "scope": "operator chain including TP4 transport; not model round",
+                "replicated": args.replicated,
+                "scope": (
+                    "TP4 operator chain with admitted transport policy; not model round"
+                ),
             }
             results.append(result)
             print(json.dumps(result), flush=True)
