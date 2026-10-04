@@ -383,8 +383,15 @@ full-round estimator before dropping warmup is 3.0179 and 2.8926. These
 closely agree; the earlier 3.97/4.27 measurements used a different prompt,
 sampling policy and shorter outputs, so they cannot establish an acceptance
 advantage over the NVFP4 target. A 10,000-resample whole-prompt bootstrap with
-seed 123 supplies the intervals above. This is not a Q8_0-versus-BF16 draft
-comparison; that control remains pending.
+seed 123 supplies the intervals above. Using the same steady emitted-token estimator on the saved NVFP4 baseline
+cohort gives 2.7588 tokens per round at 1K, versus 3.0288 for GGUF. The paired
+whole-prompt bootstrap interval for the difference is [0.0914, 0.4996]. The
+latest measured NVFP4 arm gives 2.7987, with difference interval
+[0.0558, 0.4833]. Both cohorts use the same eight input texts and sampling
+parameters, but target weights, KV dtype and draft representation differ.
+These results cannot isolate draft quantization or establish a quality
+advantage. This is not a Q8_0-versus-BF16 draft comparison; that control remains
+pending.
 
 Four concurrent natural prompts produce nonempty, reasonable output in
 5.053 seconds with a 96-token limit. All stop at the length limit. This is a
