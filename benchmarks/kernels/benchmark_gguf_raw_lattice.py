@@ -535,26 +535,29 @@ def main():
                             )
                         )
                 if n % 32 == 0:
-                    for row_tile in (64, 128):
-                        for split in sorted({1, min(2, k // 256), min(4, k // 256)}):
-                            temporary = torch.empty(
-                                (split, m, n), device="cuda", dtype=torch.float32
+                    lt_algorithms, lt_sizes = (
+                        torch.ops._C.gguf_lattice_compact_lt_sm70_prepare(x, out)
+                    )
+                    lt_workspace = torch.empty(
+                        32 * 1024 * 1024, device="cuda", dtype=torch.uint8
+                    )
+                    for index, algorithm in enumerate(lt_algorithms):
+                        candidates.append(
+                            (
+                                f"compact_dequant_blaslt_algo{index}_parts2",
+                                partial(
+                                    torch.ops._C.gguf_lattice_compact_lt_sm70_out,
+                                    out,
+                                    x,
+                                    compact,
+                                    kind,
+                                    raw_scratch,
+                                    lt_workspace,
+                                    algorithm,
+                                    2,
+                                ),
                             )
-                            candidates.append(
-                                (
-                                    f"compact_prefill_rows{row_tile}_split{split}",
-                                    partial(
-                                        torch.ops._C.gguf_lattice_compact_prefill_sm70_out,
-                                        out,
-                                        x,
-                                        compact,
-                                        kind,
-                                        temporary,
-                                        split,
-                                        row_tile,
-                                    ),
-                                )
-                            )
+                        )
                 fp32_result = torch.empty((m, n), device="cuda", dtype=torch.float32)
 
                 def fp32_blas(

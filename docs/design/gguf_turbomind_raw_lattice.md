@@ -1235,3 +1235,15 @@ NCU reports 4,497,888 DRAM read bytes, 128 registers, 14.99% active warps,
 instruction count is 7,864,320. The next experiment queues activation vectors
 in registers before independent IQ decoding, then commits the shared activation
 tile before MMA, preserving all operand bits and FP32 accumulation.
+
+Overlapping activation staging passes 52 checks and improves fused prefill
+from 147.802 to 143.102 us, still well behind 92.500 us canonical. The fused
+implementation and its capabilities are removed; the negative results remain.
+
+The next workspace candidate uses cuBLASLt `CUBLAS_COMPUTE_32F` and filters
+split-K algorithms to `CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE`. In-place and
+output-type reductions are rejected, including at execution. Plans are opaque
+CPU metadata prepared before graph capture, without persistent caches; FP16
+dequantization and the library workspace remain caller-owned GPU scratch.
+Numerical tests cover every returned algorithm with changed-input graphs and
+partials above FP16 range. No precision reduction or model default is implied.

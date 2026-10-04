@@ -249,7 +249,7 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
     if layout == "compact":
         bands += (
             ("gguf_lattice_compact_tm_f16_sm70_out", 512, None),
-            ("gguf_lattice_compact_prefill_sm70_out", 512, None),
+            ("gguf_lattice_compact_lt_sm70_out", 512, None),
         )
     return tuple(
         GGUFOperatorCapability(
@@ -265,7 +265,7 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
                 if operator
                 in (
                     "gguf_lattice_compact_tm_f16_sm70_out",
-                    "gguf_lattice_compact_prefill_sm70_out",
+                    "gguf_lattice_compact_lt_sm70_out",
                 )
                 and n % 32
                 else None

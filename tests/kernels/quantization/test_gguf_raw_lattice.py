@@ -558,11 +558,15 @@ def test_compact_turbomind_fp16_workspace_graph(kind, cancellation, dq_partition
 
 
 @pytest.mark.parametrize("kind", [21, 22])
-@pytest.mark.parametrize("row_tile", [64, 128])
-@pytest.mark.parametrize("n", [32, 160])
-def test_compact_prefill_rows_and_fp32_partials_graph(kind, row_tile, n):
-    m, k = 513, 768
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
+    n, k, m = (1536, 2560, 512) if cancellation else (160, 768, 512)
     data = packed(kind, n=n, k=k)
+    if cancellation:
+        data.fill(0)
+        data.reshape(n, k // 256, -1)[:, :, :2] = np.array([1.0], dtype="<f2").view(
+            np.uint8
+        )
     reference = (
         torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
         .cuda()
@@ -574,64 +578,40 @@ def test_compact_prefill_rows_and_fp32_partials_graph(kind, row_tile, n):
     weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
     torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
     x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(128.0)
+        x[:, k // 2 :] = -128.0
     out = torch.empty((m, n), device="cuda", dtype=torch.float16)
-    temporary = torch.empty((3, m, n), device="cuda", dtype=torch.float32)
-    for splits in (1, 3):
+    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    algorithms, sizes = torch.ops._C.gguf_lattice_compact_lt_sm70_prepare(x, out)
+    assert len(algorithms) > 0
+    assert int(sizes.max()) <= workspace.numel()
+    for algorithm in algorithms:
         run = partial(
-            torch.ops._C.gguf_lattice_compact_prefill_sm70_out,
+            torch.ops._C.gguf_lattice_compact_lt_sm70_out,
             out,
             x,
             weight,
             kind,
-            temporary,
-            splits,
-            row_tile,
+            scratch,
+            workspace,
+            algorithm,
+            2,
         )
         for _ in range(3):
             run()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
-        x.copy_(torch.randn_like(x))
-        graph.replay()
-        torch.testing.assert_close(
-            out.float(), x.float() @ reference.T, rtol=0.003, atol=0.01
-        )
-
-
-@pytest.mark.parametrize("kind", [21, 22])
-def test_compact_prefill_cancellation_uses_fp32_partials(kind):
-    n, k, m = 1536, 2560, 512
-    _, size = quant_size(kind)
-    blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
-    blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
-    data = blocks.reshape(n, -1)
-    assert np.all(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)) == 1)
-    raw = RawGGUFProjection.from_rows(data, kind)
-    source = torch.from_numpy(raw.data).cuda()
-    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
-    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
-    x = torch.full((m, k), 128.0, device="cuda", dtype=torch.float16)
-    x[:, k // 2 :] = -128.0
-    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
-    temporary = torch.empty((4, m, n), device="cuda", dtype=torch.float32)
-    for row_tile in (64, 128):
-        for splits in (1, 2, 4):
-            run = partial(
-                torch.ops._C.gguf_lattice_compact_prefill_sm70_out,
-                out,
-                x,
-                weight,
-                kind,
-                temporary,
-                splits,
-                row_tile,
-            )
-            for _ in range(3):
-                run()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                run()
+        if cancellation:
             x.neg_()
-            graph.replay()
+        else:
+            x.copy_(torch.randn_like(x))
+        graph.replay()
+        if cancellation:
             torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                out.float(), x.float() @ reference.T, rtol=0.003, atol=0.01
+            )

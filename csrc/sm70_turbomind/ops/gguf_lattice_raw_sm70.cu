@@ -5,6 +5,9 @@
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <climits>
+#include <cstring>
+#include <vector>
+#include <cublasLt.h>
 #include "gguf_lattice_compact.cuh"
 #include "src/turbomind/kernels/gemm/arch/mma_sm70.h"
 
@@ -13,6 +16,70 @@ void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                       torch::Tensor weight_ptrs);
 
 namespace {
+void check_lattice_lt(cublasStatus_t status, const char* operation) {
+  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, operation,
+              " failed with cuBLASLt status ", static_cast<int>(status));
+}
+
+struct LatticeLtDescriptors {
+  cublasLtMatmulDesc_t operation = nullptr;
+  cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+  cublasLtMatmulPreference_t preference = nullptr;
+  ~LatticeLtDescriptors() {
+    if (preference) cublasLtMatmulPreferenceDestroy(preference);
+    if (a) cublasLtMatrixLayoutDestroy(a);
+    if (b) cublasLtMatrixLayoutDestroy(b);
+    if (c) cublasLtMatrixLayoutDestroy(c);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+  }
+};
+
+void create_lattice_lt(LatticeLtDescriptors& descriptors, int m, int n, int k) {
+  check_lattice_lt(cublasLtMatmulDescCreate(&descriptors.operation,
+                                            CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                   "create FP32 matmul");
+  // Column-major views match the existing [K,N] dequantization workspace
+  // and row-major activation/output storage without an additional transpose.
+  check_lattice_lt(
+      cublasLtMatrixLayoutCreate(&descriptors.a, CUDA_R_16F, n, k, n),
+      "create weight layout");
+  check_lattice_lt(
+      cublasLtMatrixLayoutCreate(&descriptors.b, CUDA_R_16F, k, m, k),
+      "create input layout");
+  check_lattice_lt(
+      cublasLtMatrixLayoutCreate(&descriptors.c, CUDA_R_16F, n, m, n),
+      "create output layout");
+}
+
+bool lattice_lt_fp32_reduction(const cublasLtMatmulAlgo_t& algorithm) {
+  uint32_t reduction = 0;
+  int32_t splits = 1;
+  size_t written = 0;
+  check_lattice_lt(cublasLtMatmulAlgoConfigGetAttribute(
+                       &algorithm, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                       &reduction, sizeof(reduction), &written),
+                   "read reduction scheme");
+  check_lattice_lt(cublasLtMatmulAlgoConfigGetAttribute(
+                       &algorithm, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splits,
+                       sizeof(splits), &written),
+                   "read split-K count");
+  return reduction == CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE ||
+         (reduction == CUBLASLT_REDUCTION_SCHEME_NONE && splits <= 1);
+}
+
+void validate_lattice_lt_matrices(torch::Tensor out, torch::Tensor input) {
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 && input.dim() == 2 &&
+                  out.dim() == 2 && input.is_contiguous() &&
+                  out.is_contiguous() && input.size(0) >= 512 &&
+                  out.size(0) == input.size(0) && input.size(0) <= INT_MAX &&
+                  out.size(1) > 0 && out.size(1) <= INT_MAX &&
+                  out.size(1) % 32 == 0 && input.size(1) > 0 &&
+                  input.size(1) <= INT_MAX && input.size(1) % 256 == 0,
+              "GGUF cuBLASLt requires aligned FP16 prefill matrices");
+}
+
 // One warp cooperatively stages one original block. Row padding is the only
 // persistent storage overhead; unaligned block starts are stitched in shared.
 template <int Type>
@@ -470,118 +537,6 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
     for (int64_t i = int64_t{n} * blocks * Decode::kBlockBytes;
          i < storage_bytes; ++i)
       out[i] = 0;
-}
-
-// Decode one compressed tile for all row groups in a CTA. Temporary FP16
-// fragments match official FP32 dequantization followed by the final cast.
-template <int Type, int TileM>
-__global__ void compact_prefill_kernel(half* out, float* partial,
-                                       const half* input, const uint8_t* weight,
-                                       int m, int n, int k, int splits) {
-  using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
-  using MMA = turbomind::gemm::SM70_MMA_884;
-  constexpr int WarpRows = TileM / 4;
-  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
-  __shared__ __align__(16) half activations[TileM][72];
-  __shared__ __align__(16) half weights[128][72];
-  Decode::initialize(grid);
-  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  const int col_begin = blockIdx.x * 128, row_begin = blockIdx.y * TileM;
-  const int decode_group = warp / 2, first_col = col_begin + decode_group * 32;
-  const int physical_col =
-      (lane & 3) | ((lane & 4) << 2) | ((lane & 8) >> 1) | ((lane & 16) >> 1);
-  const int row_group = warp / 2, col_group = warp % 2;
-  const int arow = lane / 16 * 4 + lane % 4;
-  typename MMA::FragC accum[WarpRows / 8][2]{};
-  const int blocks = k / 256;
-  const int begin = blocks * blockIdx.z / splits;
-  const int end = blocks * (blockIdx.z + 1) / splits;
-  for (int block = begin; block < end; ++block) {
-    const uint8_t* tile = nullptr;
-    typename Decode::Parameters parameters{};
-    if (first_col < n) {
-      tile = weight + int64_t{first_col} * blocks * Decode::kBlockBytes +
-             int64_t{block} * 32 * Decode::kBlockBytes;
-      parameters = Decode::template parameters<true>(tile, 32, lane);
-    }
-#pragma unroll
-    for (int chunk = 0; chunk < 4; ++chunk) {
-      uint4 pending_activation[TileM / 32]{};
-#pragma unroll
-      for (int copy = 0; copy < TileM / 32; ++copy) {
-        const int index = threadIdx.x + copy * 256;
-        const int row = index / 8, octet = index % 8;
-        if (row_begin + row < m)
-          pending_activation[copy] = *reinterpret_cast<const uint4*>(
-              input + int64_t{row_begin + row} * k + block * 256 + chunk * 64 +
-              octet * 8);
-      }
-#pragma unroll
-      for (int octet = warp % 2; octet < 8; octet += 2) {
-        __align__(16) turbomind::Array<half, 8> values{};
-        if (first_col < n) {
-          const uint32_t packet =
-              Decode::template packet<true>(tile, 32, chunk * 8 + octet, lane);
-          values = Decode::template fragment<half>(parameters, packet,
-                                                   chunk * 8 + octet, grid);
-        }
-        *reinterpret_cast<uint4*>(
-            &weights[decode_group * 32 + physical_col][octet * 8]) =
-            *reinterpret_cast<const uint4*>(&values);
-      }
-      // SM70 software overlap: activation loads stay in registers while
-      // independent IQ packet decode fills the shared weight tile.
-#pragma unroll
-      for (int copy = 0; copy < TileM / 32; ++copy) {
-        const int index = threadIdx.x + copy * 256;
-        *reinterpret_cast<uint4*>(&activations[index / 8][(index % 8) * 8]) =
-            pending_activation[copy];
-      }
-      __syncthreads();
-#pragma unroll
-      for (int step = 0; step < 64; step += 8) {
-        typename MMA::FragA a[WarpRows / 8];
-        typename MMA::FragB b[2];
-#pragma unroll
-        for (int i = 0; i < WarpRows / 8; ++i)
-          *reinterpret_cast<uint4*>(&a[i]) = *reinterpret_cast<const uint4*>(
-              &activations[row_group * WarpRows + i * 8 + arow][step]);
-#pragma unroll
-        for (int j = 0; j < 2; ++j)
-          *reinterpret_cast<uint4*>(&b[j]) = *reinterpret_cast<const uint4*>(
-              &weights[(col_group * 2 + j) * 32 + lane][step]);
-#pragma unroll
-        for (int i = 0; i < WarpRows / 8; ++i)
-#pragma unroll
-          for (int j = 0; j < 2; ++j)
-            MMA::fma(accum[i][j], a[i], b[j], accum[i][j]);
-      }
-      __syncthreads();
-    }
-  }
-  const auto origin = MMA::thread_offset_C();
-  constexpr auto offsets = MMA::static_offset_C();
-#pragma unroll
-  for (int i = 0; i < WarpRows / 8; ++i)
-#pragma unroll
-    for (int j = 0; j < 2; ++j)
-#pragma unroll
-      for (int pair = 0; pair < 4; ++pair)
-#pragma unroll
-        for (int item = 0; item < 2; ++item) {
-          const int row = row_begin + row_group * WarpRows + i * 8 + origin.x +
-                          offsets[pair].x;
-          const int col = col_begin + col_group * 64 + j * 32 + origin.y +
-                          offsets[pair].y + item;
-          if (row < m && col < n) {
-            const int64_t index = int64_t{row} * n + col;
-            const float value = accum[i][j][pair * 2 + item];
-            if (splits == 1)
-              out[index] = __float2half_rn(value);
-            else
-              partial[int64_t{blockIdx.z} * m * n + index] = value;
-          }
-        }
 }
 
 template <int Type, class Output, bool Transpose, bool FullWidth = false,
@@ -1336,50 +1291,120 @@ void gguf_lattice_compact_tm_f16_sm70_out(
   gguf_workspace_f16_gemm_sm70_out(out, input, offsets, weight_ptrs);
 }
 
-void gguf_lattice_compact_prefill_sm70_out(torch::Tensor out,
-                                           torch::Tensor input,
-                                           torch::Tensor weight,
-                                           int64_t source_type,
-                                           torch::Tensor partial,
-                                           int64_t splits, int64_t row_tile) {
+std::vector<torch::Tensor> gguf_lattice_compact_lt_sm70_prepare(
+    torch::Tensor input, torch::Tensor out, int64_t max_candidates) {
+  validate_lattice_lt_matrices(out, input);
+  TORCH_CHECK(max_candidates > 0 && max_candidates <= 64,
+              "GGUF cuBLASLt candidate count must be 1 to 64");
+  const c10::cuda::CUDAGuard guard(input.device());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  cudaStreamCaptureStatus capture;
+  C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+  TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
+              "Prepare GGUF cuBLASLt plans before graph capture");
+  LatticeLtDescriptors descriptors;
+  create_lattice_lt(descriptors, input.size(0), out.size(1), input.size(1));
+  check_lattice_lt(cublasLtMatmulPreferenceCreate(&descriptors.preference),
+                   "create matmul preference");
+  const uint64_t workspace_bytes = 32 * 1024 * 1024;
+  const uint32_t reductions = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+  check_lattice_lt(
+      cublasLtMatmulPreferenceSetAttribute(
+          descriptors.preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+          &workspace_bytes, sizeof(workspace_bytes)),
+      "set workspace budget");
+  check_lattice_lt(
+      cublasLtMatmulPreferenceSetAttribute(
+          descriptors.preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+          &reductions, sizeof(reductions)),
+      "require FP32 split-K reduction");
+  std::vector<cublasLtMatmulHeuristicResult_t> candidates(max_candidates);
+  int count = 0;
+  check_lattice_lt(
+      cublasLtMatmulAlgoGetHeuristic(
+          at::cuda::getCurrentCUDABlasLtHandle(), descriptors.operation,
+          descriptors.a, descriptors.b, descriptors.c, descriptors.c,
+          descriptors.preference, max_candidates, candidates.data(), &count),
+      "query FP32 matmul candidates");
+  std::vector<cublasLtMatmulHeuristicResult_t> accepted;
+  for (int i = 0; i < count; ++i)
+    if (candidates[i].state == CUBLAS_STATUS_SUCCESS &&
+        candidates[i].workspaceSize <= workspace_bytes &&
+        lattice_lt_fp32_reduction(candidates[i].algo))
+      accepted.push_back(candidates[i]);
+  auto algorithms = torch::empty(
+      {static_cast<int64_t>(accepted.size()),
+       static_cast<int64_t>(sizeof(cublasLtMatmulAlgo_t))},
+      torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  auto sizes = torch::empty(
+      {static_cast<int64_t>(accepted.size())},
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  for (size_t i = 0; i < accepted.size(); ++i) {
+    std::memcpy(
+        algorithms.data_ptr<uint8_t>() + i * sizeof(cublasLtMatmulAlgo_t),
+        &accepted[i].algo, sizeof(cublasLtMatmulAlgo_t));
+    sizes.data_ptr<int64_t>()[i] = accepted[i].workspaceSize;
+  }
+  return {algorithms, sizes};
+}
+
+void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weight, int64_t source_type,
+                                      torch::Tensor scratch,
+                                      torch::Tensor workspace,
+                                      torch::Tensor algorithm,
+                                      int64_t dq_partitions) {
   validate_compact_io(out, input, weight);
+  validate_lattice_lt_matrices(out, input);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   validate_compact(weight, source_type, n, k);
-  TORCH_CHECK(m >= 512 && n % 32 == 0 && (row_tile == 64 || row_tile == 128) &&
-                  splits >= 1 && splits <= k / 256 && int64_t{m} * n <= INT_MAX,
-              "Compact prefill requires aligned output rows and valid split-K");
-  if (splits > 1)
-    TORCH_CHECK(partial.device() == weight.device() &&
-                    partial.scalar_type() == torch::kFloat32 &&
-                    partial.is_contiguous() &&
-                    partial.numel() >= splits * int64_t{m} * n,
-                "Compact prefill requires FP32 partial storage");
+  TORCH_CHECK(
+      scratch.device() == weight.device() &&
+          scratch.scalar_type() == torch::kFloat16 && scratch.dim() == 2 &&
+          scratch.size(0) == k && scratch.size(1) == n &&
+          scratch.is_contiguous() && workspace.device() == weight.device() &&
+          workspace.scalar_type() == torch::kUInt8 &&
+          workspace.is_contiguous() && algorithm.device().is_cpu() &&
+          algorithm.scalar_type() == torch::kUInt8 &&
+          algorithm.is_contiguous() &&
+          algorithm.numel() == sizeof(cublasLtMatmulAlgo_t) &&
+          (dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4),
+      "GGUF cuBLASLt requires prepared CPU plans and CUDA workspaces");
+  cublasLtMatmulAlgo_t plan;
+  std::memcpy(&plan, algorithm.data_ptr<uint8_t>(), sizeof(plan));
+  TORCH_CHECK(
+      lattice_lt_fp32_reduction(plan),
+      "GGUF cuBLASLt rejects output-type or in-place split-K reduction");
+  LatticeLtDescriptors descriptors;
+  create_lattice_lt(descriptors, m, n, k);
+  auto handle = at::cuda::getCurrentCUDABlasLtHandle();
+  cublasLtMatmulHeuristicResult_t checked{};
+  check_lattice_lt(
+      cublasLtMatmulAlgoCheck(handle, descriptors.operation, descriptors.a,
+                              descriptors.b, descriptors.c, descriptors.c,
+                              &plan, &checked),
+      "check prepared FP32 algorithm");
+  TORCH_CHECK(checked.state == CUBLAS_STATUS_SUCCESS &&
+                  checked.workspaceSize <= workspace.numel(),
+              "GGUF cuBLASLt plan workspace is unavailable");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  const dim3 grid((n + 127) / 128, (m + row_tile - 1) / row_tile, splits);
-#define COMPACT_PREFILL(TYPE, ROWS)                             \
-  compact_prefill_kernel<TYPE, ROWS><<<grid, 256, 0, stream>>>( \
-      reinterpret_cast<half*>(out.data_ptr()),                  \
-      splits > 1 ? partial.data_ptr<float>() : nullptr,         \
-      reinterpret_cast<const half*>(input.data_ptr()),          \
-      weight.data_ptr<uint8_t>(), m, n, k, splits)
-  if (source_type == 21) {
-    if (row_tile == 64) {
-      COMPACT_PREFILL(21, 64);
-    } else {
-      COMPACT_PREFILL(21, 128);
-    }
-  } else {
-    if (row_tile == 64) {
-      COMPACT_PREFILL(22, 64);
-    } else {
-      COMPACT_PREFILL(22, 128);
-    }
-  }
-#undef COMPACT_PREFILL
-  if (splits > 1)
-    reduce_vec<<<(m * n + 255) / 256, 256, 0, stream>>>(
-        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),
-        m * n, splits);
+  const dim3 grid(n / 32, k / 256, dq_partitions);
+  if (source_type == 21)
+    compact_dequant_kernel<21, half, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
+  else
+    compact_dequant_kernel<22, half, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const float alpha = 1.f, beta = 0.f;
+  check_lattice_lt(
+      cublasLtMatmul(handle, descriptors.operation, &alpha, scratch.data_ptr(),
+                     descriptors.a, input.data_ptr(), descriptors.b, &beta,
+                     out.data_ptr(), descriptors.c, out.data_ptr(),
+                     descriptors.c, &plan, workspace.data_ptr(),
+                     workspace.numel(), stream),
+      "run FP32 cuBLASLt matmul");
 }
