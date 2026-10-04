@@ -36,6 +36,16 @@ Its source-built native core is unchanged from the formal ring package:
 The adapter, draft configuration, loader and collective Python modules match
 the installed package byte for byte. No private extension override is used.
 
+The first process loaded both models at 18.99 GiB per rank and captured the
+graphs, then blocked during V2 execution warmup: FULL hybrid PLE skips the
+remote request but the embedding still waited on its semaphore. Reuse the
+local/cascade fix from #821 (`cc936d801e`); cascade rows retain their wait.
+Both regression cases pass from source and the installed wheel. The corrected
+source is `3769638467`, with wheel SHA256
+`2ac9d1da0f4355a9447c274793947223ea423ac217de4fb600eb69b5a64c19c5`;
+the native core remains unchanged. The failed process supplies no latency
+or acceptance result.
+
 Complete-round latency, acceptance and the Flash-Next ring comparison remain
 pending. The 27B C1 improvement is a smoke check and is not a Flash-Next
 latency estimate. Ring merging requires matched Flash-Next C1/C4, output
