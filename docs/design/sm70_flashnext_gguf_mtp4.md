@@ -76,8 +76,25 @@ peer atomics, contiguous local FP16 input and a payload of at most 25,600
 bytes. Other hardware, full-mesh groups, larger inputs and batch-invariant
 reduction retain existing dispatch. Startup observations report admission
 and fallback reasons. HC all-gather and the weighted MoE epilogue are pending.
-The focused capability and existing acceleration-report suite passes 48 tests.
-Formal source compilation and installed graph/lifecycle checks are pending.
+The capability, dispatch and existing acceleration-report suites pass 50 tests
+from source and from a clean installed wheel. The complete `_C` and the current
+SM70 sampler module are source-built through CMake; other unchanged native
+modules use the normal precompiled package. The installed operators are present,
+source/wheel/installed Python modules match, and the primary extension has no
+private dependencies or RPATH. Installed graph/lifecycle checks pass: 25 cases per rank and two buffer
+reopens after collective close. With the source-built installed extension,
+maximum-rank medians are 3.160/3.636/4.593/5.095 µs for M1/M2/M4/M5,
+versus NCCL 12.177/13.369/15.916/16.666 µs. The M5 result remains above
+5 µs; the first screen alone does not establish that target. Model checks
+are pending.
+
+Further screens rejected a uniform 64-thread launch (M1 3.242 µs, M5
+5.103 µs), a 96-thread launch (M1 3.509 µs, M5 5.122 µs), and Half2
+input/output transport (M1 3.463 µs, M5 5.063 µs). The scalar 128-thread
+implementation remains the baseline. A natural exponent-field packet layout
+passes 1,065,536 CPU bit round trips and 31 GPU replay checks per rank, but its
+3.545/5.016 µs M1/M5 result does not establish a decisive improvement. It is
+retained as a research candidate.
 
 Rejected variants remain useful bounds: uncompressed release/acquire packets
 took about 26.7/44.1 µs at M1/M5; relaxed uncompressed packets took about
