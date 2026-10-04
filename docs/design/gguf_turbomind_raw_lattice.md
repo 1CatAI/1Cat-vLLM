@@ -1131,3 +1131,11 @@ to eight warps. For the Flash gate, the 480-CTA grid previously exposed only
 24 resident warps per SM on average; its 75-83% long-scoreboard stall and low
 DRAM throughput motivate more independent packet loads. Octet assignment uses
 the actual warp count, preserving exact coverage and the original byte layout.
+
+The eight-warp dequantizer passed 32 checks and reduced the fastest complete
+Flash gate M512 path to 95.871 us, versus 91.890 us canonical. The TurboMind
+workspace candidate was 101.795 us. A follow-up candidate partitions the 32
+K-octets across two or four CTAs per original block, providing more active CTAs
+without changing storage. Each CTA writes a disjoint set of octets. Original
+metadata may be reread through cache; DRAM counters must establish its cost.
+The natural-layout shared-transpose kernel retains its one-CTA contract.

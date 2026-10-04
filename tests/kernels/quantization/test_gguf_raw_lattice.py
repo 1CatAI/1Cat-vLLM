@@ -488,7 +488,8 @@ def test_compact_blas_fp32_output_and_final_cast_graph(kind):
 
 @pytest.mark.parametrize("kind", [21, 22])
 @pytest.mark.parametrize("cancellation", [False, True])
-def test_compact_turbomind_fp16_workspace_graph(kind, cancellation):
+@pytest.mark.parametrize("dq_partitions", [1, 2, 4])
+def test_compact_turbomind_fp16_workspace_graph(kind, cancellation, dq_partitions):
     n, k, m = (1536, 2560, 512) if cancellation else (64, 768, 512)
     data = packed(kind, n=n, k=k)
     if cancellation:
@@ -528,7 +529,13 @@ def test_compact_turbomind_fp16_workspace_graph(kind, cancellation):
         scratch,
         offsets,
         pointers,
+        dq_partitions,
     )
+    blas_scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+        out, x, weight, kind, blas_scratch, False, 102, dq_partitions
+    )
+    torch.testing.assert_close(blas_scratch.T, expected, rtol=0, atol=0)
     for _ in range(3):
         run()
     torch.testing.assert_close(scratch, official, rtol=0, atol=0)

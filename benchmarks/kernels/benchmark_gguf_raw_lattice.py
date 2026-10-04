@@ -482,6 +482,40 @@ def main():
                             ),
                         )
                     )
+                for partitions in (2, 4):
+                    candidates.append(
+                        (
+                            f"compact_dequant_cublas_algo2_parts{partitions}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                raw_scratch,
+                                False,
+                                102,
+                                partitions,
+                            ),
+                        )
+                    )
+                    if n % 32 == 0:
+                        candidates.append(
+                            (
+                                f"compact_dequant_turbomind_f16_parts{partitions}",
+                                partial(
+                                    torch.ops._C.gguf_lattice_compact_tm_f16_sm70_out,
+                                    out,
+                                    x,
+                                    compact,
+                                    kind,
+                                    tm_scratch,
+                                    offsets,
+                                    tm_ptrs,
+                                    partitions,
+                                ),
+                            )
+                        )
                 fp32_result = torch.empty((m, n), device="cuda", dtype=torch.float32)
 
                 def fp32_blas(

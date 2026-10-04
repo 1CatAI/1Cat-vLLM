@@ -481,10 +481,11 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
     parameters = Decode::template parameters<FullWidth>(tile, width, lane);
   auto current = Decode::template fetch<FullWidth>(tile, width, warp);
   const int warps = blockDim.x / 32;
-  for (int octet = warp; octet < 32; octet += warps) {
+  const int step = warps * gridDim.z;
+  for (int octet = warp + warps * blockIdx.z; octet < 32; octet += step) {
     typename Decode::PacketWindow next{};
-    if (octet + warps < 32)
-      next = Decode::template fetch<FullWidth>(tile, width, octet + warps);
+    if (octet + step < 32)
+      next = Decode::template fetch<FullWidth>(tile, width, octet + step);
     const auto packet = Decode::extract(current, lane < width ? lane : 0);
     if (lane < width) {
       const auto values =
@@ -1129,11 +1130,15 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,
                                         torch::Tensor scratch,
-                                        bool natural_layout,
-                                        int64_t algorithm) {
+                                        bool natural_layout, int64_t algorithm,
+                                        int64_t dq_partitions) {
   TORCH_CHECK(
       algorithm == 99 || algorithm == 102,
       "Compact GGUF BLAS accepts only default or calibrated algorithm 2");
+  TORCH_CHECK(dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4,
+              "Compact GGUF DQ partitions must be 1, 2 or 4");
+  TORCH_CHECK(!natural_layout || dq_partitions == 1,
+              "Natural-layout DQ does not support partitions");
   validate_compact_io(out, input, weight, true);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
@@ -1145,7 +1150,7 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                   scratch.size(1) == (natural_layout ? k : n) &&
                   scratch.is_contiguous(),
               "Compact GGUF BLAS scratch must match its FP16 weight layout");
-  const dim3 grid((n + 31) / 32, k / 256);
+  const dim3 grid((n + 31) / 32, k / 256, dq_partitions);
   const auto stream = at::cuda::getCurrentCUDAStream();
 #define COMPACT_BLAS_DQ(TYPE, FULL)                                           \
   if (natural_layout)                                                         \
@@ -1176,7 +1181,9 @@ void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_lattice_compact_tm_f16_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor scratch, torch::Tensor offsets,
-    torch::Tensor weight_ptrs) {
+    torch::Tensor weight_ptrs, int64_t dq_partitions) {
+  TORCH_CHECK(dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4,
+              "Compact GGUF DQ partitions must be 1, 2 or 4");
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
@@ -1186,7 +1193,7 @@ void gguf_lattice_compact_tm_f16_sm70_out(
                   scratch.dim() == 2 && scratch.size(0) == n &&
                   scratch.size(1) == k && scratch.is_contiguous(),
               "Compact GGUF TurboMind requires an aligned FP16 workspace");
-  const dim3 grid(n / 32, k / 256);
+  const dim3 grid(n / 32, k / 256, dq_partitions);
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (source_type == 21)
     compact_dequant_kernel<21, half, false, true, true>
