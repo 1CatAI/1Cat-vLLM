@@ -19,6 +19,9 @@ from vllm.model_executor.kernels.linear import (
     Sm70GgufLut4Config,
     choose_mp_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+    _get_affine_blas_workspace,
+)
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
@@ -40,8 +43,106 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
+from vllm.utils.torch_utils import direct_register_custom_op
 
 _AFFINE_TYPES = AFFINE_GROUP32_TYPES | AFFINE_U2_TYPES | AFFINE_BITPLANE_TYPES
+
+
+def _supports_band(rows: int, bands: list[int]) -> bool:
+    return any(
+        rows >= bands[i] and (bands[i + 1] < 0 or rows <= bands[i + 1])
+        for i in range(0, len(bands), 2)
+    )
+
+
+def _prepared_gguf_projection(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    cache: torch.Tensor | None,
+    family: int,
+    decoder: int,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    logical_size: int,
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    # Keep M-dependent policy behind an opaque op: vLLM's range compilation
+    # drops Dynamo guards and would otherwise freeze the prefill branch.
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    if cache is not None and _supports_band(rows.shape[0], cache_bands):
+        return torch.mm(rows, cache.T).reshape(*x.shape[:-1], logical_size)
+    output = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
+    if _supports_band(rows.shape[0], blas_bands):
+        # The already prepared shared scratch is internal to this op. Passing
+        # its aliased views through Dynamo would materialize full-size clones
+        # and copybacks even when decode never touches the scratch.
+        workspace = _get_affine_blas_workspace(codes)
+        if workspace is None:
+            raise RuntimeError("Admitted GGUF BLAS workspace is unavailable")
+        scratch = workspace[: rows.shape[1] * output_size].view(
+            rows.shape[1], output_size
+        )
+        if family == 0:
+            torch.ops._C.gguf_affine_blas_sm70_out(
+                output, rows, codes, stats, decoder, scratch, group_size
+            )
+        else:
+            torch.ops._C.gguf_lattice_blas_sm70_out(
+                output, rows, codes, stats, decoder, scratch, group_size
+            )
+    elif family == 0:
+        torch.ops._C.gguf_affine_gemm_sm70_out(
+            output, rows, codes, stats, decoder, k_ld, q_ld, group_size
+        )
+    elif family == 1:
+        torch.ops._C.gguf_lut4_gemm_sm70_out(
+            output, rows, codes, stats, decoder, k_ld, q_ld, group_size
+        )
+    else:
+        torch.ops._C.gguf_lattice_gemm_sm70_out(
+            output, rows, codes, stats, decoder, k_ld, q_ld, group_size
+        )
+    # Return a separate contiguous result so the fake and real strides agree
+    # even when the prepared output pack contains padding.
+    return output[:, :logical_size].contiguous().reshape(*x.shape[:-1], logical_size)
+
+
+def _prepared_gguf_projection_fake(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    cache: torch.Tensor | None,
+    family: int,
+    decoder: int,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    logical_size: int,
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], logical_size), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="prepared_gguf_projection",
+    op_func=_prepared_gguf_projection,
+    fake_impl=_prepared_gguf_projection_fake,
+)
+
+
+def _admitted_bands(capabilities):
+    return [
+        bound
+        for capability in capabilities
+        if capability.reason is None
+        for bound in (capability.min_m, capability.max_m or -1)
+    ]
 
 
 def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
@@ -217,17 +318,30 @@ class GGUFPreparedProjection(Module):
 
     def forward(self, x):
         if self.kernel is not None:
-            rows = x.numel() // x.shape[-1]
-            if self.fp16_cache is not None and any(
-                c.reason is None and c.supports_m(rows) for c in self.cache_capabilities
-            ):
-                output = torch.mm(x.reshape(-1, x.shape[-1]), self.fp16_cache.T)
-                return output.reshape(*x.shape[:-1], self.logical_output_size)
-            output = self.kernel.apply_weights(self, x)
-            return (
-                output[..., : self.logical_output_size]
-                if self.output_padding
-                else output
+            kernel = self.kernel
+            config = kernel.config
+            if isinstance(config, Sm70GgufAffineConfig):
+                family, decoder = 0, kernel.bits
+            elif isinstance(config, Sm70GgufLut4Config):
+                family, decoder = 1, kernel.lut_id
+            else:
+                family, decoder = 2, kernel.source_type
+            capabilities = getattr(kernel, "operator_capabilities", ())
+            blas = tuple(c for c in capabilities if "blas" in c.operator)
+            return torch.ops.vllm.prepared_gguf_projection(
+                x,
+                self.codes,
+                self.stats,
+                self.fp16_cache,
+                family,
+                decoder,
+                config.group_size,
+                self.gguf_tm_k_ld,
+                self.gguf_tm_q_ld,
+                config.partition_weight_shape[1],
+                self.logical_output_size,
+                _admitted_bands(self.cache_capabilities),
+                _admitted_bands(blas),
             )
         # Imported lazily because the GGUF method owns fallback dispatch.
         from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf
