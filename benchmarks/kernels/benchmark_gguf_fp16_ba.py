@@ -45,6 +45,7 @@ def main():
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--projection", choices=("ba", "router"), default="ba")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 10, 16, 20])
     args = parser.parse_args()
     assert 0 <= args.rank < 4
     assert torch.cuda.get_device_capability() == (7, 0)
@@ -83,7 +84,7 @@ def main():
         weights.append((shards, dense, packed))
     assert weights
     results = []
-    for m in (1, 5, 10, 16, 20):
+    for m in args.m:
         torch.manual_seed(20261004 + m)
         x = (torch.randn(m, 2560, device="cuda") * 0.125).half()
         role = (
@@ -91,8 +92,9 @@ def main():
             if args.projection == "ba"
             else "model.layers.0.mlp.gate"
         )
-        fast_route = m <= 16 if args.projection == "ba" else m in (1, 5, 10)
+        fast_route = m <= 32 if args.projection == "ba" else m in (1, 5, 10)
         worst_abs = worst_l2 = 0.0
+        matches_single_rows = True
         for shards, dense, packed in weights:
             expected = (x.float() @ dense.float().T).half()
             if fast_route:
@@ -110,6 +112,15 @@ def main():
                 (error.norm() / expected.float().norm().clamp_min(1e-20)).item(),
             )
             torch.testing.assert_close(actual, expected, rtol=0.003, atol=0.003)
+            if args.projection == "ba" and fast_route:
+                single = torch.cat(
+                    [
+                        _qwen38_sm70_fp16_gemv(x[row : row + 1], dense, role, packed)
+                        for row in range(m)
+                    ]
+                )
+                matches_single_rows &= torch.equal(actual, single)
+                torch.testing.assert_close(actual, single, rtol=0, atol=0)
 
         def old_path(x=x):
             for shards, _, _ in weights:
@@ -133,6 +144,9 @@ def main():
                 "new_per_layer_us": new_us / len(weights),
                 "max_abs_error": worst_abs,
                 "max_relative_l2": worst_l2,
+                "batched_matches_single_rows": (
+                    matches_single_rows if args.projection == "ba" else None
+                ),
                 "route": (
                     "router_batch"
                     if args.projection == "router" and m in (5, 10)

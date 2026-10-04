@@ -370,7 +370,7 @@ def _qwen38_sm70_fp16_gemv(
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 16
+        and 2 <= x.shape[0] <= 32
         and x.shape[1] == 2560
         and 0 < weight.shape[0] <= 32
         and _is_packed_row_major(x)
