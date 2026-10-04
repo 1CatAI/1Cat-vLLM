@@ -30,10 +30,29 @@ def _dense(q, k, v, table, length, scale):
     return torch.einsum("bhqk,khd->bqhd", scores.softmax(-1), values)
 
 
+@pytest.mark.parametrize("through_api", [False, True])
 @pytest.mark.parametrize("page", [1024, 2048])
 @pytest.mark.parametrize("scale", [1 / math.sqrt(128), 0.1])
-def test_live_window_graph(page, scale):
+def test_live_window_graph(page, scale, through_api):
     from flash_attn_v100.sm70_dflash2_split import forward
+
+    if through_api:
+        from flash_attn_v100 import flash_attn_prefill_paged
+
+        def call(q, k, v, table, lengths, scale, output):
+            return flash_attn_prefill_paged(
+                q,
+                k,
+                v,
+                table,
+                lengths,
+                softmax_scale=scale,
+                out=output,
+                causal=False,
+                window_size=(2047, 2047),
+            )
+    else:
+        call = forward
 
     torch.manual_seed(123)
     capacity = 10240
@@ -44,11 +63,11 @@ def test_live_window_graph(page, scale):
     table = torch.randperm(pages, device="cuda").int()[None]
     lengths = torch.zeros(1, device="cuda", dtype=torch.int32)
     output = torch.empty_like(q)
-    forward(q, k, v, table, lengths, scale, output)
+    call(q, k, v, table, lengths, scale, output)
     torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        forward(q, k, v, table, lengths, scale, output)
+        call(q, k, v, table, lengths, scale, output)
     for length in (0, 8, 127, 128, 129, 1024, 2047, 2048, 2055, 4096, 8192):
         logical = torch.full(
             (capacity, 2, 128), float("nan"), device="cuda", dtype=torch.float16
