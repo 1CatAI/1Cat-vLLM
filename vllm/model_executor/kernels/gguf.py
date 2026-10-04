@@ -215,3 +215,36 @@ def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapabilit
     return GGUFOperatorCapability(
         family, quant_type_name(weight_type), operator, graph_safe, reason=reason
     )
+
+
+def raw_lattice_capabilities(
+    source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Original IQ blocks; each operator owns its FP32 accumulation policy."""
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif source_type not in (21, 22):
+        reason = "raw_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif k <= 0 or k % 256 or n <= 0:
+        reason = "raw_shape_cuts_source_block"
+    bands = (
+        ("gguf_lattice_raw_vec_sm70_out", 1, 1),
+        ("gguf_lattice_raw_mma_sm70_out", 2, 64),
+        ("gguf_lattice_raw_blas_sm70_out", 512, None),
+    )
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=minimum,
+            max_m=maximum,
+            reason=reason
+            or (None if hasattr(torch.ops._C, operator) else "operator_unavailable"),
+        )
+        for operator, minimum, maximum in bands
+    )
