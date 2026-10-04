@@ -933,3 +933,44 @@ The wheel's distribution version and Python version string differed because
 a documentation commit landed between packaging phases. The binary source
 was unchanged. A clean fixed-commit repackaging must reconcile the version
 strings and preserve this core hash before publishing the package.
+
+## Fixed-commit package and dense activation traffic
+
+The fixed-commit package reconciles both source-version strings at
+`1.5.2.dev486+g018136e79`; the distribution adds the intended
+`.precompiled` build-flavor suffix. Its whole-wheel SHA256 is
+`6346edf6f6e3b336e922f7fd61fb8472d287204182b6dd304d53443bb2c9d9af`,
+and the core retains
+`11f8495b6c40551302bd269ce84aa54401e478faf52c11354f048f3175910c0a`.
+The 210-package dependency check passes. Numerical checks are not repeated
+for an unchanged binary and a version-only packaging correction.
+
+A cold-cache NCU capture of the fastest measured 27B gate M16 descriptor,
+packet prefetch with split3, records the following main-node counters:
+
+| Counter | Value |
+| --- | ---: |
+| DRAM read bytes | 9,740,768 |
+| L1 global-load sectors (32 bytes each) | 1,798,846 |
+| L2 read sectors (32 bytes each) | 965,893 |
+| L1 throughput / sustained peak | 70.60% |
+| L2 throughput / sustained peak | 24.43% |
+| Active warps | 30.43% |
+| Registers / thread | 70 |
+| Long-scoreboard stall | 65.48% |
+| Short-scoreboard stall | 4.22% |
+| Math-pipe throttle | 2.72% |
+
+L1 requests total about 57.6 MB and L2 reads about 30.9 MB while the
+original weight payload is 9.57 MB. These counters include activation,
+metadata and other reads; they do not identify each byte by source. The
+fragment loading pattern issues strided activation reads, so a contiguous
+shared activation tile is the next bounded candidate.
+
+Source `11d6db5e68` adds optional M16 activation staging. Warps copy
+complete contiguous K256 rows in aligned vectors into a padded temporary
+shared tile and load MMA fragments from that tile. It retains original
+weight bytes, original small scales and FP32 accumulation. Weight staging
+and the seven-CTA register-budget variant remain separate controls. Changed
+input/split-K/tail checks and two 27B dense M16 comparisons must pass before
+this candidate is selected. Numerical and performance validation is pending.
