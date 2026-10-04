@@ -226,3 +226,41 @@ def test_gguf_loader_honors_draft_model_config(monkeypatch):
     monkeypatch.setattr(gguf_loader, "process_weights_after_loading", lambda *_: None)
     loader.load_model(engine, draft, prefix="draft")
     assert loaded == [draft]
+
+
+@pytest.mark.parametrize("source_kind", ["file", "resolved_gguf", "directory"])
+@pytest.mark.parametrize("has_override", [False, True])
+def test_local_draft_mask_override_never_uses_hf_lookup(
+    tmp_path, monkeypatch, source_kind, has_override
+):
+    from vllm.model_executor.models import qwen3_dflash
+
+    model = qwen3_dflash.DFlashQwen3ForCausalLM.__new__(
+        qwen3_dflash.DFlashQwen3ForCausalLM
+    )
+    torch.nn.Module.__init__(model)
+    model.model = SimpleNamespace(mask_token_id=248070)
+    source = tmp_path / "draft.gguf"
+    source.write_bytes(b"GGUF")
+    model.draft_model_config = SimpleNamespace(
+        model=str(tmp_path if source_kind == "directory" else source), revision=None
+    )
+    if source_kind == "resolved_gguf":
+        model.draft_model_config.model = "example/draft:Q8_0"
+        model._gguf_model_path = str(source)
+    expected = torch.arange(4, dtype=torch.float32)
+    if has_override:
+        torch.save(
+            {"mask_token_id": 248070, "embedding": expected},
+            tmp_path / "mask_embedding.pt",
+        )
+    monkeypatch.setattr(
+        qwen3_dflash,
+        "get_hf_file_bytes",
+        lambda *_: pytest.fail("Local draft must not query a HF repository"),
+    )
+    actual = model._read_mask_embedding()
+    if has_override:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        assert actual is None

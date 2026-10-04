@@ -3,6 +3,7 @@
 
 import io
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -1163,11 +1164,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             return None
 
         MASK_EMBEDDING_FILENAME = "mask_embedding.pt"
-        data = get_hf_file_bytes(
-            MASK_EMBEDDING_FILENAME,
-            self.draft_model_config.model,
-            self.draft_model_config.revision,
-        )
+        source = Path(getattr(self, "_gguf_model_path", self.draft_model_config.model))
+        if source.is_file() or source.is_dir():
+            directory = source.parent if source.is_file() else source
+            override = directory / MASK_EMBEDDING_FILENAME
+            data = override.read_bytes() if override.is_file() else None
+        else:
+            data = get_hf_file_bytes(
+                MASK_EMBEDDING_FILENAME,
+                self.draft_model_config.model,
+                self.draft_model_config.revision,
+            )
         if data is None:
             return None
 

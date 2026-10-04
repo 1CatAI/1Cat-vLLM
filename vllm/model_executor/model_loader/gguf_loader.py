@@ -472,6 +472,7 @@ class GGUFModelLoader(BaseModelLoader):
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
+            model._gguf_model_path = local_model_path
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
