@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import vllm._C as core
 
@@ -41,7 +42,6 @@ def main():
     parser.add_argument("--prompts-json", type=Path, required=True)
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--cuda-profiler-capture", action="store_true")
-    parser.add_argument("--eager", action="store_true")
     parser.add_argument("--input-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 4, 8, 16])
@@ -51,6 +51,9 @@ def main():
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--max-seqs", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
+    parser.add_argument("--kv-cache-dtype", default="auto")
+    parser.add_argument("--ssm-state-dtype")
+    parser.add_argument("--record-first-logprobs", action="store_true")
     args = parser.parse_args()
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Benchmark requires an ordinary installed wheel")
@@ -74,7 +77,7 @@ def main():
         model=str(args.model),
         tensor_parallel_size=4,
         dtype="half",
-        kv_cache_dtype="auto",
+        kv_cache_dtype=args.kv_cache_dtype,
         max_model_len=model_len,
         max_num_batched_tokens=args.max_batch,
         max_num_seqs=max_seqs,
@@ -82,10 +85,15 @@ def main():
         enable_prefix_caching=False,
         disable_log_stats=False,
         language_model_only=True,
-        enforce_eager=args.eager,
+        enforce_eager=False,
+        compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
     )
     if args.model.suffix.lower() == ".gguf":
         config["quantization"] = "gguf"
+    if args.ssm_state_dtype:
+        config["mamba_ssm_cache_dtype"] = args.ssm_state_dtype
+    if args.record_first_logprobs:
+        config.update(max_logprobs=-1, logprobs_mode="raw_logprobs")
     report = {
         "vllm_version": vllm.__version__,
         "vllm_origin": vllm.__file__,
@@ -106,6 +114,7 @@ def main():
             "no_mtp": True,
         },
         "natural_greedy": [],
+        "first_logprobs": [],
         "decode": [],
         "prefill": [],
         "complete": False,
@@ -116,10 +125,63 @@ def main():
     def save():
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
+    save()
     llm = LLM(**config)
     try:
+        resolved = llm.llm_engine.vllm_config.compilation_config
+        report["resolved_compilation"] = {
+            "mode": resolved.mode.name,
+            "cudagraph_mode": resolved.cudagraph_mode.name,
+            "decode_cudagraph_mode": resolved.cudagraph_mode.decode_mode().name,
+            "mixed_cudagraph_mode": resolved.cudagraph_mode.mixed_mode().name,
+        }
+        save()
+        if resolved.cudagraph_mode.decode_mode().name != "FULL":
+            raise RuntimeError(
+                "FULL decode CUDA graph is unavailable with "
+                f"{resolved.cudagraph_mode.name}; no timing results recorded"
+            )
+        report["worker_routes"] = llm.collective_rpc(
+            "get_sm70_acceleration_report", timeout=30
+        )
+        save()
+        for worker in report["worker_routes"]:
+            if worker["decode_cudagraph_mode"] != "FULL":
+                raise RuntimeError(
+                    f"Rank {worker['rank']} cannot run FULL decode CUDA graph: "
+                    f"{worker['cudagraph_mode']}; no timing results recorded"
+                )
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
+        if args.record_first_logprobs:
+            first = llm.generate(
+                [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
+                SamplingParams(temperature=0, max_tokens=1, logprobs=-1),
+                use_tqdm=False,
+            )
+            for index, output in enumerate(first):
+                entries = output.outputs[0].logprobs[0]
+                values = np.full(len(tokenizer), np.nan, dtype=np.float32)
+                for token_id, entry in entries.items():
+                    values[token_id] = entry.logprob
+                if not np.isfinite(values).all():
+                    raise RuntimeError("Incomplete or nonfinite first-logprob vector")
+                path = args.output.with_name(
+                    f"{args.output.stem}.prompt-{index}.logprobs.npy"
+                )
+                np.save(path, values)
+                top = np.argsort(values)[-10:][::-1]
+                report["first_logprobs"].append(
+                    {
+                        "index": index,
+                        "path": str(path),
+                        "vocabulary": len(values),
+                        "representation": "log_softmax(raw_logits)",
+                        "top10_ids": top.tolist(),
+                        "top10_logprobs": values[top].tolist(),
+                    }
+                )
+            save()
         natural = llm.generate(
             [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
             SamplingParams(temperature=0, max_tokens=64),
