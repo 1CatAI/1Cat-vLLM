@@ -5,7 +5,7 @@
 import gc
 import os
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from copy import deepcopy
 from datetime import timedelta
 from types import NoneType
@@ -533,8 +533,25 @@ class Worker(WorkerBase):
             if current_platform.is_cuda() and current_platform.is_device_capability(70)
             else nullcontext()
         )
-        with warmup_allocator:
-            self.model_runner.profile_run()
+        try:
+            with warmup_allocator:
+                self.model_runner.profile_run()
+        except torch.AcceleratorError:
+            stats = torch.accelerator.memory_stats(self.device)
+            free: int | None = None
+            total: int | None = None
+            with suppress(Exception):
+                free, total = current_platform.mem_get_info(self.device)
+            logger.error(
+                "GPU memory profiling failed: allocated=%s reserved=%s "
+                "inactive_split=%s driver_free=%s driver_total=%s bytes",
+                stats.get("allocated_bytes.all.current"),
+                stats.get("reserved_bytes.all.current"),
+                stats.get("inactive_split_bytes.all.current"),
+                free,
+                total,
+            )
+            raise
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
@@ -947,6 +964,14 @@ class Worker(WorkerBase):
         return {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
+            "compilation_mode": self.compilation_config.mode.name,
+            "cudagraph_mode": self.compilation_config.cudagraph_mode.name,
+            "decode_cudagraph_mode": (
+                self.compilation_config.cudagraph_mode.decode_mode().name
+            ),
+            "mixed_cudagraph_mode": (
+                self.compilation_config.cudagraph_mode.mixed_mode().name
+            ),
             "linear_kernel_selections": selections,
             "collective_kernel_selections": (
                 self.vllm_config.kernel_config.collective_kernel_selections

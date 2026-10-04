@@ -52,6 +52,78 @@ def test_canonical_adapter_retains_q2_source_without_expansion():
     assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
 
 
+def test_load_model_retains_prepared_adapter(monkeypatch):
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+    from vllm.model_executor.model_loader import gguf_loader as module
+    from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
+
+    config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_nextn_predict_layers=0,
+        num_experts=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=6,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+    )
+    data = np.stack([packed_weight(42, 64, 640, i) for i in range(2)])
+    raw = "blk.0.ffn_down_exps.weight"
+    tensor = SimpleNamespace(shape=np.array([640, 64, 2]), tensor_type=42, data=data)
+    loader = object.__new__(module.GGUFModelLoader)
+    calls = []
+
+    def mapping(model_config):
+        calls.append(model_config)
+        loader._native_adapter = Qwen4ExpAdapter(config, tp_size=4)
+        loader._native_tensors = {raw: tensor}
+        return loader._native_adapter.build_name_map(loader._native_tensors)
+
+    class CapturedModel(torch.nn.Module):
+        def load_weights(self, weights):
+            self.entries = list(weights)
+
+    model = CapturedModel()
+    monkeypatch.setattr(loader, "_prepare_weights", lambda _: "unused.gguf")
+    monkeypatch.setattr(loader, "_get_gguf_weights_map", mapping)
+    monkeypatch.setattr(loader, "_get_all_gguf_files", lambda _: [])
+    monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *args: {raw: "Q2_0"})
+    monkeypatch.setattr(module, "initialize_model", lambda **kwargs: model)
+    monkeypatch.setattr(module, "process_weights_after_loading", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "current_platform",
+        SimpleNamespace(get_device_capability=lambda: (7, 0)),
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "gguf_affine_grouped_gemm_sm70_out",
+        lambda *args: None,
+        raising=False,
+    )
+    cfg = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"),
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        kernel_config=SimpleNamespace(sm70_gguf=SimpleNamespace(enabled=True)),
+        quant_config=GGUFConfig(),
+    )
+    model_config = SimpleNamespace(dtype=torch.float16, hf_config=SimpleNamespace())
+    assert loader.load_model(cfg, model_config) is model
+    assert cfg.quant_config.canonical_expert_storage
+    types = [w.item() for n, w in model.entries if n.endswith("qweight_type")]
+    weights = [w for n, w in model.entries if n.endswith("qweight")]
+    assert types == [42, 42]
+    assert [tuple(w.shape) for w in weights] == [(64, 180), (64, 180)]
+    assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
+    assert len(calls) == 1
+    assert (
+        list(loader.get_all_weights(model_config, model, skip_weight=lambda _: True))
+        == []
+    )
+    retained = list(loader.get_all_weights(model_config, model))
+    assert [w.item() for n, w in retained if n.endswith("qweight_type")] == [42, 42]
+    assert len(calls) == 1
+
+
 def reference_part(x, ids, scores, decoded, rank, size):
     tokens, topk = ids.shape
     intermediate = decoded["w1"].shape[1] // size

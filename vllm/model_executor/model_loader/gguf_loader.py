@@ -41,6 +41,8 @@ class GGUFModelLoader(BaseModelLoader):
     supports loading both full models and sharded models.
     """
 
+    _gguf_prepared_weights_map: dict[str, str]
+
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
@@ -443,7 +445,14 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Filter mapped names before the adapter touches tensor payloads."""
         local_model_path = self._prepare_weights(model_config)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
+        if getattr(self, "_gguf_prepared_model_config", None) is model_config:
+            # Rebuilding the map also replaces the prepared native adapter,
+            # losing canonical storage and layout/fallback preparation state.
+            gguf_weights_map = self._gguf_prepared_weights_map.copy()
+        else:
+            gguf_weights_map = self._get_gguf_weights_map(model_config)
+            self._gguf_prepared_model_config = model_config
+            self._gguf_prepared_weights_map = gguf_weights_map
         if skip_weight is not None:
             gguf_weights_map = {
                 raw: name
@@ -464,6 +473,8 @@ class GGUFModelLoader(BaseModelLoader):
         self._gguf_tp_size = vllm_config.parallel_config.tensor_parallel_size
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
+        self._gguf_prepared_model_config = model_config
+        self._gguf_prepared_weights_map = gguf_weights_map
         # we can only know if tie word embeddings after mapping weights
         gguf_files = self._get_all_gguf_files(local_model_path)
         all_extra_names = []
