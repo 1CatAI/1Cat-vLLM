@@ -74,8 +74,8 @@ results remain pending.
 
 ## Installed loading checks and storage budget
 
-The installed normal wheel passes 71 CPU checks on Python 3.12.14,
-Torch 2.10.0+cu128 and CUDA 12.8. Eight changed modules match the source,
+The installed normal wheel passes 78 CPU checks on Python 3.12.14,
+Torch 2.10.0+cu128 and CUDA 12.8. Nine changed modules match the source,
 wheel members and installed files exactly; all sixteen native libraries match
 the qualified normal base wheel. The release profile accepts local GGUF draft
 files. Packed context projections expose their declared operand dtype to
@@ -152,4 +152,27 @@ sharding. Regression tests check bounded decode batches, exact converted
 values and FP16 overflow rejection. Sixteen actual IQ2_S embedding rows,
 decoded in three-row chunks, match the official FP32 dequantization followed
 by FP16 conversion bit for bit, with maximum difference zero. The rerun of
-full loading and its measured memory peak remain pending.
+target loading completed without a host OOM. A loading sample showed about
+6.2 GiB anonymous resident memory per worker; the checkpoint mapping is
+shared file-backed memory and must not be summed as four private copies.
+This sample does not establish the final anonymous memory peak.
+
+## Draft construction and local side files
+
+Pass the explicit model configuration to GGUF model initialization. A
+speculative worker carries both target and draft configurations; relying on
+the implicit configuration constructed a second target backbone and collided
+with existing GDN layer registrations. A regression uses distinct configs.
+
+Local GGUF drafts resolve the optional `mask_embedding.pt` beside the
+resolved checkpoint. Missing side files retain the shared target embedding.
+Repository-based drafts preserve their existing file lookup. Six regression
+cases cover a directory, a direct GGUF path and a resolved GGUF path, with
+and without the optional file.
+
+The loading rerun reached the correct DFlash2 constructor and enabled the
+TP4 output-sharded 25600-to-5120 context projection and existing
+range-preserving arithmetic. It then stopped when the local GGUF filename
+was passed to a repository lookup. The fix passes the installed-wheel CPU
+suite; complete draft loading, generation, speed and numerical gates remain
+pending.
