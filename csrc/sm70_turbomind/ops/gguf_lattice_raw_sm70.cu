@@ -94,9 +94,15 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
     const uint8_t* data = stage_block<Type>(
         raw[warp], weight + (int64_t)row * stride, block, stride);
     const auto values = Decode::fragment(data, lane * 8, grid);
+    // K is block aligned and each lane owns eight adjacent half values.
+    // One 128-bit load replaces eight strided 16-bit memory instructions.
+    const uint4 loaded =
+        *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
+    const auto& activation =
+        reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
 #pragma unroll
     for (int i = 0; i < 8; ++i)
-      sum = fmaf(__half2float(x[block * 256 + lane * 8 + i]), values[i], sum);
+      sum = fmaf(__half2float(activation[i]), values[i], sum);
     __syncwarp();
   }
 #pragma unroll
@@ -164,9 +170,8 @@ __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
         typename MMA::FragA a{};
         const int row = row_begin + tile * 8 + arow;
         if (row < m) {
-#pragma unroll
-          for (int i = 0; i < 8; ++i)
-            a[i] = x[(int64_t)row * k + block * 256 + base + i];
+          *reinterpret_cast<uint4*>(&a) = *reinterpret_cast<const uint4*>(
+              x + (int64_t)row * k + block * 256 + base);
         }
         MMA::fma(accum[tile], a, b, accum[tile]);
       }
