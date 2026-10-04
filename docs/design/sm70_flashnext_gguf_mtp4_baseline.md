@@ -90,13 +90,18 @@ endpoint observation rather than an isolated communication saving. Complete
 synthetic token lists were not retained in this initial harness; output identity
 is established for the separate natural prompts. The per-round cost model
 must use actual trace call counts and account for the changed acceptance.
+Acceptance counters cover the full measured request, while latency and pure
+decode use the trimmed steady window. In that exact timing window, emitted
+tokens per request-round are 3.351 without ring and 3.121 with ring; dividing
+these by their respective round means reproduces the measured pure decode.
 
 The automatic-ring C4 smoke has 37 steady four-request intervals: 66.413 ms
 per engine round, 240.918 aggregate tok/s and 3.861 mean acceptance length.
 The matched ring-disabled C4 run records 66.615 ms and 253.171 aggregate
 tok/s over 37 steady intervals, with 3.920 mean acceptance length. Thus the
 observed engine round changes by -0.202 ms while pure decode decreases 4.840%.
-The trimmed cohorts emit 624 and 592 tokens respectively. All natural token
+The trimmed cohorts emit 624 and 592 tokens respectively: 4.216 and 4.000
+emitted tokens per request-round in the timing window. All natural token
 lists still match and stop normally, but this C4 point does not establish
 non-regression. Retain it as a negative result and compare three repeats with
 1024 output tokens, saving complete output lists before deciding admission.
