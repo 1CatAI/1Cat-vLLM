@@ -5314,11 +5314,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and metadata.spec_sequence_masks is not None
             and metadata.ddtree_parent_ids is None
             and metadata.spec_query_start_loc is not None
-            and metadata.spec_query_start_loc.shape == (2,)
+            and metadata.spec_query_start_loc.ndim == 1
+            and metadata.spec_query_start_loc.numel() >= 2
             and metadata.spec_state_indices_tensor is not None
-            and metadata.spec_state_indices_tensor.shape == (1, 8)
+            and metadata.spec_state_indices_tensor.ndim == 2
+            and metadata.spec_state_indices_tensor.shape[0] >= 1
+            and metadata.spec_state_indices_tensor.shape[1] == 8
             and metadata.spec_state_slot_selectors is not None
-            and metadata.spec_state_slot_selectors.shape == (1,)
+            and metadata.spec_state_slot_selectors.ndim == 1
+            and metadata.spec_state_slot_selectors.numel() >= 1
+            and metadata.spec_query_start_loc.dtype == torch.int32
+            and metadata.spec_state_indices_tensor.dtype == torch.int32
+            and metadata.spec_state_slot_selectors.dtype == torch.int32
             and mixed_qkv.is_cuda
             and mixed_qkv.dtype == a.dtype == b.dtype == torch.float16
             and mixed_qkv.shape == (8, 2560)
@@ -5572,9 +5579,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv,
                 conv_state,
                 conv_weights,
-                spec_state_indices_tensor[:, 0],
-                spec_state_slot_selectors,
-                spec_query_start_loc,
+                spec_state_indices_tensor[:1, 0],
+                spec_state_slot_selectors[:1],
+                spec_query_start_loc[:2],
                 self.A_log,
                 a,
                 b,
@@ -7031,9 +7038,9 @@ def qwen_gdn_attention_core_spec_commit(
                 mixed_qkv,
                 conv_state,
                 conv_weights,
-                spec_state_indices_tensor[:, 0],
-                spec_state_slot_selectors,
-                spec_query_start_loc,
+                spec_state_indices_tensor[:1, 0],
+                spec_state_slot_selectors[:1],
+                spec_query_start_loc[:2],
                 self.A_log,
                 a,
                 b,
