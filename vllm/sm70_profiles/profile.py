@@ -23,6 +23,8 @@ def profile_argv(name: str = PROFILE_NAME, *, draft: str | None = None) -> list[
     if draft is not None:
         args["speculative_config"]["model"] = draft
         args["speculative_config"].pop("revision", None)
+        if Path(draft).suffix.lower() == ".gguf":
+            args["speculative_config"]["quantization"] = "gguf"
     for key, value in args.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
@@ -47,8 +49,10 @@ def main() -> None:
     parser.add_argument("--argv-lines", action="store_true")
     parser.add_argument("--draft", type=Path, help="Use a local draft checkpoint")
     ns = parser.parse_args()
-    if ns.draft is not None and not ns.draft.is_dir():
-        parser.error("--draft must name a local checkpoint directory")
+    if ns.draft is not None and not (
+        ns.draft.is_dir() or (ns.draft.is_file() and ns.draft.suffix.lower() == ".gguf")
+    ):
+        parser.error("--draft must name a local checkpoint directory or GGUF file")
     if ns.action == "show":
         print(
             json.dumps(load_profile(ns.name), indent=2)

@@ -113,6 +113,23 @@ def test_quantized_context_projection_uses_declared_operand_dtype():
     assert torch.equal(draft.combine_hidden_states(inputs), inputs.half())
 
 
+def test_release_profile_accepts_local_gguf_draft(tmp_path, monkeypatch, capsys):
+    from vllm.sm70_profiles.profile import main
+
+    path = tmp_path / "draft.gguf"
+    path.write_bytes(b"GGUF")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["profile", "argv", "--json", "--draft", str(path)],
+    )
+    main()
+    argv = json.loads(capsys.readouterr().out)
+    config = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert config["model"] == str(path)
+    assert config["quantization"] == "gguf"
+    assert "revision" not in config
+
+
 def test_dense_auxiliaries_decode_without_qwen35_norm_offsets():
     adapter = get_gguf_adapter(gguf_config_from_metadata(metadata()), tp_size=4)
     data = gguf.quants.quantize(
