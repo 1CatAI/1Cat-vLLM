@@ -87,7 +87,10 @@ def _sm70_qwen38_router_topk_kernel(
         key = tl.where(sign == 0, logit_bits ^ -1, logit_bits ^ min_i32)
         key = tl.where(valid, key, 0x7FFFFFFF)
         packed = ((key.to(tl.int64) & 0xFFFFFFFF) << 32) | offsets.to(tl.int64)
-        sorted_packed = tl.sort(packed, descending=False)
+        if SELECT_TOP16:
+            sorted_packed = -tl.topk(-packed, 16)
+        else:
+            sorted_packed = tl.sort(packed, descending=False)
 
         sorted_keys = ((sorted_packed >> 32) & 0xFFFFFFFF).to(tl.int32)
         sorted_ids = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
@@ -96,7 +99,7 @@ def _sm70_qwen38_router_topk_kernel(
         sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
 
     if SELECT_TOP16:
-        tl.static_assert(PACKED_HALF_KEY and K == 10)
+        tl.static_assert(E == 512 and BLOCK_E == 512 and K == 10)
         offsets = tl.arange(0, 16)
     raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
     raw_weights = tl.where(invalid_row, 0.0, raw_weights)
