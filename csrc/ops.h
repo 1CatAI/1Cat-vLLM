@@ -932,7 +932,8 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch);
+                                   bool prefetch, bool factor_scale,
+                                   bool float_grid);
 void gguf_lattice_raw_grouped_gate_up_sm70_out(
     torch::Tensor gate, torch::Tensor up, torch::Tensor input,
     torch::Tensor gate_weights, torch::Tensor up_weights, torch::Tensor offsets,
@@ -957,13 +958,23 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        int64_t source_type,
                                        torch::Tensor partial, int64_t splits,
                                        bool row_wise);
-void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
-                                       torch::Tensor weight,
-                                       int64_t source_type,
-                                       torch::Tensor partial, int64_t splits,
-                                       bool prefetch, bool staged,
-                                       int64_t row_tile, bool occupancy7);
+void gguf_lattice_compact_mma_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor partial, int64_t splits, bool prefetch,
+    bool staged, int64_t row_tile, bool occupancy7, bool stage_activation);
 void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,
-                                        torch::Tensor scratch);
+                                        torch::Tensor scratch,
+                                        bool natural_layout, int64_t algorithm,
+                                        int64_t dq_partitions);
+
+void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor offsets,
+                                      torch::Tensor weight_ptrs);
+void gguf_workspace_f16_prepare_sm70_out(torch::Tensor out,
+                                         torch::Tensor input);
+void gguf_lattice_compact_tm_f16_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor scratch, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, int64_t dq_partitions);

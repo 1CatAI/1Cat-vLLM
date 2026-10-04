@@ -25,6 +25,46 @@ struct LatticeRawDecoder {
     __syncthreads();
   }
 
+  // Grid entries are exact integers; expanding once per CTA removes
+  // repeated byte unpacking and half-to-float conversion in vector decode.
+  __device__ static void initialize_float(float* grid) {
+    for (int i = threadIdx.x; i < kCodebookBytes; i += blockDim.x) {
+      const uint32_t word = Codebook::word(i / 4);
+      grid[i] = float(int((word >> (8 * (i % 4))) & 255) - 128);
+    }
+    __syncthreads();
+  }
+
+  __device__ static turbomind::Array<float, 8> float_grid_fragment(
+      const uint8_t* block, int base, const float* grid) {
+    const int octet = base / 8;
+    const uint8_t high = block[66 + base / 32];
+    const uint8_t signs = block[(Type == 21 ? 74 : 34) + octet];
+    __align__(16) turbomind::Array<float, 8> values;
+    if constexpr (Type == 21) {
+      const int sub = octet % 4;
+      const int first = block[2 + 2 * octet] | (((high >> (2 * sub)) & 1) << 8);
+      const int second =
+          block[3 + 2 * octet] | (((high >> (2 * sub + 1)) & 1) << 8);
+      const float4 a = *reinterpret_cast<const float4*>(grid + first * 4);
+      const float4 b = *reinterpret_cast<const float4*>(grid + second * 4);
+      *reinterpret_cast<float4*>(&values[0]) = a;
+      *reinterpret_cast<float4*>(&values[4]) = b;
+    } else {
+      const int index =
+          block[2 + octet] | (((high >> (2 * (octet % 4))) & 3) << 8);
+      const float4 a = *reinterpret_cast<const float4*>(grid + index * 8);
+      const float4 b = *reinterpret_cast<const float4*>(grid + index * 8 + 4);
+      *reinterpret_cast<float4*>(&values[0]) = a;
+      *reinterpret_cast<float4*>(&values[4]) = b;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      values[i] = __uint_as_float(__float_as_uint(values[i]) ^
+                                  (((uint32_t{signs} >> i) & 1) << 31));
+    return values;
+  }
+
   // The biased byte grid consists of exact integers. This TurboMind PRMT
   // construction and half2 subtraction reconstruct them exactly: 1024+b
   // and 1152 are representable for every byte b, as is b-128. Only integer
@@ -91,12 +131,27 @@ struct LatticeRawDecoder {
     }
   }
 
+  // Preserve the official multiplication order for both original scale levels.
+  __device__ static float block_scale(const uint8_t* block, int base) {
+    const float d = __half2float(*reinterpret_cast<const half*>(block));
+    if constexpr (Type == 21) {
+      const int nibble =
+          (block[106 + base / 64] >> (4 * ((base / 32) % 2))) & 15;
+      return d * (1 + 2 * nibble);
+    } else {
+      const int nibble =
+          (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
+      return (d * (0.5f + nibble)) * 0.25f;
+    }
+  }
+
   // Eight consecutive K values. Both scales are multiplied in FP32 before
   // multiplying grid values. No FP16 expanded coefficient exists in storage.
-  template <class Output = float>
+  template <class Output = float, bool ApplyScale = true>
   __device__ static turbomind::Array<Output, 8> fragment(const uint8_t* block,
                                                          int base,
                                                          const uint8_t* grid) {
+    static_assert(Type != 18 || ApplyScale);
     const float d = __half2float(*reinterpret_cast<const half*>(block));
     const int octet = base / 8;
     if constexpr (Type == 18) {
@@ -130,7 +185,12 @@ struct LatticeRawDecoder {
       const uint32_t a = *reinterpret_cast<const uint32_t*>(grid + first * 4);
       const uint32_t b = *reinterpret_cast<const uint32_t*>(grid + second * 4);
       const uint64_t packed = a | (static_cast<uint64_t>(b) << 32);
-      values = table_fragment<Output>(packed, signs, d, nibble);
+      if constexpr (ApplyScale) {
+        values = table_fragment<Output>(packed, signs, d, nibble);
+      } else {
+        static_assert(std::is_same_v<Output, float>);
+        values = table_values(packed, signs, 1.f);
+      }
     } else {
       const int nibble =
           (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
@@ -138,7 +198,12 @@ struct LatticeRawDecoder {
           block[2 + octet] | (((high >> (2 * (octet % 4))) & 3) << 8);
       const uint64_t packed =
           *reinterpret_cast<const uint64_t*>(grid + index * 8);
-      values = table_fragment<Output>(packed, signs, d, nibble);
+      if constexpr (ApplyScale) {
+        values = table_fragment<Output>(packed, signs, d, nibble);
+      } else {
+        static_assert(std::is_same_v<Output, float>);
+        values = table_values(packed, signs, 1.f);
+      }
     }
     return values;
   }

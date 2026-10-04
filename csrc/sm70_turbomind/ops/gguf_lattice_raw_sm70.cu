@@ -8,6 +8,10 @@
 #include "gguf_lattice_compact.cuh"
 #include "src/turbomind/kernels/gemm/arch/mma_sm70.h"
 
+void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor offsets,
+                                      torch::Tensor weight_ptrs);
+
 namespace {
 // One warp cooperatively stages one original block. Row padding is the only
 // persistent storage overhead; unaligned block starts are stitched in shared.
@@ -74,14 +78,19 @@ __global__ void raw_dequant_transpose_kernel(half* out, const uint8_t* weight,
   }
 }
 
-template <int Type, bool Split, bool Prefetch = false>
+template <int Type, bool Split, bool Prefetch = false, bool FactorScale = false,
+          bool FloatGrid = false>
 __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int n, int k, int stride,
                                int splits) {
   using Decode = vllm::sm70_gguf::LatticeRawDecoder<Type>;
-  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
+  __shared__ __align__(16)
+      uint8_t grid[Decode::kCodebookBytes * (FloatGrid ? sizeof(float) : 1)];
   __shared__ __align__(16) uint8_t raw[4][120];
-  Decode::initialize(grid);
+  if constexpr (FloatGrid)
+    Decode::initialize_float(reinterpret_cast<float*>(grid));
+  else
+    Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int row = blockIdx.x * 4 + warp;
   if (row >= n) return;
@@ -109,16 +118,30 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
       data = raw[warp] + (block * bytes & 7);
     else
       data = stage_block<Type>(raw[warp], row_data, block, stride);
-    const auto values = Decode::fragment(data, lane * 8, grid);
+    turbomind::Array<float, 8> values;
+    if constexpr (FloatGrid)
+      values = Decode::float_grid_fragment(
+          data, lane * 8, reinterpret_cast<const float*>(grid));
+    else
+      values =
+          Decode::template fragment<float, !FactorScale>(data, lane * 8, grid);
     // K is block aligned and each lane owns eight adjacent half values.
     // One 128-bit load replaces eight strided 16-bit memory instructions.
     const uint4 loaded =
         *reinterpret_cast<const uint4*>(x + block * 256 + lane * 8);
     const auto& activation =
         reinterpret_cast<const turbomind::Array<half, 8>&>(loaded);
+    if constexpr (FactorScale) {
+      float local = 0.f;
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      sum = fmaf(__half2float(activation[i]), values[i], sum);
+      for (int i = 0; i < 8; ++i)
+        local = fmaf(__half2float(activation[i]), values[i], local);
+      sum = fmaf(Decode::block_scale(data, lane * 8), local, sum);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        sum = fmaf(__half2float(activation[i]), values[i], sum);
+    }
     __syncwarp();
     if constexpr (Prefetch) {
       if (load_next) reinterpret_cast<uint64_t*>(raw[warp])[lane] = next_word;
@@ -145,7 +168,8 @@ __global__ void reduce_vec(half* out, const float* partial, int n, int splits) {
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool StageActivation = false>
 __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
                                              const half* x,
                                              const uint8_t* weight, int m,
@@ -157,6 +181,9 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
   __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
   __shared__ __align__(16) uint8_t raw[NT][120];
   __shared__ float sums[4][MT][NT];
+  __shared__ __align__(16) half activations[StageActivation ? MT : 1][264];
+  static_assert(!StageActivation ||
+                (Compact && NT == 32 && MT == 16 && !Staged));
   Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int col_begin = blockIdx.x * NT, row_begin = blockIdx.y * MT;
@@ -180,6 +207,18 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
       if (word < kStageWords) packets[word] = first_tile[word];
     }
   }
+  if constexpr (StageActivation) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int index = threadIdx.x + i * 128;
+      const int row = index / 32, octet = index % 32;
+      uint4 value{};
+      if (row_begin + row < m)
+        value = *reinterpret_cast<const uint4*>(
+            x + int64_t{row_begin + row} * k + begin * 256 + octet * 8);
+      *reinterpret_cast<uint4*>(&activations[row][octet * 8]) = value;
+    }
+  }
   for (int block = begin; block < end; ++block) {
     uint64_t next_words[kWordsPerThread]{};
     if constexpr (Staged) {
@@ -196,6 +235,20 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
           const int word = threadIdx.x + i * 128;
           if (word < kStageWords) next_words[i] = next_tile[word];
         }
+      }
+    }
+    uint4 next_activations[StageActivation ? 4 : 1]{};
+    if constexpr (StageActivation) {
+      __syncthreads();
+      // Keep the following contiguous activation tile in registers while
+      // the current shared tile feeds decoding/MMA. SM70 has no cp.async.
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int index = threadIdx.x + i * 128;
+        const int row = index / 32, octet = index % 32;
+        if (block + 1 < end && row_begin + row < m)
+          next_activations[i] = *reinterpret_cast<const uint4*>(
+              x + int64_t{row_begin + row} * k + (block + 1) * 256 + octet * 8);
       }
     }
     const int width = FullWidth ? 32 : min(NT, n - col_begin);
@@ -235,8 +288,10 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
         const int row = row_begin + index * 8 + arow;
         if (row < m)
           *reinterpret_cast<uint4*>(&activation[index]) =
-              *reinterpret_cast<const uint4*>(x + int64_t{row} * k +
-                                              block * 256 + warp * 64);
+              *reinterpret_cast<const uint4*>(
+                  StageActivation
+                      ? &activations[index * 8 + arow][warp * 64]
+                      : x + int64_t{row} * k + block * 256 + warp * 64);
       }
 #pragma unroll
       for (int step = 0; step < 64; step += 8) {
@@ -250,9 +305,11 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
             const int row = row_begin + index * 8 + arow;
             if (row < m)
               *reinterpret_cast<uint4*>(&next_activation[index]) =
-                  *reinterpret_cast<const uint4*>(x + int64_t{row} * k +
-                                                  block * 256 + warp * 64 +
-                                                  step + 8);
+                  *reinterpret_cast<const uint4*>(
+                      StageActivation
+                          ? &activations[index * 8 + arow][warp * 64 + step + 8]
+                          : x + int64_t{row} * k + block * 256 + warp * 64 +
+                                step + 8);
           }
         }
         const uint32_t packet = Packed::extract(current, valid ? bcol : 0);
@@ -297,7 +354,8 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
           const int row = row_begin + tile * 8 + arow;
           if (row < m) {
             *reinterpret_cast<uint4*>(&a) = *reinterpret_cast<const uint4*>(
-                x + (int64_t)row * k + block * 256 + base);
+                StageActivation ? &activations[tile * 8 + arow][base]
+                                : x + (int64_t)row * k + block * 256 + base);
           }
           MMA::fma(accum[tile], a, b, accum[tile]);
         }
@@ -310,6 +368,17 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
         for (int i = 0; i < kWordsPerThread; ++i) {
           const int word = threadIdx.x + i * 128;
           if (word < kStageWords) packets[word] = next_words[i];
+        }
+      }
+    } else if constexpr (StageActivation) {
+      __syncthreads();
+      if (block + 1 < end) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int index = threadIdx.x + i * 128;
+          const int row = index / 32, octet = index % 32;
+          *reinterpret_cast<uint4*>(&activations[row][octet * 8]) =
+              next_activations[i];
         }
       }
     } else if constexpr (!Compact) {
@@ -345,12 +414,14 @@ __device__ __forceinline__ void raw_mma_body(half* out, float* partial,
 }
 
 template <int Type, int NT, int MT, bool Compact = false,
-          bool FullWidth = false, bool Prefetch = false, bool Staged = false>
+          bool FullWidth = false, bool Prefetch = false, bool Staged = false,
+          bool StageActivation = false>
 __global__ void raw_mma_kernel(half* out, float* partial, const half* x,
                                const uint8_t* weight, int m, int n, int k,
                                int stride, int splits) {
-  raw_mma_body<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>(
-      out, partial, x, weight, m, n, k, stride, splits);
+  raw_mma_body<Type, NT, MT, Compact, FullWidth, Prefetch, Staged,
+               StageActivation>(out, partial, x, weight, m, n, k, stride,
+                                splits);
 }
 
 template <int Type, bool FullWidth, bool Prefetch, bool Staged>
@@ -411,32 +482,94 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
       out[i] = 0;
 }
 
-template <int Type, class Output, bool Transpose>
+template <int Type, class Output, bool Transpose, bool FullWidth = false,
+          bool PackedOutput = false>
 __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
                                        int n, int k) {
   using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
   __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
   Decode::initialize(grid);
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  const int first = blockIdx.x * 32, width = min(32, n - first);
+  const int first = blockIdx.x * 32,
+            width = FullWidth ? 32 : min(32, n - first);
   const int block = blockIdx.y;
   const auto* tile = weight + int64_t{first} * (k / 256) * Decode::kBlockBytes +
                      int64_t{block} * width * Decode::kBlockBytes;
   typename Decode::Parameters parameters{};
-  if (lane < width) parameters = Decode::parameters(tile, width, lane);
-  for (int octet = warp; octet < 32; octet += 4) {
-    const auto packet =
-        Decode::packet(tile, width, octet, lane < width ? lane : 0);
+  if (lane < width)
+    parameters = Decode::template parameters<FullWidth>(tile, width, lane);
+  const int warps = blockDim.x / 32;
+  const int first_octet = warp + warps * blockIdx.z;
+  const int step = warps * gridDim.z;
+  auto current = Decode::template fetch<FullWidth>(tile, width, first_octet);
+  for (int octet = first_octet; octet < 32; octet += step) {
+    typename Decode::PacketWindow next{};
+    if (octet + step < 32)
+      next = Decode::template fetch<FullWidth>(tile, width, octet + step);
+    const auto packet = Decode::extract(current, lane < width ? lane : 0);
     if (lane < width) {
       const auto values =
           Decode::template fragment<Output>(parameters, packet, octet, grid);
+      if constexpr (std::is_same_v<Output, half> && !Transpose) {
+        static_assert(!PackedOutput || FullWidth);
+        const int64_t index =
+            PackedOutput
+                ? ((int64_t{first / 32} * (k / 8) + block * 32 + octet) * 32 +
+                   lane) *
+                      8
+                : int64_t{first + lane} * k + block * 256 + octet * 8;
+        *reinterpret_cast<uint4*>(out + index) =
+            *reinterpret_cast<const uint4*>(&values);
+      } else {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const int logical_k = block * 256 + octet * 8 + j, row = first + lane;
-        const int64_t index = Transpose ? int64_t{logical_k} * n + row
-                                        : int64_t{row} * k + logical_k;
-        out[index] = static_cast<Output>(values[j]);
+        for (int j = 0; j < 8; ++j) {
+          const int logical_k = block * 256 + octet * 8 + j, row = first + lane;
+          const int64_t index = Transpose ? int64_t{logical_k} * n + row
+                                          : int64_t{row} * k + logical_k;
+          out[index] = static_cast<Output>(values[j]);
+        }
       }
+    }
+    current = next;
+  }
+}
+
+template <int Type, bool FullWidth = false>
+__global__ void compact_dequant_natural_kernel(half* out, const uint8_t* weight,
+                                               int n, int k) {
+  using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
+  __shared__ __align__(16) uint8_t grid[Decode::kCodebookBytes];
+  // Eight-half row padding keeps every vector aligned. Shared copy swaps
+  // warp ownership from N columns to contiguous K without a strided store.
+  __shared__ __align__(16) half decoded[32][264];
+  Decode::initialize(grid);
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int first = blockIdx.x * 32,
+            width = FullWidth ? 32 : min(32, n - first);
+  const int block = blockIdx.y;
+  const auto* tile = weight + int64_t{first} * (k / 256) * Decode::kBlockBytes +
+                     int64_t{block} * width * Decode::kBlockBytes;
+  typename Decode::Parameters parameters{};
+  if (lane < width)
+    parameters = Decode::template parameters<FullWidth>(tile, width, lane);
+  for (int octet = warp; octet < 32; octet += 4) {
+    const auto packet = Decode::template packet<FullWidth>(
+        tile, width, octet, lane < width ? lane : 0);
+    if (lane < width) {
+      const auto values =
+          Decode::template fragment<half>(parameters, packet, octet, grid);
+      *reinterpret_cast<uint4*>(&decoded[lane][octet * 8]) =
+          *reinterpret_cast<const uint4*>(&values);
+    }
+  }
+  __syncthreads();
+  for (int index = threadIdx.x; index < 32 * 32; index += blockDim.x) {
+    const int row = index / 32, octet = index % 32;
+    if (row < width) {
+      const int64_t destination =
+          int64_t{first + row} * k + block * 256 + octet * 8;
+      *reinterpret_cast<uint4*>(out + destination) =
+          *reinterpret_cast<const uint4*>(&decoded[row][octet * 8]);
     }
   }
 }
@@ -524,7 +657,7 @@ __global__ void compact_row_vec_kernel(half* out, float* partial, const half* x,
 
 template <int Type, int NT, int MT, bool Compact = false,
           bool FullWidth = false, bool Prefetch = false, bool Staged = false,
-          bool Bounded = false>
+          bool Bounded = false, bool StageActivation = false>
 void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
                 torch::Tensor partial, int splits, cudaStream_t stream) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -538,13 +671,13 @@ void launch_mma(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
             reinterpret_cast<const half*>(input.data_ptr()),
             weight.data_ptr<uint8_t>(), m, n, k, 0, splits);
   } else {
-    raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged>
-        <<<grid, 128, 0, stream>>>(
-            reinterpret_cast<half*>(out.data_ptr()),
-            splits > 1 ? partial.data_ptr<float>() : nullptr,
-            reinterpret_cast<const half*>(input.data_ptr()),
-            weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
-            splits);
+    raw_mma_kernel<Type, NT, MT, Compact, FullWidth, Prefetch, Staged,
+                   StageActivation><<<grid, 128, 0, stream>>>(
+        reinterpret_cast<half*>(out.data_ptr()),
+        splits > 1 ? partial.data_ptr<float>() : nullptr,
+        reinterpret_cast<const half*>(input.data_ptr()),
+        weight.data_ptr<uint8_t>(), m, n, k, Compact ? 0 : weight.size(1),
+        splits);
   }
 }
 void validate_raw(torch::Tensor w, int type, int64_t n, int64_t k,
@@ -577,7 +710,8 @@ void launch_dequant(torch::Tensor out, torch::Tensor weight,
         out.size(0), out.size(1), weight.size(1));
 }
 void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
-                             torch::Tensor scratch) {
+                             torch::Tensor scratch, bool natural_layout = false,
+                             int64_t algorithm = 99) {
   const int m = input.size(0), n = out.size(1), k = input.size(1);
   auto handle = at::cuda::getCurrentCUDABlasHandle();
   cublasMath_t saved;
@@ -588,9 +722,11 @@ void lattice_blas_accumulate(torch::Tensor out, torch::Tensor input,
                   CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)));
   const float alpha = 1.f, beta = 0.f;
   const auto status = cublasGemmEx(
-      handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, scratch.data_ptr(),
-      CUDA_R_16F, n, input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
-      CUDA_R_16F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      handle, natural_layout ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+      &alpha, scratch.data_ptr(), CUDA_R_16F, natural_layout ? k : n,
+      input.data_ptr(), CUDA_R_16F, k, &beta, out.data_ptr(),
+      out.scalar_type() == torch::kFloat32 ? CUDA_R_32F : CUDA_R_16F, n,
+      CUBLAS_COMPUTE_32F, static_cast<cublasGemmAlgo_t>(algorithm));
   const auto restore = cublasSetMathMode(handle, saved);
   TORCH_CUDABLAS_CHECK(status);
   TORCH_CUDABLAS_CHECK(restore);
@@ -620,7 +756,12 @@ void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
 void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor weight, int64_t source_type,
                                    torch::Tensor partial, int64_t splits,
-                                   bool prefetch) {
+                                   bool prefetch, bool factor_scale,
+                                   bool float_grid) {
+  TORCH_CHECK(source_type != 18 || (!factor_scale && !float_grid),
+              "IQ3_XXS retains original FP32 vector accumulation");
+  TORCH_CHECK(!float_grid || factor_scale,
+              "FP32 codebooks require factored FP32 vector scales");
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() &&
                   input.scalar_type() == torch::kFloat16 &&
@@ -640,34 +781,50 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                 "Raw GGUF split-K requires FP32 partial storage");
   const dim3 grid((n + 3) / 4, splits);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define RAW_VEC(TYPE, PREFETCH)                                             \
-  if (splits == 1)                                                          \
-    raw_vec_kernel<TYPE, false, PREFETCH><<<grid, 128, 0, stream>>>(        \
-        reinterpret_cast<half*>(out.data_ptr()), nullptr,                   \
-        reinterpret_cast<const half*>(input.data_ptr()),                    \
-        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits);          \
-  else                                                                      \
-    raw_vec_kernel<TYPE, true, PREFETCH><<<grid, 128, 0, stream>>>(         \
-        reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), \
-        reinterpret_cast<const half*>(input.data_ptr()),                    \
-        weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
-  if (prefetch) {
-    if (source_type == 18) {
-      RAW_VEC(18, true);
-    } else if (source_type == 21) {
-      RAW_VEC(21, true);
+#define RAW_VEC(TYPE, PREFETCH, FACTOR, FLOAT_GRID)                    \
+  if (splits == 1)                                                     \
+    raw_vec_kernel<TYPE, false, PREFETCH, FACTOR, FLOAT_GRID>          \
+        <<<grid, 128, 0, stream>>>(                                    \
+            reinterpret_cast<half*>(out.data_ptr()), nullptr,          \
+            reinterpret_cast<const half*>(input.data_ptr()),           \
+            weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits); \
+  else                                                                 \
+    raw_vec_kernel<TYPE, true, PREFETCH, FACTOR, FLOAT_GRID>           \
+        <<<grid, 128, 0, stream>>>(                                    \
+            reinterpret_cast<half*>(out.data_ptr()),                   \
+            partial.data_ptr<float>(),                                 \
+            reinterpret_cast<const half*>(input.data_ptr()),           \
+            weight.data_ptr<uint8_t>(), n, k, weight.size(1), splits)
+#define SELECT_RAW_VEC(TYPE, FACTOR, FLOAT_GRID) \
+  if (prefetch) {                                \
+    RAW_VEC(TYPE, true, FACTOR, FLOAT_GRID);     \
+  } else {                                       \
+    RAW_VEC(TYPE, false, FACTOR, FLOAT_GRID);    \
+  }
+  if (source_type == 18) {
+    SELECT_RAW_VEC(18, false, false);
+  } else if (source_type == 21) {
+    if (factor_scale) {
+      if (float_grid) {
+        SELECT_RAW_VEC(21, true, true);
+      } else {
+        SELECT_RAW_VEC(21, true, false);
+      }
     } else {
-      RAW_VEC(22, true);
+      SELECT_RAW_VEC(21, false, false);
     }
   } else {
-    if (source_type == 18) {
-      RAW_VEC(18, false);
-    } else if (source_type == 21) {
-      RAW_VEC(21, false);
+    if (factor_scale) {
+      if (float_grid) {
+        SELECT_RAW_VEC(22, true, true);
+      } else {
+        SELECT_RAW_VEC(22, true, false);
+      }
     } else {
-      RAW_VEC(22, false);
+      SELECT_RAW_VEC(22, false, false);
     }
   }
+#undef SELECT_RAW_VEC
 #undef RAW_VEC
   if (splits > 1)
     reduce_vec<<<(n + 255) / 256, 256, 0, stream>>>(
@@ -772,14 +929,16 @@ void validate_compact(torch::Tensor weight, int type, int64_t n, int64_t k) {
               "Compact GGUF requires SM70");
 }
 void validate_compact_io(torch::Tensor out, torch::Tensor input,
-                         torch::Tensor weight) {
+                         torch::Tensor weight, bool allow_fp32_output = false) {
   TORCH_CHECK(
       input.device() == weight.device() && out.device() == weight.device() &&
           input.scalar_type() == torch::kFloat16 &&
-          out.scalar_type() == torch::kFloat16 && input.dim() == 2 &&
-          out.dim() == 2 && input.size(0) == out.size(0) && input.size(0) > 0 &&
-          input.is_contiguous() && out.is_contiguous(),
-      "Compact GGUF requires contiguous FP16 activations/output");
+          (out.scalar_type() == torch::kFloat16 ||
+           (allow_fp32_output && out.scalar_type() == torch::kFloat32)) &&
+          input.dim() == 2 && out.dim() == 2 && input.size(0) == out.size(0) &&
+          input.size(0) > 0 && input.is_contiguous() && out.is_contiguous(),
+      "Compact GGUF requires contiguous FP16 activations and admitted output "
+      "dtype");
 }
 }  // namespace
 
@@ -818,19 +977,27 @@ void gguf_lattice_compact_dequantize_sm70_out(torch::Tensor out,
   validate_compact(weight, source_type, n, k);
   const dim3 grid((n + 31) / 32, k / 256);
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define COMPACT_DQ(TYPE)                                                    \
+#define COMPACT_DQ(TYPE, FULL)                                              \
   if (out.scalar_type() == torch::kFloat32)                                 \
-    compact_dequant_kernel<TYPE, float, false><<<grid, 128, 0, stream>>>(   \
-        out.data_ptr<float>(), weight.data_ptr<uint8_t>(), n, k);           \
+    compact_dequant_kernel<TYPE, float, false, FULL>                        \
+        <<<grid, 256, 0, stream>>>(out.data_ptr<float>(),                   \
+                                   weight.data_ptr<uint8_t>(), n, k);       \
   else                                                                      \
-    compact_dequant_kernel<TYPE, half, false>                               \
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(out.data_ptr()), \
+    compact_dequant_kernel<TYPE, half, false, FULL>                         \
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(out.data_ptr()), \
                                    weight.data_ptr<uint8_t>(), n, k)
-  if (source_type == 21) {
-    COMPACT_DQ(21);
-  } else {
-    COMPACT_DQ(22);
+#define COMPACT_DQ_SELECT(TYPE) \
+  if (n % 32 == 0) {            \
+    COMPACT_DQ(TYPE, true);     \
+  } else {                      \
+    COMPACT_DQ(TYPE, false);    \
   }
+  if (source_type == 21) {
+    COMPACT_DQ_SELECT(21);
+  } else {
+    COMPACT_DQ_SELECT(22);
+  }
+#undef COMPACT_DQ_SELECT
 #undef COMPACT_DQ
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -905,12 +1072,10 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
-                                       torch::Tensor weight,
-                                       int64_t source_type,
-                                       torch::Tensor partial, int64_t splits,
-                                       bool prefetch, bool staged,
-                                       int64_t row_tile, bool occupancy7) {
+void gguf_lattice_compact_mma_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor partial, int64_t splits, bool prefetch,
+    bool staged, int64_t row_tile, bool occupancy7, bool stage_activation) {
   validate_compact_io(out, input, weight);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
@@ -968,7 +1133,34 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
       COMPACT_SELECT(22, false, BOUNDED);         \
     }                                             \
   }
-  if (occupancy7) {
+  if (stage_activation) {
+    TORCH_CHECK(mt == 16 && !staged && !occupancy7,
+                "Activation staging requires an unbounded M16 tile without "
+                "weight staging");
+#define COMPACT_ACT(TYPE, FULL, PREF)                             \
+  launch_mma<TYPE, 32, 16, true, FULL, PREF, false, false, true>( \
+      out, input, weight, partial, splits, stream)
+#define COMPACT_ACT_PREF(TYPE, FULL) \
+  if (prefetch) {                    \
+    COMPACT_ACT(TYPE, FULL, true);   \
+  } else {                           \
+    COMPACT_ACT(TYPE, FULL, false);  \
+  }
+#define COMPACT_ACT_SELECT(TYPE)   \
+  if (n % 32 == 0) {               \
+    COMPACT_ACT_PREF(TYPE, true);  \
+  } else {                         \
+    COMPACT_ACT_PREF(TYPE, false); \
+  }
+    if (source_type == 21) {
+      COMPACT_ACT_SELECT(21);
+    } else {
+      COMPACT_ACT_SELECT(22);
+    }
+#undef COMPACT_ACT_SELECT
+#undef COMPACT_ACT_PREF
+#undef COMPACT_ACT
+  } else if (occupancy7) {
     COMPACT_DISPATCH(true);
   } else {
     COMPACT_DISPATCH(false);
@@ -986,28 +1178,82 @@ void gguf_lattice_compact_mma_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_lattice_compact_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                         torch::Tensor weight,
                                         int64_t source_type,
-                                        torch::Tensor scratch) {
-  validate_compact_io(out, input, weight);
+                                        torch::Tensor scratch,
+                                        bool natural_layout, int64_t algorithm,
+                                        int64_t dq_partitions) {
+  TORCH_CHECK(
+      algorithm == 99 || algorithm == 102,
+      "Compact GGUF BLAS accepts only default or calibrated algorithm 2");
+  TORCH_CHECK(dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4,
+              "Compact GGUF DQ partitions must be 1, 2 or 4");
+  TORCH_CHECK(!natural_layout || dq_partitions == 1,
+              "Natural-layout DQ does not support partitions");
+  validate_compact_io(out, input, weight, true);
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
   validate_compact(weight, source_type, n, k);
   TORCH_CHECK(scratch.device() == weight.device() &&
                   scratch.scalar_type() == torch::kFloat16 &&
-                  scratch.dim() == 2 && scratch.size(0) == k &&
-                  scratch.size(1) == n && scratch.is_contiguous(),
-              "Compact GGUF BLAS requires FP16 [K,N] scratch");
-  const dim3 grid((n + 31) / 32, k / 256);
+                  scratch.dim() == 2 &&
+                  scratch.size(0) == (natural_layout ? n : k) &&
+                  scratch.size(1) == (natural_layout ? k : n) &&
+                  scratch.is_contiguous(),
+              "Compact GGUF BLAS scratch must match its FP16 weight layout");
+  const dim3 grid((n + 31) / 32, k / 256, dq_partitions);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+#define COMPACT_BLAS_DQ(TYPE, FULL)                                           \
+  if (natural_layout)                                                         \
+    compact_dequant_natural_kernel<TYPE, FULL><<<grid, 128, 0, stream>>>(     \
+        reinterpret_cast<half*>(scratch.data_ptr()),                          \
+        weight.data_ptr<uint8_t>(), n, k);                                    \
+  else                                                                        \
+    compact_dequant_kernel<TYPE, half, true, FULL><<<grid, 256, 0, stream>>>( \
+        reinterpret_cast<half*>(scratch.data_ptr()),                          \
+        weight.data_ptr<uint8_t>(), n, k)
+#define COMPACT_BLAS_DQ_SELECT(TYPE) \
+  if (n % 32 == 0) {                 \
+    COMPACT_BLAS_DQ(TYPE, true);     \
+  } else {                           \
+    COMPACT_BLAS_DQ(TYPE, false);    \
+  }
+  if (source_type == 21) {
+    COMPACT_BLAS_DQ_SELECT(21);
+  } else {
+    COMPACT_BLAS_DQ_SELECT(22);
+  }
+#undef COMPACT_BLAS_DQ_SELECT
+#undef COMPACT_BLAS_DQ
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  lattice_blas_accumulate(out, input, scratch, natural_layout, algorithm);
+}
+
+void gguf_lattice_compact_tm_f16_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+    int64_t source_type, torch::Tensor scratch, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, int64_t dq_partitions) {
+  TORCH_CHECK(dq_partitions == 1 || dq_partitions == 2 || dq_partitions == 4,
+              "Compact GGUF DQ partitions must be 1, 2 or 4");
+  validate_compact_io(out, input, weight);
+  const c10::cuda::CUDAGuard guard(weight.device());
+  const int n = out.size(1), k = input.size(1);
+  validate_compact(weight, source_type, n, k);
+  TORCH_CHECK(n % 32 == 0 && scratch.device() == weight.device() &&
+                  scratch.scalar_type() == torch::kFloat16 &&
+                  scratch.dim() == 2 && scratch.size(0) == n &&
+                  scratch.size(1) == k && scratch.is_contiguous(),
+              "Compact GGUF TurboMind requires an aligned FP16 workspace");
+  const dim3 grid(n / 32, k / 256, dq_partitions);
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (source_type == 21)
-    compact_dequant_kernel<21, half, true>
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+    compact_dequant_kernel<21, half, false, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
                                    weight.data_ptr<uint8_t>(), n, k);
   else
-    compact_dequant_kernel<22, half, true>
-        <<<grid, 128, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+    compact_dequant_kernel<22, half, false, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
                                    weight.data_ptr<uint8_t>(), n, k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  lattice_blas_accumulate(out, input, scratch);
+  gguf_workspace_f16_gemm_sm70_out(out, input, offsets, weight_ptrs);
 }
 
 namespace {

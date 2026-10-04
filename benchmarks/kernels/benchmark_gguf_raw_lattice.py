@@ -264,6 +264,41 @@ def main():
                         ),
                     )
                 )
+                for prefetch in (False, True):
+                    prefix = "vec_factor_scale" + ("_prefetch" if prefetch else "")
+                    candidates.append(
+                        (
+                            f"{prefix}_split{split}",
+                            partial(
+                                torch.ops._C.gguf_lattice_raw_vec_sm70_out,
+                                out,
+                                x,
+                                original,
+                                kind,
+                                tmp,
+                                split,
+                                prefetch,
+                                True,
+                            ),
+                        )
+                    )
+                candidates.append(
+                    (
+                        f"vec_float_grid_prefetch_split{split}",
+                        partial(
+                            torch.ops._C.gguf_lattice_raw_vec_sm70_out,
+                            out,
+                            x,
+                            original,
+                            kind,
+                            tmp,
+                            split,
+                            True,
+                            True,
+                            True,
+                        ),
+                    )
+                )
         elif m <= 64:
             for tile in (8, 32):
                 mt = 8 if m <= 8 else 16 if m <= 16 else 32
@@ -373,7 +408,19 @@ def main():
                         variants = [(*variant, False) for variant in variants]
                         if a.include_occupancy7 and mt == 16:
                             variants += [(*variant[:3], True) for variant in variants]
-                        for name, prefetch, staged, bounded in variants:
+                        variants = [(*variant, False) for variant in variants]
+                        if mt == 16:
+                            variants += [
+                                ("_activation", False, False, False, True),
+                                ("_prefetch_activation", True, False, False, True),
+                            ]
+                        for (
+                            name,
+                            prefetch,
+                            staged,
+                            bounded,
+                            stage_activation,
+                        ) in variants:
                             tile_name = f"_rows{row_tile}" if row_tile else ""
                             if bounded:
                                 tile_name += "_occupancy7"
@@ -392,6 +439,7 @@ def main():
                                         staged,
                                         row_tile,
                                         bounded,
+                                        stage_activation,
                                     ),
                                 )
                             )
@@ -409,6 +457,137 @@ def main():
                         ),
                     )
                 )
+                if n % 32 == 0:
+                    tm_scratch = torch.empty((n, k), device="cuda", dtype=torch.float16)
+                    offsets = torch.tensor([0, m], device="cuda", dtype=torch.int32)
+                    tm_ptrs, _ = torch.ops._C.awq_moe_build_strided_ptrs(
+                        tm_scratch.unsqueeze(0),
+                        tm_scratch.unsqueeze(0),
+                        k * 32,
+                        k * 32,
+                        1,
+                    )
+                    candidates.append(
+                        (
+                            "compact_dequant_turbomind_f16",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_tm_f16_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                tm_scratch,
+                                offsets,
+                                tm_ptrs,
+                            ),
+                        )
+                    )
+                natural_scratch = torch.empty(
+                    (n, k), device="cuda", dtype=torch.float16
+                )
+                candidates.append(
+                    (
+                        "compact_dequant_cublas_tn",
+                        partial(
+                            torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                            out,
+                            x,
+                            compact,
+                            kind,
+                            natural_scratch,
+                            True,
+                        ),
+                    )
+                )
+                for natural, scratch in ((False, raw_scratch), (True, natural_scratch)):
+                    candidates.append(
+                        (
+                            "compact_dequant_cublas"
+                            + ("_tn" if natural else "")
+                            + "_algo2",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                scratch,
+                                natural,
+                                102,
+                            ),
+                        )
+                    )
+                for partitions in (2, 4):
+                    candidates.append(
+                        (
+                            f"compact_dequant_cublas_algo2_parts{partitions}",
+                            partial(
+                                torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                raw_scratch,
+                                False,
+                                102,
+                                partitions,
+                            ),
+                        )
+                    )
+                    if n % 32 == 0:
+                        candidates.append(
+                            (
+                                f"compact_dequant_turbomind_f16_parts{partitions}",
+                                partial(
+                                    torch.ops._C.gguf_lattice_compact_tm_f16_sm70_out,
+                                    out,
+                                    x,
+                                    compact,
+                                    kind,
+                                    tm_scratch,
+                                    offsets,
+                                    tm_ptrs,
+                                    partitions,
+                                ),
+                            )
+                        )
+                fp32_result = torch.empty((m, n), device="cuda", dtype=torch.float32)
+
+                def fp32_blas(
+                    output,
+                    activation,
+                    packets,
+                    source_type,
+                    workspace,
+                    natural,
+                    temporary,
+                ):
+                    torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+                        temporary,
+                        activation,
+                        packets,
+                        source_type,
+                        workspace,
+                        natural,
+                    )
+                    output.copy_(temporary)
+
+                for natural, scratch in ((False, raw_scratch), (True, natural_scratch)):
+                    candidates.append(
+                        (
+                            "compact_dequant_cublas_f32" + ("_tn" if natural else ""),
+                            partial(
+                                fp32_blas,
+                                out,
+                                x,
+                                compact,
+                                kind,
+                                scratch,
+                                natural,
+                                fp32_result,
+                            ),
+                        )
+                    )
         old()
         old_error = errors(out, expected)
 

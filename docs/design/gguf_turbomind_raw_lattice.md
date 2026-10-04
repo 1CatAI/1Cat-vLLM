@@ -653,3 +653,558 @@ allocation to admit seven CTAs/SM. Its original entry point remains the
 comparison. An eight-CTA budget produces an eight-byte stack allocation and
 is rejected before GPU timing. The seven-CTA variant must pass resource,
 FP32 numerical and matched full-graph performance checks before selection.
+
+## Seven-CTA device and counter results
+
+Source `7122dd3b11`, core SHA256
+`c0733c0713737a81dc3fe1a7700ec992508a974508f1a4167617d62c504db6a2`,
+whole-wheel SHA256
+`9d0019a47a4340add14e2d11788278f7af92f185a3d1baf5fb9e543f820bf3b5`.
+All 24 checks pass (8.70 s). Matched M16 graph timings improve every selected
+shape, but dense 27B remains slower than canonical.
+
+| Projection | Canonical µs | Best original/equal-byte µs | Candidate |
+| --- | ---: | ---: | --- |
+| 27B gate | 39.593 | 47.087 | compact_mma_occupancy7_split2 |
+| 27B down | 38.052 | 42.632 | compact_mma_occupancy7_split2 |
+| IQ3_S expert | 17.853 | 8.189 | compact_mma_prefetch_occupancy7_split10 |
+| IQ2_S expert | 19.085 | 10.382 | compact_mma_staged_occupancy7_split10 |
+| Flash gate | 20.202 | 13.684 | compact_mma_prefetch_occupancy7_split10 |
+| Flash output | 17.384 | 13.148 | compact_mma_prefetch_occupancy7_split4 |
+
+The gate M16 winner is the plain packet decoder with the seven-CTA budget
+and split2. It uses 72 registers/thread with no stack allocation. Node
+profiling records 9,757,152 main-node DRAM read bytes, 20.86% active warps,
+32.55% long-scoreboard stall and 10.40% math-pipe throttle. Register occupancy
+limit is seven CTAs/SM; actual occupancy remains lower with this grid.
+The FP32 split reduction reads another 559,520 bytes. These counters include
+non-weight traffic and remain separate from unprofiled wall time.
+
+## Flash dense prefill attribution and TN candidate
+
+A matched cold-cache node capture at Flash gate M512 (`N=1536, K=2560`)
+identifies the current dequantization/cuBLAS cost:
+
+| Node | Profiled µs | DRAM read bytes |
+| --- | ---: | ---: |
+| Canonical fused GEMM | 120.928 | 4,637,056 |
+| Equal-byte dequantization | 20.384 | 1,696,640 |
+| cuBLAS NN GEMM | 106.176 | 14,592,352 |
+| cuBLAS FP32 split-K reduction | 16.128 | 6,295,328 |
+
+The unprofiled complete paths remain about 90/127 µs. Profiling perturbs
+node durations, so the rows above are attribution rather than a replacement
+wall-time comparison. The NN GEMM selects a 64×64 Volta kernel plus split-K
+reduction; dequantization is not the dominant gap.
+
+The next candidate writes the temporary FP16 workspace in natural `[N,K]`
+row order using aligned 128-bit stores and calls cuBLAS TN. It retains the
+NN candidate and the same FP32 computation/reduction policy. Temporary
+workspace byte size is unchanged; persistent weights remain equal-byte
+packets. Changed-input graphs and exact workspace comparisons cover both
+layouts before speed selection. Validation of TN remains pending.
+
+## Strided natural-workspace result
+
+Source `c64a8d7c2f` passes all 24 checks (7.87 s), including exact workspace
+values and changed-input graphs for NN and TN. The initial natural `[N,K]`
+workspace path is slower at every measured M512 shape; it is not selected.
+
+| Projection | Canonical µs | Compact NN µs | Initial compact TN µs |
+| --- | ---: | ---: | ---: |
+| 27B gate | 367.676 | 363.468 | 1075.453 |
+| 27B down | 342.257 | 339.610 | 982.836 |
+| IQ3_S expert | 69.220 | 27.258 | 57.179 |
+| IQ2_S expert | 64.382 | 30.288 | 59.517 |
+| Flash gate | 91.674 | 126.169 | 172.969 |
+| Flash output | 81.766 | 87.610 | 137.094 |
+
+A node capture of Flash gate TN attributes 100.064 µs to dequantization
+(4,540,096 DRAM read bytes) and 109.728 µs to its 128×128 cuBLAS GEMM
+(10,513,248 read bytes). There is no separate split-K reduction. Natural
+workspace dequantization uses 32 registers with no stack; the loss comes
+from strided partial-sector writes rather than spills. cuBLAS has 250
+registers/thread and 6.25% active warps in this capture.
+
+The next candidate stages decoded FP16 values in a padded shared tile and
+changes warp ownership for the output copy. Each warp then writes contiguous
+K vectors with aligned 128-bit stores. Padding belongs only to temporary
+shared storage; both workspace and persistent weight byte sizes remain
+unchanged. NN is retained and TN numerical/performance checks run again.
+
+## Coalesced natural workspace
+
+Source `57c614fc33` passes all 24 checks (8.07 s). This includes official
+FP32 dequantization equality, exact FP16 workspace values for both layouts,
+and changed-input full CUDA graphs. The padded shared tile changes only
+output-copy ownership; persistent packet and workspace byte sizes are unchanged.
+
+| Projection | Canonical µs | Compact NN µs | Coalesced compact TN µs |
+| --- | ---: | ---: | ---: |
+| 27B gate | 366.867 | 363.066 | 386.360 |
+| 27B down | 341.748 | 336.033 | 351.894 |
+| IQ3_S expert | 69.209 | 27.254 | 48.237 |
+| IQ2_S expert | 64.371 | 30.255 | 50.275 |
+| Flash gate | 94.161 | 126.231 | 113.438 |
+| Flash output | 81.841 | 87.671 | 81.270 |
+
+These are unprofiled full-graph replay times with distinct weight banks
+exceeding twice V100 L2, 100 replays and eight bank sweeps per graph. NN
+remains preferable for the 27B projections and single-expert shapes. TN
+reaches parity for Flash output but remains 20.5% slower for Flash gate.
+This result does not satisfy the complete promotion gate.
+
+Cold-cache node profiling of Flash gate records 25.696 µs and 1,697,664
+DRAM read bytes for coalesced dequantization, versus 100.064 µs and
+4,540,096 bytes for the earlier strided writer. The cuBLAS TN node records
+109.472 µs, 10,512,480 read bytes, 250 registers/thread and 6.25% active
+warps. Profiled node times are attribution, not the wall-time comparison.
+The next bounded experiment compares cuBLAS GEMM algorithm choices with
+FP32 computation and reduced-precision reductions disabled; no precision
+change is proposed.
+
+The installed wheel SHA256 is
+`abe02a1520497f0dbfb634014d213ac70dca89b95b0aec67600cfd5cdb65c9e2`;
+its installed core SHA256 is
+`0b7e3ecde6192dd394761129adb6f20bc97d8a2a0b9f8de546f433155d34ba87`.
+All 210 installed dependency packages are compatible.
+
+## cuBLAS algorithm comparison with overflow gate
+
+A same-precision algorithm probe found that explicitly requesting tensor
+algorithm 10 with FP16 output can overflow intermediate split partials even
+with reduced-precision reductions disabled. A cancellation workload with
+FP16 all-one weights, K=2560 and activations +128 for the first half and
+-128 for the second has exact final output zero. Default and tensor
+algorithm 2 remain finite and exact; algorithm 10 produces infinity for
+both NN and TN. FP32 output removes that overflow. The FP16 algorithm 10
+candidate is rejected rather than changing the numerical contract.
+
+Source `81700e4c74` exposes only default and algorithm 2 for calibration.
+All 26 checks pass (7.59 s), including original-format IQ3_S/IQ2_S
+cancellation workloads in both layouts and changed-input full graphs.
+
+| Projection | Canonical µs | Compact default NN µs | Compact default TN µs | Compact algo2 NN µs | Compact algo2 TN µs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 27B gate | 367.179 | 365.779 | 388.633 | 447.735 | 528.049 |
+| 27B down | 340.546 | 335.970 | 350.843 | 396.105 | 445.426 |
+| IQ3_S expert | 69.211 | 27.235 | 48.245 | 56.859 | 57.225 |
+| IQ2_S expert | 64.406 | 30.248 | 50.274 | 59.478 | 58.852 |
+| Flash gate | 91.896 | 126.308 | 114.272 | 97.719 | 107.057 |
+| Flash output | 85.270 | 87.684 | 81.563 | 74.480 | 83.712 |
+
+Complete-path full-graph timing narrows the Flash gate M512 gap to 6.3%
+and makes Flash output faster. Algorithm 2 regresses the other shapes and
+is not selected globally. The provisional winners retain the default NN
+algorithm for 27B and experts and algorithm 2 NN for these Flash dense
+shapes. Promotion still requires dense M16 and remaining storage/operator
+coverage. Kernel-only synthetic GEMM timing is not used as that gate.
+
+The installed wheel SHA256 is
+`ab49a0b0bb3e88dc657eba658f4384fca463dcd0cdce72852ab3a174b154eb0f`;
+its installed core SHA256 is
+`1e25499da47451c85409831d01b8f4a8435d44baefe96773503d033d8f8356e6`.
+The dependency check passes for all 210 packages. The [cuBLAS numerical
+behavior documentation](https://docs.nvidia.com/cuda/cublas/index.html#gemm-algorithms-numerical-behavior)
+explains why intermediate split reductions need explicit numerical checks.
+
+## Narrow packet fetch candidate
+
+The next candidate keeps the same equal-byte bit permutation but fetches
+one 32-bit word per participating lane instead of 64 bits. A 26-bit IQ3_S
+or 18-bit IQ2_S packet spans at most two such words. Two 32-bit shuffles
+and a funnel shift replace four shuffles and 64-bit stitching. Warp reads
+remain consecutive and cover exactly the original packet bits; FP32 scale
+formulas and accumulator precision are unchanged. This candidate requires
+the existing inverse, all-grid, boundary, graph and real-shape speed checks
+before selection.
+
+## Narrow packet fetch result
+
+Source `44f2c91727` passes all 26 checks (7.32 s), including official
+dequantization, bit-preserving permutation, N tails, coefficient boundaries,
+FP32 partial cancellation and changed-input full graphs. The 32-bit fetch
+retains the original payload bit layout and byte size.
+
+| Projection | M | Canonical µs | Best equal-byte µs |
+| --- | ---: | ---: | ---: |
+| 27B gate | 5 / 8 / 16 / 512 | 33.016 / 33.315 / 39.381 / 366.328 | 29.757 / 31.468 / 46.931 / 366.653 |
+| 27B down | 5 / 8 / 16 / 512 | 31.812 / 31.942 / 37.912 / 340.344 | 27.483 / 28.717 / 42.705 / 338.213 |
+| IQ3_S expert | 5 / 8 / 16 / 512 | 19.291 / 18.268 / 17.384 / 69.054 | 7.514 / 7.743 / 8.149 / 27.067 |
+| IQ2_S expert | 5 / 8 / 16 / 512 | 20.433 / 19.983 / 20.114 / 64.033 | 9.578 / 9.628 / 10.343 / 30.559 |
+| Flash gate | 5 / 8 / 16 / 512 | 20.823 / 19.252 / 21.268 / 89.837 | 9.770 / 10.174 / 13.483 / 97.621 |
+| Flash output | 5 / 8 / 16 / 512 | 16.082 / 15.855 / 17.065 / 81.533 | 9.652 / 9.987 / 12.907 / 74.387 |
+
+The 27B M5/M8 improvement is retained. M16 remains 19.2% slower for gate
+and 12.6% slower for down, so narrower extraction alone does not close the
+dense concurrency gap. Flash gate M512 retains an 8.7% gap in this run;
+Flash output is 8.8% faster. These are complete unprofiled graph paths with
+FP32 accumulation, cold weight banks, identical shape controls and 100
+replays. The previously selected M1 original-row and row-wise vector paths do
+not use the changed warp packet-fetch path and are not repeated here. Grouped expert/model step gains remain unmeasured.
+
+Installed core SHA256:
+`450dcc11c47ab2823730ad241791945102f4fa8354533f83d6e68ec01ea9be2e`.
+Whole-wheel SHA256:
+`45e62f62fc57cd77087b84240a4ea4d66bc2702c6de382886037db5264d54e85`.
+All 210 installed dependency packages are compatible.
+
+## Complete-tile dequantization specialization
+
+Source `2a745757b6` selects fixed N32 address arithmetic and aligned
+original metadata loads when N is divisible by 32. Partial tiles retain
+the general bitstream/byte-gather implementation. All 26 checks pass
+(7.99 s), covering exact FP32 and FP16 dequantization, both layouts, tails
+and FP32 partial overflow guards in changed-input full graphs.
+
+| Projection | Canonical µs | Compact default NN µs | Compact default TN µs | Compact algo2 NN µs |
+| --- | ---: | ---: | ---: | ---: |
+| 27B gate | 365.559 | 367.524 | 381.910 | 447.516 |
+| 27B down | 340.825 | 340.645 | 347.410 | 399.784 |
+| IQ3_S expert | 69.218 | 26.885 | 47.526 | 56.395 |
+| IQ2_S expert | 64.401 | 29.153 | 49.760 | 58.229 |
+| Flash gate | 93.396 | 125.793 | 111.878 | 97.236 |
+| Flash output | 84.994 | 87.721 | 79.579 | 74.245 |
+
+This is the same M512 complete-path full-graph comparison. The direct
+loading specialization has modest benefits on experts and natural workspace
+writing, but does not close Flash gate: algorithm 2 NN remains 4.1% slower
+than this run's canonical control. The canonical gate varies between
+approximately 90 and 94 µs across recorded runs; the compact path remains
+near 97 µs. That difference is retained rather than called a speed win.
+
+A matched NCU capture of the earlier 32-bit packet M16 kernel records
+9,756,896 main-node DRAM read bytes, 72 registers/thread, 20.57% active
+warps and 33.17% long-scoreboard stalls. ALU instruction count falls from
+4,368,320 to 4,172,480, but this same seven-CTA/split2 descriptor does not
+speed up materially. Reduction reads another 559,520 bytes. Narrow packet
+fetch therefore does not explain or solve the remaining dense M16 gap.
+
+Installed core SHA256:
+`f01a71c068c044ebbfbad1d0b827a861786725a0adbf39787961266fe4ac0c20`.
+Whole-wheel SHA256:
+`d071b5456f0f3773344e0a845a9795d653188cb1ff8ff8c41cc2c1414991cedf`.
+The 210-package dependency check passes. A bounded FP32-output cuBLAS
+comparison is the next prefill screening experiment; it must include final
+FP16 conversion and provide enough headroom for dequantization before any
+complete-path implementation is added.
+
+## FP32 output workspace screening
+
+A cold-bank Flash gate GEMM-only full-graph probe includes final conversion
+to FP16. Default cuBLAS NN with FP32 output takes 79.782 µs, versus
+88.879 µs for algorithm 2 with FP16 output and its matched output copy.
+Both retain about 0.0002075 relative L2 error. This is screening evidence
+only: the FP16 probe copy is additional work compared with the existing
+complete-path operator, and dequantization is excluded. It provides enough
+headroom to justify one complete-path comparison but is not a speed claim.
+
+Source `790cf01988` permits FP32 output only in compact BLAS validation.
+Vector/MMA validation continues to require FP16 output. The cuBLAS output
+type follows the output tensor, with FP32 computation and reduced-precision
+reductions disabled. The benchmark captures a temporary `[M,N]` FP32 result
+and its final FP16 copy in the same graph as temporary dequantization.
+Persistent weights retain the original equal-byte budget. Numerical checks
+and complete-path Flash gate M512 timing remain pending.
+
+## FP32 output workspace complete-path result
+
+Source `790cf01988` passes all 28 checks (8.88 s), including FP32 output
+with final FP16 conversion, tails, changed-input graphs and exact cancellation
+for both output dtypes. The Flash gate M512 complete-path result is:
+
+| Path | Unprofiled full-graph µs | Output relative L2 |
+| --- | ---: | ---: |
+| Canonical fused lattice GEMM | 93.852 | 0.0004092 |
+| Compact default NN, FP16 output | 125.834 | 0.0002072 |
+| Compact algorithm 2 NN, FP16 output | 97.277 | 0.0002072 |
+| Compact default NN, FP32 output plus FP16 conversion | 97.105 | 0.0002072 |
+| Compact default TN, FP32 output plus FP16 conversion | 103.958 | 0.0002072 |
+
+The screening margin does not survive complete-path timing: FP32 workspace
+output is effectively tied with algorithm 2 FP16 output and remains 3.5%
+slower than this canonical control. No model/default switch or expansion to
+other shapes follows this result. The FP32 result remains a correctness
+control; there is no persistent storage change.
+
+The measured core SHA256 is
+`11f8495b6c40551302bd269ce84aa54401e478faf52c11354f048f3175910c0a`.
+The wheel's distribution version and Python version string differed because
+a documentation commit landed between packaging phases. The binary source
+was unchanged. A clean fixed-commit repackaging must reconcile the version
+strings and preserve this core hash before publishing the package.
+
+## Fixed-commit package and dense activation traffic
+
+The fixed-commit package reconciles both source-version strings at
+`1.5.2.dev486+g018136e79`; the distribution adds the intended
+`.precompiled` build-flavor suffix. Its whole-wheel SHA256 is
+`6346edf6f6e3b336e922f7fd61fb8472d287204182b6dd304d53443bb2c9d9af`,
+and the core retains
+`11f8495b6c40551302bd269ce84aa54401e478faf52c11354f048f3175910c0a`.
+The 210-package dependency check passes. Numerical checks are not repeated
+for an unchanged binary and a version-only packaging correction.
+
+A cold-cache NCU capture of the fastest measured 27B gate M16 descriptor,
+packet prefetch with split3, records the following main-node counters:
+
+| Counter | Value |
+| --- | ---: |
+| DRAM read bytes | 9,740,768 |
+| L1 global-load sectors (32 bytes each) | 1,798,846 |
+| L2 read sectors (32 bytes each) | 965,893 |
+| L1 throughput / sustained peak | 70.60% |
+| L2 throughput / sustained peak | 24.43% |
+| Active warps | 30.43% |
+| Registers / thread | 70 |
+| Long-scoreboard stall | 65.48% |
+| Short-scoreboard stall | 4.22% |
+| Math-pipe throttle | 2.72% |
+
+L1 requests total about 57.6 MB and L2 reads about 30.9 MB while the
+original weight payload is 9.57 MB. These counters include activation,
+metadata and other reads; they do not identify each byte by source. The
+fragment loading pattern issues strided activation reads, so a contiguous
+shared activation tile is the next bounded candidate.
+
+Source `11d6db5e68` adds optional M16 activation staging. Warps copy
+complete contiguous K256 rows in aligned vectors into a padded temporary
+shared tile and load MMA fragments from that tile. It retains original
+weight bytes, original small scales and FP32 accumulation. Weight staging
+and the seven-CTA register-budget variant remain separate controls. Changed
+input/split-K/tail checks and two 27B dense M16 comparisons must pass before
+this candidate is selected. Numerical and performance validation is pending.
+
+## Contiguous activation staging result
+
+Source `11d6db5e68` passes all 28 checks (7.77 s), including activation
+staging on both formats, N tails, split1/split3 and changed-input full graphs.
+The initial run waited for the shared GPU lock and exited with resource
+status 75 twice; those attempts did not execute GPU tests. The completed
+run holds the common and four per-device locks throughout verification.
+
+| 27B M16 projection | Canonical µs | Best prior path µs | Activation-prefetch winner µs | Split |
+| --- | ---: | ---: | ---: | ---: |
+| Gate | 39.528 | 46.990 | 43.323 | 5 |
+| Down | 37.952 | 43.038 | 42.049 | 2 |
+
+These are complete unprofiled full-graph paths at the same TP4 shapes.
+Activation staging reduces gate time by 7.8% and down by 2.3% relative to
+the same-run prior candidates, but retains gaps of 9.6% and 10.8% versus
+canonical. It does not satisfy the full speed gate. Plain activation
+staging without register prefetch is substantially slower; the two changes
+are not selected independently. Other shapes are not promoted from these
+two results. Matched split3 and winning split5 NCU captures will distinguish
+request reduction from synchronization/occupancy effects.
+
+The IQ3_S complete-tile prefetch variant uses 66 registers/thread, no stack
+and 18,688 bytes of shared memory. The prior prefetch variant retains
+70 registers, no stack and 10,240 shared bytes; unused activation storage
+is eliminated when staging is disabled.
+
+Installed core SHA256:
+`ba8209ae4efe61ea74ff9d6a93fd8856380b919b6ffbc9f27ecfe9706c384dec`.
+Whole-wheel SHA256:
+`7ac4b557bfb0578097d78fbf3b0871b2582a5314a1017365760134ea0d280a88`.
+The package/Python source versions agree and all 210 installed dependencies
+are compatible. Root profiling disables Python bytecode writes to avoid
+creating root-owned cache directories in the task runtime.
+
+## Activation staging attribution
+
+The matched gate M16 split3 capture confirms fewer memory requests with
+staging, but shows that synchronous tile preparation offsets the benefit:
+
+| Counter | Prior packet prefetch | Synchronous activation staging |
+| --- | ---: | ---: |
+| L1 global-load sectors | 1,798,846 | 1,137,935 |
+| L2 read sectors | 965,893 | 766,095 |
+| L1 throughput / sustained peak | 70.60% | 36.84% |
+| Long-scoreboard stall | 65.48% | 47.28% |
+| Active warps | 30.43% | 28.55% |
+| Main-node profiled µs | 54.752 | 63.200 |
+
+The staging split5 wall-time winner records 1,158,021 L1 sectors, 740,137
+L2 sectors, 27.45% active warps, 47.47% long-scoreboard stall and 4.58%
+barrier stall. Main-node DRAM reads are 9,747,296 bytes; the FP32 reduction
+reads another 1,392,800 bytes. Node times remain separate from full-graph wall
+time. The lower request count alone is not evidence of a speed win.
+
+The next candidate preloads the first activation tile into shared memory
+and keeps the following complete tile in registers while decoding and
+multiplying the current one. CTA barriers protect shared reuse; SM70 does
+not require an unavailable asynchronous-copy instruction. The storage
+budget and every numerical operation remain unchanged. The same extended
+checks and two dense M16 wall comparisons must validate this candidate
+before it is selected.
+
+## Register activation lookahead reaches dense M16 parity
+
+Source `331e6234c9` passes all 28 extended checks (10.07 s). Preloading the
+following activation tile into registers changes no weight bits, activation
+values or FP32 accumulation operations. The two dense TP4 M16 comparisons are:
+
+| Projection | Canonical µs | Register activation-prefetch µs | Split |
+| --- | ---: | ---: | ---: |
+| 27B gate | 39.633 | 38.769 | 3 |
+| 27B down | 37.940 | 33.509 | 2 |
+
+The gate path is 2.2% faster and down is 11.7% faster in complete unprofiled
+full-graph replay. Earlier synchronous staging reached 43.323/42.049 µs.
+The new prefetch variant uses 119 registers/thread, no stack allocation and
+18,688 shared bytes, so its gain is demonstrated despite reduced CTA
+residency. Register count alone is not used to reject the measured winner.
+Other Flash M16 shapes and matched read-byte counters still require follow-up
+before a broader default decision.
+
+Installed core SHA256:
+`c86213d5a23f44eee18d8a58e48b252b4d2caee678e0f90496ac926656fe687c`.
+Whole-wheel SHA256:
+`47f3683cbc85816effdd796bd0ce2a8e0dc0b5d64a403865d686ee0f3c7a12a0`.
+The package/Python source versions agree and all 210 installed dependencies
+are compatible. Persistent payload bytes and alignment budgets are unchanged.
+
+## Register activation lookahead on remaining M16 shapes
+
+The same installed binary completes all four remaining Flash M16
+comparisons without repeating numerical checks:
+
+| Projection | Canonical µs | Best equal-byte µs | Schedule |
+| --- | ---: | ---: | --- |
+| IQ3_S expert | 18.364 | 8.190 | activation prefetch, split10 |
+| IQ2_S expert | 19.554 | 10.285 | activation prefetch, split10 |
+| Flash gate | 22.259 | 13.619 | prior seven-CTA packet prefetch, split10 |
+| Flash output | 17.403 | 12.392 | activation prefetch, split4 |
+
+All six measured M16 shapes are now faster than their same-run canonical
+control. This is a shape-dependent selection: the earlier Flash gate
+schedule remains preferable, so activation staging is not enabled globally.
+
+The matched 27B gate activation-lookahead split3 NCU main node reads
+9,748,192 DRAM bytes, 1,122,209 L1 global-load sectors and 854,936 L2 read
+sectors. Active warps are 21.15%, long-scoreboard stall is 36.83%, and
+register count is 119 with no stack. The FP32 reduction reads another
+835,744 bytes. Lower occupancy does not negate the demonstrated wall-time
+gain; node durations remain separate from the unprofiled comparison.
+
+The next prefill candidate separates packet fetch from extraction in the
+FP32/natural-output and FP16 transposed dequantization loop. It reads the
+following packet window into registers while reconstructing and storing
+the current one. Persistent byte size, official scale formulas and output
+layouts are unchanged. The full numerical suite and one Flash gate M512
+complete-path comparison must validate it before broadening.
+
+### Temporary packed FP16 workspace candidate
+
+An additional prefill candidate decodes the equal-byte IQ3_S/IQ2_S packet layout
+straight into TurboMind's existing FP16 operand layout, then invokes its SM70
+FP32-accumulating GEMM with a single grouped descriptor. The workspace is
+`[N/32, K/8, 32, 8]` with contiguous eight-element fragments. It is temporary
+and does not alter persistent weight storage or expand stored scales.
+
+The focused checks compare this layout against both the TurboMind converter and
+an independent tensor permutation, replay graphs with changed activations, and
+exercise cancellation where intermediate partial sums exceed the FP16 range.
+Correctness and speed remain unvalidated until the packaged runtime passes
+these checks and the complete M=512 graph comparison. This candidate has no
+model dispatch registration.
+
+The first packaged candidate passed all 32 focused checks. For Flash-Next
+`blk.0.attn_gate.weight`, TP4 rank 0, N=1536/K=2560/M=512, its complete graph
+was 102.531 us versus canonical 91.606 us and the best cuBLAS alternative
+96.956 us. It therefore does not satisfy the speed gate. Exact dequantization
+error was zero; output relative L2 error was 0.00020724.
+
+NCU node counters show the packed-workspace dequantizer reads 1,695,744 bytes
+for a 1,689,600-byte payload, while its FP16 GEMM reads 10,557,376 bytes. The
+selected 128x128x16 GEMM uses 255 registers and achieves 11.07% active warps.
+The cuBLAS algorithm-2 alternative reads 1,696,064 bytes in dequantization and
+10,504,800 bytes in GEMM. These counters describe separate workspace passes,
+not persistent compressed-weight expansion. Profiler timings are not used as
+end-to-end speed measurements. Smaller FP16 tiles are the next candidate;
+no model route is enabled by this result.
+
+The smaller FP16 tiles passed all 32 checks but the measured complete path
+remained 103.099 us versus 92.847 us canonical. They do not justify selecting
+this workspace path. The next dequantizer experiment increases a CTA from four
+to eight warps. For the Flash gate, the 480-CTA grid previously exposed only
+24 resident warps per SM on average; its 75-83% long-scoreboard stall and low
+DRAM throughput motivate more independent packet loads. Octet assignment uses
+the actual warp count, preserving exact coverage and the original byte layout.
+
+The eight-warp dequantizer passed 32 checks and reduced the fastest complete
+Flash gate M512 path to 95.871 us, versus 91.890 us canonical. The TurboMind
+workspace candidate was 101.795 us. A follow-up candidate partitions the 32
+K-octets across two or four CTAs per original block, providing more active CTAs
+without changing storage. Each CTA writes a disjoint set of octets. Original
+metadata may be reread through cache; DRAM counters must establish its cost.
+The natural-layout shared-transpose kernel retains its one-CTA contract.
+
+The first partitioned build passed 36 checks and failed four random-weight
+checks: the initial packet prefetch used octet `warp` instead of the partition's
+first octet. Constant-weight cancellation tests cannot detect that indexing
+error. The prefetch address is corrected before collecting any speed evidence;
+the failed build has no timing result or model eligibility.
+
+The corrected partition build passes 40 checks. Flash gate M512 reaches
+94.991 us with two dequantization partitions, versus 91.551 us canonical;
+four partitions regress to 96.219 us. The TurboMind workspace variants remain
+slower at 101.732/103.567 us. No prefill default changes follow from these
+results. The next independent M1 experiment prefetches the next FP16 activation
+fragment alongside the next original weight word, retaining the identical FP32
+FMA order and original-byte vector layout.
+
+The M1 activation-lookahead candidate passes 40 checks but regresses both 27B
+projections: gate/down 36.081/34.132 us versus 31.846/30.805 us canonical.
+It is reverted, restoring the earlier original-word prefetch schedule. The two
+additional FP16 registry tiles also provide no measured workspace improvement
+and are removed. The experimental FP16 workspace operator remains a declared
+compact-layout capability at M>=512, with an explicit output-pack alignment
+rejection for N tails; declaring support does not select a model default.
+
+The cleaned normal wheel passes 40 checks. NCU for the two-partition Flash gate
+dequantizer reports 1,731,392 DRAM read bytes, 72.01% active warps and 42.73%
+long-scoreboard stall, versus 1,696,064 bytes, 32.66% and 75.64% for the earlier
+four-warp single-partition reference. Metadata/cache traffic increases slightly;
+persistent storage remains 1,689,600 bytes. Its cuBLAS node reads 10,505,600 bytes
+and remains at 7.67% active warps. Profiled service times are not TPOT.
+
+The next M1 candidate factors the original block d out of each lane's
+eight-element local dot product. Small-scale/grid coefficients, local FMA,
+base-scale FMA and final reductions all use FP32. The alternative changes the
+summation order, so it requires the same official-weight dot-product error gate;
+FP32 dequantization and final MMA operand formation are unchanged. The existing
+vector schedule remains the default until a measured candidate passes.
+
+The d-only factoring candidate passes 42 checks but is slower: gate/down
+34.745/32.748 us versus the retained original-word prefetch 33.076/31.409 us
+and canonical 31.779/30.894 us. That branch is replaced by full-scale factoring:
+compute original d and small-scale multiplication in FP32, accumulate eight
+activation/grid products in FP32, then apply the combined FP32 scale by FMA.
+This removes per-weight FP32 scale multiplies while retaining both scale levels
+and FP32 accumulation. It changes grouping, so the same official-weight numerical
+and changed-input graph gates apply. The original schedule remains the default.
+The existing vector NCU trace reports 17.55% math-pipe throttle, supporting this
+instruction-count experiment.
+
+The first full-scale build retains 40 passing checks but fails the two enabled
+vector-variant checks: its accumulation call still applied d alone after the
+fragment stopped applying small scale. The missing factor is corrected by
+calling the original FP32 `block_scale` helper. The failed build collected no
+speed evidence; the numerical tolerances are unchanged.
+
+Corrected complete-scale factoring passes 42 checks. Gate/down M1 are
+32.803/30.890 us versus 32.659/30.772 us canonical in the six-route comparison.
+Nine alternating-order pairs produce gate medians 32.614/33.581 us raw/canonical
+and down 30.807/30.475 us. Different canonical launch selection and process
+conditions affect the gate baseline; these results do not close every M1 gate.
+Output relative L2 is approximately 0.000205.
+
+NCU shows full-scale factoring reduces FP32-pipe instructions from 3,777,536
+to 3,168,256, with DRAM reads 9,738,016 bytes, 40 registers and 55.08% active
+warps. Integer-pipe instructions remain 3,355,392. The next vector candidate
+expands only the fixed codebook to exact FP32 integers in shared memory once
+per CTA. It removes repeated byte unpacking/conversion; original weights/scales
+are unchanged. The larger shared table may reduce occupancy, so it is optional
+and requires measured dispatch. Scale formation, local FMA and reductions
+remain FP32.

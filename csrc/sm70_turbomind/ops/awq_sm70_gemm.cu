@@ -923,6 +923,7 @@ enum class TuneKeyKind : int {
   kGgufBitPlane6 = 15,
   kGgufLut4IQ = 16,
   kGgufLut4E2M1 = 17,
+  kGgufWorkspaceF16 = 25,
 };
 
 struct DenseTuneKey {
@@ -3951,6 +3952,85 @@ void gguf_lattice_grouped_gemm_sm70_out(
       layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
       out.data_ptr(), d, workspace.workspace, stream);
   TORCH_CHECK(result == 0, "GGUF lattice TurboMind grouped GEMM failed");
+}
+
+// Temporary FP16 operands only; persistent weights retain the GGUF bit budget.
+void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor offsets,
+                                      torch::Tensor weight_ptrs) {
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device(),
+              "GGUF FP16 workspace tensors must share a CUDA device");
+  TORCH_CHECK(
+      input.scalar_type() == torch::kFloat16 &&
+          out.scalar_type() == torch::kFloat16 &&
+          offsets.scalar_type() == torch::kInt32 &&
+          weight_ptrs.scalar_type() == torch::kUInt8 && input.dim() == 2 &&
+          out.dim() == 2 && input.is_contiguous() && out.is_contiguous() &&
+          offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
+          offsets.numel() == 2 && weight_ptrs.numel() == 16,
+      "GGUF FP16 workspace requires matrices and one grouped descriptor");
+  const int64_t m = input.size(0), k = input.size(1), n = out.size(1);
+  TORCH_CHECK(m > 0 && m <= INT_MAX && n > 0 && n <= INT_MAX && k > 0 &&
+                  k <= INT_MAX / 32 && n % 32 == 0 && k % 256 == 0 &&
+                  out.size(0) == m,
+              "GGUF FP16 workspace shape mismatch");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(k)};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(n)};
+  a.num = d.num = 1;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  turbomind::gemm::MatrixLayout b{turbomind::kHalf, turbomind::gemm::kColMajor,
+                                  static_cast<int>(k), static_cast<int>(n), 0};
+  b.num = 1;
+  b.pack = static_cast<turbomind::gemm::Pack>(turbomind::gemm::HMMA_884 |
+                                              turbomind::gemm::OPERAND_B | 1);
+  turbomind::gemm::Operation operation{};
+  operation.dispatch = select_dense_dispatch_policy_impl(
+      device, m, n, k, 1, stream, TuneKeyKind::kGgufWorkspaceF16, true, false,
+      8192);
+  operation.quant_a =
+      operation.quant_b = {turbomind::gemm::QuantType::kNone, 0};
+  operation.batch_dim = 0;
+  auto& workspace = get_workspace(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      b, nullptr, {}, 0.f, out.data_ptr(), d, out.data_ptr(), d,
+      workspace.workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF temporary FP16 TurboMind GEMM failed");
+}
+
+void gguf_workspace_f16_prepare_sm70_out(torch::Tensor out,
+                                         torch::Tensor input) {
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 && input.dim() == 2 &&
+                  out.sizes() == input.sizes() && input.is_contiguous() &&
+                  out.is_contiguous() && input.size(0) % 32 == 0 &&
+                  input.size(1) % 256 == 0 && input.size(0) <= INT_MAX &&
+                  input.size(1) <= INT_MAX / 32,
+              "GGUF FP16 prepare requires aligned contiguous matrices");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* converter = turbomind::gemm::GetConverters(
+      turbomind::kHalf, turbomind::kHalf, turbomind::kHalf, true, 70)[0];
+  TORCH_CHECK(converter, "GGUF FP16 converter is unavailable");
+  turbomind::gemm::MatrixLayout source{
+      turbomind::kHalf, turbomind::gemm::kColMajor,
+      static_cast<int>(input.size(1)), static_cast<int>(input.size(0)),
+      static_cast<int>(input.size(1))};
+  auto destination = source;
+  destination.pack = converter->pack;
+  TORCH_CHECK(converter->Convert(input.data_ptr(), source, out.data_ptr(),
+                                 destination, stream) == 0,
+              "GGUF FP16 converter failed");
 }
 
 std::vector<torch::Tensor> awq_sm70_prepare_impl(
@@ -6989,6 +7069,18 @@ void gguf_lattice_grouped_gemm_sm70_out(
   vllm::awq_sm70::gguf_lattice_grouped_gemm_sm70_out(
       out, input, offsets, weight_ptrs, stats_ptrs, source_type, num_experts,
       group_size);
+}
+
+void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor offsets,
+                                      torch::Tensor weight_ptrs) {
+  vllm::awq_sm70::gguf_workspace_f16_gemm_sm70_out(out, input, offsets,
+                                                   weight_ptrs);
+}
+
+void gguf_workspace_f16_prepare_sm70_out(torch::Tensor out,
+                                         torch::Tensor input) {
+  vllm::awq_sm70::gguf_workspace_f16_prepare_sm70_out(out, input);
 }
 
 std::vector<torch::Tensor> gguf_affine_sm70_prepare(torch::Tensor codes,
