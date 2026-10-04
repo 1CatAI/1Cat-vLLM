@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     GGUFOperatorCapability,
@@ -15,6 +16,7 @@ from vllm.model_executor.kernels.gguf import (
     decoder_family,
     lattice_grouped_capabilities,
     select_lattice_grouped_capability,
+    small_grouped_vector_capabilities,
 )
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
     SM70_SMALL_ROUTING,
@@ -35,7 +37,66 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
     AffineGGUFProjection,
     transcode_affine,
 )
+from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
+from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+
+def _expert_down(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    offsets: torch.Tensor,
+    weight_ptrs: torch.Tensor,
+    stat_ptrs: torch.Tensor,
+    source_type: int,
+    decoder: int,
+    experts: int,
+    group: int,
+    vector_batches: list[int],
+) -> None:
+    # Inspect actual routed rows inside the opaque boundary, including graph
+    # capture. Range compilation must not freeze the prefill fallback.
+    if x.shape[0] in vector_batches:
+        logger.info_once(
+            "SM70 canonical GGUF down vectors enabled (type=%d, routed_rows=%d).",
+            source_type,
+            x.shape[0],
+        )
+        torch.ops._C.gguf_small_grouped_vec_sm70_out(
+            out, x, offsets, weight_ptrs, stat_ptrs, source_type, experts, group
+        )
+    else:
+        op = (
+            torch.ops._C.gguf_lut4_grouped_gemm_sm70_out
+            if source_type == 20
+            else torch.ops._C.gguf_affine_grouped_gemm_sm70_out
+        )
+        op(out, x, offsets, weight_ptrs, stat_ptrs, decoder, experts, group)
+
+
+def _expert_down_fake(
+    out,
+    x,
+    offsets,
+    weight_ptrs,
+    stat_ptrs,
+    source_type,
+    decoder,
+    experts,
+    group,
+    vector_batches,
+):
+    return None
+
+
+direct_register_custom_op(
+    op_name="gguf_expert_down",
+    op_func=_expert_down,
+    mutates_args=["out"],
+    fake_impl=_expert_down_fake,
+)
 
 
 class GGUFExpertBank(torch.nn.Module):
@@ -151,6 +212,18 @@ class GGUFExpertBank(torch.nn.Module):
                         else f"operator_missing:{name}",
                     ),
                 )
+        self.down_vector_batches: list[int] = []
+        if self.source_type in (20, 42):
+            vector = small_grouped_vector_capabilities(
+                self.source_type,
+                self.k,
+                self.n,
+                self.experts,
+                self.dtype,
+                is_sm70=current_platform.is_device_capability(70),
+            )
+            self.capabilities = (*self.capabilities, *vector)
+            self.down_vector_batches = [c.min_m for c in vector if c.reason is None]
         self.pending.clear()
         if not any(c.reason is None for c in self.capabilities):
             raise ValueError("No admitted canonical GGUF expert operator")
@@ -168,6 +241,20 @@ class GGUFExpertBank(torch.nn.Module):
                 1,
                 x.shape[0],
             )
+        if self.source_type in (20, 42) and self.down_vector_batches:
+            torch.ops.vllm.gguf_expert_down(
+                output,
+                x,
+                offsets,
+                self.weight_ptrs,
+                self.stat_ptrs,
+                self.source_type,
+                self.decoder,
+                self.experts,
+                self.group,
+                self.down_vector_batches,
+            )
+            return output
         capability = (
             select_lattice_grouped_capability(self.capabilities, x.shape[0])
             if self.family == GGUFDecoderFamily.LATTICE
