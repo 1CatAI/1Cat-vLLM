@@ -390,3 +390,29 @@ binary, paired TP4 complete-chain graph trials: control 2.295 ms, prefetch
 ranks, but the speed regression rejects the implementation. Remove the unused
 kernel/API candidate, retain its source patch and raw results as artifacts,
 and do not launch a whole-model test or repeat parameter tuning for it.
+
+### Draft-head QPN8 candidate
+
+Existing native channel-QPN8 on the actual TP4 head shard (62,080 by 2,560):
+M1 FP16 vendor head 0.453 ms versus QPN8 0.191 ms, saving 0.262 ms in seven
+alternating graph trials. Issued code/scale storage is 159,048,960 bytes versus
+317,849,600 FP16 bytes. Four invocations suggest an operator budget of 1.048 ms;
+this is not an accepted model-round improvement. Synthetic hidden-state
+scales up to 3 yield at most 0.262 logit error versus FP64, but no model gate
+can be inferred from that test.
+
+The owned candidate uses a draft-only head view after target/draft sharing.
+The target's checkpoint parameter and quantization method remain unchanged.
+The view reuses native QPN8 for M1..8, FP16 computation/FP32 accumulation and
+the existing padding mask/global-ID/compact top1 transport. Wide batches use
+the original head. Channel preparation shares the existing implementation and
+bounds FP32 scratch by 4,096 weight rows. Raw full-vocabulary teacher-forcing
+logits use the same candidate view as greedy proposals. No user environment
+variable is added. The default candidate remains unmerged pending target and
+draft distribution, task quality/acceptance, C4 and complete-round validation.
+
+A diagnostic reference worker restores main's vendor shared-up policy and
+checkpoint draft head. Its requests are explicitly ineligible for default
+speed admission. Use the frozen 16-prompt manifest (math, code, Chinese and
+retrieval) with the same 8K prompt/256K capacity, and compare target/draft
+separately through the shared distribution tool and limits.

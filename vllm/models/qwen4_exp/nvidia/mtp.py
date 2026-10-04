@@ -595,8 +595,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        self._sm70_draft_head = None
 
     def prepare_sm70_decode_graph_model(self) -> bool:
+        if self._sm70_draft_head is None:
+            from .sm70_mtp_head import prepare_mtp_qpn8_head
+
+            self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
             return False
         if self._sm70_decode_graph_model is None:
@@ -641,12 +646,18 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        head = (
+            self._sm70_draft_head if self._sm70_draft_head is not None else self.lm_head
+        )
+        return self.logits_processor(head, hidden_states)
 
     def get_top_tokens(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = (
+            self._sm70_draft_head if self._sm70_draft_head is not None else self.lm_head
+        )
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
     def skip_checkpoint_weight(self, name: str) -> bool:
         # The drafter ships inside its target's checkpoint; without this the

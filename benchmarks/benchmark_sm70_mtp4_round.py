@@ -28,10 +28,13 @@ def main() -> None:
     parser.add_argument("--teacher-forcing-manifest", type=Path)
     parser.add_argument("--quality-manifest", type=Path)
     parser.add_argument("--diagnostics-only", action="store_true")
+    parser.add_argument("--projection-reference", action="store_true")
     parser.add_argument("--fixture", action="append")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--phase-events", action="store_true")
     args = parser.parse_args()
+    if args.projection_reference and not args.diagnostics_only:
+        parser.error("Projection reference is diagnostic-only, never default speed")
     if args.diagnostics_only and not (
         args.teacher_forcing_manifest or args.quality_manifest
     ):
@@ -148,6 +151,8 @@ def main() -> None:
         )
     if args.startup_diagnostics:
         engine["worker_cls"] = "benchmarks.sm70_startup_worker.StartupStackWorker"
+    if args.projection_reference:
+        engine["worker_cls"] = "benchmarks.sm70_mtp_reference_worker.ReferenceWorker"
     report = {
         "source": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True

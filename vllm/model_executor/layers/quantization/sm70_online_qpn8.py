@@ -119,6 +119,27 @@ def _hc_workspace(weight: torch.Tensor) -> torch.Tensor:
     return partials
 
 
+@torch.inference_mode()
+def prepare_channel_qpn8_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse the channel-QPN8 layout with bounded FP32 startup scratch."""
+    rows, _ = weight.shape
+    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
+    for begin in range(0, rows, 4096):
+        end = min(begin + 4096, rows)
+        values = weight[begin:end].float()
+        scale = values.abs().amax(dim=1, keepdim=True) / 448
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        qweight[begin:end].copy_((values / scale).to(torch.float8_e4m3fn))
+        scales[begin:end].copy_(scale)
+    codes, packed_scales = sm70_ops.fp8_qpn8_prepare_sm70(
+        qweight.contiguous(), scales.contiguous()
+    )
+    return codes, packed_scales
+
+
 def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     """Quantize one admitted FP16 weight and retain only its QPN8 layout."""
     if getattr(layer, _STATE_ATTR, False):
@@ -154,15 +175,7 @@ def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     else:
         weight_for_quant = weight
 
-    weight_f32 = weight_for_quant.float()
-    channel_scales = weight_f32.abs().amax(dim=1, keepdim=True).div_(448.0)
-    channel_scales = torch.where(
-        channel_scales == 0, torch.ones_like(channel_scales), channel_scales
-    )
-    qweight = (weight_f32 / channel_scales).to(torch.float8_e4m3fn)
-    codes, scales = sm70_ops.fp8_qpn8_prepare_sm70(
-        qweight.contiguous(), channel_scales.contiguous()
-    )
+    codes, scales = prepare_channel_qpn8_weight(weight_for_quant)
     workspace = _workspace(weight)
 
     replace_parameter(layer, "weight", codes)
