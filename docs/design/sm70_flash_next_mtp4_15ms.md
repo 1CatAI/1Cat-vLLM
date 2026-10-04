@@ -245,3 +245,75 @@ actual selected expert groups. Do not substitute resident tensor size or the
 maximum 50 route groups for those unknown measurements. New-main node
 attribution and NCU counters must supersede this historical ranking before
 selecting the next implementation.
+
+### Final-source default baseline and calibrated phases
+
+Source `925e6ca6c350b786b76c398c9ea5742ef5176e03`, integration base
+`f415b92d9e`, normal native `_C` SHA256
+`474cdbe06936d726f6f596648b310de6665edc6f19b0b7475c59fd1be2c6a325`.
+No wheel, private DSO, supplied VLLM variables or profiler. TP4 fully connected
+V100-SXM2-32GB, 300 W, Torch 2.10/cu128, CUDA 12.8, FP16 computation/KV,
+FP32 reduction/state, disk mmap, 262144 startup capacity, exactly 8192 input.
+
+Fixed8k complete-round means are 23.189, 23.152 and 23.219 ms: weighted mean
+23.186 ms over 900 rounds, 73.606 steady decode tokens/s, 18% draft acceptance,
+and 1.707 actual steady emitted tokens/round. All three outputs/counters match.
+This fails 15 ms. The historical 21.835-ms/311-round tape is a different output
+trajectory and cannot be used to claim a paired speedup or regression.
+
+The normal-EOS Chinese arithmetic smoke averages 25.699 ms over 288 rounds,
+167.807 decode tokens/s, 83.594% acceptance and 4.313 actual emitted tokens/round.
+All three outputs match and end normally; 240 km and 480/7 km/h are correct.
+This is output health, not distribution or task-set admission. Fifteen real
+SM70 kernel/graph tests pass without skips, including the FP32-policy M5/M10
+shared dispatcher with changed replay inputs.
+
+Three same-process ordinary/event pairs preserve token tapes and speculative
+counters. Observer endpoint overheads are +0.029%, +0.116% and -0.124%, passing
+the 2% reliability check. Their ordinary mean is 23.246 ms; event endpoint mean
+is 23.248 ms. The same-rank interval closure below excludes edge transitions
+and uses rank 3 for all three repeats, not independently maximized phases.
+
+| Calibrated GPU-stream interval | Mean |
+| --- | ---: |
+| Target M5 forward | 16.913 ms |
+| Draft 0, M5 | 1.344 ms |
+| Draft 1, M1 | 1.090 ms |
+| Draft 2, M1 | 1.074 ms |
+| Draft 3, M1 | 1.065 ms |
+| Draft outside its four graphs | 0.112 ms |
+| Target head/sample | 0.718 ms |
+| Target execute outside forward | 0.870 ms |
+| Handoff outside head/draft | 0.031 ms |
+| Round boundary residual | 0.005 ms |
+| Complete interval | 23.221 ms |
+
+The four draft graphs total 4.572 ms; their complete outer interval is
+4.684 ms. The GPU interval differs from its matched event endpoint by 0.027 ms.
+The separate default process mean is 23.186 ms; never substitute target forward
+or divide either round value by output-token count.
+
+A matching node capture on the same source preserves the 300-round tape but
+measures 26.665 ms. Retain its 3.479-ms overhead explicitly; do not rescale its
+kernel service into the calibrated wall table. Router/shared batch operators
+are selected in its actual target M5 graph. Some short-kernel services are
+perturbed substantially: prioritize a proposed change only after the exact
+operator-chain microbenchmark confirms unprofiled benefit.
+
+The first NCU filter matched no kernels because its default name basis is
+`function`, not `demangled`; exit zero was not a valid counter capture. The
+corrected captures contain six actual metrics each. Cold-weight router DRAM
+reads are 2,659,136 bytes for vendor and 2,666,400 bytes for native, versus
+2,621,440 source-audited weight bytes. They do not show extra complete weight
+passes. Active-warps fractions are 6.25% and 1.56%; sampled SM throughput is
+8.52% and 1.39%. These are single-kernel cold counter snapshots, not steady
+model utilization. Their instrumented durations are excluded from speed
+claims. Native and vendor steady graph timings remain a separate measurement.
+
+The next screen reuses existing channel-QPN8 preparation and M2-M8 dispatch
+for actual checkpoint GDN/output projections, comparing the current native
+FP16 chains, not a slow vendor-only control. HC remains FP16. No defaults change
+until shared full-vocabulary distribution, task quality, acceptance and C4
+checks pass. Expert-plan snapshots now record actual valid groups without
+per-round CPU synchronization; measured traffic/floor ranking remains pending
+those GPU data rather than assuming all 50 routes read distinct experts.
