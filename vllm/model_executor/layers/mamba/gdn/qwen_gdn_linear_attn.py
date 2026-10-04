@@ -5483,7 +5483,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.enable_sm70_fused_sigmoid_mixed_qkv
             and mixed_qkv.is_cuda
             and mixed_qkv.dtype == torch.float16
-            and mixed_qkv.is_contiguous()
+            and (
+                mixed_qkv.is_contiguous()
+                or (
+                    attn_metadata.spec_sequence_masks is not None
+                    and mixed_qkv.shape[0] in (5, 20)
+                    and mixed_qkv.stride(1) == 1
+                    and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
+                )
+            )
             and self.num_k_heads % self.tp_size == 0
             and self.num_v_heads % self.tp_size == 0
         )
@@ -5862,8 +5870,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.head_k_dim == self.head_v_dim == 128
             and ssm_state.dtype == torch.float32
             and mixed_qkv_spec is not None
-            and mixed_qkv_spec.is_contiguous()
-            and 1 < mixed_qkv_spec.shape[0] <= 16
+            and (
+                mixed_qkv_spec.is_contiguous()
+                or (
+                    mixed_qkv_spec.shape[0] in (5, 20)
+                    and mixed_qkv_spec.stride(1) == 1
+                    and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
+                )
+            )
+            and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
