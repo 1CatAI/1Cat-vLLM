@@ -200,3 +200,12 @@ operator checks. The packed PLE gather is already using pinned host UVA;
 its 0.100 ms service does not establish that it causes host replay skew or
 first-collective waiting. Dense quantized GEMV tuning remains in the separate
 GGUF kernel work.
+
+The updated first-ring analysis finds only about 3.0–3.3 us of target GPU
+work before the collective. Its residual after the last rank arrives is
+5.533 us. Arrival spread has median 674.758 us; its mean is 1255.998 us
+because one transition has a 37.617 ms outlier. Excluding that one point
+reduces the mean to 629.091 us. CPU replay-entry spread has median
+653.734 us, consistent with skew before target graph entry. The profiler's
+4.4–6.0 ms graph-launch API durations are instrumented values and do not
+establish ordinary host cost. PLE causality remains unproven.
