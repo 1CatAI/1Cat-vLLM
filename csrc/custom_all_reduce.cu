@@ -811,6 +811,84 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   }
 }
 
+void sm70_qwen38_hc_down_local(torch::Tensor input, torch::Tensor packed,
+                               torch::Tensor partials, torch::Tensor output,
+                               int64_t rank) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(input.is_cuda() && rank >= 0 && rank < 4,
+              "Local batch HC requires CUDA and a TP4 rank");
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  input.dim() == 2 && input.size(0) >= 2 &&
+                  input.size(0) <= 16 && input.size(1) == 10240,
+              "Local batch HC requires SM70 [2..16, 10240] input");
+  const int m = input.size(0);
+  for (const auto& tensor : {input, packed, output})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Local batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(packed.sizes() == at::IntArrayRef({3, 640, 2, 32, 8}) &&
+                  output.sizes() == at::IntArrayRef({m, 336}) &&
+                  partials.is_cuda() && partials.device() == input.device() &&
+                  partials.scalar_type() == at::kFloat &&
+                  partials.is_contiguous() &&
+                  partials.sizes() == at::IntArrayRef({20, m, 96}),
+              "Invalid local batch HC down geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  vllm::qwen38_hc_batch::hc_down_partials<false, 1, false, 96>
+      <<<dim3(3, (m + 7) / 8, 20), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(input.data_ptr()),
+          reinterpret_cast<const half*>(packed.data_ptr()),
+          partials.data_ptr<float>(), m);
+  vllm::qwen38_hc_batch::
+      down_local_packet<<<(m * 336 + 127) / 128, 128, 0, stream>>>(
+          partials.data_ptr<float>(),
+          reinterpret_cast<half*>(output.data_ptr()), rank, m);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qwen38_hc_up_local(torch::Tensor lora, torch::Tensor packed,
+                             torch::Tensor branches, torch::Tensor output,
+                             int64_t rank) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  TORCH_CHECK(branches.is_cuda() && rank >= 0 && rank < 4,
+              "Local batch HC requires CUDA and a TP4 rank");
+  const at::cuda::OptionalCUDAGuard guard(device_of(branches));
+  TORCH_CHECK(vllm::custom_allreduce_current_device_is_sm70() &&
+                  branches.dim() == 2 && branches.size(0) >= 2 &&
+                  branches.size(0) <= 16 && branches.size(1) == 10240,
+              "Local batch HC requires SM70 [2..16, 10240] input");
+  const int m = branches.size(0);
+  for (const auto& tensor : {lora, packed, branches, output})
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == branches.device() &&
+                    tensor.scalar_type() == at::kHalf &&
+                    tensor.is_contiguous() &&
+                    reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+                "Local batch HC requires aligned contiguous FP16 tensors");
+  TORCH_CHECK(lora.sizes() == at::IntArrayRef({m, 320}) &&
+                  packed.sizes() == at::IntArrayRef({80, 20, 2, 4, 8, 8}) &&
+                  output.sizes() == at::IntArrayRef({m, 2560}),
+              "Invalid local batch HC up geometry");
+  const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  CUDACHECK(cudaMemsetAsync(output.data_ptr(), 0, output.numel() * sizeof(half),
+                            stream));
+  vllm::qwen38_hc_batch::hc_up_batch<false, 1, 4, true, true>
+      <<<dim3(80, (m + 7) / 8), 32, 0, stream>>>(
+          reinterpret_cast<const half*>(lora.data_ptr()),
+          reinterpret_cast<const half*>(packed.data_ptr()),
+          reinterpret_cast<const half*>(branches.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), m, 640, rank * 640);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
 void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor packed_down, torch::Tensor packed_up,
                           torch::Tensor partials, torch::Tensor lora,
