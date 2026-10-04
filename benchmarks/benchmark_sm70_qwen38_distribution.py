@@ -15,6 +15,7 @@ import numpy as np
 from benchmarks.benchmark_sm70_qwen38_quality import prompt_token_ids
 from benchmarks.qwen38_distribution_probe import (
     distribution_metrics,
+    summarize_distribution,
 )
 
 
@@ -239,38 +240,7 @@ def summarize_groups(rows, widths):
                 if r["width"] == width
                 and (category == "all" or r["category"] == category)
             ]
-            kl = [r["kl"] for r in selected]
-            summary = {
-                "rows": len(selected),
-                "mean_kl": float(np.mean(kl)),
-                "p99_kl": float(np.quantile(kl, 0.99)),
-                "max_kl": max(kl),
-                "top1_agreement": float(
-                    np.mean([r["top1_agreement"] for r in selected])
-                ),
-                "max_logit_error": max(r["max_logit_error"] for r in selected),
-                "median_logit_error": float(
-                    np.median([r["max_logit_error"] for r in selected])
-                ),
-                "p95_logit_error": float(
-                    np.quantile([r["max_logit_error"] for r in selected], 0.95)
-                ),
-                "p99_logit_error": float(
-                    np.quantile([r["max_logit_error"] for r in selected], 0.99)
-                ),
-                "centered_max_logit_error": max(
-                    r["centered_max_logit_error"] for r in selected
-                ),
-                "top1_disagreements": sum(not r["top1_agreement"] for r in selected),
-                "mean_reverse_kl": float(np.mean([r["reverse_kl"] for r in selected])),
-            }
-            summary["passed"] = (
-                summary["mean_kl"] <= 0.001
-                and summary["p99_kl"] <= 0.01
-                and summary["max_kl"] <= 0.05
-                and summary["top1_agreement"] >= 0.99
-                and summary["max_logit_error"] <= 0.5
-            )
+            summary = summarize_distribution(selected)
             groups[f"C{width}/{category}"] = summary
     return groups
 
