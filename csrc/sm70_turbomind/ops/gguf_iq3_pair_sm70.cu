@@ -41,6 +41,10 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
   constexpr int NAcc = TwoChains ? 2 : 1, RowTiles = 1;
   constexpr bool M1Only = false;
   using D = vllm::sm70_gguf::LatticeCompactDecoder<21>;
+  // IQ3_S uses one scale nibble per four K8 octets. Each K16 pair
+  // starts at an even octet, so both packets use the same coefficient
+  // position. Reusing it lets the compiler share the coefficient work;
+  // the packet still supplies its own indices and signs.
   __shared__ __align__(16) uint8_t grid[D::kCodebookBytes];
   D::initialize(grid);
   static_assert(RowTiles == 1 || RowTiles == 2,
@@ -126,7 +130,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           octet, grid);
       const auto b1 = D::fragment<half>(
           parameters, __funnelshift_r(w1.x, w1.y, (col * 26) & 31) & 0x3ffffff,
-          octet + 1, grid);
+          octet, grid);
       half2 weights[8];
       *reinterpret_cast<uint4*>(weights) = *reinterpret_cast<const uint4*>(&b0);
       *reinterpret_cast<uint4*>(weights + 4) =
@@ -191,7 +195,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           octet, grid);
       const auto b1 = D::fragment<half>(
           parameters, __funnelshift_r(w1.x, w1.y, (col * 26) & 31) & 0x3ffffff,
-          octet + 1, grid);
+          octet, grid);
       half2 weights[8];
       *reinterpret_cast<uint4*>(weights) = *reinterpret_cast<const uint4*>(&b0);
       *reinterpret_cast<uint4*>(weights + 4) =
@@ -256,7 +260,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           octet, grid);
       const auto b1 = D::fragment<half>(
           parameters, __funnelshift_r(w1.x, w1.y, (col * 26) & 31) & 0x3ffffff,
-          octet + 1, grid);
+          octet, grid);
       half2 weights[8];
       *reinterpret_cast<uint4*>(weights) = *reinterpret_cast<const uint4*>(&b0);
       *reinterpret_cast<uint4*>(weights + 4) =
@@ -321,7 +325,7 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
           octet, grid);
       const auto b1 = D::fragment<half>(
           parameters, __funnelshift_r(w1.x, w1.y, (col * 26) & 31) & 0x3ffffff,
-          octet + 1, grid);
+          octet, grid);
       half2 weights[8];
       *reinterpret_cast<uint4*>(weights) = *reinterpret_cast<const uint4*>(&b0);
       *reinterpret_cast<uint4*>(weights + 4) =

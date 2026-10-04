@@ -269,3 +269,23 @@ approximately 9 us difference must not be attributed to that change. The
 retained original-interface pair is about 61–62 us at this workload, versus
 canonical 75.776 us / native NVFP4 48.128 us. It still misses the 30 us goal;
 no scale-width or model-route change is promoted on these data.
+
+Byte-plane reads on the weighted K64 skeleton pass official elementwise
+FP32 dequantization and bitwise comparison with tightly packed packets.
+At recorded SM 1290 MHz / memory 877 MHz, single-chain byte planes measure
+96.256 us versus tightly packed 73.728 us; two-chain byte planes measure
+113.664 us versus tightly packed 71.680 us. Native NVFP4 is 49.152 us and
+canonical 79.872 us in that cohort. The layout is rejected on this skeleton
+as well. Future speed comparisons must include the observed clock state.
+
+Using the same even-octet scale position for both K8 operands of a K16
+segment is bitwise equivalent for IQ3_S. At recorded SM 1290 MHz, matched
+single-chain K64 improves from 70.656 to 67.584 us; two-chain K64 improves
+from 73.728 to 68.608 us. Native NVFP4 is 49.152 us and canonical 79.872
+us. This saves redundant coefficient work while reusing the shared decoder,
+but still misses the performance gate.
+
+A following reader packs both K8 index/sign packets together into 52 bits
+per column and K16 segment. This preserves all 110 bytes per K256 block;
+three adjacent 32-bit reads replace four reads. Its field extraction and
+all-weight official FP32 oracle must pass before interpreting timing.
