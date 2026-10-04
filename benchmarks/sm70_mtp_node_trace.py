@@ -17,14 +17,42 @@ def install(worker, folder):
         raise ValueError("The fixed control requires four draft steps")
     restore = []
     ordinal = {"step": 0}
+    plans = [
+        (
+            name,
+            module._nvfp4_grouped_total,
+            module._nvfp4_grouped_experts,
+            module.w13_tm_weight.shape[0],
+        )
+        for name, module in runner.model.named_modules()
+        if hasattr(module, "_nvfp4_grouped_total")
+    ]
+    plan_state = (
+        {
+            "names": [plan[0] for plan in plans],
+            "values": plans[0][1].new_empty((1024, len(plans))),
+            "experts": plans[0][2].new_empty(
+                (1024, sum(plan[2].numel() for plan in plans))
+            ),
+            "expert_widths": [plan[2].numel() for plan in plans],
+            "expert_limits": [plan[3] for plan in plans],
+            "count": 0,
+            "folder": Path(folder),
+        }
+        if plans
+        else None
+    )
 
-    def wrap(obj, name, label):
+    def wrap(obj, name, label, after=None):
         original = getattr(obj, name)
 
         def observed(*args, **kwargs):
             annotation = label(*args, **kwargs) if callable(label) else label
             with torch.cuda.nvtx.range(annotation):
-                return original(*args, **kwargs)
+                result = original(*args, **kwargs)
+            if after is not None:
+                after(*args, **kwargs)
+            return result
 
         restore.append((obj, name, original))
         setattr(obj, name, observed)
@@ -38,6 +66,19 @@ def install(worker, folder):
         if ordinal["step"] > 3:
             raise RuntimeError("More than three draft decode graph replays")
         return f"mtp15.draft_step/{ordinal['step']}/M{desc.num_tokens}"
+
+    def snapshot_plans(desc):
+        if plan_state is None or desc.num_tokens != 5:
+            return
+        index = plan_state["count"]
+        if index == len(plan_state["values"]):
+            raise RuntimeError("Expert-plan snapshot capacity exhausted")
+        # Same-stream device copy after replay: no round synchronization or
+        # CPU scalar reads. Exclude this named diagnostic node from model cost.
+        with torch.cuda.nvtx.range("mtp15.expert_plan_snapshot"):
+            torch.cat([plan[1] for plan in plans], out=plan_state["values"][index])
+            torch.cat([plan[2] for plan in plans], out=plan_state["experts"][index])
+        plan_state["count"] += 1
 
     inventory = []
     for role, model in (("target", runner.model), ("draft", draft.model)):
@@ -81,6 +122,7 @@ def install(worker, folder):
         runner.cudagraph_manager,
         "run_fullgraph",
         lambda desc: f"mtp15.target_forward/M{desc.num_tokens}",
+        after=snapshot_plans,
     )
     wrap(draft, "propose", proposal_label)
     wrap(
@@ -90,6 +132,7 @@ def install(worker, folder):
     )
     wrap(draft.decode_cudagraph_manager, "run_fullgraph", decode_label)
     worker._mtp_node_trace_restore = restore
+    worker._mtp_node_trace_plans = plan_state
     return {"rank": worker.rank, "inventory_tensors": len(inventory)}
 
 
@@ -97,3 +140,43 @@ def uninstall(worker):
     for obj, name, original in reversed(worker._mtp_node_trace_restore):
         setattr(obj, name, original)
     del worker._mtp_node_trace_restore
+    state = worker._mtp_node_trace_plans
+    if state is not None:
+        values = state["values"][: state["count"]].cpu().tolist()
+        experts = state["experts"][: state["count"]].cpu().tolist()
+        valid_groups = []
+        for counts, ids in zip(values, experts):
+            row, offset = [], 0
+            for count, width, limit in zip(
+                counts, state["expert_widths"], state["expert_limits"]
+            ):
+                if not 0 <= count <= width:
+                    raise ValueError("Invalid expert plan size")
+                row.append(
+                    sum(
+                        0 <= identifier < limit
+                        for identifier in ids[offset : offset + count]
+                    )
+                )
+                offset += width
+            valid_groups.append(row)
+        (state["folder"] / f"rank{worker.rank}_expert_groups.json").write_text(
+            json.dumps(
+                {
+                    "rank": worker.rank,
+                    "layers": state["names"],
+                    "groups_per_round": values,
+                    "valid_groups_per_round": valid_groups,
+                    "qualification": (
+                        "Grouped M5 plan counts; derive issued weight/scale reads "
+                        "from kernel loops, not resident expert-bank size. "
+                        "Valid groups exclude invalid/padded expert IDs. "
+                        "Snapshot kernels are diagnostic and outside "
+                        "target-forward service."
+                    ),
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    del worker._mtp_node_trace_plans
