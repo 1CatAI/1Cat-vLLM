@@ -142,6 +142,35 @@ The operator requests carveout 66. Its actual hardware shared-memory
 configuration has not been measured; this request must not be reported as
 proof of a 64 KiB configuration. The shared CPU converter independently
 recovers every original QKVZ byte from its unchanged 9,011,200-byte payload.
-Partition coverage remains complete. GPU numerical and speed qualification
-are pending, so the entry remains research-only and contributes no claimed
-model or per-round saving.
+Partition coverage remains complete. The subsequent GPU screen below
+qualifies its numerical operands and local operator delta. It remains
+research-only because the 20-microsecond target is unmet.
+
+### Fixed-index mixed projection GPU screen
+
+The shared fixed-index numerical gate passed before this matched operator
+screen. On the same real layer-6 weights and cold-L2 graph workload, old/new/
+new/old medians are **41.984 / 38.912 / 38.912 / 41.984 microseconds**. Every
+point records 1290 MHz SM and 877 MHz memory clocks before and after timing;
+the GPU temperature is 33 degrees Celsius.
+
+| Projection | Median microseconds | Source bytes | Source GB/s |
+| --- | ---: | ---: | ---: |
+| Original compact mixed projection, 224 CTAs | 41.984 | 9,256,960 | 220.49 |
+| Fixed-index mixed projection, 160 CTAs | 38.912 | 9,256,960 | 237.89 |
+| Native NVFP4 QKVZ, same shape | 27.648 | 11,796,480 | 426.67 |
+| Native NVFP4 QKVZ plus independent dense b/a | 34.816 | 12,042,240 | 345.88 |
+
+The local improvement is 3.072 microseconds, or 7.32%. Applied only to the
+eight admitted same-type GDN layers, it projects **0.024576 milliseconds per
+round**. The 20-microsecond target is still missed. This route is not promoted,
+and no model benchmark or trace is run.
+
+Every reconstructed QKVZ F32 and F16 weight is bitwise equal to the official
+reader. Against FP32 dense products, QKV/Z relative L2 errors are 0.000321087
+and 0.000325754, with maximum absolute error 0.001953125. The changed eight-
+partition reduction produces relative L2 differences of 0.000020029 and
+0.000021586 against the old sixteen-partition kernel; this is a reduction-order
+difference, with the same weight operands and FP32 accumulation. Both b/a
+outputs remain bitwise equal to the old implementation and to the FP64 dense
+reference rounded to F16 for this input. Graph replay remains stable.
