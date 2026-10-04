@@ -102,10 +102,12 @@ def candidate_source(source: str, variant: str) -> str:
         # Keep the shared layout unchanged to isolate the extra PV product.
         # Dead residual-value conversion is removed by the CUDA compiler.
     result = source[:start] + body + source[end:]
-    if variant in ("compact-q8", "shared-dual-q8"):
+    if variant in ("compact-q8", "shared-dual-q8", "shared-tile64-q8"):
         result = compact_q8_source(result)
-    if variant == "shared-dual-q8":
+    if variant in ("shared-dual-q8", "shared-tile64-q8"):
         result = shared_dual_q8_source(result)
+    if variant == "shared-tile64-q8":
+        result = shared_tile64_q8_source(result)
     if swizzled_helper is not None:
         anchor = "__device__ __forceinline__ void grouped_verify_scale_output_fragment("
         result = result.replace(anchor, swizzled_helper + anchor, 1)
@@ -403,6 +405,59 @@ def shared_dual_q8_source(source: str) -> str:
     return source.replace(old, "      ? sizeof(CompactQ8Smem)")
 
 
+def shared_tile64_q8_source(source: str) -> str:
+    """Amortize CTA barriers over N64 without forcing register spills for two CTAs."""
+    for old, new in (
+        ("kGroupedVerifyBlockN = 32", "kGroupedVerifyBlockN = 64"),
+        ("kGroupedVerifyScoreStride = 32", "kGroupedVerifyScoreStride = 64"),
+        ("kGroupedVerifyProbStride = 32", "kGroupedVerifyProbStride = 64"),
+        (
+            "sizeof(GroupedVerifySmem) <= 64 * 1024",
+            "sizeof(GroupedVerifySmem) <= 96 * 1024",
+        ),
+    ):
+        if source.count(old) != 1:
+            raise ValueError(f"Expected one tile declaration: {old}")
+        source = source.replace(old, new)
+    start = source.index(
+        "__launch_bounds__(512, 2) void "
+        "flash_attention_grouped_verify_e4m3_full_q8_kernel("
+    )
+    end = source.index("// FP16 KV verifier: one context read", start)
+    body = source[start:end].replace(
+        "__launch_bounds__(512, 2)", "__launch_bounds__(512, 1)"
+    )
+    body = body.replace(
+        "constexpr int Values = 32 / Width;",
+        "constexpr int Values = kGroupedVerifyBlockN / Width;",
+    )
+    # Four softmax rows still share a warp; eight columns per lane now cover N64.
+    body = body.replace(
+        "const int row = warp_id * Values + lane_id / Width;",
+        "const int row = warp_id * (32 / Width) + lane_id / Width;",
+    )
+    body = body.replace(
+        "grouped_a_offset(row, col, 32)",
+        "grouped_a_offset(row, col, kGroupedVerifyProbStride)",
+    )
+    source = source[:start] + body + source[end:]
+    start = source.index("at::Tensor private_grouped_e4m3_fp32_paged(")
+    end = source.index("at::Tensor private_grouped_fp16_fp32_paged(", start)
+    entry = source[start:end]
+    first = entry.index("  constexpr int kCompensatedSmemBytes =")
+    last = entry.index("  static_assert(kCompensatedSmemBytes", first)
+    entry = (
+        entry[:first]
+        + (
+            "  TORCH_CHECK(q.size(0) / batch_size == 8, "
+            '"N64 research entry is q8 only");\n'
+            "  constexpr int kCompensatedSmemBytes = sizeof(CompactQ8Smem);\n"
+        )
+        + entry[last:]
+    )
+    return source[:start] + entry + source[end:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -417,6 +472,7 @@ def main() -> None:
             "single-width-kv",
             "compact-q8",
             "shared-dual-q8",
+            "shared-tile64-q8",
         ),
         required=True,
     )
@@ -487,7 +543,9 @@ at::Tensor private_e4m3_decoder_check() {
         "source_sha256": digest,
         "module_name": module_name,
         "entrypoint": "run",
-        "splits": 160 if args.variant in ("compact-q8", "shared-dual-q8") else 80,
+        "splits": 160
+        if args.variant in ("compact-q8", "shared-dual-q8", "shared-tile64-q8")
+        else 80,
         "arithmetic_change": args.variant
         not in ("reference", "bit-decode", "swizzled-q", "single-width-kv"),
         "source_files": {
