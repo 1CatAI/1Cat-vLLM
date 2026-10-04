@@ -126,8 +126,7 @@ __global__ void raw_vec_kernel(half* out, float* partial, const half* x,
 #pragma unroll
       for (int i = 0; i < 8; ++i)
         local = fmaf(__half2float(activation[i]), values[i], local);
-      sum =
-          fmaf(__half2float(*reinterpret_cast<const half*>(data)), local, sum);
+      sum = fmaf(Decode::block_scale(data, lane * 8), local, sum);
     } else {
 #pragma unroll
       for (int i = 0; i < 8; ++i)

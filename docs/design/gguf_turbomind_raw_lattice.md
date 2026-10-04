@@ -1186,3 +1186,9 @@ and FP32 accumulation. It changes grouping, so the same official-weight numerica
 and changed-input graph gates apply. The original schedule remains the default.
 The existing vector NCU trace reports 17.55% math-pipe throttle, supporting this
 instruction-count experiment.
+
+The first full-scale build retains 40 passing checks but fails the two enabled
+vector-variant checks: its accumulation call still applied d alone after the
+fragment stopped applying small scale. The missing factor is corrected by
+calling the original FP32 `block_scale` helper. The failed build collected no
+speed evidence; the numerical tolerances are unchanged.
