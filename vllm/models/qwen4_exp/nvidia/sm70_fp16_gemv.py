@@ -394,7 +394,14 @@ def _qwen38_sm70_fp16_gemv(
         LOAD_POLICY=plan.load_policy,
         num_warps=plan.num_warps,
     )
-    logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
+    if small_ba:
+        logger.info_once(
+            "SM70 checkpoint-FP16 batch a/b row GEMV enabled (M=%d, N=%d).",
+            x.shape[0],
+            weight.shape[0],
+        )
+    else:
+        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 M=1 GEMV route enabled.")
     return out
 
 
