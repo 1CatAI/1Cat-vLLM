@@ -5483,7 +5483,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.enable_sm70_fused_sigmoid_mixed_qkv
             and mixed_qkv.is_cuda
             and mixed_qkv.dtype == torch.float16
-            and mixed_qkv.is_contiguous()
+            and (
+                mixed_qkv.is_contiguous()
+                or (
+                    attn_metadata.spec_sequence_masks is not None
+                    and mixed_qkv.shape[0] in (5, 20)
+                    and mixed_qkv.stride(1) == 1
+                    and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
+                )
+            )
             and self.num_k_heads % self.tp_size == 0
             and self.num_v_heads % self.tp_size == 0
         )
@@ -5862,8 +5870,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.head_k_dim == self.head_v_dim == 128
             and ssm_state.dtype == torch.float32
             and mixed_qkv_spec is not None
-            and mixed_qkv_spec.is_contiguous()
-            and 1 < mixed_qkv_spec.shape[0] <= 16
+            and (
+                mixed_qkv_spec.is_contiguous()
+                or (
+                    mixed_qkv_spec.shape[0] in (5, 20)
+                    and mixed_qkv_spec.stride(1) == 1
+                    and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
+                )
+            )
+            and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
@@ -6048,6 +6063,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # Reuse the decode loader with the original fused verifier's
                 # gating, BV32 reduction and FP32 state. Avoid materializing
                 # three contiguous splits and concatenating them again.
+                direct_verify_out = bool(
+                    spec_rows_are_batch
+                    and num_actual_tokens == mixed_qkv_spec.shape[0]
+                    and num_actual_tokens in (5, 20)
+                    and core_attn_out.is_contiguous()
+                    and core_attn_out.dtype == mixed_qkv_spec.dtype
+                )
                 core_attn_out_spec, last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update_mixed_qkv(
                         A_log=self.A_log,
@@ -6067,6 +6089,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         ssm_state_indices=spec_state_indices_tensor,
                         num_accepted_tokens=spec_state_slot_selectors,
                         use_qk_l2norm_in_kernel=True,
+                        out=(
+                            core_attn_out[:num_actual_tokens].unsqueeze(0)
+                            if direct_verify_out
+                            else None
+                        ),
                     )
                 )
                 _log_runtime_route_once(
@@ -6281,7 +6308,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            if not use_dflash2_packed_gdn_verify:
+            if (
+                not use_dflash2_packed_gdn_verify
+                and core_attn_out_spec.squeeze(0).data_ptr()
+                != core_attn_out[:num_actual_tokens].data_ptr()
+            ):
                 core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec is not None and not (
             attn_metadata.num_prefills > 0
