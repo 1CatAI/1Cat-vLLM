@@ -1728,9 +1728,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 ids = ngram_ids.reshape(-1)
                 target = embedding_output.reshape(-1, self.head_dim)
                 if self._cascade:
-                    mask = torch.from_numpy(
-                        ple_disk_mask(ids.numpy(), self._disk_segments)
-                    )
+                    mask = ple_disk_mask(ids, self._disk_segments)
                     target[mask] = self.ngram_embedding.embedding_lookup(ids[mask])
                 else:
                     target.copy_(self.ngram_embedding.embedding_lookup(ids))
