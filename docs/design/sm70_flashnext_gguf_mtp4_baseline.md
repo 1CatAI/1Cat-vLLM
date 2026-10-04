@@ -109,3 +109,39 @@ The 27B result remains a separate smoke check. Ring merging requires a
 passing Flash-Next C4 comparison and natural output checks.
 Follow-up optimization starts with the actual trace and packed PLE pinned-UVA
 reading.
+
+## Longer C4 comparison
+
+The follow-up retains 128 input tokens, 8,704 capacity and batch budget 512,
+with 1,024 output tokens and three measured repeats per arm. Both use the
+normal package from `3720df1225`, wheel SHA256
+`def49fcd6c7ce3aad1150d898a65a4e461eba70c9b4147e72adcf3a2626599e9`;
+the native core remains unchanged. The only runner change adds existing,
+disabled-by-default diagnostic markers. Loading and warmup are excluded.
+
+| C4 measurement | Ring disabled | Ring automatic |
+|---|---:|---:|
+| Pure decode, repeats 1 / 2 / 3 | 228.918 / 229.421 / 233.225 tok/s | 260.337 / 263.335 / 263.158 tok/s |
+| Pure decode, total tokens / total seconds | 230.505 tok/s | 262.269 tok/s |
+| Complete engine round, weighted mean | 67.673 ms | 65.624 ms |
+| Full-cohort mean acceptance length | 3.285 | 3.830 |
+| Steady emitted tokens per request-round | 3.900 | 4.303 |
+| Steady intervals per repeat | 192 | 199 |
+| Steady emitted tokens per repeat | 2995 | 3425 |
+
+The observed weighted round reduction is 2.049 ms and pure decode improves
+13.780%. Each arm has identical complete 1,024-token lists and acceptance
+counters across its three repeats. All four separate natural prompts have
+identical token lists between arms and finish at EOS. This longer C4 smoke
+shows no throughput regression under its contract; it does not erase the
+negative 256-output-token point or establish all-workload non-regression.
+
+The forced-length timing lists differ between arms. Their first different
+zero-based positions are 34, 471, 495 and 669 for the four streams, repeated
+identically in all three comparisons. Differences include EOS and whitespace;
+the causal numerical attribution is not established. Therefore the throughput
+change includes a changed acceptance trajectory and must not be reported as
+isolated collective speedup. Ring merge output identity is scoped to the four
+natural EOS-enabled prompts. Distribution and long-output model quality
+remain separate follow-ups. Trace attribution next measures actual call counts,
+waiting and overlap against the unprofiled C1 baseline.
