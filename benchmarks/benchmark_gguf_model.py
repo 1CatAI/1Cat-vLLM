@@ -127,6 +127,10 @@ def main():
 
     llm = LLM(**config)
     try:
+        report["worker_routes"] = llm.collective_rpc(
+            "get_sm70_acceleration_report", timeout=30
+        )
+        save()
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
         if args.record_first_logprobs:
