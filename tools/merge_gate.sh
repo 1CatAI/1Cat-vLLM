@@ -32,6 +32,10 @@ for test_path in "$@"; do
     }
 done
 
+# Resolve mutable refs before tests; a concurrent fetch must not shrink scope.
+base=$(git rev-parse --verify "${base}^{commit}")
+mapfile -t changed_files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD)
+
 # These checks never reserve a GPU or load model weights. Native/GPU validation
 # remains required for changes to kernels or their execution paths.
 export CUDA_VISIBLE_DEVICES=''
@@ -51,7 +55,6 @@ git diff --check "$base" HEAD
     tests/models/qwen4_exp/test_ple_auto_hybrid_budget.py \
     tests/models/qwen4_exp/test_ple_cache_budget.py
 "$python" tools/run_cpu_tests.py --noconftest -q "$@"
-mapfile -t changed_files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD)
 if [[ ${#changed_files[@]} -gt 0 ]]; then
     "$python" -m pre_commit run --files "${changed_files[@]}"
 fi
