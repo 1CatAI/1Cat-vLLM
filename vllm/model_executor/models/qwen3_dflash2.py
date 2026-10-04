@@ -353,11 +353,13 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         output_size: int,
         prefix: str,
     ) -> nn.Module:
+        from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+
         use_sharded_fc = (
             sm70_dflash2_enabled(
                 "sharded_context_fc", capture_sm70_dflash2_config(vllm_config)
             )
-            and self.quant_config is None
+            and (self.quant_config is None or isinstance(self.quant_config, GGUFConfig))
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
             and vllm_config.parallel_config.tensor_parallel_size == 4
@@ -381,7 +383,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             bias=False,
             gather_output=True,
             params_dtype=vllm_config.model_config.dtype,
-            quant_config=None,
+            quant_config=self.quant_config,
             prefix=prefix,
             return_bias=False,
         )

@@ -101,6 +101,7 @@ def test_norm_retains_its_policy_after_initialization_context_ends(monkeypatch):
 def _hash_subject(method, policy):
     return NS(
         method=method,
+        use_local_argmax_reduction=False,
         sm70_dflash2=policy,
         mtp_expert_quantization=None,
         draft_model_config=None,

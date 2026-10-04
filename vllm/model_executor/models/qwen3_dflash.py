@@ -3,6 +3,7 @@
 
 import io
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +62,16 @@ logger = init_logger(__name__)
 
 
 _SLIDING_ATTENTION = "sliding_attention"
+
+
+def _dflash_context_projection_dtype(projection: nn.Module) -> torch.dtype | None:
+    weight = getattr(projection, "weight", None)
+    if weight is not None and weight.is_floating_point():
+        return weight.dtype
+    # Packed weights have no floating weight parameter. Their quantization
+    # method declares the projection operand dtype independently of storage.
+    dtype = getattr(getattr(projection, "quant_method", None), "params_dtype", None)
+    return dtype if dtype in (torch.float16, torch.bfloat16, torch.float32) else None
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
@@ -1034,10 +1045,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             or not self.model.use_aux_hidden_state
         ):
             return None
-        weight = getattr(self.model.fc, "weight", None)
-        return (
-            weight.dtype if weight is not None and weight.is_floating_point() else None
-        )
+        return _dflash_context_projection_dtype(self.model.fc)
 
     def combine_aux_hidden_states(
         self, aux_hidden_states: list[torch.Tensor]
@@ -1080,9 +1088,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # AWQ target paths can surface fp32 auxiliary states even when the
         # draft projection is initialized in fp16. Match the FC weight dtype
         # before dispatching the linear kernel.
-        fc_weight = getattr(self.model.fc, "weight", None)
-        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
-            hidden_states = hidden_states.to(dtype=fc_weight.dtype)
+        projection_dtype = _dflash_context_projection_dtype(self.model.fc)
+        if projection_dtype is not None and hidden_states.dtype != projection_dtype:
+            hidden_states = hidden_states.to(dtype=projection_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
@@ -1156,11 +1164,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             return None
 
         MASK_EMBEDDING_FILENAME = "mask_embedding.pt"
-        data = get_hf_file_bytes(
-            MASK_EMBEDDING_FILENAME,
-            self.draft_model_config.model,
-            self.draft_model_config.revision,
-        )
+        source = Path(getattr(self, "_gguf_model_path", self.draft_model_config.model))
+        if source.is_file() or source.is_dir():
+            directory = source.parent if source.is_file() else source
+            override = directory / MASK_EMBEDDING_FILENAME
+            data = override.read_bytes() if override.is_file() else None
+        else:
+            data = get_hf_file_bytes(
+                MASK_EMBEDDING_FILENAME,
+                self.draft_model_config.model,
+                self.draft_model_config.revision,
+            )
         if data is None:
             return None
 
