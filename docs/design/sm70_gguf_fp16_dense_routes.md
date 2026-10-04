@@ -88,8 +88,7 @@ admitted TP collective is a separate change.
 
 Loading and route preparation have focused CPU regressions, including mixed
 format rejection, layout rejection, shard order, storage sharing and router
-FP32 admission. The combined HC/dense model C1/C4 comparison remains pending.
-No end-to-end speedup is claimed here.
+FP32 admission. The first combined model comparison follows below.
 
 ## First combined model comparison
 
@@ -124,7 +123,24 @@ the same token IDs as the previous ring-enabled runtime and finish at EOS.
 
 C4 fails the throughput nonregression check, despite its nearly unchanged
 round time. Promotion remains blocked on localizing the acceptance change.
-The M=20 a/b projection currently leaves the row path and uses a combined
-dense GEMM, whereas the old floating shards use separate GEMMs. An extended
-row screen checks whether M=20/32 can preserve the M1 arithmetic exactly;
-the model result for that follow-up is not yet available.
+In that candidate, the M=20 a/b projection leaves the row path and uses a
+combined dense GEMM, whereas the old floating shards use separate GEMMs.
+This is a candidate numerical difference, not a confirmed cause of the
+acceptance regression.
+
+## Extended a/b row dispatch
+
+Source `da9b6c4232`, ordinary package `1.5.2.dev491+gda9b6c423.precompiled`,
+extends the measured GDN a/b row reduction through M=32. It does not extend
+unrelated dense projection policies. Hardware, real weights and graph timing
+method match the preceding a/b comparison.
+
+| M | Separate dense chain (µs) | Row chain (µs) | Saved per chain (ms) | Maximum absolute error against FP32 reference | Relative L2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20 | 712.540 | 130.253 | 0.582 | 3.05e-5 | 1.41e-5 |
+| 32 | 687.534 | 155.382 | 0.532 | 1.22e-4 | 3.79e-5 |
+
+For all 36 real layers, batched M=20 and M=32 outputs equal concatenated M=1
+row calls bitwise. The route check rejects dense GEMM. This local result does
+not establish restored model acceptance; the combined C1/C4 follow-up also
+includes packed vocabulary projection and fused expert alignment.
