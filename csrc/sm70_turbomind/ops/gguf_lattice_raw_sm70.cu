@@ -479,10 +479,11 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
   typename Decode::Parameters parameters{};
   if (lane < width)
     parameters = Decode::template parameters<FullWidth>(tile, width, lane);
-  auto current = Decode::template fetch<FullWidth>(tile, width, warp);
   const int warps = blockDim.x / 32;
+  const int first_octet = warp + warps * blockIdx.z;
   const int step = warps * gridDim.z;
-  for (int octet = warp + warps * blockIdx.z; octet < 32; octet += step) {
+  auto current = Decode::template fetch<FullWidth>(tile, width, first_octet);
+  for (int octet = first_octet; octet < 32; octet += step) {
     typename Decode::PacketWindow next{};
     if (octet + step < 32)
       next = Decode::template fetch<FullWidth>(tile, width, octet + step);

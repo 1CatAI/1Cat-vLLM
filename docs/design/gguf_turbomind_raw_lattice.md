@@ -1139,3 +1139,9 @@ K-octets across two or four CTAs per original block, providing more active CTAs
 without changing storage. Each CTA writes a disjoint set of octets. Original
 metadata may be reread through cache; DRAM counters must establish its cost.
 The natural-layout shared-transpose kernel retains its one-CTA contract.
+
+The first partitioned build passed 36 checks and failed four random-weight
+checks: the initial packet prefetch used octet `warp` instead of the partition's
+first octet. Constant-weight cancellation tests cannot detect that indexing
+error. The prefetch address is corrected before collecting any speed evidence;
+the failed build has no timing result or model eligibility.
