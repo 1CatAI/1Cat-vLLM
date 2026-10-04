@@ -39,6 +39,29 @@ finally:
     sys.path[:] = _original_path
 
 
+def worker_decode_routes(worker):
+    report = worker.get_sm70_acceleration_report()
+    config = worker.model_runner.compilation_config
+    manager = getattr(worker.model_runner, "cudagraph_manager", None)
+    mode = config.cudagraph_mode if manager is None else manager.cudagraph_mode
+    report.update(
+        compilation_mode=config.mode.name,
+        cudagraph_mode=mode.name,
+        decode_cudagraph_mode=mode.decode_mode().name,
+        mixed_cudagraph_mode=mode.mixed_mode().name,
+    )
+    if manager is not None:
+        report["captured_full_decode_tokens"] = sorted(
+            {
+                desc.num_tokens
+                for desc in manager.graphs
+                if desc.cg_mode.name == "FULL"
+                and desc.uniform_token_count == manager.decode_query_len
+            }
+        )
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -192,9 +215,7 @@ def main():
                 "FULL decode CUDA graph is unavailable with "
                 f"{resolved.cudagraph_mode.name}; no timing results recorded"
             )
-        report["worker_routes"] = llm.collective_rpc(
-            "get_sm70_acceleration_report", timeout=30
-        )
+        report["worker_routes"] = llm.collective_rpc(worker_decode_routes, timeout=30)
         save()
         for worker in report["worker_routes"]:
             if not args.eager and worker["decode_cudagraph_mode"] != "FULL":
@@ -202,6 +223,14 @@ def main():
                     f"Rank {worker['rank']} cannot run FULL decode CUDA graph: "
                     f"{worker['cudagraph_mode']}; no timing results recorded"
                 )
+            if not args.eager and "captured_full_decode_tokens" in worker:
+                query_len = 5 if args.mtp_draft else 1
+                required = {width * query_len for width in args.widths}
+                if not required.issubset(worker["captured_full_decode_tokens"]):
+                    raise RuntimeError(
+                        f"Rank {worker['rank']} lacks FULL decode graphs for "
+                        f"{sorted(required)} tokens; no timing results recorded"
+                    )
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
         if args.record_first_logprobs:
