@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--kv-cache-dtype", default="auto")
     parser.add_argument("--ssm-state-dtype")
-    parser.add_argument("--record-first-logits", action="store_true")
+    parser.add_argument("--record-first-logprobs", action="store_true")
     args = parser.parse_args()
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Benchmark requires an ordinary installed wheel")
@@ -92,8 +92,8 @@ def main():
         config["quantization"] = "gguf"
     if args.ssm_state_dtype:
         config["mamba_ssm_cache_dtype"] = args.ssm_state_dtype
-    if args.record_first_logits:
-        config.update(max_logprobs=-1, logprobs_mode="raw_logits")
+    if args.record_first_logprobs:
+        config.update(max_logprobs=-1, logprobs_mode="raw_logprobs")
     report = {
         "vllm_version": vllm.__version__,
         "vllm_origin": vllm.__file__,
@@ -114,7 +114,7 @@ def main():
             "no_mtp": True,
         },
         "natural_greedy": [],
-        "first_logits": [],
+        "first_logprobs": [],
         "decode": [],
         "prefill": [],
         "complete": False,
@@ -129,7 +129,7 @@ def main():
     try:
         tokenizer = llm.get_tokenizer()
         rows = json.loads(args.prompts_json.read_text())
-        if args.record_first_logits:
+        if args.record_first_logprobs:
             first = llm.generate(
                 [{"prompt_token_ids": r["prompt_token_ids"]} for r in rows],
                 SamplingParams(temperature=0, max_tokens=1, logprobs=-1),
@@ -141,19 +141,20 @@ def main():
                 for token_id, entry in entries.items():
                     values[token_id] = entry.logprob
                 if not np.isfinite(values).all():
-                    raise RuntimeError("Incomplete or nonfinite first-logit vector")
+                    raise RuntimeError("Incomplete or nonfinite first-logprob vector")
                 path = args.output.with_name(
-                    f"{args.output.stem}.prompt-{index}.logits.npy"
+                    f"{args.output.stem}.prompt-{index}.logprobs.npy"
                 )
                 np.save(path, values)
                 top = np.argsort(values)[-10:][::-1]
-                report["first_logits"].append(
+                report["first_logprobs"].append(
                     {
                         "index": index,
                         "path": str(path),
                         "vocabulary": len(values),
+                        "representation": "log_softmax(raw_logits)",
                         "top10_ids": top.tolist(),
-                        "top10_logits": values[top].tolist(),
+                        "top10_logprobs": values[top].tolist(),
                     }
                 )
             save()
