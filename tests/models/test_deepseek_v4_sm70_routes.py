@@ -74,8 +74,13 @@ def test_sparse_decode_retains_paged_route_for_measured_overhead_cases(
     assert (reason is None) is preferred
 
 
-@pytest.mark.parametrize("full_graph", [False, True])
-def test_indexer_uses_live_bounds_and_rejects_fixed_serving_graph_buckets(full_graph):
+@pytest.mark.parametrize(
+    ("full_graph", "context_bucket", "blocked"),
+    [(False, None, False), (True, None, True), (True, 65536, False)],
+)
+def test_indexer_takes_cublas_only_under_a_bounded_key_length(
+    full_graph, context_bucket, blocked
+):
     from types import SimpleNamespace
 
     from vllm.config import CUDAGraphMode
@@ -87,7 +92,8 @@ def test_indexer_uses_live_bounds_and_rejects_fixed_serving_graph_buckets(full_g
     lengths = torch.ones(3, dtype=torch.int32)
     table = torch.zeros((1, 16), dtype=torch.int32)
     context = SimpleNamespace(
-        cudagraph_runtime_mode=CUDAGraphMode.FULL if full_graph else CUDAGraphMode.NONE
+        cudagraph_runtime_mode=CUDAGraphMode.FULL if full_graph else CUDAGraphMode.NONE,
+        batch_descriptor=SimpleNamespace(attention_context_bucket=context_bucket),
     )
     with (
         patch.object(indexer, "is_forward_context_available", return_value=True),
@@ -100,9 +106,9 @@ def test_indexer_uses_live_bounds_and_rejects_fixed_serving_graph_buckets(full_g
         reason = indexer._decode_cublas_blocker(
             q, cache, weights, lengths, table, 1024, True, 1
         )
-    assert (reason is not None) is full_graph
-    if full_graph:
-        assert "full-graph" in reason
+    assert (reason is not None) is blocked
+    if blocked:
+        assert "full length" in reason
 
 
 def test_sm70_sparse_backend_contract():

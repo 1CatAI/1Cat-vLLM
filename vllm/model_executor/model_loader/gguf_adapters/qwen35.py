@@ -12,6 +12,7 @@ import regex as re
 import torch
 
 from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
+from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 
 _GLOBALS = {
     "token_embd.weight": "model.embed_tokens.weight",
@@ -61,6 +62,10 @@ def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
 
 
 class Qwen35Adapter:
+    global_names = _GLOBALS
+    layer_names = _LAYERS
+    architecture_label = "Qwen3.5"
+
     def __init__(self, config, tp_size=1):
         self.config = config
         self.tp_size = tp_size
@@ -79,8 +84,8 @@ class Qwen35Adapter:
     def build_name_map(self, tensors):
         result = {}
         for name in tensors:
-            if name in _GLOBALS:
-                result[name] = _GLOBALS[name]
+            if name in self.global_names:
+                result[name] = self.global_names[name]
                 continue
             match = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
             if match:
@@ -92,10 +97,10 @@ class Qwen35Adapter:
                         self.config, "num_nextn_predict_layers", 0
                     ):
                         continue
-                elif suffix in _LAYERS:
-                    result[name] = f"model.layers.{block}.{_LAYERS[suffix]}"
+                elif suffix in self.layer_names:
+                    result[name] = f"model.layers.{block}.{self.layer_names[suffix]}"
                     continue
-            raise ValueError(f"Unmapped Qwen3.5 GGUF tensor: {name}")
+            raise ValueError(f"Unmapped {self.architecture_label} GGUF tensor: {name}")
         return result
 
     @staticmethod
@@ -109,7 +114,7 @@ class Qwen35Adapter:
             (".down_proj.weight", ".out_proj.weight", ".o_proj.weight")
         ):
             return False
-        block_size, _ = gguf.GGML_QUANT_SIZES[tensor.tensor_type]
+        block_size, _ = quant_size(tensor.tensor_type)
         local_k, remainder = divmod(int(tensor.shape[0]), self.tp_size)
         tiled_span = local_k
         if self.layout is not None and name.endswith("linear_attn.out_proj.weight"):
@@ -190,10 +195,8 @@ class Qwen35Adapter:
             dense_fallback = self.needs_dense_fallback(name, tensor)
             if quantized and (not self.is_linear(name) or dense_fallback):
                 # Embeddings and convolution use the model's dense parameters.
-                data = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
-                # Dequantization already owns a new dense array. Retain it
-                # through Torch instead of duplicating the full vocabulary
-                # table in each TP worker before dtype conversion.
+                data = dequantize(tensor.data, tensor.tensor_type)
+                # Dequantization owns this dense array; avoid a second copy.
                 weight = torch.from_numpy(data)
             elif tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
                 data = tensor.data.view(np.uint16).copy()

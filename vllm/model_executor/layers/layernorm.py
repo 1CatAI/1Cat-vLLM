@@ -226,6 +226,32 @@ def _sm70_dflash2_gemma_fused_add_rms_norm(
     return normalized_out, residual_out
 
 
+def _sm70_dflash2_gemma_fused_add_rms_boundary(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _sm70_dflash2_gemma_fused_add_rms_norm(x, residual, weight, variance_epsilon)
+
+
+def _sm70_dflash2_gemma_fused_add_rms_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="sm70_dflash2_gemma_fused_add_rms_norm",
+    op_func=_sm70_dflash2_gemma_fused_add_rms_boundary,
+    fake_impl=_sm70_dflash2_gemma_fused_add_rms_fake,
+    mutates_args=[],
+)
+
+
 def _use_sm70_dflash2_gemma_fused_add_rms(
     x: torch.Tensor,
     residual: torch.Tensor | None,
@@ -591,7 +617,7 @@ class GemmaRMSNorm(CustomOp):
             x, residual, self.weight, self._sm70_dflash2_policy
         ):
             assert residual is not None
-            return _sm70_dflash2_gemma_fused_add_rms_norm(
+            return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
                 x,
                 residual,
                 self.weight,
@@ -653,7 +679,7 @@ class GemmaRMSNorm(CustomOp):
             x, residual, self.weight, self._sm70_dflash2_policy
         ):
             assert residual is not None
-            return _sm70_dflash2_gemma_fused_add_rms_norm(
+            return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
                 x,
                 residual,
                 self.weight,
