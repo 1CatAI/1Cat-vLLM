@@ -5125,6 +5125,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged is not None
             and _callable_accepts_keyword(self.flash_attn_prefill_paged, "anchor_lens")
         )
+        self._flash_prefill_paged_supports_dflash2_bmhd = bool(
+            getattr(self.flash_attn_prefill_paged, "_sm70_dflash2_direct_bmhd", False)
+        )
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
             os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
@@ -8916,7 +8919,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and not causal
             and bool(getattr(layer, "is_dflash_draft_attn", False))
             and anchor_lens is None
-            and num_seqs > 1
+            and (
+                num_seqs > 1
+                or (
+                    num_seqs == 1
+                    and self._flash_prefill_paged_supports_dflash2_bmhd
+                    and max_query_len == 8
+                    and query.shape[1:] == (8, 128)
+                    and query.dtype == torch.float16
+                    and block_size in (1024, 2048)
+                    and key_cache.dtype == value_cache.dtype == torch.float16
+                    and window_size == (2047, 2047)
+                )
+            )
             and 0 < max_query_len <= 16
             and query.shape[0] == num_seqs * max_query_len
             and bool(torch.all(query_lens == max_query_len).item())
