@@ -50,10 +50,12 @@ semantics: both must be off to disable packed GDN. Runtime checks determine
 whether loaded projections actually prepare these buffers. For other layouts
 the report omits the estimate rather than guessing their memory consumption.
 
-Router/shared packing also requires the worker's runtime precision policy:
-FP16 reduced-precision reductions enabled and FP16 accumulation disabled. A
-worker that disables reduced reductions never uses these packed kernels and
-now skips their 199.0625 MiB/rank of copies in the reference TP4 MTP layout.
+Router/shared packing also follows the worker's runtime precision policy.
+Both require FP16 accumulation to be disabled. The router uses ordered FP32
+partials and remains admitted with FP16 reduced-precision reductions disabled.
+The shared-expert kernel retains its FP16 partial policy, so disabling reduced
+reductions skips its unused pack. With FP16 accumulation enabled, both packs
+are rejected. The reference TP4 MTP router/shared copies total 199.0625 MiB/rank.
 The configured memory estimate remains conditional on those precision guards;
 the loaded-worker `sm70_preparations` report records the actual packed bytes
 and `_sm70_mtp_{router,shared}_batch_reason` when preparation is skipped.

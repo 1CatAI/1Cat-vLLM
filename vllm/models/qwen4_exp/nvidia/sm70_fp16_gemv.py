@@ -580,7 +580,9 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
     # configure it before preparing weights, not during graph replay.
     matmul = torch.backends.cuda.matmul
     reason = None
-    if not matmul.allow_fp16_reduced_precision_reduction:
+    # Router partials and their ordered sum stay FP32. Its preparation must
+    # match _router_batch_runtime_ok rather than the cuBLAS reduction switch.
+    if role != "router" and not matmul.allow_fp16_reduced_precision_reduction:
         reason = "fp16_reduced_precision_reduction_disabled"
     elif matmul.allow_fp16_accumulation:
         reason = "fp16_accumulation_enabled"
