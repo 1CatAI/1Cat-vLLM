@@ -211,6 +211,29 @@ def main() -> None:
                 phase_events = args.phase_events and repeat >= 0
                 phase_records = None
                 if phase_events:
+                    # Paired ordinary control in the same loaded engine/cache.
+                    control = llm.generate(
+                        [{"prompt_token_ids": fixture["prompt_token_ids"]}],
+                        SamplingParams(**sampling),
+                        use_tqdm=False,
+                    )[0]
+                    control_after = _metric_snapshot(llm)
+                    control_metrics = _request_metrics_dict(
+                        control.metrics, len(control.outputs[0].token_ids)
+                    )
+                    control_spec = _spec_decoding_delta(before, control_after)
+                    report.setdefault("phase_event_controls", []).append(
+                        {
+                            "id": fixture["id"],
+                            "repeat": repeat,
+                            "token_ids": list(control.outputs[0].token_ids),
+                            "metrics": control_metrics,
+                            "spec_decoding": control_spec,
+                        }
+                    )
+                    save()
+                    llm.reset_prefix_cache()
+                    before = _metric_snapshot(llm)
                     llm.collective_rpc("install_mtp_phase_events")
                 if traced:
                     llm.collective_rpc(
