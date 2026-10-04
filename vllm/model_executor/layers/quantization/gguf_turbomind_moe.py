@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.gguf import (
     admit_moe_fallback,
     decoder_family,
     lattice_grouped_capabilities,
+    raw_grouped_gate_up_capabilities,
     select_lattice_grouped_capability,
 )
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
@@ -31,15 +32,93 @@ from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
 )
 from vllm.model_executor.layers.quantization.gguf_moe import GGUFNativeMoEMethod
 from vllm.model_executor.layers.quantization.gguf_native import pad_weight_tail
+from vllm.model_executor.layers.quantization.gguf_raw import RawGGUFProjection
 from vllm.model_executor.layers.quantization.gguf_transcode import (
     AffineGGUFProjection,
     transcode_affine,
 )
+from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+def _expert_gate_up(
+    x: torch.Tensor,
+    offsets: torch.Tensor,
+    ids: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_up: torch.Tensor,
+    gate_ptrs: torch.Tensor,
+    gate_stats: torch.Tensor,
+    up_ptrs: torch.Tensor,
+    up_stats: torch.Tensor,
+    source_type: int,
+    experts: int,
+    group: int,
+    output_size: int,
+    top_k: int,
+    raw_batches: list[int],
+    vector_bands: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Resolve original M inside the opaque op. Range compilation must not
+    # freeze the prefill choice for subsequent MTP verification batches.
+    gate = x.new_empty((x.shape[0], output_size))
+    up = torch.empty_like(gate)
+    if x.shape[0] // top_k in raw_batches:
+        torch.ops._C.gguf_lattice_raw_grouped_gate_up_sm70_out(
+            gate, up, x, raw_gate, raw_up, offsets, ids, source_type, top_k
+        )
+    else:
+        vector = any(
+            x.shape[0] >= vector_bands[i]
+            and (vector_bands[i + 1] < 0 or x.shape[0] <= vector_bands[i + 1])
+            for i in range(0, len(vector_bands), 2)
+        )
+        op = (
+            torch.ops._C.gguf_lattice_grouped_vec_sm70_out
+            if vector
+            else torch.ops._C.gguf_lattice_grouped_gemm_sm70_out
+        )
+        for out, weights, stats in (
+            (gate, gate_ptrs, gate_stats),
+            (up, up_ptrs, up_stats),
+        ):
+            op(out, x, offsets, weights, stats, source_type, experts, group)
+    return gate, up
+
+
+def _expert_gate_up_fake(
+    x,
+    offsets,
+    ids,
+    raw_gate,
+    raw_up,
+    gate_ptrs,
+    gate_stats,
+    up_ptrs,
+    up_stats,
+    source_type,
+    experts,
+    group,
+    output_size,
+    top_k,
+    raw_batches,
+    vector_bands,
+):
+    return x.new_empty((x.shape[0], output_size)), x.new_empty(
+        (x.shape[0], output_size)
+    )
+
+
+direct_register_custom_op(
+    op_name="gguf_expert_gate_up",
+    op_func=_expert_gate_up,
+    fake_impl=_expert_gate_up_fake,
+)
 
 
 class GGUFExpertBank(torch.nn.Module):
-    def __init__(self, source_type, experts, device, dtype):
+    def __init__(self, source_type, experts, device, dtype, retain_raw=False):
         super().__init__()
         self.source_type = source_type
         self.experts = experts
@@ -48,6 +127,9 @@ class GGUFExpertBank(torch.nn.Module):
         self.family = decoder_family(source_type)
         self.pending: dict[int, Any] = {}
         self.capabilities: tuple[GGUFOperatorCapability, ...] = ()
+        self.retain_raw = retain_raw
+        self.raw_pending: dict[int, torch.Tensor] = {}
+        self.raw_capabilities: tuple[GGUFOperatorCapability, ...] = ()
 
     def add(self, index, weight, rank, size, axis):
         if weight.ndim != 2 or not 0 <= index < self.experts:
@@ -78,6 +160,20 @@ class GGUFExpertBank(torch.nn.Module):
         )
         if self.n % 32:
             raise ValueError("Canonical GGUF expert output cuts a 32-row pack")
+        if self.retain_raw:
+            self.raw_capabilities = raw_grouped_gate_up_capabilities(
+                self.source_type,
+                self.k,
+                self.n,
+                self.experts,
+                self.dtype,
+                is_sm70=current_platform.is_device_capability(70),
+            )
+            if any(c.reason is None for c in self.raw_capabilities):
+                raw = RawGGUFProjection.from_rows(source, self.source_type).tp_slice(
+                    rank, size, axis=axis
+                )
+                self.raw_pending[index] = torch.from_numpy(raw.data).to(self.device)
         if isinstance(canonical, LatticeGGUFProjection):
             codes, stats = canonical.mma884_storage()
             stats = stats.view({2: np.int16, 4: np.int32, 8: np.int64}[stats.itemsize])
@@ -152,6 +248,15 @@ class GGUFExpertBank(torch.nn.Module):
                     ),
                 )
         self.pending.clear()
+        if self.raw_pending:
+            if set(self.raw_pending) != set(range(self.experts)):
+                raise ValueError("Incomplete original-block GGUF expert bank")
+            self.register_buffer(
+                "raw_weights",
+                torch.stack([self.raw_pending[i] for i in range(self.experts)]),
+                persistent=False,
+            )
+            self.raw_pending.clear()
         if not any(c.reason is None for c in self.capabilities):
             raise ValueError("No admitted canonical GGUF expert operator")
 
@@ -212,6 +317,9 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 self.num_experts,
                 param.device,
                 self.params_dtype,
+                retain_raw=self.native_enabled
+                and shard_id in ("w1", "w3")
+                and self.weight_types[shard_id] in (21, 22),
             )
         self.builders[shard_id].add(
             expert_id,
@@ -245,10 +353,40 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             and self.hidden_size == 2560
             and layer.ep_size == 1
         )
+        gate, up = banks["w1"], banks["w3"]
+        self.raw_gate_up = bool(
+            layer.ep_size == 1
+            and gate.source_type == up.source_type
+            and hasattr(gate, "raw_weights")
+            and hasattr(up, "raw_weights")
+        )
+        if not self.raw_gate_up:
+            for bank in (gate, up):
+                if hasattr(bank, "raw_weights"):
+                    del bank.raw_weights
+        self.raw_batches = (
+            [c.min_m for c in gate.raw_capabilities if c.reason is None]
+            if self.raw_gate_up
+            else []
+        )
+        self.vector_bands = [
+            bound
+            for c in gate.capabilities[1:]
+            if c.reason is None
+            for bound in (c.min_m, c.max_m or -1)
+        ]
         self.native_admission = {
             "enabled": True,
             "tp_size": layer.tp_size,
             "ep_size": layer.ep_size,
+            "joint_gate_up": {
+                "enabled": self.raw_gate_up,
+                "original_batches": self.raw_batches,
+                "outside_m_band": "canonical_grouped_operator",
+                "reason": None
+                if self.raw_gate_up
+                else "requires_matching_admitted_original_block_banks_without_ep",
+            },
             "routing": {
                 **asdict(SM70_SMALL_ROUTING),
                 "enabled": self.small_routing,
@@ -262,6 +400,10 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                     "source_type": quant_type_name(bank.source_type),
                     "shape": [bank.experts, bank.n, bank.k],
                     "operators": [asdict(c) for c in bank.capabilities],
+                    "raw_gate_up_operators": [asdict(c) for c in bank.raw_capabilities],
+                    "raw_storage_bytes": bank.raw_weights.numel()
+                    if hasattr(bank, "raw_weights")
+                    else 0,
                 }
                 for name, bank in banks.items()
             },
@@ -300,8 +442,29 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             offsets = torch.searchsorted(sorted_ids, boundaries).to(torch.int32)
             routed = x[torch.div(order, top_k, rounding_mode="floor")].contiguous()
         bank = layer.gguf_expert_banks
-        gate = bank["w1"](routed, offsets, sorted_ids)
-        up = bank["w3"](routed, offsets, sorted_ids)
+        if self.raw_gate_up and layer.expert_map is None:
+            gate_bank, up_bank = bank["w1"], bank["w3"]
+            gate, up = torch.ops.vllm.gguf_expert_gate_up(
+                routed,
+                offsets,
+                sorted_ids,
+                gate_bank.raw_weights,
+                up_bank.raw_weights,
+                gate_bank.weight_ptrs,
+                gate_bank.stat_ptrs,
+                up_bank.weight_ptrs,
+                up_bank.stat_ptrs,
+                gate_bank.source_type,
+                self.num_experts,
+                gate_bank.group,
+                gate_bank.n,
+                top_k,
+                self.raw_batches,
+                self.vector_bands,
+            )
+        else:
+            gate = bank["w1"](routed, offsets, sorted_ids)
+            up = bank["w3"](routed, offsets, sorted_ids)
         hidden = torch.nn.functional.silu(gate) * up
         down = bank["w2"](hidden.contiguous(), offsets, sorted_ids)
         if small_routing:
