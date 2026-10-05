@@ -80,5 +80,31 @@ canonical 74.752/73.728us versus native 55.296/55.296us. Layer42 changes
 clocks between arms in that installed wiring run; its timing is not treated
 as a stable ABBA result. The focused stable raw-operator comparison above
 establishes its admission, and the installed run establishes its numerical
-and graph behavior. Natural model output and primary-machine operator
-comparison remain pending before promotion.
+and graph behavior. Natural model output passes as described below. Primary-machine operator
+comparison remains pending before promotion.
+
+## AOT module integration
+
+Registered parameter lists cannot be star-unpacked by the AOT frontend.
+Explicit gate/up record and type indexing fixes the module wrappers;
+twelve combined pure/mixed dispatch and real-module AOT capture tests pass.
+The initial model startup failure is retained and reached no inference.
+
+The normal installed `dev18+ge3ac73f9d5` package has the same native module
+bytes as the measured `dev16` package. Joint target/Q8_0 DFlash2 startup,
+AOT compilation and M8 full graph capture pass on TP4 V100-SXM2-32GB
+with ring NVLink, CUDA 12.8, Torch 2.10, FP16 KV and FP32 SSM. The 32K
+configuration uses a 1024-token batch budget, one sequence, seven
+probabilistic draft tokens, temperature 0.7/top-p 0.9/top-k 20 and seed 123.
+Both short prompts respect EOS and naturally stop within 128 tokens:
+arithmetic outputs `391`, and an English unit-testing question gets one
+reasonable explanatory sentence. Four rank reports each admit eight pure
+pairs and all eleven IQ3_S/IQ4_XS mixed pairs. The other twenty-nine mixed
+pairs retain canonical dispatch. This check establishes model integration
+and natural text health, not end-to-end performance or a primary-machine
+speed comparison.
+
+The complete package SHA256 is
+`d72cd64639199773252bc3617b74397a240657a502d3eb13a653d2a6c114373b`.
+The source-sized readers preserve both scale levels; neither the AOT fix
+nor model wiring changes FP16 operand or FP32 accumulation precision.
