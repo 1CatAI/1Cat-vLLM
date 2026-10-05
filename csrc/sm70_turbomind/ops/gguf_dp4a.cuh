@@ -139,7 +139,7 @@ struct RowIntegerGroup {
     RowIntegerGroup result;
     if constexpr (Kind == 0) {
       const auto* packets = reinterpret_cast<const int4*>(row + group * 32);
-      const int4 a = packets[0], b = packets[1];
+      const int4 a = __ldg(packets), b = __ldg(packets + 1);
       result.words[0] = a.x;
       result.words[1] = a.y;
       result.words[2] = a.z;
@@ -148,11 +148,12 @@ struct RowIntegerGroup {
       result.words[5] = b.y;
       result.words[6] = b.z;
       result.words[7] = b.w;
-      result.scale0 = scales[group * 2];
-      result.scale1 = scales[group * 2 + 1];
+      result.scale0 = __ldg(scales + group * 2);
+      result.scale1 = __ldg(scales + group * 2 + 1);
       result.minimum = 0.f;
     } else {
-      const int4 packet = *reinterpret_cast<const int4*>(row + group * 16);
+      const int4 packet =
+          __ldg(reinterpret_cast<const int4*>(row + group * 16));
       const int packed[4] = {packet.x, packet.y, packet.z, packet.w};
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
@@ -166,8 +167,8 @@ struct RowIntegerGroup {
           result.words[2 * i + 1] = Lut::iq_values(value >> 16) ^ 0x80808080U;
         }
       }
-      result.scale0 = result.scale1 = scales[group];
-      result.minimum = Kind == 1 ? mins[group] : 0.f;
+      result.scale0 = result.scale1 = __ldg(scales + group);
+      result.minimum = Kind == 1 ? __ldg(mins + group) : 0.f;
     }
     return result;
   }

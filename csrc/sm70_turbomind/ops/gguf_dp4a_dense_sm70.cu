@@ -170,10 +170,13 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
 }
 
 template <int Reader, int TileM, bool Activated>
-__global__ void row_dense(half* out, float* partial, const Q8_1* x,
-                          const uint8_t* weight, const float* scales,
-                          const float* mins, int scale_stride, int m, int n,
-                          int k, int split, int out_stride, int row_stride) {
+__global__ void row_dense(half* __restrict__ out, float* __restrict__ partial,
+                          const Q8_1* __restrict__ x,
+                          const uint8_t* __restrict__ weight,
+                          const float* __restrict__ scales,
+                          const float* __restrict__ mins, int scale_stride,
+                          int m, int n, int k, int split, int out_stride,
+                          int row_stride) {
   extern __shared__ Q8_1 activations[];
   const int tiles_m = (m + TileM - 1) / TileM;
   const int begin_m = (blockIdx.x % tiles_m) * TileM;
