@@ -65,6 +65,7 @@ def main():
     parser.add_argument("data", type=Path)
     parser.add_argument("gates", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--all-attention", action="store_true")
     args = parser.parse_args()
     data = torch.load(args.data, map_location="cpu", weights_only=True)
     gates = torch.load(args.gates, map_location="cpu", weights_only=True)
@@ -72,8 +73,13 @@ def main():
     for record in data:
         examples.setdefault(record["kind"], record)
     cases = []
-    for kind in ("gdn_in", "gdn_out", "attn_in", "attn_out"):
-        record = examples[kind]
+    dense_records = (
+        [r for r in data if r["kind"] == "attn_in"]
+        if args.all_attention
+        else [examples[kind] for kind in ("gdn_in", "gdn_out", "attn_in", "attn_out")]
+    )
+    for record in dense_records:
+        kind = record["kind"]
         a, b = projections(record, False), projections(record, True)
         assert all(hasattr(p, "segment_format") for p in b)
         assert all(p.codes.dtype == torch.uint8 for p in b)
@@ -96,6 +102,8 @@ def main():
             cases.append(
                 dict(
                     kind=kind,
+                    layer=record["layer"],
+                    shapes=[list(p.kernel.config.partition_weight_shape) for p in b],
                     m=m,
                     relative_l2=error,
                     abba=rows,

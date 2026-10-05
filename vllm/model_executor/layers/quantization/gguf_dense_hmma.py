@@ -41,7 +41,10 @@ def prepare_segment_bank(projection, canonical, device):
     elif source not in _FORMATS:
         reason = "segment_format_not_supported"
     elif (k, n) not in (
-        {(2560, width) for width in (128, 160, 256, 320, 1536, 2560, 3072, 3328, 4096)}
+        {
+            (2560, width)
+            for width in (128, 160, 256, 320, 512, 1536, 2560, 3072, 3328, 3584, 4096)
+        }
         | {(160, 2560), (1536, 2560)}
     ):
         reason = "segment_shape_has_no_calibration"
