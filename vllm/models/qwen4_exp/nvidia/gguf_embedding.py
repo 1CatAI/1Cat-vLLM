@@ -25,6 +25,70 @@ from .ple_layer import Qwen4ExpPinnedHostEmbedding, _advise_random_file_access
 
 
 @triton.jit
+def _pinned_iq4nl_rows(
+    pointer,
+    ids,
+    codebook,
+    output,
+    K: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    index = tl.load(ids + row).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    valid = col < K
+    table = pointer.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    base = table + index * WIDTH + (col // 32) * 18
+    lo = tl.load(base, valid, other=0).to(tl.uint16)
+    hi = tl.load(base + 1, valid, other=0).to(tl.uint16)
+    scale = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    packed = tl.load(base + 2 + col % 16, valid, other=0)
+    code = (packed >> (4 * ((col % 32) // 16))) & 15
+    value = tl.load(codebook + code.to(tl.int32)).to(tl.float32)
+    tl.store(output + row * K + col, scale * value, valid)
+
+
+def pinned_iq4nl_rows(pointer, ids, codebook, output, k):
+    _pinned_iq4nl_rows[(ids.numel(),)](
+        pointer,
+        ids,
+        codebook,
+        output,
+        K=k,
+        WIDTH=k // 32 * 18,
+        BLOCK=triton.next_power_of_2(k),
+        num_warps=4,
+    )
+
+
+def packed_pinned_lookup(ids, output, layer_name):
+    table = get_forward_context().no_compile_layers[layer_name]
+    index = ids.device.index
+    if index is None:
+        index = torch.accelerator.current_device_index()
+    pinned_iq4nl_rows(
+        table._accelerator_weight_ptrs[index],
+        ids,
+        table._pinned_codebook,
+        output,
+        table.embedding_dim,
+    )
+
+
+def packed_pinned_lookup_fake(ids, output, layer_name):
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_pinned_iq4nl_lookup",
+    op_func=packed_pinned_lookup,
+    mutates_args=["output"],
+    fake_impl=packed_pinned_lookup_fake,
+)
+
+
+@triton.jit
 def _gather_packed_rows(pointer, ids, output, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     index = tl.load(ids + row)
@@ -212,6 +276,24 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
             self.get_accelerator_weight(
                 torch.device("cuda", torch.accelerator.current_device_index())
             )
+            from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+            if pinned_decode_active():
+                import gguf
+
+                if self._source_type != 20 or self._device_rows or self._disk_rows:
+                    raise RuntimeError("Admitted PLE table is not wholly pinned IQ4_NL")
+                self.register_buffer(
+                    "_pinned_codebook",
+                    torch.tensor(
+                        gguf.quants.IQ4_NL.kvalues,
+                        dtype=torch.float32,
+                        device=torch.device(
+                            "cuda", torch.accelerator.current_device_index()
+                        ),
+                    ),
+                    persistent=False,
+                )
 
     def embedding_lookup(self, input_, remote_rows=None):
         if input_.device.type == "cpu":
@@ -222,6 +304,16 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
             ]
             return torch.from_numpy(self._cpu_reader.lookup(input_.numpy(), dtype))
         ids = input_.reshape(-1)
+        if hasattr(self, "_pinned_codebook") and remote_rows is None:
+            output = torch.empty(
+                (ids.numel(), self.embedding_dim),
+                dtype=self._output_dtype,
+                device=input_.device,
+            )
+            torch.ops.vllm.qwen4_exp_ple_pinned_iq4nl_lookup(
+                ids, output, self.layer_name
+            )
+            return output.reshape(*input_.shape, self.embedding_dim)
         remote = ids >= self._device_rows + self._host_rows
         if remote_rows is None and self._disk_rows:
             raise ValueError("PLE GGUF disk rows require offloader output")

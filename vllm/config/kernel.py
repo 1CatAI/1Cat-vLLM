@@ -553,6 +553,15 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_pinned_decode: bool = True
+    """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
+    ple_pinned_decode_active: bool = Field(default=False, init=False)
+    """Whether every TP rank admitted the complete pinned decode table."""
+    ple_pinned_decoders: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed pinned row decoder admission, capacity and fallback reasons."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -590,6 +599,7 @@ class KernelConfig:
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "ple_pinned_decoders",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",

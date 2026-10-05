@@ -504,7 +504,11 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
-        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_local_model:
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        if use_local_model and (
+            envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned_decode_active()
+        ):
             return
         self._launch(num_reqs, num_tokens)
 

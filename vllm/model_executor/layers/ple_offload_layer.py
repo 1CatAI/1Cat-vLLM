@@ -352,8 +352,15 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
-            if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_sm70_decode_graph_semantics():
+            from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+            pinned = pinned_decode_active()
+            if (
+                envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned
+            ) and use_sm70_decode_graph_semantics():
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
+            if pinned:
+                return self.wait_offloaded_output(hidden_states, input_ids.shape[0])
             if self.offload_keeps_local_tables():
                 # The layer gathers its resident rows itself and merges the
                 # worker's rows through wait_offloaded_output.
