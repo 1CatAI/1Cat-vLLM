@@ -24,8 +24,8 @@ TP row shards. It compares three seeded FP32 official dequantization oracles,
 checks floating outputs separately, verifies one thousand bitwise graph
 replays per input and then measures cold-L2 graph ABBA against the actual
 coalesced canonical projection. It records clocks and both source and loaded
-candidate byte counts. Compile, numerical and performance results are pending;
-model dispatch remains canonical until shape-specific GPU comparisons pass.
+candidate byte counts. Model admission is restricted to the measured
+source tuples and runtime M8; every other shape and M retains canonical.
 
 ## Initial actual-weight comparison
 
@@ -55,8 +55,7 @@ It retains only source-sized native records and padded floating B/A storage
 in addition to the canonical fallback. Actual M is selected inside an opaque
 operation with explicit mutable reduction workspace. Only measured complete
 source combinations can enter; every other M delegates to canonical.
-Installed model-wiring comparisons and the remaining real source combinations
-are pending.
+All real source combinations and installed model wiring are verified below.
 
 The remaining fifteen real QKV/Z combinations also pass. Across all nineteen
 combinations representing all forty-eight GDN layers, joint latency is
@@ -74,4 +73,23 @@ shapes, M and disabled policy retain canonical with an explicit admission
 reason. Coalesced affine code views share their existing storage; scale/min
 views retain their original row stride. CPU tests cover this aliasing,
 capability gates, runtime-M fallback and a single opaque dynamic export.
-Installed compiled-layer checks remain pending.
+The final installed complete wheel passes twenty-four CPU checks and
+prefill-first full-graph compilation for all nineteen combinations. Runtime
+M512/8/1/5/16/20/32/8 passes graph equality; every non-M8 output is bitwise
+canonical. Three official numerical inputs per combination and one thousand
+M8 graph replays per input pass. Installed joint latency remains
+38.912–45.056 µs, with all nineteen combinations faster in both ABBA arms.
+The installed layer-weighted estimate is 1.305–1.326 ms per M8 round; it
+remains an operator estimate, separate from end-to-end latency.
+
+Quantized fallback descriptors exclude floating B/A. The two original
+floating weights are aliased separately and keep their existing FP16
+projection wrapper for non-M8. Coalesced single-quantized fallback calls its
+projection directly, without an intermediate concatenation. A compiled
+prefill check initially exposed the quant-only serializer's unsupported
+floating case; this is fixed and covered by a focused regression.
+
+The shared single-projection body also passes a fresh installed compiled
+IQ3_S down check, with unchanged runtime-M/graph behavior and official
+numerical agreement. No extra full-model run or trace was used for these
+operator and wiring checks.
