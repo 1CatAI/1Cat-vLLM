@@ -28,7 +28,65 @@ from vllm.distributed.device_communicators.custom_all_reduce import CustomAllred
 from vllm.platforms import current_platform
 
 
-def generate(root):
+def row_norm_source(original):
+    """Screen serial CUB128 partials without inter-CTA norm readiness flags.
+
+    Keep all five original partial reductions and their final ordered sum. The
+    normalized epilogue rereads the just-written FP32 residual; this is a
+    bandwidth tradeoff to screen, not a presumed improvement.
+    """
+    begin = original.index("template <typename WeightT, bool Reference = false>")
+    end = original.index("\nclass CustomAllreduce", begin)
+    norm = original[begin:end]
+    body_begin = norm.index("  const int pack = row *")
+    body_end = norm.index("  using Reduce = cub::BlockReduce<float, Threads>;")
+    epilogue_begin = norm.index("  if (tid < PacksPerPart) {", body_end)
+    epilogue_end = norm.rfind("\n}")
+    prefix = norm[:body_begin].replace(
+        "sm70_push_allreduce_gemma_rms_norm", "round12_row_gemma_norm"
+    )
+    prefix = prefix.replace(
+        "const int row = blockIdx.x / Parts, part = blockIdx.x % Parts;",
+        "const int row = blockIdx.x;",
+    )
+    epilogue = norm[epilogue_begin:epilogue_end]
+    return (
+        prefix
+        + """
+  using Reduce = cub::BlockReduce<float, Threads>;
+  __shared__ typename Reduce::TempStorage storage;
+  __shared__ float partials[Parts];
+  __shared__ float inverse;
+  for (int part = 0; part < Parts; ++part) {
+"""
+        + norm[body_begin:body_end]
+        + """
+    variance = Reduce(storage).Reduce(variance, CubAddOp{}, Threads);
+    if (tid == 0) partials[part] = variance;
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float total = 0;
+#pragma unroll
+    for (int part = 0; part < Parts; ++part) total += partials[part];
+    inverse = rsqrtf(total / Width + epsilon);
+    meta->generation[row] = generation;
+  }
+  __syncthreads();
+  for (int part = 0; part < Parts; ++part) {
+    const int pack = row * (Width / P::size) + part * PacksPerPart + tid;
+    float values[P::size];
+    const float4 a = reinterpret_cast<const float4*>(residual_out)[pack * 2];
+    const float4 b = reinterpret_cast<const float4*>(residual_out)[pack * 2 + 1];
+    values[0]=a.x; values[1]=a.y; values[2]=a.z; values[3]=a.w;
+    values[4]=b.x; values[5]=b.y; values[6]=b.z; values[7]=b.w;
+"""
+        + epilogue
+        + "\n  }\n}\n"
+    )
+
+
+def generate(root, row_norm=False):
     original = (root / "csrc/custom_all_reduce.cuh").read_text()
     begin = original.index("template <typename WeightT, bool Reference = false>")
     end = original.index("\nclass CustomAllreduce", begin)
@@ -89,15 +147,18 @@ def generate(root):
 """
     )
     return (
-        '#include "custom_all_reduce.cuh"\n'
-        "using vllm::kSm70PushNormOffset; using vllm::kSm70PushNormMetaBytes;\n"
-        "using vllm::kSm70Tp4PushAllreduceBufferBytes; using vllm::Sm70PushNormMeta;\n"
-        "using vllm::Sm70PushNormReferenceMeta; using vllm::kSm70PushNormParts;\n"
-        "using vllm::kSm70GemmaRmsNormHiddenSize; using vllm::kSm70PushNormRows;\n"
-        + skeleton
-        + producer
-        + norm
-        + """
+        (
+            '#include "custom_all_reduce.cuh"\n'
+            "using vllm::kSm70PushNormOffset; using vllm::kSm70PushNormMetaBytes;\n"
+            "using vllm::kSm70Tp4PushAllreduceBufferBytes; "
+            "using vllm::Sm70PushNormMeta;\n"
+            "using vllm::Sm70PushNormReferenceMeta; using vllm::kSm70PushNormParts;\n"
+            "using vllm::kSm70GemmaRmsNormHiddenSize; using vllm::kSm70PushNormRows;\n"
+            + skeleton
+            + producer
+            + norm
+            + (row_norm_source(original) if row_norm else "")
+            + """
 size_t buffer_bytes() { return kSm70Tp4PushAllreduceBufferBytes; }
 vllm::RankData peers(const std::vector<int64_t>& pointers) {
   TORCH_CHECK(pointers.size()==4);
@@ -137,7 +198,7 @@ void launch_norm(torch::Tensor y,torch::Tensor residual_out,torch::Tensor input,
   const auto* r=residual.data_ptr<float>(); const auto* w=weight.data_ptr<float>();
   auto* out=reinterpret_cast<half*>(y.data_ptr<at::Half>());
   auto* rout=residual_out.data_ptr<float>();
-  if(consume) round12_consume_gemma_norm<float><<<40,128,0,stream>>>(
+  if(consume) ROUND12_NORM_VARIANT<float><<<ROUND12_NORM_GRID,128,0,stream>>>(
       buffers,x,r,w,out,rout,rank,1e-6f);
   else vllm::sm70_push_allreduce_gemma_rms_norm<float><<<40,128,0,stream>>>(
       buffers,x,r,w,out,rout,rank,1e-6f);
@@ -147,6 +208,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
   m.def("buffer_bytes",&buffer_bytes);
 }
 """
+        )
+        .replace(
+            "ROUND12_NORM_VARIANT",
+            "round12_row_gemma_norm" if row_norm else "round12_consume_gemma_norm",
+        )
+        .replace("ROUND12_NORM_GRID", "8" if row_norm else "40")
     )
 
 
@@ -172,12 +239,18 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--extension", type=Path)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--row-norm-screen", action="store_true")
+    parser.add_argument("--norm-only-screen", action="store_true")
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
+    if args.norm_only_screen and not args.row_norm_screen:
+        parser.error("--norm-only-screen requires --row-norm-screen")
     args.out.mkdir(parents=True, exist_ok=True)
     source = args.out / "publish-down.cu"
-    source.write_text(generate(args.source_root))
+    source.write_text(generate(args.source_root, args.row_norm_screen))
     name = "round12_qpn2_publish_norm"
+    if args.row_norm_screen:
+        name += "_row"
     if args.extension:
         spec = importlib.util.spec_from_file_location(name, args.extension)
         extension = importlib.util.module_from_spec(spec)
@@ -246,16 +319,17 @@ def main():
 
     def launch(arm):
         partial, normalized, rout = outputs[arm]
-        extension.down(
-            partial,
-            x,
-            codes,
-            scales,
-            projection.inverse_global_scale,
-            pointers,
-            rank,
-            bool(arm),
-        )
+        if not args.norm_only_screen:
+            extension.down(
+                partial,
+                x,
+                codes,
+                scales,
+                projection.inverse_global_scale,
+                pointers,
+                rank,
+                bool(arm) and not args.row_norm_screen,
+            )
         extension.norm(
             normalized, rout, partial, residual, weight, pointers, rank, bool(arm)
         )
@@ -274,6 +348,19 @@ def main():
         graphs.append((graph, start, end))
     for amplitude in (0.0, -0.1, 0.1, 1.0):
         x.normal_().mul_(amplitude)
+        if args.norm_only_screen:
+            for partial, _, _ in outputs:
+                extension.down(
+                    partial,
+                    x,
+                    codes,
+                    scales,
+                    projection.inverse_global_scale,
+                    pointers,
+                    rank,
+                    False,
+                )
+            torch.cuda.synchronize()
         dist.barrier()
         for graph, _, _ in graphs:
             graph.replay()
@@ -292,10 +379,12 @@ def main():
     row = dict(
         rank=rank,
         control_us=statistics.median(samples[0]),
-        publish_us=statistics.median(samples[1]),
+        candidate_us=statistics.median(samples[1]),
+        candidate="row_norm" if args.row_norm_screen else "epilogue_publication",
         samples_us=samples,
         bitwise_four_amplitudes=True,
-        compute_nodes_per_arm=2,
+        projection_included=not args.norm_only_screen,
+        compute_nodes_per_arm=1 if args.norm_only_screen else 2,
         measured_graph_kernel_nodes=[graph_kernel_nodes(g) for g, _, _ in graphs],
         eviction_included_in_graph_count=True,
         torch=torch.__version__,
