@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--layers", type=int, default=16)
+    parser.add_argument("--widths", type=int, nargs="+", choices=(1, 5), default=(1, 5))
+    parser.add_argument("--native-mtp-control", action="store_true")
     args = parser.parse_args()
     source = (
         Path(__file__).parents[1] / "csrc/sm70_shared_expert_ksplit_chain_screen.cu"
@@ -77,11 +79,16 @@ def main():
         w2.reshape(80, 32, 10, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
         for _, w2, _ in weights
     ]
+    native_packed_up = [
+        w13.reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+        for w13, _, _ in weights
+    ]
     report = {
         "research_only": True,
         "model_admission": False,
         "cta_count": 40,
         "w13_k_splits": 4,
+        "native_mtp_control": args.native_mtp_control,
         "scope": "complete TP-local shared expert; following all-reduce excluded",
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "layers": args.layers,
@@ -89,6 +96,9 @@ def main():
     }
 
     def screen(m):
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = bool(
+            m == 5 and args.native_mtp_control
+        )
         torch.manual_seed(4201)
         inputs = [
             torch.randn(m, 2560, device="cuda", dtype=torch.float16) * 0.1
@@ -104,6 +114,8 @@ def main():
             torch.empty(40, m, 32, device="cuda", dtype=torch.float32) for _ in weights
         ]
         outputs = [torch.empty_like(x) for x in inputs]
+        native_intermediate = [x.new_empty((m, 160)) for x in inputs]
+        native_partial = [x.new_empty((8, m, 320)) for x in inputs]
 
         def candidate():
             for x, (_, _, gate), w13, w2, proj, p, f, e, y in zip(
@@ -121,10 +133,16 @@ def main():
 
         def control():
             result = []
-            for x, (w13, w2, gate) in zip(inputs, weights):
-                projected = torch.nn.functional.linear(x, w13)
-                intermediate = x.new_empty((m, 160))
-                torch.ops._C.silu_and_mul(intermediate, projected)
+            for i, (x, (w13, w2, gate)) in enumerate(zip(inputs, weights)):
+                if m == 5 and args.native_mtp_control:
+                    intermediate = native_intermediate[i]
+                    torch.ops._C.qwen38_shared_up_batch_sm70_out(
+                        intermediate, native_partial[i], x, native_packed_up[i]
+                    )
+                else:
+                    projected = torch.nn.functional.linear(x, w13)
+                    intermediate = x.new_empty((m, 160))
+                    torch.ops._C.silu_and_mul(intermediate, projected)
                 y = torch.nn.functional.linear(intermediate, w2)
                 if m == 1:
                     sm70_ops.qwen38_shared_gate_exact_out(y, x, gate)
@@ -176,7 +194,7 @@ def main():
             )
         )
 
-    for m in (1, 5):
+    for m in args.widths:
         screen(m)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
