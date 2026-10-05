@@ -256,3 +256,126 @@ def fixed_layout_batched_preprocess_kernel(
             cta_barrier()
             write_history(x, history, qfeature, accepted)
             write_history(x, history, kfeature, accepted)
+
+
+@gluon.jit
+def head_prepared_fixed_layout_kernel(
+    x,
+    ba,
+    history,
+    w,
+    a_log,
+    bias,
+    norm,
+    state,
+    indices,
+    raw,
+    out,
+    done,
+    accepted_ptr,
+    prepared,
+    EPS: gl.constexpr,
+    BV: gl.constexpr,
+    Warps: gl.constexpr,
+):
+    tile = gl.program_id(0)
+    h = gl.program_id(1)
+    count: gl.constexpr = 128 // BV
+    pid = h * count + tile
+    accepted = gl.load(accepted_ptr).to(gl.int64)
+    epoch = gl.load(done + pid, cache_modifier=".cg") + 1
+    StateLayout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [Warps, 1], [1, 0])
+    KLayout: gl.constexpr = gl.SliceLayout(0, StateLayout)
+    VLayout: gl.constexpr = gl.SliceLayout(1, StateLayout)
+    QLayout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [1, Warps], [1, 0])
+    kdim = gl.arange(0, 128, layout=KLayout)
+    vdim = tile * BV + gl.arange(0, BV, layout=VLayout)
+    vfeature = 1024 + h * 128 + vdim
+    index = gl.load(indices + accepted - 1).to(gl.int64)
+    prepared_head = prepared + h * 8 * 386
+    ready = done + 12 * count + h
+    if tile == 0:
+        qcols = gl.arange(0, 128, layout=gl.SliceLayout(0, QLayout))
+        qs = conv_panel(x, history, w, h // 3 * 128 + qcols, accepted, 128, QLayout)
+        ks = conv_panel(
+            x, history, w, 512 + h // 3 * 128 + qcols, accepted, 128, QLayout
+        )
+        vs = conv_panel(x, history, w, 1024 + h * 128 + qcols, accepted, 128, QLayout)
+        qs = qs / gl.sqrt(gl.sum(qs * qs, 1)[:, None] + 1e-6)
+        qs = qs * 0.08838834764831845
+        ks = ks / gl.sqrt(gl.sum(ks * ks, 1)[:, None] + 1e-6)
+        tokens = gl.arange(0, 8, layout=gl.SliceLayout(1, QLayout))
+        address = tokens[:, None] * 386 + qcols[None, :]
+        gl.store(prepared_head + address, qs)
+        gl.store(prepared_head + address + 128, ks)
+        gl.store(prepared_head + address + 256, vs)
+        a = gl.load(ba + tokens * 24 + 12 + h).to(gl.float32)
+        a += gl.load(bias + h).to(gl.float32)
+        soft = gl.where(a <= 20, gl.log(1 + gl.exp(a)), a)
+        g = -gl.exp(gl.load(a_log + h).to(gl.float32)) * soft
+        beta = sigmoid(gl.load(ba + tokens * 24 + h).to(gl.float32))
+        gl.store(prepared_head + tokens * 386 + 384, g)
+        gl.store(prepared_head + tokens * 386 + 385, beta)
+        cta_barrier()
+        release_epoch(ready, epoch)
+    await_scalar_epoch(ready, epoch)
+    matrix = gl.load(
+        state + index * 196608 + h * 16384 + vdim[:, None] * 128 + kdim[None, :]
+    )
+    for t in gl.static_range(8):
+        q = gl.load(prepared_head + t * 386 + kdim, cache_modifier=".cg")
+        k = gl.load(prepared_head + t * 386 + 128 + kdim, cache_modifier=".cg")
+        v = gl.load(prepared_head + t * 386 + 256 + vdim, cache_modifier=".cg")
+        g = gl.load(prepared_head + t * 386 + 384, cache_modifier=".cg")
+        beta = gl.load(prepared_head + t * 386 + 385, cache_modifier=".cg")
+        matrix *= gl.exp(g)
+        v = (v - gl.sum(matrix * k[None, :], 1)) * beta
+        matrix += v[:, None] * k[None, :]
+        y = gl.sum(matrix * q[None, :], 1)
+        gl.store(raw + t * 1536 + h * 128 + vdim, y)
+        slot = gl.load(indices + t).to(gl.int64)
+        gl.store(
+            state + slot * 196608 + h * 16384 + vdim[:, None] * 128 + kdim[None, :],
+            matrix,
+        )
+    write_history(x, history, vfeature, accepted)
+    # All snapshots, raw outputs and this CTA's initial q/k reads precede done.
+    # Publish only after every CTA thread has completed its stores.
+    cta_barrier()
+    release_epoch(done + pid, epoch)
+    if tile == 0:
+        headtiles = h * count + gl.arange(
+            0, count, layout=gl.BlockedLayout([1], [32], [Warps], [0])
+        )
+        await_epoch(done + headtiles, epoch)
+        cta_barrier()
+        d = gl.arange(0, 128, layout=KLayout)
+        for norm_token in gl.static_range(8):
+            head_y = gl.load(
+                raw + norm_token * 1536 + h * 128 + d, cache_modifier=".cg"
+            ).to(gl.float32)
+            head_z = gl.load(x + norm_token * 4096 + 2560 + h * 128 + d).to(gl.float32)
+            variance = gl.sum(head_y * head_y) / 128
+            value = head_y * gl.rsqrt(variance + EPS) * gl.load(norm + d).to(gl.float32)
+            value *= head_z * sigmoid(head_z)
+            gl.store(out + norm_token * 1536 + h * 128 + d, value)
+        if h % 3 == 0:
+            # q/k history is shared by three value heads. Do not overwrite it
+            # until every tile in those heads has completed its initial reads.
+            group = h * count + gl.arange(
+                0,
+                triton.next_power_of_2(3 * count),
+                layout=gl.BlockedLayout([1], [32], [Warps], [0]),
+            )
+            valid = (
+                gl.arange(
+                    0,
+                    triton.next_power_of_2(3 * count),
+                    layout=gl.BlockedLayout([1], [32], [Warps], [0]),
+                )
+                < 3 * count
+            )
+            await_epoch(gl.where(valid, done + group, done + pid), epoch)
+            cta_barrier()
+            write_history(x, history, h // 3 * 128 + kdim, accepted)
+            write_history(x, history, 512 + h // 3 * 128 + kdim, accepted)
