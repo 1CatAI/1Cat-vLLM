@@ -135,3 +135,8 @@ folded integer dots cost 233/263/538 us at M1/M5/M20 against 211/213/287 us
 for the retained head. Raw decoding is also slower. Neither is selected.
 These are single-layer measurements, not end-to-end gains. Model validation
 uses one installed complete artifact for both control and candidate.
+
+Explicit one-group software lookahead passes 188 GPU checks but does not
+recover the large projection gap. Matched Q6 QKV M5 encode/projection rises
+from 23.55 to 24.58 us; M20 rises from 34.05 to 34.82 us. The mixed small
+pair remains 14.34/16.38 us. The lookahead variant is reverted.
