@@ -1674,3 +1674,11 @@ Core SHA256:
 `1358702f58168e4a46bd4775399447ebdd6d4b1bceaf2a00525efe3ca5c02bdd`.
 Native dependencies are standard Torch/CUDA libraries without private DSOs
 or preload. Model storage removal is a separate integration change.
+
+Final integration diff review restores main's mixed-projection output helper,
+admission metadata, documentation and regression tests. Native affine/LUT/
+lattice output-stride support already matches main. The repackaged wheel from
+`18e8cf7f46` keeps the same native core hash and passes the restored CPU fallback
+check. The mixed-output graph/model regression job times out before acquiring
+the shared GPU lock and remains pending. No fresh operator timing is needed
+for this Python-only restoration; its GPU compatibility check is still required.
