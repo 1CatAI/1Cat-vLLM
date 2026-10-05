@@ -272,7 +272,9 @@ def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False, block32=False
     return prepared
 
 
-def _target_head_qpn8(x, codes, scales):
+def _target_head_qpn8(
+    x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
     from vllm import _sm70_ops as ops
 
     _probe_calls["target-head-qpn8"] += 1

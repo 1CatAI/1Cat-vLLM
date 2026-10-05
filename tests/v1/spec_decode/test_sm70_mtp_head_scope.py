@@ -223,3 +223,19 @@ def test_shared_head_view_uses_full_pack_and_keeps_independent_shortlist(monkeyp
     other.shard_indices = head.shard_indices
     with pytest.raises(ValueError, match="identical checkpoint head"):
         head_ops.MTPQPN8Head(other, shared_view=draft)
+
+
+@pytest.mark.parametrize("rows", [1, 5, 8])
+def test_target_head_probe_registers_and_preserves_fake_shape(rows):
+    # Import the actual registered probe, beyond testing its shared pack view.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm.models.qwen4_exp.nvidia import sm70_mtp_structural  # noqa: F401
+
+    with FakeTensorMode():
+        x = torch.empty(rows, 2560, dtype=torch.float16)
+        codes = torch.empty(2560, 32, dtype=torch.uint8)
+        scales = torch.empty(32, dtype=torch.float16)
+        output = torch.ops.vllm.sm70_mtp_target_head_qpn8_probe(x, codes, scales)
+        assert output.shape == (rows, 32)
+        assert output.dtype == torch.float16
