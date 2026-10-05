@@ -174,3 +174,7 @@ def prepare_pinned_gguf_ple(config, tensors, names):
         status["enabled"] = status["reason"] is None
     policy.ple_pinned_decode_active = status["enabled"]
     policy.ple_pinned_decoders["gguf_rows"] = status
+    if tables:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info("GGUF pinned PLE capability: %s", status)

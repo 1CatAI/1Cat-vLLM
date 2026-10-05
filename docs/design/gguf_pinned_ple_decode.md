@@ -80,8 +80,38 @@ at least twice the packed table size in available host memory.
 
 ## Model measurements
 
-A same-wheel comparison with only `ple_pinned_decode` changed is in progress.
-It uses Flash-Next IQ3_S, FP16 MTP4, TP4, FP16 KV cache, FP32 SSM state,
-FULL target graphs, 8K C1 input and a four-request C4 cohort. Teacher-forcing
-prefixes are fixed and saved explicitly. Operator service times do not justify
-promotion before the round, completion and acceptance checks finish.
+Both arms use the same source-complete wheel built from `69e0780a82`, CUDA
+12.8, Torch 2.10.0 and four V100s. Only `ple_pinned_decode` changes. The workload
+uses Flash-Next IQ3_S, FP16 MTP4, TP4, FP16 KV cache, FP32 SSM state, FULL target
+graphs, max length 9216, prefill budget 512, four scheduled requests, memory
+utilization 0.95 and no prefix caching. C1 uses 8192 input and 256 output tokens;
+C4 uses 128 input and 600 output tokens per request. Startup and prefill are
+excluded from steady decode intervals.
+
+| Metric | CPU-offloaded decode | Pinned decode |
+| --- | --- | --- |
+| C1 mean round, two unobserved runs pooled | 22.501 ms | 18.615 ms |
+| C1 median round, before/after observed run | 22.402 / 22.516 ms | 18.602 / 18.593 ms |
+| C1 emitted tokens per steady interval | 4.886 | 4.886 |
+| C4 mean round | 53.927 ms | 46.072 ms |
+| C4 median round | 53.939 ms | 45.967 ms |
+| Eight-prompt mean acceptance | 45.845% | 47.205% |
+| Eight-prompt mean accepted length including bonus | 2.834 | 2.888 |
+
+The paired prompt bootstrap gives acceptance difference 95% CI
+[-0.368, +2.731] percentage points and accepted-length difference CI
+[-0.0147, +0.1092] tokens. These fixed prompts show no observed acceptance
+regression; the interval does not prove equivalence for arbitrary workloads.
+Both short completion checks finish normally with identical answers.
+
+All 64 teacher points use identical saved prefix token IDs, forced token IDs
+and positions. Mean KL is 0.0004528, maximum KL is 0.008371, and top-1 matches
+62/64 points. Every logit is finite. Natural long outputs are not token-identical:
+first differences occur at tokens 37–396. C1 probe outputs are identical;
+C4 outputs differ. Packed rows still match official FP32 dequantization converted
+to FP16 exactly. The changed graph topology is not a bitwise model-output promise.
+
+The C1 median is approximately 18.60 ms, above the 18.5 ms stage target. The
+measured 3.89 ms C1 and 7.85 ms C4 mean savings are end-to-end gains from this
+paired run, not a sum of lookup microbenchmark times. GPU entry skew has not
+been remeasured by this run.
