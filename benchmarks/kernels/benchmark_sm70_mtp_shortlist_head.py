@@ -59,7 +59,9 @@ def main():
             xs = torch.randn(4, rows, 2560, device="cuda", dtype=torch.float16)
 
             def full(view=view, xs=xs):
-                return [view.apply(view, x).max(dim=-1) for x in xs]
+                # Compare against the current default segmented selector, not
+                # the retired full-row Torch max implementation.
+                return [view.maybe_get_sm70_lm_head_top1_pair(x) for x in xs]
 
             def short(view=view, xs=xs):
                 return [view.maybe_get_sm70_lm_head_top1(x) for x in xs]
