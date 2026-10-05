@@ -23,6 +23,10 @@ from vllm.model_executor.kernels.linear import (
 from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
     _get_affine_blas_workspace,
 )
+from vllm.model_executor.layers.quantization.gguf_fp16_projection import (
+    FP16_SOURCE_TYPES,
+    fp16_projection_capabilities,
+)
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
@@ -372,6 +376,13 @@ class GGUFPreparedProjection(Module):
                     requires_grad=False,
                 ),
             )
+        self.fp16_capabilities = (
+            fp16_projection_capabilities(self.source_type, weight, act_dtype, enabled)
+            if self.source_type in FP16_SOURCE_TYPES
+            else ()
+        )
+        if self.fp16_capabilities:
+            self.rejection_reason = self.fp16_capabilities[0].reason
 
     def _prepare(self, weight, act_dtype):
         if not self.enabled:
@@ -471,6 +482,8 @@ class GGUFPreparedProjection(Module):
             "reason": self.rejection_reason,
             "source_output_sizes": list(self.source_output_sizes),
         }
+        if self.fp16_capabilities:
+            result["operators"] = [asdict(c) for c in self.fp16_capabilities]
         if self.kernel is not None:
             result["kernel"] = type(self.kernel).__name__
             result["local_weight_shape"] = list(
@@ -492,6 +505,10 @@ class GGUFPreparedProjection(Module):
         return result
 
     def forward(self, x):
+        if self.fp16_capabilities and self.fp16_capabilities[0].reason is None:
+            return torch.ops.vllm.prepared_gguf_fp16_projection(
+                x, self.weight, self.source_type, self.enabled
+            )
         if self.kernel is not None:
             kernel = self.kernel
             config = kernel.config
