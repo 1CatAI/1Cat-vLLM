@@ -40,6 +40,68 @@ FP32 accumulation. Its four-branch up kernel compiles with 32 registers and
 no spills; PTX places the four vector weight loads before the first packet
 poll. These are compilation findings, not GPU correctness or speed admission.
 
+## Closeout and shared-layer scope
+
+The old down/push prototype receives one cold-weight, full-HC-boundary screen
+before further implementation. Rotate all 48 layers and both HC boundaries,
+include combine/norm in both arms, alternate graph timings, and report M1,
+M4 and M5 plus graph kernel counts. Its existing occupancy fallback is retained
+only to measure this historical prototype. Timing uses deterministic synthetic
+activations with real checkpoint weights; it cannot substitute for a
+real-activation or model-quality gate. An unsuccessful result is retained and
+the prototype discarded rather than tuned further.
+
+After closeout, the shared-layer implementation covers both single-token
+decode and MTP4 target verification at M5. Draft generation and round
+integration remain separate. The next HC change removes combine/norm and the
+standalone down all-gather together: each down CTA redundantly computes the
+four-stream combine and norm, CTA zero publishes the materialized normalized
+mixer input, and each down CTA pushes its projected output. Up consumes the
+tagged inputs. Multitoken scheduling must reuse weights and fit every waiting
+CTA within the measured resident capacity; M4 must retain its accelerated
+route and must not regress. Do not carry the old large-batch fallback forward
+as the solution for M5.
+
+No grid-wide barrier or cooperative whole-HC segment is proposed. Permitted
+dependencies are redundant small computations, producer epilogue publication,
+and consumer prologue waits. Floating-point partials use scratch and a fixed
+reduction order, without floating atomic addition. A standalone cooperative
+launch can enforce residency for a waiting consumer; it does not authorize
+inter-CTA grid synchronization.
+
+Each accepted step requires a complete layer graph with real weights and cold
+L2 at M1 and M5, kernel counts and changed-input replays. Communication paths
+also test generation wrap and simultaneous residency. Model integration must
+report total graph kernels and single-CTA kernels. Accumulation-order changes
+record teacher-forcing KL mean/p99/max and top-1 agreement, and require healthy
+natural completions plus 128K/258K needle retrieval. Maximum logit difference
+is recorded without a veto threshold. FP16 inputs/weights and FP32 accumulation
+remain unchanged. C4 cannot regress. Quantization retains its separate gates.
+
+Run model endpoints after approximately 1 ms of cumulative exposed savings,
+or at a PR admission boundary; measure M1 token latency and the complete MTP4
+round separately. Discount auxiliary-stream overlap and compare observed with
+projected savings, investigating deviations beyond 15%. Do not repeat the
+existing trace until a substantial HC or QSA change is merged.
+
+The initial node-removal ledger is a projection, not a measured result:
+
+| Segment | Planned node removal per token |
+|---|---:|
+| 96 HC boundaries, four nodes to two | 192 |
+| Router top-k into expert W13 | 48 |
+| Expert W13 and W2 into one partial-producing kernel | 48 |
+| Shared expert, five nodes to one | 192 |
+| Attention and MoE reduction producers/consumers | Approximately 96 |
+| 36 GDN cores, three nodes to one | 72 |
+| 12 QSA chains, fourteen nodes to six | Approximately 96 |
+
+These steps total approximately 744 removed nodes, leaving about 605 of the
+1349-node baseline. Meeting the 600-node target still requires accounting for
+the final mixer and remaining clear/copy nodes. The zero-single-CTA target
+also requires removing QSA fill and final-mixer activation nodes. Neither
+target follows automatically from summing the main layer changes.
+
 ## Per-layer accounting
 
 | Layer (zero based) | Kind | Kernels | Stream 364 kernels | Sync kernels on 364 | Span us | Auxiliary overlap us | Weight bytes | Floor us | Span minus floor us |
