@@ -722,6 +722,13 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.native_admission["mixed_gated_pair"] = prepare_native_gated_pair(
                     layer, sources, projections, self.native_enabled
                 )
+                from vllm.model_executor.layers.quantization.gguf_native_linear import (
+                    prepare_native_linear,
+                )
+
+                self.native_admission["single_projection"] = prepare_native_linear(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
@@ -873,7 +880,14 @@ class GGUFLinearMethod(LinearMethodBase):
                 apply_prepared_gguf_projections,
             )
 
-            out = apply_prepared_gguf_projections(x, layer.gguf_tm_projections)
+            if hasattr(layer, "gguf_native_linear_records"):
+                from vllm.model_executor.layers.quantization.gguf_native_linear import (
+                    apply_native_linear,
+                )
+
+                out = apply_native_linear(layer, x)
+            else:
+                out = apply_prepared_gguf_projections(x, layer.gguf_tm_projections)
             if bias is not None:
                 out.add_(bias)
             return out
