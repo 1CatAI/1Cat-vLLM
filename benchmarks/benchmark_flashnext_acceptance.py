@@ -77,7 +77,9 @@ def main():
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--trace-only", action="store_true")
-    parser.add_argument("--input-phase-ab", action="store_true")
+    input_ab = parser.add_mutually_exclusive_group()
+    input_ab.add_argument("--input-phase-ab", action="store_true")
+    input_ab.add_argument("--ple-input-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--diagnose-attention-transfers", action="store_true")
     parser.add_argument("--kernel-config", type=json.loads, default={})
@@ -91,8 +93,9 @@ def main():
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Use a normal installed source-containing wheel")
     if args.require_installed:
-        import flash_attn_v100
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+        import flash_attn_v100
 
         if "site-packages" not in Path(flash_attn_v100.__file__).parts:
             raise RuntimeError("Flash-V100 must resolve from the installed artifact")
@@ -276,7 +279,9 @@ def main():
                 )
                 save()
             arms = (
-                ("late_observed", "early_observed", "early_off", "late_off")
+                ("fused_observed", "reference_observed", "reference_off", "fused_off")
+                if args.ple_input_ab
+                else ("late_observed", "early_observed", "early_off", "late_off")
                 if args.input_phase_ab
                 else ("off_before", "cpu_observed", "off_after")
             )
@@ -285,6 +290,12 @@ def main():
                     llm.collective_rpc(
                         "set_graph_input_preparation",
                         args=(arm.startswith("early"),),
+                        timeout=30,
+                    )
+                elif args.ple_input_ab:
+                    llm.collective_rpc(
+                        "set_ple_input_preparation",
+                        args=(arm.startswith("fused"),),
                         timeout=30,
                     )
                 observing = arm == "cpu_observed" or arm.endswith("_observed")
@@ -305,24 +316,39 @@ def main():
                 report["probes"].append(probe)
                 save()
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
-            if args.input_phase_ab:
+            if args.input_phase_ab or args.ple_input_ab:
                 llm.collective_rpc(
-                    "set_graph_input_preparation", args=(True,), timeout=30
+                    "set_ple_input_preparation"
+                    if args.ple_input_ab
+                    else "set_graph_input_preparation",
+                    args=(True,),
+                    timeout=30,
                 )
             if not args.trace_only:
                 c4_ids = fixed_ids[:128]
                 c4_params = SamplingParams(
                     temperature=0, max_tokens=600, ignore_eos=True
                 )
-                c4_phases = (False, True) if args.input_phase_ab else (True,)
+                c4_phases = (
+                    (False, True)
+                    if args.input_phase_ab or args.ple_input_ab
+                    else (True,)
+                )
                 report["c4_probes"] = []
                 for early in c4_phases:
-                    if args.input_phase_ab:
+                    if args.input_phase_ab or args.ple_input_ab:
                         llm.collective_rpc(
-                            "set_graph_input_preparation", args=(early,), timeout=30
+                            "set_ple_input_preparation"
+                            if args.ple_input_ab
+                            else "set_graph_input_preparation",
+                            args=(early,),
+                            timeout=30,
                         )
                     steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
                     cohort = dict(
+                        input_switch="ple_input_prepare"
+                        if args.ple_input_ab
+                        else "early",
                         early=early,
                         summary=summarize(steps, 4),
                         output_token_ids=[
