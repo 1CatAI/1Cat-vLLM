@@ -467,3 +467,48 @@ def joint_decode_forward(layer, positions, output, hidden_states):
     if output is not None:
         output.copy_(result)
     return result
+
+
+def _joint_forward(
+    hidden: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    context = get_forward_context()
+    layer = context.no_compile_layers[_resolve_layer_name(layer_name)]
+    count = hidden.shape[0]
+    metadata = context.attn_metadata
+    if isinstance(metadata, list):
+        metadata = metadata[0]
+    # Shape selection belongs inside the opaque operation. A Python M=5
+    # equality in the compiled caller violates its dynamic token contract.
+    eligible = count in (1, 5)
+    if eligible and isinstance(metadata, dict):
+        actual = cast(
+            FlashAttentionMetadata, metadata[layer.layer_name]
+        ).num_actual_tokens
+        eligible = actual in (0, count)
+    if eligible:
+        return joint_decode_forward(layer, positions, None, hidden)
+    return layer._forward_original(positions, None, hidden)
+
+
+def _joint_forward_fake(hidden, positions, layer_name):
+    return torch.empty_like(hidden)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_qsa_joint_forward",
+    op_func=_joint_forward,
+    fake_impl=_joint_forward_fake,
+    mutates_args=[],
+)
+
+
+def dispatch_joint_decode_forward(layer, positions, output, hidden_states):
+    result = torch.ops.vllm.qwen38_sm70_qsa_joint_forward(
+        hidden_states, positions, _encode_layer_name(layer.layer_name)
+    )
+    if output is not None:
+        output.copy_(result)
+    return result

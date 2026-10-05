@@ -448,3 +448,21 @@ alone. The native GDN operator and explicit helper remain research artifacts.
 The remaining structural screen combines the output projection and ordered
 peer reduction, evaluated in complete GDN/QSA layers with original GDN/shared
 routes and admitted QSA preparation fixed in both arms.
+
+The independent projection/ordered-peer reduction M1 screen regresses both
+complete layers. With original GDN/shared routes and admitted QSA fixed,
+GDN critical-rank time is 0.153334→0.162058 ms (25→24 kernels), and QSA is
+0.271884→0.277251 ms (27→26). Single-CTA counts stay 5/5 and 6/6. GDN outputs
+and both states match; QSA maximum output error is 1.53e-5, with identical
+selection IDs on all four ranks. Driver and profiler counts agree. Reject
+this schedule without tuning. Actual MTP4 M5 initialization fails before
+candidate projection execution: AOT specializes the marked-dynamic token
+dimension to five. This failure is not an M5 performance result.
+
+Cold MTP4 compilation exposes a Python width branch in the default QSA
+forward. The branch now lives inside an opaque whole-QSA operation with a
+shape-preserving fake result. Unsupported widths and partially padded
+metadata use the original forward. CPU FakeTensor and fullgraph AOT checks
+pass for M1 and marked-dynamic M5; targeted source hooks pass. Fresh ordinary
+M1/M5 layer, model-distribution and endpoint qualification remain pending.
+Earlier QSA timing/count admission does not qualify this new compiler boundary.
