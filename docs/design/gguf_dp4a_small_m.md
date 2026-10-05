@@ -88,3 +88,55 @@ the sustained M5 clock band; it does not assert450GB/s at1290MHz.
 The nine focused tests and real-weight oracle checks still pass. The operator
 remains separate from model dispatch pending format, down-reduction and
 model-quality checks.
+
+## Additional expert readers and down reduction
+
+The common integer reader now covers IQ3_XXS and IQ2_S as well. IQ2_S
+applies its two group16 scales to separate integer partial sums; IQ3_XXS
+restores the eighth sign from parity. Both routing index widths are accepted,
+so the native Int32 router needs no conversion kernel. The47 focused GPU
+tests cover these readers and IQ4_NL/Q2_0 down with TP4 K160 slices, changed
+inputs, routes and probabilities under CUDA Graph replay.
+
+| Format | M | Current gate/up | dp4a fused | Encode plus fused |
+|---|---:|---:|---:|---:|
+|IQ3_XXS|5|62.24us|30.54us|31.94us|
+|IQ3_XXS|20|209.41us|96.27us|97.90us|
+|IQ2_S|5|74.56us|35.54us|36.65us|
+|IQ2_S|20|212.44us|114.21us|116.47us|
+
+The IQ2_S M20 control is the production canonical grouped GEMM (two
+launches), rather than the slower original-block vector candidate. M5
+late epochs run at1530MHz. IQ2_S unique-source bandwidth is364GB/s at M5
+and388GB/s at M20; despite that lower bandwidth it wins against its current
+controls. IQ3_XXS M5 reaches505GB/s. The encoder plus fused gate/up has two
+launches for all three formats, with gathering and separate SiLU removed.
+
+Down reads existing N32/K8 canonical integer storage. This preserves the
+exact Q2_0 integers and original scales across TP4's160-wide slices, which
+cut the original64-wide blocks. IQ4_NL uses TurboMind's integer LUT. Routed
+intermediates are encoded in shared memory; a single launch performs down
+and the FP32 weighted route reduction, with the FP16 down boundary retained.
+
+| Down format | M | Current down plus unroute | Fused integer down/unroute |
+|---|---:|---:|---:|
+|IQ4_NL|5|49.30us|33.15us|
+|IQ4_NL|20|94.01us|79.60us|
+|Q2_0|5|39.64us|23.62us|
+|Q2_0|20|88.46us|62.89us|
+
+IQ4_NL M5 spans1290/1530MHz; use per-epoch matched timings for clock-specific
+comparisons. These down controls include unroute but exclude preparation of
+sorted intermediate rows. Real-weight relative L2 against official weights
+with identical Q8_1 activations is approximately1e-5; FP16-activation error
+is approximately0.005. The full expert candidate has three launches: encode
+the input once, direct-route fused gate/up, and down/unroute. Its M5 gate/up
+savings, extrapolated over10 IQ3_S,17 IQ3_XXS and20 IQ2_S layers, are1.55ms;
+this is an operator estimate and requires an independent whole-model result.
+
+Model selection is declared by capabilities for original M5/M20 and exact
+TP4 expert geometry. `kernel_config.sm70_gguf.small_m_dp4a` controls the
+Q8_1 activation route; other batches retain the existing canonical route.
+Missing operators, unsupported formats or shapes, unavailable original rows,
+disabled policy and incompatible dtypes are reported as fallback reasons.
+Model KL, top1, natural completion and acceptance intervals remain pending.

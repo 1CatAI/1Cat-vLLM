@@ -80,6 +80,8 @@ def main():
     parser.add_argument("--input-phase-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--diagnose-attention-transfers", action="store_true")
+    parser.add_argument("--kernel-config", type=json.loads, default={})
+    parser.add_argument("--completion-prompts", type=Path)
     args = parser.parse_args()
     if args.trace_only:
         args.probe = args.node_trace = True
@@ -105,6 +107,7 @@ def main():
         language_model_only=True,
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
         worker_extension_cls="vllm.sm70_graph_observer.GraphParityWorkerExtension",
+        kernel_config=args.kernel_config,
         speculative_config={
             "method": "mtp",
             "model": str(args.draft),
@@ -133,6 +136,7 @@ def main():
         prompt_text_sha256=digest(prompts),
         rows=[],
         probes=[],
+        completions=[],
         trace_only=args.trace_only,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +218,24 @@ def main():
                 ),
                 flush=True,
             )
+        if args.completion_prompts is not None:
+            for prompt in json.loads(args.completion_prompts.read_text()):
+                rendered = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                output = llm.generate(rendered, params, use_tqdm=False)[0].outputs[0]
+                report["completions"].append(
+                    dict(
+                        prompt=prompt,
+                        text=output.text,
+                        output_token_ids=list(output.token_ids),
+                        finish_reason=output.finish_reason,
+                    )
+                )
+                save()
         if args.probe:
             reference = tokenized[1]
             fixed_ids = (reference * (8192 // len(reference) + 1))[:8192]

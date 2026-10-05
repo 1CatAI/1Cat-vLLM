@@ -364,6 +364,9 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    small_m_dp4a: bool = True
+    """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
