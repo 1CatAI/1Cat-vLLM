@@ -112,7 +112,7 @@ def main():
     q, z = x.new_empty(8, 2560), x.new_empty(8, 1536)
     b, a = x.new_empty(8, 12), x.new_empty(8, 12)
     scratch_q, scratch_b = x.new_empty(8, 4096), x.new_empty(8, 24)
-    core = x.new_empty(8, 1, 12, 128)
+    core = x.new_empty(8, 12, 128)
     projected, down = x.new_empty(8, 5120), x.new_empty(8, 5120)
     up = x.new_empty(8, 4352)
     history_storage_seed = (
@@ -225,7 +225,7 @@ def main():
                 head_v_dim=128,
                 scale=128**-0.5,
                 initial_state=snapshots,
-                out=core,
+                out=core.unsqueeze(1),
                 cu_seqlens=cu,
                 ssm_state_indices=indices,
                 num_accepted_tokens=accepted,
