@@ -202,3 +202,25 @@ def test_disabled_lm_head_routes_prepare_nothing(monkeypatch) -> None:
     assert not vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer)
     assert not hasattr(layer, "_sm70_f16_raw_top1_ready")
     assert not hasattr(layer, "_sm70_f16_prepared")
+
+
+@pytest.mark.parametrize(
+    ("max_seqs", "expected"), [(1, 8), (2, 16), (4, 32), (8, 64), (16, 64)]
+)
+def test_qpn8_capacity_follows_dflash_verifier_width(monkeypatch, max_seqs, expected):
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash2", num_speculative_tokens=7),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+    )
+    monkeypatch.setattr(
+        vocab_embedding, "get_current_vllm_config_or_none", lambda: config
+    )
+    assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == expected
+
+
+@pytest.mark.parametrize("config", [None, SimpleNamespace(speculative_config=None)])
+def test_qpn8_unconfigured_capacity_retains_small_head(monkeypatch, config):
+    monkeypatch.setattr(
+        vocab_embedding, "get_current_vllm_config_or_none", lambda: config
+    )
+    assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == 8
