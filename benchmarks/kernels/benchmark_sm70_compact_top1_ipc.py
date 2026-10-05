@@ -6,6 +6,7 @@ This measures communication only, not an MTP round. Launch with torchrun.
 """
 
 import argparse
+import faulthandler
 import json
 import os
 import statistics
@@ -18,6 +19,7 @@ from vllm.distributed.device_communicators.custom_all_reduce import CustomAllred
 
 
 def main():
+    faulthandler.dump_traceback_later(90)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -98,13 +100,21 @@ def main():
                 rank_max_samples_ms=samples,
             )
         )
+        if rank == 0:
+            print(json.dumps(reports[-1]), flush=True)
     dist.barrier()
+    # Captured NCCL graph references must die before ProcessGroupNCCL shuts
+    # down; otherwise its graph-destruction callback can wait indefinitely.
+    del graphs, outputs, graph, saved
+    torch.cuda.synchronize()
     comm.close()
+    dist.destroy_process_group(group)
     dist.destroy_process_group()
     if rank == 0:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(reports, indent=2) + "\n")
         print(json.dumps(reports), flush=True)
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
