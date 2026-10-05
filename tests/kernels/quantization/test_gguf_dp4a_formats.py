@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import numpy as np
 import pytest
+import torch
 
 from vllm.model_executor.layers.quantization.gguf_dp4a_formats import (
     transcode_integer_dot,
 )
+from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
 from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 
 
 @pytest.mark.parametrize("kind", [12, 14, 23])
 @pytest.mark.parametrize("k", [1536, 2560])
-def test_integer_dot_preserves_official_fp32_weights_and_packed_codes(kind, k):
+@pytest.mark.parametrize("head_tiled", [False, True])
+def test_integer_dot_preserves_official_fp32_weights_and_packed_codes(
+    kind, k, head_tiled
+):
     n = 32
     _, size = quant_size(kind)
     rng = np.random.default_rng(kind + k)
@@ -24,7 +29,16 @@ def test_integer_dot_preserves_official_fp32_weights_and_packed_codes(kind, k):
     raw = blocks.reshape(n, -1)
     codec = transcode_integer_dot(raw, kind)
     np.testing.assert_array_equal(codec.dequantize(), dequantize(raw, kind))
-    packed, original_d, small, dmin, mins = codec.packed()
+    layout = GGUFHeadTilingLayout(2, 128) if head_tiled else None
+    packed, original_d, small, dmin, mins = codec.packed(layout)
+
+    def restored(array, head_dim):
+        if layout is None:
+            return array
+        return layout.weight_to_vllm(
+            torch.from_numpy(array), dim=1, head_dim=head_dim
+        ).numpy()
+
     packets = packed.transpose(0, 2, 1).copy().reshape(n, -1)
     if kind == 14:
         decoded = packets.view(np.int8).reshape(n, k)
@@ -36,14 +50,32 @@ def test_integer_dot_preserves_official_fp32_weights_and_packed_codes(kind, k):
             )
             & 15
         ).reshape(n, k)
-    np.testing.assert_array_equal(decoded, codec.codes)
+    np.testing.assert_array_equal(decoded, restored(codec.codes, 128))
     np.testing.assert_array_equal(
-        original_d.T, codec.d.repeat(256 // codec.group_size, axis=1)
+        original_d.T,
+        restored(
+            codec.d.repeat(256 // codec.group_size, axis=1), 128 // codec.group_size
+        ),
     )
-    np.testing.assert_array_equal(small.T, codec.small_scales)
+    np.testing.assert_array_equal(
+        small.T, restored(codec.small_scales, 128 // codec.group_size)
+    )
     assert original_d.dtype == np.float16 and small.dtype == np.int8
     if kind == 12:
-        np.testing.assert_array_equal(dmin.T, codec.dmin.repeat(8, axis=1))
-        np.testing.assert_array_equal(mins.T, codec.small_mins)
+        np.testing.assert_array_equal(dmin.T, restored(codec.dmin.repeat(8, axis=1), 4))
+        np.testing.assert_array_equal(mins.T, restored(codec.small_mins, 4))
     else:
         assert not dmin.size and not mins.size
+
+    if kind == 23:
+        import gguf
+
+        values = np.asarray(gguf.quants.IQ4_NL.kvalues, dtype=np.float32)[decoded]
+    else:
+        values = decoded.astype(np.float32)
+    reconstructed = values * (original_d.T.astype(np.float32) * small.T).repeat(
+        codec.group_size, axis=1
+    )
+    if kind == 12:
+        reconstructed -= (dmin.T.astype(np.float32) * mins.T).repeat(32, axis=1)
+    np.testing.assert_array_equal(reconstructed, restored(dequantize(raw, kind), 128))

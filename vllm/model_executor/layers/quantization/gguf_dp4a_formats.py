@@ -45,7 +45,7 @@ class GGUFIntegerDotProjection:
             out -= mins.repeat(32, axis=1)
         return out.reshape(n, k)
 
-    def packed(self):
+    def packed(self, input_layout=None):
         """N32 packets: signed int8 Q6 values, or logical eight-nibble U4 words.
 
         Expanding Q6 codes to int8 avoids decode arithmetic. Original signed
@@ -55,10 +55,34 @@ class GGUFIntegerDotProjection:
         n, k = self.shape
         if n % 32 or k % 256:
             raise ValueError("Integer dot storage requires N32 and complete K256")
+        codes = self.codes
+        original_d = self.d.repeat(256 // self.group_size, axis=1)
+        small_scales = self.small_scales
+        original_min = None if self.dmin is None else self.dmin.repeat(8, axis=1)
+        small_mins = self.small_mins
+        if input_layout is not None:
+            import torch
+
+            span, remainder = divmod(input_layout.head_dim, self.group_size)
+            if remainder:
+                raise ValueError("Head layout cuts an integer-dot scale group")
+
+            def restore(values, head_dim):
+                return input_layout.weight_to_vllm(
+                    torch.from_numpy(values), dim=1, head_dim=head_dim
+                ).numpy()
+
+            codes = restore(codes, input_layout.head_dim)
+            original_d = restore(original_d, span)
+            small_scales = restore(small_scales, span)
+            if original_min is not None:
+                assert small_mins is not None
+                original_min = restore(original_min, span)
+                small_mins = restore(small_mins, span)
         if self.source_type == 14:
-            packets = self.codes.reshape(n, k // 4, 4).view("<i4").squeeze(-1)
+            packets = codes.reshape(n, k // 4, 4).view("<i4").squeeze(-1)
         else:
-            groups = self.codes.reshape(n, k // 8, 8).astype(np.uint32)
+            groups = codes.reshape(n, k // 8, 8).astype(np.uint32)
             packets = (
                 (groups << (4 * np.arange(8, dtype=np.uint32))).sum(-1).astype("<i4")
             )
@@ -67,14 +91,10 @@ class GGUFIntegerDotProjection:
         empty_s = np.empty((0,), dtype=np.int8)
         return (
             np.ascontiguousarray(packets),
-            np.ascontiguousarray(self.d.repeat(256 // self.group_size, axis=1).T),
-            np.ascontiguousarray(self.small_scales.T),
-            empty_d
-            if self.dmin is None
-            else np.ascontiguousarray(self.dmin.repeat(8, axis=1).T),
-            empty_s
-            if self.small_mins is None
-            else np.ascontiguousarray(self.small_mins.T),
+            np.ascontiguousarray(original_d.T),
+            np.ascontiguousarray(small_scales.T),
+            empty_d if original_min is None else np.ascontiguousarray(original_min.T),
+            empty_s if small_mins is None else np.ascontiguousarray(small_mins.T),
         )
 
 
