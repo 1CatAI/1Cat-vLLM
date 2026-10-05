@@ -19,6 +19,7 @@ _probe_calls = {
     "draft-qpn8": 0,
     "draft-int8": 0,
     "draft-int8-block32": 0,
+    "draft-int8-packed": 0,
     "target-head-qpn8": 0,
 }
 _probe_widths: dict[str, set[int]] = {name: set() for name in _probe_calls}
@@ -117,9 +118,16 @@ def _draft_expert_chain(
     probabilities: torch.Tensor,
     integer: bool = False,
     block32: bool = False,
+    canonical: bool = False,
 ) -> torch.Tensor:
     role = (
-        "draft-int8-block32" if block32 else "draft-int8" if integer else "draft-qpn8"
+        "draft-int8-packed"
+        if canonical
+        else "draft-int8-block32"
+        if block32
+        else "draft-int8"
+        if integer
+        else "draft-qpn8"
     )
     _probe_calls[role] += 1
     _probe_widths[role].add(int(x.shape[0]))
@@ -148,7 +156,40 @@ direct_register_custom_op(
     ids,
     probabilities,
     integer=False,
-    block32=False: (torch.empty_like(x)),
+    block32=False,
+    canonical=False: (torch.empty_like(x)),
+)
+
+
+def _draft_packed_fallback(
+    x: torch.Tensor,
+    codes13: torch.Tensor,
+    scales13: torch.Tensor,
+    codes2: torch.Tensor,
+    scales2: torch.Tensor,
+    ids: torch.Tensor,
+    probabilities: torch.Tensor,
+) -> torch.Tensor:
+    from .sm70_mtp_int8 import packed_int8_fallback_experts
+
+    _probe_calls["draft-int8-packed"] += 1
+    _probe_widths["draft-int8-packed"].add(int(x.shape[0]))
+    return packed_int8_fallback_experts(
+        x, codes13, scales13, codes2, scales2, probabilities, ids
+    )
+
+
+direct_register_custom_op(
+    op_name="sm70_mtp_draft_packed_fallback_probe",
+    op_func=_draft_packed_fallback,
+    mutates_args=[],
+    fake_impl=lambda x,
+    codes13,
+    scales13,
+    codes2,
+    scales2,
+    ids,
+    probabilities: torch.empty_like(x),
 )
 
 
@@ -190,13 +231,34 @@ def _draft_expert_apply(
             topk_weights,
             layer._sm70_mtp_expert_integer,
             layer._sm70_mtp_expert_block32,
+            layer._sm70_mtp_expert_canonical,
+        )
+    if layer._sm70_mtp_expert_canonical:
+        if shared_experts is not None:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+                SharedExpertsOrder,
+            )
+
+            shared_experts.apply(
+                shared_experts_input, SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+            )
+        return torch.ops.vllm.sm70_mtp_draft_packed_fallback_probe(
+            x,
+            layer._sm70_mtp_qpn8_codes13,
+            layer._sm70_mtp_qpn8_scales13,
+            layer._sm70_mtp_qpn8_codes2,
+            layer._sm70_mtp_qpn8_scales2,
+            topk_ids,
+            topk_weights,
         )
     return method._sm70_mtp_original_apply(
         layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     )
 
 
-def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False, block32=False):
+def prepare_draft_expert_qpn8_probe(
+    draft_model, *, integer=False, block32=False, canonical=False
+):
     """Prepare only the provided proposer subtree, retaining FP16 fallback."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -209,6 +271,10 @@ def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False, block32=False
 
     if block32 and not integer:
         raise ValueError("Block scaling requires INT8 weights")
+    if canonical and (not block32 or not integer):
+        raise ValueError("Canonical storage requires block32 INT8")
+    if canonical and getattr(draft_model, "_sm70_decode_graph_model", None) is not None:
+        raise ValueError("Canonical probe must precede any shared-weight decode clone")
     if integer:
         from vllm.models.qwen4_exp.nvidia.sm70_mtp_int8 import (
             prepare_int8_expert_weight,
@@ -266,6 +332,18 @@ def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False, block32=False
             )
         layer._sm70_mtp_expert_integer = integer
         layer._sm70_mtp_expert_block32 = block32
+        layer._sm70_mtp_expert_canonical = canonical
+        if canonical:
+            # Byte buffers and parameter views share storage. Do not save the
+            # checkpoint FP16 tensors in a fallback closure or module field.
+            layer.w13_weight = torch.nn.Parameter(
+                layer._sm70_mtp_qpn8_codes13.view(torch.int8).view(512, 320, 2560),
+                requires_grad=False,
+            )
+            layer.w2_weight = torch.nn.Parameter(
+                layer._sm70_mtp_qpn8_codes2.view(torch.int8).view(512, 2560, 160),
+                requires_grad=False,
+            )
         object.__setattr__(method, "_sm70_mtp_original_apply", method.apply)
         method.apply = MethodType(_draft_expert_apply, method)  # type: ignore[method-assign]
         prepared += 1

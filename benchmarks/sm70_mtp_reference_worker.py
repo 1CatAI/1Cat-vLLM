@@ -135,6 +135,7 @@ class DraftExpertINT8CandidateWorker(Worker):
     """Research-only integer weights, retaining FP16 compute and target logits."""
 
     block32 = False
+    canonical = False
 
     def load_model(self, *, load_dummy_weights=False):
         super().load_model(load_dummy_weights=load_dummy_weights)
@@ -143,7 +144,10 @@ class DraftExpertINT8CandidateWorker(Worker):
         )
 
         prepared = prepare_draft_expert_qpn8_probe(
-            self.model_runner.speculator.model, integer=True, block32=self.block32
+            self.model_runner.speculator.model,
+            integer=True,
+            block32=self.block32,
+            canonical=self.canonical,
         )
         if prepared != 1:
             raise RuntimeError(f"Draft INT8 preparation missed layer: {prepared}")
@@ -153,6 +157,12 @@ class DraftExpertINT8Block32CandidateWorker(DraftExpertINT8CandidateWorker):
     """Research-only input-block scaling; no default dispatch."""
 
     block32 = True
+
+
+class DraftExpertINT8PackedCandidateWorker(DraftExpertINT8Block32CandidateWorker):
+    """Research-only single packed store, including larger-batch fallback."""
+
+    canonical = True
 
 
 class DraftFCGatherControlWorker(Worker):

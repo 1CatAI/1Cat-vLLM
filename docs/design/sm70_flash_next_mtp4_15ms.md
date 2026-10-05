@@ -982,3 +982,36 @@ control/candidate times are 0.408668/0.463677 ms. Row-major lane reads destroy
 the packed reader's memory locality. Remove this uncommitted native/helper
 variant; do not enable it to solve C4 memory pressure. A single-store design
 would need to preserve the packed layout for both decode and fallback.
+
+The follow-up keeps the native 32-output/16-input INT8 pack and lets the
+existing W8A16 Triton kernel read that layout through a default-false operator
+argument. Signed codes use zero point zero; ordinary unsigned W8A16 behavior
+is unchanged. Six up/down cases at M4/M20/M128 match the row-major unsigned
+INT8 reference bit for bit. A benchmark-only canonical worker replaces draft
+expert parameters with signed views of the same byte buffers, retaining no
+FP16 expert fallback. Native M1/M5 computation remains unchanged; larger batches
+use an opaque packed fallback with the ordinary expert configuration selection.
+
+The complete local expert-layer graph, including route alignment, up, SiLU,
+down and route sum, measures:
+
+| Tokens | Original FP16 (ms) | Row-major UINT8 (ms) | Canonical packed INT8 (ms) |
+| --- | ---: | ---: | ---: |
+| 4 | 1.127332 | 0.234199 | 0.247624 |
+| 20 | 1.418424 | 0.431155 | 0.457482 |
+| 2048 | 17.935605 | 17.576879 | 20.506633 |
+
+All quantized complete-layer outputs match. The 512-expert store decreases
+from 1,258,291,200 to 668,467,200 bytes, saving 562.5 MiB per rank relative to
+FP16 alone. The fixture contains 50 real TP0 experts; only those experts are
+routed. Prefill loses 2.571028 ms in this layer screen and must be reported
+alongside decode gains. Three CPU scope/alias checks and five fake-shape checks
+pass. No serving default changes: first complete block32 numerical/acceptance
+admission, then separately validate the single-store model and matched C4.
+
+The independent target-head probe also needs explicit tensor/return type
+annotations for custom-op schema inference. Fix its registration before the
+queued model test, and extend the shared-head tests to import the actual
+registered operation and check M1/M5/M8 fake outputs. All fourteen CPU checks
+pass; constructor-only head tests were insufficient to catch this startup
+failure. No GPU model result is attributed to the unregistered probe.

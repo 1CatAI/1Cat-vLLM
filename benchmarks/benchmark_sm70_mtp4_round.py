@@ -37,6 +37,7 @@ def main() -> None:
             "draft-qpn8",
             "draft-int8",
             "draft-int8-block32",
+            "draft-int8-packed",
             "target-head-qpn8",
             "target-top1",
         ),
@@ -213,6 +214,7 @@ def main() -> None:
             "draft-qpn8": "DraftExpertQPN8CandidateWorker",
             "draft-int8": "DraftExpertINT8CandidateWorker",
             "draft-int8-block32": "DraftExpertINT8Block32CandidateWorker",
+            "draft-int8-packed": "DraftExpertINT8PackedCandidateWorker",
             "target-head-qpn8": "TargetHeadQPN8CandidateWorker",
             "target-top1": "TargetTop1CandidateWorker",
         }[args.structural_candidate]
@@ -531,6 +533,7 @@ def main() -> None:
                     "draft-qpn8",
                     "draft-int8",
                     "draft-int8-block32",
+                    "draft-int8-packed",
                     "target-head-qpn8",
                 )
                 and args.teacher_forcing_manifest

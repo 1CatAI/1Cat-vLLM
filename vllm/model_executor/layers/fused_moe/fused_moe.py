@@ -119,6 +119,7 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    packed_int8: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -217,7 +218,7 @@ def fused_moe_kernel_gptq_awq(
     if not has_zp and use_int4_w4a16:
         b_zp_num = 8
     if not has_zp and use_int8_w8a16:
-        b_zp_num = 128
+        b_zp_num = 0 if packed_int8 else 128
     elif has_zp and use_int4_w4a16:
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
@@ -243,7 +244,29 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        if packed_int8:
+            # Signed INT8 in the existing SM70 32-output/16-input MMA pack.
+            # Read the native decode store directly instead of retaining a
+            # second row-major or FP16 copy for larger batches/prefill.
+            logical_k = offs_k[:, None] + BLOCK_SIZE_K * k
+            logical_n = offs_bn[None, :]
+            lane = (
+                (logical_n & 3)
+                + ((logical_n // 8 % 4) << 2)
+                + (((logical_n % 8) // 4) << 4)
+            )
+            physical_k = (
+                ((logical_k & 7) >> 1) + ((logical_k & 1) << 2) + (logical_k & 8)
+            )
+            packed_offset = (
+                ((logical_n // 32) * (K // 16) + logical_k // 16) * 512
+                + lane * 16
+                + physical_k
+            )
+            b_ptrs = b_ptr + off_experts * stride_be + packed_offset
+            b = tl.load(b_ptrs, mask=logical_k < K, other=0)
+        else:
+            b = tl.load(b_ptrs)
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
@@ -646,10 +669,17 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    *,
+    packed_int8: bool = False,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
     assert block_shape is not None and block_shape[0] == 0
+    if packed_int8:
+        assert use_int8_w8a16 and not use_int4_w4a16 and B_zp is None
+        assert B.dtype == torch.int8 and B.is_contiguous()
+        assert B.size(1) % 32 == 0 and B.size(2) % 32 == 0
+        assert block_shape[1] == 32
 
     M = A.size(0)
     num_tokens = M * top_k
@@ -715,6 +745,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        packed_int8=packed_int8,
         **config,
     )
 
