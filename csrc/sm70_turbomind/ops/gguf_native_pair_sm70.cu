@@ -37,7 +37,8 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
           (gate_type == 22 && (up_type == 18 || up_type == 21)) ||
           ((gate_type == 18 || gate_type == 21) && up_type == 22) ||
           (gate_type == 18 && up_type == 23) ||
-          (gate_type == 12 && up_type == 23) ||
+          (gate_type == 12 && (up_type == 23 || up_type == 21)) ||
+          (gate_type == 21 && up_type == 12) ||
           (gate_type == 23 && up_type == 12),
       "GGUF native pair requires a supported original-byte format pair");
   TORCH_CHECK(output.is_cuda() && input.is_cuda() && gate.is_cuda() &&
@@ -80,6 +81,10 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
     launch_pair<R22, R18>(output, input, gate, up, n, k, stream);
   else if (up_type == 22)
     launch_pair<R18, R22>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 12 && up_type == 21)
+    launch_pair<R12, R21>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 21 && up_type == 12)
+    launch_pair<R21, R12>(output, input, gate, up, n, k, stream);
   else if (gate_type == 12)
     launch_pair<R12, R23>(output, input, gate, up, n, k, stream);
   else if (up_type == 12)
