@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LatticeGGUFProjection,
     transcode_lattice,
 )
+from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
     LUT4_TYPES,
     Lut4GGUFProjection,
@@ -329,7 +330,9 @@ def _admitted_bands(capabilities):
     ]
 
 
-def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
+def prepare_gguf_projections(
+    sources, act_dtype, enabled, prefill_min_m, input_layout=None
+):
     """Coalesce adjacent compatible shards without changing projection order."""
     groups: list[tuple[list[torch.Tensor], int]] = []
     for weight, source_type in sources:
@@ -352,21 +355,38 @@ def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
             act_dtype,
             enabled,
             prefill_min_m,
+            input_layout=input_layout,
         )
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
+    if input_layout is not None and not all(
+        projection.input_layout_restored for projection in projections
+    ):
+        # Keep every shard in the same input order when one cannot be restored.
+        reasons = [
+            p.rejection_reason for p in projections if not p.input_layout_restored
+        ]
+        fallback = prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m)
+        for projection in fallback:
+            projection.input_layout_rejection_reasons = reasons
+        return fallback
     return projections
 
 
 class GGUFPreparedProjection(Module):
     """One mixed projection; canonical preparation never changes its row order."""
 
-    def __init__(self, weight, source_type, act_dtype, enabled, prefill_min_m):
+    def __init__(
+        self, weight, source_type, act_dtype, enabled, prefill_min_m, input_layout=None
+    ):
         super().__init__()
         self.source_type = int(source_type)
         self.enabled = enabled
         self.prefill_min_m = prefill_min_m
         self.kernel = None
+        self.input_layout = input_layout
+        self.input_layout_restored = False
+        self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]
         self.source_output_sizes = (self.logical_output_size,)
         self.output_padding = 0
@@ -421,6 +441,28 @@ class GGUFPreparedProjection(Module):
             canonical = transcode(weight.detach().cpu().numpy(), self.source_type)
         except ValueError as error:
             return f"canonical_transcode_rejected:{error}"
+        if self.input_layout is not None:
+            if not isinstance(self.input_layout, GGUFHeadTilingLayout):
+                return "input_layout_codec_unavailable"
+            if not isinstance(canonical, AffineGGUFProjection):
+                return "input_layout_requires_affine_groups"
+            head_span, remainder = divmod(
+                self.input_layout.head_dim, canonical.group_size
+            )
+            if remainder:
+                return "input_layout_cuts_canonical_group"
+            canonical = replace(
+                canonical,
+                codes=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.codes), dim=1
+                ).numpy(),
+                scales=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
+                ).numpy(),
+                mins=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
+                ).numpy(),
+            )
         padding = -n % 32
         if padding:
             canonical = replace(
@@ -469,6 +511,7 @@ class GGUFPreparedProjection(Module):
             config, "codes", "stats", "mins" if config.zero_points else None
         )
         self.kernel.process_weights_after_loading(self)
+        self.input_layout_restored = self.input_layout is not None
         self.output_padding = padding
         self.cache_capabilities = dense_fp16_cache_capabilities(
             self.source_type, k, n, act_dtype, self.enabled
@@ -485,6 +528,8 @@ class GGUFPreparedProjection(Module):
         result = {
             "source_type": quant_type_name(self.source_type),
             "reason": self.rejection_reason,
+            "input_layout_restored": self.input_layout_restored,
+            "input_layout_rejection_reasons": self.input_layout_rejection_reasons,
             "source_output_sizes": list(self.source_output_sizes),
         }
         if self.fp16_capabilities:

@@ -100,7 +100,7 @@ hides that position launch but does not meet the100µs objective. Further
 diagnosis needs the attention-wait/output boundary. The observed arms have
 large scheduling outliers and do not replace unobserved speed measurements.
 
-The fresh graph-node ledger is pending. Nsight2024.6.2 with NVTX tracing fails
+The first graph-node collection follows below; the final same-artifact check is recorded at the end. Nsight2024.6.2 with NVTX tracing fails
 during NCCL NVTX initialization. Nsight2026.2.1 passes initialization but
 produces no report even for a single-process256-kernel CUDA smoke on this
 system. CUDA-only2024.6.2 with fork tracing captures all four NCCL ranks.
@@ -200,3 +200,87 @@ for the unprofiled early-input A/B result. Each rank's attention preparation
 contains two synchronous8-byte host-to-device transfers. A benchmark-only
 one-shot dispatcher records blocking host transfers or CPU tensor indices
 with source stacks; it adds no fence and is not enabled in production.
+
+## Final combined check
+
+The final pair uses the same ordinary wheel from source `615abb0108`, with
+core SHA `d4604bbee4f70346eb23dc8b08dd071a7209de380206a35497c802123d0f7f58`.
+It includes prepared GDN output head order and asynchronous metadata index
+reuse. The workload above is unchanged. Eight natural requests per route
+produce 600 tokens each, reach the length limit and contain plausible text;
+this does not establish EOS termination or identical quantized-model outputs.
+
+| Metric | GGUF mean | NVFP4 mean | Paired difference | Difference 95% interval |
+|---|---:|---:|---:|---:|
+|Draft acceptance|44.246%|45.204%|−0.957pp|−3.347 to +0.929pp|
+|Length including bonus|2.7699|2.8081|−0.0383|−0.1339 to +0.0372|
+
+Acceptance mean intervals are 34.165–56.750% and 34.378–57.973%; length
+mean intervals are 2.3666–3.2700 and 2.3751–3.3189. The first-position
+means are 70.509% and 72.545%, with paired interval −5.095 to +0.645pp.
+All four position intervals now span zero. This set does not reproduce a
+statistically significant overall decrease, but eight clusters cannot prove
+equivalence or exclude a modest decrease.
+
+|Route|C1 before observer(ms)|C1 observed(ms)|C1 after observer(ms)|C4 mean(ms)|
+|---|---:|---:|---:|---:|
+|GGUF|23.2973|23.2519|23.6183|48.1459|
+|NVFP4|20.9488|20.6814|20.5529|46.3875|
+
+GGUF C1 controls have identical complete IDs, including the earlier head-order
+check. C4 differs from the earlier head-order run, so its absolute timing is
+not a same-trajectory implementation speedup. GGUF C4 emits 2,160 tokens over
+233 steady intervals (192.55 tokens/s aggregate); NVFP4 emits 2,099 over 217
+(208.52 tokens/s). Whole-round timings include draft and host work; graph
+service sums must not replace these measurements.
+
+Each target graph now contains 1,763 GGUF nodes and 1,527 NVFP4 nodes, over
+38 and 81 middle rounds on each rank. The 36 head-order copies disappear:
+Tensor copy counts are 5 versus 5. The remaining net difference is 236.
+HC(386), router(96), shared gate(48), QSA(72), ring(98) and n-gram(1)
+counts match. GGUF has 48 expert route/gather and 48 unroute calls, plus
+47 raw joint gate/up and 48 canonical down calls; NVFP4 uses 48 plan,
+48 W13 and 48 W2-reduce calls. The standalone expert activation exists in
+both routes. GGUF shared gate/up still needs standalone SiLU and multiply
+(48 each), whereas NVFP4 uses a different shared dense batch organization.
+These are computation/fusion differences, not removable copies. Shared-expert
+and GDN core fusion work remains with the common Flash-Next decode line.
+
+GGUF projection families contain 131 affine, 87 LUT and 41 other TurboMind
+calls. NVFP4 has 60 more CUTLASS calls, 36 combined GDN input calls and a
+different shared-projection organization. GGUF retains 36 FP16 a/b row GEMV
+and 36 projection splits. No GGUF dense projection is dequantized wholesale
+inside this graph. Its sole dequantization follows the packed PLE row gather;
+a single scatter/gather then copies rows using an identity index. Direct row
+decoding is qualified separately. Neither graph contains sort/searchsorted.
+
+Actual GPU first-node entry spread is median 49.856us, p90 407.928us and
+maximum 14.722ms for GGUF; NVFP4 is 41.741us, p90 63.406us and maximum
+168.565us. GGUF meets the 100us median target, but its tail does not. CPU
+replay submission remains asymmetric: median spread 1,366.582us versus
+998.141us for NVFP4. Rank0 is latest in all 38 GGUF CPU rounds and also owns
+asynchronous output materialization. CPU draft-proposal medians vary from
+roughly 1.6 to 2.8ms across ranks; these durations include queued GPU work
+and cannot be called pure CPU service. GPU entry is much closer because
+submission overlaps preceding draft execution. No barrier was added.
+First-allreduce median services are 4.512/23.040/55.072/50.511us across the
+GGUF ranks, rather than a millisecond. CPU asymmetry and the profiled entry
+tail remain open; a median alone is not evidence that all rank skew vanished.
+Real-model prefix API attribution records zero cudaStreamSynchronize calls
+on every rank after the metadata change, matching its independent microcheck.
+
+The merged IQ3_S dense gated-pair route has exact geometry M8/N4352/K5120;
+its IQ3_XXS extension uses the same dense specialization. Flash-Next dense
+Q6_K/Q4_K/IQ4 projections at hidden width2560 do not match those capabilities.
+The raw expert route is separate and hits all17 IQ3_XXS layers. IQ2_S M20
+keeps canonical fallback. No unmerged dense decoder or duplicate GEMV is
+introduced on this line.
+
+The newly merged floating-shard specialization admits only converted FP16
+sources1/30 with M8 and N12 or24/K5120. Flash-Next uses M5/M20 verification
+and K2560, so it is not admitted by that specialization. Its ordinary dense
+GDN a/b tensors already hit the common FP16 row GEMV (36 calls per target
+graph). The merged IQ3_S/IQ4_XS mixed native pair also admits M8/N4352/K5120;
+Flash-Next shared gate/up uses Q4_K/IQ4_XS at different geometry. These
+capability exclusions are expected. Changing those operator shapes remains
+with the GGUF dense operator line, without adding duplicate implementations.
