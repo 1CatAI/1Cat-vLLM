@@ -92,10 +92,8 @@ struct LatticeDot {
         sign = (signs >> (8 * octet)) & 255;
       }
       const uint32_t s0 = masks[sign & 15], s1 = masks[sign >> 4];
-      // These codebooks contain strictly positive int8 magnitudes. A signed
-      // byte therefore cannot carry when its complemented value gains one.
-      const int w0 = (book[first] ^ s0) + (s0 & 0x01010101U);
-      const int w1 = (book[second] ^ s1) + (s1 & 0x01010101U);
+      const int w0 = __vsub4(book[first] ^ s0, s0);
+      const int w1 = __vsub4(book[second] ^ s1, s1);
       if constexpr (Type == 22) {
         if (octet < 2) {
           sum0 = __dp4a(w0, activation[2 * octet], sum0);
