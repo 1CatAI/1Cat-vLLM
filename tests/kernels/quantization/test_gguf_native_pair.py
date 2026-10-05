@@ -14,7 +14,9 @@ from vllm.model_executor.layers.quantization.gguf_native_pair import (
 )
 
 
-@pytest.mark.parametrize("types", [(21, 23), (23, 21), (18, 21), (21, 18)])
+@pytest.mark.parametrize(
+    "types", [(21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12)]
+)
 def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
     monkeypatch.setattr(
         torch.ops._C, "gguf_native_pair_sm70_out", lambda *args: None, raising=False
@@ -34,7 +36,9 @@ def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
         assert not rejected or all(c.reason for c in rejected)
 
 
-@pytest.mark.parametrize("types", [(21, 23), (23, 21), (18, 21), (21, 18)])
+@pytest.mark.parametrize(
+    "types", [(21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12)]
+)
 def test_runtime_m_preserves_mixed_canonical_policy(monkeypatch, types):
     calls: list[tuple[Any, ...]] = []
 
@@ -120,7 +124,9 @@ def test_dynamic_compile_keeps_runtime_dispatch_opaque():
     torch._dynamo.reset()
 
 
-@pytest.mark.parametrize("types", [(21, 23), (23, 21), (18, 21), (21, 18)])
+@pytest.mark.parametrize(
+    "types", [(21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12)]
+)
 def test_registered_parameter_lists_support_aot_module_capture(types):
     class Projection(torch.nn.Module):
         def __init__(self, source_type):

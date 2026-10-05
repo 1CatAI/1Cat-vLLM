@@ -76,3 +76,12 @@ the comparison and is excluded. Existing IQ3_S/IQ4_XS orientations in
 layers 39 and 42 measure 53.248us native versus 80.896–81.920us
 canonical. Numerical, runtime-M and graph fallback checks pass. These
 secondary measurements do not replace the primary fixed-clock comparison.
+
+The revised reader passes the primary 1290/877MHz, 300W comparison:
+layer 37 measures 76.800us native versus 77.824us canonical, layer 58
+75.776–76.800us versus 78.848us, and layer 62 76.800us versus 78.848us.
+Native source bandwidth is 317.3–321.6GB/s. Both Q4_K/IQ4_XS orientations
+are admitted only for SM70 FP16 M8/N4352/K5120 gate/up projections; all
+other shapes retain canonical fallback. The three layers save an estimated
+5.12–6.14us per M8 round, not an end-to-end measurement. Source-sized
+packing preserves 73,113,600 bytes of original weights per TP4 rank.
