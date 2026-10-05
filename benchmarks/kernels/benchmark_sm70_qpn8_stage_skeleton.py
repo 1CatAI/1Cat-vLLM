@@ -9,6 +9,7 @@ separate experiments. Nothing in this benchmark changes production dispatch.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import statistics
 from functools import partial
@@ -151,6 +152,7 @@ def main():
     )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--extension", type=Path)
     parser.add_argument("--profile-launches-only", action="store_true")
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
@@ -158,12 +160,19 @@ def main():
     source = args.source_root / "csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu"
     generated = args.out / "qpn8-stages.cu"
     generated.write_text(generate(source))
-    extension = load(
-        name="round12_qpn8_stages",
-        sources=[str(generated)],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
-        verbose=True,
-    )
+    if args.extension is None:
+        extension = load(
+            name="round12_qpn8_stages",
+            sources=[str(generated)],
+            extra_cuda_cflags=["-O3", "-lineinfo"],
+            verbose=True,
+        )
+    else:
+        spec = importlib.util.spec_from_file_location(
+            "round12_qpn8_stages", args.extension
+        )
+        extension = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(extension)
     if args.compile_only:
         return
     torch.set_num_threads(1)
