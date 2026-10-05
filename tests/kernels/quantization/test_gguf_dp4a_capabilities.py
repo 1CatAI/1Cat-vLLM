@@ -5,7 +5,37 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.model_executor.kernels.gguf import dp4a_expert_capabilities
+from vllm.model_executor.kernels.gguf import (
+    dp4a_expert_capabilities,
+    q8_intermediate_expert_capabilities,
+)
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_routed_q8_requires_packaged_protocol(monkeypatch, supported):
+    packet = SimpleNamespace(
+        _schemas={"": "lanes_per_row" if supported else "activated"}
+    )
+    monkeypatch.setattr(
+        torch.ops,
+        "_C",
+        SimpleNamespace(
+            gguf_quantize_q8_1_sm70_out=object(),
+            gguf_dp4a_gate_up_sm70_out=packet,
+            gguf_dp4a_down_unroute_sm70_out=object(),
+        ),
+    )
+    caps = q8_intermediate_expert_capabilities(
+        21, 20, 2560, 160, 512, torch.float16, is_sm70=True
+    )
+    assert all(
+        c.reason == (None if supported else "routed_q8_operator_protocol_unavailable")
+        for c in caps
+    )
+    disabled = q8_intermediate_expert_capabilities(
+        21, 20, 2560, 160, 512, torch.float16, is_sm70=True, enabled=False
+    )
+    assert all(c.reason == "disabled_by_kernel_config" for c in disabled)
 
 
 @pytest.fixture
