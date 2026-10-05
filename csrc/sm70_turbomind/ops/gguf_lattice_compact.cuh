@@ -116,7 +116,7 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     return value & ((uint32_t{1} << kPacketBits) - 1);
   }
 
-  template <class Output = float>
+  template <class Output = float, bool RoundedScale = false>
   __device__ static turbomind::Array<Output, 8> fragment(Parameters parameters,
                                                          uint32_t packet,
                                                          int octet,
@@ -136,7 +136,8 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
       packed = *reinterpret_cast<const uint64_t*>(grid + (packet & 1023) * 8);
       signs = packet >> 10;
     }
-    return LatticeRawDecoder<Type>::template table_fragment<Output>(
+    return LatticeRawDecoder<Type>::template table_fragment<Output,
+                                                            RoundedScale>(
         packed, signs, parameters.d, nibble);
   }
 };

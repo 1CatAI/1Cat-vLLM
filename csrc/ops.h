@@ -971,7 +971,7 @@ void gguf_lattice_compact_blas_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor scratch, bool natural_layout,
     int64_t algorithm, int64_t dq_partitions, bool shared_metadata,
-    int64_t dq_threads);
+    int64_t dq_threads, bool rounded_scale);
 
 void gguf_workspace_f16_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                       torch::Tensor offsets,

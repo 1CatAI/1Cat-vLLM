@@ -581,7 +581,8 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
 }
 
 template <int Type, class Output, bool Transpose, bool FullWidth = false,
-          bool PackedOutput = false, bool SharedParameters = false>
+          bool PackedOutput = false, bool SharedParameters = false,
+          bool RoundedScale = false>
 __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
                                        int n, int k) {
   using Decode = vllm::sm70_gguf::LatticeCompactDecoder<Type>;
@@ -623,8 +624,8 @@ __global__ void compact_dequant_kernel(Output* out, const uint8_t* weight,
       next = Decode::template fetch<FullWidth>(tile, width, octet + step);
     const auto packet = Decode::extract(current, lane < width ? lane : 0);
     if (lane < width) {
-      const auto values =
-          Decode::template fragment<Output>(parameters, packet, octet, grid);
+      const auto values = Decode::template fragment<Output, RoundedScale>(
+          parameters, packet, octet, grid);
       if constexpr (std::is_same_v<Output, half> && !Transpose) {
         static_assert(!PackedOutput || FullWidth);
         const int64_t index =
@@ -1299,7 +1300,7 @@ void gguf_lattice_compact_blas_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     int64_t source_type, torch::Tensor scratch, bool natural_layout,
     int64_t algorithm, int64_t dq_partitions, bool shared_metadata,
-    int64_t dq_threads) {
+    int64_t dq_threads, bool rounded_scale) {
   TORCH_CHECK(algorithm == 99 || algorithm == 102 ||
                   (algorithm == 111 && out.scalar_type() == torch::kFloat32),
               "Compact GGUF BLAS requires default/algorithm 2, or FP32 output "
@@ -1325,6 +1326,9 @@ void gguf_lattice_compact_blas_sm70_out(
                   scratch.size(1) == (natural_layout ? k : n) &&
                   scratch.is_contiguous(),
               "Compact GGUF BLAS scratch must match its FP16 weight layout");
+  TORCH_CHECK(
+      !rounded_scale || (shared_metadata && !natural_layout && n % 32 == 0),
+      "Rounded group scales require aligned shared-metadata workspace");
   TORCH_CHECK(!shared_metadata || (!natural_layout && n % 32 == 0),
               "Shared original metadata requires aligned [K,N] workspace");
   const dim3 grid((n + 31) / 32, k / 256, dq_partitions);
@@ -1335,7 +1339,12 @@ void gguf_lattice_compact_blas_sm70_out(
         reinterpret_cast<half*>(scratch.data_ptr()),                      \
         weight.data_ptr<uint8_t>(), n, k);                                \
   else if constexpr (FULL) {                                              \
-    if (shared_metadata)                                                  \
+    if (rounded_scale)                                                    \
+      compact_dequant_kernel<TYPE, half, true, true, false, true, true>   \
+          <<<grid, dq_threads, 0, stream>>>(                              \
+              reinterpret_cast<half*>(scratch.data_ptr()),                \
+              weight.data_ptr<uint8_t>(), n, k);                          \
+    else if (shared_metadata)                                             \
       compact_dequant_kernel<TYPE, half, true, true, false, true>         \
           <<<grid, dq_threads, 0, stream>>>(                              \
               reinterpret_cast<half*>(scratch.data_ptr()),                \

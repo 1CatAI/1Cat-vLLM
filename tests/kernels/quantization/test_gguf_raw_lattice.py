@@ -998,3 +998,60 @@ def test_planar_rounded_scale_retains_fp32_cancellation(kind):
         x.neg_()
         graph.replay()
         torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_rounded_workspace_and_fp32_graph(kind, cancellation):
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        transcode_lattice,
+    )
+
+    n, k, m = 160, 2560, 512
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        _, size = quant_size(kind)
+        blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+        blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+        data = blocks.reshape(n, -1)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, original, kind, k)
+    reference = (
+        torch.from_numpy(transcode_lattice(data, kind).dequantize()).half().cuda()
+    )
+    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(128.0)
+        x[:, k // 2 :] = -128.0
+    out = torch.empty(m, n, device="cuda", dtype=torch.float32)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        False,
+        111,
+        2,
+        True,
+        256,
+        True,
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.neg_() if cancellation else x.normal_()
+        graph.replay()
+        torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+        if cancellation:
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                out, x.float() @ reference.float().T, rtol=0.001, atol=0.003
+            )
