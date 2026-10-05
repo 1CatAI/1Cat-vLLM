@@ -33,6 +33,11 @@ def main():
     )
     parser.add_argument("--prototype-q4-k", action="store_true")
     parser.add_argument("--prototype-iq3xxs-iq4", action="store_true")
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Skip timing after numerical and graph checks",
+    )
     args = parser.parse_args()
     assert (
         sum((args.prototype_iq3_xxs, args.prototype_q4_k, args.prototype_iq3xxs_iq4))
@@ -54,7 +59,7 @@ def main():
             if args.prototype_q4_k
             else ((18, 21), (21, 18))
             if args.prototype_iq3_xxs
-            else ((21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12))
+            else ((21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12), (18, 23))
         )
         assert tuple(types) in allowed, types
         raw = [tensors[name].data[:4352].copy() for name in names]
@@ -161,12 +166,17 @@ def main():
         flush = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         payload_bytes = sum(data.nbytes for data in raw)
         timings = []
-        for label, call in (
-            ("canonical", canonical),
-            ("native", native),
-            ("native", native),
-            ("canonical", canonical),
-        ):
+        timing_calls = (
+            ()
+            if args.check_only
+            else (
+                ("canonical", canonical),
+                ("native", native),
+                ("native", native),
+                ("canonical", canonical),
+            )
+        )
+        for label, call in timing_calls:
             before = clocks()
             elapsed = cold_graph(lambda call=call, rows=rows: call(rows), flush)
             timings.append(
