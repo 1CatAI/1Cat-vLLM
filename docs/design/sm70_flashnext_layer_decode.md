@@ -5,6 +5,20 @@ The acceptance targets are at most 600 kernels per step, no single-CTA kernels,
 and ordinary pure decode at most 7.5 ms/token before the final 6 ms target.
 These targets have not been achieved by this screen.
 
+The independently qualified direction is ordinary QSA preparation. Its M1
+layer improves 0.285542→0.250563 ms (37→27 kernels), and actual MTP4 M5
+improves 0.448010→0.418263 ms (41→32). All layer outputs and selection IDs
+match; all 192 full-vocabulary teacher-forcing rows match exactly, and both
+natural requests stop. These are independent QSA results, not qualification
+of the current combined branch or a measured endpoint speedup.
+
+Shared-expert default preparation has been removed after its model gate
+failed twice. The GDN convolution/core/norm prototype improves both research
+layers, but ordinary initialization and combined model qualification remain
+unresolved. Its new opaque interface has passed CPU functionalization checks;
+this does not establish a working full decode graph. Matched final endpoint
+and whole-model node tracing remain pending.
+
 ## Establishing a comparable endpoint
 
 The integration base is `615710ae5106beeeab87950599fff28977e92962`.
@@ -49,12 +63,11 @@ confined to the fixed-length timing requests.
 
 ## Research implementations
 
-The shared-M1 candidate is included in the ordinary package build and enabled
-by its dtype, shape and platform contract, with no new environment switch.
-Its model distribution gate is pending. The other screen DSOs are research
-artifacts; their results are not source-complete production performance
-evidence. Admission requires the ordinary package and a clean-artifact model
-gate.
+The sections below retain the research schedules and their measured failures.
+The rejected shared-M1 chain remains callable only through explicit benchmark
+preparation. Ordinary model loading uses its original shared route. Research
+DSO results do not qualify production; admission requires the ordinary package
+and its model distribution and natural-completion gates.
 
 | Segment | Screen | Synchronization and reduction |
 | --- | --- | --- |
@@ -105,11 +118,10 @@ precision changes require the same distribution and output-health gate.
 This campaign contract supersedes the historical raw-logit maximum veto for
 these changes; old evidence and thresholds remain historical records.
 
-Compilation and Python syntax/lint checks have passed. Matched endpoint and
-initial segment measurements are complete; additional segment screens and
-candidate model distribution gates remain pending. No
-endpoint speed improvement, kernel-count acceptance or production admission is
-claimed yet.
+Compilation and applicable repository checks pass. Independent QSA ordinary
+layer, distribution and natural-completion gates pass. GDN ordinary and combined
+model qualification remains pending; no endpoint improvement or global
+kernel-count acceptance is claimed.
 
 ## Initial measurements
 
