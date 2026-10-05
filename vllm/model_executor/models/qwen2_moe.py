@@ -202,6 +202,13 @@ class Qwen2MoeMLP(nn.Module):
             self._sm70_batch_shared_expert_gate = _batch_runtime_contract()
 
     def forward(self, x):
+        from vllm.model_executor.layers.quantization.gguf_dense_hmma import (
+            maybe_apply_shared_expert,
+        )
+
+        segment_out = maybe_apply_shared_expert(self, x)
+        if segment_out is not None:
+            return segment_out
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
         fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
         out = fused_act(x) if fused_act is not None else None

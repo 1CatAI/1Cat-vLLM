@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF decoder families and prepared fallback operator capabilities."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -114,6 +114,7 @@ def native_gated_pair_capabilities(
 ) -> tuple[GGUFOperatorCapability, ...]:
     """Joint original-byte readers; only measured M8 shapes are admitted."""
     if source_types not in (
+        (18, 18),
         (21, 23),
         (23, 21),
         (18, 21),
@@ -364,6 +365,21 @@ def dp4a_expert_capabilities(
     )
 
 
+def q8_intermediate_expert_capabilities(*args, **kwargs):
+    """Same calibrated bands, with the packaged routed-Q8 protocol required."""
+    capabilities = dp4a_expert_capabilities(*args, **kwargs)
+    packet = getattr(torch.ops._C, "gguf_dp4a_gate_up_sm70_out", None)
+    supported = "lanes_per_row" in str(getattr(packet, "_schemas", {}))
+    return tuple(
+        replace(
+            c,
+            reason=c.reason
+            or (None if supported else "routed_q8_operator_protocol_unavailable"),
+        )
+        for c in capabilities
+    )
+
+
 def small_grouped_vector_capabilities(
     source_type: int,
     k: int,
@@ -443,4 +459,42 @@ def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapabilit
         )
     return GGUFOperatorCapability(
         family, quant_type_name(weight_type), operator, graph_safe, reason=reason
+    )
+
+
+def native_linear_capability(
+    source_type: int,
+    k: int,
+    n: int,
+    dtype: torch.dtype | None,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> GGUFOperatorCapability:
+    """Cold-graph ABBA winners for the TP4 down projection at M8."""
+    operator = (
+        "gguf_canonical_linear_n64_sm70_out"
+        if source_type == 10
+        else "gguf_native_linear_n64_sm70_out"
+    )
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_type in (12, 23) and (k, n) == (4352, 5120):
+        reason = "measured_route_not_faster"
+    elif source_type not in (10, 17, 18, 21, 22) or (k, n) != (4352, 5120):
+        reason = "single_projection_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return GGUFOperatorCapability(
+        decoder_family(source_type) if source_type >= 0 else GGUFDecoderFamily.AFFINE,
+        quant_type_name(source_type) if source_type >= 0 else "mixed",
+        operator,
+        True,
+        min_m=8,
+        max_m=8,
+        reason=reason,
     )

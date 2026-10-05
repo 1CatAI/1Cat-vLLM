@@ -408,6 +408,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_grouped_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hc_ll_shard_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
@@ -426,7 +427,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_grouped_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_raw_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dp4a_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_shared_expert_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_linear_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu")
 
     set_gencode_flags_for_srcs(

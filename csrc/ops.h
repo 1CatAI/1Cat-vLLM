@@ -969,6 +969,15 @@ void gguf_native_pair_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor gate, torch::Tensor up,
                                int64_t gate_type, int64_t up_type);
 
+void gguf_native_linear_sm70_out(torch::Tensor out, torch::Tensor input,
+                                 torch::Tensor weight, int64_t source_type);
+
+void gguf_native_linear_n64_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor weight,
+                                     torch::Tensor partials,
+                                     torch::Tensor counters,
+                                     int64_t source_type);
+
 void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor ids,
                                      torch::Tensor route_weights,
@@ -979,4 +988,35 @@ void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
-                                bool activated);
+                                bool activated, int64_t lanes_per_row);
+
+void gguf_dense_segments_sm70_out(
+    torch::Tensor x, std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> high, std::vector<torch::Tensor> scale,
+    std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+    std::vector<int64_t> n, int64_t k, int64_t split, int64_t warps,
+    torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate);
+void gguf_shared_gate_up_sm70_out(torch::Tensor x,
+                                  std::vector<torch::Tensor> gate,
+                                  std::vector<torch::Tensor> up,
+                                  std::vector<int64_t> fmts, torch::Tensor wg,
+                                  torch::Tensor h, torch::Tensor sg,
+                                  torch::Tensor ws, torch::Tensor cnt,
+                                  int64_t split, int64_t warps);
+
+void gguf_dense_restore_canonical_sm70_out(
+    torch::Tensor weight, torch::Tensor stats, torch::Tensor codes,
+    torch::Tensor high, torch::Tensor scale, int64_t fmt, int64_t k, int64_t n);
+
+void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
+                         torch::Tensor cnt, std::vector<int64_t> ll,
+                         torch::Tensor seq, int64_t rank, int64_t variant);
+void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
+                       torch::Tensor cnt, std::vector<int64_t> ll,
+                       torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
+                       torch::Tensor out, torch::Tensor lora_out,
+                       torch::Tensor inj_out, int64_t warps);
+void gguf_canonical_linear_n64_sm70_out(
+    torch::Tensor output, torch::Tensor input, torch::Tensor weight,
+    torch::Tensor stats, torch::Tensor partials, torch::Tensor counters,
+    int64_t bits, int64_t group_size);

@@ -143,6 +143,9 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "mixed_gated_pair": getattr(method, "native_admission", {}).get(
                 "mixed_gated_pair"
             ),
+            "single_projection": getattr(method, "native_admission", {}).get(
+                "single_projection"
+            ),
             "canonical_projections": [
                 projection.admission()
                 for projection in getattr(method, "canonical_projections", ())

@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.gguf_q2_k_records import pack_q2_k_
 from vllm.model_executor.layers.quantization.gguf_q4_k_records import pack_q4_k_records
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
     _prepared_gguf_mixed_projection,
+    _prepared_gguf_projection,
     prepared_projection_arguments,
 )
 from vllm.platforms import current_platform
@@ -80,9 +81,26 @@ def _native_gated_pair(
             output, rows, gate, up, gate_type, up_type
         )
     else:
-        pair = _prepared_gguf_mixed_projection(
-            rows, codes, stats, caches, descriptors, cache_bands, blas_bands
-        )
+        if len(codes) == 1:
+            pair = _prepared_gguf_projection(
+                rows,
+                codes[0],
+                stats[0],
+                caches[0],
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+                descriptors[4],
+                descriptors[5],
+                descriptors[6],
+                cache_bands,
+                blas_bands,
+            )
+        else:
+            pair = _prepared_gguf_mixed_projection(
+                rows, codes, stats, caches, descriptors, cache_bands, blas_bands
+            )
         torch.ops._C.silu_and_mul(output, pair)
     return output.reshape(*x.shape[:-1], 4352)
 
@@ -139,8 +157,20 @@ def prepare_native_gated_pair(layer, sources, projections, enabled: bool):
             for w, t in sources
         ):
             reason = "gated_pair_shape_or_source_has_no_calibration"
-        elif len(projections) != 2 or any(
-            p.kernel is None or p.logical_output_size != 4352 for p in projections
+        elif not (
+            (
+                len(projections) == 2
+                and all(
+                    p.kernel is not None and p.logical_output_size == 4352
+                    for p in projections
+                )
+            )
+            or (
+                len(projections) == 1
+                and projections[0].kernel is not None
+                and projections[0].logical_output_size == 8704
+                and tuple(projections[0].source_output_sizes) == (4352, 4352)
+            )
         ):
             reason = "canonical_fallback_unavailable"
     if reason is None:
