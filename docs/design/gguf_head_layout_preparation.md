@@ -76,3 +76,13 @@ objective, but its tail still exceeds100us. The benchmark's one-shot transfer
 diagnostic recorded no blocking-transfer stacks in this run, so those empty
 records are not evidence for a particular source call. A direct metadata
 microbenchmark is used to validate the separately scoped index-copy change.
+
+The final same-artifact 600-token pair is recorded in
+[the graph and acceptance report](flashnext_gguf_graph_parity.md#final-combined-check).
+All four target graphs contain 1,763 nodes, confirming removal of all36
+head-order copies from the preceding1,799-node graph. The combined GGUF
+run gives C1 23.2973/23.6183ms unobserved and C4 48.1459ms. Its paired
+acceptance difference versus NVFP4 is −0.957pp (95% interval −3.347 to
++0.929pp); mean acceptance length differs by −0.0383 (−0.1339 to +0.0372).
+These intervals do not prove equivalence. Projection-bank tests isolate this
+change's 0.1066ms M5 saving; model timings include the separate metadata fix.
