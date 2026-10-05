@@ -53,6 +53,10 @@ def test_draft_head_preserves_shared_target_and_uses_actual_probe_path(monkeypat
 
 
 def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
+    from vllm.v1.attention.backends import fa_utils
+
+    # This CPU load-order test does not exercise an attention backend.
+    monkeypatch.setattr(fa_utils, "get_flash_attn_version", lambda: 2)
     from vllm.models.qwen4_exp.nvidia import mtp
 
     target_head, draft_view = object(), object()
@@ -192,3 +196,30 @@ def test_parallel_packet_preserves_logit_transform_fallback(monkeypatch, scale, 
     proc._maybe_dump_top_token_margin = lambda *args: None
     assert proc.get_top_tokens(head, torch.zeros(1, 2560)).tolist() == [102]
     head.maybe_get_sm70_lm_head_top1_pair.assert_not_called()
+
+
+def test_shared_head_view_uses_full_pack_and_keeps_independent_shortlist(monkeypatch):
+    calls = []
+    head = nn.Module()
+    head.weight = nn.Parameter(torch.randn(32, 2560, dtype=torch.float16))
+    head.shard_indices = SimpleNamespace()
+
+    def prepare(weight):
+        calls.append(weight)
+        return torch.zeros(2560, 32, dtype=torch.uint8), torch.ones(1, 32)
+
+    monkeypatch.setattr(head_ops, "prepare_channel_qpn8_weight", prepare)
+    draft = head_ops.MTPQPN8Head(head)
+    draft._shortlist_size = 1
+    draft.register_buffer("shortlist_codes", torch.ones(2560, 32, dtype=torch.uint8))
+    target = head_ops.MTPQPN8Head(head, shared_view=draft)
+    assert len(calls) == 1
+    assert target.codes is draft.codes and target.scales is draft.scales
+    assert target.codes is not draft.shortlist_codes
+    assert target._shortlist_size is None
+    assert target.head is head
+    other = nn.Module()
+    other.weight = nn.Parameter(head.weight.detach().clone())
+    other.shard_indices = head.shard_indices
+    with pytest.raises(ValueError, match="identical checkpoint head"):
+        head_ops.MTPQPN8Head(other, shared_view=draft)

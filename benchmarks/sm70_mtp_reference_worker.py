@@ -163,3 +163,17 @@ class DraftFCGatherControlWorker(Worker):
 
         sm70_mtp_fc.maybe_combine_fc = lambda *args: None
         super().load_model(load_dummy_weights=load_dummy_weights)
+
+
+class TargetHeadQPN8CandidateWorker(Worker):
+    """Research-only target LM head; output projections retain FP16."""
+
+    def load_model(self, *, load_dummy_weights=False):
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
+            prepare_target_head_qpn8_probe,
+        )
+
+        prepare_target_head_qpn8_probe(
+            self.model_runner.model, self.model_runner.speculator.model
+        )

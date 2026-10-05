@@ -23,13 +23,21 @@ logger = init_logger(__name__)
 
 
 class MTPQPN8Head(nn.Module):
-    def __init__(self, head):
+    def __init__(self, head, *, shared_view=None):
         super().__init__()
         self.head = head
         self.shard_indices = head.shard_indices
         # LogitsProcessor calls method.apply(view, hidden). This view owns no
         # replacement checkpoint parameter and never mutates the shared head.
-        codes, scales = prepare_channel_qpn8_weight(head.weight)
+        if shared_view is None:
+            codes, scales = prepare_channel_qpn8_weight(head.weight)
+        else:
+            if not isinstance(shared_view, MTPQPN8Head) or shared_view.head is not head:
+                raise ValueError(
+                    "QPN8 views can share only the identical checkpoint head"
+                )
+            # Always share full-vocabulary buffers, never shortlist buffers.
+            codes, scales = shared_view.codes, shared_view.scales
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
         self._shortlist_size = None

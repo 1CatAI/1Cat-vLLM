@@ -14,7 +14,13 @@ from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
 from vllm.utils.torch_utils import direct_register_custom_op
 
-_probe_calls = {"shared": 0, "draft-qpn8": 0, "draft-int8": 0, "draft-int8-block32": 0}
+_probe_calls = {
+    "shared": 0,
+    "draft-qpn8": 0,
+    "draft-int8": 0,
+    "draft-int8-block32": 0,
+    "target-head-qpn8": 0,
+}
 _probe_widths: dict[str, set[int]] = {name: set() for name in _probe_calls}
 
 
@@ -264,3 +270,54 @@ def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False, block32=False
         method.apply = MethodType(_draft_expert_apply, method)  # type: ignore[method-assign]
         prepared += 1
     return prepared
+
+
+def _target_head_qpn8(x, codes, scales):
+    from vllm import _sm70_ops as ops
+
+    _probe_calls["target-head-qpn8"] += 1
+    _probe_widths["target-head-qpn8"].add(int(x.shape[0]))
+    out = x.new_empty(x.shape[0], codes.shape[1])
+    ops.fp8_qpn8_gemm_sm70_out(out, x, codes, scales, 8, 2, True, False)
+    return out
+
+
+direct_register_custom_op(
+    op_name="sm70_mtp_target_head_qpn8_probe",
+    op_func=_target_head_qpn8,
+    mutates_args=[],
+    fake_impl=lambda x, codes, scales: x.new_empty(x.shape[0], codes.shape[1]),
+)
+
+
+def prepare_target_head_qpn8_probe(target_model, draft_model):
+    """Benchmark-only target head view; target output projections are unchanged."""
+    from vllm.models.qwen4_exp.nvidia.sm70_mtp_head import MTPQPN8Head
+    from vllm.v1.worker.gpu.spec_decode.eagle.utils import get_target_lm_head
+
+    language = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    head = get_target_lm_head(target_model, language)
+    shared = draft_model._sm70_draft_head
+    if not isinstance(shared, MTPQPN8Head) or shared.head is not head:
+        raise RuntimeError("Target probe requires the identical admitted draft head")
+    view = MTPQPN8Head(head, shared_view=shared)
+
+    def apply(view, layer, x, bias=None):
+        rows = x.numel() // x.shape[-1]
+        if x.dtype != torch.float16 or not 1 <= rows <= 8:
+            return MTPQPN8Head.apply(view, layer, x, bias)
+        out = torch.ops.vllm.sm70_mtp_target_head_qpn8_probe(
+            x.reshape(rows, 2560).contiguous(), view.codes, view.scales
+        )
+        if bias is not None:
+            out.add_(bias)
+        return out.reshape(*x.shape[:-1], head.weight.shape[0])
+
+    view.apply = MethodType(apply, view)  # type: ignore[method-assign]
+    owner = language if getattr(language, "lm_head", None) is head else target_model
+    owner.lm_head = view
+    return view

@@ -896,3 +896,26 @@ inputs and batch limits are unchanged. Allocator-reserved space is not itself
 proof that graph scratch can be borrowed safely: captured temporary addresses
 may be reused on replay. Keep this failure explicit until a validated lifetime
 or workspace fix completes the matched C4 comparison.
+
+The independent target-output 64K subset completes its eight-prompt test:
+3,063 accepted of 6,956 proposed tokens (44.0339%), down 6.1696 percentage
+points from full vocabulary. Its natural-cohort complete round is 24.9861 ms,
+with 2.7556 steady tokens per round and 110.286 tokens/s, compared with the
+full head's 117.222 tokens/s. Twelve automatic quality tasks pass, all sixteen
+outputs stop naturally and health checks report no failures; Chinese manual
+review is pending. Acceptance already rejects this candidate.
+
+A separate CJK extension unions that frozen 65,536-ID frequency subset with
+all 65,782 tokenizer tokens decoding to a character in the recorded Chinese,
+Japanese or Korean Unicode ranges. The union has 107,021 IDs. Its base corpus,
+model-output mix and tokenizer hashes remain unchanged; no evaluation output
+is used. Base-subset coverage statistics are explicitly labelled as belonging
+to the base only. This candidate still needs a head screen and the same
+acceptance cohort; its expanded coverage is not admission evidence.
+
+A separate target-LM-head QPN8 research worker shares the admitted draft
+view's full-vocabulary code/scale buffers for the identical checkpoint head.
+It shares no shortlist buffers, replaces only the target head in the benchmark
+worker, leaves output projections untouched and retains the original method
+at unsupported widths. An opaque operator records actual execution separately
+for target numerical tapes. There is no target-head serving dispatch change.

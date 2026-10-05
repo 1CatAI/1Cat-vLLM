@@ -32,7 +32,13 @@ def main() -> None:
     parser.add_argument("--draft-vocab", type=Path)
     parser.add_argument(
         "--structural-candidate",
-        choices=("shared", "draft-qpn8", "draft-int8", "draft-int8-block32"),
+        choices=(
+            "shared",
+            "draft-qpn8",
+            "draft-int8",
+            "draft-int8-block32",
+            "target-head-qpn8",
+        ),
     )
     parser.add_argument("--restoration-control", action="store_true")
     parser.add_argument("--diagnostics-only", action="store_true")
@@ -206,6 +212,7 @@ def main() -> None:
             "draft-qpn8": "DraftExpertQPN8CandidateWorker",
             "draft-int8": "DraftExpertINT8CandidateWorker",
             "draft-int8-block32": "DraftExpertINT8Block32CandidateWorker",
+            "target-head-qpn8": "TargetHeadQPN8CandidateWorker",
         }[args.structural_candidate]
         engine["worker_cls"] = (
             "benchmarks.sm70_mtp_reference_worker." + candidate_worker
@@ -504,7 +511,11 @@ def main() -> None:
         if args.structural_candidate:
             proof = llm.collective_rpc("get_mtp_structural_route_proof")
             report["structural_route_proof"] = proof
-            widths = {5} if args.structural_candidate == "shared" else {1, 5}
+            widths = (
+                {5}
+                if args.structural_candidate in ("shared", "target-head-qpn8")
+                else {1, 5}
+            )
             if len(proof) != 4 or any(
                 row[args.structural_candidate]["calls"] < 1
                 or not widths.issubset(row[args.structural_candidate]["widths"])
@@ -513,7 +524,12 @@ def main() -> None:
                 raise RuntimeError("Structural candidate was not executed on all ranks")
             if (
                 args.structural_candidate
-                in ("draft-qpn8", "draft-int8", "draft-int8-block32")
+                in (
+                    "draft-qpn8",
+                    "draft-int8",
+                    "draft-int8-block32",
+                    "target-head-qpn8",
+                )
                 and args.teacher_forcing_manifest
                 and any(
                     worker["structural_probe_delta"][args.structural_candidate] < 1
