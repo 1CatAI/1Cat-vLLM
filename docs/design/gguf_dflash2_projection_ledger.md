@@ -33,6 +33,9 @@ workspace, codebook and repeated cache traffic. It is not an NCU DRAM
 bandwidth measurement. Service sums can overlap; only interval unions
 are used to close the wall-time table.
 
+The [aggregate record](data/gguf_dflash2_projection_ledger_20261005.json)
+contains each retained round, role totals and counterpart arms.
+
 ## GPU round boundaries
 
 | Rank | Complete round ms | Target graph ms | After target ms |
