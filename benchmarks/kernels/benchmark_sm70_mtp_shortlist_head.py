@@ -53,12 +53,13 @@ def main():
         layer.quant_method = SimpleNamespace(
             apply=lambda head, x, bias=None: torch.nn.functional.linear(x, head.weight)
         )
+        full_view = MTPQPN8Head(layer)
         view = MTPQPN8Head(layer)
         view.prepare_shortlist(subset)
         for rows in (1, 5):
             xs = torch.randn(4, rows, 2560, device="cuda", dtype=torch.float16)
 
-            def full(view=view, xs=xs):
+            def full(view=full_view, xs=xs):
                 # Compare against the current default segmented selector, not
                 # the retired full-row Torch max implementation.
                 return [view.maybe_get_sm70_lm_head_top1_pair(x) for x in xs]
@@ -106,7 +107,7 @@ def main():
                 )
             )
             del graphs
-        del layer, view
+        del layer, view, full_view
     report["native_sha256"] = hashlib.sha256(
         Path("vllm/_C.abi3.so").read_bytes()
     ).hexdigest()
