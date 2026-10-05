@@ -126,6 +126,7 @@ def main():
             delta = original_sum - decoded.reshape(m, -1, 32).sum(-1)
             expected -= delta @ torch.from_numpy(minimum).cuda().T
         fp16_expected = x.float() @ reference.T
+        event_boundary_us = cold_graph_time(lambda: None, eviction, args.iterations)
         cases = []
         for split in args.split:
             scratch = torch.empty((split, m, n), device="cuda", dtype=torch.float32)
@@ -219,6 +220,11 @@ def main():
                 candidate=cases,
                 native_us=native_samples,
                 native_median_us=statistics.median(native_samples),
+                event_boundary_median_us=event_boundary_us,
+                timing_note=(
+                    "raw event-bounded latency; "
+                    "matched deltas cancel common boundary cost"
+                ),
                 activation_relative_l2=(
                     (expected - fp16_expected).norm() / fp16_expected.norm()
                 ).item(),
