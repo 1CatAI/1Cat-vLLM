@@ -219,6 +219,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "source_type, int num_experts) -> ()");
   ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
            &gguf_dp4a_down_unroute_sm70_out);
+  ops.def(
+      "gguf_dp4a_dense_sm70_out(Tensor(a!) out, Tensor(b!) partial, Tensor "
+      "activation, Tensor codes, Tensor d, Tensor scales, Tensor dmin, Tensor "
+      "mins, int source_type, int split, bool cooperative, bool activated) -> "
+      "()");
+  ops.impl("gguf_dp4a_dense_sm70_out", torch::kCUDA, &gguf_dp4a_dense_sm70_out);
   ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
   ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
            &gguf_quantize_q8_1_sm70_out);
