@@ -73,7 +73,7 @@ def main():
             if args.prototype_iq1_m
             else ((10, 21),)
             if args.prototype_q2_k
-            else ((17, 16), (16, 22))
+            else ((10, 21), (17, 16), (16, 22))
             if args.prototype_iq2_xxs
             else ((17, 18), (22, 17))
             if args.prototype_iq2_xs
@@ -101,6 +101,7 @@ def main():
                 (18, 22),
                 (17, 18),
                 (22, 17),
+                (10, 21),
                 (17, 16),
                 (16, 22),
             )
