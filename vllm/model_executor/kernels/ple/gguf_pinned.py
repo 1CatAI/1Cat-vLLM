@@ -25,6 +25,7 @@ def pinned_table_capability(
     local_ranks,
     max_seqs,
     local_workers,
+    dual_compile_full_graphs,
     available_bytes,
     reserve_bytes,
     explicit_host_bytes=None,
@@ -40,6 +41,8 @@ def pinned_table_capability(
         reason = "requires_sm70_fp16_output"
     elif not local_workers or tp_size != 4:
         reason = "requires_local_tp4_workers"
+    elif not dual_compile_full_graphs:
+        reason = "requires_v2_dual_compile_full_graphs"
     elif max_seqs > 4:
         reason = "decode_capacity_has_no_calibration"
     elif len(tables) != 1 or any(t["type"] != 20 for t in tables):
@@ -71,6 +74,7 @@ def prepare_pinned_gguf_ple(config, tensors, names):
     import torch
     import torch.distributed as dist
 
+    import vllm.envs as envs
     from vllm.distributed.parallel_state import get_tp_group
     from vllm.model_executor.layers.ple_offload_layer import is_offload_process
     from vllm.models.qwen4_exp.common.ple import (
@@ -110,6 +114,11 @@ def prepare_pinned_gguf_ple(config, tensors, names):
             and parallel.pipeline_parallel_size == 1
             and parallel.data_parallel_backend == "mp"
             and not parallel.use_ubatching
+        ),
+        dual_compile_full_graphs=(
+            config.use_v2_model_runner
+            and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+            and config.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ),
         available_bytes=available_host_bytes(),
         reserve_bytes=ple_host_reserve_bytes(total) if total else 0,

@@ -298,6 +298,31 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
                     ),
                     persistent=False,
                 )
+                device = self._pinned_codebook.device
+                ids = torch.tensor(
+                    [0, self._host_rows // 2, self._host_rows - 1],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                output = torch.empty(
+                    (3, self.embedding_dim), dtype=self._output_dtype, device=device
+                )
+                pinned_iq4nl_rows(
+                    self._accelerator_weight_ptrs[device.index],
+                    ids,
+                    self._pinned_codebook,
+                    output,
+                    self.embedding_dim,
+                )
+                assert self.ple_host_storage is not None
+                packed = self.ple_host_storage[
+                    [0, self._host_rows // 2, self._host_rows - 1]
+                ].numpy()
+                expected = torch.from_numpy(
+                    gguf.quants.dequantize(packed, gguf.GGMLQuantizationType.IQ4_NL)
+                ).to(device=device, dtype=self._output_dtype)
+                if not torch.equal(output, expected):
+                    raise ValueError("Pinned PLE IQ4_NL startup row check failed")
 
     def embedding_lookup(self, input_, remote_rows=None):
         if input_.device.type == "cpu":
