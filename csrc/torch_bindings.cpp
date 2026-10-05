@@ -36,6 +36,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
 #ifdef ENABLE_SM70_TURBOMIND
   ops.def(
+      "gguf_native_linear_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, "
+      "int source_type) -> ()");
+  ops.impl("gguf_native_linear_sm70_out", torch::kCUDA,
+           &gguf_native_linear_sm70_out);
+  ops.def(
       "gguf_native_pair_sm70_out(Tensor(a!) out, Tensor input, Tensor gate, "
       "Tensor up, int gate_type, int up_type) -> ()");
   ops.impl("gguf_native_pair_sm70_out", torch::kCUDA,
