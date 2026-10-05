@@ -34,7 +34,8 @@ struct Seg {
 struct Segs {
   Seg s[MAXSEG];
   int nseg;
-  const half* sgate;  // optional: out = fp16(fp16(acc) * sigmoid(sgate[token]))
+  const half* sgate;  // optional: out = fp16(fp16(acc) * sigmoid(sgate[token +
+                      // first_row]))
 };
 
 __device__ __forceinline__ void mma(float (&d)[8], uint32_t a0, uint32_t a1,
@@ -271,7 +272,8 @@ __device__ __forceinline__ void body(const Seg& sg, int t, int g0, int g1,
 
 __device__ __forceinline__ void write_out(const Seg& sg, int t, int v,
                                           float val, int M,
-                                          const half* sgate = nullptr) {
+                                          const half* sgate = nullptr,
+                                          int first_row = 0) {
   const int lv = v >> 3, i = v & 7;
   const int token = (i & 2) | ((lv & 16) ? 4 : 0) | (lv & 1);
   const int col = (i & 1) | (((lv >> 1) & 1) << 1) | ((i >> 2) << 2);
@@ -279,27 +281,27 @@ __device__ __forceinline__ void write_out(const Seg& sg, int t, int v,
   if (token < M && row < sg.n) {
     if (sgate != nullptr) {
       const float gate =
-          1.0f / (1.0f + __expf(-__half2float(__ldcg(sgate + token))));
+          1.0f /
+          (1.0f + __expf(-__half2float(__ldcg(sgate + token + first_row))));
       val = __half2float(__float2half_rn(val)) * gate;
     }
-    sg.out[token * sg.out_ld + row] = __float2half_rn(val);
+    sg.out[(token + first_row) * sg.out_ld + row] = __float2half_rn(val);
   }
 }
 
-template <int W>
+template <int W, bool Batch>
 __global__ void __launch_bounds__(32 * W)
     dense_mv(Segs segs, const half* __restrict__ x, int ldx, int M, int K,
              int S, int G, int split, float* ws, int* cnt) {
   extern __shared__ uint4 smem[];
   __shared__ int last;
   const int tile = blockIdx.x, sp = blockIdx.y;
-  const int first_row = blockIdx.z * 8;
-  const int scratch_tile = blockIdx.z * gridDim.x + tile;
-  M = min(8, M - first_row);
-  x += first_row * ldx;
-  for (int i = 0; i < segs.nseg; ++i)
-    segs.s[i].out += first_row * segs.s[i].out_ld;
-  if (segs.sgate) segs.sgate += first_row;
+  const int scratch_tile = Batch ? blockIdx.z * gridDim.x + tile : tile;
+  if constexpr (Batch) {
+    const int first_row = blockIdx.z * 8;
+    M = min(8, M - first_row);
+    x += first_row * ldx;
+  }
   int si = 0;
 #pragma unroll
   for (int i = 1; i < MAXSEG; ++i)
@@ -339,7 +341,7 @@ __global__ void __launch_bounds__(32 * W)
 #pragma unroll
     for (int w = 0; w < W; ++w) s += red[w * 256 + v];
     if (split == 1)
-      write_out(sg, t, v, s, M, segs.sgate);
+      write_out(sg, t, v, s, M, segs.sgate, Batch ? blockIdx.z * 8 : 0);
     else
       ws[(static_cast<size_t>(scratch_tile) * split + sp) * 256 + v] = s;
   }
@@ -357,7 +359,7 @@ __global__ void __launch_bounds__(32 * W)
     for (int p = 0; p < split; ++p)
       s += __ldcg(ws + (static_cast<size_t>(scratch_tile) * split + p) * 256 +
                   v);
-    write_out(sg, t, v, s, M, segs.sgate);
+    write_out(sg, t, v, s, M, segs.sgate, Batch ? blockIdx.z * 8 : 0);
   }
   if (threadIdx.x == 0) cnt[scratch_tile] = 0;
 }
@@ -370,10 +372,19 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
   const size_t smem = xs_bytes > red_bytes ? xs_bytes : red_bytes;
   if (smem > 48 * 1024) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        dense_mv<W>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        dense_mv<W, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   }
-  dense_mv<W><<<dim3(tiles, split, (M + 7) / 8), 32 * W, smem, st>>>(
-      segs, x, ldx, M, K, S, G, split, ws, cnt);
+  if (M <= 8) {
+    dense_mv<W, false><<<dim3(tiles, split), 32 * W, smem, st>>>(
+        segs, x, ldx, M, K, S, G, split, ws, cnt);
+  } else {
+    if (smem > 48 * 1024)
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          dense_mv<W, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          smem));
+    dense_mv<W, true><<<dim3(tiles, split, (M + 7) / 8), 32 * W, smem, st>>>(
+        segs, x, ldx, M, K, S, G, split, ws, cnt);
+  }
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "dense_mv launch: ", cudaGetErrorString(e),
               " tiles=", tiles, " split=", split, " W=", W, " smem=", smem);

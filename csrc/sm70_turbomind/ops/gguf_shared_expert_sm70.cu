@@ -71,7 +71,7 @@ __device__ __forceinline__ void write_h(const SwArgs& a, int p, int v, float g,
   }
 }
 
-template <int W>
+template <int W, bool Batch>
 __global__ void __launch_bounds__(32 * W) swiglu_mv(SwArgs a) {
   constexpr int HW = W / 2;
   extern __shared__ uint4 smem[];
@@ -79,13 +79,15 @@ __global__ void __launch_bounds__(32 * W) swiglu_mv(SwArgs a) {
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int npair = (a.I + 31) / 32;
   const int p = blockIdx.x, sp = blockIdx.y;
-  const int first_row = blockIdx.z * 8;
-  a.M = min(8, a.M - first_row);
-  a.x += first_row * a.ldx;
-  a.h += first_row * a.I;
-  a.sg += first_row;
-  a.ws += blockIdx.z * (npair + 1) * a.split * 512;
-  a.cnt += blockIdx.z * (npair + 1);
+  if constexpr (Batch) {
+    const int first_row = blockIdx.z * 8;
+    a.M = min(8, a.M - first_row);
+    a.x += first_row * a.ldx;
+    a.h += first_row * a.I;
+    a.sg += first_row;
+    a.ws += blockIdx.z * (npair + 1) * a.split * 512;
+    a.cnt += blockIdx.z * (npair + 1);
+  }
   half2* lut = reinterpret_cast<half2*>(smem + W * 256);
   if (p == npair) {  // shared gate dot (only split 0)
     if (sp != 0) return;
@@ -183,11 +185,21 @@ void launch_sw(const SwArgs& a) {
   const size_t smem = static_cast<size_t>(W) * 256 * 16 + 1024;
   if (smem > 48 * 1024) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        swiglu_mv<W>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        swiglu_mv<W, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem));
   }
   const int npair = (a.I + 31) / 32;
-  swiglu_mv<W><<<dim3(npair + 1, a.split, (a.M + 7) / 8), 32 * W, smem,
-                 at::cuda::getCurrentCUDAStream()>>>(a);
+  if (a.M <= 8) {
+    swiglu_mv<W, false><<<dim3(npair + 1, a.split), 32 * W, smem,
+                          at::cuda::getCurrentCUDAStream()>>>(a);
+  } else {
+    if (smem > 48 * 1024)
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          swiglu_mv<W, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          smem));
+    swiglu_mv<W, true><<<dim3(npair + 1, a.split, (a.M + 7) / 8), 32 * W, smem,
+                         at::cuda::getCurrentCUDAStream()>>>(a);
+  }
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "swiglu_mv launch: ", cudaGetErrorString(e));
 }
@@ -282,78 +294,88 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x, std::vector<torch::Tensor> g,
 namespace {
 // Reconstruct only the old packed integer layout in transient shared scratch.
 // The resident bank remains the coalesced segment layout for every M.
-__device__ uint32_t segment_high(const Seg& s, int t, int g, int step, int lane,
-                                 int j, int groups) {
-  const int64_t base = (int64_t{t} * groups + g) * 32 + lane;
-  if (s.fmt == Q5K) {
-    uint32_t h = word(s.high[base], step);
-    return (h >> ((j / 2) + (j % 2) * 16)) & 1;
-  }
-  if (s.fmt == Q6K) {
-    uint4 h = s.high[((int64_t{t} * groups + g) * 2 + step / 2) * 32 + lane];
-    int c = j / 8;
-    uint32_t v = word(h, (step % 2) * 2 + c / 2);
-    return (v >> (2 * (4 * (c % 2) + (j % 8) / 2) + (j % 2) * 16)) & 3;
-  }
-  return 0;
+__device__ uint32_t spread_two(uint32_t v) {
+  v &= 65535u;
+  v = (v | (v << 8)) & 0x00ff00ffu;
+  v = (v | (v << 4)) & 0x0f0f0f0fu;
+  return (v | (v << 2)) & 0x33333333u;
 }
-
+__device__ uint32_t spread_one(uint32_t v) {
+  v &= 65535u;
+  v = (v | (v << 8)) & 0x00ff00ffu;
+  v = (v | (v << 4)) & 0x0f0f0f0fu;
+  v = (v | (v << 2)) & 0x33333333u;
+  return (v | (v << 1)) & 0x55555555u;
+}
+__device__ uint32_t lut_native_word(uint32_t v) {
+  uint32_t result = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j)
+    result |= ((v >> (4 * j)) & 15) << (4 * (j / 2 + (j % 2) * 4));
+  return result;
+}
 __global__ void segment_native_restore(Seg s, int k, int n, int groups,
                                        uint32_t* weight, void* stats) {
   const int64_t index = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
-  if (index >= int64_t{k} * n / 8) return;
-  const int col = (index / (k / 8 * 32)) * 32 + index % 32;
-  const int kb = ((index / 32) % (k / 8)) * 8;
+  if (index >= int64_t{k} * n / 32) return;
+  const int col = (index / (k / 32 * 32)) * 32 + index % 32;
+  const int kb = ((index / 32) % (k / 32)) * 32;
   const int lane = (col % 4) | (((col % 32) / 8) << 2) | ((col & 4) << 2);
-  const int t = col / 32, step = (kb / 32) % 4, g = kb / 128, sub = kb % 32;
+  const int t = col / 32, step = (kb / 32) % 4, g = kb / 128;
   const int64_t packet = (int64_t{t} * groups * 4 + kb / 32) * 32 + lane;
-  uint4 codes =
+  const int64_t dst = (int64_t{t} * (k / 8) + kb / 8) * 32 + col % 32;
+  uint4 values =
       s.codes[s.fmt == Q8
-                  ? ((int64_t{t} * groups * 4 + kb / 32) * 2 + sub / 16) * 32 +
-                        lane
+                  ? ((int64_t{t} * groups * 4 + kb / 32) * 2) * 32 + lane
                   : packet];
-  uint32_t low = 0;
   if (s.fmt == Q8) {
-    uint32_t a = word(codes, (sub % 16) / 4) ^ 0x80808080u;
-    uint32_t b = word(codes, (sub % 16) / 4 + 1) ^ 0x80808080u;
-    weight[index * 2] = __byte_perm(a, a, 0x3120);
-    weight[index * 2 + 1] = __byte_perm(b, b, 0x3120);
+    uint4 other =
+        s.codes[((int64_t{t} * groups * 4 + kb / 32) * 2 + 1) * 32 + lane];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      uint32_t value = word(i < 4 ? values : other, i % 4) ^ 0x80808080u;
+      weight[(dst + (i / 2) * 32) * 2 + i % 2] =
+          __byte_perm(value, value, 0x3120);
+    }
   } else {
-    uint32_t packed = word(codes, sub / 8);
-    if (s.fmt == LUT4) {
-      for (int j = 0; j < 8; ++j) {
-        uint32_t q = (packed >> (4 * j)) & 15;
-        low |= q << (4 * (j / 2 + (j % 2) * 4));
-      }
-    } else
-      low = packed;
-    weight[index] = low;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      uint32_t value = word(values, i);
+      weight[dst + i * 32] = s.fmt == LUT4 ? lut_native_word(value) : value;
+    }
   }
-  const int group_size = s.fmt == Q6K ? 16 : 32;
-  if (kb % group_size) return;
-  uint32_t coef = word(s.scale[(int64_t{t} * groups + g) * 32 + lane], step);
-  const int64_t stat_index = int64_t{kb / group_size} * n + col;
-  if (s.fmt == LUT4) {
-    static_cast<uint16_t*>(stats)[stat_index] = coef & 65535;
-  } else if (s.fmt == Q5K || s.fmt == Q6K) {
-    uint32_t upper = 0;
-    for (int j = 0; j < group_size; ++j)
-      upper |= segment_high(s, t, g, step, lane, sub + j, groups)
-               << (j * (s.fmt == Q6K ? 2 : 1));
-    if (s.fmt == Q6K) {
-      uint16_t scale = kb % 32 ? coef >> 16 : coef & 65535;
+  const uint32_t coef =
+      word(s.scale[(int64_t{t} * groups + g) * 32 + lane], step);
+  const int64_t stat_index = int64_t{kb / 32} * n + col;
+  if (s.fmt == LUT4)
+    static_cast<uint16_t*>(stats)[stat_index] = coef & 65535u;
+  else if (s.fmt == Q5K) {
+    const uint32_t high =
+        word(s.high[(int64_t{t} * groups + g) * 32 + lane], step);
+    const uint32_t natural = spread_one(high) | (spread_one(high >> 16) << 1);
+    static_cast<uint64_t*>(stats)[stat_index] =
+        coef | (uint64_t{natural} << 32);
+  } else if (s.fmt == Q6K) {
+    const uint4 high =
+        s.high[((int64_t{t} * groups + g) * 2 + step / 2) * 32 + lane];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      uint32_t h = word(high, (step % 2) * 2 + i);
+      uint32_t natural = spread_two(h) | (spread_two(h >> 16) << 2);
+      uint16_t scale = i ? coef >> 16 : coef & 65535u;
       uint16_t minimum = __half_as_ushort(
           __hmul(__ushort_as_half(scale), __float2half_rn(-32.f)));
-      coef = scale | (uint32_t{minimum} << 16);
+      static_cast<uint64_t*>(stats)[int64_t{kb / 16 + i} * n + col] =
+          scale | (uint32_t{minimum} << 16) | (uint64_t{natural} << 32);
     }
-    static_cast<uint64_t*>(stats)[stat_index] = coef | (uint64_t{upper} << 32);
   } else {
+    uint32_t affine = coef;
     if (s.fmt == Q8) {
       uint16_t minimum = __half_as_ushort(
-          __hmul(__ushort_as_half(coef & 65535), __float2half_rn(-128.f)));
-      coef = (coef & 65535) | (uint32_t{minimum} << 16);
+          __hmul(__ushort_as_half(coef & 65535u), __float2half_rn(-128.f)));
+      affine = (coef & 65535u) | (uint32_t{minimum} << 16);
     }
-    static_cast<uint32_t*>(stats)[stat_index] = coef;
+    static_cast<uint32_t*>(stats)[stat_index] = affine;
   }
 }
 }  // namespace
@@ -398,7 +420,7 @@ void gguf_dense_restore_canonical_sm70_out(torch::Tensor weight,
           stats.numel() == k / (fmt == Q6K ? 16 : 32) * n,
       "invalid transient coefficients");
   Seg s = make_seg(codes, high, scale, fmt, n);
-  const int64_t count = k * n / 8;
+  const int64_t count = k * n / 32;
   segment_native_restore<<<(count + 255) / 256, 256, 0,
                            at::cuda::getCurrentCUDAStream()>>>(
       s, k, n, groups, reinterpret_cast<uint32_t*>(weight.data_ptr()),
