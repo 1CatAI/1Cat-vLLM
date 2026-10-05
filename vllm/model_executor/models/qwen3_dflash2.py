@@ -290,6 +290,9 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             ):
                 if isinstance(projection.quant_method, UnquantizedLinearMethod):
                     projection._sm70_dflash2_fp16_m8 = True
+                    projection._sm70_dflash2_fp8_m8 = (
+                        get_dflash_model_draft_tokens(speculative_config) == 7
+                    )
 
     def forward(
         self,
