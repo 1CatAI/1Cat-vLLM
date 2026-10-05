@@ -57,3 +57,21 @@ operation with explicit mutable reduction workspace. Only measured complete
 source combinations can enter; every other M delegates to canonical.
 Installed model-wiring comparisons and the remaining real source combinations
 are pending.
+
+The remaining fifteen real QKV/Z combinations also pass. Across all nineteen
+combinations representing all forty-eight GDN layers, joint latency is
+38.912–45.056 µs versus coalesced canonical 48.128–81.920 µs, at identical
+1290/877 MHz clocks. Maximum relative L2 over all fifty-seven inputs is
+0.0006698. Every combination wins both comparison arms. The
+[complete operator record](data/gguf_qkvz_tp4_m8_20261006.json) includes source
+and loaded byte counts, bandwidth, clocks, layer multiplicity and each
+numerical/ABBA result. Multiplying each saving by its layer count gives an
+estimated 1.262–1.276 ms per M8 round. This has not been measured end to end.
+
+Model capability declarations cover these nineteen complete source tuples,
+FP16 activations, SM70, M8 and the exact combined TP4 shape. Other sources,
+shapes, M and disabled policy retain canonical with an explicit admission
+reason. Coalesced affine code views share their existing storage; scale/min
+views retain their original row stride. CPU tests cover this aliasing,
+capability gates, runtime-M fallback and a single opaque dynamic export.
+Installed compiled-layer checks remain pending.
