@@ -151,13 +151,14 @@ def main():
         )
         tokenized = []
         for prompt in prompts:
-            ids = tokenizer.apply_chat_template(
+            rendered = tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt["prompt"]}],
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
-            tokenized.append(ids)
+            ids = tokenizer.encode(rendered, add_special_tokens=False)
+            tokenized.append(list(ids))
         report["prompt_tokens_sha256"] = digest(tokenized)
         params = SamplingParams(
             temperature=0,
