@@ -497,6 +497,8 @@ void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
 void qwen38_shared_gate_sigmoid_mul_out(torch::Tensor out,
                                         torch::Tensor logits);
 
+void sm70_set_fp8_small_shape_tuning(bool enabled);
+
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
 

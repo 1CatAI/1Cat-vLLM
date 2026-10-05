@@ -482,6 +482,7 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        self._apply_sm70_native_tuning_policy()
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -501,6 +502,15 @@ class Worker(WorkerBase):
                 self.vllm_config.parallel_config,
                 self.model_runner.get_model(),
             )
+
+    def _apply_sm70_native_tuning_policy(self) -> None:
+        # The native GEMM selector reads its policy from this process, so each
+        # worker hands over the engine's setting before the first GEMM runs.
+        fp8 = self.vllm_config.kernel_config.sm70_fp8
+        if hasattr(torch.ops._C, "sm70_set_fp8_small_shape_tuning"):
+            from vllm import _sm70_ops as sm70_ops
+
+            sm70_ops.sm70_set_fp8_small_shape_tuning(fp8.native_small_shape_tuning())
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)

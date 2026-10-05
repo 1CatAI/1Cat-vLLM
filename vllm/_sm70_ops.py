@@ -3418,6 +3418,10 @@ if hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
         return None
 
 
+def sm70_set_fp8_small_shape_tuning(enabled: bool) -> None:
+    _op("sm70_set_fp8_small_shape_tuning")(enabled)
+
+
 def sm70_gemm_import_cache(device_hint: torch.Tensor, path: str) -> int:
     return _op("sm70_gemm_import_cache")(device_hint, path)
 

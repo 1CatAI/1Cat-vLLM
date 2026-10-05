@@ -1072,7 +1072,15 @@ bool awq_tune_small_shapes_enabled() {
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
+// -1: follow VLLM_SM70_FP8_TUNE_SMALL_SHAPES; 0/1: set by the engine's
+// KernelConfig through sm70_set_fp8_small_shape_tuning().
+std::atomic<int> fp8_small_shape_tuning_setting{-1};
+
 bool fp8_tune_small_shapes_enabled() {
+  const int setting = fp8_small_shape_tuning_setting.load();
+  if (setting >= 0) {
+    return setting != 0;
+  }
   const char* raw = std::getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES");
   return raw == nullptr || std::atoi(raw) != 0;
 }
@@ -7372,6 +7380,10 @@ void sm70_dynamic_draft_vocab_refresh_tail_weight_out(
 void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
                            torch::Tensor _gate_weight) {
   vllm::awq_sm70::sm70_f16_gate_mul_out(out, _in_feats, _gate_weight);
+}
+
+void sm70_set_fp8_small_shape_tuning(bool enabled) {
+  vllm::awq_sm70::fp8_small_shape_tuning_setting.store(enabled ? 1 : 0);
 }
 
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,

@@ -4595,12 +4595,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
         description=(
-            "SM70: fp8 tune small shapes. The consumer locations and unset "
-            "defaults are listed below."
+            "Compatibility alias for kernel_config.sm70_fp8.small_shape_tuning. "
+            "Time the native FP8 kernel candidates for each new small shape "
+            "(M <= 16) and keep the fastest. When set and the field is not, the "
+            "engine hands this value to the native selector."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="True",
-        effective_default="True",
+        effective_default=(
+            "True; engines resolve the unset alias to the field default, off."
+        ),
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,

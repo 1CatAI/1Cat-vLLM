@@ -53,6 +53,8 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
     fp4_kinds: set[str],
     has_mxfp4_moe: bool = False,
     has_nvfp4_moe: bool = False,
+    *,
+    fp8_small_shape_tuning: bool,
 ) -> bool:
     awq_no_preserve = (
         has_awq_dense
@@ -62,7 +64,7 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
     )
     fp8_dynamic = (
         has_fp8_dense
-        and envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+        and fp8_small_shape_tuning
         and not envs.VLLM_SM70_FP8_REUSE_IMPORTED_CACHE
     )
     mxfp4_dynamic = (
@@ -209,13 +211,11 @@ def _warmup_fp8_dense_layers_coordinated(
     layers: list[tuple[torch.nn.Module, bool]],
     m_values: list[int],
     device: torch.device,
+    fp8_small_shape_tuning: bool,
 ) -> int:
     if not layers:
         return 0
-    if (
-        not envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
-        or not envs.VLLM_SM70_FP8_COORDINATED_TUNING
-    ):
+    if not fp8_small_shape_tuning or not envs.VLLM_SM70_FP8_COORDINATED_TUNING:
         return _warmup_fp8_dense_layers(layers, m_values)
 
     return _run_coordinated_dense_warmup(
@@ -1200,6 +1200,9 @@ def sm70_awq_warmup(worker: Worker) -> None:
         fp4_kinds,
         bool(mxfp4_moe_layers),
         bool(nvfp4_moe_layers),
+        fp8_small_shape_tuning=(
+            worker.vllm_config.kernel_config.sm70_fp8.native_small_shape_tuning()
+        ),
     )
     imported_records = _load_lut_cache(device, skip_import=skip_lut_cache)
     if imported_records > 0:
