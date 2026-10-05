@@ -26,6 +26,7 @@ def pinned_table_capability(
     max_seqs,
     local_workers,
     dual_compile_full_graphs,
+    disk_cascade,
     available_bytes,
     reserve_bytes,
     explicit_host_bytes=None,
@@ -43,6 +44,8 @@ def pinned_table_capability(
         reason = "requires_local_tp4_workers"
     elif not dual_compile_full_graphs:
         reason = "requires_v2_dual_compile_full_graphs"
+    elif disk_cascade:
+        reason = "disk_cascade_placement_takes_precedence"
     elif max_seqs > 4:
         reason = "decode_capacity_has_no_calibration"
     elif len(tables) != 1 or any(t["type"] != 20 for t in tables):
@@ -120,6 +123,7 @@ def prepare_pinned_gguf_ple(config, tensors, names):
             and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
             and config.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ),
+        disk_cascade=policy.ple_disk_cascade_active,
         available_bytes=available_host_bytes(),
         reserve_bytes=ple_host_reserve_bytes(total) if total else 0,
         explicit_host_bytes=ple_host_budget_bytes(),

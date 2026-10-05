@@ -17,6 +17,7 @@ def capability(**changes):
         max_seqs=4,
         local_workers=True,
         dual_compile_full_graphs=True,
+        disk_cascade=False,
         available_bytes=160 << 30,
         reserve_bytes=47 << 30,
     )
@@ -38,6 +39,7 @@ def test_all_four_shards_fit_without_double_booking_host_memory():
         ({"sm70": False}, "requires_sm70_fp16_output"),
         ({"max_seqs": 8}, "decode_capacity_has_no_calibration"),
         ({"local_workers": False}, "requires_local_tp4_workers"),
+        ({"disk_cascade": True}, "disk_cascade_placement_takes_precedence"),
         (
             {"dual_compile_full_graphs": False},
             "requires_v2_dual_compile_full_graphs",
