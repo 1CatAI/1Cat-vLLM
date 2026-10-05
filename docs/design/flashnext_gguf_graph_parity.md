@@ -34,6 +34,20 @@ and 34.378–57.973% for NVFP4. Mean-length intervals are 2.3916–3.3267 and
 2.3751–3.3189 respectively. Prompt-to-prompt variation is much larger than
 the paired difference.
 
+Per-position rates use all drafts as denominator, rather than conditioning on
+the previous position being accepted:
+
+| Draft position | GGUF | NVFP4 | Paired difference95% interval |
+|---|---:|---:|---:|
+|1|70.461%|72.545%|−4.071 to−0.388pp|
+|2|48.957%|49.892%|−4.262 to+2.038pp|
+|3|36.110%|33.957%|−0.853 to+5.387pp|
+|4|26.352%|24.421%|−0.084 to+4.439pp|
+
+The first-position rate is lower on this set, while later-position rates
+compensate in the mean length. Overall acceptance parity does not imply that
+every position has identical behavior between the two quantized checkpoints.
+
 ## Complete-round probes
 
 Separate synthetic probes respect exact token budgets and ignore EOS to keep

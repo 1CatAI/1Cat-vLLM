@@ -40,6 +40,7 @@ def compare(gguf, nvfp4, repetitions=20000):
         "prompts": 8,
         "bootstrap_repetitions": repetitions,
         "metrics": {},
+        "positions": [],
         "rows": [],
     }
     for metric in ("draft_acceptance_rate", "mean_acceptance_length"):
@@ -55,6 +56,30 @@ def compare(gguf, nvfp4, repetitions=20000):
                 (a - b)[index].mean(1), [0.025, 0.975]
             ).tolist(),
         }
+    for position in range(4):
+        rates = [
+            np.asarray(
+                [
+                    r["acceptance"]["accepted_tokens_per_pos"][position]
+                    / r["acceptance"]["num_drafts"]
+                    for r in rows
+                ],
+                dtype=float,
+            )
+            for rows in (left, right)
+        ]
+        a, b = rates
+        result["positions"].append(
+            {
+                "position": position + 1,
+                "denominator": "all_drafts_per_prompt",
+                "gguf_prompt_mean": float(a.mean()),
+                "nvfp4_prompt_mean": float(b.mean()),
+                "paired_difference_95ci": np.quantile(
+                    (a - b)[index].mean(1), [0.025, 0.975]
+                ).tolist(),
+            }
+        )
     for a, b in zip(left, right, strict=True):
         result["rows"].append(
             {
