@@ -64,6 +64,13 @@ def main():
     result = dict(
         version=vllm.__version__,
         core_sha256=hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest(),
+        benchmark_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda,
+        device=torch.cuda.get_device_name(),
+        accumulation="fp32",
+        activation_encoding="q8_1_group32_original_half_sum",
+        calls_per_graph=16,
         tensor=args.tensor,
         shape=[n, k],
         source_type=kind,
@@ -90,6 +97,7 @@ def main():
             )
             delta = original_sum - decoded.reshape(m, -1, 32).sum(-1)
             expected -= delta @ torch.from_numpy(minimum).cuda().T
+        fp16_expected = x.float() @ reference.T
         cases = []
         for split in args.split:
             scratch = torch.empty((split, m, n), device="cuda", dtype=torch.float32)
@@ -183,6 +191,13 @@ def main():
                 candidate=cases,
                 native_us=native_samples,
                 native_median_us=statistics.median(native_samples),
+                activation_relative_l2=(
+                    (expected - fp16_expected).norm() / fp16_expected.norm()
+                ).item(),
+                activation_max_absolute_error=(expected - fp16_expected)
+                .abs()
+                .max()
+                .item(),
             )
         )
         args.output.write_text(json.dumps(result, indent=2) + "\n")
