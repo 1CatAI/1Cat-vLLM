@@ -29,19 +29,15 @@ def test_direct_bmhd_preserves_window_and_overwrites_output(batch, page):
     ).int()
     lengths = torch.full((batch,), 1024, device="cuda", dtype=torch.int32)
     output = torch.empty_like(q)
-    flash_attn_prefill_paged(
-        q,
-        kc,
-        vc,
-        table,
-        lengths,
-        out=output,
-        causal=False,
-        window_size=(2047, 2047),
-    )
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        flash_attn_prefill_paged(
+
+    def call():
+        # The native ABI retains bitwise WMMA arithmetic. The single-request
+        # public route now has its own FP64-reference tests.
+        if batch == 1:
+            return native.dflash2_paged_bmhd_fwd(
+                q, kc, vc, output, table, lengths, 128**-0.5
+            )
+        return flash_attn_prefill_paged(
             q,
             kc,
             vc,
@@ -51,6 +47,11 @@ def test_direct_bmhd_preserves_window_and_overwrites_output(batch, page):
             causal=False,
             window_size=(2047, 2047),
         )
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
     for length in (0, 8, 1024, 2047, 2048, 2055, 8192):
         lengths.copy_(torch.arange(batch, device="cuda") * 17 + length)
         if length == 0:
