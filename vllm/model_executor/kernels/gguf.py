@@ -74,6 +74,87 @@ class GGUFOperatorCapability:
         return m >= self.min_m and (self.max_m is None or m <= self.max_m)
 
 
+def iq3_gated_pair_capability(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> GGUFOperatorCapability:
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_types != (21, 21) or (k, n) != (5120, 4352):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, "gguf_iq3_gated_sm70_out"):
+        reason = "operator_missing:gguf_iq3_gated_sm70_out"
+    return GGUFOperatorCapability(
+        GGUFDecoderFamily.LATTICE,
+        "IQ3_S",
+        "gguf_iq3_gated_sm70_out",
+        True,
+        min_m=8,
+        max_m=8,
+        reason=reason,
+    )
+
+
+def native_gated_pair_capabilities(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Joint original-byte readers; only measured M8 shapes are admitted."""
+    if source_types not in (
+        (21, 23),
+        (23, 21),
+        (18, 21),
+        (21, 18),
+        (12, 23),
+        (23, 12),
+        (12, 21),
+        (21, 12),
+        (18, 23),
+        (22, 21),
+        (21, 22),
+        (22, 18),
+        (18, 22),
+    ):
+        return ()
+    operator = "gguf_native_pair_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (k, n) != (5120, 4352):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=8,
+            max_m=8,
+            reason=reason,
+        )
+        for source_type in source_types
+    )
+
+
 def dense_fp16_cache_capabilities(
     source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
 ) -> tuple[GGUFOperatorCapability, ...]:
@@ -225,6 +306,55 @@ def raw_grouped_gate_up_capabilities(
             ),
         )
         for m in (1, 5, 20)
+    )
+
+
+def dp4a_expert_capabilities(
+    source_type: int,
+    down_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+    original_storage_available: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Original M bands for Q8_1 gate/up plus integer down and route reduction."""
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_type not in (18, 21, 22) or down_type not in (20, 42):
+        reason = "dp4a_expert_source_formats_unavailable"
+    elif (k, n, num_experts) != (2560, 160, 512):
+        reason = "dp4a_expert_shape_has_no_calibration"
+    elif not original_storage_available:
+        reason = "original_expert_bank_not_retained"
+    else:
+        for operator in (
+            "gguf_quantize_q8_1_sm70_out",
+            "gguf_dp4a_gate_up_sm70_out",
+            "gguf_dp4a_down_unroute_sm70_out",
+        ):
+            if not hasattr(torch.ops._C, operator):
+                reason = f"operator_missing:{operator}"
+                break
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            "gguf_expert_dp4a",
+            True,
+            min_m=m,
+            max_m=m,
+            reason=reason,
+        )
+        for m in (5, 20)
     )
 
 

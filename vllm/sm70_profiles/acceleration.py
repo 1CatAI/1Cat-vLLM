@@ -139,6 +139,10 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
                 for op in ("ggml_dequantize", "ggml_mul_mat_vec_a8", "ggml_mul_mat_a8")
             },
             "storage_fallback_reason": getattr(method, "fallback_reason", None),
+            "gated_pair": getattr(method, "native_admission", {}).get("gated_pair"),
+            "mixed_gated_pair": getattr(method, "native_admission", {}).get(
+                "mixed_gated_pair"
+            ),
             "canonical_projections": [
                 projection.admission()
                 for projection in getattr(method, "canonical_projections", ())

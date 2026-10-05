@@ -438,6 +438,46 @@ except AttributeError as error:
     raise error
 
 
+def _dequantize_gguf_rows(
+    quant: torch.Tensor,
+    qweight_type: int,
+    hidden_size: int,
+    dtype: torch.dtype | None = None,
+    native_enabled: bool = True,
+) -> torch.Tensor:
+    if qweight_type not in DEQUANT_TYPES | NATIVE_TYPES:
+        raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+    rows = quant.shape[0]
+    dequant = (
+        native_dequantize(quant, qweight_type, rows, hidden_size, dtype)
+        if native_enabled
+        else None
+    )
+    if dequant is None:
+        dequant = ops.ggml_dequantize(quant, qweight_type, hidden_size, rows, dtype)
+    # The legacy operator labels its dimensions in the opposite order;
+    # its contiguous payload is still a row-major embedding matrix.
+    return dequant.view(rows, hidden_size)
+
+
+def _dequantize_gguf_rows_fake(
+    quant: torch.Tensor,
+    qweight_type: int,
+    hidden_size: int,
+    dtype: torch.dtype | None = None,
+    native_enabled: bool = True,
+) -> torch.Tensor:
+    return torch.empty((quant.shape[0], hidden_size), dtype=dtype, device=quant.device)
+
+
+direct_register_custom_op(
+    op_name="dequantize_gguf_rows",
+    op_func=_dequantize_gguf_rows,
+    fake_impl=_dequantize_gguf_rows_fake,
+)
+dequantize_gguf_rows = torch.ops.vllm.dequantize_gguf_rows
+
+
 def _apply_gguf_embedding(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -453,15 +493,9 @@ def _apply_gguf_embedding(
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
-        dequant = (
-            native_dequantize(quant, qweight_type, x_flat.shape[0], hidden_size, dtype)
-            if native_enabled
-            else None
+        dequant = dequantize_gguf_rows(
+            quant, qweight_type, hidden_size, dtype, native_enabled
         )
-        if dequant is None:
-            dequant = ops.ggml_dequantize(
-                quant, qweight_type, hidden_size, x_flat.shape[0], dtype
-            )
         return dequant.view(*x.shape, hidden_size)
     else:
         qweight_type = WeightType(qweight_type)
@@ -667,8 +701,27 @@ class GGUFLinearMethod(LinearMethodBase):
             else:
                 sources = [(qweight, layer.qweight_type.weight_type)]
             projections = prepare_gguf_projections(
-                sources, self.params_dtype, self.native_enabled, self.prefill_min_m
+                sources,
+                self.params_dtype,
+                self.native_enabled,
+                self.prefill_min_m,
+                input_layout=self.layout,
             )
+            from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+                prepare_iq3_gated_pair,
+            )
+
+            if self.layout is None and not isinstance(self, GGUFEmbeddingMethod):
+                self.native_admission["gated_pair"] = prepare_iq3_gated_pair(
+                    layer, sources, projections, self.native_enabled
+                )
+                from vllm.model_executor.layers.quantization.gguf_native_pair import (
+                    prepare_native_gated_pair,
+                )
+
+                self.native_admission["mixed_gated_pair"] = prepare_native_gated_pair(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
@@ -678,6 +731,8 @@ class GGUFLinearMethod(LinearMethodBase):
             if any(projection.kernel is not None for projection in projections):
                 layer.gguf_tm_projections = torch.nn.ModuleList(projections)
                 self.canonical_projections = layer.gguf_tm_projections
+                if all(p.input_layout_restored for p in projections):
+                    self.layout = None
                 qweight.data_container.clear()
                 # Replace this layer's parameter rather than mutating shared
                 # checkpoint storage (for example a tied embedding parameter).
@@ -742,6 +797,21 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+
+    def apply_fused_silu_and_mul(self, layer, x):
+        if hasattr(layer, "gguf_native_gated_records"):
+            from vllm.model_executor.layers.quantization.gguf_native_pair import (
+                apply_native_gated_pair,
+            )
+
+            return apply_native_gated_pair(layer, x)
+        if not hasattr(layer, "gguf_iq3_gated_records"):
+            return None
+        from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+            apply_iq3_gated_pair,
+        )
+
+        return apply_iq3_gated_pair(layer, x)
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""

@@ -12,7 +12,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.gguf import (
     GGUFEmbeddingMethod,
-    apply_gguf_embedding,
+    dequantize_gguf_rows,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.utils import set_weight_attrs
@@ -267,8 +267,9 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
             ]
             output = packet.view(dtype).to(self._output_dtype)
         else:
-            output = apply_gguf_embedding(
-                torch.arange(ids.numel(), device=ids.device),
+            # Packet rows already follow the requested order. Decode them
+            # directly instead of indexing them by an identity arange.
+            output = dequantize_gguf_rows(
                 packet,
                 self._source_type,
                 self.embedding_dim,
