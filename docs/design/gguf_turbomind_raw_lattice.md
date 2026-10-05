@@ -1568,3 +1568,17 @@ final FP16 copy measures 92.518 µs exact and 91.836 µs rounded, versus
 89.772 µs canonical. Rounded output relative L2 is 0.0409%. The remaining
 2.3% gap still fails the speed target. The candidate is explicit only; neither
 model defaults nor canonical storage removal follows from these results.
+
+A bounded rounded-workspace tactic control confirms FP32-output algorithm 11
+with two partitions remains fastest: 91.980 µs versus 89.810 µs canonical.
+Default algorithm with one/two partitions gives 96.568/92.932 µs, algorithm 2
+with two gives 100.134 µs, and algorithm 11 with one/four gives 94.331/92.654 µs.
+No further tactic sweep is justified by this result.
+
+Paired rounded-path Nsight Systems full-graph nodes measure 16.240 µs DQ,
+91.174 µs FP32-output GEMM and 4.196 µs final FP16 copy, versus 108.589 µs
+canonical fused GEMM. These profiled times do not replace the unprofiled
+91.980/89.810 µs comparison. DQ uses 32 registers and a 48×10×2 grid; GEMM
+retains 250 registers and a 12×4×5 grid. The remaining work centers on the
+GEMM/output path rather than additional scale-decoder variants. FP32
+accumulation is retained; model quality and step savings remain unmeasured.
