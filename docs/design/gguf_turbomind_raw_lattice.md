@@ -1522,5 +1522,49 @@ The corresponding maximum absolute FP16 weight differences are 0.0002441,
 0.0001221, 0.0001221 and 0.0000610. All measured weights remain finite.
 
 These rounding statistics are not output-quality or speed evidence for a
-new decoder. The current original-byte operators retain exact final operands
-and FP32 accumulation; no pre-rounded-scale original-byte path is implemented.
+new decoder. Exact decoding remains the default. An optional transient group-scale
+rounding candidate is measured below; accumulation remains FP32.
+
+### Optional transient FP16 group scales
+
+Original weight storage remains byte-for-byte invertible and equal in size.
+The optional decoder multiplies the original FP16 block scale and small-scale
+factor in FP32, rounds the group coefficient to FP16 inside the kernel, then
+forms the FP16 MMA operand. The plane operator uses independent quantization
+and tuning identifiers; its default remains exact. The compact workspace
+candidate requires aligned shared-metadata dequantization and is also opt-in.
+
+The normal whole wheel built from source `34080e4e1a` passes 137 focused checks,
+including bit-exact workspace agreement with canonical FP16 weights, changed
+inputs under full CUDA graph replay, and FP32 overflow/cancellation checks.
+Persistent weight bits are unchanged by either mode. Installed dependencies
+are compatible (212 packages). Wheel SHA256 is
+`5b06c14f72e96c9a556dfa8d1cc23df3fbf7b4cb4dd686ffdba0ddd98c7770ed`;
+core SHA256 is
+`eeaa6331dfaee41e65d1028a1141c474779862e5d4792d68d61b39f04b11b5c0`.
+
+Matched M512 full-graph plane captures on V100 use enough distinct banks to
+exceed twice L2. Times are per projection in microseconds:
+
+| Projection (TP4) | Exact planes | Rounded planes | Canonical | Banks |
+| --- | ---: | ---: | ---: | ---: |
+| 27B gate N4352/K5120 | 506.555 | 485.385 | 495.195 | 8 |
+| 27B down N5120/K4352 | 435.972 | 421.817 | 377.620 | 8 |
+| Flash IQ3_S expert N160/K2560 | 35.394 | 35.964 | 68.755 | 73 |
+| Flash IQ2_S expert N160/K2560 | 36.727 | 37.055 | 64.135 | 97 |
+| Flash dense gate N1536/K2560 | 108.671 | 102.955 | 89.559 | 9 |
+| Flash output N2560/K1536 | 97.032 | 91.585 | 81.558 | 9 |
+
+Rounded plane output relative L2 against official FP16-weight FP32 dots is
+0.0395–0.0410%, versus about 0.0207% for exact planes. Against canonical
+FP16-weight dots it is about 0.0207–0.0208%. This is operator evidence, not
+model quality evidence. Only the 27B gate reaches canonical speed; the expert
+already benefits from exact scales and does not need the rounding tradeoff.
+No rounded plane capability is promoted.
+
+For Flash dense gate M512, compact dequantization with 256 threads, two
+partitions, shared original metadata, FP32-output cuBLAS algorithm 11 and a
+final FP16 copy measures 92.518 µs exact and 91.836 µs rounded, versus
+89.772 µs canonical. Rounded output relative L2 is 0.0409%. The remaining
+2.3% gap still fails the speed target. The candidate is explicit only; neither
+model defaults nor canonical storage removal follows from these results.
