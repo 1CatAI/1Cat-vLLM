@@ -65,6 +65,15 @@ def prepare_segment_bank(projection, canonical, device):
         max_m=8,
         reason=reason,
     )
+    projection.segment_m20_capability = GGUFOperatorCapability(
+        decoder_family(source),
+        quant_type_name(source),
+        "gguf_dense_segments_sm70_out",
+        True,
+        min_m=20,
+        max_m=20,
+        reason=reason,
+    )
     if reason:
         return False
     fmt = _FORMATS[source]
