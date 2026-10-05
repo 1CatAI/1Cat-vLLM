@@ -23,7 +23,7 @@ def candidate_source(source: str, panel: int) -> str:
     kernel = kernel.replace(
         shared,
         shared
-        + f"\n  constexpr int Panel = {panel};"
+        + f"\n  constexpr int Panel = SplitK * RowTiles == 8 ? {panel} : 4;"
         + "\n  __shared__ __align__(16) half activation[SplitK][Panel]"
         + "[RowTiles * 8][16];",
     )
@@ -97,7 +97,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--panels", type=int, nargs="+", default=[4, 8])
+    parser.add_argument("--panels", type=int, nargs="*", default=[4, 8])
+    parser.add_argument("--n16", action="store_true")
     args = parser.parse_args()
     from torch.utils.cpp_extension import load
 
@@ -105,15 +106,19 @@ def main() -> None:
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
     source_dir = args.source_root / "csrc/sm70_turbomind/ops"
     original = (source_dir / "nvfp4_qpn2_sm70.cu").read_text()
-    for panel in args.panels:
-        if panel not in (4, 8):
-            raise ValueError("Only the bounded 4/8-group screens are supported")
-        build = args.output / f"panel{panel}"
+    variants = [
+        (f"panel{panel}", candidate_source(original, panel)) for panel in args.panels
+    ]
+    if args.n16:
+        extra = Path(__file__).with_name("qpn2_native_n16_research.cuh").read_text()
+        variants.append(("native_n16", original + "\n" + extra))
+    for variant, text in variants:
+        build = args.output / variant
         build.mkdir(parents=True, exist_ok=True)
         generated = build / "candidate.cu"
-        generated.write_text(candidate_source(original, panel))
+        generated.write_text(text)
         load(
-            name=f"qpn2_activation_panel{panel}",
+            name=f"qpn2_activation_{variant}",
             sources=[str(generated)],
             extra_include_paths=[str(source_dir)],
             extra_cuda_cflags=[

@@ -57,8 +57,10 @@ def main():
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--libraries", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--panels", type=int, nargs="+", default=[4, 8])
     parser.add_argument("--rows", type=int, nargs="+", default=[8, 32])
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 16, 32, 55])
+    parser.add_argument("--n16", action="store_true")
     args = parser.parse_args()
     torch.set_grad_enabled(False)
     torch.manual_seed(20261005)
@@ -67,13 +69,17 @@ def main():
     )["_load_projection_shards"]
     libraries = {}
     candidates = []
-    for panel in [4, 8]:
+    for panel in args.panels:
         path = args.libraries / f"panel{panel}/qpn2_activation_panel{panel}.so"
         libraries[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
         torch.ops.load_library(str(path))
         candidates.append(
             (f"panel{panel}", getattr(torch.ops, f"_qpn2_activation_panel{panel}"))
         )
+    if args.n16:
+        path = args.libraries / "native_n16/qpn2_activation_native_n16.so"
+        libraries[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        torch.ops.load_library(str(path))
     eviction = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     records = []
     for layer in args.layers:
@@ -107,6 +113,13 @@ def main():
                         (name, partial(namespace.gated, *arguments))
                         for name, namespace in candidates
                     ]
+                if gated and args.n16 and rows <= 8:
+                    functions.append(
+                        (
+                            "native_n16",
+                            partial(torch.ops._qpn2_native_n16.gated, *arguments[:5]),
+                        )
+                    )
                 checks = []
                 for amplitude in [0.0, 0.125, -0.125, 0.25]:
                     x.copy_(torch.randn_like(x) * amplitude)
