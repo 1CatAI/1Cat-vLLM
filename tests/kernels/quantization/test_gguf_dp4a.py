@@ -121,10 +121,13 @@ def test_lattice_dot_matches_official_weight_and_q8_oracle(
     check()
 
 
+@pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.parametrize("m", [5, 20])
 @pytest.mark.parametrize("source_type", [20, 42])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_down_unroute_matches_tp4_official_weights(m, source_type, index_dtype):
+def test_down_unroute_matches_tp4_official_weights(
+    m, source_type, index_dtype, quantized_input
+):
     from vllm.model_executor.layers.quantization.gguf_turbomind_moe import (
         GGUFExpertBank,
     )
@@ -153,9 +156,16 @@ def test_down_unroute_matches_tp4_official_weights(m, source_type, index_dtype):
     out = torch.empty((m, n), device="cuda", dtype=torch.float16)
 
     def run():
+        input = hidden
+        if quantized_input:
+            q, d, s = quantize_reference(hidden.reshape(m * top_k, k))
+            ds = torch.stack((d, s), dim=-1).contiguous().view(torch.uint8)
+            input = torch.cat((ds, q.view(torch.uint8)), dim=-1).reshape(
+                m, top_k, k // 32, 36
+            )
         torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
             out,
-            hidden,
+            input,
             ids,
             probabilities,
             bank.weight_ptrs,
@@ -179,6 +189,61 @@ def test_down_unroute_matches_tp4_official_weights(m, source_type, index_dtype):
         run()
     hidden.copy_(torch.randn_like(hidden))
     probabilities.copy_(torch.softmax(torch.randn_like(probabilities), 1))
+    ids.copy_((ids + 1) % experts)
+    graph.replay()
+    check()
+
+
+@pytest.mark.parametrize("m", [5, 20])
+@pytest.mark.parametrize("source_type,size", [(18, 98), (21, 110), (22, 82)])
+@pytest.mark.parametrize("lanes", [4, 8, 16])
+def test_fused_gated_q8_keeps_fp16_boundary_and_changed_graph(
+    m, source_type, size, lanes
+):
+    experts, n, k, top_k = 3, 160, 768, 2
+    rng = np.random.default_rng(source_type)
+    weights = []
+    for _ in range(2):
+        raw = rng.integers(0, 256, (experts * n, k // 256, size), dtype=np.uint8)
+        d = rng.uniform(0.0001, 0.001, raw.shape[:2]).astype("<f2")
+        raw[:, :, :2] = d[..., None].view(np.uint8)
+        packed = RawGGUFProjection.from_rows(raw.reshape(experts * n, -1), source_type)
+        weights.append(torch.from_numpy(packed.data.reshape(experts, n, -1)).cuda())
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16) * 0.125
+    ids = torch.randint(experts, (m, top_k), device="cuda", dtype=torch.int32)
+    activation = torch.empty((m, k // 32, 36), device="cuda", dtype=torch.uint8)
+    hidden = torch.empty((m, top_k, n), device="cuda", dtype=torch.float16)
+    out = torch.empty((m, top_k, n // 32, 36), device="cuda", dtype=torch.uint8)
+
+    def run():
+        torch.ops._C.gguf_quantize_q8_1_sm70_out(activation, x)
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            hidden, activation, ids, *weights, source_type, True
+        )
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            out, activation, ids, *weights, source_type, True, lanes
+        )
+
+    def check():
+        q, d, s = quantize_reference(hidden.reshape(m * top_k, n))
+        if lanes == 16:
+            torch.testing.assert_close(
+                out[..., 4:].view(torch.int8).reshape_as(q), q, rtol=0, atol=0
+            )
+            ds = out[..., :4].contiguous().view(torch.float16)
+            torch.testing.assert_close(ds[..., 0].reshape_as(d), d, rtol=0, atol=0)
+            torch.testing.assert_close(ds[..., 1].reshape_as(s), s, rtol=0, atol=0)
+        else:
+            scale = out[..., :2].contiguous().view(torch.float16).float()
+            decoded = (out[..., 4:].view(torch.int8).float() * scale).reshape_as(hidden)
+            torch.testing.assert_close(decoded, hidden.float(), rtol=0.01, atol=0.01)
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.copy_(torch.randn_like(x) * 0.125)
     ids.copy_((ids + 1) % experts)
     graph.replay()
     check()
