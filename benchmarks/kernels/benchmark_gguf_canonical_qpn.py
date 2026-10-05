@@ -92,11 +92,13 @@ def main():
                 )
             return output
 
-        def canonical(x, projections=projections, role=role):
+        def canonical(x, projections=projections, role=role, output=output):
             y = apply_prepared_gguf_projections(x, projections)
             if role == "pair":
-                g, u = y.chunk(2, -1)
-                y = torch.nn.functional.silu(g) * u
+                # Match the model's single SiLU/multiply launch rather than
+                # counting two eager PyTorch pointwise calls in the baseline.
+                torch.ops._C.silu_and_mul(output, y)
+                y = output
             return y
 
         reference = [
