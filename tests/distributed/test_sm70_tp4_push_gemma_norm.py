@@ -69,7 +69,10 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                 for graph in graphs:
                     if rank == cycle % 4:
                         torch.cuda._sleep(10000)
-                    graph.replay()
+                    # Exercise many generation/epoch transitions after each
+                    # live input update, including intentionally skewed ranks.
+                    for _ in range(61):
+                        graph.replay()
                 torch.accelerator.synchronize()
                 _, expected_residual = outputs[0]
                 actual, actual_residual = outputs[1]
