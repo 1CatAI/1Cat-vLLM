@@ -49046,3 +49046,22 @@ for 34.687% of active warp cycles and FP32 partial output adds traffic. The
 next screen groups K loads to reduce barriers and coalesces partial output.
 These are rejected or pending standalone prototypes, not production speed
 claims. No M8 dispatcher or attention route changes.
+
+### M64 activation-sharing follow-up
+
+A four-group in-flight weight load schedule reduced the cold-L2 real-weight
+M64 MLP sublayer graph from 358.400 to 282.624 microseconds (gate/up followed
+by down, unchanged TP collective excluded). The N128 gate/up grid is 170
+CTAs; down uses 160. Direct activation loading eliminates the separate K16
+pack for these two calls. Registers are capped at 96 in the normal build.
+The source dispatcher changes only M64 and the two measured TP4 MLP shapes.
+Two basis-vector and graph-scratch reuse GPU tests passed on the normal wheel.
+This is not full-model admission: teacher-forced logits, actual captured
+route counts, complete concurrent rounds and acceptance remain pending.
+M16/M32 prototypes still regress and are not selected.
+
+The concurrent head capacity screen exposed a separate route gap: the target
+sampler requests top-64, while the candidate reranker supports top-16/20/21.
+Prepared 64-row buffers do not demonstrate target head selection. Runtime
+buffer-view swaps also cannot replace already captured kernels. Do not use
+that screen as a qualified head speedup or repeat it without route evidence.
