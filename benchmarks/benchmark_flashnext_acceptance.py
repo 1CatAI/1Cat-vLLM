@@ -99,6 +99,7 @@ def main():
         max_num_seqs=4,
         gpu_memory_utilization=args.memory,
         enable_prefix_caching=False,
+        disable_log_stats=False,
         language_model_only=True,
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
         worker_extension_cls="vllm.sm70_graph_observer.GraphParityWorkerExtension",
@@ -147,6 +148,8 @@ def main():
         )
         if any(r["decode_cudagraph_mode"] != "FULL" for r in report["worker_routes"]):
             raise RuntimeError("Actual FULL target decode graph is required")
+        if not _metric_snapshot(llm):
+            raise RuntimeError("Acceptance counters are unavailable before requests")
         tokenizer = llm.get_tokenizer()
         report["tokenizer"] = dict(
             type=type(tokenizer).__name__,
