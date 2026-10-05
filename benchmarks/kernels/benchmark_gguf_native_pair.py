@@ -90,6 +90,7 @@ def main():
             else ((18, 21), (21, 18))
             if args.prototype_iq3_xxs
             else (
+                (18, 18),
                 (21, 23),
                 (23, 21),
                 (18, 21),
