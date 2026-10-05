@@ -61,6 +61,24 @@ def tag_wrap_case(owner, packed, rank):
     return records
 
 
+def graph_times(graphs):
+    times = []
+    for _ in range(3):
+        dist.barrier()
+        a, b = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        a.record()
+        for _ in range(200):
+            for graph in graphs:
+                graph.replay()
+        b.record()
+        torch.accelerator.synchronize()
+        times.append(a.elapsed_time(b) * 1000 / 200 / len(graphs) / 16)
+    return times
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("weights", type=Path)
@@ -111,6 +129,7 @@ def main():
         injection = torch.empty((m, 4), device="cuda", dtype=torch.float16)
         worst = [0.0, 0.0]
         graphs = []
+        controls = []
         for pd, pu, sd, su in packed:
             if m >= 2:
                 ops.sm70_qwen38_hc_replicated(
@@ -127,6 +146,14 @@ def main():
                 ops.sm70_qwen38_hc_replicated(xx, pd, pu, pp, ll, oo, ii)
                 reference.copy_(oo[:1])
                 injection.copy_(ii[:1])
+            if m >= 2:
+                control = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(control):
+                    for _ in range(16):
+                        ops.sm70_qwen38_hc_replicated(
+                            x, pd, pu, partial, lora, reference, injection
+                        )
+                controls.append(control)
             for _ in range(4):
                 candidate = owner.apply(x, sd, su)
             torch.accelerator.synchronize()
@@ -152,21 +179,17 @@ def main():
             dist.barrier()
             graphs.append(graph)
         assert worst[0] < 0.001 and worst[1] < 0.001, worst
-        times = []
-        for _ in range(3):
-            dist.barrier()
-            a, b = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
+        abba = [
+            dict(arm=arm, graph_us=graph_times(cohort))
+            for arm, cohort in (
+                ("A", controls),
+                ("B", graphs),
+                ("B", graphs),
+                ("A", controls),
             )
-            a.record()
-            for _ in range(200):
-                for graph in graphs:
-                    graph.replay()
-            b.record()
-            torch.accelerator.synchronize()
-            times.append(a.elapsed_time(b) * 1000 / 200 / len(graphs) / 16)
-        rows.append(dict(m=m, graph_us=times, relative_max=worst))
+            if cohort
+        ]
+        rows.append(dict(m=m, abba=abba, relative_max=worst))
     records = [None] * 4
     dist.all_gather_object(records, rows)
     if rank == 0:
