@@ -729,6 +729,14 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.native_admission["single_projection"] = prepare_native_linear(
                     layer, sources, projections, self.native_enabled
                 )
+            if self.layout is None and not isinstance(self, GGUFEmbeddingMethod):
+                from vllm.model_executor.layers.quantization.gguf_qkvz import (
+                    prepare_native_qkvz,
+                )
+
+                self.native_admission["qkvz_projection"] = prepare_native_qkvz(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
@@ -880,7 +888,13 @@ class GGUFLinearMethod(LinearMethodBase):
                 apply_prepared_gguf_projections,
             )
 
-            if hasattr(layer, "gguf_native_linear_records"):
+            if hasattr(layer, "gguf_qkvz_weights"):
+                from vllm.model_executor.layers.quantization.gguf_qkvz import (
+                    apply_native_qkvz,
+                )
+
+                out = apply_native_qkvz(layer, x)
+            elif hasattr(layer, "gguf_native_linear_records"):
                 from vllm.model_executor.layers.quantization.gguf_native_linear import (
                     apply_native_linear,
                 )

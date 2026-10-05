@@ -498,3 +498,65 @@ def native_linear_capability(
         max_m=8,
         reason=reason,
     )
+
+
+def native_qkvz_capabilities(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Measured complete GDN input projections, including floating B/A."""
+    operator = "gguf_qkvz_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (
+        len(source_types) != 6
+        or source_types[:3] != (source_types[0],) * 3
+        or source_types[4:] != (30, 30)
+        or (source_types[0], source_types[3])
+        not in (
+            (23, 23),
+            (21, 18),
+            (18, 21),
+            (21, 21),
+            (21, 10),
+            (18, 10),
+            (17, 18),
+            (18, 23),
+            (21, 22),
+            (10, 18),
+            (18, 12),
+            (21, 23),
+            (18, 18),
+            (23, 21),
+            (21, 12),
+            (23, 18),
+            (18, 22),
+            (12, 21),
+            (16, 23),
+        )
+        or (k, n) != (5120, 4120)
+    ):
+        reason = "qkvz_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=8,
+            max_m=8,
+            reason=reason,
+        )
+        for source_type in source_types
+    )
