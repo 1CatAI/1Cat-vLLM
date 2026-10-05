@@ -354,8 +354,11 @@ def main():
     parser.add_argument("--row-parallel-screen", action="store_true")
     parser.add_argument("--eighty-block-screen", action="store_true")
     parser.add_argument("--norm-only-screen", action="store_true")
+    parser.add_argument("--burst", type=int, default=1)
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
+    if args.burst < 1:
+        parser.error("burst must be positive")
     if (
         sum((args.row_norm_screen, args.row_parallel_screen, args.eighty_block_screen))
         > 1
@@ -472,7 +475,8 @@ def main():
         with torch.cuda.graph(graph):
             eviction.fill_(1)
             start.record()
-            launch(arm)
+            for _ in range(args.burst):
+                launch(arm)
             end.record()
         graphs.append((graph, start, end))
     for amplitude in (0.0, -0.1, 0.1, 1.0):
@@ -513,7 +517,7 @@ def main():
             graph.replay()
             end.synchronize()
             if iteration >= 20:
-                samples[arm].append(start.elapsed_time(end) * 1000)
+                samples[arm].append(start.elapsed_time(end) * 1000 / args.burst)
     row = dict(
         rank=rank,
         control_us=statistics.median(samples[0]),
@@ -528,6 +532,8 @@ def main():
         samples_us=samples,
         bitwise_four_amplitudes=row_mode != 3,
         numerical_model_gate_passed=False,
+        burst=args.burst,
+        cold_eviction_between_each_call=args.burst == 1,
         projection_included=not args.norm_only_screen,
         compute_nodes_per_arm=1 if args.norm_only_screen else 2,
         measured_graph_kernel_nodes=[graph_kernel_nodes(g) for g, _, _ in graphs],

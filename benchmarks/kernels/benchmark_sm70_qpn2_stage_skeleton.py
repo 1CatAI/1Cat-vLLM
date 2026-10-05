@@ -181,7 +181,7 @@ __device__ __forceinline__ void shared_e2m1x16(uint2 packed, half2 scale,
     }}
   }}
 """)
-    return (
+    result = (
         """
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -213,6 +213,73 @@ void launch_stage(torch::Tensor output, torch::Tensor input,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("launch", &launch_stage); }
 """
     )
+    if decoder == "fold":
+        # Screen the bounded exact fold alone: no activation packing, changed
+        # weight addresses, extra kernels, or altered reduction order.
+        begin = helpers.index("__device__ __forceinline__ void dequant_e2m1x8")
+        reference = helpers[begin:].replace("dequant_e2m1x8", "reference_e2m1x8")
+        old = (
+            "    const half2 code = __hmul2("
+            "*reinterpret_cast<half2*>(&values[index]),\n"
+            "                               __float2half2_rn(16384.0f));"
+        )
+        assert result.count(old) == 1
+        result = result.replace(
+            old,
+            "    const half2 code = *reinterpret_cast<half2*>(&values[index]);",
+        )
+        result = (
+            result.replace(
+                "    half2 weights[8];",
+                "    const half2 expanded = __hmul2(\n"
+                "        scale, __float2half2_rn(16384.0f));\n    half2 weights[8];",
+            )
+            .replace("packed.x, scale, weights", "packed.x, expanded, weights")
+            .replace("packed.y, scale, weights", "packed.y, expanded, weights")
+        )
+        result = result.replace(
+            "  const float scale = global_scale;",
+            "  const float scale = global_scale;\n"
+            '  TORCH_CHECK(std::abs(scale) <= 3.0f/512, "scale fold bound");',
+        )
+        checker = (
+            reference
+            + """
+__global__ void check_fold_kernel(int32_t* mismatches) {
+  const int index=blockIdx.x*blockDim.x+threadIdx.x;
+  constexpr int Scales=0x4400;
+  if(index >= 16*2*Scales) return;
+  const int scale_index=index%(2*Scales);
+  const uint16_t scale_bits=(scale_index%Scales) |
+                             (scale_index>=Scales ? 0x8000 : 0);
+  const half h=__ushort_as_half(scale_bits);
+  const half2 scale=__halves2half2(h,h);
+  const half2 expanded=__hmul2(scale,__float2half2_rn(16384.0f));
+  const unsigned packed=(index/(2*Scales))*0x11111111u;
+  half2 control[4], candidate[4];
+  reference_e2m1x8(packed,scale,control);
+  dequant_e2m1x8(packed,expanded,candidate);
+  bool different=false;
+#pragma unroll
+  for(int i=0;i<4;++i)
+    different |= *reinterpret_cast<unsigned*>(&control[i]) !=
+                 *reinterpret_cast<unsigned*>(&candidate[i]);
+  mismatches[index]=different;
+}
+void check_fold(torch::Tensor output) {
+  TORCH_CHECK(output.is_cuda() && output.scalar_type()==at::kInt &&
+              output.is_contiguous() && output.numel()==16*2*0x4400);
+  check_fold_kernel<<<(output.numel()+255)/256,256,0,
+      at::cuda::getCurrentCUDAStream()>>>(output.data_ptr<int32_t>());
+}
+"""
+        )
+        marker = "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)"
+        result = result.replace(marker, checker + "\n" + marker).replace(
+            'm.def("launch", &launch_stage);',
+            'm.def("launch", &launch_stage); m.def("check_fold", &check_fold);',
+        )
+    return result
 
 
 def main():
@@ -226,7 +293,9 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
-        "--decoder", choices=("production", "prmt", "shared"), default="production"
+        "--decoder",
+        choices=("production", "prmt", "shared", "fold"),
+        default="production",
     )
     parser.add_argument(
         "--profile-launches-only",

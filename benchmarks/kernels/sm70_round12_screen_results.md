@@ -40,5 +40,27 @@ precludes integration, without repeating teacher-forcing or model acceptance.
 `benchmark_sm70_qpn2_publish_norm.py --eighty-block-screen` additionally prepares
 an 80-CTA, 64-thread norm comparison. It splits each row into ten parts instead
 of five and uses independent metadata/payload storage. Its norm reduction
-order changes. CUDA compilation succeeds; a tolerance check is only a screen,
-and model KL/top-1 admission is required if the speed screen succeeds.
+order changes. A tolerance check is only a screen; model KL/top-1 admission would be
+required for promotion. The measured result below does not justify promotion.
+
+The 80-CTA tolerance screen was run on all four 9609 V100s. Independent cold
+graph rank medians are 17.408/16.384/15.360/14.336 →
+16.384/16.384/15.360/14.336 µs. A burst of 64 calls in one graph, with just
+one leading eviction, reduces critical median per call from 8.000 to
+7.272 µs. The latter amortizes CPU launch skew but is not a cold invocation
+or a model-layer measurement. Even the optimistic 122-call estimate is only
+0.09 ms; the changed reduction order is not admitted. Both graphs retain one
+compute node per norm.
+
+An additional decoder control folds the exact power-of-two 2^14 into each
+already-rounded FP16 group scale. It changes neither activation packing,
+weight addresses, the one-byte scale layout, grid, nor MMA/reduction order.
+Its wrapper is restricted to abs(global inverse scale) ≤ 3/512. All 168
+original checkpoint MLP global scales meet this conservative bound. An
+exhaustive 557,056-case GPU bit check covers 16 FP4 codes and both signs of
+all FP16 scales with magnitude below four. Real-weight complete output bits
+also match at four input amplitudes. The paired cold-graph full kernel is
+45.056 → 45.056 µs for gate/up and 25.600 → 25.600 µs for down on 9609.
+Decode-only gate/up improves by one event-clock bin, 45.056 → 44.032 µs;
+complete-kernel timing does not improve. Reject this fold alone rather than
+claiming a model benefit or repeating expensive end-to-end gates.
