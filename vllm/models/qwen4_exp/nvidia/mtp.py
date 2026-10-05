@@ -598,10 +598,6 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         self._sm70_draft_head = None
 
     def prepare_sm70_decode_graph_model(self) -> bool:
-        if self._sm70_draft_head is None:
-            from .sm70_mtp_head import prepare_mtp_qpn8_head
-
-            self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
             return False
         if self._sm70_decode_graph_model is None:

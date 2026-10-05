@@ -359,9 +359,19 @@ def _qwen38_sm70_fp16_gemv(
     role: str = "",
     packed_router: torch.Tensor | None = None,
     dense_batch: bool = False,
+    output_codes: torch.Tensor | None = None,
+    output_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if dense_batch and _can_use_dense_batch(x, weight, role):
         out = x.new_empty((x.shape[0], weight.shape[0]))
+        if output_codes is not None and output_scales is not None:
+            from vllm import _sm70_ops as ops
+
+            ops.fp8_qpn8_gemm_sm70_out(
+                out, x, output_codes, output_scales, 12, 2, True, False
+            )
+            logger.info_once("SM70 QPN8 batch output projection candidate enabled.")
+            return out
         torch.ops._C.qwen38_dense_batch_sm70_out(out, x, weight)
         logger.info_once("SM70 Qwen3.8 exact small-batch dense projections enabled.")
         return out
@@ -418,6 +428,8 @@ def _qwen38_sm70_fp16_gemv_fake(
     role: str = "",
     packed_router: torch.Tensor | None = None,
     dense_batch: bool = False,
+    output_codes: torch.Tensor | None = None,
+    output_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
@@ -680,6 +692,8 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 getattr(layer, "prefix", ""),
                 getattr(layer, "_sm70_mtp_router_packed", None),
                 getattr(layer, "_sm70_qwen38_dense_batch", False),
+                getattr(layer, "_sm70_qwen38_output_codes", None),
+                getattr(layer, "_sm70_qwen38_output_scales", None),
             )
         return super().apply(layer, x, bias)
 
