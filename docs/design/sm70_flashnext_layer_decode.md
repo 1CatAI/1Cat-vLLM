@@ -14,9 +14,9 @@ of the current combined branch or a measured endpoint speedup.
 
 Shared-expert default preparation has been removed after its model gate
 failed twice. The GDN convolution/core/norm prototype improves both research
-layers, but ordinary initialization and combined model qualification remain
-unresolved. Its new opaque interface has passed CPU functionalization checks;
-this does not establish a working full decode graph. Matched final endpoint
+layers by 3.7–4.2 microseconds each, but ordinary full decode graph initialization
+cannot be qualified. Its default preparation has been removed. Explicit
+research preparation retains its native operator and helper. Matched final endpoint
 and whole-model node tracing remain pending.
 
 ## Establishing a comparable endpoint
@@ -435,3 +435,16 @@ only the hidden input, explicit mutable output and layer name cross AOT;
 caches and per-layer workspaces remain inside the registered layer owner.
 Native arithmetic is unchanged. The complete ordinary campaign is retried;
 these failed initializations are not performance or quality evidence.
+
+Ordinary GDN qualification is stopped. Independent-cache ownership, an explicit
+mutable output and CPU functionalization checks do not recover full-model AOT
+initialization. Synchronous FX logging reaches the final HC SiLU fake call and
+then makes no further progress; disabling FakeTensor dispatch caching does not
+recover it. Asynchronous stack diagnostics also produce corrupted frame output
+and are discarded. No normal GDN layer, distribution or speed admission is
+claimed. The small 3.7–4.2 microsecond research-layer gain does not justify
+further compiler repair in this campaign. Default loading now prepares QSA
+alone. The native GDN operator and explicit helper remain research artifacts.
+The remaining structural screen combines the output projection and ordered
+peer reduction, evaluated in complete GDN/QSA layers with original GDN/shared
+routes and admitted QSA preparation fixed in both arms.

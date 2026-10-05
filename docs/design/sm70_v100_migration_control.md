@@ -49144,3 +49144,13 @@ an explicit output, as existing attention does. CPU fake checks and 36-call
 M1/M5 AOT functionalization pass. Normal GDN layer and combined model gates
 remain pending, followed by matched endpoint timing and normal graph-node
 tracing. No new endpoint speed or global kernel-count target is claimed.
+
+GDN ordinary admission is closed without promotion. Several opaque-interface
+attempts still stall in full-model AOT; synchronous FX tracing stops at the
+final HC SiLU fake call. Disabling FakeTensor dispatch caching does not help.
+Do not continue compiler tuning for its 3.7–4.2 microsecond research-layer gain.
+Default model loading prepares QSA only. Keep the GDN ordinary native operator
+and helper solely for explicit research reproduction; no normal GDN quality or
+endpoint improvement is credited. Output-projection/ordered-peer reduction is
+compiled as the remaining structural all-reduce screen; M1/M5 complete-layer
+measurements are pending.
