@@ -16,31 +16,43 @@ from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def source(n=96, k=1536):
-    block, size = quant_size(14)
+def source(n=96, k=1536, weight_type=14):
+    block, size = quant_size(weight_type)
     raw = np.random.default_rng(20261005).integers(
         0, 256, (n * k // block, size), dtype=np.uint8
     )
-    raw[:, -2:] = np.frombuffer(np.float16(1 / 2048).tobytes(), np.uint8)
+    offset = -2 if weight_type == 14 else 0
+    raw[:, offset : None if offset == -2 else 2] = np.frombuffer(
+        np.float16(1 / 2048).tobytes(), np.uint8
+    )
+    if weight_type in (12, 13):
+        raw[:, 2:4] = np.frombuffer(np.float16(1 / 4096).tobytes(), np.uint8)
     return raw.reshape(n, -1)
 
 
 @pytest.mark.parametrize("m", [1, 5, 20, 512])
 @pytest.mark.parametrize("heads_per_group", [2, 3])
-def test_head_layout_projection_matches_official_dequant_and_graph(m, heads_per_group):
-    raw = source()
+@pytest.mark.parametrize("weight_type", [12, 13, 14])
+def test_head_layout_projection_matches_official_dequant_and_graph(
+    m, heads_per_group, weight_type
+):
+    raw = source(weight_type=weight_type)
     layout = GGUFHeadTilingLayout(heads_per_group, 128)
     weight = torch.from_numpy(raw).cuda()
-    original = prepare_gguf_projections([(weight, 14)], torch.float16, True, 256)
+    original = prepare_gguf_projections(
+        [(weight, weight_type)], torch.float16, True, 256
+    )
     restored = prepare_gguf_projections(
-        [(weight, 14)], torch.float16, True, 256, input_layout=layout
+        [(weight, weight_type)], torch.float16, True, 256, input_layout=layout
     )
     assert restored[0].input_layout_restored
-    reference = layout.weight_to_vllm(torch.from_numpy(dequantize(raw, 14)), dim=1)
-    canonical = transcode_affine(raw, 14)
+    reference = layout.weight_to_vllm(
+        torch.from_numpy(dequantize(raw, weight_type)), dim=1
+    )
+    canonical = transcode_affine(raw, weight_type)
     # This fixture has exactly representable group scales. Head restoration
     # changes only the ordering, including every group coefficient.
-    np.testing.assert_array_equal(canonical.dequantize(), dequantize(raw, 14))
+    np.testing.assert_array_equal(canonical.dequantize(), dequantize(raw, weight_type))
     torch.manual_seed(20261005 + m)
     x = (torch.randn(m, 1536, device="cuda") * 0.125).half()
     expected = x.float() @ reference.cuda().half().float().T
