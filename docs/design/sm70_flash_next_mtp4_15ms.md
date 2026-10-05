@@ -503,3 +503,30 @@ Relevant first-parent changes include QSA concurrency/long-context, GDN
 preprocessing and HC topology; quantized GGUF-only changes are not candidates
 unless a selected shared dispatch is affected. Bisect using actual endpoints,
 not profiled service or a tokens/s conversion.
+
+Matched fresh-process controls, normal extensions built from each source,
+TP4/300 W/8K input/256K capacity/no profiler, three repeats:
+
+| Source | Complete-round mean | Rounds per repeat | Acceptance |
+| --- | ---: | ---: | ---: |
+| Recompiled `e655926238` | 23.708757 ms | 300 | 18% |
+| `925e6ca6c3` | 23.048813 ms | 300 | 18% |
+| Latest-main candidate `6e36a5a83a`, main `0e359c87d3` | 23.215921 ms | 300 | 18% |
+
+The matched old/new controls emit identical token tapes and the newer path
+saves 0.659944 ms. The rebuilt historical source does not reproduce the saved
+21.835-ms/311-round tape: its output matches the frozen newer tape instead.
+This does not resolve the historical runtime discrepancy. Audit its original
+native components, precision policy and cache provenance before assigning
+the apparent 1.352-ms difference to any main commit. Source-checksum validation
+did reject and regenerate changed AOT model artifacts in the fresh control;
+stale-cache reuse is not a demonstrated cause.
+
+Latest-main default timing samples are 23.308418, 23.150912 and 23.188432 ms
+(900 rounds total, 73.513 decode tokens/s, 1.706667 emitted tokens/round).
+Natural-EOS Chinese arithmetic: 26.235914 ms/round, 83.594% acceptance,
+164.375 tokens/s, 4.3125 emitted tokens/round; all three repeats terminate with
+the correct 240-km distance and 480/7-km/h average speed. This is output health,
+not task-set or C4 admission. The 15-ms objective remains unmet. Updated
+same-process event calibration and one node-level capture are queued under
+the shared GPU locks; preserve their overhead separately from endpoint speed.
