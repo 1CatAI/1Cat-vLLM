@@ -22,7 +22,7 @@ from torch.utils.cpp_extension import load
 from vllm import _sm70_ops as ops
 
 
-def generate(source: Path) -> str:
+def generate(source: Path, fixed_shape: bool = False) -> str:
     original = source.read_text()
     helpers = original[
         original.index("__device__ __forceinline__ void fp8x8") : original.index(
@@ -41,6 +41,16 @@ def generate(source: Path) -> str:
         "template <", begin, original.index("void launch_fp8_qpn8_sm70")
     )
     full = original[begin:end]
+    specialized = ""
+    if fixed_shape:
+        specialized = full.replace(
+            "int RowTiles = 1>", "int RowTiles = 1, int FixedK = 0, int FixedN = 0>"
+        ).replace("fp8_qpn8_sm70_kernel", "fp8_qpn8_sm70_kernel_fixed")
+        specialized = specialized.replace(
+            "bool channel_scales) {",
+            "bool channel_scales) {\n"
+            "  k = FixedK; n = FixedN; m = 8; channel_scales = true;",
+        )
     variants = []
     for stage in ("a_read", "b_decode"):
         prefix = full[: full.index("  float accum[")]
@@ -97,6 +107,20 @@ def generate(source: Path) -> str:
     }}
   }}
 """)
+    if fixed_shape:
+        calls.append("""
+  if (stage == 3) {
+    if (nacc == 2) {
+      fp8_qpn8_sm70_kernel_fixed<16,2,true,false,false,false,false,1,5120,4096>
+        <<<n/32,512,0,stream>>>(c,s,x,y,nullptr,nullptr,nullptr,nullptr,
+          nullptr,0,n,n,k,8,true);
+    } else {
+      fp8_qpn8_sm70_kernel_fixed<16,1,true,false,false,false,false,1,1536,5120>
+        <<<n/32,512,0,stream>>>(c,s,x,y,nullptr,nullptr,nullptr,nullptr,
+          nullptr,0,n,n,k,8,true);
+    }
+  }
+""")
     return (
         """
 #include <torch/extension.h>
@@ -107,6 +131,7 @@ namespace {
         + helpers
         + macro
         + full
+        + specialized
         + "\n".join(variants)
         + """
 void launch(torch::Tensor out, torch::Tensor input, torch::Tensor codes,
@@ -153,24 +178,26 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--extension", type=Path)
+    parser.add_argument("--fixed-shape-screen", action="store_true")
     parser.add_argument("--profile-launches-only", action="store_true")
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     source = args.source_root / "csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu"
     generated = args.out / "qpn8-stages.cu"
-    generated.write_text(generate(source))
+    generated.write_text(generate(source, args.fixed_shape_screen))
+    extension_name = "round12_qpn8_stages"
+    if args.fixed_shape_screen:
+        extension_name += "_fixed"
     if args.extension is None:
         extension = load(
-            name="round12_qpn8_stages",
+            name=extension_name,
             sources=[str(generated)],
             extra_cuda_cflags=["-O3", "-lineinfo"],
             verbose=True,
         )
     else:
-        spec = importlib.util.spec_from_file_location(
-            "round12_qpn8_stages", args.extension
-        )
+        spec = importlib.util.spec_from_file_location(extension_name, args.extension)
         extension = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(extension)
     if args.compile_only:
@@ -195,6 +222,42 @@ def main():
         )
         extension.launch(out, x, codes, packed_scales, nacc, 2, scratch)
         assert torch.equal(out, truth)
+        if args.fixed_shape_screen:
+            for amplitude in (0.0, -0.1, 0.1, 1.0):
+                x.copy_(torch.randn_like(x) * amplitude)
+                extension.launch(truth, x, codes, packed_scales, nacc, 2, scratch)
+                extension.launch(out, x, codes, packed_scales, nacc, 3, scratch)
+                assert torch.equal(out, truth)
+            graphs = []
+            for stage in (2, 3):
+                graph = torch.cuda.CUDAGraph()
+                begin = torch.cuda.Event(enable_timing=True, external=True)
+                end = torch.cuda.Event(enable_timing=True, external=True)
+                with torch.cuda.graph(graph):
+                    eviction.fill_(1)
+                    begin.record()
+                    extension.launch(out, x, codes, packed_scales, nacc, stage, scratch)
+                    end.record()
+                graphs.append((graph, begin, end))
+            for _ in range(20):
+                for graph, begin, end in graphs:
+                    graph.replay()
+            samples = [[], []]
+            for iteration in range(args.iters):
+                for arm in (0, 1) if iteration % 2 == 0 else (1, 0):
+                    graph, begin, end = graphs[arm]
+                    graph.replay()
+                    end.synchronize()
+                    samples[arm].append(begin.elapsed_time(end) * 1000)
+            row = dict(
+                projection=name,
+                control_us=statistics.median(samples[0]),
+                fixed_shape_us=statistics.median(samples[1]),
+                full_output_bitwise_four_amplitudes=True,
+            )
+            rows.append(row)
+            print(json.dumps(row), flush=True)
+            continue
         for stage in range(3):
             run = partial(
                 extension.launch, out, x, codes, packed_scales, nacc, stage, scratch
