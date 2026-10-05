@@ -57,9 +57,11 @@ def test_compact_fallback_bounds_full_vocabulary_sort_workspace(
     expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
     reference_rows = []
 
-    def bounded_reference(x, k, p):
+    def bounded_reference(x, k, p, **kwargs):
         reference_rows.append(x.shape[0])
-        return apply_top_k_top_p_pytorch(x, k, p)
+        if rows > 1:
+            assert kwargs["rowwise_sort"]
+        return apply_top_k_top_p_pytorch(x, k, p, **kwargs)
 
     monkeypatch.setattr(
         topk_topp_sampler, "apply_top_k_top_p_pytorch", bounded_reference

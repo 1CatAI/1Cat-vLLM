@@ -829,13 +829,13 @@ workspaces. Apply the same reference filter in bounded two-row chunks instead, k
 source logits, per-row parameters, vocabulary ties and nucleus boundaries.
 Twenty MTP4/C4 uniform rows at vocabulary 248,320 force this fallback; the
 final bounded implementation matches the full reference exactly and leaves
-its input intact. PyTorch chooses a different singleton softmax reduction: at
+its input intact. PyTorch chooses a different singleton cumulative-scan reduction: at
 uniform logits, k=50/p=0.9, processing a formerly multi-row fallback as one row
 changes the cutoff by one token. Preserve its multi-row reduction with two-row
 chunks, padding an odd final chunk with an existing row and copying only the
 valid output. A genuinely singleton fallback retains its original reduction.
 The 20-row workload reduces incremental peak allocation from 229.403 MiB to
-60.860 MiB. Thirty-three focused GPU cases pass, including singleton/odd/even
+50.354 MiB. Thirty-three focused GPU cases pass, including singleton/odd/even
 rows and both evaluation and sampler-warmup cutoffs. This fixes a workspace peak, not an admitted complete-round speed gain.
 
 The new default FC/parallel-head path measures 21.237521/21.225780/21.132825 ms
@@ -848,3 +848,18 @@ The independent model-output 32K shortlist still fails: frozen-cohort
 acceptance is 41.2438%, compared with 50.2035% for the full head. A positive
 head operator result cannot admit this nine-percentage-point acceptance loss.
 Keep it benchmark-only and evaluate a larger model-output subset separately.
+
+Preserve the shared reference implementation while bounding sort scratch:
+`apply_top_k_top_p_pytorch(..., rowwise_sort=True)` sorts into preallocated
+row slices, then performs the ordinary masks, batched softmax and cumulative
+sum. The compact fallback uses at most two rows, preserving the reference
+scan category for a padded odd chunk. The final stress workload matches the
+reference and peaks at 50.354 MiB including input/output copies, versus
+229.403 MiB for full-batch sorting. Default reference callers are unchanged.
+
+C4 now completes capture and sampler warmup. Its harness fails before recording
+requests because EngineArgs inserts ModelConfig objects into the caller's
+speculative dictionary, which was also retained by the JSON report. Deep-copy
+the requested configuration before constructing the engine; do not change
+hardware, cache, 256K capacity or sampling to work around this reporting error.
+No C4 speed result is inferred from the failed report.

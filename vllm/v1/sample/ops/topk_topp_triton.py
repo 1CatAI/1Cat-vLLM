@@ -1137,7 +1137,7 @@ def _apply_top_k_top_p_compact(
         # Sorting the full vocabulary for every ambiguous row at once needs
         # batch-sized value/index/softmax buffers. Bound this rare fallback's
         # workspace to two rows, without changing ties or nucleus boundaries.
-        # PyTorch uses a different softmax reduction for a singleton batch;
+        # PyTorch uses a different cumulative scan for a singleton batch;
         # preserve the multi-row reduction even in an odd final chunk.
         # This eager path already synchronizes; captured callers use the
         # separate graph-compatible reference path below.
@@ -1150,6 +1150,7 @@ def _apply_top_k_top_p_compact(
                 logits.index_select(0, chunk),
                 k.index_select(0, chunk),
                 p.index_select(0, chunk),
+                rowwise_sort=True,
             )
             result.index_copy_(0, chunk[:valid], reference[:valid])
             del reference

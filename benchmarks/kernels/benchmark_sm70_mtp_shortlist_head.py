@@ -34,7 +34,11 @@ def main():
     ]
     name = next(n for n in index if n.endswith("lm_head.weight"))
     subset = json.loads(args.vocab.read_text())["token_ids"]
-    report = {"model_admission": False, "shards": []}
+    report = {
+        "model_admission": False,
+        "packet_production_included": True,
+        "shards": [],
+    }
     with safe_open(args.model / index[name], framework="pt") as tensors:
         weight = tensors.get_tensor(name)
     for rank in args.ranks:
@@ -65,7 +69,11 @@ def main():
                 return [view.maybe_get_sm70_lm_head_top1_pair(x) for x in xs]
 
             def short(view=view, xs=xs):
-                return [view.maybe_get_sm70_lm_head_top1(x) for x in xs]
+                pairs = []
+                for x in xs:
+                    values, ids = view.maybe_get_sm70_lm_head_top1(x)
+                    pairs.append(torch.stack((values.float(), ids.float()), dim=-1))
+                return pairs
 
             graphs = {"full": capture(full), "shortlist": capture(short)}
             checks = []

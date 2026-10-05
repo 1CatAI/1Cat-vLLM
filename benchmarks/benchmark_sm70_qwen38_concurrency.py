@@ -12,6 +12,7 @@ import json
 import os
 import statistics
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -250,7 +251,9 @@ def main():
         "runtime": vllm.__version__,
         "runtime_path": vllm.__file__,
         "mode": args.mode,
-        "engine": config,
+        # EngineArgs may fill the speculative dictionary with ModelConfig
+        # objects during initialization. Preserve the requested JSON contract.
+        "engine": deepcopy(config),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "fp32_accumulation_and_reduction": True,
