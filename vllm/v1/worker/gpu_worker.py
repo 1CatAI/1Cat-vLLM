@@ -963,6 +963,11 @@ class Worker(WorkerBase):
 
         selections = self.vllm_config.kernel_config.linear_kernel_selections
         transports = self.vllm_config.kernel_config.ple_result_transports
+        row_readers = (
+            self._ple_offload_worker_handle.row_readers
+            if self._ple_offload_worker_handle is not None
+            else {}
+        )
         manager = getattr(self.model_runner, "cudagraph_manager", None)
         mode = (
             self.compilation_config.cudagraph_mode
@@ -981,6 +986,7 @@ class Worker(WorkerBase):
                 self.vllm_config.kernel_config.collective_kernel_selections
             ),
             "ple_result_transports": transports,
+            "ple_disk_row_readers": row_readers,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
