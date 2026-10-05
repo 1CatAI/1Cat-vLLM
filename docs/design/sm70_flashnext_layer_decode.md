@@ -392,3 +392,11 @@ ranks; profiler event counts agree with driver graph nodes. The production
 variant deliberately preserves the original two batch projections, so its
 32-kernel graph is distinct from the 30-kernel concatenated-weight research
 variant. Model distribution and natural completion remain pending.
+
+Ordinary QSA independent model qualification captures all 192 teacher-forcing
+rows with the same native artifact as its original-dispatch reference. Every
+full-vocabulary logit matches: mean/p99/maximum KL are zero, top-1 agreement is
+100%, and raw maximum logit difference is zero. All category groups pass the
+retained distribution gate. Natural completion is still running; combined GDN
+qualification will use fresh original-dispatch reference and candidate captures
+after installing the GDN native artifact under the complete GPU lease.
