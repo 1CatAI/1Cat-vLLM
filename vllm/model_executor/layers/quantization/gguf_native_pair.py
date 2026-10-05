@@ -149,6 +149,11 @@ def prepare_native_gated_pair(layer, sources, projections, enabled: bool):
         (c.reason for c in capabilities if c.reason),
         None if capabilities else "gated_pair_shape_or_source_has_no_calibration",
     )
+    if reason == "measured_route_not_faster" and any(
+        w.dtype != torch.uint8 or w.shape != (4352, 20 * _SOURCE_BLOCK_BYTES[t])
+        for w, t in sources
+    ):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
     if reason is None:
         if not layer.prefix.endswith(".gate_up_proj"):
             reason = "requires_gate_up_projection_pair"
