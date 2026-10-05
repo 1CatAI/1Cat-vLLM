@@ -593,7 +593,7 @@ class GGUFPreparedProjection(Module):
                     ),
                     *self.cache_capabilities,
                     *(
-                        [self.segment_capability]
+                        [self.segment_capability, self.segment_m20_capability]
                         if hasattr(self, "segment_capability")
                         else []
                     ),
