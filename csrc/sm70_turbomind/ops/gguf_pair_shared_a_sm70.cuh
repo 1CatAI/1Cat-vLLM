@@ -39,13 +39,11 @@ __device__ __forceinline__ void native_pair_segments(
 // The tested N32/M8 staging/reduction schedule, independent of weight format.
 // Each projection has its own reader state. Only the active projection's
 // state is constructed, so unrelated record/metadata pointers stay disjoint.
-template <class GateReader, class UpReader, bool Canonical = false>
+template <class GateReader, class UpReader>
 __global__ __launch_bounds__(512, 2) void native_pair_shared_a_kernel(
     half* __restrict__ output, const half* __restrict__ input,
     const uint8_t* __restrict__ gate, const uint8_t* __restrict__ up,
-    int hidden, int k, const uint32_t* gate_stats = nullptr,
-    const uint32_t* up_stats = nullptr, int gate_stat_stride = 0,
-    int up_stat_stride = 0) {
+    int hidden, int k) {
   constexpr int SplitK = 8;
   constexpr bool SameBook =
       GateReader::kBookBytes > 0 && GateReader::kBookId == UpReader::kBookId;
@@ -76,20 +74,10 @@ __global__ __launch_bounds__(512, 2) void native_pair_shared_a_kernel(
     UpReader up;
     __device__ ReaderState() {}
   } readers;
-  if constexpr (Canonical) {
-    if (projection == 0)
-      new (&readers.gate) GateReader(gate, gate_stats, gate_stat_stride, k,
-                                     blockIdx.x, first_part, col);
-    else
-      new (&readers.up) UpReader(up, up_stats, up_stat_stride, k, blockIdx.x,
-                                 first_part, col);
-  } else {
-    if (projection == 0)
-      new (&readers.gate)
-          GateReader(gate, blockIdx.x, k / 256, first_part, col);
-    else
-      new (&readers.up) UpReader(up, blockIdx.x, k / 256, first_part, col);
-  }
+  if (projection == 0)
+    new (&readers.gate) GateReader(gate, blockIdx.x, k / 256, first_part, col);
+  else
+    new (&readers.up) UpReader(up, blockIdx.x, k / 256, first_part, col);
   float accum[8] = {};
   for (int part = 0; part < groups_per_warp / 8; ++part) {
     for (int vector = threadIdx.x; vector < SplitK * 8 * 16;

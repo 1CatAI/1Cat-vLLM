@@ -432,8 +432,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_linear_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_qkvz_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_output_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_canonical_qpn_sm70.cu")
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu")
 
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"

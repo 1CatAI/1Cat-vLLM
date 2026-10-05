@@ -73,17 +73,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "gguf_native_pair_sm70_out(Tensor(a!) out, Tensor input, Tensor gate, "
       "Tensor up, int gate_type, int up_type) -> ()");
-  ops.def(
-      "gguf_canonical_pair_sm70_out(Tensor(a!) output, Tensor input, Tensor "
-      "gate, Tensor gate_stats, Tensor up, Tensor up_stats, int family) -> ()");
-  ops.impl("gguf_canonical_pair_sm70_out", torch::kCUDA,
-           &gguf_canonical_pair_sm70_out);
-  ops.def(
-      "gguf_canonical_iq4_linear_sm70_out(Tensor(a!) output, Tensor input, "
-      "Tensor codes, Tensor stats, Tensor(b!) partials, Tensor(c!) counters) "
-      "-> ()");
-  ops.impl("gguf_canonical_iq4_linear_sm70_out", torch::kCUDA,
-           &gguf_canonical_iq4_linear_sm70_out);
   ops.impl("gguf_native_pair_sm70_out", torch::kCUDA,
            &gguf_native_pair_sm70_out);
   ops.def(
