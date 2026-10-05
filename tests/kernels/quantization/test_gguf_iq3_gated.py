@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.model_executor.kernels.gguf import iq3_gated_pair_capability
@@ -45,7 +46,8 @@ def test_only_measured_pair_and_m_are_admitted(monkeypatch):
     assert iq3_gated_pair_capability((21, 21), 5120, 4352, torch.float16, False).reason
 
 
-def test_actual_m_dispatch_and_canonical_rounding(monkeypatch):
+@pytest.mark.parametrize("widths", [(4352, 4352), (8704,)])
+def test_actual_m_dispatch_and_canonical_rounding(monkeypatch, widths):
     calls = []
 
     def pair(output, *args):
@@ -54,7 +56,7 @@ def test_actual_m_dispatch_and_canonical_rounding(monkeypatch):
 
     def canonical(x, *args):
         calls.append("canonical")
-        return torch.full((x.shape[0], 4352), 2, dtype=x.dtype)
+        return torch.full((x.shape[0], args[8]), 2, dtype=x.dtype)
 
     def silu(output, x):
         gate, up = x.chunk(2, dim=-1)
@@ -68,20 +70,21 @@ def test_actual_m_dispatch_and_canonical_rounding(monkeypatch):
         canonical,
     )
     empty = torch.empty(0)
-    for m in (512, 8, 1, 16, 8, 512):
+    for m in (512, 8, 1, 16, 32, 8, 512):
         calls.clear()
         output = _iq3_gated_pair(
             torch.empty(m, 5120, dtype=torch.float16),
             empty,
             empty,
-            [empty] * 2,
-            [empty] * 2,
-            [0] * 2,
-            [0] * 2,
+            [empty] * len(widths),
+            [empty] * len(widths),
+            [0] * len(widths),
+            [0] * len(widths),
+            list(widths),
             [512, -1],
         )
         assert output.shape == (m, 4352)
-        assert calls == (["pair"] if m == 8 else ["canonical", "canonical"])
+        assert calls == (["pair"] if m == 8 else ["canonical"] * len(widths))
         if m != 8:
             torch.testing.assert_close(
                 output,
@@ -114,6 +117,7 @@ def test_range_compilation_keeps_gated_dispatch_opaque():
             [stats, stats],
             [0, 0],
             [0, 0],
+            [4352, 4352],
             [512, -1],
         )
 

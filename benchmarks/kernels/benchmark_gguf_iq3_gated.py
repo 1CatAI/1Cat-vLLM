@@ -98,7 +98,8 @@ def main():
     x = torch.randn(8, 5120, device="cuda", dtype=torch.float16)
 
     def canonical(rows):
-        pair = torch.cat([projection(rows) for projection in projections], dim=-1)
+        parts = [projection(rows) for projection in projections]
+        pair = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         output = torch.empty(rows.shape[0], 4352, dtype=rows.dtype, device=rows.device)
         torch.ops._C.silu_and_mul(output, pair)
         return output
@@ -108,7 +109,7 @@ def main():
         return (gate.float() / (1 + torch.exp(-gate.float()))).half() * up
 
     checks = []
-    for m in (8, 1, 16, 512, 8):
+    for m in (8, 1, 16, 32, 512, 8):
         rows = torch.randn(m, 5120, device="cuda", dtype=torch.float16)
         result = apply_iq3_gated_pair(layer, rows)
         reference = official(rows)
@@ -154,6 +155,7 @@ def main():
                 "layer": args.layer,
                 "source_sha256": [hashlib.sha256(data).hexdigest() for data in payload],
                 "admission": admission,
+                "canonical_output_sizes": [p.logical_output_size for p in projections],
                 "checks": checks,
                 "samples": samples,
                 "torch": torch.__version__,

@@ -25,6 +25,7 @@ def _iq3_gated_pair(
     stats: list[torch.Tensor],
     k_ld: list[int],
     q_ld: list[int],
+    output_sizes: list[int],
     blas_bands: list[int],
 ) -> torch.Tensor:
     rows = x.reshape(-1, x.shape[-1]).contiguous()
@@ -43,14 +44,17 @@ def _iq3_gated_pair(
                 32,
                 k_ld[i],
                 q_ld[i],
-                4352,
-                4352,
+                output_sizes[i],
+                output_sizes[i],
                 [],
                 blas_bands,
             )
-            for i in range(2)
+            for i in range(len(codes))
         ]
-        torch.ops._C.silu_and_mul(output, torch.cat(projections, dim=-1))
+        pair = (
+            projections[0] if len(projections) == 1 else torch.cat(projections, dim=-1)
+        )
+        torch.ops._C.silu_and_mul(output, pair)
     return output.reshape(*x.shape[:-1], 4352)
 
 
@@ -62,6 +66,7 @@ def _iq3_gated_pair_fake(
     stats: list[torch.Tensor],
     k_ld: list[int],
     q_ld: list[int],
+    output_sizes: list[int],
     blas_bands: list[int],
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], 4352), dtype=x.dtype, device=x.device)
@@ -96,7 +101,12 @@ def prepare_iq3_gated_pair(layer, sources, projections, enabled: bool):
             reason = "requires_gate_up_projection_pair"
         elif any(w.dtype != torch.uint8 or w.shape != (4352, 2200) for w, _ in sources):
             reason = "gated_pair_shape_or_source_has_no_calibration"
-        elif len(projections) != 2 or any(p.kernel is None for p in projections):
+        elif (
+            len(projections) not in (1, 2)
+            or any(p.kernel is None for p in projections)
+            or tuple(size for p in projections for size in p.source_output_sizes)
+            != (4352, 4352)
+        ):
             reason = "canonical_fallback_unavailable"
         elif any(p.codes.device.type != "cuda" for p in projections):
             reason = "requires_cuda_fp16_activations"
@@ -135,5 +145,6 @@ def apply_iq3_gated_pair(layer, x):
         [p.stats for p in projections],
         [p.gguf_tm_k_ld for p in projections],
         [p.gguf_tm_q_ld for p in projections],
+        [p.logical_output_size for p in projections],
         blas_bands,
     )
