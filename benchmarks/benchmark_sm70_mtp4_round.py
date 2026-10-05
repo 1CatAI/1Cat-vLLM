@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--fixture-manifest", type=Path)
     parser.add_argument("--draft-vocab", type=Path)
     parser.add_argument("--structural-candidate", choices=("shared",))
+    parser.add_argument("--restoration-control", action="store_true")
     parser.add_argument("--diagnostics-only", action="store_true")
     parser.add_argument("--projection-reference", action="store_true")
     parser.add_argument(
@@ -184,6 +185,12 @@ def main() -> None:
         engine["worker_cls"] = (
             "benchmarks.sm70_mtp_reference_worker.SharedChainCandidateWorker"
         )
+    if args.restoration_control:
+        if args.draft_vocab or args.structural_candidate or args.diagnostic_path:
+            parser.error("Restoration control requires an independent arm")
+        engine["worker_cls"] = (
+            "benchmarks.sm70_mtp_reference_worker.RestorationControlWorker"
+        )
     if args.projection_reference:
         engine["worker_cls"] = "benchmarks.sm70_mtp_reference_worker.ReferenceWorker"
     if args.diagnostic_path and args.diagnostic_path != "shared":
@@ -204,7 +211,9 @@ def main() -> None:
         "warmup_outputs": [],
         "complete": False,
         "startup_diagnostics": args.startup_diagnostics,
-        "default_configuration": not (args.draft_vocab or args.structural_candidate),
+        "default_configuration": not (
+            args.draft_vocab or args.structural_candidate or args.restoration_control
+        ),
         "measurement_kind": (
             "diagnostic_node_trace"
             if args.node_trace
@@ -362,6 +371,7 @@ def main() -> None:
             report["speed_complete"]
             and not args.draft_vocab
             and not args.structural_candidate
+            and not args.restoration_control
             and all(row["complete_round_ms"] <= 15 for row in report["cases"])
         )
         save()

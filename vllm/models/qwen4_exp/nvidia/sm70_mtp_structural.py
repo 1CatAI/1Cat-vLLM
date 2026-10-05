@@ -15,7 +15,12 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-def _shared_chain(x, packed_up, packed_down, gate):
+def _shared_chain(
+    x: torch.Tensor,
+    packed_up: torch.Tensor,
+    packed_down: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
     out = torch.empty_like(x)
     partial = x.new_empty((8, x.shape[0], 320), dtype=torch.float32)
     gate_logits = x.new_empty(x.shape[0], dtype=torch.float32)
