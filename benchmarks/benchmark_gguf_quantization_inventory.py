@@ -214,6 +214,27 @@ def build_inventory(reader, model_path, tp_size):
         )
     assert sum(row["source_bytes"] for row in priorities) == mixed_bytes
     assert sum(row["layer_count"] for row in priorities) == len(mixed)
+    layer_types = []
+    for layer in layers:
+        layer_records = [r for r in records if r["layer"] == layer]
+        layer_bytes = sum(r["source_bytes"] for r in layer_records)
+        for row in aggregate(layer_records, "gguf_type", payload):
+            layer_types.append(
+                {
+                    "layer": layer,
+                    "gguf_type": row["gguf_type"],
+                    "source_bytes": row["source_bytes"],
+                    "layer_source_bytes": layer_bytes,
+                    "layer_percent": row["source_bytes"] * 100 / layer_bytes,
+                    "payload_percent": row["payload_percent"],
+                    "tensor_count": row["tensor_count"],
+                    "roles": row["roles"],
+                }
+            )
+        assert (
+            sum(r["source_bytes"] for r in layer_types if r["layer"] == layer)
+            == layer_bytes
+        )
     return {
         "model_filename": model_path.name,
         "file_bytes": model_path.stat().st_size,
@@ -226,6 +247,7 @@ def build_inventory(reader, model_path, tp_size):
         "by_family": aggregate(records, "family", payload),
         "by_role": aggregate(records, "role", payload),
         "by_type_role": type_roles,
+        "by_layer_type": layer_types,
         "gate_up_summary": {
             "pair_count": len(pairs),
             "source_bytes": pair_bytes,
@@ -279,6 +301,7 @@ def main():
         "by_family",
         "by_role",
         "by_type_role",
+        "by_layer_type",
         "gate_up_pairs",
         "mixed_pair_priority",
         "mixed_type_set_priority",
@@ -290,7 +313,14 @@ def main():
             {
                 key: value
                 for key, value in inventory.items()
-                if key not in {"tensors", "gate_up_pairs", "by_role", "by_type_role"}
+                if key
+                not in {
+                    "tensors",
+                    "gate_up_pairs",
+                    "by_role",
+                    "by_type_role",
+                    "by_layer_type",
+                }
             },
             indent=2,
         )

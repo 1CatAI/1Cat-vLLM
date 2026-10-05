@@ -29,7 +29,7 @@ mean that every weight uses that format. The three FFN projections account
 for **62.903%** of the payload.
 
 Complete per-type/per-position/per-layer records are emitted in
-`by_type_role.csv` and `tensors.csv`, including logical N/K shapes, original
+`by_type_role.csv`, `by_layer_type.csv` and `tensors.csv`, including logical N/K shapes, original
 source bytes, and GGUF data offsets. The position table above shows only the
 four largest byte contributors for each type.
 
@@ -78,6 +78,7 @@ python benchmarks/benchmark_gguf_quantization_inventory.py MODEL.gguf \
 The script reconciles tensor/type/role byte totals, pair shape and TP row
 alignment, and ordered-pair coverage. `inventory.json` is the complete record;
 CSV tables include source-type totals, families, roles, type-role positions,
+all 64 layers with each present type’s byte share and projection roles,
 every tensor, every gate/up pair, and both priority views. TP source bytes
 for FFN gate/up are exact output-row shards; other tensor types are not
 assumed to divide uniformly across ranks.
