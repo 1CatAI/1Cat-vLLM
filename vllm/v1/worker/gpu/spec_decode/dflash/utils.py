@@ -147,6 +147,10 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     _validate_dflash_shared_weights(dflash_model, shared_embed, shared_lm_head)
 
+    prepare_head = getattr(dflash_model, "prepare_sm70_nvfp4_draft_head", None)
+    if prepare_head is not None:
+        prepare_head()
+
     # Keep only the precision the loaded drafter consumes. This affects the
     # auxiliary snapshots, never the target model's hidden/residual tensors.
     # Other drafters retain their existing auxiliary-state contract.

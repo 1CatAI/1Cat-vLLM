@@ -45,7 +45,7 @@ def pack_draft_head(dense: torch.Tensor):
 
 
 class SM70DFlash2NVFP4Head(nn.Module):
-    """M8 proposal-only projection; other batch sizes retain the original head."""
+    """One eight-row tile for draft7 candidates; larger batches keep their head."""
 
     def __init__(self, codes, scales, global_scale, vocab_width, hidden_size):
         super().__init__()
@@ -78,12 +78,13 @@ class SM70DFlash2NVFP4Head(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor | None:
         if (
             x.ndim != 2
-            or x.shape != (8, self.hidden_size)
+            or x.shape[0] not in (7, 8)
+            or x.shape[1] != self.hidden_size
             or x.dtype != torch.float16
             or not x.is_contiguous()
         ):
             return None
-        output = x.new_empty((8, self.vocab_width))
+        output = x.new_empty((x.shape[0], self.vocab_width))
         ops.nvfp4_qpn2_gemm_sm70_out(
             output, x, self.codes, self.scales, self.global_scale, 16, 1
         )

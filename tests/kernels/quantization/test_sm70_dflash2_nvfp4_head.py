@@ -13,8 +13,9 @@ from vllm.model_executor.layers.quantization.sm70_dflash2_nvfp4_head import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [7, 8])
 @torch.inference_mode()
-def test_private_candidate_head_preserves_target_and_graph_fallback():
+def test_private_candidate_head_preserves_target_and_graph_fallback(rows):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 is required")
     torch.manual_seed(123)
@@ -35,13 +36,13 @@ def test_private_candidate_head_preserves_target_and_graph_fallback():
     assert torch.equal(packed, saved_weight)
     assert torch.equal(packed_scales, saved_scales)
     assert candidate.state_dict() == {}
-    x = torch.randn(8, 5120, device="cuda", dtype=torch.float16) * 0.1
+    x = torch.randn(rows, 5120, device="cuda", dtype=torch.float16) * 0.1
     eager = candidate(x)
     assert eager is not None
     assert torch.isfinite(eager).all()
     assert torch.count_nonzero(eager[:, :32]) == 0
-    for rows in (1, 7, 16, 32):
-        assert candidate(x[:1].repeat(rows, 1)) is None
+    for unsupported_rows in (1, 6, 14, 16, 28, 32):
+        assert candidate(x[:1].repeat(unsupported_rows, 1)) is None
     assert candidate(x.T.contiguous().T) is None
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
