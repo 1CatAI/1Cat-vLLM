@@ -31,15 +31,6 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
-def set_input_preparation_phase(worker, early):
-    state = worker.model_runner.model_state
-    declared = type(state).supports_early_input_preparation
-    if early and not declared:
-        raise RuntimeError("Model state has not declared independent inputs")
-    state.supports_early_input_preparation = early
-    return {"rank": worker.rank, "early": early, "declared": declared}
-
-
 def observed_cohort(llm, fixed_ids, params, width=1):
     records = []
     client = llm.llm_engine.engine_core
@@ -237,7 +228,7 @@ def main():
             for arm in () if args.trace_only else arms:
                 if args.input_phase_ab:
                     llm.collective_rpc(
-                        set_input_preparation_phase,
+                        "set_graph_input_preparation",
                         args=(arm.startswith("early"),),
                         timeout=30,
                     )
@@ -261,7 +252,7 @@ def main():
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
             if args.input_phase_ab:
                 llm.collective_rpc(
-                    set_input_preparation_phase, args=(True,), timeout=30
+                    "set_graph_input_preparation", args=(True,), timeout=30
                 )
             if not args.trace_only:
                 c4_ids = fixed_ids[:128]
@@ -273,7 +264,7 @@ def main():
                 for early in c4_phases:
                     if args.input_phase_ab:
                         llm.collective_rpc(
-                            set_input_preparation_phase, args=(early,), timeout=30
+                            "set_graph_input_preparation", args=(early,), timeout=30
                         )
                     steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
                     cohort = dict(

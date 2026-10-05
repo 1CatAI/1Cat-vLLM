@@ -116,6 +116,14 @@ class GraphParityWorkerExtension:
     rank: int
     model_runner: Any
 
+    def set_graph_input_preparation(self, early):
+        state = self.model_runner.model_state
+        declared = type(state).supports_early_input_preparation
+        if early and not declared:
+            raise RuntimeError("Model state has not declared independent inputs")
+        state.supports_early_input_preparation = early
+        return {"rank": self.rank, "early": early, "declared": declared}
+
     def start_graph_parity_observer(self, nvtx=False):
         if not hasattr(self, "_graph_parity_recorder"):
             from vllm.v1.executor.multiproc_executor import WorkerProc
