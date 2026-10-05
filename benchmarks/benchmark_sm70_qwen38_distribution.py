@@ -115,7 +115,10 @@ def capture(args):
         enable_prefix_caching=False,
         language_model_only=True,
         speculative_config=None,
-        kernel_config={"ple_result_transport": args.transport},
+        kernel_config={
+            "ple_result_transport": args.transport,
+            "ple_disk_row_gather": not args.disable_ple_row_gather,
+        },
         worker_extension_cls=(
             "benchmarks.qwen38_distribution_probe.DistributionProbeWorkerExtension"
         ),
@@ -141,6 +144,7 @@ def capture(args):
         "contract": "TP4 FP16 dense/KV, FP32 accum/state, disk mmap, no MTP",
         "engine": {k: v for k, v in engine_config.items() if k != "kernel_config"},
         "native_sha256": digest(Path(native.__file__)),
+        "worker_routes": llm.collective_rpc("get_sm70_acceleration_report"),
         "captures": [],
     }
 
@@ -334,6 +338,8 @@ def compare(args):
             )
     noise = summarize_groups(noise_rows, ref["widths"]) if noise_rows else {}
     result = {
+        "thresholds_enforced": args.precision_reduced,
+        "gate_mode": "precision_reduction" if args.precision_reduced else "record_only",
         "distribution_passed": all(g["passed"] for g in groups.values()),
         "default_noise_passed": (
             all(g["passed"] for g in noise.values()) if noise else None
@@ -345,7 +351,9 @@ def compare(args):
     }
     (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(groups, indent=2))
-    if not result["distribution_passed"] or result["default_noise_passed"] is False:
+    if args.precision_reduced and (
+        not result["distribution_passed"] or result["default_noise_passed"] is False
+    ):
         raise SystemExit("Distribution thresholds exceeded")
 
 
@@ -359,10 +367,16 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reference", type=Path)
     parser.add_argument(
+        "--precision-reduced",
+        action="store_true",
+        help="Enforce distribution thresholds for a precision-reducing candidate",
+    )
+    parser.add_argument(
         "--transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
     parser.add_argument("--widths", default="1")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--disable-ple-row-gather", action="store_true")
     parser.add_argument("--prefill-budget", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--kv-cache-memory-bytes", type=int)

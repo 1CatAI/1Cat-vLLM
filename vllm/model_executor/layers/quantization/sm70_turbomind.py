@@ -77,6 +77,28 @@ def use_batched_gemm_layouts() -> bool:
     return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
 
 
+def use_native_qpn_layouts() -> bool:
+    """Use one native layout for the qualified TP4, at-most-M32 verifier.
+
+    Larger batch capacities retain their existing prepared batch GEMMs until
+    the packed-only fallback is admitted at those decode shapes.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or config.speculative_config is None:
+        return False
+    text = config.model_config.hf_text_config
+    return bool(
+        is_exact_sm70_cuda_platform()
+        and config.parallel_config.tensor_parallel_size == 4
+        and config.scheduler_config.max_num_seqs <= 4
+        and config.speculative_config.num_speculative_tokens == 7
+        and getattr(text, "hidden_size", None) == 5120
+        and getattr(text, "model_type", None) == "qwen3_5_text"
+    )
+
+
 def forces_marlin() -> bool:
     return envs.force_sm70_marlin()
 

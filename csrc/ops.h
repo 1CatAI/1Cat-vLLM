@@ -817,6 +817,12 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes,
     double epsilon);
+
+void sm70_tp4_all_reduce_gemma_rms_norm_reference(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes,
+    double epsilon);
 void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
@@ -928,6 +934,10 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        int64_t source_type, int64_t num_experts,
                                        int64_t group_size);
 
+void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                        int64_t shard_size, int64_t num_rows, int64_t row_bytes,
+                        torch::Tensor out);
+
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
                                       torch::Tensor stats, int64_t source_type,
                                       int64_t group_size);
@@ -942,3 +952,14 @@ void gguf_small_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor stats_ptrs,
                                      int64_t source_type, int64_t num_experts,
                                      int64_t group_size);
+
+void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
+                                          torch::Tensor weight,
+                                          int64_t source_type);
+void gguf_lattice_raw_grouped_gate_up_sm70_out(
+    torch::Tensor gate, torch::Tensor up, torch::Tensor input,
+    torch::Tensor gate_weights, torch::Tensor up_weights, torch::Tensor offsets,
+    torch::Tensor ids, int64_t source_type, int64_t top_k);
+
+void gguf_iq3_gated_sm70_out(torch::Tensor out, torch::Tensor input,
+                             torch::Tensor gate, torch::Tensor up);

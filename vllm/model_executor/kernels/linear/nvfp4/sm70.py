@@ -194,6 +194,46 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer):
+        # Qualified SM70 decode keeps the native QPN2 layout only. Large M
+        # consumes that same packing through the bounded dense prefill op.
+        if (
+            self.config.policy.qualified
+            and self.config.policy.prefill
+            and self.config.policy.shared_weight
+            and self.config.policy.shared_scales
+            and sm70_tm.use_native_qpn_layouts()
+            # QPN4's FP4 representation scales FP16 group factors by 2**14.
+            # Preserve generic fallback if even the largest E4M3 scale could
+            # overflow that representation.
+            and 0 < float(layer.weight_global_scale.item()) < 65504 / (448 * 16384)
+            and current_platform.is_device_capability(70)
+            and hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out")
+        ):
+            from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+                _get_sm70_fp8_prefill_exact_dense_workspace,
+            )
+            from vllm.model_executor.layers.quantization.utils import (
+                sm70_nvfp4_native,  # noqa: F401
+            )
+
+            workspace = _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
+            k = layer.input_size_per_partition
+            n = (layer.weight.shape[0] + 31) // 32 * 32
+            if workspace is not None and workspace.numel() >= k * n:
+                sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer)
+                layer.sm70_nvfp4_qpn2_native = True
+                layer.sm70_nvfp4_qpn2_output_size = n
+                layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu
+                layer.sm70_nvfp4_qpn2_split_k, layer.sm70_nvfp4_qpn2_nacc = (
+                    _qpn2_config(k, n, False)
+                )
+                layer.sm70_nvfp4_qpn2 = True
+                logger.info_once(
+                    "SM70 NVFP4 retains one native QPN2 layout with shared "
+                    "bounded prefill scratch."
+                )
+                self._release_checkpoint_parameters(layer)
+                return
         compact_scales = compact_scales_allowed(self.config.policy)
         qpn2_shared = bool(self.config.policy.shared_weight)
         if qpn2_shared and (missing_shared_ops := _missing_qpn2_shared_ops()):
@@ -328,7 +368,18 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         nacc = int(layer.sm70_nvfp4_qpn2_nacc)
         if gated_silu:
             split_k, nacc = _qpn2_config(x_2d.shape[1], kernel_output_size * 2, True)
-        if getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
+        if getattr(layer, "sm70_nvfp4_qpn2_native", False):
+            torch.ops.vllm.sm70_nvfp4_native_dispatch(
+                out_2d,
+                x_2d,
+                state.weight,
+                state.scales,
+                state.global_scale,
+                split_k,
+                nacc,
+                gated_silu,
+            )
+        elif getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
             min_prefill_m = (
                 layer.sm70_nvfp4_qpn2_prefill_min_m
                 if layer.sm70_nvfp4_qpn2_prefill_enabled

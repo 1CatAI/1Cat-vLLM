@@ -79,7 +79,6 @@ class Qwen4ExpAdapter(Qwen35MoeAdapter):
             Qwen35Adapter.is_linear(name)
             and "hyper_connection" not in name
             and not name.endswith("ngram_embedding.weight")
-            and name != "lm_head.weight"
             and not name.endswith(
                 (
                     ".ple.norm_key.weight",

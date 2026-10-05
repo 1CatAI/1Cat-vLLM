@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
+from dataclasses import asdict
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -70,6 +71,7 @@ class GGUFConfig(QuantizationConfig):
         self.linear_layouts: dict[str, GGUFLinearLayout] = {}
         self.fallback_reasons: dict[str, str] = {}
         self.native_expert_storage = False
+        self.canonical_expert_storage = False
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -128,6 +130,10 @@ class GGUFConfig(QuantizationConfig):
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
             if self.native_expert_storage:
+                if self.canonical_expert_storage:
+                    from .gguf_turbomind_moe import GGUFTurboMindMoEMethod
+
+                    return GGUFTurboMindMoEMethod(self, layer.moe_config)
                 from vllm.model_executor.layers.quantization.gguf_moe import (
                     GGUFNativeMoEMethod,
                 )
@@ -639,6 +645,7 @@ class GGUFLinearMethod(LinearMethodBase):
         ):
             qweight = layer.qweight
             from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                mixed_projection_capabilities,
                 prepare_gguf_projections,
             )
 
@@ -662,8 +669,19 @@ class GGUFLinearMethod(LinearMethodBase):
             projections = prepare_gguf_projections(
                 sources, self.params_dtype, self.native_enabled, self.prefill_min_m
             )
+            from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+                prepare_iq3_gated_pair,
+            )
+
+            if self.layout is None and not isinstance(self, GGUFEmbeddingMethod):
+                self.native_admission["gated_pair"] = prepare_iq3_gated_pair(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
+            ]
+            self.native_admission["mixed_projection_operators"] = [
+                asdict(c) for c in mixed_projection_capabilities(projections)
             ]
             if any(projection.kernel is not None for projection in projections):
                 layer.gguf_tm_projections = torch.nn.ModuleList(projections)
@@ -733,6 +751,15 @@ class GGUFLinearMethod(LinearMethodBase):
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
 
+    def apply_fused_silu_and_mul(self, layer, x):
+        if not hasattr(layer, "gguf_iq3_gated_records"):
+            return None
+        from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+            apply_iq3_gated_pair,
+        )
+
+        return apply_iq3_gated_pair(layer, x)
+
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
         qweight = layer.qweight
@@ -789,8 +816,11 @@ class GGUFLinearMethod(LinearMethodBase):
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
         if self.canonical_projections:
-            outputs = [projection(x) for projection in layer.gguf_tm_projections]
-            out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+            from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                apply_prepared_gguf_projections,
+            )
+
+            out = apply_prepared_gguf_projections(x, layer.gguf_tm_projections)
             if bias is not None:
                 out.add_(bias)
             return out

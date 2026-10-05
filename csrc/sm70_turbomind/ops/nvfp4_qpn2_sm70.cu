@@ -160,10 +160,11 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
   }
 }
 
-// The paired M16 path reads the existing TurboMind codes and compact scales.
+// Batch kernels share the native/TurboMind reader without a second layout.
+template <bool TurboMindLayout>
 struct Nvfp4PairReader {
   static constexpr bool kFp4 = true;
-  Nvfp4Qpn2CodeReader<true> codes;
+  Nvfp4Qpn2CodeReader<TurboMindLayout> codes;
   const uint8_t* scales;
   float global_scale;
 
@@ -194,7 +195,8 @@ struct Nvfp4PairReader {
 
 // Four row tiles reuse each decoded weight. Two physical phases retain
 // the established split order while keeping shared scratch at 40/36 KiB.
-template <int Split, bool Gated, bool FullRows = false>
+template <int Split, bool Gated, bool FullRows = false,
+          bool TurboMindLayout = true>
 __global__
 __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kernel(
     const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
@@ -219,7 +221,7 @@ __launch_bounds__(256, FullRows ? 2 : 1) void nvfp4_qpn2_m32_twophase_sm70_kerne
   const int tile = blockIdx.y + projection * (width / 32);
   const int groups = k / 16;
   const int groups_per_warp = groups / Split;
-  const Nvfp4Qpn2CodeReader<true> reader(codes, tile, groups, lane);
+  const Nvfp4Qpn2CodeReader<TurboMindLayout> reader(codes, tile, groups, lane);
   const uint8_t* scale_ptr =
       scales + static_cast<size_t>(tile) * groups * 32 + lane;
 
@@ -724,10 +726,11 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
 
   // Preserve the single-request route; M9-M16 shares A across two
   // projections without creating another persistent weight layout.
-  if constexpr (TurboMindLayout) {
+  {
     if (m > 8 && m <= 16 && k >= 4096 && n >= 2048 && n % 64 == 0 &&
         split_k == 16 && accumulator_chains == 2) {
-      vllm::sm70::launch_qpn_pair_m16<Nvfp4PairReader, 16, false>(
+      vllm::sm70::launch_qpn_pair_m16<Nvfp4PairReader<TurboMindLayout>, 16,
+                                      false>(
           out, input, codes, scales, static_cast<float>(global_scale), stream);
       return;
     }
@@ -741,8 +744,10 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
           (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
           input_ptr, packed_ptr, m, k);
       auto kernel = m == 32
-                        ? nvfp4_qpn2_m32_twophase_sm70_kernel<16, false, true>
-                        : nvfp4_qpn2_m32_twophase_sm70_kernel<16, false>;
+                        ? nvfp4_qpn2_m32_twophase_sm70_kernel<16, false, true,
+                                                              TurboMindLayout>
+                        : nvfp4_qpn2_m32_twophase_sm70_kernel<16, false, false,
+                                                              TurboMindLayout>;
       kernel<<<dim3(1, n / 32), 256, 0, stream>>>(
           code_ptr, scale_ptr, packed_ptr, output_ptr, n, k, m,
           static_cast<float>(global_scale));
@@ -808,10 +813,11 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
 
   // Preserve the single-request route; M9-M16 shares A across two
   // projections without creating another persistent weight layout.
-  if constexpr (TurboMindLayout) {
+  {
     if (m > 8 && m <= 16 && k >= 4096 && hidden >= 2048 && hidden % 32 == 0 &&
         split_k == 8 && accumulator_chains == 2) {
-      vllm::sm70::launch_qpn_pair_m16<Nvfp4PairReader, 8, true>(
+      vllm::sm70::launch_qpn_pair_m16<Nvfp4PairReader<TurboMindLayout>, 8,
+                                      true>(
           out, input, codes, scales, static_cast<float>(global_scale), stream);
       return;
     }
@@ -824,8 +830,11 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
       vllm::sm70::pack_k16_input<<<
           (input.numel() / 2 + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
           input_ptr, packed_ptr, m, k);
-      auto kernel = m == 32 ? nvfp4_qpn2_m32_twophase_sm70_kernel<8, true, true>
-                            : nvfp4_qpn2_m32_twophase_sm70_kernel<8, true>;
+      auto kernel = m == 32
+                        ? nvfp4_qpn2_m32_twophase_sm70_kernel<8, true, true,
+                                                              TurboMindLayout>
+                        : nvfp4_qpn2_m32_twophase_sm70_kernel<8, true, false,
+                                                              TurboMindLayout>;
       kernel<<<dim3(1, hidden / 32), 256, 0, stream>>>(
           code_ptr, scale_ptr, packed_ptr, output_ptr, hidden, k, m,
           static_cast<float>(global_scale));

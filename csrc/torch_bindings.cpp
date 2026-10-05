@@ -34,6 +34,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
   //
 
+#ifdef ENABLE_SM70_TURBOMIND
+  ops.def(
+      "gguf_iq3_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor gate, "
+      "Tensor up) -> ()");
+  ops.impl("gguf_iq3_gated_sm70_out", torch::kCUDA, &gguf_iq3_gated_sm70_out);
+#endif
   ops.def(
       "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
       "y_q, Tensor! y_s,"
@@ -47,6 +53,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
+
+  ops.def(
+      "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+      "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
+  ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
@@ -197,6 +208,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int group_size) -> ()");
   ops.impl("gguf_small_grouped_vec_sm70_out", torch::kCUDA,
            &gguf_small_grouped_vec_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_dequantize_sm70_out(Tensor(a!) out, Tensor weight, int "
+      "source_type) -> ()");
+  ops.impl("gguf_lattice_raw_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_grouped_gate_up_sm70_out(Tensor(a!) gate, Tensor(b!) "
+      "up, Tensor input, Tensor gate_weights, Tensor up_weights, Tensor "
+      "offsets, "
+      "Tensor ids, int source_type, int top_k) -> ()");
+  ops.impl("gguf_lattice_raw_grouped_gate_up_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_grouped_gate_up_sm70_out);
   ops.def(
       "gguf_lattice_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
       "Tensor stats, int source_type, int group_size) -> ()");
@@ -1159,6 +1182,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
   custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm", torch::kCUDA,
                  &sm70_tp4_all_reduce_gemma_rms_norm);
+  custom_ar.def(
+      "sm70_tp4_all_reduce_gemma_rms_norm_reference(int fa, Tensor inp, Tensor "
+      "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
+      "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm_reference", torch::kCUDA,
+                 &sm70_tp4_all_reduce_gemma_rms_norm_reference);
   custom_ar.def(
       "sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(int fa, Tensor inp, "
       "Tensor residual, Tensor weight, Tensor! normalized_out, Tensor! "
