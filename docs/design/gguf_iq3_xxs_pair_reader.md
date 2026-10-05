@@ -53,7 +53,7 @@ IQ3_S/IQ4_XS pair, 18/40 mixed layers cover 48.463% of mixed-pair bytes.
 This is a weighted microbenchmark estimate, not an end-to-end result.
 The first GPU attempt failed while the filesystem was full; its controller
 and logs are retained. Duplicate archived artifacts were retired before
-repeating the operator checks. Model integration checks remain pending.
+repeating the operator checks. Model integration checks pass as recorded below.
 
 ## Shared-activation hardware counters
 
@@ -76,3 +76,30 @@ profiled 47.360us service and 7,837,952 warp instructions are counter evidence,
 not an unprofiled speed result. Excess shared wavefronts remain 911,091;
 shared activation reuse does not remove the codebook conflict. The earlier
 two-copy parity lookup was measured equal in latency and remains rejected.
+
+## Installed model integration
+
+The normal installed wheel passes TP4 target/Q8_0 DFlash2 AOT startup and
+M8 full graph capture on V100-SXM2-32GB with ring NVLink, Torch 2.10 cu128,
+CUDA 12.8, FP16 KV and FP32 SSM. The 32K configuration uses a 1024-token
+batch budget, one sequence and seven probabilistic draft tokens. The
+quality check requests M8 capture and uses temperature 0.7/top-p0.9/top-k20
+and seed 123, with thinking disabled and EOS respected. Arithmetic returns
+`391`; the unit-testing question receives one reasonable English sentence.
+Both prompts naturally stop within 128 tokens.
+
+Four rank reports each admit all seven IQ3_XXS/IQ3_S mixed pairs. This
+extends the existing eight pure and eleven IQ3_S/IQ4_XS pairs, while
+the remaining 22 mixed layers retain canonical dispatch. An initial report
+checker incorrectly traversed duplicate linear reports and null draft
+entries after successful model startup. That failure is retained; the
+corrected checker reads only the loaded GGUF-layer report and was validated
+on the previous eleven-pair report before repeating the quality check.
+
+Both native modules in the final wiring wheel are bitwise identical to
+the measured raw-operator wheel. Its complete SHA256 is
+`b3d977e7445cf61edfbfe1c39968dcc813e91d1704a5b575127ea995b6172624`.
+The subsequent integration of main's affine head-layout and ordered-row
+changes passes 39 focused dispatch/head-layout CPU checks without changing
+the mixed-pair readers or their measured shape. This is model integration
+and text-health evidence, not an end-to-end latency comparison.

@@ -424,6 +424,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_grouped_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_lattice_raw_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dp4a_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu")
 
