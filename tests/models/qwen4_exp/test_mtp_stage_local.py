@@ -117,7 +117,16 @@ def test_mtp_decode_view_shares_predictor_and_selects_only_during_capture(monkey
     model = object.__new__(Qwen4ExpMTP)
     nn.Module.__init__(model)
     calls = []
-    model.model = lambda *args, **kwargs: calls.append("prefill")
+
+    class Predictor:
+        def embed_input_ids(self, ids):
+            calls.append("embedding")
+            return torch.zeros(TOKENS, HIDDEN)
+
+        def __call__(self, *args, **kwargs):
+            calls.append("prefill")
+
+    model.model = Predictor()
     view = object.__new__(_Qwen4ExpMTPDecodeGraphModel)
     nn.Module.__init__(view)
     object.__setattr__(view, "_target_model", _predictor())
@@ -130,7 +139,37 @@ def test_mtp_decode_view_shares_predictor_and_selects_only_during_capture(monkey
     model.forward(**args)
     with sm70_decode_graph_compilation():
         sample, multi = model.forward(**args)
-    assert calls == ["prefill"]
+    assert calls == ["prefill", "embedding"]
     assert sample.shape == (TOKENS, HIDDEN)
     assert multi.shape == (TOKENS, HC_COUNT * HIDDEN)
     assert view.state_dict() == {}
+
+
+@pytest.mark.parametrize("provided", [False, True])
+def test_sm70_mtp_prepares_embedding_before_compiled_backbone(monkeypatch, provided):
+    from unittest.mock import Mock
+
+    from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+    from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP
+
+    monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
+    model = object.__new__(Qwen4ExpMTP)
+    nn.Module.__init__(model)
+    expected = torch.randn(TOKENS, HIDDEN)
+    embedding = Mock(return_value=expected)
+    model.model = SimpleNamespace(embed_input_ids=embedding)
+    backbone = Mock(return_value=expected)
+    object.__setattr__(model, "_sm70_decode_graph_model", backbone)
+    ids = torch.zeros(TOKENS, dtype=torch.long)
+    pos = torch.arange(TOKENS)
+    hidden = torch.zeros(TOKENS, HC_COUNT * HIDDEN)
+    with sm70_decode_graph_compilation():
+        result = model.forward(
+            ids, pos, hidden, inputs_embeds=expected if provided else None
+        )
+    assert result is expected
+    backbone.assert_called_once_with(ids, pos, hidden, None, expected, spec_step_idx=0)
+    if provided:
+        embedding.assert_not_called()
+    else:
+        embedding.assert_called_once_with(ids)

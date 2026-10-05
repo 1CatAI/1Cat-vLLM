@@ -12,6 +12,7 @@ import json
 import os
 import statistics
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -142,7 +143,7 @@ def finalize_measurements(report):
         for matched in case.get(key, [])
     ]
     checks.extend(run["matches_reference"] for run in report.get("baseline_runs", []))
-    if report.get("mode") == "nomtp":
+    if report.get("mode") in ("nomtp", "mtp"):
         # Free-running parity is diagnostic under the owner-approved FP16
         # distribution contract. Timing completeness does not accept quality.
         report["token_parity_passed"] = all(checks) if checks else None
@@ -172,6 +173,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--mode", choices=("nomtp", "mtp"), default="nomtp")
+    parser.add_argument("--worker-cls", help="Explicit benchmark control worker")
     parser.add_argument("--widths", default="1,4,8,16")
     parser.add_argument(
         "--ple-result-transport", choices=("auto", "cuda", "mapped"), default="auto"
@@ -242,11 +244,16 @@ def main():
             "num_speculative_tokens": 4,
             "draft_sample_method": "greedy",
         }
+    if args.worker_cls:
+        config["worker_cls"] = args.worker_cls
     report = {
+        "default_configuration": args.worker_cls is None,
         "runtime": vllm.__version__,
         "runtime_path": vllm.__file__,
         "mode": args.mode,
-        "engine": config,
+        # EngineArgs may fill the speculative dictionary with ModelConfig
+        # objects during initialization. Preserve the requested JSON contract.
+        "engine": deepcopy(config),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "fp32_accumulation_and_reduction": True,
@@ -529,11 +536,7 @@ def main():
                 ):
                     print(
                         f"C{width} repeat {repeat}: token differences recorded; "
-                        + (
-                            "distribution and task quality determine no-MTP acceptance"
-                            if args.mode == "nomtp"
-                            else "retaining remaining cases before the parity gate"
-                        ),
+                        "shared distribution and task quality determine acceptance",
                         flush=True,
                     )
                 save()

@@ -3140,8 +3140,15 @@ def sm70_qwen38_hc_batch(
     cooperative: bool = False,
     full_unroll: bool = False,
     fused_chain: bool = False,
+    cta_split_warps: int = 0,
 ) -> None:
-    _custom_ar_owner_namespace().sm70_qwen38_hc_batch(
+    op = _custom_ar_owner_namespace().sm70_qwen38_hc_batch
+    # Retain the ordinary route with extensions predating CTA split support.
+    supports_split = any(
+        "cta_split_warps" in str(schema) for schema in op._schemas.values()
+    )
+    extra = (cta_split_warps,) if supports_split else ()
+    op(
         fa,
         inp,
         packed_down,
@@ -3155,6 +3162,7 @@ def sm70_qwen38_hc_batch(
         cooperative,
         full_unroll,
         fused_chain,
+        *extra,
     )
 
 

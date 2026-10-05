@@ -434,7 +434,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
-    VLLM_SM70_TOP1_CUSTOM_AR: bool = False
+    VLLM_SM70_TOP1_CUSTOM_AR: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
     VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
@@ -6751,20 +6751,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
-    # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
-    # off until the communicator path has same-criterion model evidence.
+    # Compact value/ID reduction defaults on for SM70; topology and capture
+    # admission still belong to the communicator, with an exact NCCL fallback.
     "VLLM_SM70_TOP1_CUSTOM_AR": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_TOP1_CUSTOM_AR", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_TOP1_CUSTOM_AR", "1"))),
         description=(
-            "Optional custom allreduce for the tiny per-rank top1 pair. Keep "
-            "default off until the communicator path has same-criterion model "
-            "evidence."
+            "SM70 compact value/ID top1 reduction for up to 128 rows. "
+            "Uses NCCL when IPC topology or graph resources are unavailable."
         ),
         category="configuration",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=("SM70 runtime/kernel policy",),
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=("SM70", "fully connected TP IPC"),
+        acceleration_paths=("SM70 compact top1",),
         user_visible=False,
     ),
     "VLLM_SM70_F16_DENSE_ALLOWLIST": env_var(

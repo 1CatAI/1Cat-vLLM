@@ -967,8 +967,8 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                           torch::Tensor partials, torch::Tensor lora,
                           torch::Tensor local_output, torch::Tensor output,
                           torch::Tensor injection, bool round_down_partials,
-                          bool cooperative, bool full_unroll,
-                          bool fused_chain) {
+                          bool cooperative, bool full_unroll, bool fused_chain,
+                          int64_t cta_split_warps) {
 #if defined(USE_ROCM)
   TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
 #else
@@ -1015,7 +1015,7 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
       reinterpret_cast<half*>(output.data_ptr()),
       reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
       cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
-      fused_chain);
+      fused_chain, cta_split_warps);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 }
@@ -1194,8 +1194,9 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
 
   TORCH_CHECK(input_pair.scalar_type() == at::ScalarType::Float);
   TORCH_CHECK(output.scalar_type() == at::ScalarType::Long);
-  TORCH_CHECK(input_pair.numel() == 2);
-  TORCH_CHECK(output.numel() == 1);
+  TORCH_CHECK(input_pair.numel() >= 2 && input_pair.numel() <= 256 &&
+              input_pair.numel() % 2 == 0);
+  TORCH_CHECK(output.numel() == input_pair.numel() / 2);
   TORCH_CHECK(_is_weak_contiguous(input_pair));
   TORCH_CHECK(_is_weak_contiguous(output));
 
@@ -1210,7 +1211,8 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
   }
 
   fa->top1_argmax(stream, reinterpret_cast<float*>(reg_buffer),
-                  reinterpret_cast<int64_t*>(output.data_ptr()));
+                  reinterpret_cast<int64_t*>(output.data_ptr()),
+                  input_pair.numel() / 2);
 }
 
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,

@@ -322,40 +322,52 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = get_tensor_model_parallel_world_size()
 
-        local_top1 = lm_head.maybe_get_sm70_lm_head_top1(hidden_states, embedding_bias)
-        if local_top1 is None:
-            logits = lm_head.quant_method.apply(
-                lm_head, hidden_states, bias=embedding_bias
+        local_pair = None
+        pair_getter = getattr(lm_head, "maybe_get_sm70_lm_head_top1_pair", None)
+        if (
+            pair_getter is not None
+            and tp_size > 1
+            and self.soft_cap is None
+            and self.scale == 1.0
+        ):
+            local_pair = pair_getter(hidden_states, embedding_bias)
+        if local_pair is None:
+            local_top1 = lm_head.maybe_get_sm70_lm_head_top1(
+                hidden_states, embedding_bias
             )
-            if self.soft_cap is not None:
-                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-            if self.scale != 1.0:
-                logits = logits * self.scale
+            if local_top1 is None:
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states, bias=embedding_bias
+                )
+                if self.soft_cap is not None:
+                    logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+                if self.scale != 1.0:
+                    logits = logits * self.scale
 
-            # Mask out padding entries beyond org_vocab_size on this shard.
-            num_pad = lm_head.shard_indices.num_org_vocab_padding
-            if num_pad > 0:
-                logits[..., -num_pad:] = -float("inf")
+                # Mask out padding entries beyond org_vocab_size on this shard.
+                num_pad = lm_head.shard_indices.num_org_vocab_padding
+                if num_pad > 0:
+                    logits[..., -num_pad:] = -float("inf")
 
-            local_max_vals, local_max_indices = logits.max(dim=-1)
+                local_max_vals, local_max_indices = logits.max(dim=-1)
 
-            # Convert shard-local indices to global vocab indices.
-            vocab_start = lm_head.shard_indices.org_vocab_start_index
-            global_indices = local_max_indices + vocab_start
-        else:
-            local_max_vals, global_indices = local_top1
+                # Convert shard-local indices to global vocab indices.
+                vocab_start = lm_head.shard_indices.org_vocab_start_index
+                global_indices = local_max_indices + vocab_start
+            else:
+                local_max_vals, global_indices = local_top1
 
-        if tp_size == 1:
-            self._maybe_dump_top_token_margin(
-                lm_head, hidden_states, embedding_bias, global_indices
+            if tp_size == 1:
+                self._maybe_dump_top_token_margin(
+                    lm_head, hidden_states, embedding_bias, global_indices
+                )
+                return global_indices
+
+            # All-gather (value, index) pairs, then reduce to global argmax.
+            # Use float32 to avoid bf16 precision loss on large vocab indices.
+            local_pair = torch.stack(
+                [local_max_vals.float(), global_indices.float()], dim=-1
             )
-            return global_indices
-
-        # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
-        )
         _maybe_sync_top1_all_gather(self, local_pair)
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:
@@ -810,9 +822,16 @@ class LogitsProcessor(PluggableLayer):
         self,
         local_pair: torch.Tensor,
     ) -> torch.Tensor | None:
-        if not envs.VLLM_SM70_TOP1_CUSTOM_AR:
+        if (
+            not envs.VLLM_SM70_TOP1_CUSTOM_AR
+            or not current_platform.is_device_capability(70)
+        ):
             return None
-        if local_pair.numel() != 2 or local_pair.dtype != torch.float32:
+        if (
+            local_pair.dtype != torch.float32
+            or not 2 <= local_pair.numel() <= 256
+            or local_pair.numel() % 2 != 0
+        ):
             return None
         try:
             communicator = get_tp_group().device_communicator
