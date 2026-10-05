@@ -154,6 +154,11 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
+        "--profile-launches-only",
+        action="store_true",
+        help="Collect hardware counters from direct launches without event graphs",
+    )
+    parser.add_argument(
         "--extension",
         type=Path,
         help="Precompiled research extension with matching Torch ABI",
@@ -231,6 +236,12 @@ def main():
 
             run()
             torch.cuda.synchronize()
+            if args.profile_launches_only:
+                # Some profiler versions fail while capturing external-event
+                # graphs. Keep performance timing in the normal cold graph run;
+                # these direct launches provide counters for the same kernels.
+                graphs.append((None, run))
+                continue
             graph = torch.cuda.CUDAGraph()
             start = torch.cuda.Event(enable_timing=True, external=True)
             end = torch.cuda.Event(enable_timing=True, external=True)
@@ -259,10 +270,13 @@ def main():
             )
             # Retain tensors referenced by the graph's raw pointers.
             graphs.append((graph, run))
-    if args.profile:
+    if args.profile or args.profile_launches_only:
         torch.cuda.cudart().cudaProfilerStart()
-        for graph, _run in graphs:
-            graph.replay()
+        for graph, run in graphs:
+            if graph is None:
+                run()
+            else:
+                graph.replay()
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStop()
     record = dict(
@@ -271,6 +285,7 @@ def main():
         source_root=str(args.source_root),
         research_only=True,
         measured_dram_bandwidth="Use NCU counters, not bytes/time",
+        profiler_launches_only=args.profile_launches_only,
     )
     (args.out / "result.json").write_text(json.dumps(record, indent=2))
     print(json.dumps(record), flush=True)
