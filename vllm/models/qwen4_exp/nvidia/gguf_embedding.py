@@ -62,7 +62,9 @@ def pinned_iq4nl_rows(pointer, ids, codebook, output, k):
     )
 
 
-def packed_pinned_lookup(ids, output, layer_name):
+def packed_pinned_lookup(
+    ids: torch.Tensor, output: torch.Tensor, layer_name: str
+) -> None:
     table = get_forward_context().no_compile_layers[layer_name]
     index = ids.device.index
     if index is None:
@@ -76,7 +78,9 @@ def packed_pinned_lookup(ids, output, layer_name):
     )
 
 
-def packed_pinned_lookup_fake(ids, output, layer_name):
+def packed_pinned_lookup_fake(
+    ids: torch.Tensor, output: torch.Tensor, layer_name: str
+) -> None:
     return
 
 
