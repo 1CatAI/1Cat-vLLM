@@ -354,7 +354,13 @@ def prepare_gguf_projections(
         projection.input_layout_restored for projection in projections
     ):
         # Keep every shard in the same input order when one cannot be restored.
-        return prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m)
+        reasons = [
+            p.rejection_reason for p in projections if not p.input_layout_restored
+        ]
+        fallback = prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m)
+        for projection in fallback:
+            projection.input_layout_rejection_reasons = reasons
+        return fallback
     return projections
 
 
@@ -371,6 +377,7 @@ class GGUFPreparedProjection(Module):
         self.kernel = None
         self.input_layout = input_layout
         self.input_layout_restored = False
+        self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]
         self.source_output_sizes = (self.logical_output_size,)
         self.output_padding = 0
@@ -506,6 +513,7 @@ class GGUFPreparedProjection(Module):
             "source_type": quant_type_name(self.source_type),
             "reason": self.rejection_reason,
             "input_layout_restored": self.input_layout_restored,
+            "input_layout_rejection_reasons": self.input_layout_rejection_reasons,
             "source_output_sizes": list(self.source_output_sizes),
         }
         if self.kernel is not None:

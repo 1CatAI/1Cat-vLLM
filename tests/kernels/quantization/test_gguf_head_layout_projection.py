@@ -26,9 +26,10 @@ def source(n=96, k=1536):
 
 
 @pytest.mark.parametrize("m", [1, 5, 20, 512])
-def test_head_layout_projection_matches_official_dequant_and_graph(m):
+@pytest.mark.parametrize("heads_per_group", [2, 3])
+def test_head_layout_projection_matches_official_dequant_and_graph(m, heads_per_group):
     raw = source()
-    layout = GGUFHeadTilingLayout(2, 128)
+    layout = GGUFHeadTilingLayout(heads_per_group, 128)
     weight = torch.from_numpy(raw).cuda()
     original = prepare_gguf_projections([(weight, 14)], torch.float16, True, 256)
     restored = prepare_gguf_projections(
