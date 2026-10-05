@@ -8,6 +8,9 @@ import torch
 from torch.nn import Parameter
 
 from vllm.model_executor.kernels.gguf import native_gated_pair_capabilities
+from vllm.model_executor.layers.quantization.gguf_iq1_m_records import (
+    pack_iq1_m_records,
+)
 from vllm.model_executor.layers.quantization.gguf_iq2_s_records import (
     pack_iq2_s_records,
 )
@@ -42,6 +45,7 @@ _SOURCE_BLOCK_BYTES = {
     21: 110,
     22: 82,
     23: 136,
+    29: 56,
 }
 _SOURCE_PACKERS = {
     10: pack_q2_k_records,
@@ -52,6 +56,7 @@ _SOURCE_PACKERS = {
     21: signed_index_records,
     22: pack_iq2_s_records,
     23: pack_iq4_xs_records,
+    29: pack_iq1_m_records,
 }
 
 
