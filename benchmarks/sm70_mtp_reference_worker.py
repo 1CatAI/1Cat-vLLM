@@ -79,3 +79,24 @@ class ShortlistCandidateWorker(Worker):
         model._sm70_draft_head.prepare_shortlist(
             json.loads(path.read_text())["token_ids"]
         )
+
+
+class RestorationControlWorker(Worker):
+    """Matched checkpoint-head/zero-split HC control; all other routes retained."""
+
+    def load_model(self, *, load_dummy_weights=False):
+        from vllm import _custom_ops as ops
+        from vllm.models.qwen4_exp.nvidia import sm70_mtp_head
+
+        sm70_mtp_head.prepare_mtp_qpn8_head = lambda head: None
+        original_hc = ops.sm70_qwen38_hc_batch
+
+        def zero_split(*args, **kwargs):
+            if len(args) > 13:
+                args = (*args[:13], 0)
+            else:
+                kwargs["cta_split_warps"] = 0
+            return original_hc(*args, **kwargs)
+
+        ops.sm70_qwen38_hc_batch = zero_split
+        super().load_model(load_dummy_weights=load_dummy_weights)

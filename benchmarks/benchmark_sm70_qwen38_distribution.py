@@ -303,11 +303,13 @@ def compare(args):
                 }
             )
     noise = summarize_groups(noise_rows, ref["widths"]) if noise_rows else {}
+    admission_keys = [f"C{width}/all" for width in cand["widths"]]
     result = {
-        "distribution_passed": all(g["passed"] for g in groups.values()),
+        "distribution_passed": all(groups[key]["passed"] for key in admission_keys),
         "default_noise_passed": (
-            all(g["passed"] for g in noise.values()) if noise else None
+            all(noise[key]["passed"] for key in admission_keys) if noise else None
         ),
+        "admission_groups": admission_keys,
         "default_noise": noise,
         "quality_acceptance": "requires separate fixed task suite",
         "groups": groups,

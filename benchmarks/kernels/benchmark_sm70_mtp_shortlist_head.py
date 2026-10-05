@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--vocab", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--ranks", type=int, nargs="+", default=[0, 1, 2, 3])
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(20261005)
@@ -36,7 +37,9 @@ def main():
     report = {"model_admission": False, "shards": []}
     with safe_open(args.model / index[name], framework="pt") as tensors:
         weight = tensors.get_tensor(name)
-    for rank in range(4):
+    for rank in args.ranks:
+        if not 0 <= rank < 4:
+            raise ValueError("TP4 rank must be in 0..3")
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(
             weight[rank * 62080 : (rank + 1) * 62080].cuda().half().contiguous(),

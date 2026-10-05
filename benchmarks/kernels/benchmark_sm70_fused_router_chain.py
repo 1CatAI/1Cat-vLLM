@@ -29,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--token-cta", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(1)
     assert torch.cuda.get_device_capability() == (7, 0)
@@ -62,7 +63,14 @@ def main():
 
     def fused():
         for i, w in enumerate(weights):
-            torch.ops._C.qwen38_router_fused_sm70_out(*work["fused"][i], xs[i], w)
+            if args.token_cta:
+                buffers = work["fused"][i]
+                torch.ops._C.qwen38_router_token_cta_sm70_out(
+                    *buffers[:4], xs[i], packed[i]
+                )
+                torch.ops._C.qwen38_router_fused_sm70_out(*buffers, xs[i], w, True)
+            else:
+                torch.ops._C.qwen38_router_fused_sm70_out(*work["fused"][i], xs[i], w)
 
     graphs = {"control": capture(control), "fused": capture(fused)}
     checks = []
@@ -107,7 +115,9 @@ def main():
         model_admission=False,
         rows=5,
         layers=48,
-        ctas=80,
+        ctas=5 if args.token_cta else 80,
+        warps_per_cta=16 if args.token_cta else 8,
+        token_cta=args.token_cta,
         weight_bytes=48 * 512 * 2560 * 2,
         floor_ms_750GBs=48 * 512 * 2560 * 2 / 750e6,
         checks=checks,
