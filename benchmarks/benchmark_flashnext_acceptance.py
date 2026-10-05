@@ -286,18 +286,24 @@ def main():
                     steps, outputs = observed_cohort(
                         llm,
                         fixed_ids,
-                        SamplingParams(temperature=0, max_tokens=128, ignore_eos=True),
+                        SamplingParams(temperature=0, max_tokens=256, ignore_eos=True),
                     )
+                    report["node_trace"] = dict(
+                        output_token_ids=[
+                            list(o.outputs[0].token_ids) for o in outputs
+                        ],
+                        generation_complete=True,
+                        workers=llm.collective_rpc(
+                            "read_graph_parity_observer", timeout=30
+                        ),
+                    )
+                    # Preserve completed generation and CPU records before
+                    # profiler shutdown or optional interval statistics.
+                    save()
+                    report["node_trace"]["summary"] = summarize(steps, 1)
+                    save()
                 finally:
                     llm.collective_rpc("stop_graph_parity_capture", timeout=30)
-                report["node_trace"] = dict(
-                    output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
-                    summary=summarize(steps, 1),
-                    workers=llm.collective_rpc(
-                        "read_graph_parity_observer", timeout=30
-                    ),
-                )
-                save()
         report["complete"] = True
         save()
     finally:
