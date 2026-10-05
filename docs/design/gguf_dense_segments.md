@@ -10,7 +10,7 @@ are preserved. The segment decoder is shared by both operations.
 ## Same-card acceptance
 
 The supplied implementations are compared in one process on one V100 with
-actual rank-0 TP4 weights from all 48 Flash-Next IQ3_S layers, M5, CUDA graphs,
+supplied rank-0 weight slices from all 48 Flash-Next IQ3_S layers, M5, CUDA graphs,
 Torch 2.10/CUDA 12.8 and observed SM/memory clocks 1530/877 MHz. The full dense
 sequence uses ABBA ordering. These initial measurements use research JIT
 extensions; production performance must be revalidated after incorporation
@@ -88,3 +88,32 @@ M20 outputs differ from the existing route by relative L2 approximately
 The output projections retain small M20 regressions; complete-round C4 must
 confirm the combined input/shared-expert gains outweigh them. Capabilities
 admit M1..8 and M20 explicitly, with one resident segment bank.
+
+## Replicated KV heads in TP4
+
+The supplied extraction divides every column-parallel tensor by four. The
+model has two KV heads of width 256, so TP4 replicates each complete KV head
+on two ranks. Corrected rank-0 K/V slices use 256 rows each. The original
+48-layer sequence above therefore measures narrower attention inputs and
+must not be presented as the complete production TP4 sequence.
+
+All twelve corrected attention inputs pass same-process ABBA in the complete
+installed extension. Source-compatible K/V segments include N512; five layers
+coalesce Q/K/V into N3584. Both widths are now declared capabilities.
+
+|Attention input, twelve-layer mean|Canonical us|Segment us|Maximum relative L2|
+|---|---:|---:|---:|
+|M5|34.015|15.665|0.0000350|
+|M20|39.380|32.380|0.0000234|
+
+These inputs use official FP32 dequantization references for the corrected
+KV slices. Repeated fixed input rows extend M8 fixtures to M20. The complete
+model comparison uses the same installed wheel and changes only the segment
+and HC LL switches.
+
+The first disabled-route control failed during initial profiling before
+timing: allocated bytes were 28.84GB and reserved bytes 33.01GB, with only
+1.5MiB driver memory free. The retry uses the standard PyTorch
+`expandable_segments:True` allocator setting on both arms, preserving model,
+batch budget and arithmetic. This failed startup is retained separately from
+performance evidence.
