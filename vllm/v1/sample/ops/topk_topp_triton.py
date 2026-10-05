@@ -1134,12 +1134,18 @@ def _apply_top_k_top_p_compact(
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         rows = reference_rows.nonzero(as_tuple=True)[0]
-        reference = apply_top_k_top_p_pytorch(
-            logits.index_select(0, rows),
-            k.index_select(0, rows),
-            p.index_select(0, rows),
-        )
-        result.index_copy_(0, rows, reference)
+        # Sorting the full vocabulary for every ambiguous row at once needs
+        # batch-sized value/index/softmax buffers. Bound this rare fallback's
+        # workspace to one row, without changing ties or nucleus boundaries.
+        # This eager path already synchronizes; captured callers use the
+        # separate graph-compatible reference path below.
+        for row in rows.tolist():
+            reference = apply_top_k_top_p_pytorch(
+                logits[row : row + 1].clone(),
+                k[row : row + 1],
+                p[row : row + 1],
+            )
+            result[row : row + 1].copy_(reference)
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result

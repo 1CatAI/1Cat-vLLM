@@ -820,3 +820,14 @@ MMA operands with FP32 sums. The four-step layer graph measures
 0.435784 -> 0.183962 ms, while an independent row-major integer dequantization
 oracle agrees within relative L2 0.000197. This is not model distribution or
 acceptance admission and installs no serving default.
+
+With early head preparation, C4 completes all target and draft graph capture.
+Sampler warmup then runs out of memory while allocating a 20-MiB full-batch
+sort value buffer. The compact top-k/top-p boundary fallback sorts every
+ambiguous target row together, materializing batch-sized index and probability
+workspaces. Apply the same reference filter one row at a time instead, keeping
+source logits, per-row parameters, vocabulary ties and nucleus boundaries.
+Twenty MTP4/C4 uniform rows at vocabulary 248,320 force this fallback; the
+bounded implementation matches the full reference exactly and leaves its
+input intact. Twenty-eight focused GPU cutoff, mixed-parameter and graph tests
+pass. This fixes a workspace peak, not an admitted complete-round speed gain.
