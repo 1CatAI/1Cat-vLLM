@@ -413,3 +413,13 @@ cache owner through its registered layer, following QSA's cache-access model.
 Its workspace and epoch arguments remain explicit mutations to preserve call
 ordering. CUDA arithmetic and native artifact are unchanged. Ordinary-route
 retry and combined model qualification remain pending.
+
+The cache-owner retry still does not produce layer timings. Startup stacks
+locate the delay in AOT/FakeTensor metadata processing while compiling the
+full decode graph, before execution of the new CUDA core. A subsequent worker
+exits during that stage; its cause is not established by the retained log.
+The transaction now follows the existing opaque attention output interface:
+only the hidden input, explicit mutable output and layer name cross AOT;
+caches and per-layer workspaces remain inside the registered layer owner.
+Native arithmetic is unchanged. The complete ordinary campaign is retried;
+these failed initializations are not performance or quality evidence.

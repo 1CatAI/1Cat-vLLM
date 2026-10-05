@@ -18,27 +18,22 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 def _forward(
     hidden: torch.Tensor,
-    core: torch.Tensor,
-    norms: torch.Tensor,
-    flags: torch.Tensor,
-    epochs: torch.Tensor,
-    accepted_one: torch.Tensor,
+    output: torch.Tensor,
     layer_name: LayerNameType,
-) -> torch.Tensor:
+) -> None:
     context = get_forward_context()
     layer = context.no_compile_layers[_resolve_layer_name(layer_name)]
     all_metadata = context.attn_metadata
     if isinstance(all_metadata, list):
         all_metadata = all_metadata[0]
-    output = torch.empty_like(hidden)
     if not isinstance(all_metadata, dict):
         output.zero_()
-        return output
+        return
     metadata = cast(GDNAttentionMetadata, all_metadata[layer.prefix])
     count = hidden.shape[0]
     if metadata.num_actual_tokens == 0:
         output.zero_()
-        return output
+        return
     ordinary = (
         count == 1
         and metadata.num_actual_tokens == 1
@@ -55,11 +50,11 @@ def _forward(
     if not (ordinary or speculative):
         # A one-row prefill still uses the original complete forward method.
         layer._forward_method(hidden, output)
-        return output
+        return
     if speculative:
         if metadata.spec_state_indices_tensor is None:
             layer._forward_method(hidden, output)
-            return output
+            return
         indices = metadata.spec_state_indices_tensor[0]
         accepted = metadata.spec_state_slot_selectors
         if accepted is None:
@@ -67,15 +62,16 @@ def _forward(
     else:
         if metadata.non_spec_state_indices_tensor is None:
             layer._forward_method(hidden, output)
-            return output
+            return
         indices = metadata.non_spec_state_indices_tensor[:1]
-        accepted = accepted_one
+        accepted = layer._sm70_gdn_conv_norm_accepted
     if accepted is None:
         layer._forward_method(hidden, output)
-        return output
+        return
     # The hybrid cache exposes FP16 and FP32 views of one byte allocation.
     # Keep that owner inside the opaque transaction, as QSA does for its
-    # caches. Mutable workspace/epoch arguments retain call ordering in AOT.
+    # caches. The explicit output mutation retains this transaction in AOT;
+    # per-layer workspaces belong to the same opaque owner as its caches.
     conv, state = layer.kv_cache
     qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
         hidden,
@@ -102,27 +98,29 @@ def _forward(
         state,
         indices,
         accepted,
-        core,
-        norms,
-        flags,
-        epochs,
+        layer._sm70_gdn_conv_norm_core,
+        layer._sm70_gdn_conv_norm_norms,
+        layer._sm70_gdn_conv_norm_flags,
+        layer._sm70_gdn_conv_norm_epochs,
         normalized,
         layer.norm.eps,
         False,
     )
     result, _ = layer.out_proj(normalized.flatten(1))
-    return result
+    output.copy_(result)
 
 
-def _fake(hidden, core, norms, flags, epochs, accepted_one, layer_name):
-    return torch.empty_like(hidden)
+def _fake(
+    hidden: torch.Tensor, output: torch.Tensor, layer_name: LayerNameType
+) -> None:
+    pass
 
 
 direct_register_custom_op(
     op_name="qwen38_sm70_gdn_conv_norm_forward",
     op_func=_forward,
     fake_impl=_fake,
-    mutates_args=["core", "norms", "flags", "epochs"],
+    mutates_args=["output"],
 )
 
 
@@ -195,15 +193,11 @@ def prepare_gdn_conv_norm(module: torch.nn.Module, vllm_config) -> int:
 
 def conv_norm_forward(layer, hidden_states, output):
     layer_name = _encode_layer_name(layer.prefix)
-    result = torch.ops.vllm.qwen38_sm70_gdn_conv_norm_forward(
+    if output is None:
+        output = torch.empty_like(hidden_states)
+    torch.ops.vllm.qwen38_sm70_gdn_conv_norm_forward(
         hidden_states,
-        layer._sm70_gdn_conv_norm_core,
-        layer._sm70_gdn_conv_norm_norms,
-        layer._sm70_gdn_conv_norm_flags,
-        layer._sm70_gdn_conv_norm_epochs,
-        layer._sm70_gdn_conv_norm_accepted,
+        output,
         layer_name,
     )
-    if output is not None:
-        output.copy_(result)
-    return result
+    return output
