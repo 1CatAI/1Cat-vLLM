@@ -61,6 +61,7 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[8, 32])
     parser.add_argument("--layers", type=int, nargs="+", default=[0, 16, 32, 55])
     parser.add_argument("--n16", action="store_true")
+    parser.add_argument("--coalesced", action="store_true")
     args = parser.parse_args()
     torch.set_grad_enabled(False)
     torch.manual_seed(20261005)
@@ -78,6 +79,10 @@ def main():
         )
     if args.n16:
         path = args.libraries / "native_n16/qpn2_activation_native_n16.so"
+        libraries[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        torch.ops.load_library(str(path))
+    if args.coalesced:
+        path = args.libraries / "coalesced/qpn2_activation_coalesced.so"
         libraries[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
         torch.ops.load_library(str(path))
     eviction = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
@@ -118,6 +123,16 @@ def main():
                         (
                             "native_n16",
                             partial(torch.ops._qpn2_native_n16.gated, *arguments[:5]),
+                        )
+                    )
+                if args.coalesced:
+                    namespace = torch.ops._qpn2_activation_coalesced
+                    functions.append(
+                        (
+                            "coalesced",
+                            partial(
+                                namespace.gated if gated else namespace.gemm, *arguments
+                            ),
                         )
                     )
                 checks = []

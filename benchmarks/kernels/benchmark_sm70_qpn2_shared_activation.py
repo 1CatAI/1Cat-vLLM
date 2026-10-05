@@ -93,12 +93,55 @@ def candidate_source(source: str, panel: int) -> str:
     return result.replace("_qpn2_candidate", f"_qpn2_activation_panel{panel}")
 
 
+def coalesced_source(source: str) -> str:
+    """Load a complete 32B row segment once per warp, then distribute it.
+
+    Four adjacent lanes read four consecutive 8B pieces of one activation row.
+    The original fragment owner receives those pieces with warp shuffles. This
+    removes overlapping 16B sector requests without a CTA barrier or changing
+    the projection/reduction partitions.
+    """
+    old = (
+        "      const int row = row_base + row_tile * kQpn2RowsPerCta + local_row;"
+        """
+      if (row < m) {
+        const half* input_row = input + static_cast<size_t>(row) * k;
+        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
+      }"""
+    )
+    assert source.count(old) == 2
+    new = """      const int read_row =
+          row_base + row_tile * kQpn2RowsPerCta + (lane >> 2);
+      uint2 piece = make_uint2(0, 0);
+      if (read_row < m) {
+        const half* source = input + static_cast<size_t>(read_row) * k
+                             + group * 16 + (lane & 3) * 4;
+        piece = *reinterpret_cast<const uint2*>(source);
+      }
+      const int owner = local_row * 4;
+      input01 = make_uint4(
+          __shfl_sync(0xffffffff, piece.x, owner),
+          __shfl_sync(0xffffffff, piece.y, owner),
+          __shfl_sync(0xffffffff, piece.x, owner + 1),
+          __shfl_sync(0xffffffff, piece.y, owner + 1));
+      input23 = make_uint4(
+          __shfl_sync(0xffffffff, piece.x, owner + 2),
+          __shfl_sync(0xffffffff, piece.y, owner + 2),
+          __shfl_sync(0xffffffff, piece.x, owner + 3),
+          __shfl_sync(0xffffffff, piece.y, owner + 3));"""
+    return source.replace(old, new).replace(
+        "_qpn2_candidate", "_qpn2_activation_coalesced"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--panels", type=int, nargs="*", default=[4, 8])
+    parser.add_argument("--panels", type=int, nargs="*", choices=[4, 8], default=[4, 8])
     parser.add_argument("--n16", action="store_true")
+    parser.add_argument("--coalesced", action="store_true")
     args = parser.parse_args()
     from torch.utils.cpp_extension import load
 
@@ -112,6 +155,8 @@ def main() -> None:
     if args.n16:
         extra = Path(__file__).with_name("qpn2_native_n16_research.cuh").read_text()
         variants.append(("native_n16", original + "\n" + extra))
+    if args.coalesced:
+        variants.append(("coalesced", coalesced_source(original)))
     for variant, text in variants:
         build = args.output / variant
         build.mkdir(parents=True, exist_ok=True)
