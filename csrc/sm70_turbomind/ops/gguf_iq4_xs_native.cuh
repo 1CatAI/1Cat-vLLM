@@ -51,7 +51,11 @@ struct Iq4XsNativeDecoder {
     turbomind::Array<Output, 8> result;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      const float value = __fmul_rn(scale, __half2float(integers[0][0][i]));
+      // The canonical LUT transform emits interleaved half2 pairs
+      // [q0,q4,q1,q5,q2,q6,q3,q7]. Native packets use logical [q0..q7].
+      const int canonical_lane = (i & 3) * 2 + (i >> 2);
+      const float value =
+          __fmul_rn(scale, __half2float(integers[0][0][canonical_lane]));
       if constexpr (std::is_same_v<Output, half>)
         result[i] = __float2half_rn(value);
       else

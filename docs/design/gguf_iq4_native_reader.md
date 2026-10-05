@@ -107,3 +107,42 @@ The next gate is device operand comparison followed by same-shape cold-L2
 graph timing for each orientation and actual layer weights. Until that
 passes, these eleven pairs and the other mixed pairs retain their existing
 canonical implementation. No speed or model-level benefit is claimed here.
+
+## GPU operand gate: canonical lane order
+
+The initial native wrapper incorrectly assumed that the existing LUT
+transform emitted eight consecutive logical values. The transform emits
+`[q0, q4, q1, q5, q2, q6, q3, q7]`, arranging half2 pairs for its canonical
+MMA layout. The native record stores logical `[q0, ..., q7]` packets.
+
+The initial layer-39 gate rank-zero Float operand oracle found 15,536,553
+bit mismatches among 22,282,240 values, with maximum absolute error
+0.1352691650390625. All outputs were finite. The record inverse and CPU
+dequantization had already passed; they did not exercise this device lane
+mapping. This failure is retained as evidence for that separate test boundary.
+
+The wrapper now maps logical lane `i` to canonical lane
+`(i & 3)*2 + (i >> 2)` before the original FP32 scale operations. No source
+bits, LUT values, scale representation, or arithmetic precision changes.
+The operator remains unselected until the corrected device gate passes.
+
+`gguf_iq4_native_oracle_sm70.cu` is a research-only Float/Half operand oracle,
+registered only with `GGUF_IQ4_ORACLE_RESEARCH`. It performs no GEMM and is
+not a production speed path. `benchmark_gguf_iq4_native_operand.py` tests
+all 64 scale codes and 16 LUT entries crossed with signed zeros, the smallest
+Half subnormal, non-dyadic scales and extreme finite Half scales. Its
+`--stress-only` option isolates those inputs before real weight checks.
+
+After this correction, the smallest GPU gate passes on V100-SXM2-32GB with
+Torch 2.10.0+cu128 and CUDA 12.8. The 512x512 stress matrix crosses all eight
+original d patterns with all 64 scale codes and all 16 LUT entries. Its
+262,144 Float values and 262,144 Half values are bitwise equal to the
+official reader. Finite maximum absolute error is zero. The extreme d cases
+have 64,384 expected Half infinities; signs and bits match exactly, without
+clipping. Both reader instantiations retain 32 registers and zero spills.
+
+The corrected full layer-39 gate and layer-42 up rank-zero device checks
+remain pending. No mixed GEMM or model route is admitted by this stress-only
+result. The initial failure and fixed stress results are stored in
+`gguf_iq4_native_operand_oracle.json`; they contain no weight data or local
+paths.

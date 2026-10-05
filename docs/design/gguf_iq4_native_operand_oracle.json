@@ -1,0 +1,64 @@
+{
+  "operand_only": true,
+  "gpu": "Tesla V100-SXM2-32GB",
+  "torch": "2.10.0+cu128",
+  "cuda": "12.8",
+  "initial_failure": {
+    "complete": false,
+    "operand_only": true,
+    "reader_source": "7643accea2",
+    "reason": "Canonical LUT fragment has interleaved half2 lane order; initial native wrapper treated it as contiguous",
+    "rows": [
+      {
+        "case": "layer39_gate_tp4_rank0",
+        "N": 4352,
+        "K": 5120,
+        "source_bytes": 11837440,
+        "record_bytes": 11837440,
+        "dtype": "torch.float32",
+        "elements": 22282240,
+        "bit_mismatches": 15536553,
+        "max_abs_error_finite": 0.1352691650390625,
+        "expected_nonfinite": 0,
+        "actual_nonfinite": 0
+      }
+    ]
+  },
+  "fixed_stress": {
+    "complete": true,
+    "operand_only": true,
+    "gpu": "Tesla V100-SXM2-32GB",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "rows": [
+      {
+        "case": "all_scale_codes_signed_zeros_extreme_d",
+        "N": 512,
+        "K": 512,
+        "source_bytes": 139264,
+        "record_bytes": 139264,
+        "dtype": "torch.float32",
+        "elements": 262144,
+        "bit_mismatches": 0,
+        "max_abs_error_finite": 0.0,
+        "expected_nonfinite": 0,
+        "actual_nonfinite": 0
+      },
+      {
+        "case": "all_scale_codes_signed_zeros_extreme_d",
+        "N": 512,
+        "K": 512,
+        "source_bytes": 139264,
+        "record_bytes": 139264,
+        "dtype": "torch.float16",
+        "elements": 262144,
+        "bit_mismatches": 0,
+        "max_abs_error_finite": 0.0,
+        "expected_nonfinite": 64384,
+        "actual_nonfinite": 64384
+      }
+    ]
+  },
+  "actual_tensor_gate": "pending",
+  "gemm_or_model_tested": false
+}
