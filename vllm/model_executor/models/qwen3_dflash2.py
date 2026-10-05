@@ -555,7 +555,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
                     device=hidden_states.device,
                     dtype=hidden_states.dtype,
                 )
-                logits = self.lm_head.quant_method.apply(
+                logits = self.lm_head.scheme.apply_weights(
                     self.lm_head, hidden_states, bias=None, output=output
                 )
             else:
