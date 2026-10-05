@@ -25,6 +25,7 @@ from benchmarks.benchmark_sm70_qwen38_concurrency import (  # noqa: E402
     generate_cohort,
     summarize,
 )
+from benchmarks.sm70_teacher_conditions import teacher_conditions  # noqa: E402
 
 
 def digest(value):
@@ -77,7 +78,9 @@ def main():
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--trace-only", action="store_true")
-    parser.add_argument("--input-phase-ab", action="store_true")
+    input_ab = parser.add_mutually_exclusive_group()
+    input_ab.add_argument("--input-phase-ab", action="store_true")
+    input_ab.add_argument("--ple-input-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--diagnose-attention-transfers", action="store_true")
     parser.add_argument("--kernel-config", type=json.loads, default={})
@@ -92,10 +95,12 @@ def main():
         raise RuntimeError("Use a normal installed source-containing wheel")
     if args.require_installed:
         import flash_attn_v100
-        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
 
         if "site-packages" not in Path(flash_attn_v100.__file__).parts:
             raise RuntimeError("Flash-V100 must resolve from the installed artifact")
+
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
         if "site-packages" not in Path(flash_attn_v100_cuda.__file__).parts:
             raise RuntimeError("Flash-V100 extension must resolve from the artifact")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -276,7 +281,9 @@ def main():
                 )
                 save()
             arms = (
-                ("late_observed", "early_observed", "early_off", "late_off")
+                ("fused_observed", "reference_observed", "reference_off", "fused_off")
+                if args.ple_input_ab
+                else ("late_observed", "early_observed", "early_off", "late_off")
                 if args.input_phase_ab
                 else ("off_before", "cpu_observed", "off_after")
             )
@@ -285,6 +292,12 @@ def main():
                     llm.collective_rpc(
                         "set_graph_input_preparation",
                         args=(arm.startswith("early"),),
+                        timeout=30,
+                    )
+                elif args.ple_input_ab:
+                    llm.collective_rpc(
+                        "set_ple_input_preparation",
+                        args=(arm.startswith("fused"),),
                         timeout=30,
                     )
                 observing = arm == "cpu_observed" or arm.endswith("_observed")
@@ -305,24 +318,39 @@ def main():
                 report["probes"].append(probe)
                 save()
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
-            if args.input_phase_ab:
+            if args.input_phase_ab or args.ple_input_ab:
                 llm.collective_rpc(
-                    "set_graph_input_preparation", args=(True,), timeout=30
+                    "set_ple_input_preparation"
+                    if args.ple_input_ab
+                    else "set_graph_input_preparation",
+                    args=(True,),
+                    timeout=30,
                 )
             if not args.trace_only:
                 c4_ids = fixed_ids[:128]
                 c4_params = SamplingParams(
                     temperature=0, max_tokens=600, ignore_eos=True
                 )
-                c4_phases = (False, True) if args.input_phase_ab else (True,)
+                c4_phases = (
+                    (False, True)
+                    if args.input_phase_ab or args.ple_input_ab
+                    else (True,)
+                )
                 report["c4_probes"] = []
                 for early in c4_phases:
-                    if args.input_phase_ab:
+                    if args.input_phase_ab or args.ple_input_ab:
                         llm.collective_rpc(
-                            "set_graph_input_preparation", args=(early,), timeout=30
+                            "set_ple_input_preparation"
+                            if args.ple_input_ab
+                            else "set_graph_input_preparation",
+                            args=(early,),
+                            timeout=30,
                         )
                     steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
                     cohort = dict(
+                        input_switch="ple_input_prepare"
+                        if args.ple_input_ab
+                        else "early",
                         early=early,
                         summary=summarize(steps, 4),
                         output_token_ids=[
@@ -372,50 +400,46 @@ def main():
             root = args.output.with_suffix("").with_name(args.output.stem + "-teacher")
             root.mkdir(parents=True, exist_ok=True)
             report["teacher_forcing"] = dict(directory=str(root), rows=[])
-            for row in reference["rows"]:
-                if len(row["output_token_ids"]) <= args.teacher_positions:
-                    raise RuntimeError("Teacher continuation is too short")
-                for position in range(args.teacher_positions):
-                    prefix = (
-                        row["prompt_token_ids"] + row["output_token_ids"][:position]
+            report["teacher_forcing"]["reference"] = (
+                str(args.teacher_reference) if args.teacher_reference else None
+            )
+            for key, prefix, forced in teacher_conditions(
+                reference, args.teacher_positions
+            ):
+                llm.collective_rpc(
+                    "start_teacher_capture", args=(str(root), key), timeout=30
+                )
+                try:
+                    llm.generate(
+                        {"prompt_token_ids": prefix},
+                        SamplingParams(
+                            temperature=0, max_tokens=6, allowed_token_ids=[forced]
+                        ),
+                        use_tqdm=False,
                     )
-                    forced = row["output_token_ids"][position]
-                    key = f"{row['id']}-{position:03d}"
-                    llm.collective_rpc(
-                        "start_teacher_capture", args=(str(root), key), timeout=30
+                finally:
+                    workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
+                if any(w["captured"] != 1 for w in workers):
+                    raise RuntimeError(f"M5 teacher target was not captured: {workers}")
+                captured = torch.load(root / f"{key}.pt", weights_only=True)
+                if (
+                    captured["position"].item() != len(prefix)
+                    or captured["input_ids"].item() != forced
+                ):
+                    raise RuntimeError(
+                        "Captured distribution has different teacher conditioning"
                     )
-                    try:
-                        llm.generate(
-                            {"prompt_token_ids": prefix},
-                            SamplingParams(
-                                temperature=0, max_tokens=6, allowed_token_ids=[forced]
-                            ),
-                            use_tqdm=False,
-                        )
-                    finally:
-                        workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
-                    if any(w["captured"] != 1 for w in workers):
-                        raise RuntimeError(
-                            f"M5 teacher target was not captured: {workers}"
-                        )
-                    captured = torch.load(root / f"{key}.pt", weights_only=True)
-                    if (
-                        captured["position"].item() != len(prefix)
-                        or captured["input_ids"].item() != forced
-                    ):
-                        raise RuntimeError(
-                            "Captured distribution has different teacher conditioning"
-                        )
-                    report["teacher_forcing"]["rows"].append(
-                        dict(
-                            key=key,
-                            prefix_sha256=digest(prefix),
-                            forced=forced,
-                            position=len(prefix),
-                            workers=workers,
-                        )
+                report["teacher_forcing"]["rows"].append(
+                    dict(
+                        key=key,
+                        prefix_sha256=digest(prefix),
+                        prefix_token_ids=list(prefix),
+                        forced=forced,
+                        position=len(prefix),
+                        workers=workers,
                     )
-                    save()
+                )
+                save()
         report["complete"] = True
         save()
     finally:
