@@ -1622,3 +1622,55 @@ loop discarded the final four bytes of a partial 64-bit word. The fix writes
 only existing packet halfwords and leaves final alignment at at most seven
 bytes. Rebuilt validation and performance remain pending until shared GPU
 resources are available. No model storage or default is promoted.
+
+After merging main `96903f9fd9`, the normal whole wheel from `b13b5b0325`
+passes 183 focused checks in 20.88 seconds, including independent odd-width
+packet inverses and the new model gate/up dispatch/graph suites. All 212
+installed dependencies are compatible. IQ3_XXS's exact FP16 operand proof
+covers all 63,488 finite FP16 block scales, eight official grid magnitudes,
+16 small coefficients and both signs: 16,252,928 results with zero bit
+mismatches, including signed zero, subnormals and final overflow.
+
+The equal-byte IQ3_XXS expert projection now meets all five requested points.
+Full graphs rotate 81 banks, each 156,800 bytes, exceeding twice V100 L2.
+FP16 operands and FP32 accumulation are retained:
+
+| M | Equal-byte route | µs | Current canonical µs |
+| --- | --- | ---: | ---: |
+| 1 | Row vector, split-K 8 | 6.667 | 15.738 |
+| 5 | Prefetched mma884, split-K 10 | 7.152 | 17.494 |
+| 8 | Prefetched mma884, split-K 10 | 7.355 | 13.063 |
+| 16 | mma884 with activation prefetch, split-K 10 | 7.878 | 12.541 |
+| 512 | Temporary FP16 DQ, FP32 cuBLASLt plan 3, two partitions | 22.179 | 23.166 |
+
+The cuBLASLt number is a locally prepared heuristic plan index for this exact
+shape/runtime, not a stable algorithm identifier or a portable default.
+Persistent bytes are 3.0625 bits per weight, versus 4.0 canonical; the single
+raw-row vector is a further 6.110 µs but needs a different persistent layout.
+Only the equal-byte packet results justify using one stored layout across M.
+
+Actual E512/top-10/TP4 N160/K2560 grouped projections use nine distinct banks
+and full CUDA graphs. Sorting and the rest of the FFN are excluded:
+
+| Original tokens | Equal-byte grouped µs | Canonical grouped µs |
+| --- | ---: | ---: |
+| 1 | 30.384 | 72.101 |
+| 5 | 37.778 | 94.403 |
+| 8 | 53.633 | 112.476 |
+| 16 | 80.359 | 140.868 |
+| 512 | 325.786 | 528.677 |
+
+Grouped relative L2 against official FP16 weights with FP32 dots is
+0.0202–0.0209%. Each complete expert bank occupies exactly 80,281,600 bytes,
+versus 104,857,600 canonical, saving 24,576,000 bytes per rank and bank. The
+smallest active bank set across nine addresses exceeds twice L2. These are
+operator results; model quality, full routing/FFN cost and step savings remain
+pending. The first compact M8 NCU follow-up times out before acquiring the
+shared GPU lock and supplies no additional traffic evidence.
+
+Whole-wheel SHA256:
+`521666b7a214d1df3c8301585645e13f1f910c7226bd0169812d64975aa05d09`.
+Core SHA256:
+`1358702f58168e4a46bd4775399447ebdd6d4b1bceaf2a00525efe3ca5c02bdd`.
+Native dependencies are standard Torch/CUDA libraries without private DSOs
+or preload. Model storage removal is a separate integration change.
