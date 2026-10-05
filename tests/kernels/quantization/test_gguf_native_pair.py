@@ -14,6 +14,17 @@ from vllm.model_executor.layers.quantization.gguf_native_pair import (
 )
 
 
+def test_measured_iq4_pair_rejection_does_not_admit_other_shapes():
+    caps = native_gated_pair_capabilities((23, 23), 5120, 4352, torch.float16)
+    assert len(caps) == 2
+    assert all(c.reason == "measured_route_not_faster" for c in caps)
+    assert not any(c.supports_m(m) for c in caps for m in (1, 8, 32, 512))
+    other = native_gated_pair_capabilities((23, 23), 4096, 4352, torch.float16)
+    assert all(
+        c.reason == "gated_pair_shape_or_source_has_no_calibration" for c in other
+    )
+
+
 @pytest.mark.parametrize(
     "types",
     [
