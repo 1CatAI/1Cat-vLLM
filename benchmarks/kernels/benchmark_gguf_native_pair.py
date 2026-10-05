@@ -11,13 +11,12 @@ import torch
 from benchmark_gguf_iq3_gated import clocks, cold_graph
 
 import vllm._custom_ops  # noqa: F401
-from vllm.model_executor.layers.quantization.gguf_iq3_records import (
-    signed_index_records,
-)
-from vllm.model_executor.layers.quantization.gguf_iq4_native import (
-    pack_iq4_xs_records,
+from vllm.model_executor.layers.quantization.gguf_native_pair import (
+    apply_native_gated_pair,
+    prepare_native_gated_pair,
 )
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
+    apply_prepared_gguf_projections,
     prepare_gguf_projections,
 )
 
@@ -43,27 +42,24 @@ def main():
             (torch.from_numpy(data).cuda(), kind) for data, kind in zip(raw, types)
         ]
         projections = prepare_gguf_projections(sources, torch.float16, True, 8)
-        packed = [
-            torch.from_numpy(
-                signed_index_records(data) if kind == 21 else pack_iq4_xs_records(data)
-            ).cuda()
-            for data, kind in zip(raw, types)
-        ]
+        layer_module = torch.nn.Module()
+        layer_module.prefix = f"model.layers.{layer}.mlp.gate_up_proj"
+        layer_module.gguf_tm_projections = torch.nn.ModuleList(projections)
+        admission = prepare_native_gated_pair(layer_module, sources, projections, True)
+        assert admission["reason"] is None, admission
         references = [
             torch.from_numpy(
                 gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
             ).cuda()
             for data, kind in zip(raw, types)
         ]
-        output = torch.empty(8, 4352, dtype=torch.float16, device="cuda")
 
-        def native(rows, output=output, packed=packed, types=types):
-            torch.ops._C.gguf_native_pair_sm70_out(output, rows, *packed, *types)
-            return output
+        def native(rows, layer_module=layer_module):
+            return apply_native_gated_pair(layer_module, rows)
 
-        def canonical(rows, output=output, projections=projections):
-            pair = torch.cat([projection(rows) for projection in projections], dim=-1)
-            result = torch.empty_like(output)
+        def canonical(rows, projections=projections):
+            pair = apply_prepared_gguf_projections(rows, projections)
+            result = rows.new_empty((rows.shape[0], 4352))
             torch.ops._C.silu_and_mul(result, pair)
             return result
 
@@ -92,6 +88,25 @@ def main():
                         "max_abs": float(difference.abs().max()),
                     }
                 )
+        fallbacks = []
+        for m in (512, 8, 1, 5, 16, 20, 32, 8):
+            sample = torch.randn(m, 5120, dtype=torch.float16, device="cuda")
+            result = native(sample)
+            if m != 8:
+                torch.testing.assert_close(result, canonical(sample), rtol=0, atol=0)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replay_output = native(sample)
+            graph.replay()
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(replay_output, result, rtol=0, atol=0)
+            fallbacks.append(
+                {
+                    "m": m,
+                    "route": "native" if m == 8 else "canonical",
+                    "graph_bitwise_equal": True,
+                }
+            )
         flush = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         payload_bytes = sum(data.nbytes for data in raw)
         timings = []
@@ -122,6 +137,8 @@ def main():
                 "k": 5120,
                 "source_bytes": payload_bytes,
                 "checks": checks,
+                "admission": admission,
+                "fallbacks": fallbacks,
                 "abba": timings,
             }
         )

@@ -39,7 +39,34 @@ replay, recording SM/memory clocks for each arm. Source-payload bandwidth
 is a workload ratio, not an NCU memory counter. Acquire the shared GPU lock
 and selected device lock before running it.
 
-GPU GEMM numerical checks and same-session timing are pending. No model
-shape is admitted by this operator change. Mixed projections retain their
-canonical route until an actual-weight comparison shows a faster shape;
-slower or unmeasured shapes must retain canonical dispatch.
+GPU GEMM checks now pass in a normal source-complete wheel with Torch 2.10,
+CUDA 12.8 and V100 SXM2 32GB. Three independent M8 inputs per orientation
+give native relative L2 0.000497–0.000534 against official FP32 weights and
+FP32 GEMM, versus 0.000598–0.000623 for canonical. Native maximum absolute
+error is 0.00390625–0.0078125; all results are finite.
+
+| Actual TP4 slice | Clock in every timed arm | Canonical ABBA arms | Native ABBA arms | Native source bandwidth |
+| --- | --- | --- | --- | --- |
+| Layer39, IQ4_XS/IQ3_S | 1530/877MHz | 74.752/74.752us | 54.272/54.272us | 394.5GB/s |
+| Layer42, IQ3_S/IQ4_XS | 1530/877MHz | 75.776/75.776us | 54.272/54.784us | 390.8–394.5GB/s |
+
+Each pair contains 21,411,840 source bytes. Cold-L2 eviction is 16MiB,
+with 84 graph samples per arm and 300W power limit. The first layer42 run
+changed SM clocks during its first canonical arm; that arm is excluded,
+and the table uses one focused repeat with stable clocks. These are
+secondary-machine operator measurements, not primary-machine or end-to-end
+results. Across eleven eligible layers, 20.48–21.50us per layer suggests
+about 0.225–0.237ms of projection saving. No full-round gain is claimed.
+
+Capability declarations admit only both measured orientations at
+M8/N4352/K5120, FP16 operands and SM70. Source records are retained only
+after that admission, adding 235,530,240 bytes per rank across eleven layers.
+Actual M is resolved inside an opaque operator; other M reuse the existing
+canonical mixed-projection policies, including M5/M20 direct output and
+prefill workspace resolution. Disabled policy, missing operator, transformed
+layouts, other types and uncalibrated shapes retain canonical dispatch with
+reported reasons. The loader and fused-SiLU interface use the same capability.
+
+Five new CPU dispatch/graph checks and the adjacent canonical regressions
+pass. The installed preparation/opaque-operator GPU graph fallback check is
+pending before promotion; its benchmark covers M512/8/1/5/16/20/32/8.
