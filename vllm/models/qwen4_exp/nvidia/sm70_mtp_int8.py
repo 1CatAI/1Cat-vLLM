@@ -6,8 +6,8 @@ import torch
 
 
 @torch.inference_mode()
-def prepare_int8_expert_weight(weight):
-    """Pack row-scaled integers into the existing 32-by-16 MMA layout.
+def prepare_int8_expert_weight(weight, *, block32=False):
+    """Pack row or input-block-scaled integers into the 32-by-16 MMA layout.
 
     Zero rows use scale one. Startup FP32 scratch is bounded to 4096 rows.
     This helper installs no serving dispatch and never replaces FP16 weights.
@@ -15,18 +15,24 @@ def prepare_int8_expert_weight(weight):
     if weight.ndim != 2 or weight.dtype != torch.float16:
         raise ValueError("Expected a two-dimensional FP16 weight")
     rows, width = weight.shape
-    if rows % 32 or width % 16:
+    if rows % 32 or width % (32 if block32 else 16):
         raise ValueError("Expert weight must align to 32 output and 16 input rows")
     integer = torch.empty_like(weight, dtype=torch.int8)
-    scales = weight.new_empty(rows)
+    groups = width // 32 if block32 else 1
+    scales = weight.new_empty((groups, rows)) if block32 else weight.new_empty(rows)
     for begin in range(0, rows, 4096):
         values = weight[begin : begin + 4096].float()
+        if block32:
+            values = values.reshape(values.shape[0], groups, 32)
         scale = values.abs().amax(-1, keepdim=True) / 127
         scale = torch.where(scale == 0, torch.ones_like(scale), scale)
         integer[begin : begin + 4096].copy_(
-            (values / scale).round().clamp(-127, 127).to(torch.int8)
+            (values / scale).round().clamp(-127, 127).to(torch.int8).reshape(-1, width)
         )
-        scales[begin : begin + 4096].copy_(scale.flatten())
+        if block32:
+            scales[:, begin : begin + 4096].copy_(scale.squeeze(-1).t())
+        else:
+            scales[begin : begin + 4096].copy_(scale.flatten())
     lane = torch.arange(32, device=weight.device)
     columns = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) >> 2)
     physical = torch.tensor(

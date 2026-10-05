@@ -31,7 +31,8 @@ def main() -> None:
     parser.add_argument("--fixture-manifest", type=Path)
     parser.add_argument("--draft-vocab", type=Path)
     parser.add_argument(
-        "--structural-candidate", choices=("shared", "draft-qpn8", "draft-int8")
+        "--structural-candidate",
+        choices=("shared", "draft-qpn8", "draft-int8", "draft-int8-block32"),
     )
     parser.add_argument("--restoration-control", action="store_true")
     parser.add_argument("--diagnostics-only", action="store_true")
@@ -204,6 +205,7 @@ def main() -> None:
             "shared": "SharedChainCandidateWorker",
             "draft-qpn8": "DraftExpertQPN8CandidateWorker",
             "draft-int8": "DraftExpertINT8CandidateWorker",
+            "draft-int8-block32": "DraftExpertINT8Block32CandidateWorker",
         }[args.structural_candidate]
         engine["worker_cls"] = (
             "benchmarks.sm70_mtp_reference_worker." + candidate_worker
@@ -510,7 +512,8 @@ def main() -> None:
             ):
                 raise RuntimeError("Structural candidate was not executed on all ranks")
             if (
-                args.structural_candidate in ("draft-qpn8", "draft-int8")
+                args.structural_candidate
+                in ("draft-qpn8", "draft-int8", "draft-int8-block32")
                 and args.teacher_forcing_manifest
                 and any(
                     worker["structural_probe_delta"][args.structural_candidate] < 1

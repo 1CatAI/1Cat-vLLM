@@ -27,8 +27,10 @@ def main():
     formats = parser.add_mutually_exclusive_group()
     formats.add_argument("--qpn8", action="store_true")
     formats.add_argument("--int8", action="store_true")
+    formats.add_argument("--int8-block32", action="store_true")
     args = parser.parse_args()
-    quantized = args.qpn8 or args.int8
+    integer_format = args.int8 or args.int8_block32
+    quantized = args.qpn8 or integer_format
     torch.set_num_threads(1)
     torch.manual_seed(20261005)
     saved = load_file(str(args.weights))
@@ -44,12 +46,12 @@ def main():
         )
 
         prepare = prepare_channel_qpn8_weight
-        if args.int8:
+        if integer_format:
             from vllm.models.qwen4_exp.nvidia.sm70_mtp_int8 import (
                 prepare_int8_expert_weight,
             )
 
-            prepare = prepare_int8_expert_weight
+            prepare = lambda w: prepare_int8_expert_weight(w, block32=args.int8_block32)
         codes13, scales13 = prepare(w13.view(-1, 2560))
         codes2, scales2 = prepare(w2.view(-1, 160))
         quantized13, quantized2 = torch.empty_like(w13), torch.empty_like(w2)
@@ -58,11 +60,13 @@ def main():
             (quantized2, codes2, scales2, 160),
         ):
             # Existing decoder emits [K,N], while MoE weights are [E,N,K].
-            if args.int8:
+            if integer_format:
                 # Independent row-major quantization oracle; do not decode the
                 # packed layout used by the candidate.
                 source = w13 if k == 2560 else w2
-                rows = source.view(-1, k)
+                rows = source.view(-1, k).float()
+                if args.int8_block32:
+                    rows = rows.view(-1, k // 32, 32)
                 scale = rows.float().abs().amax(-1, keepdim=True) / 127
                 scale = torch.where(scale == 0, torch.ones_like(scale), scale)
                 integer = (rows.float() / scale).round().clamp(-127, 127).half()
@@ -71,8 +75,14 @@ def main():
                 decoded = torch.empty_like(codes, dtype=torch.float16)
                 torch.ops._C.fp8_qpn8_dequantize_sm70_out(decoded, codes, scales)
                 dense.copy_(decoded.t().reshape_as(dense))
-        scales13 = scales13.view(512, 320)
-        scales2 = scales2.view(512, 2560)
+        scales13 = (
+            scales13.view(80, 512, 320)
+            if args.int8_block32
+            else scales13.view(512, 320)
+        )
+        scales2 = (
+            scales2.view(5, 512, 2560) if args.int8_block32 else scales2.view(512, 2560)
+        )
     arms = (
         ("control", "fused", "quantized_reference")
         if quantized
@@ -124,7 +134,9 @@ def main():
             f = b["fused"]
             if quantized:
                 chain = (
-                    torch.ops._C.sm70_mtp_moe_int8_chain_out
+                    torch.ops._C.sm70_mtp_moe_int8_block32_chain_out
+                    if args.int8_block32
+                    else torch.ops._C.sm70_mtp_moe_int8_chain_out
                     if args.int8
                     else torch.ops._C.sm70_mtp_moe_qpn8_chain_out
                 )
@@ -197,7 +209,13 @@ def main():
             trials["quantized_reference"].append(elapsed(graphs["quantized_reference"]))
     result = dict(
         model_admission=False,
-        candidate_format=("channel_INT8" if args.int8 else "channel_QPN8")
+        candidate_format=(
+            "block32_INT8"
+            if args.int8_block32
+            else "channel_INT8"
+            if args.int8
+            else "channel_QPN8"
+        )
         if quantized
         else "FP16",
         shapes=[5, 1, 1, 1],

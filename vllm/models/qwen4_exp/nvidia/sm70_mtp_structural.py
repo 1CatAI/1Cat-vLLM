@@ -14,7 +14,7 @@ from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
 from vllm.utils.torch_utils import direct_register_custom_op
 
-_probe_calls = {"shared": 0, "draft-qpn8": 0, "draft-int8": 0}
+_probe_calls = {"shared": 0, "draft-qpn8": 0, "draft-int8": 0, "draft-int8-block32": 0}
 _probe_widths: dict[str, set[int]] = {name: set() for name in _probe_calls}
 
 
@@ -110,14 +110,19 @@ def _draft_expert_chain(
     ids: torch.Tensor,
     probabilities: torch.Tensor,
     integer: bool = False,
+    block32: bool = False,
 ) -> torch.Tensor:
-    role = "draft-int8" if integer else "draft-qpn8"
+    role = (
+        "draft-int8-block32" if block32 else "draft-int8" if integer else "draft-qpn8"
+    )
     _probe_calls[role] += 1
     _probe_widths[role].add(int(x.shape[0]))
     out = torch.empty_like(x)
     activation = x.new_empty((x.shape[0] * 10, 160))
     chain = (
-        torch.ops._C.sm70_mtp_moe_int8_chain_out
+        torch.ops._C.sm70_mtp_moe_int8_block32_chain_out
+        if block32
+        else torch.ops._C.sm70_mtp_moe_int8_chain_out
         if integer
         else torch.ops._C.sm70_mtp_moe_qpn8_chain_out
     )
@@ -136,7 +141,8 @@ direct_register_custom_op(
     scales2,
     ids,
     probabilities,
-    integer=False: (torch.empty_like(x)),
+    integer=False,
+    block32=False: (torch.empty_like(x)),
 )
 
 
@@ -177,13 +183,14 @@ def _draft_expert_apply(
             topk_ids,
             topk_weights,
             layer._sm70_mtp_expert_integer,
+            layer._sm70_mtp_expert_block32,
         )
     return method._sm70_mtp_original_apply(
         layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
     )
 
 
-def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False):
+def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False, block32=False):
     """Prepare only the provided proposer subtree, retaining FP16 fallback."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -194,16 +201,22 @@ def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False):
         prepare_channel_qpn8_weight,
     )
 
+    if block32 and not integer:
+        raise ValueError("Block scaling requires INT8 weights")
     if integer:
         from vllm.models.qwen4_exp.nvidia.sm70_mtp_int8 import (
             prepare_int8_expert_weight,
         )
 
-        prepare = prepare_int8_expert_weight
+        prepare = lambda w: prepare_int8_expert_weight(w, block32=block32)
     else:
         prepare = prepare_channel_qpn8_weight
     op_name = (
-        "sm70_mtp_moe_int8_chain_out" if integer else "sm70_mtp_moe_qpn8_chain_out"
+        "sm70_mtp_moe_int8_block32_chain_out"
+        if block32
+        else "sm70_mtp_moe_int8_chain_out"
+        if integer
+        else "sm70_mtp_moe_qpn8_chain_out"
     )
     if not hasattr(torch.ops._C, op_name):
         raise RuntimeError("Rebuild the normal SM70 extension for draft QPN8 probe")
@@ -242,10 +255,11 @@ def prepare_draft_expert_qpn8_probe(draft_model, *, integer=False):
             )
             layer.register_buffer(
                 "_sm70_mtp_qpn8_scales" + role,
-                scales.view(512, n),
+                scales.view(k // 32, 512, n) if block32 else scales.view(512, n),
                 persistent=False,
             )
         layer._sm70_mtp_expert_integer = integer
+        layer._sm70_mtp_expert_block32 = block32
         object.__setattr__(method, "_sm70_mtp_original_apply", method.apply)
         method.apply = MethodType(_draft_expert_apply, method)  # type: ignore[method-assign]
         prepared += 1

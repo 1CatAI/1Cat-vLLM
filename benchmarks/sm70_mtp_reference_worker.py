@@ -134,6 +134,8 @@ class DraftExpertQPN8CandidateWorker(Worker):
 class DraftExpertINT8CandidateWorker(Worker):
     """Research-only integer weights, retaining FP16 compute and target logits."""
 
+    block32 = False
+
     def load_model(self, *, load_dummy_weights=False):
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
@@ -141,10 +143,16 @@ class DraftExpertINT8CandidateWorker(Worker):
         )
 
         prepared = prepare_draft_expert_qpn8_probe(
-            self.model_runner.speculator.model, integer=True
+            self.model_runner.speculator.model, integer=True, block32=self.block32
         )
         if prepared != 1:
             raise RuntimeError(f"Draft INT8 preparation missed layer: {prepared}")
+
+
+class DraftExpertINT8Block32CandidateWorker(DraftExpertINT8CandidateWorker):
+    """Research-only input-block scaling; no default dispatch."""
+
+    block32 = True
 
 
 class DraftFCGatherControlWorker(Worker):

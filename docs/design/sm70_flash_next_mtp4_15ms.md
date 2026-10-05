@@ -863,3 +863,36 @@ speculative dictionary, which was also retained by the JSON report. Deep-copy
 the requested configuration before constructing the engine; do not change
 hardware, cache, 256K capacity or sampling to work around this reporting error.
 No C4 speed result is inferred from the failed report.
+
+### Integer expert and C4 follow-up
+
+The row-scaled INT8 expert candidate finishes all sixteen numerical tapes.
+Target KL is zero. On 2,176 draft positions, mean/p99/maximum KL are
+0.000084486/0.000807959/0.062439157 with 100% top1 agreement. Maximum KL
+exceeds 0.05, so the candidate remains disabled. Frozen prompt acceptance
+is 49.3344%, versus 50.2035% for the current default. Its fixed-input complete
+rounds measure 20.657373/20.708493/20.754261 ms; these are rejected-candidate
+measurements, not default performance. Twelve automatic tasks pass and all
+sixteen quality outputs stop naturally.
+
+A benchmark-only input-block-32 INT8 follow-up addresses channel-wide scale
+outliers. FP16 MMA and FP32 accumulation stay unchanged; scale reads increase
+by 6.25% of code bytes. Fifty checkpoint experts have up/down reconstruction
+relative L2 0.005613/0.005516, compared with row scaling's 0.011088/0.007056.
+The four-step layer graph measures 0.436398 -> 0.188733 ms. An independent
+row-major block dequantization oracle agrees within relative L2 0.000282.
+Full-model distribution and acceptance admission are still required.
+
+The independently trained 65,536-ID shortlist passes a production-packet head
+screen: four-head critical-shard times are 0.786043 -> 0.505518 ms at M1,
+and 0.797870 -> 0.514509 ms at M5. Its evaluation remains independent of the
+failed 32K subset; coverage never substitutes for acceptance.
+
+After the sampler workspace and JSON snapshot fixes, the C4 control completes
+startup but fails actual 8K prefill while requesting a 160-MiB FP16 activation
+buffer of shape [8192,10240]. Reported free memory is approximately 63--69 MiB;
+no speed sample is recorded. The 4-GiB KV allocation, 262144 service limit,
+inputs and batch limits are unchanged. Allocator-reserved space is not itself
+proof that graph scratch can be borrowed safely: captured temporary addresses
+may be reused on replay. Keep this failure explicit until a validated lifetime
+or workspace fix completes the matched C4 comparison.

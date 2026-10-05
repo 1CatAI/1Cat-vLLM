@@ -50,7 +50,7 @@ __device__ __forceinline__ void accumulate(float* c, uint4 a, uint4 b,
   DRAFT_MMA(c, b.z, b.w, w[6], w[7]);
 }
 
-template <bool Integer>
+template <bool Integer, bool Block32 = false>
 __global__ __launch_bounds__(256, 1) void draft_qpn8_up(const half* x,
                                                         const uint8_t* codes,
                                                         const half* scales,
@@ -64,14 +64,22 @@ __global__ __launch_bounds__(256, 1) void draft_qpn8_up(const half* x,
   __shared__ float sums[2][8][32];
   float gate[8] = {}, up[8] = {};
   if (expert >= 0 && expert < 512) {
-    const half gs = scales[expert * 320 + blockIdx.x * 32 + col];
-    const half us = scales[expert * 320 + (blockIdx.x + 5) * 32 + col];
+    half gs{}, us{};
+    if constexpr (!Block32) {
+      gs = scales[expert * 320 + blockIdx.x * 32 + col];
+      us = scales[expert * 320 + (blockIdx.x + 5) * 32 + col];
+    }
     const int64_t offset = int64_t(expert) * 320 * 2560;
 #pragma unroll 1
     for (int g = warp * 20; g < (warp + 1) * 20; ++g) {
       const half* input = x + (route / 10) * 2560 + g * 16;
       const uint4 a = *reinterpret_cast<const uint4*>(input);
       const uint4 b = *reinterpret_cast<const uint4*>(input + 8);
+      if constexpr (Block32) {
+        const int base = (g / 2) * 512 * 320 + expert * 320;
+        gs = scales[base + blockIdx.x * 32 + col];
+        us = scales[base + (blockIdx.x + 5) * 32 + col];
+      }
       half2 wg[8], wu[8];
       load_weights<Integer>(
           codes + offset + (blockIdx.x * 160 + g) * 512 + lane * 16, gs, wg);
@@ -106,7 +114,7 @@ __global__ __launch_bounds__(256, 1) void draft_qpn8_up(const half* x,
   }
 }
 
-template <bool Integer>
+template <bool Integer, bool Block32 = false>
 __global__ __launch_bounds__(320, 1) void draft_qpn8_down(
     const half* activation, const uint8_t* codes, const half* scales,
     const int* ids, const float* probabilities, half* output) {
@@ -118,12 +126,17 @@ __global__ __launch_bounds__(320, 1) void draft_qpn8_down(
   float accum[8] = {};
   if (expert >= 0 && expert < 512) {
     const int64_t offset = int64_t(expert) * 2560 * 160;
-    const half s = scales[expert * 2560 + blockIdx.x * 32 + quad * 8 + r];
+    half s{};
+    if constexpr (!Block32)
+      s = scales[expert * 2560 + blockIdx.x * 32 + quad * 8 + r];
 #pragma unroll 1
     for (int g = 0; g < 10; ++g) {
       const half* input = activation + (row * 10 + route) * 160 + g * 16;
       const uint4 a = *reinterpret_cast<const uint4*>(input);
       const uint4 b = *reinterpret_cast<const uint4*>(input + 8);
+      if constexpr (Block32)
+        s = scales[(g / 2) * 512 * 2560 + expert * 2560 + blockIdx.x * 32 +
+                   quad * 8 + r];
       half2 w[8];
       load_weights<Integer>(
           codes + offset + (blockIdx.x * 10 + g) * 512 + lane * 16, s, w);
@@ -149,7 +162,7 @@ __global__ __launch_bounds__(320, 1) void draft_qpn8_down(
 }
 #undef DRAFT_MMA
 
-template <bool Integer>
+template <bool Integer, bool Block32 = false>
 void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
          torch::Tensor w13, torch::Tensor s13, torch::Tensor w2,
          torch::Tensor s2, torch::Tensor ids, torch::Tensor probabilities) {
@@ -171,15 +184,20 @@ void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
               ids.sizes() == at::IntArrayRef({m, 10}) &&
               probabilities.sizes() == ids.sizes() &&
               w13.numel() == int64_t(512) * 320 * 2560 &&
-              w2.numel() == int64_t(512) * 2560 * 160 &&
-              s13.sizes() == at::IntArrayRef({512, 320}) &&
-              s2.sizes() == at::IntArrayRef({512, 2560}));
+              w2.numel() == int64_t(512) * 2560 * 160);
+  if constexpr (Block32) {
+    TORCH_CHECK(s13.sizes() == at::IntArrayRef({80, 512, 320}) &&
+                s2.sizes() == at::IntArrayRef({5, 512, 2560}));
+  } else {
+    TORCH_CHECK(s13.sizes() == at::IntArrayRef({512, 320}) &&
+                s2.sizes() == at::IntArrayRef({512, 2560}));
+  }
   const auto stream = at::cuda::getCurrentCUDAStream();
-  draft_qpn8_up<Integer><<<dim3(5, m * 10), 256, 0, stream>>>(
+  draft_qpn8_up<Integer, Block32><<<dim3(5, m * 10), 256, 0, stream>>>(
       reinterpret_cast<const half*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
       reinterpret_cast<const half*>(s13.data_ptr()), ids.data_ptr<int>(),
       reinterpret_cast<half*>(activation.data_ptr()));
-  draft_qpn8_down<Integer><<<dim3(80, m), 320, 0, stream>>>(
+  draft_qpn8_down<Integer, Block32><<<dim3(80, m), 320, 0, stream>>>(
       reinterpret_cast<const half*>(activation.data_ptr()),
       w2.data_ptr<uint8_t>(), reinterpret_cast<const half*>(s2.data_ptr()),
       ids.data_ptr<int>(), probabilities.data_ptr<float>(),
@@ -209,4 +227,14 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("sm70_mtp_moe_int8_chain_out", &run<true>);
+}
+
+TORCH_LIBRARY_FRAGMENT(_C, m) {
+  m.def(
+      "sm70_mtp_moe_int8_block32_chain_out(Tensor(a!) output, "
+      "Tensor(b!) activation, Tensor x, Tensor codes13, Tensor scales13, "
+      "Tensor codes2, Tensor scales2, Tensor ids, Tensor probabilities) -> ()");
+}
+TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("sm70_mtp_moe_int8_block32_chain_out", &run<true, true>);
 }
