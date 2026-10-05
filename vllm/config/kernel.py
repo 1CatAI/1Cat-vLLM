@@ -493,6 +493,8 @@ class KernelConfig:
     sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
     """SM70 ring collective policy, resolved from actual peer capabilities."""
 
+    hc_ll_shard: bool = True
+    """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )

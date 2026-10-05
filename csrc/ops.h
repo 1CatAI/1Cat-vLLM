@@ -980,3 +980,12 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
                                 bool activated);
+
+void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
+                         torch::Tensor cnt, std::vector<int64_t> ll,
+                         torch::Tensor seq, int64_t rank, int64_t variant);
+void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
+                       torch::Tensor cnt, std::vector<int64_t> ll,
+                       torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
+                       torch::Tensor out, torch::Tensor lora_out,
+                       torch::Tensor inj_out, int64_t warps);

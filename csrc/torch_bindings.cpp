@@ -219,6 +219,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "source_type, int num_experts) -> ()");
   ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
            &gguf_dp4a_down_unroute_sm70_out);
+  ops.def(
+      "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
+      "cnt, "
+      "int[] ll, Tensor(c!) seq, int rank, int variant) -> ()");
+  ops.impl("sm70_hc_ll_down_out", torch::kCUDA, &sm70_hc_ll_down_out);
+  ops.def(
+      "sm70_hc_ll_up_out(int ll_lora, Tensor wu, Tensor x, Tensor(a!) cnt, "
+      "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
+      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps) -> ()");
+  ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
   ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
   ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
            &gguf_quantize_q8_1_sm70_out);
