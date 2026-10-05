@@ -1,0 +1,146 @@
+{
+  "scope": "Unprofiled matched sixteen prompts; first twenty output rounds per prompt omitted; full-round means equal-weighted by prompt, output-token latency pooled; C4 smoke includes first-use setup, no throughput claim",
+  "baseline_runtime": "1.5.2.dev41+g5620850f81",
+  "candidate_runtime": "1.5.2.dev53+g49ac1c58ff",
+  "cohorts": [
+    {
+      "input_tokens": 1024,
+      "baseline": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 22.219657063718866,
+        "prompt_mean_tokens_per_round": 2.919854746840921,
+        "steady_intervals": 1488,
+        "steady_emitted_tokens": 4327,
+        "pooled_ms_per_output_token": 7.641069016152244,
+        "pooled_output_tokens_per_second": 130.87174031357756,
+        "mean_ttft_ms": 344.45053339004517
+      },
+      "candidate": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 20.63931425042916,
+        "prompt_mean_tokens_per_round": 2.9141695165100487,
+        "steady_intervals": 1490,
+        "steady_emitted_tokens": 4331,
+        "pooled_ms_per_output_token": 7.10028308105903,
+        "pooled_output_tokens_per_second": 140.83945507294433,
+        "mean_ttft_ms": 345.71853280067444
+      },
+      "round_saving_ms": 1.5803428132897075,
+      "round_speedup": 1.0765695407373743
+    },
+    {
+      "input_tokens": 8192,
+      "baseline": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 23.316529274392988,
+        "prompt_mean_tokens_per_round": 2.9390156879509024,
+        "steady_intervals": 1488,
+        "steady_emitted_tokens": 4353,
+        "pooled_ms_per_output_token": 7.970144795322336,
+        "pooled_output_tokens_per_second": 125.4682349794822,
+        "mean_ttft_ms": 2687.072217464447
+      },
+      "candidate": {
+        "prompts": 8,
+        "prompt_mean_full_round_ms": 21.734425415596988,
+        "prompt_mean_tokens_per_round": 2.9939108054008714,
+        "steady_intervals": 1462,
+        "steady_emitted_tokens": 4353,
+        "pooled_ms_per_output_token": 7.299747720308124,
+        "pooled_output_tokens_per_second": 136.99103562414479,
+        "mean_ttft_ms": 2692.7095353603363
+      },
+      "round_saving_ms": 1.5821038587959997,
+      "round_speedup": 1.0727925320565712
+    }
+  ],
+  "route_admission": {
+    "pair_admission": [
+      {
+        "pure": 8,
+        "mixed": 52
+      },
+      {
+        "pure": 8,
+        "mixed": 52
+      },
+      {
+        "pure": 8,
+        "mixed": 52
+      },
+      {
+        "pure": 8,
+        "mixed": 52
+      }
+    ],
+    "projection_admission": [
+      {
+        "down": 37,
+        "qkvz": 48
+      },
+      {
+        "down": 37,
+        "qkvz": 48
+      },
+      {
+        "down": 37,
+        "qkvz": 48
+      },
+      {
+        "down": 37,
+        "qkvz": 48
+      }
+    ]
+  },
+  "natural_health": [
+    {
+      "prompt": "请只回答17乘以23的数值。",
+      "text": "391",
+      "finish_reason": "stop"
+    },
+    {
+      "prompt": "Reply with one brief sentence explaining what a unit test does.",
+      "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+      "finish_reason": "stop"
+    }
+  ],
+  "c4_smoke": {
+    "wall_seconds": 7.399303684942424,
+    "requests": 4,
+    "throughput_gate": "smoke only; no matching old C4 baseline recorded"
+  },
+  "source": "49ac1c58ffa8d91a3ef4b1ea068178362cf28b2f",
+  "contract": {
+    "cuda": "12.8",
+    "torch": "2.10.0+cu128",
+    "python": "3.12.14",
+    "gpu": "4xV100-SXM2-32GB/NVLink",
+    "power_w": 300,
+    "timed_sm_clock_mhz": 1290,
+    "memory_clock_mhz": 877,
+    "tensor_parallel": 4,
+    "max_model_len": 262144,
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 4,
+    "gpu_memory_utilization": 0.9,
+    "dtype": "float16",
+    "kv_cache_dtype": "float16",
+    "mamba_ssm_cache_dtype": "float32",
+    "draft_tokens": 7,
+    "draft_tensor_parallel": 4,
+    "draft_sampling": "probabilistic",
+    "attention_backend": "FLASH_ATTN_V100",
+    "cuda_graphs": true,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 20,
+    "seed": 123,
+    "max_output_tokens": 600,
+    "speed_fixture_ignore_eos": true,
+    "thinking": false
+  },
+  "raw_sha256": {
+    "integration-full-path-562.json": "75a4f2b75e907f416f2c05467cad439424fdb8253dd2c0dd017f49644b793d0a",
+    "integration-projection-batch.json": "02720a935184a436555461b4af52401bbd5c1a4d1616f51551c42d68f5520069"
+  }
+}
