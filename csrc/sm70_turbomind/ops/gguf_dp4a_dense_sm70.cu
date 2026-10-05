@@ -142,13 +142,22 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
   }
   __syncthreads();
   float values[TileM] = {};
-  for (int group = begin + warp; group < end; group += 4) {
-    const auto weight = IntegerGroup<Kind>::load(codes, d, scales, dmin, mins,
-                                                 n, k, col, group);
+  if (begin + warp < end) {
+    auto weight = IntegerGroup<Kind>::load(codes, d, scales, dmin, mins, n, k,
+                                           col, begin + warp);
+    for (int group = begin + warp; group < end; group += 4) {
+      // Volta has no asynchronous copy: issue the following weight loads
+      // before the independent integer dots for the current group.
+      auto next = weight;
+      if (group + 4 < end)
+        next = IntegerGroup<Kind>::load(codes, d, scales, dmin, mins, n, k, col,
+                                        group + 4);
 #pragma unroll
-    for (int t = 0; t < TileM; ++t)
-      if (begin_m + t < m)
-        values[t] += weight.dot(activations[t * span + group - begin]);
+      for (int t = 0; t < TileM; ++t)
+        if (begin_m + t < m)
+          values[t] += weight.dot(activations[t * span + group - begin]);
+      weight = next;
+    }
   }
 #pragma unroll
   for (int t = 0; t < TileM; ++t) sums[warp][t][lane] = values[t];
