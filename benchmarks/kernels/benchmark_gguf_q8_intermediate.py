@@ -51,9 +51,6 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--layer", type=int, default=17)
     parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument(
-        "--lanes", type=int, nargs="+", choices=[4, 8, 16, 32], default=[16, 8, 4]
-    )
     args = parser.parse_args()
     assert "site-packages" in vllm.__file__, vllm.__file__
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -146,7 +143,7 @@ def main():
             output(lanes is not None)
 
         full()
-        for lanes in args.lanes:
+        for lanes in (16, 8, 4):
             full(lanes)
             if lanes == 16:
                 torch.testing.assert_close(candidate, baseline, rtol=0, atol=0)
