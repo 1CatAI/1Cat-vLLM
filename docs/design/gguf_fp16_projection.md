@@ -49,10 +49,9 @@ module imports the wrapper module, which registers the operation and fake
 implementation through `direct_register_custom_op`. No separate native
 library registration, CMake target or external DSO is required.
 
-The installed normal `1cat-vllm` 1.5.2.dev13 package RECORD includes the
-existing `fp16_gemv_silu.py`. A candidate wheel must additionally include
-`gguf_fp16_projection.py` and the updated GGUF preparation module. No installed
-package was changed while preparing this implementation.
+The normal wheel includes the existing `fp16_gemv_silu.py`, the new
+`gguf_fp16_projection.py` and the updated GGUF preparation module. The
+operator test imports those installed files directly.
 
 ## Validation boundary
 
@@ -80,7 +79,8 @@ The installed normal wheel contains the wrapper, existing Triton row source
 and declared dev14 native libraries. No source overlay or private DSO was
 used. The updated native libraries include the CPU PLE registration. Extra
 signed-pair native APIs are present but are not used by this floating operator.
-The source tree does not include the signed-pair model dispatch changes.
+The validation wheel's Python source does not include signed-pair model
+dispatch changes; its floating-shard path is tested independently.
 
 Workload: local Tesla V100-SXM2-32GB, SM70, clocks 1290/877 MHz, Torch
 2.10.0+cu128, Triton 3.6.0, FP16 activations and operands, FP32 accumulation.
@@ -108,8 +108,46 @@ relative L2 error 2.28e-05 against the official Float reference.
 On the separate model trace, 96 old B/A calls occupy 11.5252 ms. Replacing
 them with these standalone local timings projects about 0.70 ms of B/A work,
 or 10.82 ms saved per round. That is a projection across machines, not an
-end-to-end measurement. Primary-host operator confirmation and model-level
-route/quality validation remain pending; no model speedup is claimed.
+end-to-end measurement. The same-host confirmation below replaces the
+primary-host operator evidence gap. Model-level row routing and quality
+were not tested here; no model speedup is claimed.
+
+## Primary-host operator confirmation
+
+On the same Tesla V100-SXM2-32GB used for the model trace, clocks remain
+1290/877 MHz throughout all ABBA arms. The normal installed wheel uses
+Python 3.12.14, Torch 2.10.0+cu128 and Triton 3.6.0. Activations and restored
+weights are FP16, with FP32 products, accumulation and reduction. The workload
+is again the real layer-6 TP4 rank-zero N12/K5120 matrices, M8 and a 16 MiB
+graph-resident cache flush before each call. Each arm contains 84 samples.
+
+| Projection | Original mm, A arms (µs) | Row GEMV, B arms (µs) | Source bytes | Source-byte bandwidth (GB/s) |
+| --- | --- | --- | --- | --- |
+| b | 148.096 / 148.288 | 7.232 / 7.232 | 122,880 | 16.99 |
+| a | 151.920 / 151.712 | 7.232 / 7.216 | 122,880 | 16.99–17.03 |
+
+Both restored operands, both M8 outputs against official Float FP32 dot
+products rounded to Half, and both M8 outputs against original mm have zero
+bit differences. Every output remains finite. The M512 → M8 → M1 → M16 →
+M32 → M8 sequence selects the row kernel at exactly the two M8 points;
+every CUDA Graph replay matches its uncaptured output bit for bit. The
+unchanged M512 fallback retains relative L2 error 2.278e-05. Each of the two
+compiled graphs contains one opaque projection operation.
+
+The two projections together save 285.552 µs per layer in this standalone
+ABBA workload. Extrapolating that workload to 48 GDN layers gives 13.706 ms;
+this is not a measured model result. Applying only the measured row timing
+to the trace's 96 calls estimates 0.694 ms of B/A work, compared with the
+trace's original 11.5252 ms, a projected 10.831 ms reduction. Actual model
+routing and round latency still need model-level observation.
+
+Validation package provenance is Python source
+`89a7ce5617bc217c50cd1ff56c006735b613b702`, declared normal native source
+`e7cea684818f1ae7d56fc5601fe956670dbbd2aa`, wheel SHA256
+`da24c510ace4547333bfa51d2c01c3bf5c49356c04929bedf3a5c9d16e5a10ef`.
+The wrapper, GGUF preparation module, reused row kernel and benchmark source
+all match the final branch files by SHA256. This operator-only check does not
+validate unrelated native APIs or a complete latest-main release artifact.
 
 Reproduce the operator test from a normally installed wheel, holding the
 shared GPU reservation and individual GPU lock:
