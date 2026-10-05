@@ -11,9 +11,80 @@ namespace vllm::sm70_gguf {
 template <int Type>
 struct NativePairReader;
 
-// Original Q4_K field layout follows llama.cpp's get_scale_min_k4;
+// Original Q2_K and Q4_K layouts follow llama.cpp's block definitions;
 // its MIT license is retained in
 // csrc/quantization/gguf_upstream/llama.cpp/LICENSE.
+template <>
+struct NativePairReader<10> {
+  static constexpr int kBlockBytes = 84;
+  static constexpr int kBookId = 0;
+  static constexpr int kBookBytes = 0;
+  struct Record {
+    uint32_t bits[8];
+    uint32_t scales[2];
+    float d;
+    float dmin;
+  };
+  const uint8_t* payload;
+  const uint2* scales;
+  const half2* original_d;
+  float2 cached_d;
+  int half_block;
+  bool first;
+
+  __device__ NativePairReader(const uint8_t* source, int tile, int blocks_k,
+                              int first_part, int col) {
+    const uint8_t* macro = source + int64_t{tile} * blocks_k * 32 * kBlockBytes;
+    payload = macro + first_part * 1280 + col * 16;
+    scales = reinterpret_cast<const uint2*>(macro + first_part * 1280 + 1024 +
+                                            col * 8);
+    original_d = reinterpret_cast<const half2*>(
+        macro + blocks_k * 2560 + (first_part / 2) * 128 + col * 4);
+    cached_d = {0, 0};
+    half_block = first_part & 1;
+    first = true;
+  }
+
+  __device__ static void initialize(uint8_t*) {}
+
+  __device__ Record load() {
+    if (first || half_block == 0) cached_d = __half22float2(*original_d);
+    const uint4 a = *reinterpret_cast<const uint4*>(payload);
+    const uint4 b = *reinterpret_cast<const uint4*>(payload + 512);
+    const uint2 c = *scales;
+    Record record{{a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w},
+                  {c.x, c.y},
+                  cached_d.x,
+                  cached_d.y};
+    payload += 1280;
+    scales += 160;
+    original_d += half_block * 32;
+    half_block ^= 1;
+    first = false;
+    return record;
+  }
+
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t*) {
+    static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
+    const uint32_t scale =
+        (record.scales[Segment / 4] >> (8 * (Segment & 3))) & 255;
+    const float d = record.d * static_cast<float>(scale & 15);
+    const float m = record.dmin * static_cast<float>(scale >> 4);
+    turbomind::Array<half, 8> result;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      constexpr int offset = (Segment & 1) * 16 + Fragment * 8;
+      const uint32_t q =
+          (record.bits[(offset + i) / 4] >> (8 * (i & 3) + 2 * (Segment / 2))) &
+          3;
+      result[i] = __float2half_rn(__fmaf_rn(d, static_cast<float>(q), -m));
+    }
+    return result;
+  }
+};
+
 template <>
 struct NativePairReader<12> {
   static constexpr int kBlockBytes = 144;
@@ -100,6 +171,139 @@ struct NativePairReader<12> {
       result[i] = __float2half_rn(__fmaf_rn(d, static_cast<float>(q), -m));
     }
     return result;
+  }
+};
+
+template <>
+struct NativePairReader<16> {
+  using Codebook = turbomind::gemm::LatticeCodebook<16>;
+  using OperandDecoder = LatticeRawDecoder<22>;
+  static constexpr int kBlockBytes = 66;
+  static constexpr int kBookId = 16;
+  static constexpr int kBookBytes = Codebook::kBytes;
+  struct Record {
+    uint32_t words[8];
+    float d;
+  };
+  const uint8_t* payload;
+  const half* original_d;
+  float cached_d;
+  int half_block;
+  bool first;
+
+  __device__ NativePairReader(const uint8_t* source, int tile, int blocks_k,
+                              int first_part, int col) {
+    const uint8_t* macro = source + int64_t{tile} * blocks_k * 32 * kBlockBytes;
+    payload = macro + first_part * 1024 + col * 16;
+    original_d = reinterpret_cast<const half*>(macro + blocks_k * 2048 +
+                                               (first_part / 2) * 64 + col * 2);
+    cached_d = 0;
+    half_block = first_part & 1;
+    first = true;
+  }
+
+  __device__ static void initialize(uint8_t* book) {
+    auto* words = reinterpret_cast<uint32_t*>(book);
+    for (int i = threadIdx.x; i < kBookBytes / 4; i += blockDim.x)
+      words[i] = Codebook::word(i);
+    __syncthreads();
+  }
+
+  __device__ Record load() {
+    if (first || half_block == 0) cached_d = __half2float(*original_d);
+    const uint4 a = *reinterpret_cast<const uint4*>(payload);
+    const uint4 b = *reinterpret_cast<const uint4*>(payload + 512);
+    Record record{{a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w}, cached_d};
+    payload += 1024;
+    original_d += half_block * 32;
+    half_block ^= 1;
+    first = false;
+    return record;
+  }
+
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t* book) {
+    static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
+    constexpr int octet = 2 * Segment + Fragment;
+    constexpr int group = octet / 4;
+    const uint32_t index = (record.words[2 * group] >> (8 * (octet & 3))) & 255;
+    const uint32_t aux = record.words[2 * group + 1];
+    const uint32_t sign_index = (aux >> (7 * (octet & 3))) & 127;
+    const uint32_t signs = sign_index | ((__popc(sign_index) & 1) << 7);
+    const uint64_t packed =
+        *reinterpret_cast<const uint64_t*>(book + index * 8);
+    return OperandDecoder::table_fragment<half>(packed, signs, record.d,
+                                                aux >> 28);
+  }
+};
+
+template <>
+struct NativePairReader<17> {
+  using Codebook = turbomind::gemm::LatticeCodebook<17>;
+  using OperandDecoder = LatticeRawDecoder<22>;
+  static constexpr int kBlockBytes = 74;
+  static constexpr int kBookId = 17;
+  static constexpr int kBookBytes = Codebook::kBytes;
+  struct Record {
+    uint32_t words[8];
+    uint32_t scales;
+    float d;
+  };
+  const uint8_t* payload;
+  const uint32_t* scales;
+  const half* original_d;
+  float cached_d;
+  int half_block;
+  bool first;
+
+  __device__ NativePairReader(const uint8_t* source, int tile, int blocks_k,
+                              int first_part, int col) {
+    const uint8_t* macro = source + int64_t{tile} * blocks_k * 32 * kBlockBytes;
+    payload = macro + first_part * 1152 + col * 16;
+    scales = reinterpret_cast<const uint32_t*>(macro + first_part * 1152 +
+                                               1024 + col * 4);
+    original_d = reinterpret_cast<const half*>(macro + blocks_k * 2304 +
+                                               (first_part / 2) * 64 + col * 2);
+    cached_d = 0;
+    half_block = first_part & 1;
+    first = true;
+  }
+
+  __device__ static void initialize(uint8_t* book) {
+    auto* words = reinterpret_cast<uint32_t*>(book);
+    for (int i = threadIdx.x; i < kBookBytes / 4; i += blockDim.x)
+      words[i] = Codebook::word(i);
+    __syncthreads();
+  }
+
+  __device__ Record load() {
+    if (first || half_block == 0) cached_d = __half2float(*original_d);
+    const uint4 a = *reinterpret_cast<const uint4*>(payload);
+    const uint4 b = *reinterpret_cast<const uint4*>(payload + 512);
+    Record record{{a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w}, *scales, cached_d};
+    payload += 1152;
+    scales += 288;
+    original_d += half_block * 32;
+    half_block ^= 1;
+    first = false;
+    return record;
+  }
+
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t* book) {
+    static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
+    constexpr int octet = 2 * Segment + Fragment;
+    const uint32_t word =
+        (record.words[octet / 2] >> ((octet & 1) * 16)) & 65535;
+    const uint32_t sign_index = word >> 9;
+    const uint32_t signs = sign_index | ((__popc(sign_index) & 1) << 7);
+    const uint64_t packed =
+        *reinterpret_cast<const uint64_t*>(book + (word & 511) * 8);
+    // IQ2_XS uses the same exact grid/coefficient operand formation as IQ2_S.
+    return OperandDecoder::table_fragment<half>(
+        packed, signs, record.d, (record.scales >> (4 * Segment)) & 15);
   }
 };
 
