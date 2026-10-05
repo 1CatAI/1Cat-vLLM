@@ -19,6 +19,9 @@ pytestmark = pytest.mark.skipif(
 def test_source_values_and_live_graph(rows, width, dtype):
     torch.manual_seed(1530)
     logits = torch.randn(rows, width, dtype=dtype, device="cuda")
+    if dtype == torch.float32 and rows > 8:
+        assert compact_half_topk(logits) is None
+        return
     assert compact_half_topk(logits) is not None
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -90,7 +93,11 @@ def test_target_probe_preserves_dense_token_mask(rows, dtype):
         for rank in range(4):
             shard = logits[:, rank * 62080 : (rank + 1) * 62080]
             if custom:
-                values, ids = compact_half_topk(shard)
+                selected = compact_half_topk(shard)
+                if selected is None:
+                    values, ids = shard.float().topk(64, dim=-1)
+                else:
+                    values, ids = selected
             else:
                 values, ids = shard.float().topk(64, dim=-1)
             shard_values.append(values)
@@ -127,3 +134,13 @@ def test_target_probe_preserves_dense_token_mask(rows, dtype):
                     torch.tensor([top_p], device="cuda"),
                 )
                 assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("width", [1025, 62080, 65535])
+@torch.inference_mode()
+def test_fp32_ties_use_lowest_vocab_ids(width):
+    logits = torch.ones(8, width, device="cuda", dtype=torch.float32)
+    values, ids = compact_half_topk(logits)
+    expected = torch.arange(64, device="cuda").expand(8, -1)
+    assert torch.equal(ids, expected)
+    assert torch.equal(values, torch.ones_like(values))

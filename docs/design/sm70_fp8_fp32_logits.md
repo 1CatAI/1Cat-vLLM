@@ -26,6 +26,9 @@ verification uses the same capability guard; widths above 32 retain the
 original head.
 
 The compact top-64 probe sorts original FP32 keys without casting to FP16.
-It retains the existing cutoff/nucleus reference guard and has two kernels,
-matching the FP16 probe. FP16 inputs continue using their original 32-bit keys;
-FP32 inputs use 48 significant bits in a 64-bit value/ID key.
+Its stable first pass sorts 32-bit float keys while carrying vocabulary IDs;
+hierarchical merges retain all 48 significant value/ID bits. Small FP32
+batches use two kernels for short shards and three for full vocabulary
+shards. FP32 batches above eight rows retain the generic selector. FP16
+inputs continue using their original two-kernel, 32-bit-key probe. The
+existing cutoff/nucleus reference guard remains required.

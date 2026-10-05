@@ -54,3 +54,20 @@ def test_fp32_head_rejects_unsupported_verification_width():
     scale = torch.empty(40, 62080, device="cuda", dtype=torch.float16)
     with pytest.raises(RuntimeError, match="unsupported FP32 LM-head shape"):
         torch.ops._C.fp8_gemm_sm70_fp32_head_out(output, x, weight, scale, 0, 0)
+
+
+def test_fp32_head_fake_tensor_registration():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    if not hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out"):
+        pytest.skip("Native FP32 head operator required")
+    with FakeTensorMode():
+        x = torch.empty(8, 5120, device="cuda", dtype=torch.float16)
+        output = torch.empty(8, 62080, device="cuda", dtype=torch.float32)
+        weight = torch.empty(5120, 62080, device="cuda", dtype=torch.uint8)
+        scale = torch.empty(40, 62080, device="cuda", dtype=torch.float16)
+        result = torch.ops._C.fp8_gemm_sm70_fp32_head_out(
+            output, x, weight, scale, 5120, 62080
+        )
+        assert result is None
+        assert output.dtype == torch.float32

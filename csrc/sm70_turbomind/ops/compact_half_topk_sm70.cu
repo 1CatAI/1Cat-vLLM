@@ -11,10 +11,11 @@
 #include <type_traits>
 #include <cub/block/block_radix_sort.cuh>
 
-template <typename Input, typename Key, int Items, bool Merge>
+template <typename Input, typename Key, int Items, bool Merge,
+          bool Intermediate = false>
 __global__ void select_compact_keys(const Input* x, Key* partial, float* values,
                                     int64_t* ids, int n, int stride, int k,
-                                    int width) {
+                                    int width, Key* extra) {
   constexpr int Threads = 256, Tile = Threads * Items;
   using Sort = cub::BlockRadixSort<Key, Threads, Items>;
   __shared__ typename Sort::TempStorage storage;
@@ -24,7 +25,8 @@ __global__ void select_compact_keys(const Input* x, Key* partial, float* values,
   for (int i = 0; i < Items; ++i) {
     const int col = threadIdx.x * Items + i;
     if constexpr (Merge) {
-      keys[i] = col < width ? partial[row * width + col] : 0;
+      const int index = col + (Intermediate ? blockIdx.y * Tile : 0);
+      keys[i] = index < width ? partial[row * width + index] : 0;
     } else {
       const int index = blockIdx.y * Tile + col;
       Key order;
@@ -50,35 +52,89 @@ __global__ void select_compact_keys(const Input* x, Key* partial, float* values,
     const int col = threadIdx.x * Items + i;
     if (col < k) {
       if constexpr (Merge) {
-        const int index = 0xffff - (keys[i] & 0xffff);
-        ids[row * k + col] = index;
-        if constexpr (std::is_same_v<Input, half>)
-          values[row * k + col] = __half2float(x[row * stride + index]);
-        else
-          values[row * k + col] = x[row * stride + index];
+        if constexpr (Intermediate) {
+          extra[(row * gridDim.y + blockIdx.y) * k + col] = keys[i];
+        } else {
+          const int index = 0xffff - (keys[i] & 0xffff);
+          ids[row * k + col] = index;
+          if constexpr (std::is_same_v<Input, half>)
+            values[row * k + col] = __half2float(x[row * stride + index]);
+          else
+            values[row * k + col] = x[row * stride + index];
+        }
       } else {
         partial[row * width + blockIdx.y * k + col] = keys[i];
       }
     }
   }
 }
+
+// Stable radix ranks preserve ascending vocabulary IDs within a tied leaf.
+// Only the primary float key is sorted here; merges retain the full ID key.
+template <int Items>
+__global__ void select_fp32_leaf(const float* x, uint64_t* partial, int n,
+                                 int stride, int width) {
+  constexpr int Threads = 256, Tile = Threads * Items;
+  using Sort = cub::BlockRadixSort<uint32_t, Threads, Items, uint16_t>;
+  __shared__ typename Sort::TempStorage storage;
+  uint32_t keys[Items];
+  uint16_t indices[Items];
+  const int row = blockIdx.x;
+#pragma unroll
+  for (int i = 0; i < Items; ++i) {
+    const int index = blockIdx.y * Tile + threadIdx.x * Items + i;
+    uint32_t bits = index < n ? __float_as_uint(x[row * stride + index]) : 0;
+    if ((bits & 0x7fffffff) == 0) bits = 0;
+    if ((bits & 0x7fffffff) > 0x7f800000) bits = 0x7fffffff;
+    keys[i] = index < n ? ((bits & 0x80000000) ? ~bits : bits ^ 0x80000000) : 0;
+    indices[i] = index < n ? index : 0xffff;
+  }
+  Sort(storage).SortDescending(keys, indices);
+#pragma unroll
+  for (int i = 0; i < Items; ++i) {
+    const int col = threadIdx.x * Items + i;
+    if (col < 64)
+      partial[row * width + blockIdx.y * 64 + col] =
+          (uint64_t(keys[i]) << 16) | (0xffff - indices[i]);
+  }
+}
+
 template <typename Input, typename Key>
 void launch_compact_topk(const at::Tensor& x, at::Tensor partial,
                          at::Tensor values, at::Tensor ids, int k, int tiles,
                          int width, cudaStream_t stream) {
   const auto* data = reinterpret_cast<const Input*>(x.data_ptr());
-  select_compact_keys<Input, Key, 4, false>
-      <<<dim3(x.size(0), tiles), 256, 0, stream>>>(
-          data, partial.data_ptr<Key>(), nullptr, nullptr, x.size(1),
-          x.stride(0), k, width);
+  if constexpr (std::is_same_v<Input, float>) {
+    select_fp32_leaf<4><<<dim3(x.size(0), tiles), 256, 0, stream>>>(
+        data, partial.data_ptr<uint64_t>(), x.size(1), x.stride(0), width);
+  } else {
+    select_compact_keys<Input, Key, 4, false>
+        <<<dim3(x.size(0), tiles), 256, 0, stream>>>(
+            data, partial.data_ptr<Key>(), nullptr, nullptr, x.size(1),
+            x.stride(0), k, width, nullptr);
+  }
+  if constexpr (std::is_same_v<Input, float>) {
+    if (width > 1024) {
+      const int groups = (width + 511) / 512;
+      auto* temp = partial.data_ptr<Key>() + x.size(0) * width;
+      select_compact_keys<Input, Key, 2, true, true>
+          <<<dim3(x.size(0), groups), 256, 0, stream>>>(
+              data, partial.data_ptr<Key>(), nullptr, nullptr, x.size(1),
+              x.stride(0), k, width, temp);
+      select_compact_keys<Input, Key, 2, true><<<x.size(0), 256, 0, stream>>>(
+          data, temp, values.data_ptr<float>(), ids.data_ptr<int64_t>(),
+          x.size(1), x.stride(0), k, groups * k, nullptr);
+      return;
+    }
+  }
   if (width <= 1024)
     select_compact_keys<Input, Key, 4, true><<<x.size(0), 256, 0, stream>>>(
         data, partial.data_ptr<Key>(), values.data_ptr<float>(),
-        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width);
+        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width, nullptr);
   else
     select_compact_keys<Input, Key, 16, true><<<x.size(0), 256, 0, stream>>>(
         data, partial.data_ptr<Key>(), values.data_ptr<float>(),
-        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width);
+        ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width, nullptr);
 }
 
 void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
@@ -89,7 +145,12 @@ void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
               x.dim() == 2 && x.stride(1) == 1);
   TORCH_CHECK(x.size(1) <= 65535 && x.size(1) >= k && k == 64);
   int tiles = (x.size(1) + 1023) / 1024, width = tiles * k;
-  TORCH_CHECK(width <= 4096 && partial.numel() == x.size(0) * width);
+  TORCH_CHECK(width <= 4096 &&
+              partial.numel() ==
+                  x.size(0) *
+                      (width + (x.scalar_type() == at::kFloat && width > 1024
+                                    ? ((width + 511) / 512) * k
+                                    : 0)));
   TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 32);
   TORCH_CHECK(partial.is_cuda() && values.is_cuda() && ids.is_cuda());
   TORCH_CHECK(partial.device() == x.device() && values.device() == x.device() &&
