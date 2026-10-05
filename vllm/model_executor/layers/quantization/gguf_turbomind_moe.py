@@ -8,12 +8,14 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     GGUFOperatorCapability,
     admit_moe_fallback,
     decoder_family,
+    dp4a_expert_capabilities,
     lattice_grouped_capabilities,
     raw_grouped_gate_up_capabilities,
     select_lattice_grouped_capability,
@@ -178,6 +180,134 @@ direct_register_custom_op(
     op_func=_expert_down,
     mutates_args=["out"],
     fake_impl=_expert_down_fake,
+)
+
+
+def _expert_dp4a(
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    probabilities: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_up: torch.Tensor,
+    gate_ptrs: torch.Tensor,
+    gate_stats: torch.Tensor,
+    up_ptrs: torch.Tensor,
+    up_stats: torch.Tensor,
+    down_ptrs: torch.Tensor,
+    down_stats: torch.Tensor,
+    source_type: int,
+    down_type: int,
+    down_decoder: int,
+    experts: int,
+    group: int,
+    intermediate: int,
+    raw_batches: list[int],
+    vector_bands: list[int],
+    down_vector_batches: list[int],
+    dp4a_batches: list[int],
+) -> torch.Tensor:
+    # Resolve actual M inside the opaque boundary so range compilation cannot
+    # freeze a prefill choice into an MTP verification graph.
+    m, top_k = ids.shape
+    if (
+        m in dp4a_batches
+        and probabilities.dtype == torch.float32
+        and x.is_contiguous()
+        and ids.is_contiguous()
+        and probabilities.is_contiguous()
+    ):
+        logger.info_once(
+            "SM70 Q8_1 GGUF experts enabled (type=%d, down=%d, M=%d).",
+            source_type,
+            down_type,
+            m,
+        )
+        q8 = torch.empty((m, x.shape[1] // 32, 36), dtype=torch.uint8, device=x.device)
+        hidden = x.new_empty((m, top_k, intermediate))
+        output = torch.empty_like(x)
+        torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            hidden, q8, ids, raw_gate, raw_up, source_type, True
+        )
+        torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
+            output,
+            hidden,
+            ids,
+            probabilities,
+            down_ptrs,
+            down_stats,
+            down_type,
+            experts,
+        )
+        return output
+    routed, offsets, sorted_ids, inverse = torch.ops.vllm.sm70_small_expert_route(
+        x, ids, experts
+    )
+    gate, up = _expert_gate_up(
+        routed,
+        offsets,
+        sorted_ids,
+        raw_gate,
+        raw_up,
+        gate_ptrs,
+        gate_stats,
+        up_ptrs,
+        up_stats,
+        source_type,
+        experts,
+        group,
+        intermediate,
+        top_k,
+        raw_batches,
+        vector_bands,
+    )
+    hidden = (torch.nn.functional.silu(gate) * up).contiguous()
+    down = x.new_empty((m * top_k, x.shape[1]))
+    _expert_down(
+        down,
+        hidden,
+        offsets,
+        down_ptrs,
+        down_stats,
+        down_type,
+        down_decoder,
+        experts,
+        32,
+        down_vector_batches,
+    )
+    return torch.ops.vllm.sm70_small_expert_unroute(down, inverse, probabilities)
+
+
+def _expert_dp4a_fake(
+    x,
+    ids,
+    probabilities,
+    raw_gate,
+    raw_up,
+    gate_ptrs,
+    gate_stats,
+    up_ptrs,
+    up_stats,
+    down_ptrs,
+    down_stats,
+    source_type,
+    down_type,
+    down_decoder,
+    experts,
+    group,
+    intermediate,
+    raw_batches,
+    vector_bands,
+    down_vector_batches,
+    dp4a_batches,
+):
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="gguf_expert_dp4a",
+    op_func=_expert_dp4a,
+    fake_impl=_expert_dp4a_fake,
 )
 
 
@@ -392,6 +522,10 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
     def __init__(self, quant_config, moe):
         super().__init__(quant_config, moe)
         self.builders: dict[str, GGUFExpertBank] = {}
+        config = get_current_vllm_config_or_none()
+        self.dp4a_enabled = self.native_enabled and (
+            config.kernel_config.sm70_gguf.small_m_dp4a if config is not None else True
+        )
 
     def load_expert(self, layer, param, weight, shard_id, expert_id):
         if param.is_gguf_weight_type:
@@ -465,10 +599,32 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             if c.reason is None
             for bound in (c.min_m, c.max_m or -1)
         ]
+        down = banks["w2"]
+        self.dp4a_capabilities = dp4a_expert_capabilities(
+            gate.source_type,
+            down.source_type,
+            gate.k,
+            gate.n,
+            self.num_experts,
+            self.params_dtype,
+            is_sm70=current_platform.is_device_capability(70),
+            enabled=self.dp4a_enabled,
+            original_storage_available=self.raw_gate_up,
+        )
+        self.dp4a_batches = [
+            c.min_m for c in self.dp4a_capabilities if c.reason is None
+        ]
         self.native_admission = {
             "enabled": True,
             "tp_size": layer.tp_size,
             "ep_size": layer.ep_size,
+            "small_m_dp4a": {
+                "enabled": bool(self.dp4a_batches),
+                "activation_format": "Q8_1",
+                "accumulation": "FP32",
+                "operators": [asdict(c) for c in self.dp4a_capabilities],
+                "outside_m_band": "canonical_grouped_operator",
+            },
             "joint_gate_up": {
                 "enabled": self.raw_gate_up,
                 "original_batches": self.raw_batches,
@@ -513,6 +669,32 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             )
         if x.shape[0] == 0:
             return torch.empty_like(x)
+        if self.dp4a_batches and layer.expert_map is None:
+            bank = layer.gguf_expert_banks
+            gate, up, down = bank["w1"], bank["w3"], bank["w2"]
+            return torch.ops.vllm.gguf_expert_dp4a(
+                x,
+                topk_ids,
+                topk_weights,
+                gate.raw_weights,
+                up.raw_weights,
+                gate.weight_ptrs,
+                gate.stat_ptrs,
+                up.weight_ptrs,
+                up.stat_ptrs,
+                down.weight_ptrs,
+                down.stat_ptrs,
+                gate.source_type,
+                down.source_type,
+                down.decoder,
+                self.num_experts,
+                gate.group,
+                self.intermediate_size,
+                self.raw_batches,
+                self.vector_bands,
+                down.down_vector_batches,
+                self.dp4a_batches,
+            )
         ids = topk_ids
         mask = None
         if layer.expert_map is not None:
