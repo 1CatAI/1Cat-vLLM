@@ -49188,3 +49188,34 @@ natural stop outputs (88/75 tokens). This does not meet 7.5 ms. Actual MTP4
 natural completion and whole-token forward-plus-sampling node tracing remain
 pending. Main advanced with HC/all-reduce/MTP changes during this campaign;
 do not relabel the fixed-revision pair as newer-main qualification.
+
+Actual MTP4 natural completion also passes after correcting the private
+record writer's mutable engine-config alias: original/candidate both stop
+at 77/76 tokens with matching IDs, matching contracts and identical native
+artifacts. Capacity is 32768 and memory 0.88; no MTP speed claim is made.
+Do not rerun completed M1 endpoint or teacher-forcing phases for this metadata
+recording fix. The normal-package whole-token Nsight/driver capture is running.
+
+The ordinary QSA-only complete-token capture now closes: all four ranks
+prepare twelve QSA layers and zero GDN/shared chains. Their retained M1
+model graph has 1277 kernels, 253 single-CTA kernels and 485 grids<=4.
+Two Nsight forwards per rank each record exactly 1277 graph kernels with
+matching name multisets. Each forward includes 32 more non-graph kernels
+(1309 total, 281 single-CTA); sampling adds fifteen kernels, twelve
+single-CTA. Full first-token totals are 1324 kernels, 293 single-CTA and
+528 grids<=4 on every rank. A separate first-to-second-forward interval
+query finds the same totals and zero unscoped kernels. No original-package
+whole-token trace is paired here; do not credit a delta against the earlier
+1349 record. Profiler timing is excluded from endpoint acceptance.
+
+Trace retry one fails ENOSPC before the capture trigger; move only owned
+compile caches/tmp/reports to tmpfs. Retry two exposes inherited
+CUDAGraph initialization overriding a patched allocator's retention flag.
+Patching both allocation and initialization passes a leased CUDA smoke and
+recovers the final Nsight capture/export. Preserve numerical/endpoint/MTP
+results; no production source change is needed for these instrumentation
+repairs. All owned GPU processes exit and the complete lease is released.
+Keep draft PR #961 unmerged: 11.572608 ms/token, 1324 kernels and 293
+single-CTA kernels do not meet the global targets, and later main changes
+remain unqualified. All rejected schedules and their scope limits stay
+in the campaign record; do not repeat their tuning.

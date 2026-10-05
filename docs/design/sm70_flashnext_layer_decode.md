@@ -16,14 +16,16 @@ rows exactly (KL mean/p99/max zero, top-1 100%, maximum logit error zero).
 Matched ordinary unprofiled endpoint medians are 11.797933→11.572608
 ms/token: 0.225325 ms, or 1.91%, saved. Six pairs of 513 output token IDs
 match; both natural requests stop (88/75 tokens) with matching IDs. Actual
-MTP4 natural completion and the whole-model token trace remain pending.
+MTP4 natural completion also passes: both arms stop at 77/76 tokens with
+matching IDs. The complete-token trace counts 1324 kernels and 293 single-CTA kernels
+per rank. The retained model graph contains 1277 kernels and 253 single-CTA
+kernels; both Nsight forward traces match driver counts exactly.
 
 Shared-expert default preparation has been removed after its model gate
 failed twice. The GDN convolution/core/norm prototype improves both research
 layers by 3.7–4.2 microseconds each, but ordinary full decode graph initialization
 cannot be qualified. Its default preparation has been removed. Explicit
-research preparation retains its native operator and helper. The matched endpoint improvement is recorded above; whole-model node
-tracing remains pending.
+research preparation retains its native operator and helper. Matched endpoint and whole-token node results are recorded above.
 
 ## Establishing a comparable endpoint
 
@@ -513,5 +515,54 @@ groups all pass. Maximum raw-logit difference remains diagnostic.
 
 Main advanced during this campaign with HC/all-reduce/MTP source changes.
 This fixed-revision pair is not qualification of that newer integration
-head. Actual MTP4 natural completion and complete-token driver/Nsight
-node evidence remain pending.
+head. Actual MTP4 natural completion passes at 32768 capacity and memory
+0.88: both arms stop at 77/76 tokens with matching IDs and identical native
+artifacts. This is a health check, not MTP throughput acceptance. The first
+recording attempt aborts because the constructor mutates the speculative
+configuration dictionary with a non-JSON ModelConfig; freezing the requested
+configuration before construction fixes the private record writer. Completed
+M1/teacher-forcing phases are retained. Complete-token driver/Nsight node
+evidence is recorded below.
+
+## Ordinary complete-token node evidence
+
+The default-QSA package is traced separately from endpoint timing after
+eight warmup output tokens, with 8192 input tokens and no MTP. Profiling
+retains original CUDA graphs and synchronizes the forward/sampling NVTX
+boundaries. These profiler timings do not establish TPOT.
+
+All four ranks prepare twelve QSA layers, zero shared chains and zero GDN
+chains. Their retained M1 model graph contains 1277 kernel nodes, 253
+single-CTA nodes and 485 grids of at most four CTAs. Nsight records exactly
+1277 graph kernels in each of two forwards on every rank; kernel-name
+multisets agree between the forwards.
+
+Each forward also includes 32 non-graph kernels, for 1309 total and 281
+single-CTA kernels. First-token sampling contributes fifteen kernels,
+twelve single-CTA kernels. The complete first token therefore contains
+1324 kernels, 293 single-CTA kernels and 528 grids of at most four CTAs
+on every rank. An independent SQLite query from first forward start to
+second forward start gives these same totals and zero kernels outside
+the two synchronized forward/sampling scopes. The 600-kernel and
+zero-single-CTA targets are not met. No matching original-package whole-token
+trace is recorded, so do not subtract these totals from the separately
+reported historical 1349 figure.
+
+The first trace startup aborts on disk exhaustion before the profiler
+trigger. Its retry moves compilation caches, temporary files and reports
+to an owned tmpfs directory. The first graph-retention patch changes only
+`CUDAGraph.__new__`; inherited `__init__(keep_graph=False)` overwrites it.
+Patching initialization too passes a held-lease CUDA graph replay/raw-node
+smoke, and the final capture/export succeeds. These are instrumentation
+failures, not kernel or quality failures. Endpoint, teacher-forcing and MTP
+health phases are retained without repetition.
+
+All seven prescribed structural directions have measurement records.
+HC, router/expert, QSA-core and projection/ordered-peer schedules regress
+their recorded scopes; shared fusion fails model distribution twice;
+ordinary GDN cannot qualify full-model AOT for its small research-layer
+gain. Keep these schedules out of normal loading. QSA projection/preparation
+remains the sole accepted default change. The measured 11.572608-ms/token
+endpoint, 1324 kernels and 293 single-CTA kernels leave all global targets
+unmet. The owned draft PR remains unmerged; newer main is not qualified by
+this fixed-source campaign.
