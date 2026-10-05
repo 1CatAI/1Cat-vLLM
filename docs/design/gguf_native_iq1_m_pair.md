@@ -10,7 +10,8 @@ Use the existing llama.cpp-derived 2048-entry IQ1 lattice codebook and
 its retained MIT attribution. Decode d, subscale and grid/delta in FP32
 before the final FP16 operand conversion. The shared-A skeleton, FP32
 MMA accumulation/reduction and fused epilogue remain unchanged. Only
-IQ1_M/IQ2_S enters raw dispatch; model admission remains canonical.
+IQ1_M/IQ2_S enters raw dispatch; model capability requires the measured
+SM70 FP16 M8/N4352/K5120 shape.
 
 Ten CPU storage/cursor checks pass, including all eight split-K starts.
 A real N64/K5120 gate sample preserves 71,680 original bytes and 327,680
@@ -27,5 +28,7 @@ At stable secondary1530/877MHz,300W,16MiB cold-L2 graph ABBA, layer13
 native64.512us versus canonical90.112us. Original12,011,520-byte payload
 gives186.2GB/s versus133.3GB/s. The isolated single-layer saving is
 25.600us; no end-to-end result is claimed. Admit only the measured
-SM70 FP16 M8/N4352/K5120 orientation. Installed prepared-layer checks
-and fixed1290MHz comparison are pending.
+SM70 FP16 M8/N4352/K5120 orientation. The installed prepared-layer capability, official numerical and all
+runtime-M graph checks pass. All16 native libraries are bitwise identical
+to the qualified prototype wheel. Fixed1290MHz comparison remains queued
+and will be reported separately.
