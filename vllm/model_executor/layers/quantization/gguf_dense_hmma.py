@@ -40,7 +40,10 @@ def prepare_segment_bank(projection, canonical, device):
         reason = "disabled_by_kernel_config"
     elif source not in _FORMATS:
         reason = "segment_format_not_supported"
-    elif not (k in (160, 1536, 2560) and 0 < n <= 4096 and n % 32 == 0):
+    elif (k, n) not in (
+        {(2560, width) for width in (128, 160, 256, 320, 1536, 2560, 3072, 3328, 4096)}
+        | {(160, 2560), (1536, 2560)}
+    ):
         reason = "segment_shape_has_no_calibration"
     elif projection.output_padding:
         reason = "segment_output_padding_not_qualified"
