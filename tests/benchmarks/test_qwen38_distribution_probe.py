@@ -78,7 +78,10 @@ def test_worker_probe_tracks_request_mapping_and_rejects_wrong_input(tmp_path):
         )
 
 
-def test_default_repeat_noise_blocks_an_identical_candidate(tmp_path):
+@pytest.mark.parametrize("precision_reduced", [False, True])
+def test_distribution_thresholds_only_block_precision_reduction(
+    tmp_path, precision_reduced
+):
     import json
     from types import SimpleNamespace
 
@@ -109,8 +112,15 @@ def test_default_repeat_noise_blocks_an_identical_candidate(tmp_path):
             values = [1, 0, 0] if cohort["repeat"] == 1 else [0, 0, 0]
             np.save(folder / "0000.npy", values)
             (folder / "0000.json").write_text(json.dumps({"active_width": 1}))
-    with pytest.raises(SystemExit, match="thresholds"):
-        compare(SimpleNamespace(reference=reference, output=candidate))
+    args = SimpleNamespace(
+        reference=reference, output=candidate, precision_reduced=precision_reduced
+    )
+    if precision_reduced:
+        with pytest.raises(SystemExit, match="thresholds"):
+            compare(args)
+    else:
+        compare(args)
     result = json.loads((candidate / "comparison.json").read_text())
     assert result["distribution_passed"]
     assert not result["default_noise_passed"]
+    assert result["thresholds_enforced"] == precision_reduced

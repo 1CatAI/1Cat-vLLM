@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from multiprocessing.connection import Connection
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
@@ -316,6 +316,7 @@ class PleOffloadWorkerHandle:
     proc: Any
     death_writer: Connection | None
     ready_pipe_reader: Connection | None
+    row_readers: dict[str, Any] = field(default_factory=dict)
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
@@ -458,6 +459,7 @@ class PleOffloadWorker:
                 f"{message.get('error', 'unknown error')}"
             )
         layer_names = message["layer_names"]
+        handle.row_readers = message.get("row_readers", {})
         logger.info(
             "Worker ready - %d PleOffloadLayer(s): %s",
             len(layer_names),
@@ -530,6 +532,7 @@ class PleOffloadWorker:
                 {
                     "status": PleOffloadWorker.READY_STR,
                     "layer_names": sorted(runner.layer_names),
+                    "row_readers": vllm_config.kernel_config.ple_disk_row_readers,
                 }
             )
             ready_writer.close()

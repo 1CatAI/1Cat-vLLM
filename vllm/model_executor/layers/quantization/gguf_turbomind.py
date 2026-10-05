@@ -11,6 +11,7 @@ from torch.nn import Module, Parameter
 
 from vllm.model_executor.kernels.gguf import (
     GGUFOperatorCapability,
+    decoder_family,
     dense_fp16_cache_capabilities,
 )
 from vllm.model_executor.kernels.linear import (
@@ -134,6 +135,180 @@ direct_register_custom_op(
     op_func=_prepared_gguf_projection,
     fake_impl=_prepared_gguf_projection_fake,
 )
+
+
+def _prepared_gguf_mixed_projection(
+    x: torch.Tensor,
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
+    cache_offset = blas_offset = 0
+    policies = []
+    for spec in specs:
+        cache_count, blas_count = spec[-2:]
+        policies.append(
+            (
+                cache_bands[cache_offset : cache_offset + cache_count],
+                blas_bands[blas_offset : blas_offset + blas_count],
+            )
+        )
+        cache_offset += cache_count
+        blas_offset += blas_count
+    # Retain the calibrated per-projection policy outside measured target
+    # verification sizes. This decision must use actual M inside the op.
+    direct = rows.shape[0] in (5, 20) and all(
+        not _supports_band(rows.shape[0], cb) and not _supports_band(rows.shape[0], bb)
+        for cb, bb in policies
+    )
+    if not direct:
+        outputs = [
+            _prepared_gguf_projection(
+                x,
+                c,
+                s,
+                cache,
+                spec[0],
+                spec[1],
+                spec[2],
+                spec[3],
+                spec[4],
+                spec[5],
+                spec[6],
+                cb,
+                bb,
+            )
+            for c, s, cache, spec, (cb, bb) in zip(
+                codes, stats, caches, specs, policies
+            )
+        ]
+        return torch.cat(outputs, dim=-1)
+    total = sum(spec[6] for spec in specs)
+    output = torch.empty((rows.shape[0], total), dtype=x.dtype, device=x.device)
+    offset = 0
+    for c, s, spec in zip(codes, stats, specs):
+        family, decoder, group, k_ld, q_ld, output_size, logical_size = spec[:7]
+        destination = output[:, offset : offset + logical_size]
+        if family == 0:
+            torch.ops._C.gguf_affine_gemm_sm70_out(
+                destination, rows, c, s, decoder, k_ld, q_ld, group
+            )
+        elif family == 1:
+            torch.ops._C.gguf_lut4_gemm_sm70_out(
+                destination, rows, c, s, decoder, k_ld, q_ld, group
+            )
+        else:
+            torch.ops._C.gguf_lattice_gemm_sm70_out(
+                destination, rows, c, s, decoder, k_ld, q_ld, group
+            )
+        offset += logical_size
+    return output.reshape(*x.shape[:-1], total)
+
+
+def _prepared_gguf_mixed_projection_fake(
+    x: torch.Tensor,
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    total = sum(descriptors[6::9])
+    return torch.empty((*x.shape[:-1], total), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="prepared_gguf_mixed_projection",
+    op_func=_prepared_gguf_mixed_projection,
+    fake_impl=_prepared_gguf_mixed_projection_fake,
+)
+
+
+def mixed_projection_capabilities(projections):
+    """Declare output-view eligibility independently of quantization family."""
+    if len(projections) < 2 or any(p.kernel is None for p in projections):
+        # An imported fallback format may not have a canonical family at all.
+        # Its existing projection admission carries the rejection reason.
+        return ()
+    capabilities = []
+    for projection in projections:
+        reason = projection.rejection_reason
+        if projection.kernel is None:
+            reason = reason or "projection_not_prepared"
+        elif projection.output_padding:
+            reason = "mixed_output_has_padded_projection"
+        elif projection.logical_output_size % 32:
+            reason = "mixed_output_cuts_output_pack"
+        for m in (5, 20):
+            capabilities.append(
+                GGUFOperatorCapability(
+                    decoder_family(projection.source_type),
+                    quant_type_name(projection.source_type),
+                    "prepared_gguf_mixed_projection",
+                    True,
+                    min_m=m,
+                    max_m=m,
+                    reason=reason,
+                )
+            )
+    return tuple(capabilities)
+
+
+def apply_prepared_gguf_projections(x, projections):
+    capabilities = mixed_projection_capabilities(projections)
+    if not capabilities or any(c.reason is not None for c in capabilities):
+        outputs = [projection(x) for projection in projections]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+    codes: list[torch.Tensor] = []
+    stats: list[torch.Tensor] = []
+    caches: list[torch.Tensor | None] = []
+    descriptors: list[int] = []
+    cache_bands: list[int] = []
+    blas_bands: list[int] = []
+    for projection in projections:
+        kernel = projection.kernel
+        config = kernel.config
+        if isinstance(config, Sm70GgufAffineConfig):
+            family, decoder = 0, kernel.bits
+        elif isinstance(config, Sm70GgufLut4Config):
+            family, decoder = 1, kernel.lut_id
+        else:
+            family, decoder = 2, kernel.source_type
+        cb = _admitted_bands(projection.cache_capabilities)
+        bb = _admitted_bands(
+            tuple(
+                c
+                for c in getattr(kernel, "operator_capabilities", ())
+                if "blas" in c.operator
+            )
+        )
+        codes.append(projection.codes)
+        stats.append(projection.stats)
+        caches.append(projection.fp16_cache)
+        descriptors.extend(
+            (
+                family,
+                decoder,
+                config.group_size,
+                projection.gguf_tm_k_ld,
+                projection.gguf_tm_q_ld,
+                config.partition_weight_shape[1],
+                projection.logical_output_size,
+                len(cb),
+                len(bb),
+            )
+        )
+        cache_bands.extend(cb)
+        blas_bands.extend(bb)
+    return torch.ops.vllm.prepared_gguf_mixed_projection(
+        x, codes, stats, caches, descriptors, cache_bands, blas_bands
+    )
 
 
 def _admitted_bands(capabilities):

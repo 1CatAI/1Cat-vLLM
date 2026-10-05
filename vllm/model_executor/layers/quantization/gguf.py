@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
+from dataclasses import asdict
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -644,6 +645,7 @@ class GGUFLinearMethod(LinearMethodBase):
         ):
             qweight = layer.qweight
             from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                mixed_projection_capabilities,
                 prepare_gguf_projections,
             )
 
@@ -669,6 +671,9 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
+            ]
+            self.native_admission["mixed_projection_operators"] = [
+                asdict(c) for c in mixed_projection_capabilities(projections)
             ]
             if any(projection.kernel is not None for projection in projections):
                 layer.gguf_tm_projections = torch.nn.ModuleList(projections)
@@ -794,8 +799,11 @@ class GGUFLinearMethod(LinearMethodBase):
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
         if self.canonical_projections:
-            outputs = [projection(x) for projection in layer.gguf_tm_projections]
-            out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+            from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                apply_prepared_gguf_projections,
+            )
+
+            out = apply_prepared_gguf_projections(x, layer.gguf_tm_projections)
             if bias is not None:
                 out.add_(bias)
             return out
