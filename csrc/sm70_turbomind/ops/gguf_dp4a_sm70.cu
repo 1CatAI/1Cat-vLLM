@@ -99,7 +99,9 @@ void launch_gate_up(torch::Tensor out, torch::Tensor activation,
                     torch::Tensor ids, torch::Tensor gate, torch::Tensor up,
                     bool activated, int lanes) {
   if (out.scalar_type() == torch::kUInt8) {
-    if (lanes == 4)
+    if (lanes == 32)
+      launch_quantized_gate_up<Type, Index, 32>(out, activation, ids, gate, up);
+    else if (lanes == 4)
       launch_quantized_gate_up<Type, Index, 4>(out, activation, ids, gate, up);
     else if (lanes == 8)
       launch_quantized_gate_up<Type, Index, 8>(out, activation, ids, gate, up);
@@ -282,7 +284,8 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
   const int n = gate.size(1), top_k = ids.size(1);
   const bool quantized = out.scalar_type() == torch::kUInt8;
   TORCH_CHECK(lanes_per_row == 16 ||
-                  (quantized && (lanes_per_row == 4 || lanes_per_row == 8)),
+                  (quantized && (lanes_per_row == 4 || lanes_per_row == 8 ||
+                                 lanes_per_row == 32)),
               "Unsupported expert integer-dot row partition");
   TORCH_CHECK(
       out.device() == activation.device() && out.is_contiguous() &&
