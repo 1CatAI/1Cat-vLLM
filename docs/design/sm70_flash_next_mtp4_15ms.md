@@ -765,3 +765,13 @@ M4 0.861030 -> 0.784558 ms; M5 0.862136 -> 0.786964 ms. Input scales zero,
 infinity, NaNs and excluded padding pass at M1/M4/M5/M16/M128. The approximately
 0.078-ms local gain is not a complete-model speed claim. Prepare it on the
 owned default path, with model/C4 qualification required before merging.
+
+The TP4 real-weight FC screen passes: four steps [M5,M1,M1,M1], including
+both Gemma norms, both FP16 projections and residual addition, measure
+0.600678 -> 0.545341 ms (rank-max median of seven alternating graph trials).
+Moving addition ahead of gather preserves bytes at input scales zero, 0.03,
+one and three. Prepare the default SM70 small-graph route using the existing
+unquantized ColumnParallelLinear projections and a single feature gather.
+Other devices, quantized or LoRA wrappers, batch-invariant mode and large
+prefill retain the original path. Nine CPU FC/stage-local tests pass. This
+0.055337-ms operator gain remains separate from complete-round admission.

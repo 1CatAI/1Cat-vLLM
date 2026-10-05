@@ -421,24 +421,30 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Embedding branch: pre-norm -> fc_embedding -> [T, H].
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-        inputs_embeds = self.fc_embedding(inputs_embeds)
+        from .sm70_mtp_fc import maybe_combine_fc
 
-        # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-        # the main model truly emits the pre-final-mixer multi stream
-        # on the first step; subsequent steps reuse the prior draft
-        # step's multi stream).
-        num_tokens = hidden_states.shape[0]
-        hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-            num_tokens, hc_count, hidden_size
-        )
-        hidden_states = self.fc_hidden(hidden_states)
-        # Add the embedding residual to every branch, then fold back
-        # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-        hidden_states = hidden_states.flatten(-2)
+        combined = maybe_combine_fc(self, inputs_embeds, hidden_states)
+        if combined is not None:
+            hidden_states = combined
+        else:
+            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            inputs_embeds = self.fc_embedding(inputs_embeds)
+
+            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
+            # the main model truly emits the pre-final-mixer multi stream
+            # on the first step; subsequent steps reuse the prior draft
+            # step's multi stream).
+            num_tokens = hidden_states.shape[0]
+            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+                num_tokens, hc_count, hidden_size
+            )
+            hidden_states = self.fc_hidden(hidden_states)
+            # Add the embedding residual to every branch, then fold back
+            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
+            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+            hidden_states = hidden_states.flatten(-2)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
