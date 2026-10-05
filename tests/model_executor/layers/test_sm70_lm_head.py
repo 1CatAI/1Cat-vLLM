@@ -207,9 +207,12 @@ def test_disabled_lm_head_routes_prepare_nothing(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("max_seqs", "expected"), [(1, 8), (2, 16), (4, 32), (8, 64), (16, 64)]
 )
-def test_qpn8_capacity_follows_dflash_verifier_width(monkeypatch, max_seqs, expected):
+@pytest.mark.parametrize("method", ["dflash", "dflash2"])
+def test_qpn8_capacity_follows_dflash_verifier_width(
+    monkeypatch, max_seqs, expected, method
+):
     config = SimpleNamespace(
-        speculative_config=SimpleNamespace(method="dflash2", num_speculative_tokens=7),
+        speculative_config=SimpleNamespace(method=method, num_speculative_tokens=7),
         scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
     )
     monkeypatch.setattr(
