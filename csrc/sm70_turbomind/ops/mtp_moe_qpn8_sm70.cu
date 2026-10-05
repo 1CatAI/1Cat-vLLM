@@ -20,11 +20,22 @@ namespace {
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
+template <bool Integer>
 __device__ __forceinline__ void load_weights(const uint8_t* codes, half scale,
                                              half2* weights) {
   const uint4 q = *reinterpret_cast<const uint4*>(codes);
-  fp8x8_to_half2x4_fast(make_uint2(q.x, q.y), weights);
-  fp8x8_to_half2x4_fast(make_uint2(q.z, q.w), weights + 4);
+  if constexpr (Integer) {
+    const auto* bytes = reinterpret_cast<const int8_t*>(&q);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int first = (i / 4) * 8 + i % 4;
+      weights[i] = __halves2half2(__int2half_rn(int(bytes[first])),
+                                  __int2half_rn(int(bytes[first + 4])));
+    }
+  } else {
+    fp8x8_to_half2x4_fast(make_uint2(q.x, q.y), weights);
+    fp8x8_to_half2x4_fast(make_uint2(q.z, q.w), weights + 4);
+  }
   const half2 s = __halves2half2(scale, scale);
 #pragma unroll
   for (int i = 0; i < 8; ++i) weights[i] = __hmul2(weights[i], s);
@@ -39,6 +50,7 @@ __device__ __forceinline__ void accumulate(float* c, uint4 a, uint4 b,
   DRAFT_MMA(c, b.z, b.w, w[6], w[7]);
 }
 
+template <bool Integer>
 __global__ __launch_bounds__(256, 1) void draft_qpn8_up(const half* x,
                                                         const uint8_t* codes,
                                                         const half* scales,
@@ -61,9 +73,9 @@ __global__ __launch_bounds__(256, 1) void draft_qpn8_up(const half* x,
       const uint4 a = *reinterpret_cast<const uint4*>(input);
       const uint4 b = *reinterpret_cast<const uint4*>(input + 8);
       half2 wg[8], wu[8];
-      load_weights(codes + offset + (blockIdx.x * 160 + g) * 512 + lane * 16,
-                   gs, wg);
-      load_weights(
+      load_weights<Integer>(
+          codes + offset + (blockIdx.x * 160 + g) * 512 + lane * 16, gs, wg);
+      load_weights<Integer>(
           codes + offset + ((blockIdx.x + 5) * 160 + g) * 512 + lane * 16, us,
           wu);
       accumulate(gate, a, b, wg);
@@ -94,6 +106,7 @@ __global__ __launch_bounds__(256, 1) void draft_qpn8_up(const half* x,
   }
 }
 
+template <bool Integer>
 __global__ __launch_bounds__(320, 1) void draft_qpn8_down(
     const half* activation, const uint8_t* codes, const half* scales,
     const int* ids, const float* probabilities, half* output) {
@@ -112,8 +125,8 @@ __global__ __launch_bounds__(320, 1) void draft_qpn8_down(
       const uint4 a = *reinterpret_cast<const uint4*>(input);
       const uint4 b = *reinterpret_cast<const uint4*>(input + 8);
       half2 w[8];
-      load_weights(codes + offset + (blockIdx.x * 10 + g) * 512 + lane * 16, s,
-                   w);
+      load_weights<Integer>(
+          codes + offset + (blockIdx.x * 10 + g) * 512 + lane * 16, s, w);
       accumulate(accum, a, b, w);
     }
   }
@@ -136,6 +149,7 @@ __global__ __launch_bounds__(320, 1) void draft_qpn8_down(
 }
 #undef DRAFT_MMA
 
+template <bool Integer>
 void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
          torch::Tensor w13, torch::Tensor s13, torch::Tensor w2,
          torch::Tensor s2, torch::Tensor ids, torch::Tensor probabilities) {
@@ -161,11 +175,11 @@ void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
               s13.sizes() == at::IntArrayRef({512, 320}) &&
               s2.sizes() == at::IntArrayRef({512, 2560}));
   const auto stream = at::cuda::getCurrentCUDAStream();
-  draft_qpn8_up<<<dim3(5, m * 10), 256, 0, stream>>>(
+  draft_qpn8_up<Integer><<<dim3(5, m * 10), 256, 0, stream>>>(
       reinterpret_cast<const half*>(x.data_ptr()), w13.data_ptr<uint8_t>(),
       reinterpret_cast<const half*>(s13.data_ptr()), ids.data_ptr<int>(),
       reinterpret_cast<half*>(activation.data_ptr()));
-  draft_qpn8_down<<<dim3(80, m), 320, 0, stream>>>(
+  draft_qpn8_down<Integer><<<dim3(80, m), 320, 0, stream>>>(
       reinterpret_cast<const half*>(activation.data_ptr()),
       w2.data_ptr<uint8_t>(), reinterpret_cast<const half*>(s2.data_ptr()),
       ids.data_ptr<int>(), probabilities.data_ptr<float>(),
@@ -180,4 +194,19 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "Tensor x, Tensor w13, Tensor s13, Tensor w2, Tensor s2, Tensor ids, "
       "Tensor probabilities) -> ()");
 }
-TORCH_LIBRARY_IMPL(_C, CUDA, m) { m.impl("sm70_mtp_moe_qpn8_chain_out", &run); }
+TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("sm70_mtp_moe_qpn8_chain_out", &run<false>);
+}
+
+// The INT8 candidate uses the same byte layout and FP16 MMA operands. It is
+// isolated from serving; model distribution and acceptance admission is
+// pending.
+TORCH_LIBRARY_FRAGMENT(_C, m) {
+  m.def(
+      "sm70_mtp_moe_int8_chain_out(Tensor(a!) output, "
+      "Tensor(b!) activation, Tensor x, Tensor codes13, Tensor scales13, "
+      "Tensor codes2, Tensor scales2, Tensor ids, Tensor probabilities) -> ()");
+}
+TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("sm70_mtp_moe_int8_chain_out", &run<true>);
+}

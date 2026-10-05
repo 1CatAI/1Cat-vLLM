@@ -129,3 +129,29 @@ class DraftExpertQPN8CandidateWorker(Worker):
             raise RuntimeError(
                 f"Draft QPN8 expert preparation missed layer: {prepared}"
             )
+
+
+class DraftExpertINT8CandidateWorker(Worker):
+    """Research-only integer weights, retaining FP16 compute and target logits."""
+
+    def load_model(self, *, load_dummy_weights=False):
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
+            prepare_draft_expert_qpn8_probe,
+        )
+
+        prepared = prepare_draft_expert_qpn8_probe(
+            self.model_runner.speculator.model, integer=True
+        )
+        if prepared != 1:
+            raise RuntimeError(f"Draft INT8 preparation missed layer: {prepared}")
+
+
+class DraftFCGatherControlWorker(Worker):
+    """Retain two draft FC gathers with all other defaults and startup fixes."""
+
+    def load_model(self, *, load_dummy_weights=False):
+        from vllm.models.qwen4_exp.nvidia import sm70_mtp_fc
+
+        sm70_mtp_fc.maybe_combine_fc = lambda *args: None
+        super().load_model(load_dummy_weights=load_dummy_weights)

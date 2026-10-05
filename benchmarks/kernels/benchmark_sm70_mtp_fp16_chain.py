@@ -24,8 +24,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--qpn8", action="store_true")
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument("--qpn8", action="store_true")
+    formats.add_argument("--int8", action="store_true")
     args = parser.parse_args()
+    quantized = args.qpn8 or args.int8
     torch.set_num_threads(1)
     torch.manual_seed(20261005)
     saved = load_file(str(args.weights))
@@ -35,27 +38,44 @@ def main():
     w2 = torch.zeros(512, 2560, 160, device="cuda", dtype=torch.float16)
     w13[:50].copy_(saved["w13"])
     w2[:50].copy_(saved["w2"])
-    if args.qpn8:
+    if quantized:
         from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
             prepare_channel_qpn8_weight,
         )
 
-        codes13, scales13 = prepare_channel_qpn8_weight(w13.view(-1, 2560))
-        codes2, scales2 = prepare_channel_qpn8_weight(w2.view(-1, 160))
+        prepare = prepare_channel_qpn8_weight
+        if args.int8:
+            from vllm.models.qwen4_exp.nvidia.sm70_mtp_int8 import (
+                prepare_int8_expert_weight,
+            )
+
+            prepare = prepare_int8_expert_weight
+        codes13, scales13 = prepare(w13.view(-1, 2560))
+        codes2, scales2 = prepare(w2.view(-1, 160))
         quantized13, quantized2 = torch.empty_like(w13), torch.empty_like(w2)
         for dense, codes, scales, k in (
             (quantized13, codes13, scales13, 2560),
             (quantized2, codes2, scales2, 160),
         ):
             # Existing decoder emits [K,N], while MoE weights are [E,N,K].
-            decoded = torch.empty_like(codes, dtype=torch.float16)
-            torch.ops._C.fp8_qpn8_dequantize_sm70_out(decoded, codes, scales)
-            dense.copy_(decoded.t().reshape_as(dense))
+            if args.int8:
+                # Independent row-major quantization oracle; do not decode the
+                # packed layout used by the candidate.
+                source = w13 if k == 2560 else w2
+                rows = source.view(-1, k)
+                scale = rows.float().abs().amax(-1, keepdim=True) / 127
+                scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+                integer = (rows.float() / scale).round().clamp(-127, 127).half()
+                dense.copy_((integer * scale.half()).reshape_as(dense))
+            else:
+                decoded = torch.empty_like(codes, dtype=torch.float16)
+                torch.ops._C.fp8_qpn8_dequantize_sm70_out(decoded, codes, scales)
+                dense.copy_(decoded.t().reshape_as(dense))
         scales13 = scales13.view(512, 320)
         scales2 = scales2.view(512, 2560)
     arms = (
         ("control", "fused", "quantized_reference")
-        if args.qpn8
+        if quantized
         else ("control", "fused")
     )
     stages = []
@@ -102,8 +122,13 @@ def main():
     def fused():
         for x, ids, probabilities, _, b in stages:
             f = b["fused"]
-            if args.qpn8:
-                torch.ops._C.sm70_mtp_moe_qpn8_chain_out(
+            if quantized:
+                chain = (
+                    torch.ops._C.sm70_mtp_moe_int8_chain_out
+                    if args.int8
+                    else torch.ops._C.sm70_mtp_moe_qpn8_chain_out
+                )
+                chain(
                     f["out"],
                     f["activation"],
                     x,
@@ -120,7 +145,7 @@ def main():
                 )
 
     graphs = {"control": capture(control), "fused": capture(fused)}
-    if args.qpn8:
+    if quantized:
         graphs["quantized_reference"] = capture(lambda: control("quantized_reference"))
     checks = []
     for scale in (0.0, 0.03, 1.0, 3.0):
@@ -151,13 +176,13 @@ def main():
                     .item(),
                 )
             )
-            if args.qpn8:
+            if quantized:
                 oracle = b["quantized_reference"]["out"]
                 relative = (
                     (oracle.float() - result.float()).norm()
                     / oracle.float().norm().clamp_min(1e-12)
                 ).item()
-                assert relative < 0.001, "Packed QPN8 layout/oracle mismatch"
+                assert relative < 0.001, "Packed byte layout/oracle mismatch"
                 values[-1]["dequantized_oracle_relative_l2"] = relative
                 values[-1]["dequantized_oracle_max_error"] = (
                     (oracle - result).abs().max().item()
@@ -168,16 +193,18 @@ def main():
         order = ("control", "fused") if trial % 2 else ("fused", "control")
         for arm in order:
             trials[arm].append(elapsed(graphs[arm]))
-        if args.qpn8:
+        if quantized:
             trials["quantized_reference"].append(elapsed(graphs["quantized_reference"]))
     result = dict(
         model_admission=False,
-        candidate_format="channel_QPN8" if args.qpn8 else "FP16",
+        candidate_format=("channel_INT8" if args.int8 else "channel_QPN8")
+        if quantized
+        else "FP16",
         shapes=[5, 1, 1, 1],
         layers_per_step=1,
         control_launches=16,
         fused_launches=8,
-        w13_ctas_per_m1=50 if args.qpn8 else 100,
+        w13_ctas_per_m1=50 if quantized else 100,
         w13_warps_per_cta=8,
         w2_ctas_per_m1=80,
         w2_warps_per_cta=10,
@@ -219,7 +246,7 @@ def main():
             )
 
     result["stage_medians_ms"] = {}
-    for stage in () if args.qpn8 else (1, 2):
+    for stage in () if quantized else (1, 2):
         pair = {
             "control": capture(lambda s=stage: control_stage(s)),
             "fused": capture(lambda s=stage: fused_stage(s)),

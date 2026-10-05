@@ -805,3 +805,18 @@ Coverage is descriptive only. Compare its head against the current parallel
 full-head selector, and admit only a head-time reduction plus at most one
 percentage point of acceptance loss on the frozen eight-by-600 cohort.
 The earlier corpus-only 32K and 64K candidates remain rejected.
+
+The C4 default subsequently reaches the original error directly: QPN8 draft
+head packing at graph capture needs another 152 MiB with only 84.62 MiB free.
+Prepare the same head immediately after checkpoint loading and target-head
+sharing, before KV allocation or graph warmup; capture only reuses it.
+Do not reduce the cache or 256K service limit. C4 control disables only the new
+FC gather merge and retains this startup correction and all other defaults.
+
+A separate benchmark-only row-scaled symmetric INT8 expert pack reduces weight
+reconstruction relative L2 from E4M3's 2.64%/2.58% to 1.11%/0.71% for the
+fifty checkpoint experts' up/down weights. It retains byte reads and FP16
+MMA operands with FP32 sums. The four-step layer graph measures
+0.435784 -> 0.183962 ms, while an independent row-major integer dequantization
+oracle agrees within relative L2 0.000197. This is not model distribution or
+acceptance admission and installs no serving default.
