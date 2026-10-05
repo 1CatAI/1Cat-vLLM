@@ -114,6 +114,7 @@ def native_gated_pair_capabilities(
 ) -> tuple[GGUFOperatorCapability, ...]:
     """Joint original-byte readers; only measured M8 shapes are admitted."""
     if source_types not in (
+        (18, 18),
         (21, 23),
         (23, 21),
         (18, 21),
