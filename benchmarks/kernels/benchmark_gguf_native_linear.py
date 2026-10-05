@@ -31,7 +31,10 @@ def main():
     parser.add_argument("--layers", type=int, nargs="+")
     parser.add_argument("--nvfp4-model", type=Path)
     parser.add_argument("--n64", action="store_true")
+    parser.add_argument("--canonical-qpn", action="store_true")
     args = parser.parse_args()
+    if args.canonical_qpn:
+        args.n64 = True
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -59,6 +62,8 @@ def main():
     for layer in layers:
         tensor = tensors[f"blk.{layer}.ffn_down.weight"]
         source_type = int(tensor.tensor_type)
+        if args.canonical_qpn and source_type not in (10, 12):
+            continue
         assert source_type in _SOURCE_PACKERS
         # Row-parallel TP4 splits complete source blocks along K.
         raw = np.ascontiguousarray(tensor.data[:, : tensor.data.shape[1] // 4])
@@ -94,12 +99,44 @@ def main():
             block_n // 64, 2, 512, dtype=torch.float32, device="cuda"
         )
         block_counters = torch.zeros(block_n // 64, dtype=torch.int32, device="cuda")
+        block_projections = None
+        block_reference = None
+        if args.canonical_qpn:
+            block_source = torch.from_numpy(
+                np.ascontiguousarray(raw[:block_n, :block_size])
+            ).cuda()
+            block_projections = prepare_gguf_projections(
+                [(block_source, source_type)], torch.float16, True, 8
+            )
+            block_reference = torch.empty(
+                256, block_n, dtype=torch.float16, device="cuda"
+            )
+            bp = block_projections[0]
+            torch.ops._C.gguf_affine_dequantize_sm70_out(
+                block_reference,
+                bp.codes,
+                bp.stats,
+                bp.kernel.bits,
+                bp.kernel.config.group_size,
+            )
         for begin in range(0, 256, 8):
             basis.zero_()
             basis[:, begin : begin + 8].copy_(
                 torch.eye(8, dtype=torch.float16, device="cuda")
             )
-            if args.n64:
+            if args.canonical_qpn:
+                bp = block_projections[0]
+                torch.ops._C.gguf_canonical_linear_n64_sm70_out(
+                    block_out,
+                    basis,
+                    bp.codes,
+                    bp.stats,
+                    block_partials,
+                    block_counters,
+                    bp.kernel.bits,
+                    bp.kernel.config.group_size,
+                )
+            elif args.n64:
                 torch.ops._C.gguf_native_linear_n64_sm70_out(
                     block_out,
                     basis,
@@ -114,7 +151,9 @@ def main():
                 )
             torch.testing.assert_close(
                 block_out,
-                official[:block_n, begin : begin + 8].T.half(),
+                block_reference[begin : begin + 8]
+                if args.canonical_qpn
+                else official[:block_n, begin : begin + 8].T.half(),
                 rtol=0,
                 atol=0,
             )
@@ -129,8 +168,21 @@ def main():
             source_type=source_type,
             partials=partials,
             counters=counters,
+            projections=projections,
         ):
-            if args.n64:
+            if args.canonical_qpn:
+                p = projections[0]
+                torch.ops._C.gguf_canonical_linear_n64_sm70_out(
+                    out,
+                    x,
+                    p.codes,
+                    p.stats,
+                    partials,
+                    counters,
+                    p.kernel.bits,
+                    p.kernel.config.group_size,
+                )
+            elif args.n64:
                 torch.ops._C.gguf_native_linear_n64_sm70_out(
                     out, x, records, partials, counters, source_type
                 )
@@ -182,7 +234,11 @@ def main():
         ):
             before = clocks()
             us = cold_graph(lambda call=call, rows=rows: call(rows), flush)
-            read_bytes = raw.nbytes if label == "native" else canonical_bytes
+            read_bytes = (
+                raw.nbytes
+                if label == "native" and not args.canonical_qpn
+                else canonical_bytes
+            )
             timings.append(
                 {
                     "route": label,
@@ -253,10 +309,14 @@ def main():
                 "k": k,
                 "source_bytes": raw.nbytes,
                 "n64": args.n64,
+                "canonical_qpn": args.canonical_qpn,
                 "canonical_bytes": canonical_bytes,
                 "checks": checks,
                 "graph_bitwise_equal": True,
-                "official_half_operand_basis_equal": True,
+                "operand_basis_equal": True,
+                "operand_basis_reference": "canonical"
+                if args.canonical_qpn
+                else "official",
                 "abba": timings,
                 "nvfp4_reference": nvfp4_reference,
             }

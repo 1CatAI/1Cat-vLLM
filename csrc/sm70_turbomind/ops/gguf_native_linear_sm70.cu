@@ -9,14 +9,63 @@
 #include "gguf_pair_shared_a_sm70.cuh"
 
 namespace vllm::sm70_gguf {
+// Consume the already prepared canonical stream. No source superblock or
+// nested scale unpacking is repeated in the main loop. Operand conversion is
+// the same transform used by canonical GEMM/dequantization.
+template <int Bits, int Group>
+struct CanonicalAffineReader {
+  static constexpr int kBookBytes = 0;
+  using Packet = std::conditional_t<Bits == 2, uint16_t, uint32_t>;
+  using Code =
+      std::conditional_t<Bits == 2, turbomind::uint2_t, turbomind::uint4_t>;
+  struct Record {
+    Packet packets[16];
+    uint32_t coefficients[128 / Group];
+  };
+  const Packet* packets;
+  const uint32_t* coefficients;
+  int stat_stride;
+  __device__ CanonicalAffineReader(const uint8_t* source, const uint32_t* stats,
+                                   int n, int k, int tile, int first, int col) {
+    packets = reinterpret_cast<const Packet*>(source) +
+              int64_t{tile} * (k / 8) * 32 + first * 16 * 32 + col;
+    coefficients = stats + int64_t{first} * (128 / Group) * n + tile * 32 + col;
+    stat_stride = n;
+  }
+  __device__ static void initialize(uint8_t*) {}
+  __device__ Record load() {
+    Record record;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) record.packets[i] = packets[i * 32];
+#pragma unroll
+    for (int i = 0; i < 128 / Group; ++i)
+      record.coefficients[i] = coefficients[i * stat_stride];
+    packets += 16 * 32;
+    coefficients += (128 / Group) * stat_stride;
+    return record;
+  }
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t*) {
+    constexpr int octet = Segment * 2 + Fragment;
+    turbomind::Array<Code, 8> data[1][1];
+    reinterpret_cast<Packet&>(data[0][0]) = record.packets[octet];
+    turbomind::Array<uint32_t, 1> stats[1][1];
+    stats[0][0][0] = record.coefficients[(octet * 8) / Group];
+    turbomind::Array<half, 8> decoded[1][1];
+    turbomind::gemm::Transform_HMMA_SIMT_B::apply(decoded, 0, data, stats, 1);
+    return decoded[0][0];
+  }
+};
+
 // Two N32 subtiles share the pair's activation staging and codebook. Two
 // global K partitions expose 160 CTAs for N5120, with no separate reduction
 // launch. Partial sums remain FP32 until the last CTA writes the output.
-template <class Reader>
+template <class Reader, bool Canonical = false>
 __global__ __launch_bounds__(512, 2) void native_linear_n64_kernel(
     half* __restrict__ output, const half* __restrict__ input,
-    const uint8_t* __restrict__ weight, float* __restrict__ partials,
-    int* __restrict__ counters, int n, int k) {
+    const uint8_t* __restrict__ weight, const uint32_t* __restrict__ stats,
+    float* __restrict__ partials, int* __restrict__ counters, int n, int k) {
   constexpr int SplitK = 8, GlobalSplitK = 2;
   union alignas(16) Storage {
     uint8_t book[Reader::kBookBytes > 0 ? Reader::kBookBytes : 1];
@@ -37,7 +86,12 @@ __global__ __launch_bounds__(512, 2) void native_linear_n64_kernel(
   const int local_parts = parts / GlobalSplitK;
   const int first = global_first + warp * local_parts / SplitK;
   const int last = global_first + (warp + 1) * local_parts / SplitK;
-  Reader reader(weight, blockIdx.x * 2 + subtile, k / 256, first, col);
+  Reader reader = [&]() {
+    if constexpr (Canonical)
+      return Reader(weight, stats, n, k, blockIdx.x * 2 + subtile, first, col);
+    else
+      return Reader(weight, blockIdx.x * 2 + subtile, k / 256, first, col);
+  }();
   float accum[8] = {};
   for (int part = 0; part < (local_parts + SplitK - 1) / SplitK; ++part) {
     for (int vector = threadIdx.x; vector < SplitK * 8 * 16;
@@ -199,8 +253,26 @@ void launch_linear_n64(torch::Tensor output, torch::Tensor input,
   native_linear_n64_kernel<Reader><<<dim3(n / 64, 2), 512, 0, stream>>>(
       reinterpret_cast<half*>(output.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-      weight.data_ptr<uint8_t>(), partials.data_ptr<float>(),
+      weight.data_ptr<uint8_t>(), nullptr, partials.data_ptr<float>(),
       counters.data_ptr<int>(), n, k);
+}
+
+template <int Bits, int Group>
+void launch_canonical_linear(torch::Tensor output, torch::Tensor input,
+                             torch::Tensor weight, torch::Tensor stats,
+                             torch::Tensor partials, torch::Tensor counters,
+                             int n, int k, cudaStream_t stream) {
+  using namespace vllm::sm70_gguf;
+  using Reader = CanonicalAffineReader<Bits, Group>;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      native_linear_n64_kernel<Reader, true>,
+      cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  native_linear_n64_kernel<Reader, true><<<dim3(n / 64, 2), 512, 0, stream>>>(
+      reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<const uint8_t*>(weight.data_ptr<int32_t>()),
+      reinterpret_cast<const uint32_t*>(stats.data_ptr<int32_t>()),
+      partials.data_ptr<float>(), counters.data_ptr<int>(), n, k);
 }
 }  // namespace
 
@@ -332,5 +404,52 @@ void gguf_native_linear_sm70_out(torch::Tensor output, torch::Tensor input,
     default:
       TORCH_CHECK(false, "Unsupported GGUF native linear format");
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gguf_canonical_linear_n64_sm70_out(
+    torch::Tensor output, torch::Tensor input, torch::Tensor weight,
+    torch::Tensor stats, torch::Tensor partials, torch::Tensor counters,
+    int64_t bits, int64_t group_size) {
+  TORCH_CHECK(output.is_cuda() && input.is_cuda() && weight.is_cuda() &&
+                  stats.is_cuda() && partials.is_cuda() && counters.is_cuda() &&
+                  output.device() == input.device() &&
+                  weight.device() == input.device() &&
+                  stats.device() == input.device() &&
+                  partials.device() == input.device() &&
+                  counters.device() == input.device() &&
+                  output.is_contiguous() && input.is_contiguous() &&
+                  weight.is_contiguous() && stats.is_contiguous() &&
+                  partials.is_contiguous() && counters.is_contiguous() &&
+                  output.dim() == 2 && input.dim() == 2 && weight.dim() == 2 &&
+                  stats.dim() == 2 && output.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kInt32 &&
+                  stats.scalar_type() == torch::kInt32 &&
+                  partials.scalar_type() == torch::kFloat32 &&
+                  counters.scalar_type() == torch::kInt32,
+              "GGUF canonical linear requires FP16 CUDA matrices, prepared "
+              "int32 code/stat streams and FP32 reduction workspace");
+  const int64_t m = input.size(0), k = input.size(1), n = output.size(1);
+  TORCH_CHECK(m == 8 && output.size(0) == m && n > 0 && n % 64 == 0 && k > 0 &&
+                  k % 256 == 0 && n <= INT_MAX && k <= INT_MAX &&
+                  ((bits == 2 && group_size == 16) ||
+                   (bits == 4 && group_size == 32)) &&
+                  weight.sizes() == c10::IntArrayRef({k, n * bits / 32}) &&
+                  stats.sizes() == c10::IntArrayRef({k / group_size, n}) &&
+                  partials.sizes() == c10::IntArrayRef({n / 64, 2, 512}) &&
+                  counters.sizes() == c10::IntArrayRef({n / 64}),
+              "GGUF canonical linear requires M8/N64/K256 and U2G16/U4G32");
+  const c10::cuda::CUDAGuard guard(input.device());
+  const auto* properties = at::cuda::getDeviceProperties(input.get_device());
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "GGUF canonical linear requires SM70");
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  if (bits == 2)
+    launch_canonical_linear<2, 16>(output, input, weight, stats, partials,
+                                   counters, n, k, stream);
+  else
+    launch_canonical_linear<4, 32>(output, input, weight, stats, partials,
+                                   counters, n, k, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
