@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--prototype-iq2-xxs", action="store_true")
     parser.add_argument("--prototype-q2-k", action="store_true")
     parser.add_argument("--prototype-iq1-m", action="store_true")
+    parser.add_argument("--prototype-pure", action="store_true")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -55,6 +56,7 @@ def main():
                 args.prototype_iq2_xxs,
                 args.prototype_q2_k,
                 args.prototype_iq1_m,
+                args.prototype_pure,
             )
         )
         <= 1
@@ -69,7 +71,9 @@ def main():
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
         allowed = (
-            ((29, 22),)
+            ((18, 18), (23, 23))
+            if args.prototype_pure
+            else ((29, 22),)
             if args.prototype_iq1_m
             else ((10, 21),)
             if args.prototype_q2_k
@@ -125,6 +129,7 @@ def main():
             or args.prototype_iq2_xxs
             or args.prototype_q2_k
             or args.prototype_iq1_m
+            or args.prototype_pure
         ):
             from vllm.model_executor.layers.quantization.gguf_iq3_records import (
                 signed_index_records,
@@ -161,7 +166,7 @@ def main():
                 from vllm.model_executor.layers.quantization import gguf_iq2_xxs_records
 
                 packers[16] = gguf_iq2_xxs_records.pack_iq2_xxs_records
-            if args.prototype_q4_k or args.prototype_iq3xxs_iq4:
+            if args.prototype_q4_k or args.prototype_iq3xxs_iq4 or args.prototype_pure:
                 from vllm.model_executor.layers.quantization.gguf_iq4_native import (
                     pack_iq4_xs_records,
                 )
