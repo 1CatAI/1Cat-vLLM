@@ -35,5 +35,10 @@ versus canonical77.824us; layer12 IQ2_S/IQ2_XS native51.200–52.224us
 versus82.944us. Payload14,970,880 bytes gives292.4–298.4GB/s for
 IQ2_XS/IQ3_XXS; payload13,578,240 gives260.0–265.2GB/s for IQ2_S/IQ2_XS.
 Native relative L2 is0.000491–0.000525. Primary fixed-clock comparison
-is pending before merge. Model admission is prepared only for these two
+remains queued and will be reported separately. Model admission uses only these two
 measured SM70 FP16 M8/N4352/K5120 orientations.
+
+The complete latest-main installed wheel passes prepared-layer capability,
+official numerical and all runtime-M graph checks for layers11/16/12.
+Both qualified pair kernel SASS bodies and all five reader/skeleton source
+files are bitwise unchanged after the latest-main native rebuild.
