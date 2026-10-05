@@ -51,3 +51,47 @@ storage estimates, not a measured model allocation. Keeping both complete
 layouts would add about 571 MiB, exceeding the observed tightest rank's
 headroom. Integration therefore needs one resident weight representation and
 a shared FP16 prefill workspace, with actual memory validation before adoption.
+
+## Cold-cache operator measurements
+
+The normalized storage implementation passes 72 GPU checks on V100, including
+changed-input CUDA Graph replay, output subviews and fused FP16 SiLU/multiply.
+A synthetic IQ4 fused fixture initially overflowed FP16 in both the official
+oracle and the kernel; the bounded fixture fixes the test without changing
+kernel arithmetic. The official comparison itself passed before the finite
+assertion failed.
+
+Measurements below use the complete wheel from `c33d0179aa`, Torch 2.10,
+CUDA 12.8, a V100 at observed 1530 MHz / 877 MHz, TP4 tensor slices and FP32
+accumulation. Each operation follows a 32 MiB read/write cache eviction.
+External graph events exclude the eviction, but contribute a measured common
+boundary of about 3.07 us. Times retain that overhead; matched differences
+cancel it. Candidate times include activation quantization. Bandwidth from
+these raw event boundaries is conservative. These are operator results,
+not whole-model latency gains.
+
+| Projection | Local N/K | M5 control/candidate, us | M20 control/candidate, us |
+|---|---|---:|---:|
+|Q6_K QKV|2560/2560|24.58 / 24.58|29.70 / 34.82|
+|Q4_K Z|1536/2560|17.41 / 16.38|20.48 / 24.58|
+|Q6_K output|2560/1536|19.46 / 18.43|22.53 / 25.60|
+|Q4_K shared projection|160/2560|16.38 / 11.26|16.38 / 11.26|
+|IQ4_XS shared projection|160/2560|21.76 / 10.24|21.50 / 11.26|
+|Coalesced Q6_K QKV/Z|4096/2560|28.67 / 33.79|33.79 / 48.13|
+
+The large M20 and coalesced regressions are not selected by the model.
+The normalized implementation alone does not justify replacing all dense
+projections. Nsight Compute on the initial QKV kernel reports 47 registers,
+16.17% issue activity, 0.21 eligible warps per scheduler and substantial
+long-scoreboard waiting. Cooperative shared activation staging improves
+some measurements but leaves the large projections short of the target.
+
+The next variant reads raw Q6_K through the shared integer-dot header and
+uses the routed expert kernel's two-row, 16-lane K partition. It retains the
+original signed subgroup scales in integer sums, then multiplies by the
+original Half superblock scale and Q8 activation scale with FP32 accumulation.
+It avoids expanded weight bytes. Raw K256 blocks cannot generally restore a
+128-element GDN head permutation losslessly; that layout must keep a
+normalized representation. Raw cooperative reduction is explicitly rejected.
+No model dispatch selects the new variants until their measured bands and
+quality checks pass.
