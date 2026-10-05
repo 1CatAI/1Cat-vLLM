@@ -91,10 +91,10 @@ packaged comparison measures latest main’s coalesced N8704 canonical GEMM
 plus SiLU; it must pass independently before the native pair is admitted.
 
 Only eight layers have two IQ3_S FFN projections. Their source byte share is
-12.765% of all gate/up pairs. A 62.5us pair versus the recorded 76–81us
-canonical pair saves about 13.5–18.5us per eligible layer, approximately
-0.108–0.148ms across those eight layers. This is a projection estimate,
-not a measured full-round saving. The 40 mixed-type pairs account for
+12.765% of all gate/up pairs. The primary-machine packaged comparison below
+saves 20.48–21.50us per eligible layer, approximately 0.164–0.172ms across
+those eight layers. This is a projection estimate, not a measured full-round
+saving. The 40 mixed-type pairs account for
 62.286% of pair bytes; see the complete
 [source inventory](gguf_qwen38_iq3s_source_inventory.md).
 
@@ -114,7 +114,20 @@ research table used 1290/877MHz. Do not compare the two timing tables across
 clocks. Within its single ABBA session, the packaged canonical N8704 GEMM
 plus SiLU took 62.464us in both arms, versus 45.056us in both native arms.
 Native source-payload bandwidth is 425.0GB/s. This is installed-package
-validation; the primary-machine operator comparison remains pending.
+validation on the secondary machine.
+
+The same normal wheel also passes the primary-machine installed-operator
+check at steady SM/memory 1290/877MHz, 300W. Every ABBA arm records the
+same clocks. Canonical N8704 GEMM plus SiLU takes 70.656/69.632us; the native
+pair takes 49.152us in both arms. Native source/packed payload is 19,148,800
+bytes and payload bandwidth is 389.6GB/s. Canonical packed codes plus stats
+occupy 22,282,240 bytes, corresponding to 315.4/320.0GB/s. These payload
+ratios are distinct from NCU physical traffic. Native M8 relative L2 and
+maximum errors match the secondary-machine values above; other tested
+row counts again equal the canonical fallback bitwise. The retained
+same-clock NVFP4 research pair measurement is 51.200/52.224us with
+25,067,520 source bytes; it is a separate research run, rather than a third
+arm of this installed-package session.
 
 Latest-main baseline source `0e359c87d315931b89b7d5a774927f212d57f3b1`
 uses its normal `dev11+g0e359c87d3` wheel on four fully connected V100s,
@@ -212,7 +225,6 @@ checks runtime canonical fallbacks. Acquire the shared GPU lock and the
 selected device lock before running it. The complete source inventory is
 reproducible with `benchmark_gguf_quantization_inventory.py`.
 
-Latest-main end-to-end, graph-boundary ledger and secondary-machine packaged
-operator checks are recorded above. The primary-machine operator comparison
-and native-route natural termination check are pending. No end-to-end gain
-is claimed from isolated operator timings.
+Latest-main end-to-end, graph-boundary ledger and both machines' packaged
+operator checks are recorded above. The native-route natural termination
+check is pending. No end-to-end gain is claimed from isolated operator timings.
