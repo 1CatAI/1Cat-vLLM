@@ -400,3 +400,8 @@ full-vocabulary logit matches: mean/p99/maximum KL are zero, top-1 agreement is
 retained distribution gate. Natural completion is still running; combined GDN
 qualification will use fresh original-dispatch reference and candidate captures
 after installing the GDN native artifact under the complete GPU lease.
+
+Both ordinary QSA natural requests terminate with `stop` (88 and 75 tokens),
+completing its independent layer/distribution/natural campaign. This admits the
+direction for subsequent endpoint measurement; it does not credit an endpoint
+speedup. GDN package layer and combined distribution qualification are next.
