@@ -65,12 +65,6 @@ def test_ple_request_indices_preserve_state_and_acceptance_order(
     torch.testing.assert_close(
         metadata.num_accepted_tokens.cpu(), accepted.cpu()[spec_rows], rtol=0, atol=0
     )
-    if non_spec_rows:
-        torch.testing.assert_close(
-            metadata.non_spec_state_indices_tensor.cpu(),
-            slots[non_spec_rows, 0],
-            rtol=0,
-            atol=0,
-        )
-    else:
-        assert metadata.non_spec_state_indices_tensor is None
+    torch.testing.assert_close(
+        metadata.state_indices_tensor.cpu(), slots[non_spec_rows, 0], rtol=0, atol=0
+    )
