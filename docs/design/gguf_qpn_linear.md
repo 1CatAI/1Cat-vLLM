@@ -98,9 +98,11 @@ graph equality, other-M bitwise canonical results and cold-graph ABBA.
 
 Compiled native results preserve the raw operator gains for all four
 original formats. The fifth Q2_K instance initially hits the test harness's
-shared forward-code recompile limit; reset the compiler between independent
-instances and retry only that case. This is a harness failure, not a kernel
-failure. Its completed gate will close admission before merge.
+shared forward-code recompile limit. Resetting the compiler between independent
+instances and retrying only that case completes the gate: compiled Q2_K is
+34.816us versus canonical 36.864us in both ABBA arms at 1290/877MHz.
+All eight M values pass graph equality and other-M bitwise canonical checks.
+The complete integrated package also passes 75 adjacent CPU checks.
 
 About 0.21ms per round is estimated from native per-layer deltas and the
 actual layer counts; no full-model gain is measured here. The full 16-prompt
