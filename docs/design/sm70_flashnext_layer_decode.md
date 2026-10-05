@@ -383,5 +383,12 @@ The ordinary QSA package passes its M1 complete-layer screen with the original
 shared expert fixed in both arms: 0.285542/0.250563 ms, 37/27 kernels and 9/6
 single-CTA kernels. All three layer outputs and selection IDs match on all four
 ranks. Startup reports zero prepared shared chains. The graph profiler event
-count agrees with retained CUDA driver nodes. MTP4 M5 and model distribution
-qualification are still pending.
+count agrees with retained CUDA driver nodes. Model distribution qualification
+is still pending.
+
+Ordinary QSA actual MTP4 M5 also passes: 0.448010/0.418263 ms, 41/32 kernels
+and 1/1 single-CTA kernels. Layer outputs and selection IDs match on all four
+ranks; profiler event counts agree with driver graph nodes. The production
+variant deliberately preserves the original two batch projections, so its
+32-kernel graph is distinct from the 30-kernel concatenated-weight research
+variant. Model distribution and natural completion remain pending.
