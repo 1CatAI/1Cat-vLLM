@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import statistics
+import subprocess
 from pathlib import Path
 
 import torch
@@ -118,7 +119,37 @@ def main():
                 torch.testing.assert_close(
                     out.float(), expected, rtol=0.003, atol=0.003
                 )
-                samples = [graph_time(operation, args.iterations) for _ in range(4)]
+                samples, controls, combined_samples, clocks = [], [], [], []
+
+                def combined(operation=operation, q8=q8, x=x):
+                    torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
+                    operation()
+
+                operations = {
+                    "candidate": operation,
+                    "control": lambda x=x: control(x),
+                    "combined": combined,
+                }
+                timing = {
+                    "candidate": samples,
+                    "control": controls,
+                    "combined": combined_samples,
+                }
+                for epoch in range(4):
+                    for name in list(operations)[:: 1 if epoch % 2 == 0 else -1]:
+                        timing[name].append(
+                            graph_time(operations[name], args.iterations)
+                        )
+                    clocks.append(
+                        subprocess.check_output(
+                            [
+                                "nvidia-smi",
+                                "--query-gpu=clocks.sm,clocks.mem",
+                                "--format=csv,noheader",
+                            ],
+                            text=True,
+                        ).strip()
+                    )
                 elapsed = statistics.median(samples)
                 cases.append(
                     dict(
@@ -126,6 +157,13 @@ def main():
                         cooperative=cooperative,
                         epoch_us=samples,
                         median_us=elapsed,
+                        control_us=controls,
+                        control_median_us=statistics.median(controls),
+                        encode_and_projection_us=combined_samples,
+                        encode_and_projection_median_us=statistics.median(
+                            combined_samples
+                        ),
+                        clocks=clocks,
                         storage_bytes=sum(t.numel() * t.element_size() for t in packed),
                         source_gbps=sum(t.numel() * t.element_size() for t in packed)
                         / elapsed
@@ -137,7 +175,7 @@ def main():
                     )
                 )
         native_samples = [
-            graph_time(lambda x=x: control(x), args.iterations) for _ in range(4)
+            value for case in cases for value in case.get("control_us", [])
         ]
         result["cases"].append(
             dict(
