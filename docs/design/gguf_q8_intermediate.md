@@ -60,3 +60,9 @@ An exact XOR/add replacement for packed sign subtraction passes 73 GPU
 checks and exhaustive CPU checks of every codebook/sign combination. Two
 paired cold repeats retain 45.06 us M5 and 117.76 us M20 Q8 gate/up times.
 It is reverted because it provides no measured throughput benefit.
+
+A whole-warp, 32-lane row candidate passes six changed-input graph checks.
+Cold IQ3_S M5 gate/up rises from 45.06 to 50.18 us and the complete pipeline
+from 67.58 to 72.70 us. M20 gate/up rises from 117.76 to 140.29 us. IQ3_XXS
+M5 also regresses, 41.47 to 49.15 us. The candidate is reverted; the qualified
+16-lane schedule remains unchanged.
