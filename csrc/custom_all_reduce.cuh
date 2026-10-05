@@ -94,7 +94,9 @@ constexpr size_t kSm70Tp4PushAllreduceM16Bytes =
     16 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceM32Bytes =
     32 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
-constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM32Bytes;
+constexpr size_t kSm70Tp4PushAllreduceM64Bytes =
+    64 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM64Bytes;
 constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
@@ -200,7 +202,10 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
   if (bytes == kSm70Tp4PushAllreduceM8Bytes ||
       (concurrency != nullptr && std::strcmp(concurrency, "1") == 0 &&
        (bytes == kSm70Tp4PushAllreduceM16Bytes ||
-        bytes == kSm70Tp4PushAllreduceM32Bytes))) {
+        bytes == kSm70Tp4PushAllreduceM32Bytes ||
+        (bytes > kSm70Tp4PushAllreduceM32Bytes &&
+         bytes <= kSm70Tp4PushAllreduceM64Bytes &&
+         bytes % (kSm70GemmaRmsNormHiddenSize * sizeof(half)) == 0)))) {
     return kSm70Tp4PushAllreduceBlocks;
   }
   if (bytes == kSm70Tp4PushAllreduce8KiBBytes) {
@@ -237,6 +242,14 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
                  (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0)
              ? 13
              : 0;
+}
+
+inline int sm70_tp4_push_allreduce_threads(size_t bytes) {
+  // Preserve the qualified smaller-message geometry. Larger captured decode
+  // messages reuse the same two-epoch protocol with fewer packs per thread.
+  return bytes > kSm70Tp4PushAllreduceM32Bytes
+             ? 2 * kSm70Tp4PushAllreduceThreads
+             : kSm70Tp4PushAllreduceThreads;
 }
 
 inline int sm70_gemma_rms_norm_threads() {
@@ -2209,8 +2222,8 @@ class CustomAllreduce {
         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
         if (push_blocks > 0) {
           sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
-              <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
-                  sm70_tp4_push_buffers_, input, output, rank_, size);
+              <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
+                 stream>>>(sm70_tp4_push_buffers_, input, output, rank_, size);
           return;
         }
       }

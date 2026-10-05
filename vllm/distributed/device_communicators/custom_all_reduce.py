@@ -359,7 +359,8 @@ class CustomAllreduce:
             )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
-                "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
+                "FP16 verifier messages through 640 KiB, 8-KiB decode, "
+                "and 5-KiB Qwen4Exp "
                 "payloads; batch payloads are %s, 5-KiB sum2 is %s, "
                 "and opt-in 25-KiB MTP4 is %s.",
                 qwen38_batch_status,
