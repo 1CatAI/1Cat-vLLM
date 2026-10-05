@@ -25,6 +25,8 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--wired", action="store_true")
+    parser.add_argument("--compiled", action="store_true")
     args = parser.parse_args()
     assert 0 <= args.rank < 4
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -117,6 +119,54 @@ def main():
                 x = layout.input_to_gguf(x)
             return apply_prepared_gguf_projections(x, [projection])
 
+        admission = None
+        runtime_checks = []
+        if args.wired:
+            from vllm.model_executor.layers.quantization.gguf_small_output import (
+                apply_small_output,
+                prepare_small_output,
+            )
+
+            module = torch.nn.Module()
+            layer_id = int(tensor.name.split(".")[1])
+            module.prefix = f"model.layers.{layer_id}." + (
+                "linear_attn.out_proj" if gdn else "self_attn.o_proj"
+            )
+            module.gguf_tm_projections = torch.nn.ModuleList([projection])
+            admission = prepare_small_output(
+                module, [(source, kind)], [projection], True, layout if gdn else None
+            )
+            if kind == 12:
+                assert admission["reason"] == "measured_route_not_faster"
+                continue
+            assert admission["reason"] is None, admission
+            partitions = (1,)
+
+            def wired(x, module=module):
+                return apply_small_output(module, x)
+
+            if args.compiled:
+                torch._dynamo.reset()
+                wired = torch.compile(wired, dynamic=True, fullgraph=True)
+                wired(torch.randn(512, 1536, dtype=torch.float16, device="cuda"))
+
+            def candidate(x, split, wired=wired):
+                assert split == 1
+                return wired(x)
+
+            for m in (512, 8, 1, 5, 16, 20, 32, 8):
+                rows = torch.randn(m, 1536, dtype=torch.float16, device="cuda")
+                actual = wired(rows)
+                if m != 8:
+                    torch.testing.assert_close(actual, canonical(rows), rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    replay = wired(rows)
+                graph.replay()
+                torch.accelerator.synchronize()
+                torch.testing.assert_close(replay, actual, rtol=0, atol=0)
+                runtime_checks.append({"m": m, "bitwise_graph": True})
+
         checks = []
         for seed in (131, 132, 133):
             torch.manual_seed(seed)
@@ -164,6 +214,9 @@ def main():
                 "n": 5120,
                 "k": 1536,
                 "source_bytes": raw.nbytes,
+                "admission": admission,
+                "compiled": args.compiled,
+                "runtime_checks": runtime_checks,
                 "candidate_weight_stream_bytes": stream_bytes,
                 "candidate_source": "canonical_u4" if kind == 12 else "original",
                 "canonical_input_layout_restored": projection.input_layout_restored,
