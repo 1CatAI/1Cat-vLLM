@@ -9,7 +9,7 @@ operator is introduced.
 Local TP4 expert rows have N160/K2560/E512. Gate/up partition along N preserves
 complete source blocks along K. Each IQ3_XXS row contains 980 payload bytes plus
 four alignment bytes. Retaining both matrices for 17 layers costs
-2,740,715,520 additional bytes per rank (2.553 GiB), excluding allocator overhead.
+2,740,715,520 additional bytes per rank (2.552 GiB), excluding allocator overhead.
 Canonical banks remain available for unsupported batches. TP4 is unchanged.
 
 ## Operator policy
