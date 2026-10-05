@@ -96,8 +96,11 @@ def main():
         ) or not outputs.get("default_configuration"):
             raise ValueError("Require complete default-path model training outputs")
         training = outputs["training"]
+        # This tokenizer rebuilds vocabulary bookkeeping in get_vocab_size;
+        # do not repeat it for every emitted training token.
+        vocabulary_size = len(tokenizer)
         if any(
-            type(t) is not int or not 0 <= t < len(tokenizer)
+            type(t) is not int or not 0 <= t < vocabulary_size
             for row in training
             for t in row["token_ids"]
         ):
