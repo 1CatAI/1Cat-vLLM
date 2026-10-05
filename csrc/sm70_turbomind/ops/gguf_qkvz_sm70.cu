@@ -42,6 +42,7 @@ struct QkvzSource {
   int columns;
   int first_tile;
   int output_offset;
+  int stats_stride;
 };
 struct QkvzSources {
   QkvzSource items[5];
@@ -63,7 +64,7 @@ __global__ __launch_bounds__(512, 2) void qkvz_shared_a_kernel(
   native_linear_n64_body<Reader, Canonical>(                                  \
       output, input, descriptor.weight, descriptor.stats, partials, counters, \
       descriptor.columns, 5120, tile, blockIdx.x, 4120,                       \
-      descriptor.output_offset, shared)
+      descriptor.output_offset, descriptor.stats_stride, shared)
   switch (descriptor.type) {
     case 10:
       RUN_READER(NativePairReader<10>, false);
@@ -118,9 +119,11 @@ void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(weights.size() == 5 && stats.size() == 5 && types.size() == 5,
               "GGUF QKVZ requires four quantized sources and packed FP16 B/A");
   const auto device = input.device();
-  auto check = [&](const torch::Tensor& tensor, at::ScalarType dtype) {
+  auto check = [&](const torch::Tensor& tensor, at::ScalarType dtype,
+                   bool contiguous = true) {
     TORCH_CHECK(tensor.is_cuda() && tensor.device() == device &&
-                    tensor.is_contiguous() && tensor.scalar_type() == dtype,
+                    (!contiguous || tensor.is_contiguous()) &&
+                    tensor.scalar_type() == dtype,
                 "GGUF QKVZ operand device, dtype or contiguity mismatch");
   };
   check(input, torch::kFloat16);
@@ -145,10 +148,11 @@ void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
     } else if (type == 102 || type == 104) {
       const int bits = type == 102 ? 2 : 4, group = type == 102 ? 16 : 32;
       check(weights[i], torch::kInt32);
-      check(stats[i], torch::kInt32);
+      check(stats[i], torch::kInt32, false);
       TORCH_CHECK(
           weights[i].sizes() == c10::IntArrayRef({5120, n * bits / 32}) &&
-              stats[i].sizes() == c10::IntArrayRef({5120 / group, n}),
+              stats[i].sizes() == c10::IntArrayRef({5120 / group, n}) &&
+              stats[i].stride(1) == 1 && stats[i].stride(0) >= n,
           "GGUF QKVZ canonical stream geometry mismatch");
     } else {
       int bytes = 0;
@@ -195,7 +199,9 @@ void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
         type,
         n,
         first_tile,
-        offset};
+        offset,
+        (type == 102 || type == 104) ? static_cast<int>(stats[i].stride(0))
+                                     : n};
     first_tile += (n + 63) / 64;
     offset += n;
   }

@@ -61,7 +61,7 @@ __device__ __forceinline__ void native_linear_n64_body(
     const uint8_t* __restrict__ weight, const uint32_t* __restrict__ stats,
     float* __restrict__ partials, int* __restrict__ counters, int n, int k,
     int tile, int scratch_tile, int output_stride, int output_offset,
-    uint8_t* shared) {
+    int stats_stride, uint8_t* shared) {
   constexpr int SplitK = 8, GlobalSplitK = 2;
   uint8_t* book = shared;
   auto* reductions = reinterpret_cast<float (*)[SplitK][256]>(shared);
@@ -83,7 +83,8 @@ __device__ __forceinline__ void native_linear_n64_body(
   const int last = global_first + (warp + 1) * local_parts / SplitK;
   Reader reader = [&]() {
     if constexpr (Canonical)
-      return Reader(weight, stats, n, k, tile * 2 + subtile, first, col);
+      return Reader(weight, stats, stats_stride, k, tile * 2 + subtile, first,
+                    col);
     else
       return Reader(weight, tile * 2 + subtile, k / 256, first, col);
   }();

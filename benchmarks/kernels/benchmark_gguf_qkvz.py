@@ -85,6 +85,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+", default=[1, 0, 9, 20])
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--wired", action="store_true")
+    parser.add_argument("--compiled", action="store_true")
     args = parser.parse_args()
     assert 0 <= args.rank < 4
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -123,6 +125,54 @@ def main():
 
         def canonical(x, prepared=prepared):
             return apply_prepared_gguf_projections(x, prepared)
+
+        admission = None
+        if args.wired:
+            from vllm.model_executor.layers.quantization.gguf_qkvz import (
+                apply_native_qkvz,
+                prepare_native_qkvz,
+            )
+
+            module = torch.nn.Module()
+            module.prefix = f"model.layers.{layer}.linear_attn.in_proj_qkvz"
+            module.gguf_tm_projections = torch.nn.ModuleList(prepared)
+            admission = prepare_native_qkvz(module, sources, prepared, True)
+            assert admission["reason"] is None, admission
+            weights = list(module.gguf_qkvz_weights)
+            stats = list(module.gguf_qkvz_scales)
+            types = module.gguf_qkvz_types
+            partials = module.gguf_qkvz_partials
+            counters = module.gguf_qkvz_counters
+
+            def wired(x, module=module):
+                return apply_native_qkvz(module, x)
+
+            candidate = wired
+        if args.compiled:
+            assert args.wired
+            torch._dynamo.reset()
+            candidate = torch.compile(candidate, dynamic=True, fullgraph=True)
+            candidate(torch.randn(512, 5120, dtype=torch.float16, device="cuda"))
+        runtime_checks = []
+        if args.wired:
+            for m in (512, 8, 1, 5, 16, 20, 32, 8):
+                rows = torch.randn(m, 5120, dtype=torch.float16, device="cuda")
+                actual = candidate(rows)
+                if m != 8:
+                    torch.testing.assert_close(actual, canonical(rows), rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    replay = candidate(rows)
+                graph.replay()
+                torch.accelerator.synchronize()
+                torch.testing.assert_close(replay, actual, rtol=0, atol=0)
+                runtime_checks.append(
+                    {
+                        "m": m,
+                        "bitwise_graph": True,
+                        "route": "qkvz" if m == 8 else "canonical",
+                    }
+                )
 
         checks = []
         for seed in (131, 132, 133):
@@ -169,6 +219,9 @@ def main():
         report["cases"].append(
             {
                 "layer": layer,
+                "admission": admission,
+                "compiled": args.compiled,
+                "runtime_checks": runtime_checks,
                 "source_types": [t for _, t in sources],
                 "operator_types": types,
                 "m": 8,

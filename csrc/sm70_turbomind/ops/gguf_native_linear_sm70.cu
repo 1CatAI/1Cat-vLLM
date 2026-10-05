@@ -16,7 +16,7 @@ __global__ __launch_bounds__(512, 2) void native_linear_n64_kernel(
   __shared__ alignas(16) uint8_t shared[33793];
   native_linear_n64_body<Reader, Canonical>(
       output, input, weight, stats, partials, counters, n, k, blockIdx.x,
-      blockIdx.x, n, 0, shared);
+      blockIdx.x, n, 0, n, shared);
 }
 
 template <class Reader>
