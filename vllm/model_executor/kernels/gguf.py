@@ -327,8 +327,10 @@ def dp4a_expert_capabilities(
     is_sm70: bool,
     enabled: bool = True,
     original_storage_available: bool = True,
+    canonical_storage_available: bool = False,
 ) -> tuple[GGUFOperatorCapability, ...]:
-    """Original M bands for Q8_1 gate/up plus integer down and route reduction."""
+    """Measured M bands for Q8_1 gate/up plus integer down and route reduction."""
+    canonical = source_type in (20, 23) and down_type == 20
     reason = None
     if not enabled:
         reason = "disabled_by_kernel_config"
@@ -336,16 +338,22 @@ def dp4a_expert_capabilities(
         reason = "requires_sm70"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"
-    elif source_type not in (18, 21, 22) or down_type not in (20, 42):
+    elif not canonical and (
+        source_type not in (18, 21, 22) or down_type not in (20, 42)
+    ):
         reason = "dp4a_expert_source_formats_unavailable"
     elif (k, n, num_experts) != (2560, 160, 512):
         reason = "dp4a_expert_shape_has_no_calibration"
-    elif not original_storage_available:
+    elif canonical and not canonical_storage_available:
+        reason = "requires_iq4_codebook_zero_group32_banks_without_ep"
+    elif not canonical and not original_storage_available:
         reason = "original_expert_bank_not_retained"
     else:
         for operator in (
             "gguf_quantize_q8_1_sm70_out",
-            "gguf_dp4a_gate_up_sm70_out",
+            "gguf_dp4a_lut4_gate_up_sm70_out"
+            if canonical
+            else "gguf_dp4a_gate_up_sm70_out",
             "gguf_dp4a_down_unroute_sm70_out",
         ):
             if not hasattr(torch.ops._C, operator):
@@ -368,7 +376,12 @@ def dp4a_expert_capabilities(
 def q8_intermediate_expert_capabilities(*args, **kwargs):
     """Same calibrated bands, with the packaged routed-Q8 protocol required."""
     capabilities = dp4a_expert_capabilities(*args, **kwargs)
-    packet = getattr(torch.ops._C, "gguf_dp4a_gate_up_sm70_out", None)
+    name = (
+        "gguf_dp4a_lut4_gate_up_sm70_out"
+        if capabilities[0].family == GGUFDecoderFamily.LUT4
+        else "gguf_dp4a_gate_up_sm70_out"
+    )
+    packet = getattr(torch.ops._C, name, None)
     supported = "lanes_per_row" in str(getattr(packet, "_schemas", {}))
     return tuple(
         replace(

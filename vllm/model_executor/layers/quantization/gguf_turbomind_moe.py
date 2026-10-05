@@ -87,7 +87,9 @@ def _expert_gate_up(
             for i in range(0, len(vector_bands), 2)
         )
         op = (
-            torch.ops._C.gguf_lattice_grouped_vec_sm70_out
+            torch.ops._C.gguf_lut4_grouped_gemm_sm70_out
+            if source_type in (20, 23)
+            else torch.ops._C.gguf_lattice_grouped_vec_sm70_out
             if vector
             else torch.ops._C.gguf_lattice_grouped_gemm_sm70_out
         )
@@ -95,7 +97,16 @@ def _expert_gate_up(
             (gate, gate_ptrs, gate_stats),
             (up, up_ptrs, up_stats),
         ):
-            op(out, x, offsets, weights, stats, source_type, experts, group)
+            op(
+                out,
+                x,
+                offsets,
+                weights,
+                stats,
+                0 if source_type in (20, 23) else source_type,
+                experts,
+                group,
+            )
     return gate, up
 
 
@@ -241,9 +252,22 @@ def _expert_dp4a(
                 source_type,
                 m,
             )
-        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-            hidden, q8, ids, raw_gate, raw_up, source_type, True
-        )
+        if source_type in (20, 23):
+            torch.ops._C.gguf_dp4a_lut4_gate_up_sm70_out(
+                hidden,
+                q8,
+                ids,
+                gate_ptrs,
+                gate_stats,
+                up_ptrs,
+                up_stats,
+                experts,
+                4 if quantized_hidden else 16,
+            )
+        else:
+            torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+                hidden, q8, ids, raw_gate, raw_up, source_type, True
+            )
         torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
             output,
             hidden,
@@ -542,6 +566,11 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         self.dp4a_enabled = self.native_enabled and (
             config.kernel_config.sm70_gguf.small_m_dp4a if config is not None else True
         )
+        self.lut4_dp4a_enabled = self.dp4a_enabled and (
+            config.kernel_config.sm70_gguf.lut4_expert_dp4a
+            if config is not None
+            else True
+        )
         self.q8_intermediate_enabled = self.dp4a_enabled and (
             config.kernel_config.sm70_gguf.q8_expert_intermediate
             if config is not None
@@ -621,6 +650,21 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             for bound in (c.min_m, c.max_m or -1)
         ]
         down = banks["w2"]
+        canonical_iq4 = bool(
+            layer.ep_size == 1
+            and all(
+                b.source_type in (20, 23) and b.decoder == 0 and b.group == 32
+                for b in (gate, up)
+            )
+            and down.source_type == 20
+            and down.decoder == 0
+            and down.group == 32
+        )
+        dp4a_enabled = (
+            self.lut4_dp4a_enabled
+            if gate.source_type in (20, 23)
+            else self.dp4a_enabled
+        )
         self.dp4a_capabilities = dp4a_expert_capabilities(
             gate.source_type,
             down.source_type,
@@ -629,8 +673,9 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             self.num_experts,
             self.params_dtype,
             is_sm70=current_platform.is_device_capability(70),
-            enabled=self.dp4a_enabled,
+            enabled=dp4a_enabled,
             original_storage_available=self.raw_gate_up,
+            canonical_storage_available=canonical_iq4,
         )
         self.dp4a_batches = [
             c.min_m for c in self.dp4a_capabilities if c.reason is None
@@ -643,8 +688,9 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             self.num_experts,
             self.params_dtype,
             is_sm70=current_platform.is_device_capability(70),
-            enabled=self.q8_intermediate_enabled,
+            enabled=self.q8_intermediate_enabled and dp4a_enabled,
             original_storage_available=self.raw_gate_up,
+            canonical_storage_available=canonical_iq4,
         )
         self.q8_intermediate_batches = [
             c.min_m for c in q8_capabilities if c.reason is None
@@ -663,7 +709,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             "q8_intermediate": {
                 "enabled": bool(self.q8_intermediate_batches),
                 "format": "Q8_1",
-                "lanes_per_row": 16,
+                "lanes_per_row": 4 if canonical_iq4 else 16,
                 "operators": [asdict(c) for c in q8_capabilities],
                 "outside_m_band": "fp16_intermediate",
             },
@@ -718,8 +764,8 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 x,
                 topk_ids,
                 topk_weights,
-                gate.raw_weights,
-                up.raw_weights,
+                getattr(gate, "raw_weights", gate.weight_ptrs),
+                getattr(up, "raw_weights", up.weight_ptrs),
                 gate.weight_ptrs,
                 gate.stat_ptrs,
                 up.weight_ptrs,

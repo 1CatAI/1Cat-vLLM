@@ -367,6 +367,9 @@ class Sm70GgufConfig:
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 
+    lut4_expert_dp4a: bool = True
+    """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
+
     small_m_hmma: bool = True
     """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
 
