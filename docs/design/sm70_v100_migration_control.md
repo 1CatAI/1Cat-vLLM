@@ -49029,3 +49029,20 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## Batched NVFP4 activation reuse screen, 2026-10-05
+
+An isolated M16-M64 projection screen freezes QUASAR layer 55 TP rank 0
+weights and compares installed dispatch with an N128 prototype. On V100
+SXM2 16GB at a 300W limit, M32 gate/up requests 201.915 MB at L1TEX,
+54.786 MB total at L2 and 25.395 MB from DRAM. Down requests 101.762 MB,
+36.082 MB and 12.813 MB respectively. Aggregate counters establish excess
+cache traffic; they do not identify all excess bytes as activation reads.
+
+A shared-B WMMA tile regresses M32 gate/up and down and exceeds the
+96-register limit for some shapes. The direct HMMA884 shared-A tile reduces
+gate/up L1TEX requests to 71.811 MB but still regresses: barrier waits account
+for 34.687% of active warp cycles and FP32 partial output adds traffic. The
+next screen groups K loads to reduce barriers and coalesces partial output.
+These are rejected or pending standalone prototypes, not production speed
+claims. No M8 dispatcher or attention route changes.
