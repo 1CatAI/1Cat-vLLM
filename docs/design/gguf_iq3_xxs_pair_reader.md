@@ -16,9 +16,11 @@ in the existing shared-activation skeleton.
 The raw operator builds both IQ3_XXS/IQ3_S orientations alongside the two
 existing IQ3_S/IQ4_XS orientations. Byte checks distinguish 98/110/136-byte
 blocks. Host launch code is shared; the existing two kernel instantiations
-retain their implementation. Model capability declarations are unchanged:
-IQ3_XXS pairs remain canonical pending actual-weight GPU checks and a
-matched cold-L2 graph comparison.
+retain their implementation. Actual-weight GPU checks and the matched cold-L2 graph comparison pass
+in both orientations. Model capability declarations admit only
+M8/N4352/K5120 on SM70 with FP16 operands; all other descriptors retain
+canonical dispatch. Source-sized IQ3_XXS records are prepared alongside
+the existing independent IQ3_S reader.
 
 Ten CPU record/cursor checks pass. The new cursor oracle covers all eight
 split-K starts for K5120, including odd starts, two N32 tiles, all columns
@@ -31,4 +33,24 @@ IQ3_XXS orientations use 63 registers, 34,816 shared bytes, zero stack and
 zero local memory. Existing IQ3_S/IQ4_XS instantiations retain 64 registers
 and 33,792 shared bytes. The installed wheel imports both normal extensions
 and passes native-member hashes and dependency checks without private DSOs.
-GPU numerical, graph and speed evidence remains pending.
+Actual layer2 and layer38 TP4 slices pass official-dequantization FP32-GEMM
+checks across three seeds: native relative L2 is 0.000503–0.000536 and
+0.000507–0.000516, respectively. Runtime M512/8/1/5/16/20/32/8 and graph
+replay checks pass; other M retain bitwise canonical results.
+
+Cold-L2 graph ABBA uses 16 MiB eviction before each event, 84 samples,
+V100 SXM2 32GB, fixed SM/memory 1290/877MHz and 300W, Torch 2.10 cu128
+and CUDA 12.8. Both orientations read 18,104,320 source bytes per pair.
+
+| Gate/up types | Canonical ABBA arms | Native ABBA arms | Source bandwidth |
+| --- | --- | --- | --- |
+| IQ3_XXS/IQ3_S | 86.016/86.016us | 57.344/57.344us | 315.7GB/s |
+| IQ3_S/IQ3_XXS | 87.040/87.040us | 58.368/58.368us | 310.2GB/s |
+
+Seven layers save an estimated 0.201ms of projection service per round,
+covering another 16.954% of mixed-pair source bytes. Together with the
+IQ3_S/IQ4_XS pair, 18/40 mixed layers cover 48.463% of mixed-pair bytes.
+This is a weighted microbenchmark estimate, not an end-to-end result.
+The first GPU attempt failed while the filesystem was full; its controller
+and logs are retained. Duplicate archived artifacts were retired before
+repeating the operator checks. Model integration checks remain pending.

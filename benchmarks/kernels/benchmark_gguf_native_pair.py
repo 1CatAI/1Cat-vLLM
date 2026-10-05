@@ -42,7 +42,9 @@ def main():
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
         allowed = (
-            ((18, 21), (21, 18)) if args.prototype_iq3_xxs else ((21, 23), (23, 21))
+            ((18, 21), (21, 18))
+            if args.prototype_iq3_xxs
+            else ((21, 23), (23, 21), (18, 21), (21, 18))
         )
         assert tuple(types) in allowed, types
         raw = [tensors[name].data[:4352].copy() for name in names]
