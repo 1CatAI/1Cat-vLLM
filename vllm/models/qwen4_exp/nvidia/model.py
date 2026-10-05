@@ -1160,6 +1160,9 @@ class Qwen4ExpForCausalLM(
                     self.vllm_config.kernel_config.qsa_auto_e4m3_active
                 ),
             )
+        from .sm70_shared_expert_chain import prepare_shared_expert_chains
+
+        prepare_shared_expert_chains(self, self.vllm_config)
         return loaded
 
 
@@ -1377,6 +1380,9 @@ class Qwen4ExpForConditionalGeneration(
                 self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
             ),
         )
+        from .sm70_shared_expert_chain import prepare_shared_expert_chains
+
+        prepare_shared_expert_chains(self, self.language_model.vllm_config)
         return loaded
 
     @classmethod

@@ -20,7 +20,7 @@ the earlier pair does not establish current-main speed.
 The normal `fd65333826e9` package and this integration base have identical CUDA
 sources and NVFP4 model implementation. Their only source differences are four
 GGUF Python files. Its native artifact is therefore a source-matched NVFP4
-control. A fresh normal native build from this owned tree is in progress.
+control. A fresh normal native build from this owned tree is complete.
 Historical pinned-UVA timing cannot by itself identify a regression commit in
 the disk route; same-contract comparisons must locate the later disk slowdown.
 
@@ -49,10 +49,12 @@ confined to the fixed-length timing requests.
 
 ## Research implementations
 
-No experimental runtime dispatch or new environment switch is installed.
-The screen DSOs are research artifacts; they are not source-complete production
-performance evidence. An admitted implementation must move into the ordinary
-package build and pass a clean-artifact model gate.
+The shared-M1 candidate is included in the ordinary package build and enabled
+by its dtype, shape and platform contract, with no new environment switch.
+Its model distribution gate is pending. The other screen DSOs are research
+artifacts; their results are not source-complete production performance
+evidence. Admission requires the ordinary package and a clean-artifact model
+gate.
 
 | Segment | Screen | Synchronization and reduction |
 | --- | --- | --- |
@@ -106,7 +108,7 @@ these changes; old evidence and thresholds remain historical records.
 Compilation and Python syntax/lint checks have passed. Matched endpoint and
 initial segment measurements are complete; additional segment screens and
 candidate model distribution gates remain pending. No
-speed improvement, kernel-count acceptance or default production admission is
+endpoint speed improvement, kernel-count acceptance or production admission is
 claimed yet.
 
 ## Initial measurements
@@ -216,8 +218,8 @@ above come from the corrected implementations. A queue-script failure skipped
 one invocation; it contributes no timing result.
 
 The account cannot change application clocks, so the historical/current clock
-difference remains unquantified. No clock setting changed. No runtime dispatch
-has changed and no candidate has passed model distribution admission.
+difference remains unquantified. No clock setting changed and no candidate
+has passed model distribution admission.
 
 The packed-router follow-up uses a lossless layout matched to SM70 MMA
 fragments and one multi-warp router CTA per token. Routing IDs match for all
@@ -228,13 +230,13 @@ the complete segment remains slower at both widths and is rejected. The HC
 vector-load follow-up also remains slower at both widths, with and without
 the preceding production reduction, and is rejected.
 
-A forty-producer shared-M1 implementation is being prepared for the ordinary
+A forty-producer shared-M1 implementation is included in the ordinary
 SM70 extension and opaque Python dispatch. M5 retains its existing native
 batched-up route; prefill retains ordinary projections. Standalone complete
 non-PLE decoder-layer captures retain actual M1 inputs and MTP4 verifier M5
 metadata. Those layer graphs are explicitly separated from the compiled
-whole-model endpoint. Ordinary-artifact build, layer and model distribution
-validation are still pending; no production admission is claimed.
+whole-model endpoint. Ordinary-artifact build and M1 layer validation pass;
+MTP4 layer and model distribution validation remain pending.
 
 The coalesced HC experiment replaces one-row producers with two K partitions
 per eight-row group and contiguous peer publications. Its first kernel has
@@ -255,9 +257,43 @@ quality runs can use identical native artifacts.
 
 Fake schemas preserve output shape/dtype at M1, M5, M17 and M33. Six
 distribution-probe unit tests pass, including diagnostic-only raw logit
-differences. The first standalone decoder-layer compile failed before timing
-because eager collection selected a Python CUDA norm wrapper that could not
-be traced. A subsequent capture re-selects the compiled model's CustomOp
-policy while preserving explicitly enforced operators and the chosen GDN
-backend. Complete-layer timing and model distribution admission remain
-pending.
+differences. Initial eager-model collection attempts selected a Python CUDA
+norm wrapper that could not be traced, and then encountered mixed-dtype views
+of recurrent-state storage that AOT could not functionalize. The successful
+capture uses normal model initialization and independent benchmark state
+storage with the original strides and active rows.
+
+The ordinary-artifact complete M1 layer graphs measure:
+
+| Non-PLE layer | Control / shared candidate (ms) | Kernels | Single-CTA kernels |
+| --- | ---: | ---: | ---: |
+| GDN layer 2 | 0.152791 / 0.149709 | 25 / 21 | 5 / 3 |
+| QSA layer 3 | 0.304732 / 0.301912 | 37 / 33 | 9 / 7 |
+
+These are critical-rank medians from seven alternating paired repetitions,
+not endpoint TPOT. Hidden and injection outputs match; maximum MLP output
+differences are 9.16e-5 and 3.05e-5, respectively. Each graph includes the
+complete decoder layer, both HC transactions and production reductions. The
+MTP4 M5 collection initially exhausted memory during 8K PLE prefill, before
+layer measurement. Its layer-only retry uses 65536 startup capacity and 88%
+memory budget, recorded separately from the 262144/94% M1 endpoint contract.
+That retry also failed startup admission: 0.78 GiB KV was available, below the
+1.1 GiB needed for 64K. The next MTP4 layer-only run uses 32768 capacity and
+88% memory, retaining the actual 8192-token input. Neither failed collection
+contributes performance evidence.
+
+A separate QSA research phase combines the two input projections, both
+norm/rotary preparation paths, main KV publication and output initialization.
+It retains the native score, selection and sparse-attention core rather than
+using the rejected coupled selector/core prototype. Offline SM70 compilation
+passes at M1 and M5; complete-layer timing, selection and arithmetic checks
+are pending.
+
+A GDN research follow-up includes convolution, recurrent update and gated
+normalization in one kernel, retaining the parallel value tiles. Norm consumers
+delay convolution-state writes until their local value producers finish. The
+Q/K commit additionally waits on the 48 producers sharing that query head;
+there is no whole-grid barrier. It retains the MTP sliding convolution window
+and commits every speculative recurrent state through the actual slot table.
+CPU compilation passes; complete-layer output/state checks and timing at M1/M5
+remain pending. No production dispatch is installed by either research import.

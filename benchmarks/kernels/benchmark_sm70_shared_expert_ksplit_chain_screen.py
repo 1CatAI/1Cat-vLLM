@@ -27,19 +27,33 @@ def main():
     parser.add_argument("--layers", type=int, default=16)
     parser.add_argument("--widths", type=int, nargs="+", choices=(1, 5), default=(1, 5))
     parser.add_argument("--native-mtp-control", action="store_true")
+    parser.add_argument("--native-package", action="store_true")
     args = parser.parse_args()
     source = (
         Path(__file__).parents[1] / "csrc/sm70_shared_expert_ksplit_chain_screen.cu"
     )
-    extension = load(
-        "sm70_shared_expert_ksplit_chain_screen",
-        [str(source)],
-        extra_cuda_cflags=["-O3", "-gencode=arch=compute_70,code=sm_70"],
-        verbose=True,
-    )
-    if args.build_only:
-        args.output.write_text(json.dumps({"library": extension.__file__}) + "\n")
-        return
+    if args.native_package:
+        if args.build_only:
+            parser.error("--native-package validates an already built ordinary package")
+        import vllm._custom_ops  # noqa: F401
+        from vllm.models.qwen4_exp.nvidia import (
+            sm70_fp16_gemv,  # noqa: F401
+            sm70_shared_expert_chain,  # noqa: F401
+        )
+
+        if not hasattr(torch.ops._C, "qwen38_shared_expert_chain_sm70_out"):
+            raise RuntimeError("Rebuild the ordinary SM70 extension")
+        extension = None
+    else:
+        extension = load(
+            "sm70_shared_expert_ksplit_chain_screen",
+            [str(source)],
+            extra_cuda_cflags=["-O3", "-gencode=arch=compute_70,code=sm_70"],
+            verbose=True,
+        )
+        if args.build_only:
+            args.output.write_text(json.dumps({"library": extension.__file__}) + "\n")
+            return
     assert torch.cuda.get_device_capability() == (7, 0)
     import vllm._custom_ops  # noqa: F401
     from vllm import _sm70_ops as sm70_ops
@@ -84,7 +98,8 @@ def main():
         for w13, _, _ in weights
     ]
     report = {
-        "research_only": True,
+        "research_only": not args.native_package,
+        "ordinary_package": args.native_package,
         "model_admission": False,
         "cta_count": 40,
         "w13_k_splits": 4,
@@ -94,6 +109,13 @@ def main():
         "layers": args.layers,
         "widths": [],
     }
+
+    if args.native_package:
+        import vllm._C as native
+
+        report["native_sha256"] = hashlib.sha256(
+            Path(native.__file__).read_bytes()
+        ).hexdigest()
 
     def screen(m):
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = bool(
@@ -118,18 +140,49 @@ def main():
         native_partial = [x.new_empty((8, m, 320)) for x in inputs]
 
         def candidate():
-            for x, (_, _, gate), w13, w2, proj, p, f, e, y in zip(
-                inputs,
-                weights,
-                packed_up,
-                packed_down,
-                projections,
-                partials,
-                flags,
-                epochs,
-                outputs,
+            for i, (
+                x,
+                (raw_up, raw_down, gate),
+                w13,
+                w2,
+                proj,
+                p,
+                f,
+                e,
+                y,
+            ) in enumerate(
+                zip(
+                    inputs,
+                    weights,
+                    packed_up,
+                    packed_down,
+                    projections,
+                    partials,
+                    flags,
+                    epochs,
+                    outputs,
+                )
             ):
-                extension.run(x, w13, w2, gate, proj, p, f, e, y)
+                if args.native_package:
+                    outputs[i] = torch.ops.vllm.qwen38_sm70_shared_expert_chain(
+                        x,
+                        raw_up,
+                        raw_down,
+                        gate,
+                        w13,
+                        w2,
+                        proj,
+                        p,
+                        f,
+                        e,
+                        native_packed_up[i],
+                        True,
+                        True,
+                        args.native_mtp_control,
+                        True,
+                    )
+                else:
+                    extension.run(x, w13, w2, gate, proj, p, f, e, y)
 
         def control():
             result = []

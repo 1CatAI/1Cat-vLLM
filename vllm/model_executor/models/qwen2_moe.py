@@ -203,6 +203,15 @@ class Qwen2MoeMLP(nn.Module):
 
     def forward(self, x):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
+        if getattr(self, "_sm70_qwen38_shared_chain", False):
+            from vllm.models.qwen4_exp.nvidia.sm70_shared_expert_chain import (
+                shared_expert_chain_forward,
+            )
+
+            out = shared_expert_chain_forward(self, x)
+            return _sm70_dump_qwen_mlp_tensor(
+                "mlp_after_expert_gate", self.layer_idx, out
+            )
         fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
         out = fused_act(x) if fused_act is not None else None
         if out is None:

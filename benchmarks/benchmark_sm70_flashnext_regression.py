@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--input-len", type=int, default=8192)
     parser.add_argument("--output-len", type=int, default=513)
     parser.add_argument("--repeats", type=int, default=6)
+    parser.add_argument("--health-only", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.94)
     args = parser.parse_args()
     import os
@@ -126,6 +127,11 @@ def main():
             )[0]
             report["health"].append(dict(prompt=prompt, **metrics(output)))
             save()
+        if args.health_only:
+            report["speed_acceptance"] = False
+            report["complete"] = True
+            save()
+            return
         piece = tok.encode(
             "This fixed benchmark prompt is used to create a deterministic "
             "tokenized input for single-request decode measurement. ",
