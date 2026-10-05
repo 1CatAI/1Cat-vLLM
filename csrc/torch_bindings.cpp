@@ -213,6 +213,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int group_size) -> ()");
   ops.impl("gguf_small_grouped_vec_sm70_out", torch::kCUDA,
            &gguf_small_grouped_vec_sm70_out);
+  ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
+  ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
+           &gguf_quantize_q8_1_sm70_out);
+  ops.def(
+      "gguf_dp4a_gate_up_sm70_out(Tensor(a!) out, Tensor activation, Tensor "
+      "ids, Tensor gate, Tensor up, int source_type, bool activated) -> ()");
+  ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_gate_up_sm70_out);
   ops.def(
       "gguf_lattice_raw_dequantize_sm70_out(Tensor(a!) out, Tensor weight, int "
       "source_type) -> ()");
