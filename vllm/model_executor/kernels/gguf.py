@@ -74,6 +74,36 @@ class GGUFOperatorCapability:
         return m >= self.min_m and (self.max_m is None or m <= self.max_m)
 
 
+def iq3_gated_pair_capability(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> GGUFOperatorCapability:
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_types != (21, 21) or (k, n) != (5120, 4352):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, "gguf_iq3_gated_sm70_out"):
+        reason = "operator_missing:gguf_iq3_gated_sm70_out"
+    return GGUFOperatorCapability(
+        GGUFDecoderFamily.LATTICE,
+        "IQ3_S",
+        "gguf_iq3_gated_sm70_out",
+        True,
+        min_m=8,
+        max_m=8,
+        reason=reason,
+    )
+
+
 def dense_fp16_cache_capabilities(
     source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
 ) -> tuple[GGUFOperatorCapability, ...]:
