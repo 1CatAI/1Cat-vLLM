@@ -294,6 +294,10 @@ def maybe_apply_shared_expert(layer, x):
 
     if layer.expert_gate is None:
         return None
+    # This operator returns a local TP contribution. FusedMoE owns the
+    # reduction; other callers must retain RowParallelLinear's reduction.
+    if getattr(layer.down_proj, "reduce_results", False):
+        return None
     gu = getattr(layer.gate_up_proj, "gguf_tm_projections", None)
     down = getattr(layer.down_proj, "gguf_tm_projections", None)
     weight = getattr(layer.expert_gate, "weight", None)
