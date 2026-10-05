@@ -1582,3 +1582,10 @@ canonical fused GEMM. These profiled times do not replace the unprofiled
 retains 250 registers and a 12×4×5 grid. The remaining work centers on the
 GEMM/output path rather than additional scale-decoder variants. FP32
 accumulation is retained; model quality and step savings remain unmeasured.
+
+A full-tile rounded plane tactic restricted to M512/N1536/K2560 passes 137
+checks but measures 101.453 µs versus 89.577 µs canonical (exact planes
+108.648 µs). The small improvement does not meet the target and remains slower
+than the workspace path. Remove this shape-specific tactic rather than retain
+an extra unsuccessful specialization. Original rounded-scale operators remain
+explicit candidates with no default promotion.

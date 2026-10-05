@@ -101,13 +101,6 @@ void Registry::sm70_884_4() {
     };
     add_rounded_original.template operator()<21,32>();
     add_rounded_original.template operator()<22,16>();
-    {
-      using C = Config_GgufLatticeOriginal<21, 32, kColMajor, true>;
-      using Full = typename C::template Type<128,256,32,2,4,1,D,D,2,true,
-                                            1,32,128,128,1,true>;
-      Add(std::make_unique<ExactMnkKernelImpl<typename Full::Kernel,
-                                             512,1536,2560>>());
-    }
     auto add_lattice = [this]<int Type, int Group>() {
       using C = Config_GgufLattice<Type,Group,kColMajor>;
       using G = Config_GgufLattice<Type,Group,kColMajor,0>;
