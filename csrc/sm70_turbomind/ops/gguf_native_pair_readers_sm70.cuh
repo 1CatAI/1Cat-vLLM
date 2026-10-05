@@ -249,8 +249,8 @@ template <>
 struct NativePairReader<23> {
   using Decoder = Iq4XsNativeDecoder;
   static constexpr int kBlockBytes = 136;
-  static constexpr int kBookId = -1;
-  static constexpr int kBookBytes = 0;
+  static constexpr int kBookId = 23;
+  static constexpr int kBookBytes = 16 * sizeof(float);
   struct Record {
     uint4 packets[4];
     Decoder::Parameters params;
@@ -280,7 +280,9 @@ struct NativePairReader<23> {
     first = true;
   }
 
-  __device__ static void initialize(uint8_t*) {}
+  __device__ static void initialize(uint8_t* book) {
+    Decoder::initialize_float_book(book);
+  }
 
   __device__ Record load() {
     if (first || half_block == 0) {
@@ -305,7 +307,7 @@ struct NativePairReader<23> {
 
   template <int Segment, int Fragment>
   __device__ static turbomind::Array<half, 8> fragment(const Record& record,
-                                                       const uint8_t*) {
+                                                       const uint8_t* book) {
     static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
     const uint4 data = record.packets[Segment / 2];
     uint32_t packet;
@@ -313,8 +315,8 @@ struct NativePairReader<23> {
       packet = Fragment == 0 ? data.x : data.y;
     else
       packet = Fragment == 0 ? data.z : data.w;
-    return Decoder::fragment<half>(record.params,
-                                   record.half_block * 4 + Segment / 2, packet);
+    return Decoder::fragment_from_float_book<half>(
+        record.params, record.half_block * 4 + Segment / 2, packet, book);
   }
 };
 }  // namespace vllm::sm70_gguf
