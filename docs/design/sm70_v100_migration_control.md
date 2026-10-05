@@ -49075,3 +49075,12 @@ These results are not accepted acceleration evidence. Original head weights
 remain the final-score source; raw QPN8 scores are used only for support search.
 The next operator screen uses retained real hidden states and wider candidate
 support rather than another Gaussian-only coverage test.
+
+The raw-probe failure above needs a correction: all global top-20 tokens were
+present at every one of the 8056 positions. The two apparent support misses
+are nucleus-boundary rounding cases. Reproducing the existing reference guard
+on CPU marks both for the unchanged dense callback (distance to top-p:
+5.96e-7 and 1.91e-6; guard margin: 1.22e-4). The first analysis omitted this
+fallback. GPU flag confirmation and the effective sampling comparison are
+pending; do not describe those raw-probe diagnostics as a demonstrated failure
+of the complete sampler. The measured C8 timing still requires investigation.
