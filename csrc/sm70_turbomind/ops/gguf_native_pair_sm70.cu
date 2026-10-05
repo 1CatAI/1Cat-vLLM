@@ -11,6 +11,7 @@
 using R12 = vllm::sm70_gguf::NativePairReader<12>;
 using R18 = vllm::sm70_gguf::NativePairReader<18>;
 using R21 = vllm::sm70_gguf::NativePairReader<21>;
+using R22 = vllm::sm70_gguf::NativePairReader<22>;
 using R23 = vllm::sm70_gguf::NativePairReader<23>;
 namespace {
 template <class Gate, class Up>
@@ -33,6 +34,8 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(
       (gate_type == 21 && (up_type == 23 || up_type == 18)) ||
           ((gate_type == 23 || gate_type == 18) && up_type == 21) ||
+          (gate_type == 22 && (up_type == 18 || up_type == 21)) ||
+          ((gate_type == 18 || gate_type == 21) && up_type == 22) ||
           (gate_type == 18 && up_type == 23) ||
           (gate_type == 12 && up_type == 23) ||
           (gate_type == 23 && up_type == 12),
@@ -55,7 +58,11 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
                   k % 1024 == 0 && n <= INT_MAX && k <= INT_MAX,
               "GGUF native pair requires M8/N32/K1024");
   const auto block_bytes = [](int64_t type) {
-    return type == 12 ? 144 : type == 18 ? 98 : type == 21 ? 110 : 136;
+    return type == 12   ? 144
+           : type == 18 ? 98
+           : type == 21 ? 110
+           : type == 22 ? 82
+                        : 136;
   };
   TORCH_CHECK(gate.numel() == n * (k / 256) * block_bytes(gate_type) &&
                   up.numel() == n * (k / 256) * block_bytes(up_type),
@@ -65,7 +72,15 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "GGUF native pair requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (gate_type == 12)
+  if (gate_type == 22 && up_type == 21)
+    launch_pair<R22, R21>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 21 && up_type == 22)
+    launch_pair<R21, R22>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 22)
+    launch_pair<R22, R18>(output, input, gate, up, n, k, stream);
+  else if (up_type == 22)
+    launch_pair<R18, R22>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 12)
     launch_pair<R12, R23>(output, input, gate, up, n, k, stream);
   else if (up_type == 12)
     launch_pair<R23, R12>(output, input, gate, up, n, k, stream);

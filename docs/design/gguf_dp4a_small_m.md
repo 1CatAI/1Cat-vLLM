@@ -140,3 +140,49 @@ Q8_1 activation route; other batches retain the existing canonical route.
 Missing operators, unsupported formats or shapes, unavailable original rows,
 disabled policy and incompatible dtypes are reported as fallback reasons.
 Model KL, top1, natural completion and acceptance intervals remain pending.
+
+## First model comparison
+
+The complete installed SM70 wheel uses Torch2.10/CUDA12.8, four V100s,
+TP4, Flash-Next IQ3_S and FP16 MTP weights with four speculative tokens.
+Both arms use FULL target graphs, FP16 KV, FP32 recurrent state, maximum
+length9216, prefill budget512, maximum four sequences, memory utilization0.95,
+no prefix cache and greedy sampling. The only policy change is
+`kernel_config.sm70_gguf.small_m_dp4a`.
+
+The C1 probe uses8192 input tokens and256 output tokens; C4 uses128 input
+tokens and600 output tokens per stream. Pure decode intervals exclude
+prefill and terminal intervals. Eight distinct natural prompts each produce
+600 tokens for the acceptance comparison; these requests stop at the length
+limit and are not described as EOS completions. Two bounded natural prompts
+produce the same answers in both arms and terminate at EOS after2/17 tokens.
+
+| Probe | FP16 activation control | Integer expert candidate |
+|---|---:|---:|
+|C1 median, first unobserved probe|23.257ms|20.679ms|
+|C1 median, final unobserved probe|23.261ms|20.683ms|
+|C1 mean, final unobserved probe|23.251ms|21.274ms|
+|C4 median|51.672ms|44.380ms|
+|C4 mean|51.485ms|44.591ms|
+
+One candidate C1 final-probe interval is a long outlier; it remains in the
+raw data and the mean. The candidate's first C1 mean is20.716ms. Report
+median and mean separately: the steady improvement is approximately2.58ms,
+while the final-probe mean improves1.98ms. These are actual emitted-token
+system intervals, not sums of projection timings. The18.5ms phase goal has
+not been reached.
+
+Teacher-forcing captures full-vocabulary logits from the actual M5 target
+hidden states after graph replay. Every TP worker participates in the normal
+LM head; rank0 saves logits before sampling restrictions. A fixed allowed
+token forces the first continuation token, and captured position/token plus
+prefix hashes must agree across arms. Only the first verification of each
+request is captured. Forced-request acceptance is excluded from the natural
+prompt acceptance sample. All64 paired positions complete: top1 agrees at
+64/64, mean KL(reference || candidate) is0.000768 and maximum KL is0.008665.
+Eight-prompt mean acceptance is44.819% versus46.145%, with paired bootstrap
+delta +1.326 percentage points and95% interval[-2.106,+4.962] points.
+Mean acceptance length is2.793 versus2.846, delta +0.053 and95% interval
+[-0.084,+0.198]. This sample does not show a decrease; the broad interval
+does not prove equivalence. Both arms use the same installed extension and
+tokenized prompt hashes. C1/C4 raw means, medians and the outlier are retained.
