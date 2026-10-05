@@ -72,7 +72,9 @@ def main():
                 # checkpoint's trained BF16 norms or the original FP8 head.
                 scale = weight.float().abs().amax(1).clamp_min(1e-12) / 448.0
                 quantized = (weight.float() / scale[:, None]).to(torch.float8_e4m3fn)
-                codes, qscale = ops.fp8_qpn8_prepare_sm70(quantized, scale)
+                codes, qscale = ops.fp8_qpn8_prepare_sm70(
+                    quantized, scale[:, None].contiguous()
+                )
                 x = torch.randn(8, k, device="cuda", dtype=torch.float16) * 0.1
                 output = x.new_empty((8, n))
                 split, chains = (8, 2) if name == "gate_up" else (16, 2)
