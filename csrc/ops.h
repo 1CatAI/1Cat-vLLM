@@ -957,3 +957,7 @@ void gguf_lattice_raw_grouped_gate_up_sm70_out(
 
 void gguf_iq3_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                              torch::Tensor gate, torch::Tensor up);
+
+void gguf_native_pair_sm70_out(torch::Tensor out, torch::Tensor input,
+                               torch::Tensor gate, torch::Tensor up,
+                               int64_t gate_type, int64_t up_type);
