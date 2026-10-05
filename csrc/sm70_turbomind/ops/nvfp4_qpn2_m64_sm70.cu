@@ -195,7 +195,8 @@ __global__ void nvfp4_qpn2_m64_n128_finish(half* output, const float* partial,
 
 // The dispatcher admits only the two qualified TP4 MLP shapes. Each stream
 // owns its partials; sharing across sequential layers avoids graph-pool copies
-// of this scratch. Retain each allocation so earlier graph pointers stay live.
+// of this scratch. Both shapes share a fixed-size buffer whose pointer stays
+// live for earlier captured graphs. Every used partial is overwritten.
 void nvfp4_qpn2_m64_n128_sm70_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor codes, torch::Tensor scales,
                                   double global_scale, bool gated_silu) {
@@ -225,16 +226,17 @@ void nvfp4_qpn2_m64_n128_sm70_out(torch::Tensor out, torch::Tensor input,
               "M64 QPN2 layout size mismatch");
   const at::cuda::OptionalCUDAGuard guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  using Key = std::tuple<int, cudaStream_t, int64_t>;
+  using Key = std::tuple<int, cudaStream_t>;
   static std::mutex mutex;
   static std::map<Key, torch::Tensor> scratch;
-  const int64_t elements = int64_t(parts) * projections * rows * width;
+  constexpr int64_t kMaxElements = int64_t(5) * 2 * 64 * 4352;
   torch::Tensor storage;
   {
     std::lock_guard<std::mutex> lock(mutex);
-    auto& cached = scratch[{input.get_device(), stream, elements}];
+    auto& cached = scratch[{input.get_device(), stream}];
     if (!cached.defined()) {
-      cached = torch::empty({elements}, input.options().dtype(torch::kFloat32));
+      cached =
+          torch::empty({kMaxElements}, input.options().dtype(torch::kFloat32));
     }
     storage = cached;
   }
