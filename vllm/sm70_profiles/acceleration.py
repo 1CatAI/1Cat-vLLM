@@ -324,10 +324,10 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
             "total_bytes": sum(copies.values()) if reference_layout else None,
             "excludes": "allocator overhead, graphs, temporary workspaces and KV cache",
             "precision_policy_note": (
-                "Router/shared estimates assume FP16 reduced-precision reductions "
-                "are enabled and FP16 accumulation is disabled. Workers skip "
-                "these copies otherwise; inspect sm70_preparations for actual "
-                "packed bytes and per-layer precision rejection reasons."
+                "Router/shared estimates require FP16 accumulation disabled; "
+                "shared packs also require FP16 reduced-precision reductions. "
+                "Router partials remain FP32. Inspect sm70_preparations for "
+                "actual packed bytes and per-layer precision rejection reasons."
             ),
             "capacity_note": (
                 "Packed weights reduce memory available to KV and graph/workspace "
@@ -514,7 +514,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": sparse_policy.reason,
         "configuration": asdict(sparse_policy),
         "decode_fallback": "retain configured paged QK-D for low query/index workloads",
-        "indexer_graph_fallback": "paged indexer for fixed full-graph key buckets",
+        "indexer_graph_fallback": (
+            "paged indexer for unbounded full graphs or rejected key layouts"
+        ),
         "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
     }
     report["ple_result_transports"] = cfg.kernel_config.ple_result_transports

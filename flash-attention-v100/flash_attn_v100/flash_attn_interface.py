@@ -1581,6 +1581,71 @@ def flash_attn_prefill_paged(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    if (
+        not causal
+        and window_size == (2047, 2047)
+        and anchor_lens is None
+        and anchored_window == 0
+        and q.is_cuda
+        and q.dtype == torch.float16
+        and q.ndim == 4
+        and 1 <= q.shape[0] <= 4
+        and q.shape[1:] == (8, 8, 128)
+        and k_cache.dtype == v_cache.dtype == torch.float16
+        and kv_cache_dtype in ("auto", "fp16")
+        and k_cache.ndim == v_cache.ndim == 4
+        and k_cache.shape[1] in (1024, 2048)
+        and k_cache.shape[2:] == v_cache.shape[2:] == (2, 128)
+        and k_cache.stride(-1) == v_cache.stride(-1) == 1
+        and torch.cuda.get_device_capability(q.device) == (7, 0)
+        and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
+        and (out is None or out.is_contiguous())
+    ):
+        # Single-request query blocks benefit from splitting the live window.
+        # Concurrent blocks retain the qualified native WMMA route.
+        if (
+            q.shape[0] == 1
+            and q.is_contiguous()
+            and k_cache.device == v_cache.device == q.device
+            and k_cache.shape == v_cache.shape
+            and block_table.device == seq_lens.device == q.device
+            and block_table.dtype == seq_lens.dtype == torch.int32
+            and block_table.ndim == 2
+            and block_table.shape[0] == 1
+            and seq_lens.shape == (1,)
+            and (
+                out is None
+                or (
+                    out.shape == q.shape
+                    and out.dtype == q.dtype
+                    and out.device == q.device
+                )
+            )
+        ):
+            try:
+                from .sm70_dflash2_split import forward as split_window
+            except ImportError:
+                split_window = None
+            if split_window is not None:
+                return split_window(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_table.contiguous(),
+                    seq_lens,
+                    softmax_scale,
+                    out,
+                )
+        return flash_attn_v100_cuda.dflash2_paged_bmhd_fwd(
+            q.contiguous(),
+            k_cache,
+            v_cache,
+            out,
+            block_table.contiguous(),
+            seq_lens.contiguous(),
+            softmax_scale,
+        )
+
     out_original = out
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
@@ -1618,6 +1683,13 @@ def flash_attn_prefill_paged(
         int(anchored_window),
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
+
+
+# Advertise the packaged direct-output ABI to the attention backend. Older
+# extension builds keep their existing single-request publication path.
+flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
+    flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
+)
 
 
 def fp8_e4m3_paged_kv_to_fp16(

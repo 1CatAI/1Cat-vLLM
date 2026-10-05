@@ -103,7 +103,7 @@ def test_hc_and_ple_mapping_and_inverse_norm_convolution():
     assert not adapter.is_linear(mapping["blk.0.hc_attn_inject.weight"])
     assert not adapter.is_linear("model.layers.0.mlp.gate.weight")
     assert not adapter.is_linear("model.layers.0.mlp.shared_expert_gate.weight")
-    assert not adapter.is_linear("lm_head.weight")
+    assert adapter.is_linear("lm_head.weight")
     for norm in ("norm_key", "norm_query", "norm_conv"):
         assert not adapter.is_linear(f"model.layers.1.ple.{norm}.weight")
     assert adapter.restore(
@@ -190,3 +190,17 @@ def test_stacked_experts_keep_independent_projection_type():
         assert weights[f"{prefix}.{expert}.up_proj.qweight_type"].item() == 8
         assert weights[f"{prefix}.{expert}.gate_proj.qweight"].shape == (4, 18)
         assert weights[f"{prefix}.{expert}.up_proj.qweight"].shape == (4, 34)
+
+
+def test_quantized_vocabulary_head_keeps_packed_payload_and_type():
+    adapter = Qwen4ExpAdapter(small_config())
+    raw = np.arange(3 * 210, dtype=np.uint16).astype(np.uint8).reshape(3, 210)
+    tensor = SimpleNamespace(tensor_type=gguf.GGMLQuantizationType.Q6_K, data=raw)
+    tensors = {"output.weight": tensor}
+    weights = dict(
+        adapter.weights(tensors, adapter.build_name_map(tensors), torch.float16)
+    )
+    assert set(weights) == {"lm_head.qweight_type", "lm_head.qweight"}
+    assert weights["lm_head.qweight_type"].item() == int(gguf.GGMLQuantizationType.Q6_K)
+    assert weights["lm_head.qweight"].dtype == torch.uint8
+    torch.testing.assert_close(weights["lm_head.qweight"], torch.from_numpy(raw))

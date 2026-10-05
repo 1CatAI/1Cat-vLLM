@@ -282,18 +282,33 @@ class DFlashQwen3Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # Per-head RMSNorm
-        q_shape, k_shape = q.shape, k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
-        ).view(q_shape)
-        k = self.k_norm(
-            k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
-        ).view(k_shape)
+        fused_prep = getattr(self, "_sm70_dflash2_qk_rope", False)
+        if fused_prep:
+            q = torch.empty_like(q)
+            k = torch.empty_like(k)
+            torch.ops.vllm.sm70_dflash2_qk_norm_rope_cache(
+                qkv,
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.attn.layer_name,
+            )
+        else:
+            # Per-head RMSNorm
+            q_shape, k_shape = q.shape, k.shape
+            q = self.q_norm(
+                q.view(*q_shape[:-1], q_shape[-1] // self.head_dim, self.head_dim)
+            ).view(q_shape)
+            k = self.k_norm(
+                k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
+            ).view(k_shape)
 
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v)
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v, kv_cache_updated=fused_prep)
         output_input_scale = getattr(self, "output_input_scale", 1.0)
         if output_input_scale != 1.0:
             attn_output = attn_output / output_input_scale

@@ -173,4 +173,9 @@ std::vector<at::Tensor> flash_attention_backward(
     const bool deterministic, std::optional<at::Generator> gen_,
     std::optional<at::Tensor>& rng_state);
 
+at::Tensor flash_attention_dflash2_paged_bmhd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    std::optional<at::Tensor>& output, const at::Tensor& table,
+    const at::Tensor& lengths, const float scale);
+
 #endif
