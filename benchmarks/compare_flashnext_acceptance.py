@@ -10,9 +10,25 @@ import numpy as np
 
 
 def compare(gguf, nvfp4, repetitions=20000):
-    for key in ("prompt_tokens_sha256", "sampling"):
+    for key in ("prompt_tokens_sha256", "sampling", "core_sha256", "torch", "cuda"):
         if gguf[key] != nvfp4[key]:
             raise ValueError(f"Unmatched {key}")
+    for key in (
+        "tensor_parallel_size",
+        "dtype",
+        "kv_cache_dtype",
+        "mamba_ssm_cache_dtype",
+        "max_model_len",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        "gpu_memory_utilization",
+        "enable_prefix_caching",
+        "disable_log_stats",
+        "speculative_config",
+        "compilation_config",
+    ):
+        if gguf["config"][key] != nvfp4["config"][key]:
+            raise ValueError(f"Unmatched runtime setting: {key}")
     if not gguf["complete"] or not nvfp4["complete"]:
         raise ValueError("Both runs must be complete")
     left, right = gguf["rows"], nvfp4["rows"]
