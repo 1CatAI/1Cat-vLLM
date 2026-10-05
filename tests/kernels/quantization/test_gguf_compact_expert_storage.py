@@ -102,11 +102,16 @@ def test_compact_bank_graph_with_changed_routing(monkeypatch):
         ),
     )
     bank = module.GGUFExpertBank(18, 4, "cuda", torch.float16, prefer_compact=True)
-    data = source(n=128, k=768)
+    references = []
     for expert in range(4):
+        data = source(n=128, k=768)
+        blocks = data.reshape(128, 3, 98)
+        blocks[:, :, :2] = np.array([0.01 * (expert + 1)], dtype="<f2").view(np.uint8)
         bank.add(expert, torch.from_numpy(data).cuda(), 0, 4, axis=0)
+        references.append(
+            torch.from_numpy(dequantize(data[:32], 18)).half().cuda().float()
+        )
     bank.finalize()
-    reference = torch.from_numpy(dequantize(data[:32], 18)).half().cuda().float()
     x = torch.randn(21, 768, device="cuda", dtype=torch.float16)
     offsets = torch.tensor([0, 5, 5, 17, 21], device="cuda", dtype=torch.int32)
     ids = torch.empty(0, device="cuda", dtype=torch.int32)
@@ -119,7 +124,9 @@ def test_compact_bank_graph_with_changed_routing(monkeypatch):
         offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
         x.normal_()
         graph.replay()
-        torch.testing.assert_close(
-            out.float(), x.float() @ reference.T, rtol=0.001, atol=0.003
-        )
+        expected = torch.empty_like(out, dtype=torch.float32)
+        for expert, reference in enumerate(references):
+            begin, end = boundaries[expert : expert + 2]
+            expected[begin:end] = x[begin:end].float() @ reference.T
+        torch.testing.assert_close(out.float(), expected, rtol=0.001, atol=0.003)
     assert list(dict(bank.named_buffers())) == ["weights"]
