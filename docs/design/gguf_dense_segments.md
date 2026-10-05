@@ -1,7 +1,7 @@
 # Coalesced GGUF dense projections on SM70
 
 Flash-Next uses mixed Q4_K, Q5_K, Q6_K and IQ4 dense projections.
-The new route issues one projection kernel for same-input segments at M1..8,
+The new route issues one projection kernel for same-input segments at M1..8/M20,
 reconstructing FP16 weights with mma884 and FP32 accumulation. Shared experts
 use two launches: gate/up with SiLU and a parallel shared-gate dot, then down
 with the sigmoid epilogue. Codes and the canonical FP16 coefficient rounding
@@ -39,7 +39,7 @@ remain required, because the Q8 activation contract differs from FP16 MMA.
 
 ## Storage and capture requirements
 
-One resident packed bank replaces the old canonical bank. M above eight uses
+One resident packed bank replaces the old canonical bank. Unqualified M uses
 TurboMind after restoring its integer layout into shared transient scratch;
 there is no second retained quantized bank. Restore must be byte-identical to
 the existing converter and must be benchmarked at M20 before model admission.
