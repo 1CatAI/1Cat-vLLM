@@ -1,0 +1,84 @@
+# Flash-Next GGUF graph parity and MTP4 acceptance
+
+## Fixed workload
+
+The paired run uses ISTA-DASLab Qwen3.8-Flash-Next GSQ-RCO IQ3_S GGUF and
+RadixArk Qwen3.8-Flash-Next NVFP4. Both use the same FP16 MTP4 draft weights,
+TP4 on GPU0–3 (V100-SXM2-32GB), CUDA12.8, Torch2.10.0+cu128, Python3.12,
+FP16 activations/KV, FP32 recurrent state and accumulation, FULL graphs,
+max length9216, max batch512, four sequences, memory utilization0.95,
+prefix caching disabled and metric collection enabled.
+
+Eight natural prompts are shipped in benchmarks/flashnext_acceptance_prompts.json.
+Greedy sampling overrides model defaults explicitly; EOS is respected, max
+output is600. Both tokenizers produce identical chat input IDs. All eight
+requests in both runs produce600 tokens and stop at the length limit; this is
+not EOS-termination evidence. Texts are plausible writing, explanation, code
+and planning in Chinese and English.
+
+## Paired acceptance
+
+Intervals use20,000 deterministic paired bootstrap resamples with prompt as the
+cluster unit. They do not treat4,800 output tokens as independent observations.
+
+| Metric | GGUF mean | NVFP4 mean | Difference | Difference95% interval |
+|---|---:|---:|---:|---:|
+| Draft acceptance |45.470%|45.204%|+0.266pp|−1.468 to+2.057pp|
+| Length, including bonus |2.8188|2.8081|+0.0107|−0.0587 to+0.0823|
+
+The earlier large acceptance decrease is not reproduced on this set. Eight
+prompt clusters do not establish equivalence for all workloads.
+
+## Complete-round probes
+
+Separate synthetic probes respect exact token budgets and ignore EOS to keep
+verification geometry fixed. They are performance probes, not quality tests.
+C1 uses I8192/O256; C4 uses I128/O600. Steady intervals trim eight eligible
+rounds at both ends. Primary reports use an ordinary source-containing wheel,
+not graph-node profiling.
+
+| Route | C1 before observer (ms) | C1 observed (ms) | C1 after observer (ms) | C4 mean (ms) |
+|---|---:|---:|---:|---:|
+| GGUF |24.2522|24.1096|25.4961|49.7277|
+| NVFP4 |21.3536|21.4406|22.1936|47.2284|
+
+The last control arms contain outliers. These absolute values are not a matched
+gain against the earlier26.07/52.06ms workload, which used different prompts
+and limits. Different speculative trajectories also affect emitted-token
+throughput; verification-round time alone is not the MTP throughput metric.
+
+## Replay entry observations
+
+The benchmark-only worker extension timestamps the actual CUDAGraph replay
+call after manager-side waits, along with input, attention, sampling, PLE and
+asynchronous output stages. It adds no GPU fence. CPU stage wall durations can
+include waits for preceding GPU work; nested durations are not additive.
+
+| Route | Rounds | Median spread (µs) | p90 (µs) | Latest rank |
+|---|---:|---:|---:|---|
+| GGUF |38|109.804|206.838|rank3 in31 rounds|
+| NVFP4 |81|647.349|769.847|rank0 in79 rounds|
+
+GGUF worker-entry spread has median529.27µs. Attention-metadata preparation
+includes about20ms of GPU waiting, ending with only53.78µs inter-rank spread.
+Subsequent model-input preparation expands this to100.99µs; actual replay
+entry reaches109.80µs. The post-attention tail is255–303µs, including201–230µs
+for model input preparation. This motivates moving independent position
+preparation before attention metadata while preserving current-stream order.
+The same-engine phase A/B and fresh graph-node difference ledger are pending.
+
+## Prepared GGUF coverage
+
+All four ranks prepare17 IQ3_XXS gate/up layers for original M1/M5/M20,
+20 IQ2_S layers for M1/M5, and10 IQ3_S layers for M1/M5/M20. IQ2_S M20 retains
+canonical grouped fallback. Original rows add2.552GiB per rank for IQ3_XXS.
+
+Dense GDN QKV uses Q6_K at local N2560/K2560, Z uses Q4_K at N1536/K2560,
+and output uses Q6_K at N2560/K1536. Shared gate/up includes Q4_K/IQ4_XS at
+N160/K2560. Existing IQ3_S/IQ2_S native dense candidates do not cover Q6_K.
+The IQ4_XS source-layout reader provides preparation/oracle support without
+changing runtime dispatch.
+
+HC modules, row GEMV, GDN projection tails, router top-k, shared-expert gates,
+QSA batch selection and FlashQLA report preparation/route hits. Graph-node
+inspection must confirm the final captured kernel composition.
