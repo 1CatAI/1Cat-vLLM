@@ -100,10 +100,31 @@ hides that position launch but does not meet the100µs objective. Further
 diagnosis needs the attention-wait/output boundary. The observed arms have
 large scheduling outliers and do not replace unobserved speed measurements.
 
-The fresh graph-node ledger is pending. Nsight2024.6.2 fails during NCCL NVTX
-initialization before weights load. Its failed path is retained; a normal
-four-rank NCCL initialization succeeds under Nsight2026.2.1. Neither failure
-nor graph-node service time supplies an unprofiled performance result.
+The fresh graph-node ledger is pending. Nsight2024.6.2 with NVTX tracing fails
+during NCCL NVTX initialization. Nsight2026.2.1 passes initialization but
+produces no report even for a single-process256-kernel CUDA smoke on this
+system. CUDA-only2024.6.2 with fork tracing captures all four NCCL ranks.
+Use `--kill=none` so ending collection does not terminate the application.
+The CUDA-only ledger strips Nsight's system-ID bits from process identifiers
+and selects the largest repeating graph, checking its launch count against
+the independent M5 CPU records. A regression using the retained historical
+trace reproduces2175 nodes on each rank across59 middle rounds; this is
+parser validation, not a new model measurement.
+
+A whole-wheel native template passes CPU checks but fails model startup with
+rank1 cuBLAS allocation failure; it is not model-qualified. An owned SM70
+native build then passes29 CPU and25 GPU checks, including official expert
+dequantization, changed-input graphs and mixed-output bitwise comparisons.
+Its ordinary wheel uses source `b8dbe0d0ae715b2b5e12889ecb1115fe8ec3c1f4`, with core
+`d9a0d86934a412c1847d20ce4422216d93b720d1f25019568e0d650e3117f6e6`.
+The source build retains existing CUDA objects and rebuilds the new CPU
+gather registration through the normal CMake/package path. Neither failed
+startup nor profiled service time supplies an unprofiled speed result.
+
+An asynchronous-output event experiment reduces waiting-thread CPU from
+129.62ms busy waiting to0.066ms blocking in a150ms GPU-wait proxy, but median
+host position launches remain67.47 versus66.18µs. It does not explain the
+model's rank0 launch discrepancy, so no production event-wait change is made.
 
 ## Prepared GGUF coverage
 
