@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm.model_executor.kernels.gguf import dp4a_expert_capabilities
+
+
+@pytest.fixture
+def packaged(monkeypatch):
+    operators = {
+        name: object()
+        for name in (
+            "gguf_quantize_q8_1_sm70_out",
+            "gguf_dp4a_gate_up_sm70_out",
+            "gguf_dp4a_down_unroute_sm70_out",
+        )
+    }
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace(**operators))
+
+
+@pytest.mark.parametrize("gate", [18, 21, 22])
+@pytest.mark.parametrize("down", [20, 42])
+def test_only_calibrated_original_m_is_admitted(packaged, gate, down):
+    caps = dp4a_expert_capabilities(
+        gate, down, 2560, 160, 512, torch.float16, is_sm70=True
+    )
+    admitted = [
+        m
+        for m in (1, 2, 4, 5, 8, 10, 16, 20, 32, 50, 200)
+        if any(c.reason is None and c.supports_m(m) for c in caps)
+    ]
+    assert admitted == [5, 20]
+    assert all(c.graph_safe for c in caps)
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"enabled": False}, "disabled_by_kernel_config"),
+        ({"is_sm70": False}, "requires_sm70"),
+        ({"dtype": torch.bfloat16}, "requires_fp16_activations"),
+        ({"source_type": 23}, "dp4a_expert_source_formats_unavailable"),
+        ({"down_type": 14}, "dp4a_expert_source_formats_unavailable"),
+        ({"n": 320}, "dp4a_expert_shape_has_no_calibration"),
+        ({"k": 5120}, "dp4a_expert_shape_has_no_calibration"),
+        ({"original_storage_available": False}, "original_expert_bank_not_retained"),
+    ],
+)
+def test_fallback_reasons(packaged, changes, reason):
+    parameters = dict(
+        source_type=21,
+        down_type=42,
+        k=2560,
+        n=160,
+        num_experts=512,
+        dtype=torch.float16,
+        is_sm70=True,
+    )
+    parameters.update(changes)
+    caps = dp4a_expert_capabilities(**parameters)
+    assert all(c.reason == reason for c in caps)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "gguf_quantize_q8_1_sm70_out",
+        "gguf_dp4a_gate_up_sm70_out",
+        "gguf_dp4a_down_unroute_sm70_out",
+    ],
+)
+def test_missing_packaged_component_rejects_entire_route(packaged, monkeypatch, name):
+    monkeypatch.delattr(torch.ops._C, name)
+    caps = dp4a_expert_capabilities(21, 42, 2560, 160, 512, torch.float16, is_sm70=True)
+    assert all(c.reason == f"operator_missing:{name}" for c in caps)
