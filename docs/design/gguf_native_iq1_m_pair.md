@@ -17,6 +17,15 @@ A real N64/K5120 gate sample preserves 71,680 original bytes and 327,680
 independently decoded official FP32 values bitwise. All 2048 existing
 codebook entries match the official reader.
 
-Normal CUDA build and installed GPU numerical/graph/speed comparisons
-are pending.
-No end-to-end result is claimed.
+The complete CUDA12.8 SM70 wheel passes its installed native audit.
+This pair uses64 registers,41,984 shared bytes and zero stack/local
+memory. All real-weight official FP32 GEMM comparisons pass, relative
+L2 0.000515–0.000522, as do runtime M512/8/1/5/16/20/32/8 and graph
+checks; non-M8 remains bitwise canonical.
+
+At stable secondary1530/877MHz,300W,16MiB cold-L2 graph ABBA, layer13
+native64.512us versus canonical90.112us. Original12,011,520-byte payload
+gives186.2GB/s versus133.3GB/s. The isolated single-layer saving is
+25.600us; no end-to-end result is claimed. Admit only the measured
+SM70 FP16 M8/N4352/K5120 orientation. Installed prepared-layer checks
+and fixed1290MHz comparison are pending.
