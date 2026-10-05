@@ -14,6 +14,97 @@ struct NativePairReader;
 // Original Q2_K and Q4_K layouts follow llama.cpp's block definitions;
 // its MIT license is retained in
 // csrc/quantization/gguf_upstream/llama.cpp/LICENSE.
+// IQ1_M uses the existing llama.cpp-derived lattice book and original
+// distributed half scale; every decode product remains FP32 until final half.
+template <>
+struct NativePairReader<29> {
+  using Codebook = turbomind::gemm::LatticeCodebook<29>;
+  static constexpr int kBlockBytes = 56;
+  static constexpr int kBookId = 29;
+  static constexpr int kBookBytes = Codebook::kBytes;
+  struct Record {
+    uint32_t indices[4];
+    uint32_t high[2];
+    uint32_t scales;
+    float d;
+  };
+  const uint8_t* payload;
+  const uint2* high;
+  const uint2* original_scales;
+  uint2 cached_scales;
+  float cached_d;
+  int half_block;
+  bool first;
+
+  __device__ NativePairReader(const uint8_t* source, int tile, int blocks_k,
+                              int first_part, int col) {
+    const uint8_t* macro = source + int64_t{tile} * blocks_k * 32 * kBlockBytes;
+    payload = macro + first_part * 768 + col * 16;
+    high = reinterpret_cast<const uint2*>(macro + first_part * 768 + 512 +
+                                          col * 8);
+    original_scales = reinterpret_cast<const uint2*>(
+        macro + blocks_k * 1536 + (first_part / 2) * 256 + col * 8);
+    cached_scales = {0, 0};
+    cached_d = 0;
+    half_block = first_part & 1;
+    first = true;
+  }
+
+  __device__ static void initialize(uint8_t* book) {
+    auto* words = reinterpret_cast<uint32_t*>(book);
+    for (int i = threadIdx.x; i < kBookBytes / 4; i += blockDim.x)
+      words[i] = Codebook::word(i);
+    __syncthreads();
+  }
+
+  __device__ Record load() {
+    if (first || half_block == 0) {
+      cached_scales = *original_scales;
+      const uint16_t d =
+          ((cached_scales.x >> 12) & 15) | ((cached_scales.x >> 24) & 240) |
+          ((cached_scales.y >> 4) & 3840) | ((cached_scales.y >> 16) & 61440);
+      cached_d = __half2float(__ushort_as_half(d));
+    }
+    const uint4 indices = *reinterpret_cast<const uint4*>(payload);
+    const uint2 aux = *high;
+    Record record{{indices.x, indices.y, indices.z, indices.w},
+                  {aux.x, aux.y},
+                  half_block ? cached_scales.y : cached_scales.x,
+                  cached_d};
+    payload += 768;
+    high += 96;
+    original_scales += half_block * 32;
+    half_block ^= 1;
+    first = false;
+    return record;
+  }
+
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t* book) {
+    static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
+    constexpr int octet = 2 * Segment + Fragment;
+    const uint32_t high = (record.high[octet / 8] >> (4 * (octet & 7))) & 15;
+    const uint32_t index =
+        ((record.indices[octet / 4] >> (8 * (octet & 3))) & 255) |
+        ((high & 7) << 8);
+    const uint64_t packed =
+        *reinterpret_cast<const uint64_t*>(book + index * 8);
+    const int scale =
+        (record.scales >> (16 * (Segment / 4) + 3 * (Segment & 3))) & 7;
+    const float d = record.d * static_cast<float>(2 * scale + 1);
+    const float delta = (high & 8) ? -0.125f : 0.125f;
+    turbomind::Array<half, 8> result;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float grid =
+          static_cast<float>(int((packed >> (8 * i)) & 255) - 128);
+      result[i] = __float2half_rn(d * (grid + delta));
+    }
+    return result;
+  }
+};
+
 template <>
 struct NativePairReader<10> {
   static constexpr int kBlockBytes = 84;

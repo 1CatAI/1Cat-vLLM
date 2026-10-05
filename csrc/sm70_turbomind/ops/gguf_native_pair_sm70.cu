@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "gguf_pair_shared_a_sm70.cuh"
 
+using R29 = vllm::sm70_gguf::NativePairReader<29>;
 using R10 = vllm::sm70_gguf::NativePairReader<10>;
 using R12 = vllm::sm70_gguf::NativePairReader<12>;
 using R16 = vllm::sm70_gguf::NativePairReader<16>;
@@ -42,6 +43,7 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
           (gate_type == 17 && (up_type == 18 || up_type == 16)) ||
           (gate_type == 16 && up_type == 22) ||
           (gate_type == 10 && up_type == 21) ||
+          (gate_type == 29 && up_type == 22) ||
           (gate_type == 22 && up_type == 17) ||
           (gate_type == 18 && up_type == 23) ||
           (gate_type == 12 && (up_type == 23 || up_type == 21)) ||
@@ -67,6 +69,8 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
               "GGUF native pair requires M8/N32/K1024");
   const auto block_bytes = [](int64_t type) {
     switch (type) {
+      case 29:
+        return R29::kBlockBytes;
       case 10:
         return R10::kBlockBytes;
       case 12:
@@ -96,7 +100,9 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "GGUF native pair requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (gate_type == 10)
+  if (gate_type == 29)
+    launch_pair<R29, R22>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 10)
     launch_pair<R10, R21>(output, input, gate, up, n, k, stream);
   else if (gate_type == 17 && up_type == 16)
     launch_pair<R17, R16>(output, input, gate, up, n, k, stream);
