@@ -352,9 +352,7 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
-            from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
-
-            pinned = pinned_decode_active()
+            pinned = getattr(self, "_pinned_decode", False)
             if (
                 envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned
             ) and use_sm70_decode_graph_semantics():

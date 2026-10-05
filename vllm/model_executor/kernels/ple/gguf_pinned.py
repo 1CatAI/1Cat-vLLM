@@ -90,7 +90,7 @@ def prepare_pinned_gguf_ple(config, tensors, names):
             "type": int(tensors[raw].tensor_type),
             "k": int(tensors[raw].shape[0]),
             "n": int(tensors[raw].shape[1]),
-            "bytes": tensors[raw].n_bytes,
+            "bytes": int(tensors[raw].n_bytes),
         }
         for raw, name in names.items()
         if name.endswith(".ple_embedding.ngram_embedding.weight")

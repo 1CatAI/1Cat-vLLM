@@ -1136,6 +1136,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
         )
         self._cascade = ple_cascade_configured()
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        self._pinned_decode = pinned_decode_active()
+
         self._remote_placements: list[PLERemotePlacement] = []
         self._disk_segments: list[PLEDiskSegment] = []
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
