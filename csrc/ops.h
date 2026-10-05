@@ -1031,3 +1031,11 @@ void gguf_small_output_sm70_out(torch::Tensor output, torch::Tensor input,
                                 torch::Tensor weight, torch::Tensor partials,
                                 torch::Tensor counters, int64_t type,
                                 int64_t splits, bool gdn_head_tiling);
+
+void gguf_canonical_pair_sm70_out(torch::Tensor output, torch::Tensor input,
+                                  torch::Tensor gate, torch::Tensor gate_stats,
+                                  torch::Tensor up, torch::Tensor up_stats,
+                                  int64_t family);
+void gguf_canonical_iq4_linear_sm70_out(
+    torch::Tensor output, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor stats, torch::Tensor partials, torch::Tensor counters);

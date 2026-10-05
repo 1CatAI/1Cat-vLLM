@@ -9,6 +9,7 @@ namespace vllm::sm70_gguf {
 template <int Bits, int Group>
 struct CanonicalAffineReader {
   static constexpr int kBookBytes = 0;
+  static constexpr int kBookId = 0;
   using Packet = std::conditional_t<Bits == 2, uint16_t, uint32_t>;
   using Code =
       std::conditional_t<Bits == 2, turbomind::uint2_t, turbomind::uint4_t>;
@@ -48,6 +49,53 @@ struct CanonicalAffineReader {
     stats[0][0][0] = record.coefficients[(octet * 8) / Group];
     turbomind::Array<half, 8> decoded[1][1];
     turbomind::gemm::Transform_HMMA_SIMT_B::apply(decoded, 0, data, stats, 1);
+    return decoded[0][0];
+  }
+};
+
+// Read the existing LUT4 converter stream without expanding source scales
+// again. Packet lanes and half multiplication match canonical GEMM exactly.
+struct CanonicalIq4Reader {
+  static constexpr int kBookBytes = 0;
+  static constexpr int kBookId = 0;
+  struct Record {
+    uint32_t packets[16];
+    uint16_t coefficients[4];
+  };
+  const uint32_t* packets;
+  const uint16_t* coefficients;
+  int stat_stride;
+  __device__ CanonicalIq4Reader(const uint8_t* source, const uint32_t* stats,
+                                int n, int k, int tile, int first, int col) {
+    packets = reinterpret_cast<const uint32_t*>(source) +
+              int64_t{tile} * (k / 8) * 32 + first * 16 * 32 + col;
+    coefficients = reinterpret_cast<const uint16_t*>(stats) +
+                   int64_t{first} * 4 * n + tile * 32 + col;
+    stat_stride = n;
+  }
+  __device__ static void initialize(uint8_t*) {}
+  __device__ Record load() {
+    Record record;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) record.packets[i] = packets[i * 32];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      record.coefficients[i] = coefficients[i * stat_stride];
+    packets += 16 * 32;
+    coefficients += 4 * stat_stride;
+    return record;
+  }
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t*) {
+    constexpr int octet = Segment * 2 + Fragment;
+    turbomind::Array<turbomind::uint4_t, 8> data[1][1];
+    reinterpret_cast<uint32_t&>(data[0][0]) = record.packets[octet];
+    turbomind::Array<uint16_t, 1> stats[1][1];
+    stats[0][0][0] = record.coefficients[octet / 4];
+    turbomind::Array<half, 8> decoded[1][1];
+    turbomind::gemm::Transform_HMMA_SM70_Lut4<0>::apply(decoded, 0, data, stats,
+                                                        1);
     return decoded[0][0];
   }
 };
