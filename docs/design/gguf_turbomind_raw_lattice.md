@@ -1483,3 +1483,10 @@ Plane capabilities admit only the measured faster N160/K2560 expert at M512.
 Dense descriptors report measured regression, uncalibrated shapes report that
 reason, and unavailable operators, hardware, types and dimensions explain
 fallback. This is operator admission; model storage is not promoted by it.
+
+The exact integer-factor variant in the fused IQ3_S plane kernel also passes
+129 checks but does not close dense performance: Flash gate M512 is 109.480
+versus 89.490 µs canonical. It is removed. SASS comparison finds the same local
+load/store counts as canonical; the scalar original metadata loader adds byte
+and halfword loads instead of adjacent-row vector accesses. Static instruction
+counts alone do not establish a runtime bottleneck.
