@@ -27,6 +27,8 @@ def main() -> None:
     parser.add_argument("--startup-diagnostics", action="store_true")
     parser.add_argument("--teacher-forcing-manifest", type=Path)
     parser.add_argument("--quality-manifest", type=Path)
+    parser.add_argument("--fixture-manifest", type=Path)
+    parser.add_argument("--draft-vocab", type=Path)
     parser.add_argument("--diagnostics-only", action="store_true")
     parser.add_argument("--projection-reference", action="store_true")
     parser.add_argument(
@@ -53,7 +55,7 @@ def main() -> None:
         raise ValueError(
             f"Default admission requires no supplied VLLM variables: {supplied}"
         )
-    if args.repeats < (1 if args.node_trace else 3):
+    if args.repeats < (1 if args.node_trace or args.fixture_manifest else 3):
         raise ValueError("At least three measured repetitions are required")
     if args.node_trace and (args.diagnostics_only or not args.fixture):
         parser.error("node-trace requires an explicit fixture and a generation")
@@ -118,6 +120,16 @@ def main() -> None:
         fixtures.append(
             {"id": f"natural8k/{index}", "prompt_token_ids": tokens, "natural": True}
         )
+    if args.fixture_manifest:
+        fixtures = json.loads(args.fixture_manifest.read_text())
+        if not fixtures or len({f["id"] for f in fixtures}) != len(fixtures):
+            raise ValueError("Fixture manifest requires unique, nonempty cases")
+        for fixture in fixtures:
+            ids = fixture["prompt_token_ids"]
+            if len(ids) != 8192 or any(
+                type(t) is not int or not 0 <= t < len(tokenizer) for t in ids
+            ):
+                raise ValueError("Every fixture requires exactly 8192 valid token IDs")
     if args.fixture:
         selected = set(args.fixture)
         unknown = selected - {fixture["id"] for fixture in fixtures}
@@ -156,6 +168,15 @@ def main() -> None:
         )
     if args.startup_diagnostics:
         engine["worker_cls"] = "benchmarks.sm70_startup_worker.StartupStackWorker"
+    if args.draft_vocab:
+        if args.diagnostic_path or args.projection_reference or args.node_trace:
+            parser.error("Shortlist comparison must be an independent candidate arm")
+        engine["hf_overrides"] = {
+            "sm70_mtp_draft_vocab_file": str(args.draft_vocab.resolve())
+        }
+        engine["worker_cls"] = (
+            "benchmarks.sm70_mtp_reference_worker.ShortlistCandidateWorker"
+        )
     if args.projection_reference:
         engine["worker_cls"] = "benchmarks.sm70_mtp_reference_worker.ReferenceWorker"
     if args.diagnostic_path and args.diagnostic_path != "shared":
@@ -176,6 +197,7 @@ def main() -> None:
         "warmup_outputs": [],
         "complete": False,
         "startup_diagnostics": args.startup_diagnostics,
+        "default_configuration": args.draft_vocab is None,
         "measurement_kind": (
             "diagnostic_node_trace"
             if args.node_trace
@@ -218,6 +240,7 @@ def main() -> None:
                     "skip_special_tokens": False,
                 }
             )
+            sampling = fixture.get("sampling", sampling)
             # Warm this exact prompt/shape before measuring its requests.
             for repeat in range(-1, args.repeats):
                 # Keep prefill/chunk boundaries identical to the speed control.
@@ -325,8 +348,10 @@ def main() -> None:
         report["speed_complete"] = not (
             args.diagnostics_only or args.node_trace or args.phase_events
         )
-        report["latency_passed"] = report["speed_complete"] and all(
-            row["complete_round_ms"] <= 15 for row in report["cases"]
+        report["latency_passed"] = (
+            report["speed_complete"]
+            and not args.draft_vocab
+            and all(row["complete_round_ms"] <= 15 for row in report["cases"])
         )
         save()
         # Diagnostics follow the completed unprofiled speed report and use no

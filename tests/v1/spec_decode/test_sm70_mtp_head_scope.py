@@ -65,3 +65,37 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
     assert not prepare(model)
     assert seen == [target_head]
     assert model._sm70_draft_head is draft_view
+
+
+def test_shortlist_keeps_global_ids_and_excludes_padding(monkeypatch):
+    shared = nn.Module()
+    shared.weight = nn.Parameter(torch.zeros(32, 2560, dtype=torch.float16))
+    shared.weight.data[:, 0] = -torch.arange(1, 33)
+    shared.shard_indices = SimpleNamespace(
+        num_org_vocab_padding=0, org_vocab_start_index=100, org_vocab_end_index=132
+    )
+    shared.quant_method = SimpleNamespace(
+        apply=lambda layer, x, bias=None: torch.nn.functional.linear(x, layer.weight)
+    )
+    monkeypatch.setattr(
+        head_ops, "prepare_channel_qpn8_weight", lambda w: (w.clone(), torch.ones(32))
+    )
+
+    def gemm(out, x, codes, *args):
+        out.copy_(torch.nn.functional.linear(x, codes))
+
+    monkeypatch.setattr(head_ops.ops, "fp8_qpn8_gemm_sm70_out", gemm)
+    view = head_ops.MTPQPN8Head(shared)
+    view.prepare_shortlist([131, 106, 103, 106, 999])
+    assert view._shortlist_size == 3
+    x = torch.zeros(5, 2560, dtype=torch.float16)
+    x[:, 0] = 1
+    values, ids = view.maybe_get_sm70_lm_head_top1(x)
+    assert ids.tolist() == [103] * 5
+    assert values.tolist() == [-4] * 5
+    # Full-vocabulary diagnostic logits still include the original best ID 100.
+    assert view.apply(view, x).argmax(dim=-1).tolist() == [0] * 5
+    view.prepare_shortlist([999])
+    values, ids = view.maybe_get_sm70_lm_head_top1(x)
+    assert torch.isneginf(values).all()
+    assert ids.tolist() == [100] * 5

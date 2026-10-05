@@ -57,3 +57,25 @@ class OutputCandidateWorker(ReferenceWorker):
                     layer.register_buffer(
                         "_sm70_qwen38_output_scales", scales, persistent=False
                     )
+
+
+class ShortlistCandidateWorker(Worker):
+    """Benchmark-only shortlist, installed before normal graph capture."""
+
+    def load_model(self, *, load_dummy_weights=False):
+        import json
+        from pathlib import Path
+
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm.models.qwen4_exp.nvidia.sm70_mtp_head import prepare_mtp_qpn8_head
+
+        model = self.model_runner.speculator.model
+        if model._sm70_draft_head is None:
+            model._sm70_draft_head = prepare_mtp_qpn8_head(model.lm_head)
+        if model._sm70_draft_head is None:
+            raise RuntimeError("Shortlist candidate requires admitted QPN8 draft head")
+        config = self.vllm_config.model_config.hf_config
+        path = Path(config.sm70_mtp_draft_vocab_file)
+        model._sm70_draft_head.prepare_shortlist(
+            json.loads(path.read_text())["token_ids"]
+        )
