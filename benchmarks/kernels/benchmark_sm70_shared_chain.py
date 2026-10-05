@@ -66,7 +66,10 @@ def load_chain(model, rank):
             packed_up = (
                 up.reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
             )
-            chains.append((up, down, gate, packed_up, down.t().contiguous()))
+            packed_down = (
+                down.reshape(80, 32, 10, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+            )
+            chains.append((up, down, gate, packed_up, packed_down))
     return chains
 
 

@@ -28,7 +28,7 @@ def test_shared_probe_preserves_fallback_and_does_not_reduce_tp(monkeypatch):
         torch.ops._C, "qwen38_shared_chain_sm70_out", lambda *args: None, raising=False
     )
     assert candidate.prepare_shared_chain_probe(layer) == 1
-    assert layer._sm70_shared_down_probe.shape == (160, 2560)
+    assert layer._sm70_shared_down_probe.shape == (80, 10, 2, 32, 8)
     for rows in (4, 5, 20):
         x = torch.zeros(rows, 2560, dtype=torch.float16)
         assert torch.equal(layer(x), x + 1)  # CPU never enters the CUDA probe.

@@ -659,3 +659,51 @@ admission. The benchmark-only worker prepares the proposer subtree alone,
 retains original FP16 weights for unsupported widths/prefill, and preserves
 shared-expert ordering and the outer TP reduction. Full-vocabulary target
 and draft gates, matched acceptance, quality and C4 remain required.
+
+### Follow-up qualification
+
+The 65536-ID corpus shortlist also fails the same eight-prompt test:
+acceptance 50.204% -> 47.318% (-2.886 percentage points), round mean
+25.817724 -> 25.215015 ms, emitted tokens/round 3.000626 -> 2.888487,
+and decode throughput 116.223 -> 114.554 tokens/s. Its critical-shard four
+M1 heads improve from 0.850913 to 0.486953 ms; operator speed does not admit
+the acceptance loss. Chinese acceptance falls from 62.048% to 51.014% even
+though observed Chinese training-corpus coverage is 100%. Both corpus-only
+shortlists remain disabled.
+
+The matched checkpoint-head/zero-split HC control records 46.659% acceptance
+on these prompts; restored defaults record 50.204% (+3.545 percentage points).
+This is separate from the synthetic timing fixture's acceptance loss. The
+original-path natural quality control passes all twelve automatic tasks
+(four GSM8K, four HumanEval, four retrieval) and all sixteen outputs stop
+normally, with no empty/invalid-character/repeated-line anomalies. Two Chinese
+explanations pass manual review; two have minor precondition/comparison-count
+omissions, recorded for matched candidate comparison. No candidate quality
+or main promotion is inferred from the control alone.
+
+The next shortlist uses target output IDs from 32 independent multilingual
+training prompts, with natural EOS and a 600-token cap. Their short inputs
+serve vocabulary collection, not speed admission. Before collecting results,
+fix a 70% normalized model-output / 30% corpus-backfill mixture per language;
+language weights and the frozen evaluation prompts remain unchanged. Count
+emitted IDs directly, without detokenize/re-tokenize changes. Evaluation
+records are rejected by the builder. Acceptance and head-time gates remain
+unchanged.
+
+Latest integrated main is `6ae4c0c1c9`, including #885's native disk-row reader
+and #955's earlier model-input preparation. The ordinary extension passes
+all fourteen CPU mapped-row tests; source/native deployment remains protected
+by shared GPU leases. The frozen 23.216-ms baseline is not reopened.
+
+Shared expert follow-up replaces the scalar down projection with packed FP16
+MMA, preserving one cooperative launch and deterministic eight-way FP32
+reduction. Padded activation rows prevent shared-memory bank conflicts. This
+is an operator candidate, not an admitted default. A separate real-weight FC
+chain screen moves the embedding residual addition ahead of the two TP
+all-gathers, reducing them to one gather while preserving original FP16
+arithmetic. It includes both norms and projections and remains benchmark-only.
+
+Structural model probes now record actual opaque-op invocation counts and
+widths on every TP rank; registration or buffer preparation alone cannot
+qualify a candidate. Deep HC, QSA and GDN work in #961 explicitly screens
+M1/M5, but serving dispatch and GPU acceptance are still pending.

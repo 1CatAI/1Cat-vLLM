@@ -33,6 +33,7 @@ from vllm.distributed.parallel_state import graph_capture
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
 
+@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)

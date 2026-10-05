@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--startup-diagnostics", action="store_true")
     parser.add_argument("--teacher-forcing-manifest", type=Path)
     parser.add_argument("--quality-manifest", type=Path)
+    parser.add_argument("--training-manifest", type=Path)
     parser.add_argument("--fixture-manifest", type=Path)
     parser.add_argument("--draft-vocab", type=Path)
     parser.add_argument("--structural-candidate", choices=("shared", "draft-qpn8"))
@@ -45,9 +46,19 @@ def main() -> None:
     ) and not args.diagnostics_only:
         parser.error("Projection reference is diagnostic-only, never default speed")
     if args.diagnostics_only and not (
-        args.teacher_forcing_manifest or args.quality_manifest
+        args.teacher_forcing_manifest or args.quality_manifest or args.training_manifest
     ):
-        parser.error("diagnostics-only requires forcing or quality cases")
+        parser.error("diagnostics-only requires forcing, quality or training cases")
+    if args.training_manifest and (
+        args.projection_reference
+        or args.diagnostic_path
+        or args.draft_vocab
+        or args.structural_candidate
+        or args.restoration_control
+        or args.node_trace
+        or args.phase_events
+    ):
+        parser.error("Vocabulary training requires an unprofiled default-path arm")
     # Importing vLLM applies platform defaults. Audit first to distinguish
     # those framework defaults from user-supplied performance variables.
     supplied = {
@@ -452,6 +463,32 @@ def main() -> None:
                         "spec_decoding": _spec_decoding_delta(
                             before, _metric_snapshot(llm)
                         ),
+                    }
+                )
+                save()
+        if args.training_manifest:
+            if not report["default_configuration"]:
+                raise ValueError(
+                    "Collect target-output vocabulary statistics on default"
+                )
+            report["training"] = []
+            for case in json.loads(args.training_manifest.read_text()):
+                llm.reset_prefix_cache()
+                output = llm.generate(
+                    [{"prompt_token_ids": case["prompt_token_ids"]}],
+                    SamplingParams(**case["sampling"]),
+                    use_tqdm=False,
+                )[0].outputs[0]
+                report["training"].append(
+                    {
+                        "id": case["id"],
+                        "language": case["language"],
+                        "prompt_sha256": hashlib.sha256(
+                            json.dumps(case["prompt_token_ids"]).encode()
+                        ).hexdigest(),
+                        "token_ids": list(output.token_ids),
+                        "text": output.text,
+                        "finish_reason": output.finish_reason,
                     }
                 )
                 save()

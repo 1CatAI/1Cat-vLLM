@@ -36,12 +36,38 @@ def rank_vocab(counts, size, special_ids, language_weights):
     return sorted(selected[:size])
 
 
+def mix_target_counts(counts, training, fraction=0.7):
+    """Mix normalized independent model outputs with the corpus per language.
+
+    Language balance and unobserved-token backfill come from the original
+    training corpus. Output token IDs are counted directly, without a lossy
+    detokenize/re-tokenize round trip. Evaluation records are never accepted.
+    """
+    model = defaultdict(Counter)
+    for row in training:
+        if not row["id"].startswith("vocab-train/"):
+            raise ValueError("Expected independent vocabulary-training outputs")
+        model[row["language"]].update(row["token_ids"])
+    mixed = dict(counts)
+    for language, predicted in model.items():
+        source = counts[language, "train"]
+        total, model_total = sum(source.values()), sum(predicted.values())
+        if not total or not model_total:
+            raise ValueError("Model and corpus training counts must be nonempty")
+        blended = Counter({t: (1 - fraction) * n / total for t, n in source.items()})
+        for token, count in predicted.items():
+            blended[token] += fraction * count / model_total
+        mixed[language, "train"] = blended
+    return mixed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--size", type=int, default=32768)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--target-outputs", type=Path)
     args = parser.parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
     documents = json.loads(args.corpus.read_text())
@@ -62,7 +88,20 @@ def main():
     # Normalize each language before mixing, so article length/count does not
     # implicitly erase the Chinese domain. Evaluation never changes this mix.
     weights = {"en": 0.4, "zh": 0.4, "code": 0.15, "ja": 0.025, "ko": 0.025}
-    ids = rank_vocab(counts, args.size, tokenizer.all_special_ids, weights)
+    ranked = counts
+    if args.target_outputs:
+        outputs = json.loads(args.target_outputs.read_text())
+        if not outputs.get("complete") or not outputs.get("default_configuration"):
+            raise ValueError("Require complete default-path model training outputs")
+        training = outputs["training"]
+        if any(
+            type(t) is not int or not 0 <= t < len(tokenizer)
+            for row in training
+            for t in row["token_ids"]
+        ):
+            raise ValueError("Training output contains invalid token IDs")
+        ranked = mix_target_counts(counts, training)
+    ids = rank_vocab(ranked, args.size, tokenizer.all_special_ids, weights)
     selected = set(ids)
     statistics = [
         {
@@ -87,6 +126,11 @@ def main():
         "coverage_is_admission_gate": False,
         "model_admission": False,
     }
+    if args.target_outputs:
+        result["target_outputs_sha256"] = hashlib.sha256(
+            args.target_outputs.read_bytes()
+        ).hexdigest()
+        result["target_output_fraction_per_language"] = 0.7
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k != "token_ids"}))

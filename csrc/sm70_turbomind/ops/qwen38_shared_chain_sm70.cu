@@ -28,7 +28,8 @@ __global__ __launch_bounds__(256, 1) void shared_chain(
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3, col = quad * 8 + r;
   __shared__ float reduction[8][8][32];
-  __shared__ half activated[8][160];
+  // Pad rows to keep vector loads aligned and distribute MMA rows over banks.
+  __shared__ __align__(16) half activated[8][168];
   float acc[8] = {};
   // Each K320 partition is further divided among eight warps; all weights
   // are read once across the grid and reused for every token in this batch.
@@ -89,21 +90,32 @@ __global__ __launch_bounds__(256, 1) void shared_chain(
                __float2half_rn(u));
   }
   __syncthreads();
-  float outputs[8] = {};
-  const int output_col = blockIdx.x * 32 + lane;
-  // Disjoint output ownership and a fixed eight-way shared-memory sum.
-  // K-major down packing makes every warp's 32 output reads contiguous.
-#pragma unroll
-  for (int k = warp * 20; k < (warp + 1) * 20; ++k) {
-    const float w = __half2float(down[k * 2560 + output_col]);
-#pragma unroll
-    for (int row = 0; row < 8; ++row)
-      if (row < m)
-        outputs[row] = fmaf(w, __half2float(activated[row][k]), outputs[row]);
+  float down_acc[8] = {};
+  const int begin_down = warp * 10 / 8;
+  const int end_down = (warp + 1) * 10 / 8;
+  for (int g = begin_down; g < end_down; ++g) {
+    const half* w = down + (blockIdx.x * 10 + g) * 512 + col * 8;
+    const uint4 lo = *reinterpret_cast<const uint4*>(w);
+    const uint4 hi = *reinterpret_cast<const uint4*>(w + 256);
+    uint4 a = {}, b = {};
+    if (r < m) {
+      a = *reinterpret_cast<const uint4*>(activated[r] + g * 16);
+      b = *reinterpret_cast<const uint4*>(activated[r] + g * 16 + 8);
+    }
+    SHARED_MMA(down_acc, a.x, a.y, lo.x, lo.y);
+    SHARED_MMA(down_acc, a.z, a.w, lo.z, lo.w);
+    SHARED_MMA(down_acc, b.x, b.y, hi.x, hi.y);
+    SHARED_MMA(down_acc, b.z, b.w, hi.z, hi.w);
   }
 #pragma unroll
-  for (int row = 0; row < 8; ++row) reduction[warp][row][lane] = outputs[row];
+  for (int i = 0; i < 8; ++i) {
+    const int rr = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+    const int cc =
+        quad * 8 + (i & 1) + (((lane >> 1) & 1) << 1) + ((i >> 2) << 2);
+    reduction[warp][rr][cc] = down_acc[i];
+  }
   __syncthreads();
+  const int output_col = blockIdx.x * 32 + lane;
   if (warp < m) {
     float sum = reduction[0][warp][lane];
 #pragma unroll
@@ -133,7 +145,7 @@ void run(torch::Tensor out, torch::Tensor partial, torch::Tensor gate_logits,
   TORCH_CHECK(x.dim() == 2 && m >= 1 && m <= 8 && x.size(1) == 2560 &&
               out.sizes() == x.sizes() &&
               up.sizes() == at::IntArrayRef({10, 160, 2, 32, 8}) &&
-              down.sizes() == at::IntArrayRef({160, 2560}) &&
+              down.sizes() == at::IntArrayRef({80, 10, 2, 32, 8}) &&
               gate.numel() == 2560 &&
               partial.sizes() == at::IntArrayRef({8, m, 320}) &&
               gate_logits.numel() == m);

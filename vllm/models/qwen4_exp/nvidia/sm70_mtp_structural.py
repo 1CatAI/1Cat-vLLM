@@ -89,7 +89,10 @@ def prepare_shared_chain_probe(model):
             continue
         layer.register_buffer(
             "_sm70_shared_down_probe",
-            layer.down_proj.weight.detach().t().contiguous(),
+            layer.down_proj.weight.detach()
+            .reshape(80, 32, 10, 2, 8)
+            .permute(0, 2, 3, 1, 4)
+            .contiguous(),
             persistent=False,
         )
         object.__setattr__(layer, "_sm70_shared_original_forward", layer.forward)
