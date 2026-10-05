@@ -178,7 +178,7 @@ using Config_NVF4 = Sm70_s884<Operand_A<half>,             // A
                               half,                        // Tc
                               raster_order, group_axis>;
 
-template <Order raster_order, int group_axis = -1>
+template <Order raster_order, int group_axis = -1, class Output = half>
 using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               Transform_Default,           // tarnsform A
                               VoidOperand,                 // U
@@ -186,7 +186,7 @@ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               Transform_HMMA_SIMT_B,       // transform B,
                               Operand_V_Pack<uint16_t>,    // V
                               kRowMajor,                   // order_C
-                              half,                        // Tc
+                              Output,                      // Tc
                               raster_order, group_axis>;
 
 // Dense batch FP4/FP8 share the activation supply and warp tiling policy.

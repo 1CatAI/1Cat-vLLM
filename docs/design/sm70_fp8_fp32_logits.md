@@ -19,3 +19,5 @@ length, together with a concurrency smoke.
 The model workload uses CUDA 12.8, Torch 2.10, four V100-SXM2-32GB GPUs at
 300 W, TP4, original Qwen3.8-27B NVFP4, DFlash2 draft7, maximum length 262144,
 memory utilization 0.8, FP8 E4M3 target KV storage, and 1024/8192-token inputs.
+
+The SM70 registry includes FP32 epilogues for small and 32-row verifier tiles. Explicit FP16 output buffers retain their previous contract. Batched verification uses the same capability guard; widths above 32 retain the original head.

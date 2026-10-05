@@ -20,7 +20,7 @@ def test_fp32_head_matches_fp64_dense_and_live_graph_inputs():
     packed, packed_scale, meta = ops.fp8_sm70_prepare(weight, scale, 128, False)
     k_ld, q_ld = int(meta[0]), int(meta[1])
     reference_weight = weight.double() * scale.double()
-    for rows in (1, 8):
+    for rows in (1, 8, 32):
         x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
         output = torch.empty(rows, n, device="cuda", dtype=torch.float32)
 
@@ -48,8 +48,8 @@ def test_fp32_head_matches_fp64_dense_and_live_graph_inputs():
 def test_fp32_head_rejects_unsupported_verification_width():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 CUDA device required")
-    x = torch.empty(9, 5120, device="cuda", dtype=torch.float16)
-    output = torch.empty(9, 62080, device="cuda", dtype=torch.float32)
+    x = torch.empty(33, 5120, device="cuda", dtype=torch.float16)
+    output = torch.empty(33, 62080, device="cuda", dtype=torch.float32)
     weight = torch.empty(5120, 62080, device="cuda", dtype=torch.uint8)
     scale = torch.empty(40, 62080, device="cuda", dtype=torch.float16)
     with pytest.raises(RuntimeError, match="unsupported FP32 LM-head shape"):

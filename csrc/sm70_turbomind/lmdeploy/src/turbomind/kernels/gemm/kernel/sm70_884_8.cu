@@ -124,6 +124,12 @@ void Registry::sm70_884_8() {
         Add<C::Type<  8, 256,  64, 1, 4, 1, D, S, 2, true, 1, 128>>();
         Add<C::Type<  8, 256,  32, 1, 4, 1, D, S, 2, true, 1, 128>>();
 
+        // Preserve FP32 verifier logits at single-request and TP4 C4 widths.
+        using F32 = Config_E4M3<kColMajor, 0, float>;
+        Add<F32::Type<8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 128>>();
+        Add<F32::Type<8, 256, 64, 1, 4, 1, D, S, 2, true, 1, 128>>();
+        Add<F32::Type<32, 256, 32, 1, 4, 1, D, S, 2, true, 1, 128>>();
+
         using CP = Config_E4M3_Prescaled<kColMajor, 0>;
         using Q38PrescaledFull = CP::Type<64, 256, 16, 1, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true>;
         Add(std::make_unique<Qwen38PrescaledFullTileKernelImpl<typename Q38PrescaledFull::Kernel>>());

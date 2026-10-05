@@ -4955,7 +4955,7 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
       out.scalar_type() == torch::kFloat16 || fp32_head,
       "fp8_gemm_sm70: output must be float16 or supported FP32 logits.");
   TORCH_CHECK(
-      !fp32_head || (in_feats.size(0) > 0 && in_feats.size(0) <= 8 &&
+      !fp32_head || (in_feats.size(0) > 0 && in_feats.size(0) <= 32 &&
                      in_feats.size(1) == 5120 && tm_weight.size(1) == 62080 &&
                      !gated_silu && !exact_8k_prefill_prescaled),
       "fp8_gemm_sm70: unsupported FP32 LM-head shape.");

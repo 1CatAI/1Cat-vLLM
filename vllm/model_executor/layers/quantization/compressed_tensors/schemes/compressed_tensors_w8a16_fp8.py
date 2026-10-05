@@ -523,7 +523,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 and sm70_dflash2_enabled("fp32_logits", capture_sm70_dflash2_config())
             )
             if layer.sm70_fp8_fp32_head:
-                logger.info_once("SM70 channel-FP8 LM head uses FP32 logits at M1..8.")
+                logger.info_once("SM70 channel-FP8 LM head uses FP32 logits at M1..32.")
             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
             layer.sm70_fp8_k_ld = int(meta[0].item())
             layer.sm70_fp8_q_ld = int(meta[1].item())
@@ -580,7 +580,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 getattr(layer, "sm70_fp8_fp32_head", False)
                 and bias is None
                 and (output is None or output.dtype == torch.float32)
-                and 1 <= x_2d.shape[0] <= 8
+                and 1 <= x_2d.shape[0] <= 32
             )
             if output is not None:
                 if (
