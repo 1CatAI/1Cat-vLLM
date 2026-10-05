@@ -23,53 +23,13 @@ logger = init_logger(__name__)
 
 
 class MTPQPN8Head(nn.Module):
-    def __init__(self, head, *, shared_view=None):
+    def __init__(self, head):
         super().__init__()
         self.head = head
         self.shard_indices = head.shard_indices
-        # LogitsProcessor calls method.apply(view, hidden). This view owns no
-        # replacement checkpoint parameter and never mutates the shared head.
-        if shared_view is None:
-            codes, scales = prepare_channel_qpn8_weight(head.weight)
-        else:
-            if not isinstance(shared_view, MTPQPN8Head) or shared_view.head is not head:
-                raise ValueError(
-                    "QPN8 views can share only the identical checkpoint head"
-                )
-            # Always share full-vocabulary buffers, never shortlist buffers.
-            codes, scales = shared_view.codes, shared_view.scales
+        codes, scales = prepare_channel_qpn8_weight(head.weight)
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
-        self._shortlist_size = None
-
-    def prepare_shortlist(self, token_ids):
-        """Prepare an evaluated candidate; full-vocabulary probes stay intact.
-
-        Original global IDs are retained. Only greedy draft decisions use this
-        pack; target logits and stochastic correction retain the full head.
-        Call before capture, never while a captured graph is serving requests.
-        """
-        ids = torch.as_tensor(token_ids, dtype=torch.int64, device=self.weight.device)
-        if ids.ndim != 1 or not ids.numel():
-            raise ValueError("Draft shortlist must be a nonempty vector")
-        ids = ids.unique(sorted=True)
-        start = self.shard_indices.org_vocab_start_index
-        end = self.shard_indices.org_vocab_end_index
-        local = ids[(ids >= start) & (ids < end)]
-        self._shortlist_size = local.numel()
-        self.register_buffer("shortlist_ids", local, persistent=False)
-        if self._shortlist_size == 0:
-            return
-        selected = self.weight.index_select(0, local - start)
-        padded = (self._shortlist_size + 31) // 32 * 32
-        if padded != self._shortlist_size:
-            selected = torch.nn.functional.pad(
-                selected, (0, 0, 0, padded - self._shortlist_size)
-            )
-        codes, scales = prepare_channel_qpn8_weight(selected)
-        self.register_buffer("shortlist_codes", codes, persistent=False)
-        self.register_buffer("shortlist_scales", scales, persistent=False)
-        self._shortlist_padded = padded
 
     @property
     def quant_method(self):
@@ -93,8 +53,7 @@ class MTPQPN8Head(nn.Module):
     def maybe_get_sm70_lm_head_top1_pair(self, hidden_states, bias=None):
         """Emit the existing compact packet without full-row serial selection."""
         if (
-            self._shortlist_size is not None
-            or hidden_states.ndim != 2
+            hidden_states.ndim != 2
             or hidden_states.dtype != torch.float16
             or not hidden_states.is_cuda
             or not 1 <= hidden_states.shape[0] <= 8
@@ -116,39 +75,6 @@ class MTPQPN8Head(nn.Module):
         return pairs
 
     def maybe_get_sm70_lm_head_top1(self, hidden_states, bias=None):
-        rows = hidden_states.numel() // hidden_states.shape[-1]
-        if (
-            self._shortlist_size is not None
-            and hidden_states.dtype == torch.float16
-            and 1 <= rows <= 8
-        ):
-            shape = hidden_states.shape[:-1]
-            if self._shortlist_size == 0:
-                values = hidden_states.new_full(shape, -float("inf"))
-                ids = torch.full(
-                    shape,
-                    self.shard_indices.org_vocab_start_index,
-                    dtype=torch.int64,
-                    device=hidden_states.device,
-                )
-                return values, ids
-            logits = hidden_states.new_empty(rows, self._shortlist_padded)
-            ops.fp8_qpn8_gemm_sm70_out(
-                logits,
-                hidden_states.reshape(rows, 2560).contiguous(),
-                self.shortlist_codes,
-                self.shortlist_scales,
-                8,
-                2,
-                True,
-                False,
-            )
-            valid = logits[:, : self._shortlist_size]
-            if bias is not None:
-                indices = self.shortlist_ids - self.shard_indices.org_vocab_start_index
-                valid = valid + bias.index_select(0, indices)
-            values, indices = valid.max(dim=-1)
-            return values.reshape(shape), self.shortlist_ids[indices].reshape(shape)
         # Use the existing compact value/ID reduction on these QPN8 logits,
         # including the existing vocabulary padding mask and global ID offset.
         return None

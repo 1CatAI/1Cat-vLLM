@@ -29,58 +29,6 @@ class HeadCandidateWorker(ReferenceWorker):
         model._sm70_draft_head = MTPQPN8Head(model.lm_head)
 
 
-class OutputCandidateWorker(ReferenceWorker):
-    def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
-            prepare_channel_qpn8_weight,
-        )
-
-        seen = set()
-        for model in (self.model_runner.model, self.model_runner.speculator.model):
-            for layer in model.modules():
-                if id(layer) in seen:
-                    continue
-                seen.add(id(layer))
-                weight = getattr(layer, "weight", None)
-                prefix = str(getattr(layer, "prefix", ""))
-                if (
-                    weight is not None
-                    and weight.is_cuda
-                    and tuple(weight.shape) == (2560, 1536)
-                    and prefix.endswith((".linear_attn.out_proj", ".self_attn.o_proj"))
-                ):
-                    codes, scales = prepare_channel_qpn8_weight(weight)
-                    layer.register_buffer(
-                        "_sm70_qwen38_output_codes", codes, persistent=False
-                    )
-                    layer.register_buffer(
-                        "_sm70_qwen38_output_scales", scales, persistent=False
-                    )
-
-
-class ShortlistCandidateWorker(Worker):
-    """Benchmark-only shortlist, installed before normal graph capture."""
-
-    def load_model(self, *, load_dummy_weights=False):
-        import json
-        from pathlib import Path
-
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm.models.qwen4_exp.nvidia.sm70_mtp_head import prepare_mtp_qpn8_head
-
-        model = self.model_runner.speculator.model
-        if model._sm70_draft_head is None:
-            model._sm70_draft_head = prepare_mtp_qpn8_head(model.lm_head)
-        if model._sm70_draft_head is None:
-            raise RuntimeError("Shortlist candidate requires admitted QPN8 draft head")
-        config = self.vllm_config.model_config.hf_config
-        path = Path(config.sm70_mtp_draft_vocab_file)
-        model._sm70_draft_head.prepare_shortlist(
-            json.loads(path.read_text())["token_ids"]
-        )
-
-
 class RestorationControlWorker(Worker):
     """Matched checkpoint-head/zero-split HC control; all other routes retained."""
 
@@ -102,69 +50,6 @@ class RestorationControlWorker(Worker):
         super().load_model(load_dummy_weights=load_dummy_weights)
 
 
-class SharedChainCandidateWorker(Worker):
-    def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
-            prepare_shared_chain_probe,
-        )
-
-        target = prepare_shared_chain_probe(self.model_runner.model)
-        draft = prepare_shared_chain_probe(self.model_runner.speculator.model)
-        if target != 48 or draft != 1:
-            raise RuntimeError(
-                f"Shared-chain preparation missed layers: {target}/{draft}"
-            )
-
-
-class DraftExpertQPN8CandidateWorker(Worker):
-    def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
-            prepare_draft_expert_qpn8_probe,
-        )
-
-        prepared = prepare_draft_expert_qpn8_probe(self.model_runner.speculator.model)
-        if prepared != 1:
-            raise RuntimeError(
-                f"Draft QPN8 expert preparation missed layer: {prepared}"
-            )
-
-
-class DraftExpertINT8CandidateWorker(Worker):
-    """Research-only integer weights, retaining FP16 compute and target logits."""
-
-    block32 = False
-    canonical = False
-
-    def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
-            prepare_draft_expert_qpn8_probe,
-        )
-
-        prepared = prepare_draft_expert_qpn8_probe(
-            self.model_runner.speculator.model,
-            integer=True,
-            block32=self.block32,
-            canonical=self.canonical,
-        )
-        if prepared != 1:
-            raise RuntimeError(f"Draft INT8 preparation missed layer: {prepared}")
-
-
-class DraftExpertINT8Block32CandidateWorker(DraftExpertINT8CandidateWorker):
-    """Research-only input-block scaling; no default dispatch."""
-
-    block32 = True
-
-
-class DraftExpertINT8PackedCandidateWorker(DraftExpertINT8Block32CandidateWorker):
-    """Research-only single packed store, including larger-batch fallback."""
-
-    canonical = True
-
-
 class DraftFCGatherControlWorker(Worker):
     """Retain two draft FC gathers with all other defaults and startup fixes."""
 
@@ -173,26 +58,3 @@ class DraftFCGatherControlWorker(Worker):
 
         sm70_mtp_fc.maybe_combine_fc = lambda *args: None
         super().load_model(load_dummy_weights=load_dummy_weights)
-
-
-class TargetHeadQPN8CandidateWorker(Worker):
-    """Research-only target LM head; output projections retain FP16."""
-
-    def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
-            prepare_target_head_qpn8_probe,
-        )
-
-        prepare_target_head_qpn8_probe(
-            self.model_runner.model, self.model_runner.speculator.model
-        )
-
-
-class TargetTop1CandidateWorker(Worker):
-    """Research-only reuse of the existing greedy compact TP top1 path."""
-
-    def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
-        self.model_runner._sm70_mtp_target_top1_probe = True
-        self.model_runner._sm70_mtp_target_top1_proof = {"calls": 0, "widths": set()}

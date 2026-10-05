@@ -15,7 +15,6 @@ import torch
 
 def install(worker, token_ids, prompt_length, prompt_sha256, folder):
     from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
-    from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import structural_route_proof
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     runner = worker.model_runner
@@ -33,7 +32,6 @@ def install(worker, token_ids, prompt_length, prompt_sha256, folder):
         "target": [],
         "draft": [],
         "tape": tape,
-        "probe_start": structural_route_proof(),
     }
     runner._mtp15_forcing = state
     rank = torch.distributed.get_rank()
@@ -171,15 +169,9 @@ def flush(worker, *, discard=False):
         runner.speculator.run_model = restore["run_model"]
         runner.speculator._sample_draft = restore["sample_draft"]
         del runner._mtp15_forcing
-    from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import structural_route_proof
 
-    proof = structural_route_proof()
     return {
         "rank": rank,
         "counts": counts,
         "restored": True,
-        "structural_probe_delta": {
-            name: row["calls"] - state["probe_start"][name]["calls"]
-            for name, row in proof.items()
-        },
     }

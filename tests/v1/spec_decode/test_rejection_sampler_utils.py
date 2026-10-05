@@ -9,7 +9,6 @@ import torch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     dflash2_sparse_topk_rejection_sample,
-    greedy_rejection_from_top_tokens,
     rejection_sample,
 )
 
@@ -74,74 +73,6 @@ def _build_rejection_sample_inputs(
         temperature=temp_tensor,
         seed=seed,
     )
-
-
-@pytest.mark.parametrize("num_reqs", [1, 4])
-@pytest.mark.parametrize("accepted_prefix", range(5))
-@pytest.mark.parametrize("logit_case", ["finite", "ties", "negative_inf"])
-def test_greedy_top_tokens_matches_dense_rejection(
-    num_reqs: int, accepted_prefix: int, logit_case: str
-):
-    """Check ragged/zero drafts, recovery, bonus, ties and indexed inputs."""
-    device = "cuda"
-    torch.manual_seed(20261005)
-    drafts = [4] if num_reqs == 1 else [4, 3, 0, 1]
-    sizes = [draft + 1 for draft in drafts]
-    total = sum(sizes)
-    vocab_size = 248320
-    logits = torch.randn(total, vocab_size, device=device, dtype=torch.float16)
-    if logit_case == "ties":
-        # Tie both across original sampler blocks and within a block.
-        logits[:, [7, 8, 8193, 200000]] = 10
-    elif logit_case == "negative_inf":
-        logits.fill_(-float("inf"))
-    top_ids = logits.argmax(dim=-1)
-    cu = torch.tensor([0] + sizes, device=device, dtype=torch.int32).cumsum(0)
-    cu = cu.to(torch.int32)
-    proposals = torch.zeros(total, device=device, dtype=torch.int32)
-    offset = 0
-    for draft in drafts:
-        prefix = min(accepted_prefix, draft)
-        for step in range(draft):
-            token = top_ids[offset + step]
-            proposals[offset + step + 1] = (
-                token if step < prefix else (token + 1) % vocab_size
-            )
-        offset += draft + 1
-    indices = torch.arange(total, device=device, dtype=torch.int64) * 2 + 1
-    input_ids = torch.full((2 * total,), -123, device=device, dtype=torch.int32)
-    input_ids[indices] = proposals
-    mapping = torch.arange(num_reqs, device=device, dtype=torch.int32)
-    expanded = torch.repeat_interleave(mapping, torch.tensor(sizes, device=device))
-    local_pos = torch.cat(
-        [torch.arange(size, device=device, dtype=torch.int32) for size in sizes]
-    )
-    dense, dense_counts = rejection_sample(
-        logits,
-        None,
-        proposals,
-        cu,
-        local_pos,
-        mapping,
-        expanded,
-        local_pos,
-        torch.zeros(num_reqs, device=device),
-        mapping.to(torch.int64),
-        4,
-    )
-    compact, compact_counts = greedy_rejection_from_top_tokens(
-        top_ids, input_ids, indices, cu, 4
-    )
-    torch.testing.assert_close(compact_counts, dense_counts)
-    mask = torch.arange(5, device=device)[None, :] < dense_counts[:, None]
-    torch.testing.assert_close(compact[mask], dense[mask])
-    assert (compact[~mask] == -1).all()
-    expected = torch.tensor(
-        [min(accepted_prefix, draft) + 1 for draft in drafts],
-        device=device,
-        dtype=torch.int32,
-    )
-    torch.testing.assert_close(compact_counts, expected)
 
 
 def _assert_distribution_match(

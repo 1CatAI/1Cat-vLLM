@@ -79,40 +79,6 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
     assert model._sm70_draft_head is draft_view
 
 
-def test_shortlist_keeps_global_ids_and_excludes_padding(monkeypatch):
-    shared = nn.Module()
-    shared.weight = nn.Parameter(torch.zeros(32, 2560, dtype=torch.float16))
-    shared.weight.data[:, 0] = -torch.arange(1, 33)
-    shared.shard_indices = SimpleNamespace(
-        num_org_vocab_padding=0, org_vocab_start_index=100, org_vocab_end_index=132
-    )
-    shared.quant_method = SimpleNamespace(
-        apply=lambda layer, x, bias=None: torch.nn.functional.linear(x, layer.weight)
-    )
-    monkeypatch.setattr(
-        head_ops, "prepare_channel_qpn8_weight", lambda w: (w.clone(), torch.ones(32))
-    )
-
-    def gemm(out, x, codes, *args):
-        out.copy_(torch.nn.functional.linear(x, codes))
-
-    monkeypatch.setattr(head_ops.ops, "fp8_qpn8_gemm_sm70_out", gemm)
-    view = head_ops.MTPQPN8Head(shared)
-    view.prepare_shortlist([131, 106, 103, 106, 999])
-    assert view._shortlist_size == 3
-    x = torch.zeros(5, 2560, dtype=torch.float16)
-    x[:, 0] = 1
-    values, ids = view.maybe_get_sm70_lm_head_top1(x)
-    assert ids.tolist() == [103] * 5
-    assert values.tolist() == [-4] * 5
-    # Full-vocabulary diagnostic logits still include the original best ID 100.
-    assert view.apply(view, x).argmax(dim=-1).tolist() == [0] * 5
-    view.prepare_shortlist([999])
-    values, ids = view.maybe_get_sm70_lm_head_top1(x)
-    assert torch.isneginf(values).all()
-    assert ids.tolist() == [100] * 5
-
-
 def test_parallel_packet_cpu_keeps_original_route(monkeypatch):
     view = object.__new__(head_ops.MTPQPN8Head)
     nn.Module.__init__(view)
@@ -196,46 +162,3 @@ def test_parallel_packet_preserves_logit_transform_fallback(monkeypatch, scale, 
     proc._maybe_dump_top_token_margin = lambda *args: None
     assert proc.get_top_tokens(head, torch.zeros(1, 2560)).tolist() == [102]
     head.maybe_get_sm70_lm_head_top1_pair.assert_not_called()
-
-
-def test_shared_head_view_uses_full_pack_and_keeps_independent_shortlist(monkeypatch):
-    calls = []
-    head = nn.Module()
-    head.weight = nn.Parameter(torch.randn(32, 2560, dtype=torch.float16))
-    head.shard_indices = SimpleNamespace()
-
-    def prepare(weight):
-        calls.append(weight)
-        return torch.zeros(2560, 32, dtype=torch.uint8), torch.ones(1, 32)
-
-    monkeypatch.setattr(head_ops, "prepare_channel_qpn8_weight", prepare)
-    draft = head_ops.MTPQPN8Head(head)
-    draft._shortlist_size = 1
-    draft.register_buffer("shortlist_codes", torch.ones(2560, 32, dtype=torch.uint8))
-    target = head_ops.MTPQPN8Head(head, shared_view=draft)
-    assert len(calls) == 1
-    assert target.codes is draft.codes and target.scales is draft.scales
-    assert target.codes is not draft.shortlist_codes
-    assert target._shortlist_size is None
-    assert target.head is head
-    other = nn.Module()
-    other.weight = nn.Parameter(head.weight.detach().clone())
-    other.shard_indices = head.shard_indices
-    with pytest.raises(ValueError, match="identical checkpoint head"):
-        head_ops.MTPQPN8Head(other, shared_view=draft)
-
-
-@pytest.mark.parametrize("rows", [1, 5, 8])
-def test_target_head_probe_registers_and_preserves_fake_shape(rows):
-    # Import the actual registered probe, beyond testing its shared pack view.
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    from vllm.models.qwen4_exp.nvidia import sm70_mtp_structural  # noqa: F401
-
-    with FakeTensorMode():
-        x = torch.empty(rows, 2560, dtype=torch.float16)
-        codes = torch.empty(2560, 32, dtype=torch.uint8)
-        scales = torch.empty(32, dtype=torch.float16)
-        output = torch.ops.vllm.sm70_mtp_target_head_qpn8_probe(x, codes, scales)
-        assert output.shape == (rows, 32)
-        assert output.dtype == torch.float16

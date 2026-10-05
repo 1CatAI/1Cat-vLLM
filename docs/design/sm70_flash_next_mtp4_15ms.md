@@ -1,1017 +1,171 @@
-# Flash-Next MTP4 complete-round latency
+# Flash-Next MTP4 default-path qualification
 
-## Acceptance
+## Default behavior
 
-The default path must average at most 15 ms per complete MTP4 round on TP4
-V100-SXM2-32GB, using exactly 8192 input tokens and a 262144-token service
-limit. The round includes four drafts, target verification, sampling, handoff
-and preparation. Use endpoint steady decode elapsed time divided by the
-completed speculative-round count. Never divide by emitted tokens or use
-only target forward time. Record emitted tokens/s, tokens per round and
-acceptance separately.
+Flash-Next MTP4 uses the complete 248,320-token vocabulary. On qualified TP4
+SM70 hardware, the draft head uses channel-QPN8 storage with FP16 compute;
+the shared target head and target output projections retain their original
+parameters and methods. Prepare the draft pack after target-head sharing and
+before KV allocation or CUDA graph capture. M1--M8 draft logits and compact
+top1 use the same head view. Unsupported shapes/devices retain the checkpoint
+head. Batch-invariant execution excludes these numerical fast paths.
 
-Speed admission uses a fresh process, no profiler and no supplied VLLM
-performance variables. Record source SHA, native extension hashes, actual
-routes, model identity, Torch/CUDA versions, topology and GPU power limits.
-The current remote TP4 group is fully connected with NV2 and has a 300-W
-power limit on every V100. Historical 185-W timings are not matched controls.
-No wheel packaging is required during development.
+The admitted path also enables eight-warp HC when its TP4 fused transport is
+available, FP32 shared-expert partials when the worker disables reduced FP16
+reduction, parallel local head selection, compact value/ID IPC, and one draft
+FC feature gather. The FC change retains the original local FP16 projections
+and residual rounding. Communicator topology/capture guards retain the normal
+NCCL fallback. No additional performance environment variables are required.
 
-PLE defaults to file-backed disk mmap. Only bounded results and flags use
-mapped pinned memory. Reuse the mapped-result transport from #831 for MTP;
-other speculative methods retain their existing transport qualification.
-The resident PLE table must not become the default.
+PLE stays disk-mapped. Reuse the bounded mapped-result transport from #831
+and the CPU row reader from #885 for MTP. Other speculative methods retain
+their independent transport guard. Do not make the resident PLE table the
+default. Failed CUDA graph capture must propagate its original error instead
+of entering graph-buffer registration collectives during unwinding.
 
-Target and draft share the numerical contract and tools in
+The ambiguous top-k/top-p reference fallback bounds sorting scratch through
+row-wise sorting and two-row chunks. Preserve the original batched softmax
+and cumulative-sum schedule, including a padded odd final chunk. Ordinary
+sampling and captured reference paths keep their existing semantics.
+
+## Measurement contract
+
+The optimization target remains **15 ms per complete round**. Include draft,
+target verification, target head/sampling, handoff and preparation. Divide
+endpoint steady decode elapsed time by completed speculative rounds; do not
+substitute target forward time or divide by emitted tokens. Report emitted
+tokens/s, accepted/proposed drafts and tokens/round separately.
+
+Use exactly 8192 input tokens, a 262144-token startup limit and fixed MTP4.
+The qualified hardware is four V100-SXM2-32GB cards with full NV2 connectivity,
+300-W limits, TP4, Python 3.12.14, Torch 2.10.0+cu128, CUDA 12.8 and driver
+580.173.02. Compute/KV are FP16, recurrent state is FP32, target experts are
+NVFP4 and draft experts remain FP16. PLE is disk mmap, one request uses 4 GiB
+of KV per rank, and speed runs have no profiler or supplied VLLM performance
+variables. No wheel build is needed during development.
+
+Use the shared numerical document and tools in
 [SM70 distribution acceptance](sm70_qwen38_distribution_acceptance.md).
-`qwen38_distribution_probe.py` owns the limits and summary implementation;
-`sm70_teacher_forcing_metrics.py` only aligns MTP captures with it. FP32
-reassociation and lower-precision candidates may be evaluated with those
-limits. Target and draft must pass separately. Also require matched task
-accuracy, truncation/noncompletion checks and no material acceptance loss.
-A route-hit or a forced reference output is not a quality-set result.
-C4 short concurrency must not regress.
+Target and draft are evaluated separately on aligned teacher-forced prefixes:
+mean KL <=0.001, p99 KL <=0.01, maximum KL <=0.05 and top1 agreement >=99%.
+Nonfinite logits fail. Maximum raw/centered logit errors are recorded only.
+`qwen38_distribution_probe.py` owns the limits; the MTP alignment tool does
+not maintain a second threshold set. Also inspect task correctness, natural
+completion, truncation/noncompletion and acceptance. Shortlist admission allows
+at most one percentage point of acceptance loss on the same eight-prompt,
+600-output-token cohort. C4 concurrency remains a separate qualification.
 
-## Rebuild the baseline before optimization
+## Recorded model results
 
-The campaign has been rebased onto current main. #831 and #832 are merged;
-The rebuilt baseline records the main SHA below. A subsequent merge of main
-at `6ae4c0c1c9` includes #885's CPU mapped-result reader and earlier draft-input
-preparation. Preserve source identities instead of attributing later results
-to the original baseline.
-Include #914's batched PLE n-gram implementation. Freeze the final main SHA
-before recording any new timings. The previous 22--24-ms results are historical
-and cannot establish the new baseline.
+These are measurements of the recorded sources, not a new performance claim
+for the subsequently synchronized main branch. Integration included main
+`6ae4c0c1c9`; the final default speed source was `2b4f74d82f`. Later row-wise
+sampler and metadata fixes were separately checked at `b7b2cb3540`.
 
-First use `benchmark_sm70_mtp4_round.py` without diagnostic flags. It warms
-up each fixture, records at least three repetitions, saves token sequences,
-request timestamps, finish reasons and speculative counters. All inputs are
-exactly 8192 tokens. `fixed8k` preserves the historical deterministic fixture;
-its forced output past EOS qualifies timing only. The `natural8k/*` fixtures
-use normal EOS and checkpoint sampling. Report their results separately.
-A fixture selector reduces work while keeping the frozen prompt unchanged.
-
-Then collect one node trace with `--node-trace --fixture <same fixture>` and
-Nsight Systems `--trace=cuda,nvtx --sample=none
---cuda-graph-trace=node:host-only --cpuctxsw=none
---capture-range=cudaProfilerApi`.
-Trace admission is always false. Annotations are installed after graph capture;
-they preserve FULL graphs and distinguish target M5, draft step 0 at its real
-width, draft steps 1--3, target head/sample, preparation and handoff.
-Reset the prefix cache before both control and traced requests to keep prefill
-conditions consistent. Report token tapes and round counts, and compare diagnostics against an
-ordinary control in the same loaded engine. Do not assume cross-startup
-identity or hide differences through a timing rescale.
-Report the profiled endpoint round mean beside the unprofiled control. Do not
-rescale kernel service sums to make them equal to unprofiled wall time.
-
-## Choose work from the new trace
-
-Build a table per target kernel/shape and TP rank, including calls per round,
-active weight layout and padding, weight bytes actually read including repeated
-passes, the weight-only lower bound at 750 GB/s, actual node service and
-service minus lower bound. Include the target head even though it runs in the
-sampling phase. Sort by that last column. Show rank service, critical rank,
-GPU sums and wall envelopes separately.
-
-The saved tensor inventory provides shapes, strides, storage identities and
-packed-buffer sizes. It is **not** a DRAM-traffic measurement. Do not add all
-resident weights or treat unique checkpoint size as per-round reads. Resolve
-which packed tensors each selected kernel reads. Validate traffic on the
-leading family with focused NCU counters; unknown read counts remain unknown.
-For expert kernels account for selected experts and reuse across tokens.
-The weight-only bound excludes activation traffic, communication and compute.
-
-Recheck the historical dense, HC, small-kernel and draft bottlenecks. Current
-source already contains TP-sharded M5 HC and some router/shared-expert batch
-routes; the trace must prove their runtime selection. Prioritize missing
-M2--M8 skinny-M projections only after the table establishes the gap. Prove
-an exact-shape operator/single-layer improvement before whole-model runs.
-Run end-to-end only when the accumulated predicted saving is substantial or
-when preparing to merge.
-
-Do not retest the rejected local HC split-K, resident MoE, directly reused
-shortlist, single cooperative HC kernel, BV16 or four-warp candidates.
-Their historical artifacts remain in the prior campaign branch and worklog.
-
-## Strata reference
-
-Read-only reference snapshot: `Niko1221/Strata` commit
-`6f32ec070f23ced9f50e704d854d775da52591ab`, MIT license.
-Use [draft-vocab documentation](https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/docs/DETAILS.md),
-[the corpus/script builder](https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/tools/draft_vocab.py)
-and [multi-token HC kernels](https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/src/kernels/cuda/fused_gr.cu).
-Its current CJK subset contains 106299 IDs; the English/code subset contains
-40525. These sizes are references, not our vocabulary choice. Evaluate three candidates: the Strata English/code set, its CJK extension,
-and a set ranked by actual target-model outputs. Corpus coverage is descriptive
-and cannot admit or reject a draft set. Compare Chinese/English acceptance,
-actual emitted tokens/round, complete-round latency and tokens/s with a fixed
-MTP4 control; select by tokens/s. Retain the original token IDs. Preserve original token
-IDs and use compact value/ID IPC instead of gathering full vocabulary logits.
-
-The current Strata confidence cutoff defaults to zero in source; a 0.5 gate
-is a proposed candidate here. Define whether confidence uses the full or
-restricted vocabulary, validate its calibration and retain a fixed MTP4
-control. Variable verify graphs need explicit window/round counts; changes
-in draft count cannot satisfy the fixed-round target through denominator
-changes. Report acceptance, proposals and emitted tokens per round together
-with output speed.
-
-HC reference ideas include token/stream norm blocks, multi-token reuse of
-one weight load, double-buffered input tiles and row-group/stream parallelism.
-SM70 uses ordinary copies rather than cp.async. Preserve attribution and the
-MIT notice if reference code is copied or adapted. CPU expert execution and
-single-card cache mechanisms are outside this TP4 scope.
-
-## Current status
-
-### Unprofiled main baseline, 2026-10-05
-
-Integration base: `c60bbe1194403cb5c36404bc35bc2580d8ee72a0`.
-Measured source: `e65592623899f1da9b1267c8cae44d5bcd03240e`.
-Normal source-built native components; Python 3.12.14, Torch 2.10.0+cu128,
-CUDA 12.8, driver 580.173.02. TP4 V100-SXM2-32GB, full NV2, 300 W per card.
-FP16 computation/KV, FP32 SSM state, NVFP4 target experts, FP16 draft experts.
-PLE disk mmap, fixed MTP4, max length 262144, input 8192, one request, 4-GiB
-KV cache per rank. No profiler or user-supplied VLLM variables.
-
-| Fixture | Complete round mean | Repetitions / rounds | Decode tokens/s | Draft acceptance | Tokens/round | Finish |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Historical fixed8k, greedy | 21.835 ms | 3 / 933 | 75.40 | 16.16% | 1.646 | length, deliberately ignore EOS |
-| Chinese natural8k/0, T=1, p=.95, k=20 | 24.304 ms | 3 / 363 | 172.40 | 79.75% | 4.190 | EOS in all repeats |
-
-Round means divide total endpoint decode elapsed time by total speculative
-rounds. The fixed fixture samples are 21.820, 21.849 and 21.835 ms; the natural
-fixture samples are 24.379, 24.274 and 24.260 ms. Outputs match across repeats
-within each fixture. The Chinese arithmetic answer gives 240 km and 68.57 km/h;
-this is an output-health check, not quality-set or numerical admission.
-Speed results come from `benchmark_sm70_mtp4_round.py`; its JSON preserves
-prompt hashes, complete token IDs, sampling, request timestamps and counters.
-
-Both fixtures fail the 15-ms target. Node attribution, measured traffic,
-quality/distribution and C4 admission remain pending. No structural-kernel
-speed claim is made.
-
-Two node captures measured 28.107 and 28.060 ms over 300 rounds. Both differ
-from the original control's token tape and 311 rounds. Resetting the prefix
-cache and disabling CPU context-switch tracing did not remove the difference.
-The unprofiled CUDA-event run also produces the 300-round tape, including its
-uninstrumented warmup: the difference is not exclusively caused by profiling.
-AOT/cache state and restart variability remain hypotheses, not established
-causes. The event harness now adds ordinary controls in the same loaded engine.
-Do not rescale either node capture into the 21.835-ms control.
-
-### Unprofiled phase diagnostic
-
-Source `8d28bfc00f`, same hardware/max length/input/sampling, no profiler.
-Three endpoint means are 23.844, 23.818 and 23.771 ms over 300 rounds each.
-CUDA event target-to-next-target intervals on rank 2 average 23.784 ms after
-excluding the edge rounds; their agreement with endpoints checks the interval
-boundaries. Event instrumentation overhead has not yet been checked against
-same-process ordinary controls, so these are diagnostic measurements.
-
-| Same-rank GPU-stream wall interval | Mean |
+| Quantity | Recorded result |
 | --- | ---: |
-| Target M5 forward | 17.591 ms |
-| Draft 0, M5 | 1.338 ms |
-| Draft 1, M1 | 1.045 ms |
-| Draft 2, M1 | 1.034 ms |
-| Draft 3, M1 | 1.030 ms |
-| Draft metadata/gaps beyond its four graphs | 0.114 ms |
-| Target head/sample | 0.729 ms |
-| Target execute outside forward, including preparation/waits | 0.863 ms |
-| Sample/handoff outside head and draft | 0.032 ms |
-| Remaining round boundary | 0.007 ms |
-
-Use nested ranges only once in this wall table. Kernel service from Nsight is
-reported separately. The 300-round synthetic case counts acceptance beyond the
-output cutoff: raw acceptance length is 1.720, while actual steady emitted
-output is 512/300 = 1.707 tokens/round. It is timing-only, not output quality.
-
-### FP32-policy router/shared repair
-
-Real 48-layer checkpoint weights, M5, FP16 inputs/weights/output, FP32
-accumulation/reduction, cold streaming sequences larger than L2, graph timings:
-
-| Operator chain | Vendor control | Native candidate | Saving |
-| --- | ---: | ---: | ---: |
-| Router | 0.616 ms | 0.386 ms | 0.230 ms |
-| Shared up plus SiLU/multiply | 0.644 ms | 0.327 ms | 0.317 ms |
-
-The worst FP64 comparison errors do not increase over the vendor across input
-scales 0, .03, .1, 1 and 3. This is operator evidence, not model distribution or
-quality admission. Shared up now stores FP32 K320 partials under the ordinary
-worker precision policy and preserves the final FP16 projection/activation
-boundaries. The legacy FP16-partial schedule remains available. An explicit
-native FP32 capability allows old binaries to retain the vendor fallback.
-
-The new integration base is `f415b92d9e`: it already contains the router repair,
-PR #900 topology-qualified HC, and #924 GDN preprocessing. Reuse those main changes;
-only the shared FP32 schedule adds new projection behavior here. The combined
-0.547-ms estimate is relative to the earlier c60 control; do not count main's
-router contribution twice. Full-round, shared distribution, quality/acceptance
-and C4 gates on the final source remain pending. The 15-ms objective is unmet.
-
-### Trace calibration and source-audited weight floor
-
-`analyze_sm70_mtp4_phases.py` compares each CUDA-event request with its ordinary
-control in the same loaded engine. It reports output/counter differences and
-observer overhead; the initial diagnostic tolerance is 2% in either direction.
-This is a trace reliability check, not a numerical gate or endpoint speed
-admission. Missing controls cannot pass. Per-rank nested intervals are counted
-once, with mean/p50/p90/p99 and an explicit boundary residual. GPU event origins
-are independent across ranks. Never maximize each phase separately and add them.
-The six focused observer/analysis CPU tests pass. GPU calibration is reported in the final-source section below.
-
-The earlier reset-cache node capture at source `7778083c3f` provides these rank-0
-native weight-read audits, sorted by service minus the weight-only floor.
-They are historical profiled service, not new-main endpoint measurements.
-
-| Native target family | Calls/round | Issued weight bytes/round | Weight floor at 750 GB/s | Profiled service | Difference |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| HC up with fused gather | 96 | 157,286,400 | 0.210 ms | 1.072 ms | 0.862 ms |
-| HC down partials | 96 | 188,743,680 | 0.252 ms | 0.848 ms | 0.597 ms |
-| Output projection | 48 | 377,487,360 | 0.503 ms | 0.913 ms | 0.410 ms |
-| Packed GDN QKVZ and BA | 36 | 760,872,960 | 1.014 ms | 1.386 ms | 0.372 ms |
-
-HC uses TP-local down `[96,10240]` and up `[2560,320]` packed weights; both
-include padding/stream layout. GDN BA reads 32 padded output columns, not only
-the 24 logical columns. M5 reads each listed pack once; unsupported wider
-shapes must account for repeated row tiles separately. The native source loops
-establish issued reads, not physical DRAM traffic. Activation/state traffic and
-IPC waits are excluded from these floors. Their difference is an investigation
-budget, not a promised optimization gain or a bandwidth-utilization counter.
-
-The complete per-kernel artifact retains unknown traffic explicitly. Vendor
-weight passes require counters; NVFP4 weight and FP16 scale reads depend on the
-actual selected expert groups. Do not substitute resident tensor size or the
-maximum 50 route groups for those unknown measurements. New-main node
-attribution and NCU counters must supersede this historical ranking before
-selecting the next implementation.
-
-### Final-source default baseline and calibrated phases
-
-Source `925e6ca6c350b786b76c398c9ea5742ef5176e03`, integration base
-`f415b92d9e`, normal native `_C` SHA256
-`474cdbe06936d726f6f596648b310de6665edc6f19b0b7475c59fd1be2c6a325`.
-No wheel, private DSO, supplied VLLM variables or profiler. TP4 fully connected
-V100-SXM2-32GB, 300 W, Torch 2.10/cu128, CUDA 12.8, FP16 computation/KV,
-FP32 reduction/state, disk mmap, 262144 startup capacity, exactly 8192 input.
-
-Fixed8k complete-round means are 23.189, 23.152 and 23.219 ms: weighted mean
-23.186 ms over 900 rounds, 73.606 steady decode tokens/s, 18% draft acceptance,
-and 1.707 actual steady emitted tokens/round. All three outputs/counters match.
-This fails 15 ms. The historical 21.835-ms/311-round tape is a different output
-trajectory and cannot be used to claim a paired speedup or regression.
-
-The normal-EOS Chinese arithmetic smoke averages 25.699 ms over 288 rounds,
-167.807 decode tokens/s, 83.594% acceptance and 4.313 actual emitted tokens/round.
-All three outputs match and end normally; 240 km and 480/7 km/h are correct.
-This is output health, not distribution or task-set admission. Fifteen real
-SM70 kernel/graph tests pass without skips, including the FP32-policy M5/M10
-shared dispatcher with changed replay inputs.
-
-Three same-process ordinary/event pairs preserve token tapes and speculative
-counters. Observer endpoint overheads are +0.029%, +0.116% and -0.124%, passing
-the 2% reliability check. Their ordinary mean is 23.246 ms; event endpoint mean
-is 23.248 ms. The same-rank interval closure below excludes edge transitions
-and uses rank 3 for all three repeats, not independently maximized phases.
-
-| Calibrated GPU-stream interval | Mean |
-| --- | ---: |
-| Target M5 forward | 16.913 ms |
-| Draft 0, M5 | 1.344 ms |
-| Draft 1, M1 | 1.090 ms |
-| Draft 2, M1 | 1.074 ms |
-| Draft 3, M1 | 1.065 ms |
-| Draft outside its four graphs | 0.112 ms |
-| Target head/sample | 0.718 ms |
-| Target execute outside forward | 0.870 ms |
-| Handoff outside head/draft | 0.031 ms |
-| Round boundary residual | 0.005 ms |
-| Complete interval | 23.221 ms |
-
-The four draft graphs total 4.572 ms; their complete outer interval is
-4.684 ms. The GPU interval differs from its matched event endpoint by 0.027 ms.
-The separate default process mean is 23.186 ms; never substitute target forward
-or divide either round value by output-token count.
-
-A matching node capture on the same source preserves the 300-round tape but
-measures 26.665 ms. Retain its 3.479-ms overhead explicitly; do not rescale its
-kernel service into the calibrated wall table. Router/shared batch operators
-are selected in its actual target M5 graph. Some short-kernel services are
-perturbed substantially: prioritize a proposed change only after the exact
-operator-chain microbenchmark confirms unprofiled benefit.
-
-The first NCU filter matched no kernels because its default name basis is
-`function`, not `demangled`; exit zero was not a valid counter capture. The
-corrected captures contain six actual metrics each. Cold-weight router DRAM
-reads are 2,659,136 bytes for vendor and 2,666,400 bytes for native, versus
-2,621,440 source-audited weight bytes. They do not show extra complete weight
-passes. Active-warps fractions are 6.25% and 1.56%; sampled SM throughput is
-8.52% and 1.39%. These are single-kernel cold counter snapshots, not steady
-model utilization. Their instrumented durations are excluded from speed
-claims. Native and vendor steady graph timings remain a separate measurement.
-
-The next screen reuses existing channel-QPN8 preparation and M2-M8 dispatch
-for actual checkpoint GDN/output projections, comparing the current native
-FP16 chains, not a slow vendor-only control. HC remains FP16. No defaults change
-until shared full-vocabulary distribution, task quality, acceptance and C4
-checks pass. Expert-plan snapshots record actual valid groups without per-round CPU
-synchronization; the measured traffic qualification follows below.
-
-### Traffic qualification and QPN8 screen
-
-Source `5c95f6e627`, same native binary and model computation as the recorded
-baseline. The plan-only diagnostic attaches no Nsight collector and preserves
-the 300-round token tape. All four ranks record 48 layers and agree on valid
-groups: after excluding edge rounds, the mean is 29.561 groups/layer, not 50.
-Issued W13 codes plus FP16 scales total 726,491,919 bytes/round/card; W2 totals
-363,245,960. Their 750-GB/s floors are 0.969 and 0.484 ms. The matching node
-services are 1.693 and 0.840 ms. These are issued-weight floors versus profiled
-service, not measured DRAM bandwidth. Do not claim 730 GB/s from the maximum
-route count. Qualify steady kernels at the observed group density next.
-
-The existing QPN8 native-chain M5 screen completes on real checkpoint weights,
-FP16 inputs/output and FP32 accumulation, seven alternating graph trials:
-
-| Projection chain | Current native FP16 | Existing channel-QPN8 | Saving |
-| --- | ---: | ---: | ---: |
-| GDN input, all 36 layers including BA and output splits | 1.182 ms | 1.153 ms | 0.029 ms |
-| Output, all 48 layers | 0.674 ms | 0.422 ms | 0.252 ms |
-
-The native GDN issued-weight rate is already approximately 644 GB/s. Halving
-its QKVZ storage does not halve chain latency: the existing FP8 path retains
-BA and split/staging work. Reject this full GDN conversion for insufficient
-benefit; do not promote it or repeat parameter sweeps. Output projection stays
-a candidate, with only 0.252 ms measured operator saving. Neither arm has model
-numerical/quality admission; FP8 operator relative L2 errors reach about 2.7%
-versus FP64, so operator timing cannot justify enabling it by default. No FP8
-runtime defaults change and no model test is credited to these microbenchmarks.
-
-### Production-chain qualification
-
-Source `06aa730e6b`, unchanged normal native binary. These microbenchmarks
-use real checkpoint weights and synthetic activations; they do not measure
-model-round latency or admit a numerical change. Seven unprofiled CUDA-graph
-trials, no dispatch overrides or candidate parameter sweeps:
-
-- TP4 current three-kernel HC projection/transport chain over all 96 pairs:
-  critical-rank median 2.273 ms. Its 346,030,080 issued weight bytes have a
-  0.461-ms weight-only floor. Combine/norm and the final mixer are excluded.
-  The difference includes both compute and transport, not just HBM reads.
-- Current grouped NVFP4 layer with a 30-group M5 density fixture: plan/W13/
-  SwiGLU 30.46–30.47 us; W2/ordered reduction 12.96–12.98 us; whole chain
-  43.27–43.29 us. Independent expert-bank offsets agree. Weight plus scale
-  floors are 20.48 and 10.24 us. This fixture does not preserve captured route
-  multiplicities and cannot replace actual whole-model timing.
-
-HC has the larger confirmed gap; isolate its local projection work from TP
-transport and inspect counters before choosing a structural change. Avoid
-retesting rejected cooperative HC or local split-K implementations.
-
-### HC local counters and rejected prefetch
-
-Unprofiled current local projection diagnostics measure 0.947 ms for 96 down
-projections plus local packet preparation, and 0.851 ms for 96 up/mix projections
-plus output clearing. They use extra local preparation kernels, so their sum
-cannot be subtracted exactly from the 2.273-ms transport chain.
-
-NCU captures of production local kernels (source `dbe942926f7973999cd50a663a03318b4c1ae5be`, after warmup,
-cold replay cache, unmodified clocks) contain seven actual metric rows each.
-Down/up read 2,072,480/1,676,288 DRAM bytes for weight packs of
-1,966,080/1,638,400 bytes. There is no duplicate full weight pass. CTA counts
-are 60/80 with one warp each; sampled active warps are 1.56%, global-memory
-long-scoreboard stalls 59.28%/38.49%, and registers/thread 86/90. This identifies
-limited latency hiding as an investigation target; NCU durations are excluded
-from steady performance results.
-
-A register-prefetch implementation keeps the following K16 weight/input tile
-live during the current MMA. Source `55125727fe`, ordinary source-built native
-binary, paired TP4 complete-chain graph trials: control 2.295 ms, prefetch
-2.614 ms (+13.91%). Changed inputs at five scales preserve outputs on all four
-ranks, but the speed regression rejects the implementation. Remove the unused
-kernel/API candidate, retain its source patch and raw results as artifacts,
-and do not launch a whole-model test or repeat parameter tuning for it.
-
-### Draft-head QPN8 candidate
-
-Existing native channel-QPN8 on the actual TP4 head shard (62,080 by 2,560):
-M1 FP16 vendor head 0.453 ms versus QPN8 0.191 ms, saving 0.262 ms in seven
-alternating graph trials. Issued code/scale storage is 159,048,960 bytes versus
-317,849,600 FP16 bytes. Four invocations suggest an operator budget of 1.048 ms;
-this is not an accepted model-round improvement. Synthetic hidden-state
-scales up to 3 yield at most 0.262 logit error versus FP64, but no model gate
-can be inferred from that test.
-
-The owned candidate uses a draft-only head view after target/draft sharing.
-The target's checkpoint parameter and quantization method remain unchanged.
-The view reuses native QPN8 for M1..8, FP16 computation/FP32 accumulation and
-the existing padding mask/global-ID/compact top1 transport. Wide batches use
-the original head. Channel preparation shares the existing implementation and
-bounds FP32 scratch by 4,096 weight rows. Raw full-vocabulary teacher-forcing
-logits use the same candidate view as greedy proposals. No user environment
-variable is added. The benchmark candidate remains unmerged pending target and
-draft distribution, task quality/acceptance, C4 and complete-round validation.
-
-A diagnostic reference worker restores main's vendor shared-up policy and
-checkpoint draft head. Its requests are explicitly ineligible for default
-speed admission. Use the frozen 16-prompt manifest (math, code, Chinese and
-retrieval) with the same 8K prompt/256K capacity, and compare target/draft
-separately through the shared distribution tool and limits.
-
-### Structural campaign and numerical gates, 2026-10-05
-
-Stop register-prefetch attempts. Priority is HC CTA-parallel reduction/finish,
-fused router projection/softmax/top10/plan, fused shared-expert chain, segmented
-QSA selection/attention, distributed GDN state updates, and expert plan/launch
-fusion. All proposals first use whole-layer graph benchmarks. Keep default
-endpoint timing at 8K input/256K capacity, no profiler and actual round counts.
-
-The frozen 16-prompt reference/candidate comparison contains 2,656 target
-positions and 2,176 draft positions. Target shared-FP32 comparison passes all
-limits (zero KL/raw logit difference, 100% top1). Draft-head QPN8 gives mean KL
-0.000466, p99 0.006037, max 0.020955 and top1 99.724%; raw maximum logit error
-0.710938 is recorded only. Under the shared owner-revised contract this
-draft distribution passes; restore automatic draft-only QPN8 preparation.
-The target head and checkpoint parameter remain unchanged. Shared and output
-projections retain independent diagnostic reference paths.
-
-A full HC graph over 96 real checkpoint pairs includes combine/norm, down
-projection/SiLU/gather and up/mix/gather. Unprofiled critical-rank medians:
-production 2.713 ms, 8-warp CTA split 2.378 ms, 16-warp 2.450 ms. These are
-operator-chain measurements, not endpoint speed. The 8-warp saving is only
-0.335 ms and does not satisfy the HC-chain goal of 1 ms. Complete column-pair
-ownership removes the separate down gather, but seven alternating full-chain
-trials regress: control 2.709 ms, 8-warp finish 3.374 ms, 16-warp finish
-2.977 ms. This implementation is rejected; do not integrate or tune it.
-
-Output-projection QPN8 independently fails the same 16-prompt gate. Target:
-mean KL 0.006661, p99 0.089210, max 0.552678, top1 98.117%, raw maximum
-logit error 9.433594. Draft: mean KL 0.018349, p99 0.268329, max 6.915023,
-top1 98.851%, maximum error 25.859375. No runtime default is enabled.
-
-Compact top1 transport was default-off and accepted only one value/ID pair.
-The structural candidate enables the existing IPC reducer automatically on
-SM70 and extends its one-block protocol to 128 independent row pairs. C4
-uses the same compact payload instead of reverting to NCCL. Topology and
-graph-warmup guards retain the exact NCCL fallback. Ordinary hidden-state
-all-reduce selection is unaffected. The four-decision TP4 graph benchmark
-compares changed inputs, shard ties, width changes and repeated epochs against
-NCCL. This is communication-only evidence; full-model gates remain required.
-
-TP4 graph results pass all widths (1, 4, 5, 16, 128), changed values, ties and
-repeated epochs. Four decisions at M1: NCCL 0.101535 ms versus compact IPC
-0.036680 ms; M4: 0.103511 versus 0.036879 ms. The first benchmark attempt
-did not finish communicator shutdown; destroy captured NCCL graphs before
-the process group, retain its log, and credit only the completed retry.
-This is not the model C4 acceptance gate or a complete-round speed result.
-
-Source audit identifies three all-gathers per draft step: top1 value/ID,
-`fc_embedding` output and `fc_hidden` output. The latter two carry hidden
-tensors needed by the HC block, not logits. Compact top1 replaces only the
-first. Removing the other two requires a distributed projection/norm/HC
-dataflow; silently substituting token IDs is incorrect.
-
-The published owned branch merges main `0e359c87d3` (including the newer GDN
-projection tails, strided QKV, direct GDN output and compact target top-k).
-The earlier 23.186-ms endpoint is a frozen historical control, not the current
-main result. Rebuild normal native extensions before measuring the merged
-endpoint; do not reuse the older extension with newer dispatch code.
-
-The router structural prototype spreads checkpoint-FP16 projection across
-80 CTAs, sharing each weight load across all rows. Writers publish their
-results before a completion ticket; the last CTA runs normalized top10 and
-the existing integer-only route-group plan. There are no spinning CTAs or
-cooperative-launch assumptions. FP32 accumulation retains the FP16 router
-logit boundary. The checkpoint graph compares projection/selection/plan over
-48 layers; production dispatch remains unchanged pending measured gains and
-shared model gates. It is not a register-prefetch experiment.
-
-The 80-CTA SIMT/last-producer prototype passes real-weight operator checks
-(all tested scales select the same top10 IDs, maximum router logit difference
-0.0078125), but regresses the complete 48-layer router graph from 0.711178 ms
-to 2.016435 ms. Reject it without model integration or parameter sweeps.
-The unprofiled control must not be equated with the older 1.62-ms profiled
-router family service sum. A further design must preserve tensor-core batch
-projection and prove that its selection/plan finish does not serialize work.
-
-The apparent 1.352-ms rebase regression was not reproduced under matched
-conditions. The owner closed this investigation on 2026-10-05; no further
-bisection, historical-runtime audit or regression experiments are scheduled.
-The latest-main baseline is fixed at **23.216 ms per complete round**.
-
-Matched fresh-process controls, normal extensions built from each source,
-TP4/300 W/8K input/256K capacity/no profiler, three repeats:
-
-| Source | Complete-round mean | Rounds per repeat | Acceptance |
-| --- | ---: | ---: | ---: |
-| Recompiled `e655926238` | 23.708757 ms | 300 | 18% |
-| `925e6ca6c3` | 23.048813 ms | 300 | 18% |
-| Latest-main candidate `6e36a5a83a`, main `0e359c87d3` | 23.215921 ms | 300 | 18% |
-
-The matched old/new controls emit identical token tapes and the newer path
-saves 0.659944 ms. The rebuilt historical source does not reproduce the saved
-21.835-ms/311-round tape: its output matches the frozen newer tape instead.
-The owner closed the historical discrepancy without further investigation.
-These source controls remain historical evidence, not a new optimization task.
-
-Latest-main default timing samples are 23.308418, 23.150912 and 23.188432 ms
-(900 rounds total, 73.513 decode tokens/s, 1.706667 emitted tokens/round).
-Natural-EOS Chinese arithmetic: 26.235914 ms/round, 83.594% acceptance,
-164.375 tokens/s, 4.3125 emitted tokens/round; all three repeats terminate with
-the correct 240-km distance and 480/7-km/h average speed. This is output health,
-not task-set or C4 admission. The 15-ms objective remains unmet. Updated
-same-process event calibration and one node-level capture are queued under
-the shared GPU locks; preserve their overhead separately from endpoint speed.
-
-## Current implementation sequence (owner revision, 2026-10-05)
-
-Restore the admitted draft-only QPN8 head, compact top1 IPC, and the positive
-8-warp TP4 HC split on the FP32 fused batched route. The measured operator
-savings are approximately 1.048 ms across four draft heads and 0.335 ms across
-96 HC pairs; these estimates are not an endpoint measurement. Keep output
-projection QPN8 disabled. No new acceleration environment switches are added.
-
-1. Build a 32768-token draft shortlist from corpus frequencies. Freeze eight
-   bilingual prompts before collecting candidate results, each with exactly
-   8192 input tokens and 600 output tokens. Compare full-QPN8 and shortlisted
-   QPN8 heads: acceptance may fall by at most one percentage point, and draft
-   head time must decrease. Report proposals, emitted tokens per round, whole
-   round latency and tokens/s. Corpus coverage is descriptive, never a gate.
-2. Fuse shared gate/up/SiLU/down into one kernel with deterministic tiled down
-   reduction and no floating-point atomics; target <=0.3 ms for 48 layers.
-3. Use one multi-warp CTA per token for router projection and top10, without
-   a last-finishing-CTA protocol; target <=0.3 ms for 48 layers.
-4. Rank draft single-CTA, grid-at-most-four and one-warp kernels by service,
-   then combine dependent work. Deep HC, QSA and GDN changes are owned by
-   the shared decode line; ensure their supported M5 routes are selected here.
-
-Each new structure first needs a real-weight whole-layer graph microbenchmark.
-Run full-model timing after accumulated predicted gains reach about 1 ms, or
-before merging. Shared GPU locks govern every GPU job and source deployment.
-
-### Structural operator screens, 2026-10-05
-
-These are unprofiled, single-card CUDA graph measurements on an uncontested
-V100-SXM2-32GB at 300 W. The TP0 tensors come from the same checkpoint as
-the remote TP4 baseline. No full-model speed or quality is admitted here.
-Seven alternating graph trials use real weights; shared/router chains rotate
-all 48 layers to avoid a single hot-weight fixture.
-
-| Operator chain | Control | Candidate | Decision |
-| --- | ---: | ---: | --- |
-| Four QPN8 draft heads, M1, largest shortlist shard | 0.833485 ms | 0.268585 ms | Reject 32K: acceptance falls by 14.07 percentage points |
-| Four QPN8 draft heads, M5 | 0.840376 ms | 0.270705 ms | Original global IDs preserved |
-| 48 shared gate/up/SiLU/down chains | 0.994468 ms | 0.690063 ms | 0.304405-ms operator gain; model gates pending |
-| 48 routers, projection/top10/plan | 0.631368 ms | 3.190070 ms | Reject token-CTA prototype; no production dispatch |
-| Four FP16 draft expert chains, M5 + three M1 | 0.436480 ms | 0.449876 ms | First fused version regresses; do not integrate |
-
-The router candidate uses five 16-warp CTAs, 128 registers/thread, zero
-local spills. More warps inside a CTA still leave at most five active SMs.
-Its single-token tensor-core projection repeats the token across eight MMA
-rows instead of sharing one weight load across the five real tokens. The
-weight read instructions also repeat for each token. These structural limits
-remain even without register spilling. Local hardware-counter collection
-was denied by driver counter permissions; DRAM bytes/utilization are not
-filled with estimates.
-
-The shared candidate uses one residency-checked cooperative launch, 80
-eight-warp CTAs, and fixed-order down reductions without floating atomics.
-Maximum local-output differences versus the five-launch control are 0,
-1.19e-7, 6.10e-5 and 9.77e-4 at input scales 0, .03, 1 and 3. This passes
-a layout/finite-value screen, not the independent model distribution gate.
-It remains above the 0.3-ms component goal.
-
-The first draft fusion passes finite/zero-input/layout screens and shows
-relative output L2 differences below 1.41e-4, but its down stage issues
-strided scalar half loads. The next implementation pairs adjacent 128-bit
-loads in padded shared tiles and reports up/down stage timing separately.
-The up loop also avoids compiler-expanded register preloading. This is a
-structural memory-access correction, not a parameter sweep.
-
-### Restored defaults and rejected shortlist, 2026-10-05
-
-Source `f61348a4f6`, normal extension `bf0f4cf15724`, same fully connected TP4
-V100/300-W contract, 262144 startup capacity, 8192 input, no profiler and no
-supplied VLLM variables. The three fixed-MTP4 round means are 21.739059,
-21.593571 and 21.776461 ms. Across 963 rounds the mean is **21.703030 ms**,
-1.512891 ms below the owner's frozen 23.215921-ms main baseline. The 15-ms
-objective remains unmet. Synthetic acceptance falls from 18% to 15.031%;
-this timing fixture runs past EOS, so matched natural outputs are required
-before task-quality or acceptance conclusions. Numerical QPN8 admission
-remains valid; maximum logit error is record-only.
-
-The disjoint-corpus 32768-ID shortlist fails the frozen eight-prompt,
-600-output-token acceptance test. Both arms use the same temperature, seeds,
-8192-token prompts and compact value/ID IPC. Aggregate acceptance divides
-accepted tokens by proposed tokens, with per-language results retained.
-
-| Eight-prompt arm | Rounds | Acceptance | Complete round | Emitted tokens/round | Decode tokens/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Full QPN8 draft vocabulary | 1597 | 50.204% | 25.817724 ms | 3.000626 | 116.223 |
-| 32768-ID frequency shortlist | 1963 | 36.131% | 25.489029 ms | 2.441161 | 95.773 |
-
-The 14.073-percentage-point acceptance loss exceeds the one-point limit;
-the shortlist remains benchmark-only. Chinese acceptance declines from
-62.048% to 44.496%. A smaller head alone does not admit the candidate. Forced
-600-token output is an acceptance/timing fixture, not a natural quality test.
-The already-built 65536-ID candidate uses the same training-only ranking;
-its operator proof must pass before a matched acceptance run.
-
-The coalesced FP16 draft fusion also fails the operator screen:
-0.436593 -> 0.535665 ms for M5 plus three M1 expert chains. Up/SiLU grows
-from 0.319007 to 0.400374 ms; down/route sum grows from 0.114299 to
-0.134492 ms. Reject it without model integration or parameter sweeps.
-The next draft candidate reduces weight bytes through the existing
-channel-QPN8 preparation and fragment decoder, with FP16 compute and FP32
-accumulation; it has no default dispatch or model admission.
-
-A calibrated main-source event diagnostic is complete (source `6e36a5a83a`).
-Same-engine ordinary/event token tapes and round counters match in all three
-pairs; overhead ranges from -0.025% to +0.949%, within the 2% limit.
-Rank-3 target M5 averages about 16.780 ms and the complete draft interval
-about 4.525 ms. These precede restored defaults and do not replace the
-fixed main baseline. The separately profiled node capture measures
-26.893 ms/round; its service sums are attribution only, never speed admission.
-M5 has 1428 target nodes. Source-audited issued weight reads are retained
-separately from actual DRAM counters, which have not been measured locally.
-
-### Grouped QPN8 draft expert screen
-
-Normal `_C` build `bf376946ad16`, real-checkpoint TP0 experts, one V100 at
-300 W, no profiler, seven alternating whole-chain graphs. Four expert steps
-(M5, M1, M1, M1) improve from **0.435937 to 0.163205 ms** (0.272732-ms
-saving). A control running the same dequantized QPN8 weights through the
-old FP16 kernels takes 0.435220 ms, isolating execution structure from
-quantization alone.
-
-Both kernels reuse the existing channel-QPN8 packing and fragment decoder.
-Up pairs gate and value tiles before FP16 SiLU. Down uses ten route warps,
-with a fixed-order FP32 sum after each weighted route's FP16 boundary.
-There is no persistent grid or floating-point atomic. Launches decrease
-from sixteen to eight across the four steps. Compute remains FP16 with
-FP32 accumulators.
-
-At scales 0, .03, 1 and 3, zero-input and finite-value checks pass. Relative
-L2 difference from the independent dequantized-weight control stays below
-0.000240; relative L2 versus original FP16 weights is roughly 4.3--4.9%.
-These hidden-output differences are diagnostics, not logit distribution
-admission. The benchmark-only worker prepares the proposer subtree alone,
-retains original FP16 weights for unsupported widths/prefill, and preserves
-shared-expert ordering and the outer TP reduction. Full-vocabulary target
-and draft gates, matched acceptance, quality and C4 remain required.
-
-### Follow-up qualification
-
-The 65536-ID corpus shortlist also fails the same eight-prompt test:
-acceptance 50.204% -> 47.318% (-2.886 percentage points), round mean
-25.817724 -> 25.215015 ms, emitted tokens/round 3.000626 -> 2.888487,
-and decode throughput 116.223 -> 114.554 tokens/s. Its critical-shard four
-M1 heads improve from 0.850913 to 0.486953 ms; operator speed does not admit
-the acceptance loss. Chinese acceptance falls from 62.048% to 51.014% even
-though observed Chinese training-corpus coverage is 100%. Both corpus-only
-shortlists remain disabled.
-
-The matched checkpoint-head/zero-split HC control records 46.659% acceptance
-on these prompts; restored defaults record 50.204% (+3.545 percentage points).
-This is separate from the synthetic timing fixture's acceptance loss. The
-original-path natural quality control passes all twelve automatic tasks
-(four GSM8K, four HumanEval, four retrieval) and all sixteen outputs stop
-normally, with no empty/invalid-character/repeated-line anomalies. Two Chinese
-explanations pass manual review; two have minor precondition/comparison-count
-omissions, recorded for matched candidate comparison. No candidate quality
-or main promotion is inferred from the control alone.
-
-The next shortlist uses target output IDs from 32 independent multilingual
-training prompts, with natural EOS and a 600-token cap. Their short inputs
-serve vocabulary collection, not speed admission. Before collecting results,
-fix a 70% normalized model-output / 30% corpus-backfill mixture per language;
-language weights and the frozen evaluation prompts remain unchanged. Count
-emitted IDs directly, without detokenize/re-tokenize changes. Evaluation
-records are rejected by the builder. Acceptance and head-time gates remain
-unchanged.
-
-Latest integrated main is `6ae4c0c1c9`, including #885's native disk-row reader
-and #955's earlier model-input preparation. The ordinary extension passes
-all fourteen CPU mapped-row tests; source/native deployment remains protected
-by shared GPU leases. The frozen 23.216-ms baseline is not reopened.
-
-Shared expert follow-up replaces the scalar down projection with packed FP16
-MMA, preserving one cooperative launch and deterministic eight-way FP32
-reduction. Padded activation rows prevent shared-memory bank conflicts. This
-is an operator candidate, not an admitted default. A separate real-weight FC
-chain screen moves the embedding residual addition ahead of the two TP
-all-gathers, reducing them to one gather while preserving original FP16
-arithmetic. It includes both norms and projections and remains benchmark-only.
-
-Structural model probes now record actual opaque-op invocation counts and
-widths on every TP rank; registration or buffer preparation alone cannot
-qualify a candidate. Deep HC, QSA and GDN work in #961 explicitly screens
-M1/M5, but serving dispatch and GPU acceptance are still pending.
-
-### Structural model admission and C4 startup failure
-
-The first cooperative shared chain fails matched full-model distribution:
-target mean/p99/maximum KL 0.005431/0.084623/0.353846 and top1 98.6446%;
-draft 0.008927/0.107390/5.343494 and top1 99.0809%. Operator error screens
-cannot replace these model limits. The packed tensor-core down follow-up
-changes the 48-layer graph from 0.993065 to 0.662876 ms, but has no admitted
-model distribution and is not enabled in serving.
-
-Restored defaults retain all twelve automatic quality passes and all sixteen
-natural stops. Manual Chinese review finds the same two minor omissions as
-the checkpoint-head control, with no new failures. This fixed sample is not
-a large-sample accuracy claim. C4 remains unqualified.
-
-The checkpoint-head C4 control fails before generation: rank zero needs a
-304-MiB allocation while only 210.62 MiB is free. Inductor combo benchmarking
-materializes a synthetic 62,080-by-2,560 embedding shard. Exception cleanup
-then enters CPU graph-address registration while peers wait in CUDA
-synchronization, hiding the original error. Preserve the capture exception
-and register addresses only after successful capture. Move the unchanged
-draft vocabulary lookup ahead of the compiled small-shape backbone, keeping
-lookup and TP reduction inside the outer CUDA graph. This avoids putting the
-full vocabulary table in combo benchmarking's arguments; it does not change
-model precision, the 256K capacity, or the 4-GiB cache contract. Matched GPU
-speed/quality and C4 checks are required for the new input boundary.
-
-Eager teacher-forcing probes explicitly retain the serving decode semantic
-context. For draft expert candidates, every forcing case on every TP rank
-must additionally prove an opaque-op invocation. Graph capture route proof
-alone cannot qualify an eager distribution measurement.
-
-The first run with the new input boundary completes three unprofiled fixed
-samples and the frozen eight-prompt acceptance cohort, then fails during eager
-forcing on a 1,632-token prefill outside the decode compiler's [1, 10] range.
-Its speed records remain valid, but neither numerical, quality nor vocabulary
-training completion is inferred. Select the forcing semantic context using
-the actual captured compiler limit: small decode uses it; large prefill keeps
-its separate compiler. Preserve the existing speed records and retry only
-missing diagnostics. Collect natural quality and independent vocabulary
-training before forcing; each has its own completion flag, while overall
-candidate admission still requires every requested stage.
-
-### Parallel draft local top1
-
-The remaining full-head selector scans 62,080 logits in one CTA. Split it into
-512-column segments and merge the small set of maxima, emitting the existing
-FP32 value/global-ID packet directly. Preserve first-index ties, NaN precedence
-and vocabulary padding. Keep soft-cap/scaling, shortlists and older extensions
-on their existing routes. Target projection precision and head are unchanged.
-
-A source-built V100 real-weight four-head graph (including packet production,
-excluding identical TP IPC) screens 0.854364 -> 0.776305 ms at M1;
-M4 0.861030 -> 0.784558 ms; M5 0.862136 -> 0.786964 ms. Input scales zero,
-0.03, one and three preserve the packets exactly. Finite values, ties, negative
-infinity, NaNs and excluded padding pass at M1/M4/M5/M16/M128. The approximately
-0.078-ms local gain is not a complete-model speed claim. Prepare it on the
-owned default path, with model/C4 qualification required before merging.
-
-The TP4 real-weight FC screen passes: four steps [M5,M1,M1,M1], including
-both Gemma norms, both FP16 projections and residual addition, measure
-0.600678 -> 0.545341 ms (rank-max median of seven alternating graph trials).
-Moving addition ahead of gather preserves bytes at input scales zero, 0.03,
-one and three. Prepare the default SM70 small-graph route using the existing
-unquantized ColumnParallelLinear projections and a single feature gather.
-Other devices, quantized or LoRA wrappers, batch-invariant mode and large
-prefill retain the original path. Nine CPU FC/stage-local tests pass. This
-0.055337-ms operator gain remains separate from complete-round admission.
-
-### Draft expert QPN8 model rejection and independent shortlist
-
-The grouped draft expert QPN8 candidate completes all sixteen teacher-forcing
-cases with actual opaque-op execution proved on every TP rank. Target logits
-are unchanged. Across 2,176 draft positions, mean/p99/maximum KL are
-0.00029649/0.00472838/0.09147594 and top1 agreement is 99.8162%. Maximum KL
-fails the shared 0.05 limit; maximum logit error is recorded only. The largest
-case is `chinese/2`. Twelve automatic quality tasks pass and all sixteen
-outputs finish naturally, but the frozen eight-by-600-token acceptance falls
-from 50.2035% to 46.2315% (minus 3.9721 percentage points). This candidate stays
-disabled. Its 20.6926/20.8012/20.7786-ms fixed-input measurements cannot be
-reported as admitted default performance.
-
-The latest valid default fixed-input mean remains 21.244033 ms, from 963
-rounds and three repetitions within one engine. Its eight-prompt acceptance
-is 50.2035%. The original main baseline remains 23.215921 ms, and the alleged
-1.35-ms regression investigation is closed.
-
-An independent target-output shortlist has 32,768 global token IDs, built from
-32 training prompts disjoint from the evaluation cohort (18,358 output IDs).
-The frozen language weights are English 0.40, Chinese 0.40, code 0.15,
-Japanese 0.025 and Korean 0.025; within each language, target-output frequency
-has weight 0.70 and corpus frequency 0.30. Special tokens are retained.
-Coverage is descriptive only. Compare its head against the current parallel
-full-head selector, and admit only a head-time reduction plus at most one
-percentage point of acceptance loss on the frozen eight-by-600 cohort.
-The earlier corpus-only 32K and 64K candidates remain rejected.
-
-The C4 default subsequently reaches the original error directly: QPN8 draft
-head packing at graph capture needs another 152 MiB with only 84.62 MiB free.
-Prepare the same head immediately after checkpoint loading and target-head
-sharing, before KV allocation or graph warmup; capture only reuses it.
-Do not reduce the cache or 256K service limit. C4 control disables only the new
-FC gather merge and retains this startup correction and all other defaults.
-
-A separate benchmark-only row-scaled symmetric INT8 expert pack reduces weight
-reconstruction relative L2 from E4M3's 2.64%/2.58% to 1.11%/0.71% for the
-fifty checkpoint experts' up/down weights. It retains byte reads and FP16
-MMA operands with FP32 sums. The four-step layer graph measures
-0.435784 -> 0.183962 ms, while an independent row-major integer dequantization
-oracle agrees within relative L2 0.000197. This is not model distribution or
-acceptance admission and installs no serving default.
-
-With early head preparation, C4 completes all target and draft graph capture.
-Sampler warmup then runs out of memory while allocating a 20-MiB full-batch
-sort value buffer. The compact top-k/top-p boundary fallback sorts every
-ambiguous target row together, materializing batch-sized index and probability
-workspaces. Apply the same reference filter in bounded two-row chunks instead, keeping
-source logits, per-row parameters, vocabulary ties and nucleus boundaries.
-Twenty MTP4/C4 uniform rows at vocabulary 248,320 force this fallback; the
-final bounded implementation matches the full reference exactly and leaves
-its input intact. PyTorch chooses a different singleton cumulative-scan reduction: at
-uniform logits, k=50/p=0.9, processing a formerly multi-row fallback as one row
-changes the cutoff by one token. Preserve its multi-row reduction with two-row
-chunks, padding an odd final chunk with an existing row and copying only the
-valid output. A genuinely singleton fallback retains its original reduction.
-The 20-row workload reduces incremental peak allocation from 229.403 MiB to
-50.354 MiB. Thirty-three focused GPU cases pass, including singleton/odd/even
-rows and both evaluation and sampler-warmup cutoffs. This fixes a workspace peak, not an admitted complete-round speed gain.
-
-The new default FC/parallel-head path measures 21.237521/21.225780/21.132825 ms
-(963 rounds, arithmetic mean 21.198709 ms). Frozen prompt acceptance stays
-50.2035% (3,207/6,388); target and draft full-vocabulary forcing both have KL
-zero and top1 agreement 100% on the sixteen cases. All sixteen natural outputs
-are identical to the previously reviewed default. C4 remains pending.
-
-The independent model-output 32K shortlist still fails: frozen-cohort
-acceptance is 41.2438%, compared with 50.2035% for the full head. A positive
-head operator result cannot admit this nine-percentage-point acceptance loss.
-Keep it benchmark-only and evaluate a larger model-output subset separately.
-
-Preserve the shared reference implementation while bounding sort scratch:
-`apply_top_k_top_p_pytorch(..., rowwise_sort=True)` sorts into preallocated
-row slices, then performs the ordinary masks, batched softmax and cumulative
-sum. The compact fallback uses at most two rows, preserving the reference
-scan category for a padded odd chunk. The final stress workload matches the
-reference and peaks at 50.354 MiB including input/output copies, versus
-229.403 MiB for full-batch sorting. Default reference callers are unchanged.
-
-C4 now completes capture and sampler warmup. Its harness fails before recording
-requests because EngineArgs inserts ModelConfig objects into the caller's
-speculative dictionary, which was also retained by the JSON report. Deep-copy
-the requested configuration before constructing the engine; do not change
-hardware, cache, 256K capacity or sampling to work around this reporting error.
-No C4 speed result is inferred from the failed report.
-
-### Integer expert and C4 follow-up
-
-The row-scaled INT8 expert candidate finishes all sixteen numerical tapes.
-Target KL is zero. On 2,176 draft positions, mean/p99/maximum KL are
-0.000084486/0.000807959/0.062439157 with 100% top1 agreement. Maximum KL
-exceeds 0.05, so the candidate remains disabled. Frozen prompt acceptance
-is 49.3344%, versus 50.2035% for the current default. Its fixed-input complete
-rounds measure 20.657373/20.708493/20.754261 ms; these are rejected-candidate
-measurements, not default performance. Twelve automatic tasks pass and all
-sixteen quality outputs stop naturally.
-
-A benchmark-only input-block-32 INT8 follow-up addresses channel-wide scale
-outliers. FP16 MMA and FP32 accumulation stay unchanged; scale reads increase
-by 6.25% of code bytes. Fifty checkpoint experts have up/down reconstruction
-relative L2 0.005613/0.005516, compared with row scaling's 0.011088/0.007056.
-The four-step layer graph measures 0.436398 -> 0.188733 ms. An independent
-row-major block dequantization oracle agrees within relative L2 0.000282.
-Full-model distribution and acceptance admission are still required.
-
-The independently trained 65,536-ID shortlist passes a production-packet head
-screen: four-head critical-shard times are 0.786043 -> 0.505518 ms at M1,
-and 0.797870 -> 0.514509 ms at M5. Its evaluation remains independent of the
-failed 32K subset; coverage never substitutes for acceptance.
-
-After the sampler workspace and JSON snapshot fixes, the C4 control completes
-startup but fails actual 8K prefill while requesting a 160-MiB FP16 activation
-buffer of shape [8192,10240]. Reported free memory is approximately 63--69 MiB;
-no speed sample is recorded. The 4-GiB KV allocation, 262144 service limit,
-inputs and batch limits are unchanged. Allocator-reserved space is not itself
-proof that graph scratch can be borrowed safely: captured temporary addresses
-may be reused on replay. Keep this failure explicit until a validated lifetime
-or workspace fix completes the matched C4 comparison.
-
-The independent target-output 64K subset completes its eight-prompt test:
-3,063 accepted of 6,956 proposed tokens (44.0339%), down 6.1696 percentage
-points from full vocabulary. Its natural-cohort complete round is 24.9861 ms,
-with 2.7556 steady tokens per round and 110.286 tokens/s, compared with the
-full head's 117.222 tokens/s. Twelve automatic quality tasks pass, all sixteen
-outputs stop naturally and health checks report no failures; Chinese manual
-review is pending. Acceptance already rejects this candidate.
-
-A separate CJK extension unions that frozen 65,536-ID frequency subset with
-all 65,782 tokenizer tokens decoding to a character in the recorded Chinese,
-Japanese or Korean Unicode ranges. The union has 107,021 IDs. Its base corpus,
-model-output mix and tokenizer hashes remain unchanged; no evaluation output
-is used. Base-subset coverage statistics are explicitly labelled as belonging
-to the base only. This candidate still needs a head screen and the same
-acceptance cohort; its expanded coverage is not admission evidence.
-
-A separate target-LM-head QPN8 research worker shares the admitted draft
-view's full-vocabulary code/scale buffers for the identical checkpoint head.
-It shares no shortlist buffers, replaces only the target head in the benchmark
-worker, leaves output projections untouched and retains the original method
-at unsupported widths. An opaque operator records actual execution separately
-for target numerical tapes. There is no target-head serving dispatch change.
-
-The CJK head screen includes production value/ID packet generation. Critical
-four-head times are 0.785971 -> 0.535419 ms at M1 and 0.797594 -> 0.540897 ms
-at M5. Original TP vocabulary ownership gives 32,715/35,890/29,640/8,776 rows;
-these counts expose residual imbalance but do not change admission. The
-`--include-cjk` corpus builder reproduces the exact 107,021-ID union, with
-four focused CPU tests passing. Model acceptance remains pending.
-
-A separate target LM-head screen uses the real 62,080-by-2,560 checkpoint
-shard and one invocation per graph: M5 FP16/QPN8 measures 0.481403/0.192010 ms;
-M20 measures 0.502303/0.357335 ms. These are projection-only timings. The
-benchmark target view currently changes only M1--8, retaining its original
-method at M20. Eleven CPU scope/load-order checks pass, including identical
-full-pack sharing and shortlist exclusion. Model gates remain pending.
-
-Reading router row-major weights could remove 125,829,120 additional bytes
-across 48 layers, but the existing direct-reader screen is slower despite
-identical FP16 output: M5 0.355226 -> 0.550359 ms; M10 0.404838 -> 0.577014 ms.
-Do not enable it to hide the C4 allocation failure. The shared-expert gate
-boundary audit also finds no new mismatch: both current default and fusion
-materialize FP16 sigmoid before FP16 multiplication. Its numerical rejection
-stands until an independently demonstrated cause is corrected.
-
-The CJK extension completes acceptance: 3,098/6,804 proposed tokens, or
-45.5320%, versus 50.2035% for full vocabulary. Natural-cohort round time is
-25.11718 ms, 2.81717 steady tokens per round and 112.161 tokens/s. Twelve
-automatic tasks pass, all sixteen outputs stop naturally and health checks
-find no failures. Acceptance rejects this subset. Retain the full vocabulary
-by default and stop further subset expansion or repartitioning on this line.
-
-A cooperative row-major router loader preserves all tested FP16 values but
-is slower: M5 packed/direct/cooperative times 0.355451/0.551199/0.920535 ms,
-and M10 0.405699/0.576594/0.908068 ms. Remove the uncommitted cooperative
-implementation. Do not repeat either original-weight reader or enable one
-as a workaround for the C4 memory failure.
-
-The MRv2 target verifier still gathers dense vocabulary logits before greedy
-rejection, while ordinary decode already uses compact TP top1. Add a
-benchmark-only MTP4 verifier that reuses the same model top1 method and sampler
-eligibility gate, then performs prefix verification in one kernel. Keep the
-common sampled/rejected count postprocessing. Stochastic, synthetic, grammar,
-penalty, logprob and prefill cases retain the original sampler.
-
-Thirty GPU cases match the dense reference for valid output tokens and counts,
-including ragged/zero draft counts, rejection at every position, full acceptance,
-ties across vocabulary blocks and all-negative-infinity logits. Twenty-four CPU
-route/eligibility checks pass. An isolated graph screen, excluding head and TP
-communication, measures dense FP32-copy/rejection versus argmax/rejection at
-0.029716/0.016824 ms for five rows and 0.086456/0.030792 ms for twenty rows.
-Verification with existing top1 IDs alone takes 0.004157/0.004362 ms. These are
-sampling-only measurements, not complete-round improvements. Teacher forcing
-overrides the sampling method, so its distribution dumps cannot prove this
-verifier executed; natural-cohort route counts and exact operator comparisons
-are required before promotion.
-
-A canonical row-major block32 INT8 reader was screened to test whether one
-weight store could serve native draft decode and the existing W8A16 fallback,
-instead of retaining both FP16 and packed INT8 experts. The four-step chain
-matches the independent dequantization oracle, but its same-session FP16
-control/candidate times are 0.408668/0.463677 ms. Row-major lane reads destroy
-the packed reader's memory locality. Remove this uncommitted native/helper
-variant; do not enable it to solve C4 memory pressure. A single-store design
-would need to preserve the packed layout for both decode and fallback.
-
-The follow-up keeps the native 32-output/16-input INT8 pack and lets the
-existing W8A16 Triton kernel read that layout through a default-false operator
-argument. Signed codes use zero point zero; ordinary unsigned W8A16 behavior
-is unchanged. Six up/down cases at M4/M20/M128 match the row-major unsigned
-INT8 reference bit for bit. A benchmark-only canonical worker replaces draft
-expert parameters with signed views of the same byte buffers, retaining no
-FP16 expert fallback. Native M1/M5 computation remains unchanged; larger batches
-use an opaque packed fallback with the ordinary expert configuration selection.
-
-The complete local expert-layer graph, including route alignment, up, SiLU,
-down and route sum, measures:
-
-| Tokens | Original FP16 (ms) | Row-major UINT8 (ms) | Canonical packed INT8 (ms) |
-| --- | ---: | ---: | ---: |
-| 4 | 1.127332 | 0.234199 | 0.247624 |
-| 20 | 1.418424 | 0.431155 | 0.457482 |
-| 2048 | 17.935605 | 17.576879 | 20.506633 |
-
-All quantized complete-layer outputs match. The 512-expert store decreases
-from 1,258,291,200 to 668,467,200 bytes, saving 562.5 MiB per rank relative to
-FP16 alone. The fixture contains 50 real TP0 experts; only those experts are
-routed. Prefill loses 2.571028 ms in this layer screen and must be reported
-alongside decode gains. Three CPU scope/alias checks and five fake-shape checks
-pass. No serving default changes: first complete block32 numerical/acceptance
-admission, then separately validate the single-store model and matched C4.
-
-The independent target-head probe also needs explicit tensor/return type
-annotations for custom-op schema inference. Fix its registration before the
-queued model test, and extend the shared-head tests to import the actual
-registered operation and check M1/M5/M8 fake outputs. All fourteen CPU checks
-pass; constructor-only head tests were insufficient to catch this startup
-failure. No GPU model result is attributed to the unregistered probe.
+| Frozen main complete-round baseline | 23.215921 ms |
+| Default fixed8k arithmetic mean | 21.198709 ms |
+| Repetitions / completed rounds | 3 / 963 |
+| Per-repetition complete-round means | 21.237521 / 21.225780 / 21.132825 ms |
+| Fixed-fixture acceptance / tokens per round | 15.031% / 1.5950 |
+| Fixed-fixture decode speed | 75.241 tokens/s |
+| Eight-prompt natural-cohort acceptance | 50.2035% (3,207 / 6,388) |
+| Natural-cohort tokens per round / decode speed | 3.000626 / 117.2215 tokens/s |
+
+The historical fixed fixture deliberately ignores EOS for timing. It is not
+a quality or natural-acceptance result. Natural cohort round means are
+25.5979 ms, a separate workload despite the same 8K input length.
+
+Sixteen teacher-forcing tapes compare the final default with its mathematically
+unchanged full-head control: target and draft KL are zero, top1 agreement is
+100%, and raw logit differences are zero. Sixteen natural texts match the
+reviewed default exactly; twelve automatic tasks pass and all sixteen outputs
+stop naturally. Four Chinese cases require manual review; two partial answers
+already exist in the reference and are not new regressions. Do not report a
+16/16 quality score.
+
+The initially admitted draft-only QPN8 head has mean KL 0.000465567, p99
+0.006037387, maximum 0.020955119 and top1 agreement 99.724%. Raw maximum
+logit difference 0.710938 is diagnostic. The FP32 shared branch and eight-warp
+HC preserve their independently recorded numerical admission.
+
+Matched C4 startup completes graph capture and sampler warmup, but the actual
+8K prefill fails a 160-MiB activation allocation with approximately 63--69 MiB
+free. **No C4 throughput/non-regression result is available.** Do not reduce
+input length, KV budget or startup capacity to relabel this failure as a pass.
+The 15-ms speed target is also not achieved. This integration carries the
+qualified default changes and the explicit remaining validation limits.
+
+## Reproduce and inspect
+
+Run from the editable source tree after building its normal SM70 extension:
+
+```bash
+.venv/bin/python -m benchmarks.benchmark_sm70_mtp4_round \
+  --model /path/to/flash-next --fixture fixed8k --repeats 3 \
+  --out /path/to/rounds.json
+```
+
+The report records source, exact prompts/token tapes, sampling, resolved engine
+settings, endpoint timestamps, completed rounds and acceptance counters.
+Use `--fixture-manifest` for the frozen eight-prompt 600-token cohort.
+Use `--quality-manifest` for separately scored tasks and
+`--teacher-forcing-manifest` for fixed continuations. Forcing preserves the
+serving decode context on small draft shapes and restores all observers even
+when a dump fails. Forcing cannot qualify natural outputs or speed.
+
+For diagnostics, use `--phase-events` or `--node-trace` on the same fixture.
+The latter requires Nsight Systems CUDA graph node tracing. Install annotations
+after graph capture, reset prefix cache identically, and pair diagnostics with
+an ordinary control in the same loaded engine. Keep profiler overhead visible;
+never rescale service sums into the unprofiled round mean. The analyzer splits
+target M5, four draft steps, head/sample, preparation and handoff. Kernel tables
+must distinguish service, critical-rank wall, actual issued bytes and a
+weight-only floor at 750 GB/s. Resident checkpoint bytes are not DRAM traffic.
+
+Thirty local head selection cases cover finite logits, ties, NaNs and padding.
+Compact TP4 transport covers changing values, row widths and repeated graph
+signaling epochs. Thirty-three sampler boundary cases preserve reference masks;
+the forced twenty-row fallback peak drops from 229.403 to 50.354 MiB.
+These operator checks are not complete-round or C4 endpoint results.
+
+## Research archive and closed directions
+
+Unadmitted kernels, shortlist controls and quantized-expert/target-head probes
+are preserved at the immutable
+[research snapshot](https://github.com/1CatAI/1Cat-vLLM/tree/fd65b839251de53aef94105b51aff082307a3602),
+including the complete trace history and benchmark recipes. They are excluded
+from this default-path integration, including their CUDA build registrations.
+Queued research jobs use frozen bundles from that snapshot and do not mutate
+the integrated checkout. New candidates require independent model gates before
+promotion; operator timings below are not default speed.
+
+| Candidate | Evidence / decision |
+| --- | --- |
+| Corpus 32K / 64K shortlist | Acceptance 36.1309% / 47.3177%; rejected |
+| Target-output 32K / 64K shortlist | Acceptance 41.2438% / 44.0339%; rejected |
+| CJK-extended 107,021-ID shortlist | Acceptance 45.5320%; rejected |
+| Target output projections QPN8 | Distribution rejection; not enabled |
+| Grouped QPN8 draft experts | Maximum KL 0.091476 and acceptance 46.2315%; rejected |
+| Row-scaled INT8 draft experts | Maximum KL 0.062439 >0.05; rejected despite acceptance 49.3344% |
+| Block32 INT8 draft experts | Four-step operator 0.436398 ->0.188733 ms; model gates pending |
+| Single packed INT8 draft store | M4/M20 layer 1.127332/1.418424 ->0.247624/0.457482 ms; saves 562.5 MiB/rank; M2048 prefill slows 2.571028 ms; model/C4 gates pending |
+| Target LM-head QPN8 | M5 projection 0.481403 ->0.192010 ms; model gates pending |
+| Compact greedy MTP target verifier | Sampling-only five rows 0.029716 ->0.016824 ms; full-model admission pending |
+| Cooperative shared-expert fusion | Operator gain but target/draft distribution failure; rejected |
+| Token-CTA router | 48-layer chain 0.631368 ->3.190070 ms; rejected |
+| Direct/cooperative row-major router readers | Slower despite exact output; rejected |
+| Row-major INT8 draft reader | Four-step FP16/candidate 0.408668/0.463677 ms; rejected |
+
+Keep full-vocabulary drafting; stop expanding or rebalancing the rejected
+shortlists. Do not repeat the closed 1.35-ms rebase regression investigation,
+HC local split-K, resident MoE, register prefetch, single cooperative HC,
+BV16/four-warp GDN or the two rejected FP16 draft fusion variants. The ordinary
+decode line owns further HC/QSA/GDN core work; verify M5 applicability when
+that line qualifies a change.
+
+Strata is a read-only reference, MIT-licensed snapshot
+`6f32ec070f23ced9f50e704d854d775da52591ab`. Its draft vocabulary and HC designs
+informed research choices; no CPU expert/cache scheme is enabled for TP4.
+Preserve source/license attribution if adapting its code in future work.

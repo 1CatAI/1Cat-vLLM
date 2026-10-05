@@ -60,8 +60,8 @@ stratum summaries for diagnosis:
 Also report median/p95/p99 logit error, additive-offset-centered maximum
 error, top-1 margin and disagreement counts. A common logit offset has no
 probability effect; raw and centered errors must both be visible. Maximum raw and centered logit errors are diagnostics, not admission gates.
-The owner explicitly revised this contract on 2026-10-05: a common offset or
-FP32 reassociation must not reject a candidate whose distribution passes.
+A common offset or FP32 reassociation must not reject a candidate whose
+distribution passes.
 Mean/p99/maximum KL, top-1 agreement and finite-logit checks remain gates.
 
 The mean-KL limit is 22x and 58x below the cross-implementation examples

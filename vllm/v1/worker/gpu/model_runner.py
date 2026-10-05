@@ -1345,41 +1345,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
-        # Benchmark-only until compact MTP verification completes admission.
-        sm70_mtp_greedy = (
-            sampler_output is None
-            and getattr(self, "_sm70_mtp_target_top1_probe", False)
-            and input_batch.num_draft_tokens > 0
-            and 1 <= input_batch.num_reqs <= 4
-            and not input_batch.is_prefilling_np.any()
-            and (
-                (input_batch.cu_num_logits_np[1:] - input_batch.cu_num_logits_np[:-1])
-                <= 5
-            ).all()
-            and self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
-            and self.num_speculative_steps == 4
-            and getattr(self.model_config.hf_config, "model_type", None) == "qwen4_exp"
-            and grammar_output is None
-            and self.device.type == "cuda"
-            and current_platform.is_device_capability(70)
-            and self.lora_config is None
-            and hasattr(self.model, "get_top_tokens")
-            and self.rejection_sampler is not None
-            and self.rejection_sampler.rejection_sample_method == "standard"
-            and self.sampler is not None
-            and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
-        )
-        if sm70_mtp_greedy:
-            assert self.rejection_sampler is not None
-            sampled = self.model.get_top_tokens(sample_hidden_states)
-            sampler_output = self.rejection_sampler.sample_from_top_tokens(
-                sampled, input_batch
-            )
-            proof = getattr(self, "_sm70_mtp_target_top1_proof", None)
-            assert proof is not None
-            proof["calls"] += 1
-            proof["widths"].add(sample_hidden_states.shape[0])
         sm70_greedy_decode = (
             sampler_output is None
             and input_batch.num_draft_tokens == 0

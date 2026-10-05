@@ -29,25 +29,10 @@ def main() -> None:
     parser.add_argument("--quality-manifest", type=Path)
     parser.add_argument("--training-manifest", type=Path)
     parser.add_argument("--fixture-manifest", type=Path)
-    parser.add_argument("--draft-vocab", type=Path)
-    parser.add_argument(
-        "--structural-candidate",
-        choices=(
-            "shared",
-            "draft-qpn8",
-            "draft-int8",
-            "draft-int8-block32",
-            "draft-int8-packed",
-            "target-head-qpn8",
-            "target-top1",
-        ),
-    )
     parser.add_argument("--restoration-control", action="store_true")
     parser.add_argument("--diagnostics-only", action="store_true")
     parser.add_argument("--projection-reference", action="store_true")
-    parser.add_argument(
-        "--diagnostic-path", choices=("reference", "shared", "head", "output")
-    )
+    parser.add_argument("--diagnostic-path", choices=("reference", "shared", "head"))
     parser.add_argument("--fixture", action="append")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--phase-events", action="store_true")
@@ -63,8 +48,6 @@ def main() -> None:
     if args.training_manifest and (
         args.projection_reference
         or args.diagnostic_path
-        or args.draft_vocab
-        or args.structural_candidate
         or args.restoration_control
         or args.node_trace
         or args.phase_events
@@ -186,43 +169,14 @@ def main() -> None:
     }
     if args.node_trace:
         engine["profiler_config"] = {"profiler": "cuda"}
-    if (
-        args.teacher_forcing_manifest
-        or args.node_trace
-        or args.phase_events
-        or args.structural_candidate
-    ):
+    if args.teacher_forcing_manifest or args.node_trace or args.phase_events:
         engine["worker_extension_cls"] = (
             "benchmarks.sm70_mtp_admission_worker.MtpAdmissionExtension"
         )
     if args.startup_diagnostics:
         engine["worker_cls"] = "benchmarks.sm70_startup_worker.StartupStackWorker"
-    if args.draft_vocab:
-        if args.diagnostic_path or args.projection_reference or args.node_trace:
-            parser.error("Shortlist comparison must be an independent candidate arm")
-        engine["hf_overrides"] = {
-            "sm70_mtp_draft_vocab_file": str(args.draft_vocab.resolve())
-        }
-        engine["worker_cls"] = (
-            "benchmarks.sm70_mtp_reference_worker.ShortlistCandidateWorker"
-        )
-    if args.structural_candidate:
-        if args.draft_vocab or args.diagnostic_path or args.projection_reference:
-            parser.error("Structural precision probe requires its own candidate arm")
-        candidate_worker = {
-            "shared": "SharedChainCandidateWorker",
-            "draft-qpn8": "DraftExpertQPN8CandidateWorker",
-            "draft-int8": "DraftExpertINT8CandidateWorker",
-            "draft-int8-block32": "DraftExpertINT8Block32CandidateWorker",
-            "draft-int8-packed": "DraftExpertINT8PackedCandidateWorker",
-            "target-head-qpn8": "TargetHeadQPN8CandidateWorker",
-            "target-top1": "TargetTop1CandidateWorker",
-        }[args.structural_candidate]
-        engine["worker_cls"] = (
-            "benchmarks.sm70_mtp_reference_worker." + candidate_worker
-        )
     if args.restoration_control:
-        if args.draft_vocab or args.structural_candidate or args.diagnostic_path:
+        if args.diagnostic_path:
             parser.error("Restoration control requires an independent arm")
         engine["worker_cls"] = (
             "benchmarks.sm70_mtp_reference_worker.RestorationControlWorker"
@@ -233,7 +187,6 @@ def main() -> None:
         cls = {
             "reference": "ReferenceWorker",
             "head": "HeadCandidateWorker",
-            "output": "OutputCandidateWorker",
         }[args.diagnostic_path]
         engine["worker_cls"] = "benchmarks.sm70_mtp_reference_worker." + cls
     report = {
@@ -247,9 +200,7 @@ def main() -> None:
         "warmup_outputs": [],
         "complete": False,
         "startup_diagnostics": args.startup_diagnostics,
-        "default_configuration": not (
-            args.draft_vocab or args.structural_candidate or args.restoration_control
-        ),
+        "default_configuration": not args.restoration_control,
         "measurement_kind": (
             "diagnostic_node_trace"
             if args.node_trace
@@ -405,8 +356,6 @@ def main() -> None:
         )
         report["latency_passed"] = (
             report["speed_complete"]
-            and not args.draft_vocab
-            and not args.structural_candidate
             and not args.restoration_control
             and all(row["complete_round_ms"] <= 15 for row in report["cases"])
         )
@@ -512,38 +461,6 @@ def main() -> None:
                     )
                 report["teacher_forcing"].append({"id": tape["id"], "workers": result})
                 save()
-        if args.structural_candidate:
-            proof = llm.collective_rpc("get_mtp_structural_route_proof")
-            report["structural_route_proof"] = proof
-            widths = (
-                {5}
-                if args.structural_candidate
-                in ("shared", "target-head-qpn8", "target-top1")
-                else {1, 5}
-            )
-            if len(proof) != 4 or any(
-                row[args.structural_candidate]["calls"] < 1
-                or not widths.issubset(row[args.structural_candidate]["widths"])
-                for row in proof
-            ):
-                raise RuntimeError("Structural candidate was not executed on all ranks")
-            if (
-                args.structural_candidate
-                in (
-                    "draft-qpn8",
-                    "draft-int8",
-                    "draft-int8-block32",
-                    "draft-int8-packed",
-                    "target-head-qpn8",
-                )
-                and args.teacher_forcing_manifest
-                and any(
-                    worker["structural_probe_delta"][args.structural_candidate] < 1
-                    for case in report["teacher_forcing"]
-                    for worker in case["workers"]
-                )
-            ):
-                raise RuntimeError("Draft numerical probe used its fallback")
         report["complete"] = True
         save()
     except BaseException:
