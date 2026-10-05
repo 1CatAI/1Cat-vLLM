@@ -60,7 +60,7 @@ __global__ __launch_bounds__(256, 2) void shared_expert_chain(
 #pragma unroll
       for (int i = 0; i < 16; ++i)
         value = fmaf(__half2float(activation[row][i]),
-                     __half2float(w2[n * 160 + tile * 16 + i]), value);
+                     __half2float(w2[(tile * 16 + i) * 2560 + n]), value);
       partials[(tile * m + row) * 2560 + n] = value;
     }
     __syncthreads();
@@ -97,7 +97,7 @@ void run(torch::Tensor x, torch::Tensor w13, torch::Tensor w2,
   const int m = x.size(0);
   TORCH_CHECK((m == 1 || m == 5) && x.size(1) == 2560);
   TORCH_CHECK(w13.sizes() == at::IntArrayRef({320, 2560}));
-  TORCH_CHECK(w2.sizes() == at::IntArrayRef({2560, 160}));
+  TORCH_CHECK(w2.sizes() == at::IntArrayRef({160, 2560}));
   TORCH_CHECK(gate.numel() == 2560 && partials.numel() == 10 * m * 2560);
   for (const auto& tensor : {x, w13, w2, gate, output}) {
     TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous());

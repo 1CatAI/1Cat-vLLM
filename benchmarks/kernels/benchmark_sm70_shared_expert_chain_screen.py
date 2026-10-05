@@ -63,6 +63,7 @@ def main():
         w2 = get(prefix + "shared_expert.down_proj.weight")[:, :160].contiguous().cuda()
         gate = get(prefix + "shared_expert_gate.weight").cuda()
         weights.append((w13, w2, gate))
+    packed_down = [w2.t().contiguous() for _, w2, _ in weights]
     report = {
         "research_only": True,
         "model_admission": False,
@@ -87,8 +88,8 @@ def main():
         outputs = [torch.empty_like(x) for x in inputs]
 
         def candidate():
-            for x, (w13, w2, gate), p, f, e, y in zip(
-                inputs, weights, partials, flags, epochs, outputs
+            for x, (w13, _, gate), w2, p, f, e, y in zip(
+                inputs, weights, packed_down, partials, flags, epochs, outputs
             ):
                 extension.run(x, w13, w2, gate, p, f, e, y)
 
