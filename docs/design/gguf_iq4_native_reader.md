@@ -142,7 +142,10 @@ have 64,384 expected Half infinities; signs and bits match exactly, without
 clipping. Both reader instantiations retain 32 registers and zero spills.
 
 The corrected full layer-39 gate and layer-42 up rank-zero device checks
-remain pending. No mixed GEMM or model route is admitted by this stress-only
-result. The initial failure and fixed stress results are stored in
+also pass: each has 22,282,240 weights, and both Float and Half comparisons
+have zero bit mismatches and zero maximum absolute error. Every actual
+weight is finite. The same complete stress point passes again. This proves
+operand reconstruction; no mixed GEMM or model route is admitted by these
+operand-only results. The initial failure and fixed stress results are stored in
 `gguf_iq4_native_operand_oracle.json`; they contain no weight data or local
 paths.
