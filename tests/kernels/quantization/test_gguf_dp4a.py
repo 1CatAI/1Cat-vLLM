@@ -14,8 +14,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 def quantize_reference(x):
     groups = x.float().reshape(x.shape[0], -1, 32)
     maximum = groups.abs().amax(-1, keepdim=True)
-    d = maximum / 127
-    ratio = torch.where(maximum == 0, 0, groups / d)
+    # CUDA uses FP32 division; Torch division by a scalar can multiply by
+    # its rounded reciprocal instead. Explicit rounding avoids a different
+    # side of a half-integer boundary in this independent oracle.
+    d = (maximum.double() / 127).float()
+    ratio = torch.where(maximum == 0, 0, (groups.double() / d.double()).float())
     q = (ratio.sign() * (ratio.abs() + 0.5).floor()).to(torch.int8)
     scales = d.squeeze(-1).half()
     sums = groups.sum(-1).half()
