@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 from vllm.model_executor.kernels.gguf import iq3_gated_pair_capability
-from vllm.model_executor.layers.quantization.gguf_iq3_gated import _iq3_gated_pair
+from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+    _iq3_gated_pair,
+    apply_iq3_gated_pair,
+)
 from vllm.model_executor.layers.quantization.gguf_iq3_records import (
     signed_index_records,
 )
@@ -102,6 +107,7 @@ def test_actual_m_dispatch_and_canonical_rounding(monkeypatch, widths):
 
 def test_range_compilation_keeps_gated_dispatch_opaque():
     torch._dynamo.reset()
+
     graphs = []
 
     def backend(graph, inputs):
@@ -134,4 +140,42 @@ def test_range_compilation_keeps_gated_dispatch_opaque():
     nodes = [n for n in graphs[0].graph.nodes if n.op == "call_function"]
     assert len(nodes) == 1
     assert "gguf_iq3_gated_pair" in str(nodes[0].target)
+    torch._dynamo.reset()
+
+
+def test_registered_parameter_list_compiles_through_layer_wrapper():
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.kernel = SimpleNamespace(operator_capabilities=())
+            self.codes = torch.nn.Parameter(
+                torch.empty(0, device="meta", dtype=torch.int32), False
+            )
+            self.stats = torch.nn.Parameter(
+                torch.empty(0, device="meta", dtype=torch.int64), False
+            )
+            self.gguf_tm_k_ld = self.gguf_tm_q_ld = 0
+            self.logical_output_size = 8704
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gguf_iq3_gated_records = torch.nn.ParameterList(
+                [
+                    torch.nn.Parameter(
+                        torch.empty(0, device="meta", dtype=torch.uint8), False
+                    )
+                    for _ in range(2)
+                ]
+            )
+            self.gguf_tm_projections = torch.nn.ModuleList([Projection()])
+
+        def forward(self, x):
+            return apply_iq3_gated_pair(self, x)
+
+    torch._dynamo.reset()
+    compiled = torch.compile(Layer(), backend="eager", fullgraph=True, dynamic=True)
+    for m in (512, 8, 16, 8):
+        x = torch.empty(m, 5120, dtype=torch.float16, device="meta")
+        assert compiled(x).shape == (m, 4352)
     torch._dynamo.reset()
