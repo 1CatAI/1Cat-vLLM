@@ -18,8 +18,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 def _forward(
     hidden: torch.Tensor,
-    conv: torch.Tensor,
-    state: torch.Tensor,
     core: torch.Tensor,
     norms: torch.Tensor,
     flags: torch.Tensor,
@@ -75,6 +73,10 @@ def _forward(
     if accepted is None:
         layer._forward_method(hidden, output)
         return output
+    # The hybrid cache exposes FP16 and FP32 views of one byte allocation.
+    # Keep that owner inside the opaque transaction, as QSA does for its
+    # caches. Mutable workspace/epoch arguments retain call ordering in AOT.
+    conv, state = layer.kv_cache
     qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
         hidden,
         layer.in_proj_qkvz.weight,
@@ -112,7 +114,7 @@ def _forward(
     return result
 
 
-def _fake(hidden, conv, state, core, norms, flags, epochs, accepted_one, layer_name):
+def _fake(hidden, core, norms, flags, epochs, accepted_one, layer_name):
     return torch.empty_like(hidden)
 
 
@@ -120,7 +122,7 @@ direct_register_custom_op(
     op_name="qwen38_sm70_gdn_conv_norm_forward",
     op_func=_forward,
     fake_impl=_fake,
-    mutates_args=["conv", "state", "core", "norms", "flags", "epochs"],
+    mutates_args=["core", "norms", "flags", "epochs"],
 )
 
 
@@ -192,16 +194,9 @@ def prepare_gdn_conv_norm(module: torch.nn.Module, vllm_config) -> int:
 
 
 def conv_norm_forward(layer, hidden_states, output):
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        _resolve_qwen_gdn_kv_cache_args,
-    )
-
     layer_name = _encode_layer_name(layer.prefix)
-    conv, state = _resolve_qwen_gdn_kv_cache_args(layer_name, hidden_states)
     result = torch.ops.vllm.qwen38_sm70_gdn_conv_norm_forward(
         hidden_states,
-        conv,
-        state,
         layer._sm70_gdn_conv_norm_core,
         layer._sm70_gdn_conv_norm_norms,
         layer._sm70_gdn_conv_norm_flags,

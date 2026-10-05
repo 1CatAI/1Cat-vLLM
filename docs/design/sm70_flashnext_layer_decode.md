@@ -405,3 +405,11 @@ Both ordinary QSA natural requests terminate with `stop` (88 and 75 tokens),
 completing its independent layer/distribution/natural campaign. This admits the
 direction for subsequent endpoint measurement; it does not credit an endpoint
 speedup. GDN package layer and combined distribution qualification are next.
+
+The first ordinary GDN startup fails before measurement because AOT cannot
+functionalize mutations of the FP16 convolution and FP32 recurrent views of
+the same hybrid byte allocation. The opaque forward now resolves that shared
+cache owner through its registered layer, following QSA's cache-access model.
+Its workspace and epoch arguments remain explicit mutations to preserve call
+ordering. CUDA arithmetic and native artifact are unchanged. Ordinary-route
+retry and combined model qualification remain pending.
