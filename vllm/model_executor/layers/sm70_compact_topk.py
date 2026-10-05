@@ -28,10 +28,6 @@ def compact_half_topk(
     ):
         return None
     rows, width = logits.shape
-    # Larger FP32 batches retain the generic selector until a concurrent
-    # model measurement qualifies the hierarchical path for that workload.
-    if logits.dtype == torch.float32 and rows > 8:
-        return None
     scratch_width = ((width + 1023) // 1024) * 64
     if logits.dtype == torch.float32 and scratch_width > 1024:
         scratch_width += ((scratch_width + 511) // 512) * 64

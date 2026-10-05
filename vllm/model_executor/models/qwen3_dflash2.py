@@ -547,9 +547,21 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             else None
         )
         if local_candidates is None:
-            logits = self.lm_head.quant_method.apply(
-                self.lm_head, hidden_states, bias=None
-            )
+            if getattr(self.lm_head, "sm70_fp8_fp32_head", False):
+                # The shared head's FP32 verifier epilogue must not widen the
+                # draft selector's original logits and radix-sort contract.
+                output = torch.empty(
+                    (*hidden_states.shape[:-1], self.lm_head.output_size_per_partition),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+                logits = self.lm_head.quant_method.apply(
+                    self.lm_head, hidden_states, bias=None, output=output
+                )
+            else:
+                logits = self.lm_head.quant_method.apply(
+                    self.lm_head, hidden_states, bias=None
+                )
             num_pad = self.lm_head.shard_indices.num_org_vocab_padding
             if num_pad > 0:
                 logits[..., -num_pad:] = -float("inf")

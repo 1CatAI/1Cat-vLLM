@@ -21,7 +21,9 @@ The model workload uses CUDA 12.8, Torch 2.10, four V100-SXM2-16GB GPUs at
 memory utilization 0.92, FP8 E4M3 target KV storage, and 1024/8192-token inputs.
 
 The SM70 registry includes FP32 epilogues for small and 32-row verifier tiles.
-Explicit FP16 output buffers retain their previous contract. Batched
+Explicit FP16 output buffers retain their previous contract. The shared
+DFlash2 candidate head uses that contract to retain its original FP16 logits.
+Batched
 verification uses the same capability guard; widths above 32 retain the
 original head.
 
@@ -29,6 +31,6 @@ The compact top-64 probe sorts original FP32 keys without casting to FP16.
 Its stable first pass sorts 32-bit float keys while carrying vocabulary IDs;
 hierarchical merges retain all 48 significant value/ID bits. Small FP32
 batches use two kernels for short shards and three for full vocabulary
-shards. FP32 batches above eight rows retain the generic selector. FP16
+shards, including batched probes through thirty-two rows. FP16
 inputs continue using their original two-kernel, 32-bit-key probe. The
 existing cutoff/nucleus reference guard remains required.

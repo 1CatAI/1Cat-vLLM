@@ -19,9 +19,6 @@ pytestmark = pytest.mark.skipif(
 def test_source_values_and_live_graph(rows, width, dtype):
     torch.manual_seed(1530)
     logits = torch.randn(rows, width, dtype=dtype, device="cuda")
-    if dtype == torch.float32 and rows > 8:
-        assert compact_half_topk(logits) is None
-        return
     assert compact_half_topk(logits) is not None
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
