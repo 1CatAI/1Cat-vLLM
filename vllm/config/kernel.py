@@ -370,6 +370,9 @@ class Sm70GgufConfig:
     small_m_hmma: bool = True
     """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
 
+    q8_expert_intermediate: bool = True
+    """Encode routed intermediates once in qualified integer expert gate/up."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
