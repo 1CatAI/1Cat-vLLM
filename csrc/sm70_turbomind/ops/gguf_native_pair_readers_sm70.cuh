@@ -171,6 +171,76 @@ struct NativePairReader<18> {
 };
 
 template <>
+struct NativePairReader<22> {
+  using Decoder = LatticeRawDecoder<22>;
+  static constexpr int kBlockBytes = 82;
+  static constexpr int kBookId = 22;
+  static constexpr int kBookBytes = Decoder::kCodebookBytes;
+  struct Record {
+    uint32_t indices[4];
+    uint32_t signs[4];
+    uint32_t high;
+    uint32_t scales;
+    float d;
+  };
+  const uint8_t* payload;
+  const uint8_t* metadata;
+  const half* original_d;
+  float cached_d;
+  int half_block;
+  bool first;
+
+  __device__ NativePairReader(const uint8_t* source, int tile, int blocks_k,
+                              int first_part, int col) {
+    const uint8_t* macro = source + int64_t{tile} * blocks_k * 32 * kBlockBytes;
+    payload = macro + first_part * 1280 + col * 16;
+    metadata = macro + first_part * 1280 + 1024 + col * 8;
+    original_d = reinterpret_cast<const half*>(macro + blocks_k * 2560 +
+                                               (first_part / 2) * 64 + col * 2);
+    cached_d = 0;
+    half_block = first_part & 1;
+    first = true;
+  }
+
+  __device__ static void initialize(uint8_t* book) {
+    Decoder::initialize(book);
+  }
+
+  __device__ Record load() {
+    if (first || half_block == 0) cached_d = __half2float(*original_d);
+    const uint4 indices = *reinterpret_cast<const uint4*>(payload);
+    const uint4 signs = *reinterpret_cast<const uint4*>(payload + 512);
+    const uint2 aux = *reinterpret_cast<const uint2*>(metadata);
+    Record record{{indices.x, indices.y, indices.z, indices.w},
+                  {signs.x, signs.y, signs.z, signs.w},
+                  aux.x,
+                  aux.y,
+                  cached_d};
+    payload += 1280;
+    metadata += 1280;
+    original_d += half_block * 32;
+    half_block ^= 1;
+    first = false;
+    return record;
+  }
+
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t* book) {
+    static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
+    constexpr int octet = 2 * Segment + Fragment;
+    const uint32_t low = (record.indices[octet / 4] >> (8 * (octet & 3))) & 255;
+    const uint32_t index = low | (((record.high >> (2 * octet)) & 3) << 8);
+    const uint32_t signs = (record.signs[octet / 4] >> (8 * (octet & 3))) & 255;
+    const uint64_t packed =
+        *reinterpret_cast<const uint64_t*>(book + index * 8);
+    // Reuse the original decoder's exact final FP16 operand formation.
+    return Decoder::table_fragment<half>(packed, signs, record.d,
+                                         (record.scales >> (4 * Segment)) & 15);
+  }
+};
+
+template <>
 struct NativePairReader<21> {
   using Decoder = Iq3NibbleBookDecoder;
   static constexpr int kBlockBytes = 110;

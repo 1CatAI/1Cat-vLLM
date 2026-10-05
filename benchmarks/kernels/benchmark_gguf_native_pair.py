@@ -32,8 +32,25 @@ def main():
         help="Test the unadmitted IQ3_XXS reader through the raw operator",
     )
     parser.add_argument("--prototype-q4-k", action="store_true")
+    parser.add_argument("--prototype-iq3xxs-iq4", action="store_true")
+    parser.add_argument("--prototype-iq2-s", action="store_true")
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Skip timing after numerical and graph checks",
+    )
     args = parser.parse_args()
-    assert not (args.prototype_iq3_xxs and args.prototype_q4_k)
+    assert (
+        sum(
+            (
+                args.prototype_iq3_xxs,
+                args.prototype_q4_k,
+                args.prototype_iq3xxs_iq4,
+                args.prototype_iq2_s,
+            )
+        )
+        <= 1
+    )
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     assert torch.cuda.get_device_capability() == (7, 0)
@@ -44,11 +61,27 @@ def main():
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
         allowed = (
-            ((12, 23), (23, 12))
+            ((22, 21), (21, 22), (22, 18), (18, 22))
+            if args.prototype_iq2_s
+            else ((18, 23),)
+            if args.prototype_iq3xxs_iq4
+            else ((12, 23), (23, 12))
             if args.prototype_q4_k
             else ((18, 21), (21, 18))
             if args.prototype_iq3_xxs
-            else ((21, 23), (23, 21), (18, 21), (21, 18))
+            else (
+                (21, 23),
+                (23, 21),
+                (18, 21),
+                (21, 18),
+                (12, 23),
+                (23, 12),
+                (18, 23),
+                (22, 21),
+                (21, 22),
+                (22, 18),
+                (18, 22),
+            )
         )
         assert tuple(types) in allowed, types
         raw = [tensors[name].data[:4352].copy() for name in names]
@@ -59,7 +92,12 @@ def main():
         layer_module = torch.nn.Module()
         layer_module.prefix = f"model.layers.{layer}.mlp.gate_up_proj"
         layer_module.gguf_tm_projections = torch.nn.ModuleList(projections)
-        if args.prototype_iq3_xxs or args.prototype_q4_k:
+        if (
+            args.prototype_iq3_xxs
+            or args.prototype_q4_k
+            or args.prototype_iq3xxs_iq4
+            or args.prototype_iq2_s
+        ):
             from vllm.model_executor.layers.quantization.gguf_iq3_records import (
                 signed_index_records,
             )
@@ -68,7 +106,13 @@ def main():
             )
 
             packers = {18: pack_iq3_xxs_records, 21: signed_index_records}
-            if args.prototype_q4_k:
+            if args.prototype_iq2_s:
+                from vllm.model_executor.layers.quantization.gguf_iq2_s_records import (
+                    pack_iq2_s_records,
+                )
+
+                packers[22] = pack_iq2_s_records
+            if args.prototype_q4_k or args.prototype_iq3xxs_iq4:
                 from vllm.model_executor.layers.quantization.gguf_iq4_native import (
                     pack_iq4_xs_records,
                 )
@@ -155,12 +199,17 @@ def main():
         flush = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         payload_bytes = sum(data.nbytes for data in raw)
         timings = []
-        for label, call in (
-            ("canonical", canonical),
-            ("native", native),
-            ("native", native),
-            ("canonical", canonical),
-        ):
+        timing_calls = (
+            ()
+            if args.check_only
+            else (
+                ("canonical", canonical),
+                ("native", native),
+                ("native", native),
+                ("canonical", canonical),
+            )
+        )
+        for label, call in timing_calls:
             before = clocks()
             elapsed = cold_graph(lambda call=call, rows=rows: call(rows), flush)
             timings.append(

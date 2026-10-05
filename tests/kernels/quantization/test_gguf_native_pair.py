@@ -15,7 +15,20 @@ from vllm.model_executor.layers.quantization.gguf_native_pair import (
 
 
 @pytest.mark.parametrize(
-    "types", [(21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12)]
+    "types",
+    [
+        (21, 23),
+        (23, 21),
+        (18, 21),
+        (21, 18),
+        (12, 23),
+        (23, 12),
+        (18, 23),
+        (22, 21),
+        (21, 22),
+        (22, 18),
+        (18, 22),
+    ],
 )
 def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
     monkeypatch.setattr(
@@ -26,6 +39,7 @@ def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
     assert [m for m in (1, 5, 8, 16, 20, 32, 512) if caps[0].supports_m(m)] == [8]
     for arguments in (
         ((21, 21), 5120, 4352, torch.float16),
+        ((23, 18), 5120, 4352, torch.float16),
         ((21, 23), 5120, 4096, torch.float16),
         ((99,), 5120, 4352, torch.float16),
         (types, 5120, 4352, torch.bfloat16),
@@ -37,7 +51,20 @@ def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
 
 
 @pytest.mark.parametrize(
-    "types", [(21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12)]
+    "types",
+    [
+        (21, 23),
+        (23, 21),
+        (18, 21),
+        (21, 18),
+        (12, 23),
+        (23, 12),
+        (18, 23),
+        (22, 21),
+        (21, 22),
+        (22, 18),
+        (18, 22),
+    ],
 )
 def test_runtime_m_preserves_mixed_canonical_policy(monkeypatch, types):
     calls: list[tuple[Any, ...]] = []
@@ -125,7 +152,20 @@ def test_dynamic_compile_keeps_runtime_dispatch_opaque():
 
 
 @pytest.mark.parametrize(
-    "types", [(21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12)]
+    "types",
+    [
+        (21, 23),
+        (23, 21),
+        (18, 21),
+        (21, 18),
+        (12, 23),
+        (23, 12),
+        (18, 23),
+        (22, 21),
+        (21, 22),
+        (22, 18),
+        (18, 22),
+    ],
 )
 def test_registered_parameter_lists_support_aot_module_capture(types):
     class Projection(torch.nn.Module):
