@@ -749,3 +749,19 @@ its separate compiler. Preserve the existing speed records and retry only
 missing diagnostics. Collect natural quality and independent vocabulary
 training before forcing; each has its own completion flag, while overall
 candidate admission still requires every requested stage.
+
+### Parallel draft local top1
+
+The remaining full-head selector scans 62,080 logits in one CTA. Split it into
+512-column segments and merge the small set of maxima, emitting the existing
+FP32 value/global-ID packet directly. Preserve first-index ties, NaN precedence
+and vocabulary padding. Keep soft-cap/scaling, shortlists and older extensions
+on their existing routes. Target projection precision and head are unchanged.
+
+A source-built V100 real-weight four-head graph (including packet production,
+excluding identical TP IPC) screens 0.854364 -> 0.776305 ms at M1;
+M4 0.861030 -> 0.784558 ms; M5 0.862136 -> 0.786964 ms. Input scales zero,
+0.03, one and three preserve the packets exactly. Finite values, ties, negative
+infinity, NaNs and excluded padding pass at M1/M4/M5/M16/M128. The approximately
+0.078-ms local gain is not a complete-model speed claim. Prepare it on the
+owned default path, with model/C4 qualification required before merging.

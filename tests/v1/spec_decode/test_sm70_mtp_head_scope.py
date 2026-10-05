@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -103,3 +104,88 @@ def test_shortlist_keeps_global_ids_and_excludes_padding(monkeypatch):
     values, ids = view.maybe_get_sm70_lm_head_top1(x)
     assert torch.isneginf(values).all()
     assert ids.tolist() == [100] * 5
+
+
+def test_parallel_packet_cpu_keeps_original_route(monkeypatch):
+    view = object.__new__(head_ops.MTPQPN8Head)
+    nn.Module.__init__(view)
+    view._shortlist_size = None
+    monkeypatch.setattr(
+        head_ops.torch.ops._C,
+        "qwen38_mtp_local_top1_sm70_out",
+        lambda *args: None,
+        raising=False,
+    )
+    assert (
+        view.maybe_get_sm70_lm_head_top1_pair(torch.zeros(1, 2560, dtype=torch.float16))
+        is None
+    )
+
+
+def test_older_extension_does_not_attempt_parallel_packet(monkeypatch):
+    view = object.__new__(head_ops.MTPQPN8Head)
+    nn.Module.__init__(view)
+    view._shortlist_size = None
+    view.shard_indices = SimpleNamespace(num_added_elements=0)
+    hidden = SimpleNamespace(ndim=2, dtype=torch.float16, is_cuda=True, shape=(1, 2560))
+    monkeypatch.setattr(head_ops.torch.ops, "_C", SimpleNamespace())
+    assert view.maybe_get_sm70_lm_head_top1_pair(hidden) is None
+
+
+@pytest.mark.parametrize("use_custom_ipc", [False, True])
+def test_parallel_packet_reuses_compact_transport_without_recomputing_logits(
+    monkeypatch, use_custom_ipc
+):
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers import logits_processor as module
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module, "_maybe_sync_top1_all_gather", lambda *args: None)
+    packet = torch.tensor([[4.0, 102.0], [2.0, 100.0]])
+    ids = torch.tensor([102, 100])
+    head = SimpleNamespace(
+        maybe_get_sm70_lm_head_top1_pair=Mock(return_value=packet),
+        maybe_get_sm70_lm_head_top1=Mock(
+            side_effect=AssertionError("duplicate projection")
+        ),
+    )
+    proc = module.LogitsProcessor(256)
+    proc._maybe_dump_top_token_margin = Mock()
+    proc._maybe_custom_top1_argmax = Mock(return_value=ids if use_custom_ipc else None)
+    gather = Mock(side_effect=lambda pair, dim: torch.cat([pair] * 4, dim=dim))
+    monkeypatch.setattr(module, "tensor_model_parallel_all_gather", gather)
+    assert torch.equal(proc.get_top_tokens(head, torch.zeros(2, 2560)), ids)
+    assert proc._maybe_custom_top1_argmax.call_args.args[0] is packet
+    assert gather.call_count == (0 if use_custom_ipc else 1)
+    head.maybe_get_sm70_lm_head_top1.assert_not_called()
+
+
+@pytest.mark.parametrize("scale,cap", [(2.0, None), (1.0, 2.0)])
+def test_parallel_packet_preserves_logit_transform_fallback(monkeypatch, scale, cap):
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers import logits_processor as module
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(module, "_maybe_sync_top1_all_gather", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_gather",
+        lambda pair, dim: torch.cat([pair] * 4, dim=dim),
+    )
+    head = SimpleNamespace(
+        maybe_get_sm70_lm_head_top1_pair=Mock(),
+        maybe_get_sm70_lm_head_top1=Mock(return_value=None),
+        quant_method=SimpleNamespace(
+            apply=lambda *args, **kwargs: torch.tensor([[0.0, 1.0, 3.0]])
+        ),
+        shard_indices=SimpleNamespace(
+            num_org_vocab_padding=0, org_vocab_start_index=100
+        ),
+    )
+    proc = module.LogitsProcessor(256, scale=scale, soft_cap=cap)
+    proc._maybe_custom_top1_argmax = lambda pair: None
+    proc._maybe_dump_top_token_margin = lambda *args: None
+    assert proc.get_top_tokens(head, torch.zeros(1, 2560)).tolist() == [102]
+    head.maybe_get_sm70_lm_head_top1_pair.assert_not_called()

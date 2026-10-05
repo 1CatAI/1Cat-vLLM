@@ -413,6 +413,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_shared_chain_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_fp16_chain_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_qpn8_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_fp16_sm70.cu"

@@ -82,6 +82,31 @@ class MTPQPN8Head(nn.Module):
             out.add_(bias)
         return out.reshape(*x.shape[:-1], self.weight.shape[0])
 
+    def maybe_get_sm70_lm_head_top1_pair(self, hidden_states, bias=None):
+        """Emit the existing compact packet without full-row serial selection."""
+        if (
+            self._shortlist_size is not None
+            or hidden_states.ndim != 2
+            or hidden_states.dtype != torch.float16
+            or not hidden_states.is_cuda
+            or not 1 <= hidden_states.shape[0] <= 8
+            or getattr(self.shard_indices, "num_added_elements", 0)
+            or not hasattr(torch.ops._C, "qwen38_mtp_local_top1_sm70_out")
+        ):
+            return None
+        start = self.shard_indices.org_vocab_start_index
+        valid = self.shard_indices.org_vocab_end_index - start
+        if valid < 1:
+            return None
+        logits = self.apply(self, hidden_states, bias)
+        rows = hidden_states.shape[0]
+        pairs = logits.new_empty((rows, 2), dtype=torch.float32)
+        partial = logits.new_empty((rows, (valid + 511) // 512, 2), dtype=torch.float32)
+        torch.ops._C.qwen38_mtp_local_top1_sm70_out(
+            pairs, partial, logits, valid, start
+        )
+        return pairs
+
     def maybe_get_sm70_lm_head_top1(self, hidden_states, bias=None):
         rows = hidden_states.numel() // hidden_states.shape[-1]
         if (

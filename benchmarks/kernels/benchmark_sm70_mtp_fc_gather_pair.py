@@ -108,7 +108,9 @@ def main():
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
             with (
-                graph_capture() as context,
+                graph_capture(
+                    device=torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+                ) as context,
                 torch.cuda.graph(graph, stream=context.stream),
             ):
                 saved = launch(arm == "combined")
