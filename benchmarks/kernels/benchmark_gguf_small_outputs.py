@@ -38,7 +38,7 @@ def main():
         gdn = tensor.name.endswith(".ssm_out.weight")
         attention = tensor.name.endswith(".attn_output.weight")
         kind = int(tensor.tensor_type)
-        if not (gdn or attention) or kind not in (16, 17, 18, 21, 22, 23, 29):
+        if not (gdn or attention) or kind not in (12, 16, 17, 18, 21, 22, 23, 29):
             continue
         role = "gdn_out" if gdn else "attention_o"
         if (role, kind) in seen:
@@ -76,7 +76,17 @@ def main():
         if gdn:
             reference = layout.weight_to_vllm(reference, dim=1)
         reference = reference.cuda()
-        weight = torch.from_numpy(_SOURCE_PACKERS[kind](raw)).cuda()
+        if kind == 12:
+            assert not gdn or projection.input_layout_restored
+            weight = projection.codes
+            partitions = (2,)
+            stream_bytes = sum(
+                t.numel() * t.element_size() for t in (weight, projection.stats)
+            )
+        else:
+            weight = torch.from_numpy(_SOURCE_PACKERS[kind](raw)).cuda()
+            partitions = (1, 2)
+            stream_bytes = weight.numel() * weight.element_size()
         partials = torch.empty(80, 2, 512, dtype=torch.float32, device="cuda")
         counters = torch.zeros(80, dtype=torch.int32, device="cuda")
         output = torch.empty(8, 5120, dtype=torch.float16, device="cuda")
@@ -90,10 +100,16 @@ def main():
             output=output,
             kind=kind,
             gdn=gdn,
+            projection=projection,
         ):
-            torch.ops._C.gguf_small_output_sm70_out(
-                output, x, weight, partials, counters, kind, split, gdn
-            )
+            if kind == 12:
+                torch.ops._C.gguf_canonical_linear_n64_sm70_out(
+                    output, x, weight, projection.stats, partials, counters, 4, 32
+                )
+            else:
+                torch.ops._C.gguf_small_output_sm70_out(
+                    output, x, weight, partials, counters, kind, split, gdn
+                )
             return output
 
         def canonical(x, projection=projection, gdn=gdn):
@@ -106,7 +122,7 @@ def main():
             torch.manual_seed(seed)
             x = torch.randn(8, 1536, dtype=torch.float16, device="cuda")
             oracle = (x.float() @ reference.T).half()
-            for split in (1, 2):
+            for split in partitions:
                 actual = candidate(x, split).clone()
                 difference = actual.float() - oracle.float()
                 relative = float(difference.norm() / oracle.float().norm())
@@ -128,7 +144,7 @@ def main():
                     }
                 )
         timings = []
-        for split in (1, 2):
+        for split in partitions:
             for label in ("canonical", "candidate", "candidate", "canonical"):
                 call = (
                     (lambda x=x: canonical(x))
@@ -148,6 +164,8 @@ def main():
                 "n": 5120,
                 "k": 1536,
                 "source_bytes": raw.nbytes,
+                "candidate_weight_stream_bytes": stream_bytes,
+                "candidate_source": "canonical_u4" if kind == 12 else "original",
                 "canonical_input_layout_restored": projection.input_layout_restored,
                 "checks": checks,
                 "timings": timings,
