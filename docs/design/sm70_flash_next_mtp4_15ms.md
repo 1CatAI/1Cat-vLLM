@@ -457,6 +457,19 @@ all-reduce selection is unaffected. The four-decision TP4 graph benchmark
 compares changed inputs, shard ties, width changes and repeated epochs against
 NCCL. This is communication-only evidence; full-model gates remain required.
 
+TP4 graph results pass all widths (1, 4, 5, 16, 128), changed values, ties and
+repeated epochs. Four decisions at M1: NCCL 0.101535 ms versus compact IPC
+0.036680 ms; M4: 0.103511 versus 0.036879 ms. The first benchmark attempt
+did not finish communicator shutdown; destroy captured NCCL graphs before
+the process group, retain its log, and credit only the completed retry.
+This is not the model C4 acceptance gate or a complete-round speed result.
+
+Source audit identifies three all-gathers per draft step: top1 value/ID,
+`fc_embedding` output and `fc_hidden` output. The latter two carry hidden
+tensors needed by the HC block, not logits. Compact top1 replaces only the
+first. Removing the other two requires a distributed projection/norm/HC
+dataflow; silently substituting token IDs is incorrect.
+
 The published owned branch merges main `0e359c87d3` (including the newer GDN
 projection tails, strided QKV, direct GDN output and compact target top-k).
 The earlier 23.186-ms endpoint is a frozen historical control, not the current
@@ -471,6 +484,14 @@ cooperative-launch assumptions. FP32 accumulation retains the FP16 router
 logit boundary. The checkpoint graph compares projection/selection/plan over
 48 layers; production dispatch remains unchanged pending measured gains and
 shared model gates. It is not a register-prefetch experiment.
+
+The 80-CTA SIMT/last-producer prototype passes real-weight operator checks
+(all tested scales select the same top10 IDs, maximum router logit difference
+0.0078125), but regresses the complete 48-layer router graph from 0.711178 ms
+to 2.016435 ms. Reject it without model integration or parameter sweeps.
+The unprofiled control must not be equated with the older 1.62-ms profiled
+router family service sum. A further design must preserve tensor-core batch
+projection and prove that its selection/plan finish does not serialize work.
 
 Source controls for rebase bisection must retain complete-round timing and
 normal sampling, identical 8K prompt/256K capacity/power/precision/cache policy.
