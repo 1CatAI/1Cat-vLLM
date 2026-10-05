@@ -27,10 +27,10 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 }
 
 template <bool Activated>
-__global__ __launch_bounds__(128, 12) void gate_up(
-    half* output, const Q8_1* activation, const int64_t* ids,
-    const uint8_t* gate, const uint8_t* up, int n, int k, int stride,
-    int top_k) {
+__global__ void gate_up(half* output, const Q8_1* activation,
+                        const int64_t* ids, const uint8_t* gate,
+                        const uint8_t* up, int n, int k, int stride,
+                        int top_k) {
   __shared__ uint32_t book[IQ3SDot::kBookWords];
   __shared__ uint32_t masks[16];
   extern __shared__ Q8_1 shared_x[];
@@ -41,22 +41,23 @@ __global__ __launch_bounds__(128, 12) void gate_up(
         reinterpret_cast<const uint32_t*>(x)[i];
   IQ3SDot::initialize(book, masks);
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const int row = blockIdx.x * 4 + warp;
+  // Two independent rows per warp keep all lanes busy at K2560 (80 groups).
+  const int row = blockIdx.x * 8 + warp * 2 + lane / 16;
   if (row >= n) return;
   const int64_t expert_row = ids[route] * n + row;
   const uint8_t* g = gate + expert_row * stride;
   const uint8_t* u = up + expert_row * stride;
   float gs = 0.f, us = 0.f;
-  for (int group = lane; group < groups; group += 32) {
+  for (int group = lane % 16; group < groups; group += 16) {
     gs += IQ3SDot::dot(g, group, shared_x[group], book, masks);
     us += IQ3SDot::dot(u, group, shared_x[group], book, masks);
   }
 #pragma unroll
-  for (int offset = 16; offset; offset >>= 1) {
-    gs += __shfl_down_sync(0xffffffff, gs, offset);
-    us += __shfl_down_sync(0xffffffff, us, offset);
+  for (int offset = 8; offset; offset >>= 1) {
+    gs += __shfl_down_sync(__activemask(), gs, offset, 16);
+    us += __shfl_down_sync(__activemask(), us, offset, 16);
   }
-  if (!lane) {
+  if (lane % 16 == 0) {
     if constexpr (Activated) {
       // Keep the retained FP16 gate/up boundary before SiLU and multiply.
       const float g16 = __half2float(__float2half_rn(gs));
@@ -130,7 +131,7 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
               "Invalid fused gate/up output");
   const c10::cuda::CUDAGuard guard(activation.device());
   require_sm70();
-  const dim3 grid((n + 3) / 4, m * top_k);
+  const dim3 grid((n + 7) / 8, m * top_k);
   const auto stream = at::cuda::getCurrentCUDAStream();
   const size_t shared = activation.size(1) * sizeof(Q8_1);
   if (activated)
