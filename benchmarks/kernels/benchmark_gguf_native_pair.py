@@ -69,7 +69,19 @@ def main():
             if args.prototype_q4_k
             else ((18, 21), (21, 18))
             if args.prototype_iq3_xxs
-            else ((21, 23), (23, 21), (18, 21), (21, 18), (12, 23), (23, 12), (18, 23))
+            else (
+                (21, 23),
+                (23, 21),
+                (18, 21),
+                (21, 18),
+                (12, 23),
+                (23, 12),
+                (18, 23),
+                (22, 21),
+                (21, 22),
+                (22, 18),
+                (18, 22),
+            )
         )
         assert tuple(types) in allowed, types
         raw = [tensors[name].data[:4352].copy() for name in names]

@@ -121,6 +121,10 @@ def native_gated_pair_capabilities(
         (12, 23),
         (23, 12),
         (18, 23),
+        (22, 21),
+        (21, 22),
+        (22, 18),
+        (18, 22),
     ):
         return ()
     operator = "gguf_native_pair_sm70_out"
