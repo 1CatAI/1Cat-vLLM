@@ -128,8 +128,8 @@ def main():
                 own if i == rank else extension.open_peer(h)
                 for i, h in enumerate(handles)
             ]
-            down_epochs = torch.zeros(m, 83, device="cuda", dtype=torch.int32)
-            norm_flags = torch.zeros(m, device="cuda", dtype=torch.int32)
+            down_epochs = torch.zeros(m, 86, device="cuda", dtype=torch.int32)
+            norm_flags = torch.zeros(m, 4, device="cuda", dtype=torch.int32)
             gathered_banks = [
                 torch.zeros(m, 336, device="cuda", dtype=torch.float16) for _ in banks
             ]

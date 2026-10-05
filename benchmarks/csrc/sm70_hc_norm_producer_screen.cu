@@ -12,7 +12,7 @@
 struct Peers {
   uint32_t* p[4];
 };
-constexpr int PacketStride = 336 + 2560 + 4 * 2560, Blocks = 83;
+constexpr int PacketStride = 336 + 2560 + 4 * 2560, Blocks = 86;
 __device__ float warp_sum(float x) {
   for (int d = 16; d; d >>= 1) x += __shfl_xor_sync(0xffffffff, x, d);
   return x;
@@ -73,7 +73,7 @@ __global__ __launch_bounds__(256, 2) void hc_norm_producer(
                  __half_as_ushort(core[row * 2560 + h]));
       }
     }
-    if (block == 81) {
+    if (block >= 81 && block < 85) {
       if constexpr (ReduceCore) {
         for (int h = t; h < 2560; h += 256) {
           float value = 0;
@@ -88,13 +88,13 @@ __global__ __launch_bounds__(256, 2) void hc_norm_producer(
         }
         __syncthreads();
       }
-      const int branch = t / 64, lane = t % 64;
+      const int branch = block - 81;
       const float scale =
           2.f * sig(__half2float(injection[row * 4 + branch]) / 4.f);
-      float values[40], sum = 0;
+      float values[10], sum = 0;
 #pragma unroll
-      for (int i = 0; i < 40; ++i) {
-        const int h = lane + i * 64, k = branch * 2560 + h;
+      for (int i = 0; i < 10; ++i) {
+        const int h = t + i * 256, k = branch * 2560 + h;
         const half c = ReduceCore ? reduced_core[h] : core[row * 2560 + h];
         const half value = __float2half_rn(fmaf(
             __half2float(c), scale, __half2float(residual[row * 10240 + k])));
@@ -105,11 +105,16 @@ __global__ __launch_bounds__(256, 2) void hc_norm_producer(
       sum = warp_sum(sum);
       if ((t & 31) == 0) sums[t / 32] = sum;
       __syncthreads();
-      const float inv =
-          rsqrtf((sums[branch * 2] + sums[branch * 2 + 1]) / 2560.f + eps);
+      if (t == 0) {
+        float total = 0;
+        for (int warp = 0; warp < 8; ++warp) total += sums[warp];
+        sums[0] = rsqrtf(total / 2560.f + eps);
+      }
+      __syncthreads();
+      const float inv = sums[0];
 #pragma unroll
-      for (int i = 0; i < 40; ++i) {
-        const int k = branch * 2560 + lane + i * 64;
+      for (int i = 0; i < 10; ++i) {
+        const int k = branch * 2560 + t + i * 256;
         const float value = values[i] * inv;
         xn[row * 10240 + k] =
             __float2half_rn(fmaf(value, __half2float(norm[k]), value));
@@ -118,17 +123,20 @@ __global__ __launch_bounds__(256, 2) void hc_norm_producer(
       __syncthreads();
       if (t == 0) {
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device> flag(
-            norm_flags[row]);
+            norm_flags[row * 4 + branch]);
         flag.store(generation, cuda::memory_order_release);
       }
       __syncthreads();
     } else if (block < 81) {
       // Only the leader polls; subsequent payload loads bypass stale L1 data.
       if (t == 0) {
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_device> flag(
-            norm_flags[row]);
-        while (flag.load(cuda::memory_order_acquire) != generation)
-          __nanosleep(128);
+#pragma unroll
+        for (int branch = 0; branch < 4; ++branch) {
+          cuda::atomic_ref<uint32_t, cuda::thread_scope_device> flag(
+              norm_flags[row * 4 + branch]);
+          while (flag.load(cuda::memory_order_acquire) != generation)
+            __nanosleep(128);
+        }
       }
       __syncthreads();
       float dot = 0;
@@ -181,7 +189,7 @@ void down(torch::Tensor residual, torch::Tensor core, torch::Tensor injection,
   const int m = residual.size(0);
   TORCH_CHECK((m == 1 || m == 5) && residual.size(1) == 10240 &&
               pointers.size() == 4);
-  TORCH_CHECK(epochs.numel() == m * Blocks && flags.numel() == m);
+  TORCH_CHECK(epochs.numel() == m * Blocks && flags.numel() == m * 4);
   Peers peers;
   for (int r = 0; r < 4; ++r) peers.p[r] = (uint32_t*)pointers[r];
   const half* rp = (half*)residual.data_ptr();

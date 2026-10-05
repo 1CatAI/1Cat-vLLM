@@ -52,9 +52,9 @@ def graph_kernel_geometry(graph, output: Path, label: str):
     profile.export_chrome_trace(str(trace))
     events = json.loads(trace.read_text())["traceEvents"]
     kernels = [event for event in events if event.get("cat") == "kernel"]
-    if not kernels:
-        raise RuntimeError("Profiler did not record CUDA graph kernels")
     grids = retained_graph_grids(graph)
+    if not grids:
+        raise RuntimeError("Retained CUDA graph contains no kernel nodes")
     return {
         "kernels": len(grids),
         "single_cta": sum(math.prod(grid) == 1 for grid in grids),
