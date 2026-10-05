@@ -31,7 +31,7 @@ __global__ __launch_bounds__(256, 2) void shared_expert_mma_chain(
             col = quad * 8 + r;
   const uint32_t generation = epochs[block] + 1;
   __shared__ float projected[8 * 5 * 32], gate_partials[8], gate_sigmoid[5];
-  __shared__ half activation[5 * 16];
+  __shared__ __align__(16) half activation[5 * 16];
   float accum[8] = {};
 #pragma unroll 4
   for (int g = part * 40 + warp * 5; g < part * 40 + (warp + 1) * 5; ++g) {
