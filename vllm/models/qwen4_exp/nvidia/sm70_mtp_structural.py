@@ -14,6 +14,17 @@ from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
 from vllm.utils.torch_utils import direct_register_custom_op
 
+_probe_calls = {"shared": 0, "draft-qpn8": 0}
+_probe_widths: dict[str, set[int]] = {"shared": set(), "draft-qpn8": set()}
+
+
+def structural_route_proof():
+    """Actual opaque-op invocations during execution/capture, not registration."""
+    return {
+        name: {"calls": count, "widths": sorted(_probe_widths[name])}
+        for name, count in _probe_calls.items()
+    }
+
 
 def _shared_chain(
     x: torch.Tensor,
@@ -21,6 +32,8 @@ def _shared_chain(
     packed_down: torch.Tensor,
     gate: torch.Tensor,
 ) -> torch.Tensor:
+    _probe_calls["shared"] += 1
+    _probe_widths["shared"].add(int(x.shape[0]))
     out = torch.empty_like(x)
     partial = x.new_empty((8, x.shape[0], 320), dtype=torch.float32)
     gate_logits = x.new_empty(x.shape[0], dtype=torch.float32)
@@ -94,6 +107,8 @@ def _draft_expert_chain(
     ids: torch.Tensor,
     probabilities: torch.Tensor,
 ) -> torch.Tensor:
+    _probe_calls["draft-qpn8"] += 1
+    _probe_widths["draft-qpn8"].add(int(x.shape[0]))
     out = torch.empty_like(x)
     activation = x.new_empty((x.shape[0] * 10, 160))
     torch.ops._C.sm70_mtp_moe_qpn8_chain_out(

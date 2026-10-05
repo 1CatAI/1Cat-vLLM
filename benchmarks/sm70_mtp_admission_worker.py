@@ -4,6 +4,13 @@
 
 
 class MtpAdmissionExtension:
+    def get_mtp_structural_route_proof(self):
+        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
+            structural_route_proof,
+        )
+
+        return structural_route_proof()
+
     def install_mtp_phase_events(self):
         from benchmarks.sm70_mtp_phase_events import install
 

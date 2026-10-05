@@ -164,7 +164,12 @@ def main() -> None:
     }
     if args.node_trace:
         engine["profiler_config"] = {"profiler": "cuda"}
-    if args.teacher_forcing_manifest or args.node_trace or args.phase_events:
+    if (
+        args.teacher_forcing_manifest
+        or args.node_trace
+        or args.phase_events
+        or args.structural_candidate
+    ):
         engine["worker_extension_cls"] = (
             "benchmarks.sm70_mtp_admission_worker.MtpAdmissionExtension"
         )
@@ -450,6 +455,16 @@ def main() -> None:
                     }
                 )
                 save()
+        if args.structural_candidate:
+            proof = llm.collective_rpc("get_mtp_structural_route_proof")
+            report["structural_route_proof"] = proof
+            widths = {5} if args.structural_candidate == "shared" else {1, 5}
+            if len(proof) != 4 or any(
+                row[args.structural_candidate]["calls"] < 1
+                or not widths.issubset(row[args.structural_candidate]["widths"])
+                for row in proof
+            ):
+                raise RuntimeError("Structural candidate was not executed on all ranks")
         report["complete"] = True
         save()
     except BaseException:
