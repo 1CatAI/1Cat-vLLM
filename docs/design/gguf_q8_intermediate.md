@@ -66,3 +66,28 @@ Cold IQ3_S M5 gate/up rises from 45.06 to 50.18 us and the complete pipeline
 from 67.58 to 72.70 us. M20 gate/up rises from 117.76 to 140.29 us. IQ3_XXS
 M5 also regresses, 41.47 to 49.15 us. The candidate is reverted; the qualified
 16-lane schedule remains unchanged.
+
+## Whole-model validation with the installed Flash-V100 backend
+
+A complete installed SM70 wheel compares the Q8 intermediate and fused
+small-M dense switches together, using Flash-Next IQ3_S, TP4 on four V100s,
+FP16 MTP4, FP16 KV, FP32 recurrent state and FULL CUDA graphs. Torch is
+2.10/CUDA 12.8. The native Flash-V100 extension is loaded from the installed
+package, with no source-checkout overlays.
+
+C1 uses an 8192-token prompt and 256 output tokens. Unobserved round medians
+are 23.37/23.39 ms for control and 23.18/23.14 ms for the joint candidate;
+both emit 171 tokens in 35 measured intervals. C4 uses 128 input tokens
+and 600 output tokens per request: median round time is 50.85 vs 48.12 ms.
+Aggregate decode throughput is 194.52 vs 192.99 tokens/s because emitted
+tokens per round differ. The joint C1 delta must not be attributed solely
+to this expert change. The 18.5 ms phase target remains unmet.
+
+At 64 matched teacher-forcing positions, mean KL is 0.0009271, maximum KL
+0.008577, and top-1 agreement is 63/64. Eight natural prompts with 600
+output-token budgets give mean draft acceptance 45.796% vs 45.996%; the
+paired 95% interval for the change is [-1.593, 1.950] percentage points.
+Mean accepted length is 2.8319 vs 2.8398 (change interval [-0.0637, 0.0780]).
+Two bounded Chinese completion prompts stop naturally with identical token
+IDs. These results support numerical admission under the Q8 activation
+contract; they do not establish a material C1 gain.
