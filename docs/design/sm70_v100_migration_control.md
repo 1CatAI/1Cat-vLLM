@@ -49065,3 +49065,22 @@ sampler requests top-64, while the candidate reranker supports top-16/20/21.
 Prepared 64-row buffers do not demonstrate target head selection. Runtime
 buffer-view swaps also cannot replace already captured kernels. Do not use
 that screen as a qualified head speedup or repeat it without route evidence.
+
+### Normal M64 model gate: rejected pending attribution
+
+The source-built M64 route completes 8K C8 after gate/up and down share one
+fixed per-stream FP32 scratch allocation. Two GPU basis/graph tests pass,
+and normal/standalone real-weight MLP outputs are bitwise equal with equal
+250.880 microsecond cold graph medians. Compiler differences do not explain
+the model discrepancy.
+
+The matched complete verify round regresses from 46.910 to 53.441 ms.
+C1 remains 14.842 versus 14.856 ms. Eight fixed-seed prompts with 600 outputs
+have overlapping acceptance intervals: 3.228 [3.156, 3.290] versus 3.243
+[3.120, 3.359] tokens per returned decode chunk. Worker graph-only records
+omit initial mixed-prefill progression and are not used as the full-prompt
+acceptance estimator. The initial profile began during prefill and is invalid
+for decode accounting. A corrected pure-decode capture confirms 64 gate/up
+and 64 down calls per round, plus 140 two-stage collectives. Their matched
+baseline attribution remains pending. Do not promote this route based on the
+local MLP gain; full-model speed and teacher-forcing gates are not passed.
