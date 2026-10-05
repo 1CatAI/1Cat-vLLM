@@ -36,7 +36,9 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
                                torch::Tensor gate, torch::Tensor up,
                                int64_t gate_type, int64_t up_type) {
   TORCH_CHECK(
-      (gate_type == 21 && (up_type == 23 || up_type == 18)) ||
+      (gate_type == 18 && up_type == 18) ||
+          (gate_type == 23 && up_type == 23) ||
+          (gate_type == 21 && (up_type == 23 || up_type == 18)) ||
           ((gate_type == 23 || gate_type == 18) && up_type == 21) ||
           (gate_type == 22 && (up_type == 18 || up_type == 21)) ||
           ((gate_type == 18 || gate_type == 21) && up_type == 22) ||
@@ -100,7 +102,11 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "GGUF native pair requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (gate_type == 29)
+  if (gate_type == 18 && up_type == 18)
+    launch_pair<R18, R18>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 23 && up_type == 23)
+    launch_pair<R23, R23>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 29)
     launch_pair<R29, R22>(output, input, gate, up, n, k, stream);
   else if (gate_type == 10)
     launch_pair<R10, R21>(output, input, gate, up, n, k, stream);

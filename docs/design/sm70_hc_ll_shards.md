@@ -68,3 +68,30 @@ The joint dense/HC whole-model comparison in
 [the segment design](gguf_dense_segments.md) reports the earlier extension
 explicitly. Guarded HC performance is checked against the packaged replicated
 operator in the same four-process ABBA benchmark before promotion.
+
+## Packaged same-process ABBA and model gate
+
+The guarded extension is measured against its packaged replicated operator
+on all four GPUs, with two real pairs and 16 operations per graph. M5 is
+23.72–24.02us versus 17.40–17.44us; M8 is 24.22–24.61us versus
+18.88–18.89us. M20 is 29.76–30.19us versus 30.82–30.83us: this shape is a
+0.6–1.1us operator regression, not an operator speedup. An existing four-warp
+up variant gives 30.55–30.60us at M20 and remains slower than the control;
+the five-warp default is retained. The admitted path keeps a single sharded
+batch pack, saves replicated weight storage, and avoids rebuilding it during
+M20 graph execution. This is a memory/performance tradeoff at M20.
+
+The joint dense/HC installed-wheel comparison reports C1 pooled mean
+23.301→22.107ms and C4 mean 55.110→51.008ms. C4 median is
+54.581→50.830ms. It uses the extension before the inactive-row guard, which
+has separately passed the numerical and ABBA checks above. These are combined
+route results, not an HC-only end-to-end delta. Teacher forcing has 63/64 top-1
+agreement and mean KL 0.001010. Eight natural prompts show acceptance
+44.320→44.802%, paired difference confidence interval [-0.724,+1.634]
+percentage points. Two bounded natural prompts terminate identically.
+
+A new guarded-extension trace confirms 96 down and 96 up kernels per target
+verification, 1,263 target kernels total, and direct-peer exchanges on the
+partially connected topology. GPU target entry skew remains p50 0.586ms and
+p90 0.663ms; the host synchronization target is still open. Trace timings
+are diagnostic and are not substituted for the unprofiled model result.
