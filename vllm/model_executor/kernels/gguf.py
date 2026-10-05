@@ -115,6 +115,7 @@ def native_gated_pair_capabilities(
     """Joint original-byte readers; only measured M8 shapes are admitted."""
     if source_types not in (
         (18, 18),
+        (23, 23),
         (21, 23),
         (23, 21),
         (18, 21),
@@ -146,6 +147,8 @@ def native_gated_pair_capabilities(
         reason = "requires_fp16_activations"
     elif (k, n) != (5120, 4352):
         reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif source_types == (23, 23):
+        reason = "measured_route_not_faster"
     elif not hasattr(torch.ops._C, operator):
         reason = f"operator_missing:{operator}"
     return tuple(
