@@ -49110,3 +49110,37 @@ is used. MTP layer collection retries at 32K capacity and 88% memory after
 64K attempts failed prefill memory and startup KV admission. QSA preparation,
 sigmoid-gated GDN convolution/core/norm and consumer-side HC gather layer
 screens remain pending; the global latency and kernel-count targets are open.
+
+Flash-Next current decisions supersede the pending statuses above. Restoring
+the shared chain's FP16 SiLU boundary does not recover its model gate: 192
+rows still yield mean/p99/max KL 0.002857/0.030546/0.068376 and top-1 97.396%.
+Default preparation is removed. Do not repeat numerical tuning for its small
+complete-layer gain; explicit research reproduction retains the operator.
+
+Ordinary QSA preparation, with original shared experts in both arms, passes
+M1 complete-layer timing (0.285542→0.250563 ms, 37→27 kernels, 9→6 single-CTA)
+and actual MTP4 M5 (0.448010→0.418263 ms, 41→32 kernels, 1→1 single-CTA).
+All layer outputs and selection IDs match on every rank. Independent normal
+package qualification has exact full-vocabulary logits across all 192 rows:
+KL mean/p99/max 0, top-1 100%; both natural requests stop (88/75 tokens).
+M1 reads two original projection weight pointers; M5 retains both original
+batch projections. Do not credit the 30-node concatenated-weight research
+M5 graph to the production route's 32 nodes.
+
+HC consumer-side peer gather and TP-sharded up also fail complete layers at
+both widths: M1 GDN/QSA 0.147343→0.195369 / 0.303332→0.339579 ms;
+M5 0.276275→0.447232 / 0.453240→0.612452 ms. Stop this schedule. The older
+coalesced M1 arm already used a TP-sharded native up projection; replicated
+M1 up computation is not the cause of its regression.
+
+The actual sigmoid GDN convolution/recurrence/norm research transaction
+improves both full layers (M1 0.148716→0.144978 ms, 21→18 kernels;
+M5 0.275958→0.271739 ms, 28→25). Convolution states match and FP32 recurrent
+state differences are at most 5.96e-8. Its normal extension builds; ordinary
+startup first exposed unsupported AOT mutation of mixed-dtype views of the
+hybrid cache, followed by long FakeTensor/AOT processing before CUDA execution.
+The revised opaque interface holds caches/workspaces internally and mutates
+an explicit output, as existing attention does. CPU fake checks and 36-call
+M1/M5 AOT functionalization pass. Normal GDN layer and combined model gates
+remain pending, followed by matched endpoint timing and normal graph-node
+tracing. No new endpoint speed or global kernel-count target is claimed.
