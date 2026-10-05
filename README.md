@@ -1337,7 +1337,7 @@ Current directions include:
 
 Join the **1Cat-LLM Open-Source Community** by adding WeChat ID **`YM_isi`** to request the latest group invitation.
 
-> The previously displayed Group 8 QR code expired on **September 20, 2026**. Use the contact above for a current invitation.
+![1Cat-vLLM WeChat Group 8 QR code](docs/assets/wechat-group-qr-8-20261005.png)
 
 ---
 
