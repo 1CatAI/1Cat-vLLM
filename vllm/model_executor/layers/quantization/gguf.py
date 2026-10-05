@@ -737,6 +737,13 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.native_admission["qkvz_projection"] = prepare_native_qkvz(
                     layer, sources, projections, self.native_enabled
                 )
+                from vllm.model_executor.layers.quantization.gguf_qkv import (
+                    prepare_native_qkv,
+                )
+
+                self.native_admission["qkv_projection"] = prepare_native_qkv(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
@@ -908,6 +915,12 @@ class GGUFLinearMethod(LinearMethodBase):
                 )
 
                 out = apply_native_qkvz(layer, x)
+            elif hasattr(layer, "gguf_qkv_weights"):
+                from vllm.model_executor.layers.quantization.gguf_qkv import (
+                    apply_native_qkv,
+                )
+
+                out = apply_native_qkv(layer, x)
             elif hasattr(layer, "gguf_small_output_records"):
                 from vllm.model_executor.layers.quantization.gguf_small_output import (
                     apply_small_output,

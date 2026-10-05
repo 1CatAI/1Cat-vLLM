@@ -534,6 +534,57 @@ def native_linear_capability(
     )
 
 
+def native_qkv_capabilities(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype | None,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Measured Q/K/V combinations in their logical projection order."""
+    calibrated = {
+        (16, 21, 21),
+        (10, 23, 21),
+        (10, 22, 18),
+        (10, 12, 21),
+        (10, 18, 21),
+        (21, 12, 12),
+        (23, 23, 12),
+        (10, 23, 12),
+        (21, 23, 12),
+        (21, 23, 23),
+        (23, 12, 12),
+        (18, 23, 12),
+        (18, 12, 12),
+        (12, 23, 21),
+    }
+    reason = None
+    operator = "gguf_qkv_sm70_out"
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (k, n) != (5120, 3584) or source_types not in calibrated:
+        reason = "qkv_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(t),
+            quant_type_name(t),
+            operator,
+            True,
+            min_m=8,
+            max_m=8,
+            reason=reason,
+        )
+        for t in source_types
+    )
+
+
 def native_qkvz_capabilities(
     source_types: tuple[int, ...],
     k: int,
