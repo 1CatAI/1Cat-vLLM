@@ -3,11 +3,13 @@
 
 import gguf
 import numpy as np
+import pytest
 
 
-def test_shared_iq2_s_operand_formation_matches_original_iq2_xs_formula():
-    gguf.quants.IQ2_XS.init_grid()
-    grid = np.unique(gguf.quants.IQ2_XS.grid)
+@pytest.mark.parametrize("quant", [gguf.quants.IQ2_XS, gguf.quants.IQ2_XXS])
+def test_shared_iq2_s_operand_formation_matches_original_formula(quant):
+    quant.init_grid()
+    grid = np.unique(quant.grid)
     assert grid.tolist() == [8, 25, 43]
     signs = np.frombuffer(gguf.quants.IQ2_XXS.ksigns, dtype=np.uint8)
     assert all(int(signs[i]) == (i | ((i.bit_count() & 1) << 7)) for i in range(128))
