@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Validate installed IQ3_S/IQ4_XS gated pairs on actual TP4 weight slices."""
+"""Validate installed mixed gated pairs on actual TP4 weight slices."""
 
 import argparse
 import json

@@ -26,4 +26,9 @@ and all sixteen octets per K128 record. Reconstructed index bytes, sign/scale
 words and cached original d match the source. An initial oracle failure was
 caused by using big-endian integer parsing in the test; specifying the
 original little-endian byte order fixes the oracle without changing the
-reader. GPU numerical, graph, resource and speed evidence remains pending.
+reader. The normal CUDA 12.8 SM70 extension and complete wheel build pass. Both
+IQ3_XXS orientations use 63 registers, 34,816 shared bytes, zero stack and
+zero local memory. Existing IQ3_S/IQ4_XS instantiations retain 64 registers
+and 33,792 shared bytes. The installed wheel imports both normal extensions
+and passes native-member hashes and dependency checks without private DSOs.
+GPU numerical, graph and speed evidence remains pending.
