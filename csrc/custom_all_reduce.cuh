@@ -136,7 +136,8 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
-constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
+// Full-K down finish owns 44 column-pair counters per eight-token tile.
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 512;
 constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
@@ -1682,24 +1683,31 @@ __global__ void __launch_bounds__(512, 1)
 template <int ngpus>
 __global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
                                          Signal* self_sg, int64_t* output,
-                                         int rank) {
+                                         int rank, int rows) {
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
-  if (threadIdx.x == 0) {
+  const int row = threadIdx.x;
+  if (row < rows) {
     float best_value = -std::numeric_limits<float>::infinity();
     int64_t best_index = std::numeric_limits<int64_t>::max();
 
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
       const float* pair = reinterpret_cast<const float*>(_dp->ptrs[i]);
-      const float value = pair[0];
-      const int64_t index = static_cast<int64_t>(llrintf(pair[1]));
-      if (value > best_value || (value == best_value && index < best_index)) {
+      const float value = pair[2 * row];
+      const int64_t index = static_cast<int64_t>(llrintf(pair[2 * row + 1]));
+      // Match full-vocabulary argmax: NaNs precede finite values, and the
+      // first original vocabulary ID wins among NaNs or equal logits.
+      const bool value_nan = isnan(value), best_nan = isnan(best_value);
+      if ((value_nan && (!best_nan || index < best_index)) ||
+          (!value_nan && !best_nan &&
+           (value > best_value ||
+            (value == best_value && index < best_index)))) {
         best_value = value;
         best_index = index;
       }
     }
-    output[0] = best_index;
+    output[row] = best_index;
   }
 
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
@@ -2809,7 +2817,8 @@ class CustomAllreduce {
 #undef TILE_RUNTIME_WAIT_REDUCE_CASE
   }
 
-  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output) {
+  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output,
+                   int rows) {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CUDACHECK(cudaStreamIsCapturing(stream, &status));
@@ -2826,11 +2835,11 @@ class CustomAllreduce {
       ptrs = it->second;
     }
 
-#define TOP1_CASE(ngpus)                                            \
-  case ngpus: {                                                     \
-    cross_device_top1_argmax<ngpus>                                 \
-        <<<1, 32, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_); \
-    break;                                                          \
+#define TOP1_CASE(ngpus)                                                   \
+  case ngpus: {                                                            \
+    cross_device_top1_argmax<ngpus>                                        \
+        <<<1, 128, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, rows); \
+    break;                                                                 \
   }
 
     switch (world_size_) {

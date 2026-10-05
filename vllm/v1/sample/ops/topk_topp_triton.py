@@ -1191,17 +1191,26 @@ def _apply_top_k_top_p_compact(
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         rows = reference_rows.nonzero(as_tuple=True)[0]
-        # Dense sorting creates an int64 index for every vocabulary entry.
-        # Bound the temporary working set when many verifier rows need the
-        # reference, while preserving each row's full-vocabulary operation.
-        max_reference_rows = 16 if rows.numel() > 32 else 32
-        for chunk in rows.split(max_reference_rows):
+        # Sorting the full vocabulary for every ambiguous row at once needs
+        # batch-sized value/index/softmax buffers. Bound this rare fallback's
+        # workspace to two rows, without changing ties or nucleus boundaries.
+        # PyTorch uses a different cumulative scan for a singleton batch;
+        # preserve the multi-row reduction even in an odd final chunk.
+        # This eager path already synchronizes; captured callers use the
+        # separate graph-compatible reference path below.
+        for start in range(0, rows.numel(), 2):
+            chunk = rows[start : start + 2]
+            valid = chunk.numel()
+            if valid == 1 and rows.numel() > 1:
+                chunk = torch.cat((chunk, rows[:1]))
             reference = apply_top_k_top_p_pytorch(
                 logits.index_select(0, chunk),
                 k.index_select(0, chunk),
                 p.index_select(0, chunk),
+                rowwise_sort=True,
             )
-            result.index_copy_(0, chunk, reference)
+            result.index_copy_(0, chunk[:valid], reference[:valid])
+            del reference
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result

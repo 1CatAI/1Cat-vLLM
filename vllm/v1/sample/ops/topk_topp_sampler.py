@@ -352,6 +352,8 @@ def apply_top_k_top_p_pytorch(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     allow_cpu_sync: bool = False,
+    *,
+    rowwise_sort: bool = False,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
@@ -368,7 +370,20 @@ def apply_top_k_top_p_pytorch(
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
 
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    if rowwise_sort and logits.shape[0] > 1:
+        # Bound radix-sort scratch while retaining the original batch shape
+        # for the softmax and cumulative sum below.
+        logits_sort = torch.empty_like(logits)
+        logits_idx = torch.empty_like(logits, dtype=torch.int64)
+        for row in range(logits.shape[0]):
+            torch.sort(
+                logits[row : row + 1],
+                dim=-1,
+                descending=False,
+                out=(logits_sort[row : row + 1], logits_idx[row : row + 1]),
+            )
+    else:
+        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
         # Apply top-k.

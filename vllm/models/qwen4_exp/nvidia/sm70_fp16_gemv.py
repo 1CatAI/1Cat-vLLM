@@ -286,7 +286,6 @@ def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
         and x.dtype == torch.float16
         and x.is_contiguous()
         and x.data_ptr() % 16 == 0
-        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
     )
 
@@ -296,9 +295,17 @@ def _qwen38_sm70_shared_up(
 ) -> torch.Tensor:
     if _shared_batch_runtime_ok(x) and packed is not None:
         out = x.new_empty((x.shape[0], 160))
-        partial = x.new_empty((8, x.shape[0], 320))
-        torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
-        logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
+        reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        if reduced:
+            partial = x.new_empty((8, x.shape[0], 320))
+            torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
+        else:
+            partial = x.new_empty((8, x.shape[0], 320), dtype=torch.float32)
+            torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
+        logger.info_once(
+            "SM70 MTP4 shared-expert batch projection enabled (partials=%s).",
+            partial.dtype,
+        )
         return out
     gate_up = torch.nn.functional.linear(x, weight)
     out = gate_up.new_empty((*gate_up.shape[:-1], 160))
@@ -607,12 +614,16 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
     # configure it before preparing weights, not during graph replay.
     matmul = torch.backends.cuda.matmul
     reason = None
-    # Router partials and their ordered sum stay FP32. Its preparation must
-    # match _router_batch_runtime_ok rather than the cuBLAS reduction switch.
-    if role != "router" and not matmul.allow_fp16_reduced_precision_reduction:
-        reason = "fp16_reduced_precision_reduction_disabled"
-    elif matmul.allow_fp16_accumulation:
+    # Router always uses FP32 partials; shared up selects their dtype from
+    # the worker policy. Older binaries retain the vendor FP32 fallback.
+    if matmul.allow_fp16_accumulation:
         reason = "fp16_accumulation_enabled"
+    elif (
+        role == "shared"
+        and not matmul.allow_fp16_reduced_precision_reduction
+        and not hasattr(torch.ops._C, "qwen38_shared_up_batch_fp32_sm70_out")
+    ):
+        reason = "fp32_shared_operator_missing"
     # The loaded-worker report already collects _sm70_*_reason attributes.
     setattr(layer, f"_sm70_mtp_{role}_batch_reason", reason)
     if reason is not None:

@@ -90,7 +90,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_top1_custom_ar = envs.VLLM_SM70_TOP1_CUSTOM_AR
+            use_top1_custom_ar = (
+                envs.VLLM_SM70_TOP1_CUSTOM_AR
+                and current_platform.is_device_capability(70)
+            )
             use_sm70_awq_mlp_down_tile_ar = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR
             use_sm70_awq_mlp_down_tile_overlap = (
                 envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
