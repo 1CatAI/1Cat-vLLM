@@ -242,7 +242,10 @@ def main() -> None:
             )
             sampling = fixture.get("sampling", sampling)
             # Warm this exact prompt/shape before measuring its requests.
-            for repeat in range(-1, args.repeats):
+            fixture_repeats = int(fixture.get("repeats", args.repeats))
+            if fixture_repeats < 1:
+                raise ValueError("Fixture repetitions must be positive")
+            for repeat in range(-1, fixture_repeats):
                 # Keep prefill/chunk boundaries identical to the speed control.
                 # Reusing a cached GDN state can change the greedy token tape.
                 llm.reset_prefix_cache()
