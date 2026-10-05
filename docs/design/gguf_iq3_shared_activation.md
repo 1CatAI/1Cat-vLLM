@@ -67,3 +67,35 @@ control. Applying it only to the eight measured same-type layers gives
 layers retain their existing implementation until each shape and format
 combination is measured. This result is an operator experiment; it does not
 establish model-level latency or dispatch behavior.
+
+## N64 with two K partitions
+
+The follow-up gives each CTA two N32 output tiles and half of K. Four K
+warps share one activation tile across both projections and both N32 tiles.
+The signed book stays live across persistent tasks; a separate partials/
+completion-flag union retains the existing last-CTA reduction protocol.
+There is no additional reduction launch. `__launch_bounds__(512, 2)` produces
+62 registers, zero spills and 41,472 bytes of shared memory. The K128 loop
+has 647 static instructions, or 80.875 per K16. The complete persistent-task
+backedge includes 866 instructions with the reduction and completion path.
+
+The same session and controls produce:
+
+| Path | Two medians, us | Source GB/s |
+| --- | ---: | ---: |
+| N32 shared activation | 50.176 / 50.176 | 381.63 |
+| N64, grid 80 | 58.368 / 58.368 | 328.07 |
+| N64, grid 160 | 53.248 / 53.248 | 359.62 |
+| NVFP4 native pair, split 8 and 16 | 51.200 / 51.200 | 489.60 |
+
+The completion counters return to zero after each invocation, including all
+84 graph replays. Every output is finite. The changed FP32 reduction tree
+has relative L2 difference 0.0000071532 and maximum absolute difference
+0.00048828125 against the retained pair. Relative L2 error against the
+FP32 GEMM reference is 0.00049519; maximum absolute error remains
+0.00390625. Weight operands and accumulation precision are unchanged.
+
+Both N64 configurations are slower than the N32 candidate. The N64 source
+is retained only as an experiment; the N32 candidate remains the choice for
+the measured shape. No additional GPU investigation is required to reject
+this N64 configuration.
