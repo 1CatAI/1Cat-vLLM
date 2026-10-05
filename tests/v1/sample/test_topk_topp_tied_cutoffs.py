@@ -42,14 +42,18 @@ def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p, rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_compact_fallback_bounds_full_vocabulary_sort_workspace(monkeypatch):
+@pytest.mark.parametrize("rows", [1, 19, 20])
+@pytest.mark.parametrize("top_k,top_p", [(20, 0.95), (50, 0.9)])
+def test_compact_fallback_bounds_full_vocabulary_sort_workspace(
+    monkeypatch, rows, top_k, top_p
+):
     from vllm.v1.sample.ops import topk_topp_sampler
 
     # MTP4 at C4 has 20 target rows. Uniform logits force the ambiguous tie
     # fallback, which previously sorted the entire expanded batch together.
-    logits = torch.ones((20, 248320), device="cuda")
-    k = torch.full((20,), 20, dtype=torch.int32, device="cuda")
-    p = torch.full((20,), 0.95, device="cuda")
+    logits = torch.ones((rows, 248320), device="cuda")
+    k = torch.full((rows,), top_k, dtype=torch.int32, device="cuda")
+    p = torch.full((rows,), top_p, device="cuda")
     expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
     reference_rows = []
 
@@ -61,9 +65,13 @@ def test_compact_fallback_bounds_full_vocabulary_sort_workspace(monkeypatch):
         topk_topp_sampler, "apply_top_k_top_p_pytorch", bounded_reference
     )
     actual = apply_top_k_top_p_triton(logits, k, p)
-    assert reference_rows == [1] * 20
+    assert reference_rows == ([1] if rows == 1 else [2] * ((rows + 1) // 2))
     assert torch.equal(actual, expected)
-    assert torch.equal(logits, torch.ones_like(logits))
+    if rows > 1:
+        assert torch.equal(logits, torch.ones_like(logits))
+    else:
+        # The established singleton reference route permits in-place masking.
+        assert actual.data_ptr() == logits.data_ptr()
 
 
 @pytest.mark.parametrize("mask_value", [-float("inf"), -123.0])

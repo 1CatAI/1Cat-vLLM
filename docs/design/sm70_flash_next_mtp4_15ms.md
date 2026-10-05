@@ -825,9 +825,26 @@ With early head preparation, C4 completes all target and draft graph capture.
 Sampler warmup then runs out of memory while allocating a 20-MiB full-batch
 sort value buffer. The compact top-k/top-p boundary fallback sorts every
 ambiguous target row together, materializing batch-sized index and probability
-workspaces. Apply the same reference filter one row at a time instead, keeping
+workspaces. Apply the same reference filter in bounded two-row chunks instead, keeping
 source logits, per-row parameters, vocabulary ties and nucleus boundaries.
 Twenty MTP4/C4 uniform rows at vocabulary 248,320 force this fallback; the
-bounded implementation matches the full reference exactly and leaves its
-input intact. Twenty-eight focused GPU cutoff, mixed-parameter and graph tests
-pass. This fixes a workspace peak, not an admitted complete-round speed gain.
+final bounded implementation matches the full reference exactly and leaves
+its input intact. PyTorch chooses a different singleton softmax reduction: at
+uniform logits, k=50/p=0.9, processing a formerly multi-row fallback as one row
+changes the cutoff by one token. Preserve its multi-row reduction with two-row
+chunks, padding an odd final chunk with an existing row and copying only the
+valid output. A genuinely singleton fallback retains its original reduction.
+The 20-row workload reduces incremental peak allocation from 229.403 MiB to
+60.860 MiB. Thirty-three focused GPU cases pass, including singleton/odd/even
+rows and both evaluation and sampler-warmup cutoffs. This fixes a workspace peak, not an admitted complete-round speed gain.
+
+The new default FC/parallel-head path measures 21.237521/21.225780/21.132825 ms
+(963 rounds, arithmetic mean 21.198709 ms). Frozen prompt acceptance stays
+50.2035% (3,207/6,388); target and draft full-vocabulary forcing both have KL
+zero and top1 agreement 100% on the sixteen cases. All sixteen natural outputs
+are identical to the previously reviewed default. C4 remains pending.
+
+The independent model-output 32K shortlist still fails: frozen-cohort
+acceptance is 41.2438%, compared with 50.2035% for the full head. A positive
+head operator result cannot admit this nine-percentage-point acceptance loss.
+Keep it benchmark-only and evaluate a larger model-output subset separately.

@@ -1136,16 +1136,23 @@ def _apply_top_k_top_p_compact(
         rows = reference_rows.nonzero(as_tuple=True)[0]
         # Sorting the full vocabulary for every ambiguous row at once needs
         # batch-sized value/index/softmax buffers. Bound this rare fallback's
-        # workspace to one row, without changing ties or nucleus boundaries.
+        # workspace to two rows, without changing ties or nucleus boundaries.
+        # PyTorch uses a different softmax reduction for a singleton batch;
+        # preserve the multi-row reduction even in an odd final chunk.
         # This eager path already synchronizes; captured callers use the
         # separate graph-compatible reference path below.
-        for row in rows.tolist():
+        for start in range(0, rows.numel(), 2):
+            chunk = rows[start : start + 2]
+            valid = chunk.numel()
+            if valid == 1 and rows.numel() > 1:
+                chunk = torch.cat((chunk, rows[:1]))
             reference = apply_top_k_top_p_pytorch(
-                logits[row : row + 1].clone(),
-                k[row : row + 1],
-                p[row : row + 1],
+                logits.index_select(0, chunk),
+                k.index_select(0, chunk),
+                p.index_select(0, chunk),
             )
-            result[row : row + 1].copy_(reference)
+            result.index_copy_(0, chunk[:valid], reference[:valid])
+            del reference
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result
