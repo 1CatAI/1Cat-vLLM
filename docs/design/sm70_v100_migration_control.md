@@ -49178,3 +49178,13 @@ event per arm; retain driver geometry and mark the profiler incomplete.
 Reject this remaining all-reduce schedule. The final normal QSA-only campaign
 has acquired its complete GPU lease and begins fresh reference/candidate
 teacher-forcing capture before endpoint and whole-model trace qualification.
+
+Fresh current-source QSA-only qualification now passes all 192 full-vocabulary
+teacher-forcing rows exactly: KL mean/p99/max 0, top-1 100%, maximum logit
+difference 0. Matched ordinary unprofiled source `615710ae51` / `34f1f241d9`
+medians are 11.797933 / 11.572608 ms/token (0.225325 ms, 1.91%, saved), with
+identical native artifacts, matching six 513-token ID pairs and matching
+natural stop outputs (88/75 tokens). This does not meet 7.5 ms. Actual MTP4
+natural completion and whole-token forward-plus-sampling node tracing remain
+pending. Main advanced with HC/all-reduce/MTP changes during this campaign;
+do not relabel the fixed-revision pair as newer-main qualification.

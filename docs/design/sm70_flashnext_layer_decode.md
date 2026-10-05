@@ -10,17 +10,20 @@ whole-layer graphs improve 0.285839→0.250696 ms (37→27 kernels, nine→six
 single-CTA kernels). Actual MTP4 M5 improves 0.448645→0.419471 ms
 (41→32 kernels, one single-CTA kernel in both arms). All layer outputs and
 selection IDs match on four ranks; retained driver nodes and profiler counts
-agree. The dynamic M5 compilation fix preserves these layer gains. Earlier
-independent QSA qualification matches all 192 full-vocabulary teacher-forcing
-rows exactly and both natural requests stop. Fresh current-source distribution,
-natural completion, endpoint and whole-model trace remain pending.
+agree. The dynamic M5 compilation fix preserves these layer gains. Fresh
+current-source qualification matches all 192 full-vocabulary teacher-forcing
+rows exactly (KL mean/p99/max zero, top-1 100%, maximum logit error zero).
+Matched ordinary unprofiled endpoint medians are 11.797933→11.572608
+ms/token: 0.225325 ms, or 1.91%, saved. Six pairs of 513 output token IDs
+match; both natural requests stop (88/75 tokens) with matching IDs. Actual
+MTP4 natural completion and the whole-model token trace remain pending.
 
 Shared-expert default preparation has been removed after its model gate
 failed twice. The GDN convolution/core/norm prototype improves both research
 layers by 3.7–4.2 microseconds each, but ordinary full decode graph initialization
 cannot be qualified. Its default preparation has been removed. Explicit
-research preparation retains its native operator and helper. Matched final endpoint
-and whole-model node tracing remain pending.
+research preparation retains its native operator and helper. The matched endpoint improvement is recorded above; whole-model node
+tracing remains pending.
 
 ## Establishing a comparable endpoint
 
@@ -480,3 +483,35 @@ GDN active convolution/recurrent states match; layer output error is at most
 ranks. QSA profiler and driver counts agree; GDN profiler reports one extra
 event in each arm, so use the retained driver counts and mark its event
 trace incomplete. No further tuning or production promotion is justified.
+
+## Current-source ordinary endpoint, 2026-10-06
+
+The candidate runtime source is `34f1f241d9`, with original GDN/shared
+preparation and default QSA. The integration/control source is
+`615710ae5106beeeab87950599fff28977e92962`. Both arms use the same twelve
+native artifacts; the normal `_C` SHA-256 is
+`7e9b5b4e9a1f66d683658db6895261450682bda9b67ae8357776eb16d8d7bafb`.
+Ordinary SM70 `_C`, `_C_stable_libtorch` and `_moe_C` targets build from
+source, with standard Torch/CUDA dynamic dependencies. No research-sidecar
+operator is enabled in the normal model.
+
+The matched contract is TP4, FP16 dense/KV, FP32 recurrent state, disk mmap
+PLE, 262144 startup capacity, 94% memory, budget 8192, one sequence, CUDA
+graphs, no prefix cache and no MTP. Both arms admit 324595 KV tokens.
+After 32-token warmup, six 8192-input/513-output forced greedy requests
+measure first-to-last-token pure decode separately from TTFT/prefill.
+Reference samples are 11.865827, 11.681961, 11.808513, 11.761887,
+11.810058 and 11.787353 ms/token. Candidate samples are 11.592604,
+11.534522, 11.497538, 11.591776, 11.586345 and 11.558872. All six
+token-ID pairs match. Two official natural requests stop at 88/75 tokens
+and match IDs. The 11.572608-ms result does not meet the 7.5-ms target.
+
+Fresh teacher-forcing uses the same frozen 192-row, full-vocabulary
+manifest. All logits match exactly: KL mean/p99/max zero, top-1 100%,
+maximum raw-logit difference zero. Chinese, English, code and arithmetic
+groups all pass. Maximum raw-logit difference remains diagnostic.
+
+Main advanced during this campaign with HC/all-reduce/MTP source changes.
+This fixed-revision pair is not qualification of that newer integration
+head. Actual MTP4 natural completion and complete-token driver/Nsight
+node evidence remain pending.
