@@ -124,6 +124,13 @@ class GraphParityWorkerExtension:
         state.supports_early_input_preparation = early
         return {"rank": self.rank, "early": early, "declared": declared}
 
+    def set_ple_input_preparation(self, fused):
+        state = self.model_runner.model_state
+        if not hasattr(state, "_ple_kernel_config"):
+            raise RuntimeError("Model state does not expose PLE input preparation")
+        state._ple_kernel_config.ple_input_prepare = bool(fused)
+        return {"rank": self.rank, "ple_input_prepare": bool(fused)}
+
     def start_graph_parity_observer(self, nvtx=False):
         if not hasattr(self, "_graph_parity_recorder"):
             from vllm.v1.executor.multiproc_executor import WorkerProc
