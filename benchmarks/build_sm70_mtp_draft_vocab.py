@@ -91,7 +91,9 @@ def main():
     ranked = counts
     if args.target_outputs:
         outputs = json.loads(args.target_outputs.read_text())
-        if not outputs.get("complete") or not outputs.get("default_configuration"):
+        if not (
+            outputs.get("training_complete") or outputs.get("complete")
+        ) or not outputs.get("default_configuration"):
             raise ValueError("Require complete default-path model training outputs")
         training = outputs["training"]
         if any(

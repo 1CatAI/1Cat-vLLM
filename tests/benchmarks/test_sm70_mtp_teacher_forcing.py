@@ -13,6 +13,9 @@ from benchmarks.sm70_mtp_teacher_forcing import flush, install
 class GPUModelRunner:
     def __init__(self):
         self.device = torch.device("cpu")
+        self.vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[1, 5, 10])
+        )
         self.model = SimpleNamespace(compute_logits=lambda hidden: hidden)
         self.speculator = SimpleNamespace(
             method="mtp",
@@ -124,4 +127,24 @@ def test_forcing_keeps_dynamic_vocab_tail_updates(tmp_path, monkeypatch):
     )
     runner.sample(torch.zeros(1, 4), batch, None)
     assert len(seen) == 1 and seen[0][1]
+    flush(worker, discard=True)
+
+
+def test_eager_forcing_keeps_large_prefill_outside_decode_range(tmp_path, monkeypatch):
+    from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    runner = GPUModelRunner()
+    seen = []
+    runner.speculator.input_buffers.positions = torch.arange(1632)
+    runner.speculator.input_buffers.input_ids = torch.zeros(1632, dtype=torch.long)
+    runner.speculator.run_model = lambda *args, **kwargs: seen.append(
+        is_sm70_decode_graph_compiling()
+    )
+    worker = SimpleNamespace(model_runner=runner)
+    install(worker, list(range(2000)), 8, "prefill", str(tmp_path))
+    runner.speculator.run_model(1632)
+    runner.speculator.run_model(1)
+    assert seen == [False, True]
+    assert not is_sm70_decode_graph_compiling()
     flush(worker, discard=True)

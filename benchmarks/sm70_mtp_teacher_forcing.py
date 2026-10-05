@@ -96,13 +96,18 @@ def install(worker, token_ids, prompt_length, prompt_sha256, folder):
         kwargs["is_profile"] = True
         return propose(*args, **kwargs)
 
+    decode_token_limit = max(
+        runner.vllm_config.compilation_config.cudagraph_capture_sizes or [1]
+    )
+
     def draft_forward(num_tokens, *args, **kwargs):
         positions = draft.input_buffers.positions[:num_tokens].long()
         # MTP input token is shifted one position relative to target hidden.
         draft.input_buffers.input_ids[:num_tokens].copy_(tape[positions + 1])
         # Eager diagnostics must retain serving decode semantics; otherwise
         # a guarded precision candidate could silently take its FP16 fallback.
-        with sm70_decode_graph_compilation():
+        # Large prefill must retain its independent compiler and range.
+        with sm70_decode_graph_compilation(num_tokens <= decode_token_limit):
             return run_model(num_tokens, *args, **kwargs)
 
     def sample_draft_fixed(self, hidden, idx_mapping, positions, step, draft_logits):

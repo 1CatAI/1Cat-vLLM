@@ -738,3 +738,14 @@ Eager teacher-forcing probes explicitly retain the serving decode semantic
 context. For draft expert candidates, every forcing case on every TP rank
 must additionally prove an opaque-op invocation. Graph capture route proof
 alone cannot qualify an eager distribution measurement.
+
+The first run with the new input boundary completes three unprofiled fixed
+samples and the frozen eight-prompt acceptance cohort, then fails during eager
+forcing on a 1,632-token prefill outside the decode compiler's [1, 10] range.
+Its speed records remain valid, but neither numerical, quality nor vocabulary
+training completion is inferred. Select the forcing semantic context using
+the actual captured compiler limit: small decode uses it; large prefill keeps
+its separate compiler. Preserve the existing speed records and retry only
+missing diagnostics. Collect natural quality and independent vocabulary
+training before forcing; each has its own completion flag, while overall
+candidate admission still requires every requested stage.
