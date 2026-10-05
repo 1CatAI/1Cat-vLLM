@@ -795,6 +795,10 @@ void nvfp4_qpn2_shared_decode_sm70_out(
     torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
     int64_t tm_q_ld, bool gated_silu);
 
+void nvfp4_qpn2_m64_n128_sm70_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor codes, torch::Tensor scales,
+                                  double global_scale, bool gated_silu);
+
 // This distinct operator is the layout capability gate. Old binaries never
 // consume TurboMind codes as QPN2. A zero threshold disables dense prefill.
 void nvfp4_qpn2_tm_dispatch_sm70_out(
@@ -820,6 +824,15 @@ void nvfp4_qpn2_tm_dispatch_sm70_out(
     auto prefill_scales = scales.view({k / 16, n});
     nvfp4_qpn4_prefill_sm70_impl<true>(out, 0, input, codes, prefill_scales,
                                        global_scale, true, gated_silu);
+    return;
+  }
+  // M64 shares each activation tile across N128 and both gated projections.
+  // Keep M8/M16/M32 and all other shapes on their established reductions.
+  if (input.size(0) == 64 && input.is_contiguous() &&
+      ((gated_silu && k == 5120 && out.size(1) == 4352) ||
+       (!gated_silu && k == 4352 && out.size(1) == 5120))) {
+    nvfp4_qpn2_m64_n128_sm70_out(out, input, codes, scales, global_scale,
+                                 gated_silu);
     return;
   }
   // Keep the M-dependent route opaque to Dynamo's compiled token ranges.
