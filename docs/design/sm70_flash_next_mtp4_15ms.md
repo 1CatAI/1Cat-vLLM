@@ -559,7 +559,7 @@ all 48 layers to avoid a single hot-weight fixture.
 
 | Operator chain | Control | Candidate | Decision |
 | --- | ---: | ---: | --- |
-| Four QPN8 draft heads, M1, largest shortlist shard | 0.833485 ms | 0.268585 ms | 32K candidate reduces head time; acceptance pending |
+| Four QPN8 draft heads, M1, largest shortlist shard | 0.833485 ms | 0.268585 ms | Reject 32K: acceptance falls by 14.07 percentage points |
 | Four QPN8 draft heads, M5 | 0.840376 ms | 0.270705 ms | Original global IDs preserved |
 | 48 shared gate/up/SiLU/down chains | 0.994468 ms | 0.690063 ms | 0.304405-ms operator gain; model gates pending |
 | 48 routers, projection/top10/plan | 0.631368 ms | 3.190070 ms | Reject token-CTA prototype; no production dispatch |
@@ -587,3 +587,75 @@ strided scalar half loads. The next implementation pairs adjacent 128-bit
 loads in padded shared tiles and reports up/down stage timing separately.
 The up loop also avoids compiler-expanded register preloading. This is a
 structural memory-access correction, not a parameter sweep.
+
+### Restored defaults and rejected shortlist, 2026-10-05
+
+Source `f61348a4f6`, normal extension `bf0f4cf15724`, same fully connected TP4
+V100/300-W contract, 262144 startup capacity, 8192 input, no profiler and no
+supplied VLLM variables. The three fixed-MTP4 round means are 21.739059,
+21.593571 and 21.776461 ms. Across 963 rounds the mean is **21.703030 ms**,
+1.512891 ms below the owner's frozen 23.215921-ms main baseline. The 15-ms
+objective remains unmet. Synthetic acceptance falls from 18% to 15.031%;
+this timing fixture runs past EOS, so matched natural outputs are required
+before task-quality or acceptance conclusions. Numerical QPN8 admission
+remains valid; maximum logit error is record-only.
+
+The disjoint-corpus 32768-ID shortlist fails the frozen eight-prompt,
+600-output-token acceptance test. Both arms use the same temperature, seeds,
+8192-token prompts and compact value/ID IPC. Aggregate acceptance divides
+accepted tokens by proposed tokens, with per-language results retained.
+
+| Eight-prompt arm | Rounds | Acceptance | Complete round | Emitted tokens/round | Decode tokens/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Full QPN8 draft vocabulary | 1597 | 50.204% | 25.817724 ms | 3.000626 | 116.223 |
+| 32768-ID frequency shortlist | 1963 | 36.131% | 25.489029 ms | 2.441161 | 95.773 |
+
+The 14.073-percentage-point acceptance loss exceeds the one-point limit;
+the shortlist remains benchmark-only. Chinese acceptance declines from
+62.048% to 44.496%. A smaller head alone does not admit the candidate. Forced
+600-token output is an acceptance/timing fixture, not a natural quality test.
+The already-built 65536-ID candidate uses the same training-only ranking;
+its operator proof must pass before a matched acceptance run.
+
+The coalesced FP16 draft fusion also fails the operator screen:
+0.436593 -> 0.535665 ms for M5 plus three M1 expert chains. Up/SiLU grows
+from 0.319007 to 0.400374 ms; down/route sum grows from 0.114299 to
+0.134492 ms. Reject it without model integration or parameter sweeps.
+The next draft candidate reduces weight bytes through the existing
+channel-QPN8 preparation and fragment decoder, with FP16 compute and FP32
+accumulation; it has no default dispatch or model admission.
+
+A calibrated main-source event diagnostic is complete (source `6e36a5a83a`).
+Same-engine ordinary/event token tapes and round counters match in all three
+pairs; overhead ranges from -0.025% to +0.949%, within the 2% limit.
+Rank-3 target M5 averages about 16.780 ms and the complete draft interval
+about 4.525 ms. These precede restored defaults and do not replace the
+fixed main baseline. The separately profiled node capture measures
+26.893 ms/round; its service sums are attribution only, never speed admission.
+M5 has 1428 target nodes. Source-audited issued weight reads are retained
+separately from actual DRAM counters, which have not been measured locally.
+
+### Grouped QPN8 draft expert screen
+
+Normal `_C` build `bf376946ad16`, real-checkpoint TP0 experts, one V100 at
+300 W, no profiler, seven alternating whole-chain graphs. Four expert steps
+(M5, M1, M1, M1) improve from **0.435937 to 0.163205 ms** (0.272732-ms
+saving). A control running the same dequantized QPN8 weights through the
+old FP16 kernels takes 0.435220 ms, isolating execution structure from
+quantization alone.
+
+Both kernels reuse the existing channel-QPN8 packing and fragment decoder.
+Up pairs gate and value tiles before FP16 SiLU. Down uses ten route warps,
+with a fixed-order FP32 sum after each weighted route's FP16 boundary.
+There is no persistent grid or floating-point atomic. Launches decrease
+from sixteen to eight across the four steps. Compute remains FP16 with
+FP32 accumulators.
+
+At scales 0, .03, 1 and 3, zero-input and finite-value checks pass. Relative
+L2 difference from the independent dequantized-weight control stays below
+0.000240; relative L2 versus original FP16 weights is roughly 4.3--4.9%.
+These hidden-output differences are diagnostics, not logit distribution
+admission. The benchmark-only worker prepares the proposer subtree alone,
+retains original FP16 weights for unsupported widths/prefill, and preserves
+shared-expert ordering and the outer TP reduction. Full-vocabulary target
+and draft gates, matched acceptance, quality and C4 remain required.

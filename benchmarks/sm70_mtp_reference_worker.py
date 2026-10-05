@@ -115,3 +115,17 @@ class SharedChainCandidateWorker(Worker):
             raise RuntimeError(
                 f"Shared-chain preparation missed layers: {target}/{draft}"
             )
+
+
+class DraftExpertQPN8CandidateWorker(Worker):
+    def load_model(self, *, load_dummy_weights=False):
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
+            prepare_draft_expert_qpn8_probe,
+        )
+
+        prepared = prepare_draft_expert_qpn8_probe(self.model_runner.speculator.model)
+        if prepared != 1:
+            raise RuntimeError(
+                f"Draft QPN8 expert preparation missed layer: {prepared}"
+            )

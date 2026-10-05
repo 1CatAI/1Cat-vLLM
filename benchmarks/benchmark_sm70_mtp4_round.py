@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument("--quality-manifest", type=Path)
     parser.add_argument("--fixture-manifest", type=Path)
     parser.add_argument("--draft-vocab", type=Path)
-    parser.add_argument("--structural-candidate", choices=("shared",))
+    parser.add_argument("--structural-candidate", choices=("shared", "draft-qpn8"))
     parser.add_argument("--restoration-control", action="store_true")
     parser.add_argument("--diagnostics-only", action="store_true")
     parser.add_argument("--projection-reference", action="store_true")
@@ -182,8 +182,12 @@ def main() -> None:
     if args.structural_candidate:
         if args.draft_vocab or args.diagnostic_path or args.projection_reference:
             parser.error("Structural precision probe requires its own candidate arm")
+        candidate_worker = {
+            "shared": "SharedChainCandidateWorker",
+            "draft-qpn8": "DraftExpertQPN8CandidateWorker",
+        }[args.structural_candidate]
         engine["worker_cls"] = (
-            "benchmarks.sm70_mtp_reference_worker.SharedChainCandidateWorker"
+            "benchmarks.sm70_mtp_reference_worker." + candidate_worker
         )
     if args.restoration_control:
         if args.draft_vocab or args.structural_candidate or args.diagnostic_path:
