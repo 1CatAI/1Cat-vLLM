@@ -55,3 +55,8 @@ lanes are not admitted. IQ3_S M5 gate/up remains about 45.06 us, or 384 GB/s
 using unique original-weight bytes. This does not meet the 450 GB/s cold-cache
 target. The gain comes mainly from avoiding repeated down input quantization.
 Model quality and round latency must be measured separately.
+
+An exact XOR/add replacement for packed sign subtraction passes 73 GPU
+checks and exhaustive CPU checks of every codebook/sign combination. Two
+paired cold repeats retain 45.06 us M5 and 117.76 us M20 Q8 gate/up times.
+It is reverted because it provides no measured throughput benefit.
