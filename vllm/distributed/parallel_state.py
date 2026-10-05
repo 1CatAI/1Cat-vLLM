@@ -188,13 +188,14 @@ def sm70_tp4_all_reduce_gemma_rms_norm(
     weight: torch.Tensor,
     epsilon: float,
     group_name: str,
+    prefetch_codes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._sm70_tp4_all_reduce_gemma_rms_norm_out_place(
-        tensor, residual, weight, epsilon
+        tensor, residual, weight, epsilon, prefetch_codes
     )
 
 
@@ -204,8 +205,9 @@ def sm70_tp4_all_reduce_gemma_rms_norm_fake(
     weight: torch.Tensor,
     epsilon: float,
     group_name: str,
+    prefetch_codes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del weight, epsilon, group_name
+    del weight, epsilon, group_name, prefetch_codes
     return torch.empty_like(tensor), torch.empty_like(residual, dtype=torch.float32)
 
 
@@ -798,6 +800,7 @@ class GroupCoordinator:
         residual: torch.Tensor,
         weight: torch.Tensor,
         epsilon: float,
+        prefetch_codes: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -808,7 +811,7 @@ class GroupCoordinator:
         )
         if fused_op is None:
             raise RuntimeError("Device communicator lacks SM70 fused AR RMSNorm")
-        return fused_op(input_, residual, weight, epsilon)
+        return fused_op(input_, residual, weight, epsilon, prefetch_codes)
 
     def _sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather_out_place(
         self,

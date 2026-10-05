@@ -469,6 +469,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         residual: torch.Tensor,
         weight: torch.Tensor,
         epsilon: float,
+        prefetch_codes: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ca_comm = self.ca_comm
         if (
@@ -479,7 +480,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
         ):
             return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
-                input_, residual, weight, epsilon
+                input_, residual, weight, epsilon, prefetch_codes
             )
         from vllm.model_executor.layers.layernorm import (
             _sm70_dflash2_gemma_fused_add_rms_norm,

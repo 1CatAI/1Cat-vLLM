@@ -30,6 +30,7 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
         dist.group.WORLD, torch.device("cuda", rank), max_size=1024 * 1024
     )
     assert not ca.disabled and ca.fully_connected and ca.sm70_tp4_push_buffer_ptrs
+    codes = torch.empty(272 * 320 * 256, device="cuda", dtype=torch.uint8)
     try:
         for dtype in (torch.float16, torch.float32):
             x = torch.zeros(8, 5120, device="cuda", dtype=torch.float16)
@@ -40,13 +41,17 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
             torch.accelerator.synchronize()
             dist.barrier()
             graphs, outputs = [], []
-            for fused in (False, True):
+            for route in ("unfused", "fused", "prefetch"):
                 graph = torch.cuda.CUDAGraph()
                 with ca.capture(), torch.cuda.graph(graph):
                     for _ in range(140):
-                        if fused:
+                        if route != "unfused":
                             output = ca.sm70_tp4_all_reduce_gemma_rms_norm(
-                                x, residual, weight, 1e-6
+                                x,
+                                residual,
+                                weight,
+                                1e-6,
+                                codes if route == "prefetch" else None,
                             )
                             # Separate packets must survive interleaved ordinary AR.
                             ca.custom_all_reduce(x)
@@ -76,6 +81,9 @@ def _check_push_norm(rank: int, rendezvous: str) -> None:
                 torch.accelerator.synchronize()
                 _, expected_residual = outputs[0]
                 actual, actual_residual = outputs[1]
+                hinted, hinted_residual = outputs[2]
+                assert torch.equal(hinted.view(torch.uint8), actual.view(torch.uint8))
+                assert torch.equal(hinted_residual, actual_residual)
                 assert torch.equal(actual_residual, expected_residual)
                 values = expected_residual.double()
                 oracle = values * torch.rsqrt(

@@ -3043,6 +3043,7 @@ def sm70_tp4_all_reduce_gemma_rms_norm(
     reg_buffer: int,
     reg_buffer_sz_bytes: int,
     epsilon: float,
+    prefetch_codes: torch.Tensor | None = None,
 ) -> None:
     _custom_ar_op("sm70_tp4_all_reduce_gemma_rms_norm")(
         fa,
@@ -3054,6 +3055,7 @@ def sm70_tp4_all_reduce_gemma_rms_norm(
         reg_buffer,
         reg_buffer_sz_bytes,
         epsilon,
+        prefetch_codes,
     )
 
 

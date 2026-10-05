@@ -625,6 +625,7 @@ class CustomAllreduce:
         residual: torch.Tensor,
         weight: torch.Tensor,
         epsilon: float,
+        prefetch_codes: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fuse the eight-row push collective, residual add, and Gemma norm."""
         if not self.can_sm70_tp4_all_reduce_gemma_rms_norm(inp, residual, weight):
@@ -644,6 +645,7 @@ class CustomAllreduce:
             reg_buffer,
             reg_buffer_size,
             epsilon,
+            prefetch_codes,
         )
         return normalized_out, residual_out
 

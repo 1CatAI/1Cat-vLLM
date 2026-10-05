@@ -816,7 +816,7 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes,
-    double epsilon);
+    double epsilon, std::optional<torch::Tensor> prefetch_codes = std::nullopt);
 
 void sm70_tp4_all_reduce_gemma_rms_norm_reference(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,

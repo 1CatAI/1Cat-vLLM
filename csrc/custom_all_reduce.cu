@@ -546,7 +546,8 @@ void sm70_all_reduce_gemma_rms_norm_impl(
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t _reg_buffer,
     int64_t reg_buffer_sz_bytes, double epsilon,
-    bool benchmark_reference = false) {
+    bool benchmark_reference = false,
+    const std::optional<torch::Tensor>& prefetch_codes = std::nullopt) {
   constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
@@ -597,6 +598,15 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   const bool push_norm = kWorldSize == 4 && inp.size(0) == 8 &&
                          fa->fully_connected_ &&
                          fa->sm70_tp4_push_buffers_registered_;
+  const uint8_t* next_codes = nullptr;
+  if (push_norm && prefetch_codes.has_value()) {
+    const auto& codes = *prefetch_codes;
+    TORCH_CHECK(codes.device() == inp.device() && codes.is_contiguous() &&
+                    codes.scalar_type() == at::ScalarType::Byte &&
+                    codes.numel() == 272 * 320 * 256,
+                "Expected native QPN2 gate/up codes for N8704/K5120");
+    next_codes = codes.data_ptr<uint8_t>();
+  }
   if (push_norm) {
     reg_buffer = inp.data_ptr();
   } else if (reg_buffer) {
@@ -640,13 +650,13 @@ void sm70_all_reduce_gemma_rms_norm_impl(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
           residual_out_ptr, num_tokens, hidden_size, epsilon_f,
-          benchmark_reference);
+          benchmark_reference, next_codes);
     } else {
       fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
           stream, input_ptr, residual_ptr,
           reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
           residual_out_ptr, num_tokens, hidden_size, epsilon_f,
-          benchmark_reference);
+          benchmark_reference, next_codes);
     }
   } else if constexpr (kWorldSize == 2) {
     auto residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
@@ -682,10 +692,11 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t _reg_buffer,
-    int64_t reg_buffer_sz_bytes, double epsilon) {
+    int64_t reg_buffer_sz_bytes, double epsilon,
+    std::optional<torch::Tensor> prefetch_codes) {
   sm70_all_reduce_gemma_rms_norm_impl<4>(
       _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
-      reg_buffer_sz_bytes, epsilon);
+      reg_buffer_sz_bytes, epsilon, false, prefetch_codes);
 }
 
 void sm70_tp4_all_reduce_gemma_rms_norm_reference(
