@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--trace-only", action="store_true")
     parser.add_argument("--input-phase-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
+    parser.add_argument("--diagnose-attention-transfers", action="store_true")
     args = parser.parse_args()
     if args.trace_only:
         args.probe = args.node_trace = True
@@ -220,6 +221,15 @@ def main():
                 temperature=0, top_p=1, top_k=-1, max_tokens=256, ignore_eos=True
             )
             llm.generate({"prompt_token_ids": fixed_ids}, probe_params, use_tqdm=False)
+            if args.diagnose_attention_transfers:
+                llm.collective_rpc("start_attention_transfer_diagnosis", timeout=30)
+                llm.generate(
+                    {"prompt_token_ids": fixed_ids}, probe_params, use_tqdm=False
+                )
+                report["attention_transfers"] = llm.collective_rpc(
+                    "read_attention_transfer_diagnosis", timeout=30
+                )
+                save()
             arms = (
                 ("late_observed", "early_observed", "early_off", "late_off")
                 if args.input_phase_ab

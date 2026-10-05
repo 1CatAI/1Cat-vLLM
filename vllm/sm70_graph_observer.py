@@ -165,6 +165,58 @@ class GraphParityWorkerExtension:
     def read_graph_parity_observer(self, stop=True):
         return self._graph_parity_recorder.read(stop)
 
+    def start_attention_transfer_diagnosis(self):
+        """Record one attention preparation's implicit host transfers."""
+        import traceback
+
+        import torch
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        records = []
+
+        class TransferDiagnosis(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                suspicious = False
+                if func is torch.ops.aten.index.Tensor and args[0].is_cuda:
+                    suspicious = any(
+                        index is not None and index.device.type == "cpu"
+                        for index in args[1]
+                    )
+                elif func is torch.ops.aten._to_copy.default:
+                    destination = kwargs.get("device")
+                    suspicious = (
+                        args[0].device.type == "cpu"
+                        and destination is not None
+                        and destination.type == "cuda"
+                        and not kwargs.get("non_blocking", False)
+                    )
+                if suspicious:
+                    records.append(
+                        {
+                            "operator": str(func),
+                            "shape": list(args[0].shape),
+                            "stack": traceback.format_stack(limit=16),
+                        }
+                    )
+                return func(*args, **kwargs)
+
+        state = self.model_runner.model_state
+        original = state.prepare_attn
+
+        @wraps(original)
+        def diagnosed(*args, **kwargs):
+            state.prepare_attn = original
+            with TransferDiagnosis():
+                return original(*args, **kwargs)
+
+        self._attention_transfer_diagnosis = records
+        state.prepare_attn = diagnosed
+        return {"rank": self.rank}
+
+    def read_attention_transfer_diagnosis(self):
+        return {"rank": self.rank, "records": self._attention_transfer_diagnosis}
+
     def start_graph_parity_capture(self):
         import torch
 
