@@ -61,6 +61,27 @@ def test_forcing_aligns_target_and_shifted_draft(tmp_path, monkeypatch):
     assert not hasattr(runner, "_mtp15_forcing")
 
 
+def test_eager_forcing_keeps_decode_semantics_and_restores_context(
+    tmp_path, monkeypatch
+):
+    from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    runner = GPUModelRunner()
+    seen = []
+    runner.speculator.run_model = lambda *args, **kwargs: seen.append(
+        is_sm70_decode_graph_compiling()
+    )
+    install(
+        SimpleNamespace(model_runner=runner), list(range(32)), 8, "x", str(tmp_path)
+    )
+    assert not is_sm70_decode_graph_compiling()
+    runner.speculator.run_model(2)
+    assert seen == [True]
+    assert not is_sm70_decode_graph_compiling()
+    flush(SimpleNamespace(model_runner=runner), discard=True)
+
+
 def test_failed_dump_restores_runner(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     runner = GPUModelRunner()

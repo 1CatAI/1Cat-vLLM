@@ -502,6 +502,16 @@ def main() -> None:
                 for row in proof
             ):
                 raise RuntimeError("Structural candidate was not executed on all ranks")
+            if (
+                args.structural_candidate == "draft-qpn8"
+                and args.teacher_forcing_manifest
+                and any(
+                    worker["structural_probe_delta"]["draft-qpn8"] < 1
+                    for case in report["teacher_forcing"]
+                    for worker in case["workers"]
+                )
+            ):
+                raise RuntimeError("Draft numerical probe used its fallback")
         report["complete"] = True
         save()
     except BaseException:

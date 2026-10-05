@@ -14,6 +14,8 @@ import torch
 
 
 def install(worker, token_ids, prompt_length, prompt_sha256, folder):
+    from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+    from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import structural_route_proof
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
     runner = worker.model_runner
@@ -27,7 +29,12 @@ def install(worker, token_ids, prompt_length, prompt_sha256, folder):
     if len(token_ids) <= prompt_length + 8:
         raise ValueError("Need a continuation and final draft padding")
     tape = torch.tensor(token_ids, device=runner.device, dtype=torch.int64)
-    state = {"target": [], "draft": [], "tape": tape}
+    state = {
+        "target": [],
+        "draft": [],
+        "tape": tape,
+        "probe_start": structural_route_proof(),
+    }
     runner._mtp15_forcing = state
     rank = torch.distributed.get_rank()
     root = Path(folder)
@@ -93,7 +100,10 @@ def install(worker, token_ids, prompt_length, prompt_sha256, folder):
         positions = draft.input_buffers.positions[:num_tokens].long()
         # MTP input token is shifted one position relative to target hidden.
         draft.input_buffers.input_ids[:num_tokens].copy_(tape[positions + 1])
-        return run_model(num_tokens, *args, **kwargs)
+        # Eager diagnostics must retain serving decode semantics; otherwise
+        # a guarded precision candidate could silently take its FP16 fallback.
+        with sm70_decode_graph_compilation():
+            return run_model(num_tokens, *args, **kwargs)
 
     def sample_draft_fixed(self, hidden, idx_mapping, positions, step, draft_logits):
         logits = self.model.compute_logits(hidden)
@@ -156,4 +166,15 @@ def flush(worker, *, discard=False):
         runner.speculator.run_model = restore["run_model"]
         runner.speculator._sample_draft = restore["sample_draft"]
         del runner._mtp15_forcing
-    return {"rank": rank, "counts": counts, "restored": True}
+    from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import structural_route_proof
+
+    proof = structural_route_proof()
+    return {
+        "rank": rank,
+        "counts": counts,
+        "restored": True,
+        "structural_probe_delta": {
+            name: row["calls"] - state["probe_start"][name]["calls"]
+            for name, row in proof.items()
+        },
+    }
