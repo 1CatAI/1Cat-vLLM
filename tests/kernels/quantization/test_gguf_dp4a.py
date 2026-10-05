@@ -89,7 +89,7 @@ def test_iq3_s_dot_matches_official_weight_and_q8_oracle(m, activated):
             torch.einsum("mk,mtnk->mtn", quantized, w[ids]).half() for w in reference
         ]
         expected = (
-            torch.nn.functional.silu(gate.float()) * up.float()
+            (torch.nn.functional.silu(gate) * up)
             if activated
             else torch.stack((gate, up), 2)
         )

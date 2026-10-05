@@ -61,8 +61,8 @@ __global__ void gate_up(half* output, const Q8_1* activation,
       // Keep the retained FP16 gate/up boundary before SiLU and multiply.
       const float g16 = __half2float(__float2half_rn(gs));
       const float u16 = __half2float(__float2half_rn(us));
-      output[int64_t(route) * n + row] =
-          __float2half_rn(g16 / (1.f + expf(-g16)) * u16);
+      const half silu = __float2half_rn(g16 / (1.f + expf(-g16)));
+      output[int64_t(route) * n + row] = __hmul(silu, __float2half_rn(u16));
     } else {
       output[int64_t(route) * 2 * n + row] = __float2half_rn(gs);
       output[int64_t(route) * 2 * n + n + row] = __float2half_rn(us);
