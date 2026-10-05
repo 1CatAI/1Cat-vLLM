@@ -571,8 +571,14 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
               component = i % Decode::kScaleBytes;
     const auto* raw =
         source + int64_t{first + col} * stride + block * Decode::kBlockBytes;
-    tile[packet_bytes + width * 2 + i] =
-        raw[(Type == 21 ? 106 : 74) + component];
+    if constexpr (Type == 18) {
+      // Preserve the two original scale nibbles, without expanding signs.
+      tile[packet_bytes + width * 2 + i] =
+          (raw[69 + 8 * component] >> 4) | (raw[73 + 8 * component] & 0xf0);
+    } else {
+      tile[packet_bytes + width * 2 + i] =
+          raw[(Type == 21 ? 106 : 74) + component];
+    }
   }
   if (blockIdx.x == (n - 1) / 32 && block == blocks - 1 && threadIdx.x == 0)
     for (int64_t i = int64_t{n} * blocks * Decode::kBlockBytes;
@@ -1031,8 +1037,9 @@ void gguf_lattice_raw_mma_sm70_out(torch::Tensor out, torch::Tensor input,
 
 namespace {
 void validate_compact(torch::Tensor weight, int type, int64_t n, int64_t k) {
-  TORCH_CHECK(type == 21 || type == 22, "Unsupported compact GGUF type");
-  const int bytes = type == 21 ? 110 : 82;
+  TORCH_CHECK(type == 18 || type == 21 || type == 22,
+              "Unsupported compact GGUF type");
+  const int bytes = type == 18 ? 98 : type == 21 ? 110 : 82;
   TORCH_CHECK(n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX && k % 256 == 0 &&
                   weight.is_cuda() && weight.scalar_type() == torch::kUInt8 &&
                   weight.dim() == 1 && weight.is_contiguous() &&
@@ -1063,11 +1070,15 @@ void gguf_lattice_compact_reorder_sm70_out(torch::Tensor out, torch::Tensor raw,
   const c10::cuda::CUDAGuard guard(raw.device());
   TORCH_CHECK(raw.dim() == 2, "Compact reorder requires original GGUF rows");
   const int n = raw.size(0), k = logical_k;
-  validate_raw(raw, source_type, n, k);
+  validate_raw(raw, source_type, n, k, true);
   validate_compact(out, source_type, n, k);
   const dim3 grid((n + 31) / 32, k / 256);
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (source_type == 21)
+  if (source_type == 18)
+    compact_reorder_kernel<18><<<grid, 128, 0, stream>>>(
+        out.data_ptr<uint8_t>(), raw.data_ptr<uint8_t>(), n, k / 256,
+        raw.size(1), out.numel());
+  else if (source_type == 21)
     compact_reorder_kernel<21><<<grid, 128, 0, stream>>>(
         out.data_ptr<uint8_t>(), raw.data_ptr<uint8_t>(), n, k / 256,
         raw.size(1), out.numel());
@@ -1129,7 +1140,9 @@ void gguf_lattice_compact_dequantize_sm70_out(torch::Tensor out,
   } else {                      \
     COMPACT_DQ(TYPE, false);    \
   }
-  if (source_type == 21) {
+  if (source_type == 18) {
+    COMPACT_DQ_SELECT(18);
+  } else if (source_type == 21) {
     COMPACT_DQ_SELECT(21);
   } else {
     COMPACT_DQ_SELECT(22);
@@ -1169,7 +1182,13 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
         reinterpret_cast<const half*>(input.data_ptr()),                    \
         weight.data_ptr<uint8_t>(), n, k, splits)
   if (row_wise) {
-    if (source_type == 21) {
+    if (source_type == 18) {
+      if (n % 32 == 0) {
+        COMPACT_ROW_VEC(18, true);
+      } else {
+        COMPACT_ROW_VEC(18, false);
+      }
+    } else if (source_type == 21) {
       if (n % 32 == 0) {
         COMPACT_ROW_VEC(21, true);
       } else {
@@ -1194,7 +1213,9 @@ void gguf_lattice_compact_vec_sm70_out(torch::Tensor out, torch::Tensor input,
         reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(), \
         reinterpret_cast<const half*>(input.data_ptr()),                    \
         weight.data_ptr<uint8_t>(), n, k, splits)
-    if (source_type == 21) {
+    if (source_type == 18) {
+      COMPACT_VEC(18);
+    } else if (source_type == 21) {
       COMPACT_VEC(21);
     } else {
       COMPACT_VEC(22);
@@ -1252,10 +1273,18 @@ void gguf_lattice_compact_mma_sm70_out(
   }
 #define COMPACT_DISPATCH(BOUNDED)                 \
   if (staged) {                                   \
-    if (source_type == 21) {                      \
+    if (source_type == 18) {                      \
+      COMPACT_MMA(18, true, true, true, BOUNDED); \
+    } else if (source_type == 21) {               \
       COMPACT_MMA(21, true, true, true, BOUNDED); \
     } else {                                      \
       COMPACT_MMA(22, true, true, true, BOUNDED); \
+    }                                             \
+  } else if (source_type == 18) {                 \
+    if (n % 32 == 0) {                            \
+      COMPACT_SELECT(18, true, BOUNDED);          \
+    } else {                                      \
+      COMPACT_SELECT(18, false, BOUNDED);         \
     }                                             \
   } else if (source_type == 21) {                 \
     if (n % 32 == 0) {                            \
@@ -1289,7 +1318,9 @@ void gguf_lattice_compact_mma_sm70_out(
   } else {                         \
     COMPACT_ACT_PREF(TYPE, false); \
   }
-    if (source_type == 21) {
+    if (source_type == 18) {
+      COMPACT_ACT_SELECT(18);
+    } else if (source_type == 21) {
       COMPACT_ACT_SELECT(21);
     } else {
       COMPACT_ACT_SELECT(22);
@@ -1381,7 +1412,9 @@ void gguf_lattice_compact_blas_sm70_out(
   } else {                           \
     COMPACT_BLAS_DQ(TYPE, false);    \
   }
-  if (source_type == 21) {
+  if (source_type == 18) {
+    COMPACT_BLAS_DQ_SELECT(18);
+  } else if (source_type == 21) {
     COMPACT_BLAS_DQ_SELECT(21);
   } else {
     COMPACT_BLAS_DQ_SELECT(22);
@@ -1409,7 +1442,11 @@ void gguf_lattice_compact_tm_f16_sm70_out(
               "Compact GGUF TurboMind requires an aligned FP16 workspace");
   const dim3 grid(n / 32, k / 256, dq_partitions);
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (source_type == 21)
+  if (source_type == 18)
+    compact_dequant_kernel<18, half, false, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
+  else if (source_type == 21)
     compact_dequant_kernel<21, half, false, true, true>
         <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
                                    weight.data_ptr<uint8_t>(), n, k);
@@ -1440,7 +1477,11 @@ void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
       "Compact cuBLASLt requires aligned prefill scratch and partitions");
   const auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(n / 32, k / 256, dq_partitions);
-  if (source_type == 21)
+  if (source_type == 18)
+    compact_dequant_kernel<18, half, true, true>
+        <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
+                                   weight.data_ptr<uint8_t>(), n, k);
+  else if (source_type == 21)
     compact_dequant_kernel<21, half, true, true>
         <<<grid, 256, 0, stream>>>(reinterpret_cast<half*>(scratch.data_ptr()),
                                    weight.data_ptr<uint8_t>(), n, k);
@@ -1455,11 +1496,12 @@ void gguf_lattice_compact_lt_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_lattice_compact_grouped_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor weight,
     torch::Tensor offsets, torch::Tensor tile_prefix, int64_t source_type) {
-  TORCH_CHECK(weight.is_cuda() && weight.scalar_type() == torch::kUInt8 &&
-                  weight.dim() == 2 && weight.is_contiguous() &&
-                  weight.size(0) > 0 && weight.size(0) <= 1024 &&
-                  (source_type == 21 || source_type == 22),
-              "Compact grouped GGUF requires IQ3_S/IQ2_S expert packets");
+  TORCH_CHECK(
+      weight.is_cuda() && weight.scalar_type() == torch::kUInt8 &&
+          weight.dim() == 2 && weight.is_contiguous() && weight.size(0) > 0 &&
+          weight.size(0) <= 1024 &&
+          (source_type == 18 || source_type == 21 || source_type == 22),
+      "Compact grouped GGUF requires IQ3_XXS/IQ3_S/IQ2_S expert packets");
   const c10::cuda::CUDAGuard guard(weight.device());
   TORCH_CHECK(input.device() == weight.device() &&
                   out.device() == weight.device() && input.dim() == 2 &&
@@ -1473,7 +1515,10 @@ void gguf_lattice_compact_grouped_sm70_out(
                   out.size(1) % 32 == 0,
               "Compact grouped GGUF requires aligned FP16 matrices");
   const int experts = weight.size(0), n = out.size(1), k = input.size(1);
-  const int64_t bytes = int64_t{n} * (k / 256) * (source_type == 21 ? 110 : 82);
+  const int64_t bytes = int64_t{n} * (k / 256) *
+                        (source_type == 18   ? 98
+                         : source_type == 21 ? 110
+                                             : 82);
   TORCH_CHECK(
       weight.size(1) == (bytes + 7) / 8 * 8 &&
           offsets.device() == weight.device() &&
@@ -1498,7 +1543,9 @@ void gguf_lattice_compact_grouped_sm70_out(
       reinterpret_cast<const half*>(input.data_ptr()),        \
       weight.data_ptr<uint8_t>(), offsets.data_ptr<int>(),    \
       tile_prefix.data_ptr<int>(), experts, n, k, bytes)
-  if (source_type == 21) {
+  if (source_type == 18) {
+    GROUPED_COMPACT(18);
+  } else if (source_type == 21) {
     GROUPED_COMPACT(21);
   } else {
     GROUPED_COMPACT(22);

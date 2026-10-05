@@ -11,10 +11,10 @@ namespace vllm::sm70_gguf {
 // followed by the original FP16 d plane and original small-scale byte plane.
 template <int Type>
 struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
-  static constexpr int kPacketBits = Type == 21 ? 26 : 18;
+  static constexpr int kPacketBits = Type == 18 ? 23 : Type == 21 ? 26 : 18;
   static constexpr int kPacketBytesPerRow = kPacketBits * 32 / 8;
-  static constexpr int kScaleBytes = Type == 21 ? 4 : 8;
-  static constexpr int kBlockBytes = Type == 21 ? 110 : 82;
+  static constexpr int kScaleBytes = Type == 22 ? 8 : 4;
+  static constexpr int kBlockBytes = Type == 18 ? 98 : Type == 21 ? 110 : 82;
   static_assert(kPacketBytesPerRow + 2 + kScaleBytes == kBlockBytes);
 
   struct Parameters {
@@ -23,6 +23,15 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
   };
 
   __device__ static uint32_t source_packet(const uint8_t* block, int octet) {
+    if constexpr (Type == 18) {
+      const int offset = 66 + 4 * (octet / 4);
+      const uint32_t aux = uint32_t{block[offset]} |
+                           (uint32_t{block[offset + 1]} << 8) |
+                           (uint32_t{block[offset + 2]} << 16) |
+                           (uint32_t{block[offset + 3]} << 24);
+      return block[2 + 2 * octet] | (uint32_t{block[3 + 2 * octet]} << 8) |
+             (((aux >> (7 * (octet % 4))) & 127) << 16);
+    }
     const uint32_t high = block[66 + octet / 4];
     if constexpr (Type == 21) {
       const uint32_t first =
@@ -46,7 +55,7 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     result.d = __half2float(reinterpret_cast<const half*>(metadata)[col]);
     const auto* scales = metadata + width * 2 + col * kScaleBytes;
     if constexpr (FullWidth) {
-      if constexpr (Type == 21)
+      if constexpr (Type != 22)
         result.scales = *reinterpret_cast<const uint32_t*>(scales);
       else
         result.scales = *reinterpret_cast<const uint64_t*>(scales);
@@ -124,7 +133,15 @@ struct LatticeCompactDecoder : LatticeRawDecoder<Type> {
     uint64_t packed;
     uint32_t signs;
     int nibble;
-    if constexpr (Type == 21) {
+    if constexpr (Type == 18) {
+      nibble = (parameters.scales >> (4 * (octet / 4))) & 15;
+      const uint32_t first = packet & 255, second = (packet >> 8) & 255;
+      packed = *reinterpret_cast<const uint32_t*>(grid + first * 4) |
+               (uint64_t{*reinterpret_cast<const uint32_t*>(grid + second * 4)}
+                << 32);
+      const uint32_t low = packet >> 16;
+      signs = low | ((__popc(low) & 1) << 7);
+    } else if constexpr (Type == 21) {
       nibble = (parameters.scales >> (4 * (octet / 4))) & 15;
       const uint32_t first = packet & 511, second = (packet >> 9) & 511;
       packed = *reinterpret_cast<const uint32_t*>(grid + first * 4) |

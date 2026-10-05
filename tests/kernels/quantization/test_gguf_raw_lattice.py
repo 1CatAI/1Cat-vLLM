@@ -140,7 +140,11 @@ def test_raw_blas_graph(kind):
 
 def restore_compact_bytes(storage, kind, n, k):
     """Independent bitstream inverse: verify every source bit survives."""
-    block_bytes, bits, small_bytes = (110, 26, 4) if kind == 21 else (82, 18, 8)
+    block_bytes, bits, small_bytes = {
+        18: (98, 23, 4),
+        21: (110, 26, 4),
+        22: (82, 18, 8),
+    }[kind]
     blocks = k // 256
     restored = np.zeros((n, blocks, block_bytes), dtype=np.uint8)
     for first in range(0, n, 32):
@@ -154,15 +158,31 @@ def restore_compact_bytes(storage, kind, n, k):
             target[:, :2] = tile[packet_bytes : packet_bytes + width * 2].reshape(
                 width, 2
             )
-            target[:, 106 if kind == 21 else 74 :] = tile[
-                packet_bytes + width * 2 :
-            ].reshape(width, small_bytes)
+            scales = tile[packet_bytes + width * 2 :].reshape(width, small_bytes)
+            if kind == 18:
+                for group in range(8):
+                    target[:, 69 + 4 * group] = (
+                        (scales[:, group // 2] >> (4 * (group % 2))) & 15
+                    ) << 4
+            else:
+                target[:, 106 if kind == 21 else 74 :] = scales
             for octet in range(32):
                 for col in range(width):
                     packet = (stream >> ((octet * width + col) * bits)) & (
                         (1 << bits) - 1
                     )
-                    if kind == 21:
+                    if kind == 18:
+                        target[col, 2 + octet * 2] = packet & 255
+                        target[col, 3 + octet * 2] = (packet >> 8) & 255
+                        offset = 66 + 4 * (octet // 4)
+                        aux = int.from_bytes(
+                            target[col, offset : offset + 4].tobytes(), "little"
+                        )
+                        aux |= (packet >> 16) << (7 * (octet % 4))
+                        target[col, offset : offset + 4] = np.frombuffer(
+                            aux.to_bytes(4, "little"), dtype=np.uint8
+                        )
+                    elif kind == 21:
                         target[col, 2 + octet * 2] = packet & 255
                         target[col, 3 + octet * 2] = (packet >> 9) & 255
                         target[col, 66 + octet // 4] |= (
@@ -178,7 +198,7 @@ def restore_compact_bytes(storage, kind, n, k):
     return restored.reshape(n, -1)
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("n", [1, 7, 37, 64])
 def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -617,7 +637,7 @@ def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
             )
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("experts", [1, 7, 512, 1024])
 def test_compact_grouped_offsets_and_changed_graph(kind, experts):
     n, k = 32, 768
@@ -1086,7 +1106,7 @@ def test_iq3_xxs_raw_prefill_workspace_and_changed_graph():
         )
 
 
-def test_iq3_xxs_raw_capabilities_keep_compact_unavailable():
+def test_iq3_xxs_raw_and_compact_capabilities():
     from vllm.model_executor.kernels.gguf import (
         compact_lattice_capabilities,
         raw_lattice_capabilities,
@@ -1096,6 +1116,6 @@ def test_iq3_xxs_raw_capabilities_keep_compact_unavailable():
     assert all(cap.reason is None for cap in caps)
     assert [cap.supports_m(1) for cap in caps] == [True, False, False]
     assert all(
-        cap.reason == "raw_source_format_unavailable"
+        cap.reason is None
         for cap in compact_lattice_capabilities(18, 2560, 160, torch.float16)
     )
