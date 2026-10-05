@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 
-from vllm.sm70_graph_observer import CPUStageRecorder
+from vllm.sm70_graph_observer import CPUStageRecorder, GraphParityWorkerExtension
+from vllm.v1.serial_utils import MsgpackEncoder
 
 
 def test_disabled_observer_preserves_results_and_records_nothing():
@@ -96,3 +97,22 @@ def test_failed_manager_clears_target_context():
     before = len(rec.events)
     Graph().replay()
     assert len(rec.events) == before
+
+
+def test_phase_rpc_uses_serializable_named_method_and_declared_capability():
+    class State:
+        supports_early_input_preparation = True
+
+    worker = GraphParityWorkerExtension()
+    worker.rank = 0
+    worker.model_runner = SimpleNamespace(model_state=State())
+    assert worker.set_graph_input_preparation(False)["early"] is False
+    assert worker.set_graph_input_preparation(True)["early"] is True
+    assert MsgpackEncoder().encode(("set_graph_input_preparation", (True,), {}))
+
+    class DependentState:
+        supports_early_input_preparation = False
+
+    worker.model_runner.model_state = DependentState()
+    with pytest.raises(RuntimeError, match="has not declared"):
+        worker.set_graph_input_preparation(True)
