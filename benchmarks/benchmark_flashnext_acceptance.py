@@ -76,8 +76,11 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=600)
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
+    parser.add_argument("--trace-only", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     args = parser.parse_args()
+    if args.trace_only:
+        args.probe = args.node_trace = True
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Use a normal installed source-containing wheel")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -127,6 +130,7 @@ def main():
         prompt_text_sha256=digest(prompts),
         rows=[],
         probes=[],
+        trace_only=args.trace_only,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -173,7 +177,7 @@ def main():
             SamplingParams(temperature=0, max_tokens=16),
             use_tqdm=False,
         )
-        for prompt, ids in zip(prompts, tokenized):
+        for prompt, ids in () if args.trace_only else zip(prompts, tokenized):
             before = _metric_snapshot(llm)
             started = time.perf_counter()
             result = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
@@ -212,7 +216,9 @@ def main():
                 temperature=0, top_p=1, top_k=-1, max_tokens=256, ignore_eos=True
             )
             llm.generate({"prompt_token_ids": fixed_ids}, probe_params, use_tqdm=False)
-            for arm in ("off_before", "cpu_observed", "off_after"):
+            for arm in (
+                () if args.trace_only else ("off_before", "cpu_observed", "off_after")
+            ):
                 if arm == "cpu_observed":
                     llm.collective_rpc(
                         "start_graph_parity_observer", args=(False,), timeout=30
@@ -230,14 +236,17 @@ def main():
                 report["probes"].append(probe)
                 save()
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
-            c4_ids = fixed_ids[:128]
-            c4_params = SamplingParams(temperature=0, max_tokens=600, ignore_eos=True)
-            steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
-            report["c4_probe"] = dict(
-                summary=summarize(steps, 4),
-                output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
-            )
-            save()
+            if not args.trace_only:
+                c4_ids = fixed_ids[:128]
+                c4_params = SamplingParams(
+                    temperature=0, max_tokens=600, ignore_eos=True
+                )
+                steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
+                report["c4_probe"] = dict(
+                    summary=summarize(steps, 4),
+                    output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
+                )
+                save()
             if args.node_trace:
                 llm.collective_rpc(
                     "start_graph_parity_observer", args=(True,), timeout=30
