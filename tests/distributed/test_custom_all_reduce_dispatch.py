@@ -204,3 +204,52 @@ def test_tp8_push_registration_stays_in_communicator_dso(
             getattr(ops, name)(123, [1, 2])
     getattr(other, name).assert_not_called()
     getattr(other, size_name).assert_not_called()
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_capture_failure_preserves_error_without_cpu_registration(
+    monkeypatch, disabled
+):
+    from contextlib import nullcontext
+
+    from vllm.distributed.device_communicators import custom_all_reduce
+
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_disable_expandable_segments_for_cuda_ipc",
+        lambda _: nullcontext(),
+    )
+    comm = _mock_communicator()
+    comm.disabled = disabled
+    comm.register_graph_buffers = Mock()
+    error = RuntimeError("capture failed before peer synchronization")
+    with pytest.raises(RuntimeError) as raised, comm.capture():
+        assert comm._IS_CAPTURING
+        raise error
+    assert raised.value is error
+    assert not comm._IS_CAPTURING
+    comm.register_graph_buffers.assert_not_called()
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_successful_capture_registers_with_capture_state_cleared(monkeypatch, disabled):
+    from contextlib import nullcontext
+
+    from vllm.distributed.device_communicators import custom_all_reduce
+
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "_disable_expandable_segments_for_cuda_ipc",
+        lambda _: nullcontext(),
+    )
+    comm = _mock_communicator()
+    comm.disabled = disabled
+    comm.register_graph_buffers = Mock(side_effect=lambda: assert_capture_cleared(comm))
+    with comm.capture():
+        assert comm._IS_CAPTURING
+    assert not comm._IS_CAPTURING
+    assert comm.register_graph_buffers.call_count == (0 if disabled else 1)
+
+
+def assert_capture_cleared(comm):
+    assert not comm._IS_CAPTURING

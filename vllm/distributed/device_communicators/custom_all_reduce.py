@@ -390,13 +390,16 @@ class CustomAllreduce:
         It records all the buffer addresses used in the CUDA graph.
         """
         with _disable_expandable_segments_for_cuda_ipc(not self.disabled):
+            self._IS_CAPTURING = True
             try:
-                self._IS_CAPTURING = True
                 yield
             finally:
                 self._IS_CAPTURING = False
-                if not self.disabled:
-                    self.register_graph_buffers()
+            # Register only after successful capture. On failure a peer can
+            # still be inside CUDA work: a CPU collective here hides the error
+            # and prevents the executor from terminating the failed worker.
+            if not self.disabled:
+                self.register_graph_buffers()
 
     def register_graph_buffers(self):
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)

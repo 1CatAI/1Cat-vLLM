@@ -707,3 +707,34 @@ Structural model probes now record actual opaque-op invocation counts and
 widths on every TP rank; registration or buffer preparation alone cannot
 qualify a candidate. Deep HC, QSA and GDN work in #961 explicitly screens
 M1/M5, but serving dispatch and GPU acceptance are still pending.
+
+### Structural model admission and C4 startup failure
+
+The first cooperative shared chain fails matched full-model distribution:
+target mean/p99/maximum KL 0.005431/0.084623/0.353846 and top1 98.6446%;
+draft 0.008927/0.107390/5.343494 and top1 99.0809%. Operator error screens
+cannot replace these model limits. The packed tensor-core down follow-up
+changes the 48-layer graph from 0.993065 to 0.662876 ms, but has no admitted
+model distribution and is not enabled in serving.
+
+Restored defaults retain all twelve automatic quality passes and all sixteen
+natural stops. Manual Chinese review finds the same two minor omissions as
+the checkpoint-head control, with no new failures. This fixed sample is not
+a large-sample accuracy claim. C4 remains unqualified.
+
+The checkpoint-head C4 control fails before generation: rank zero needs a
+304-MiB allocation while only 210.62 MiB is free. Inductor combo benchmarking
+materializes a synthetic 62,080-by-2,560 embedding shard. Exception cleanup
+then enters CPU graph-address registration while peers wait in CUDA
+synchronization, hiding the original error. Preserve the capture exception
+and register addresses only after successful capture. Move the unchanged
+draft vocabulary lookup ahead of the compiled small-shape backbone, keeping
+lookup and TP reduction inside the outer CUDA graph. This avoids putting the
+full vocabulary table in combo benchmarking's arguments; it does not change
+model precision, the 256K capacity, or the 4-GiB cache contract. Matched GPU
+speed/quality and C4 checks are required for the new input boundary.
+
+Eager teacher-forcing probes explicitly retain the serving decode semantic
+context. For draft expert candidates, every forcing case on every TP rank
+must additionally prove an opaque-op invocation. Graph capture route proof
+alone cannot qualify an eager distribution measurement.

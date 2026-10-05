@@ -636,6 +636,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             backbone = self._sm70_decode_graph_model
             if backbone is None:
                 raise RuntimeError("SM70 Qwen3.8 MTP decode compiler was not prepared")
+            if inputs_embeds is None:
+                assert input_ids is not None
+                # Keep the unchanged vocabulary lookup outside the compiled
+                # backbone. Combo-kernel benchmarking otherwise synthesizes a
+                # full 304-MiB TP vocabulary shard during graph startup. The
+                # outer CUDA graph still captures lookup and its TP reduction.
+                inputs_embeds = self.model.embed_input_ids(input_ids)
         return backbone(
             input_ids,
             positions,
