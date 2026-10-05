@@ -261,6 +261,12 @@ class Sm70Fp8Config:
     """Use TurboMind; auto retains the shared legacy backend preference."""
     block_qpn8: bool = True
     """Use native weight-only block QPN8 when its kernel capabilities match."""
+    block_qpn8_volta_turbomind_prefill: bool | None = None
+    """Keep a second, TurboMind-packed copy of each block QPN8 weight on Volta
+    for rows beyond M=8. False holds one packed layout and serves those rows
+    through the dense FP16 prefill that Turing uses. Auto keeps the copy only
+    when decode can exceed 8 rows (max_num_seqs * (speculative tokens + 1)):
+    below that it serves just prefill, where the dense path keeps pace."""
     dequant_fallback: bool | None = None
     """Keep the legacy dense dequantization route available when requested."""
     qpn8: bool | None = None
@@ -358,6 +364,12 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    small_m_dp4a: bool = True
+    """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
+
+    q8_expert_intermediate: bool = True
+    """Encode routed intermediates once in qualified integer expert gate/up."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
@@ -367,6 +379,17 @@ class Sm70GgufConfig:
         if value <= 0:
             raise ValueError("GGUF prefill_min_m must be positive")
         return value
+
+
+@config
+class Sm70RingConfig:
+    """Small FP16 collectives on a verified four-GPU NVLink ring."""
+
+    enabled: bool = True
+    """Admit the ring operator when topology and peer atomics are supported."""
+
+    max_bytes: int = Field(default=25600, gt=0, le=25600)
+    """Largest calibrated input payload; larger messages retain NCCL."""
 
 
 @config
@@ -470,6 +493,14 @@ class KernelConfig:
     sm70_gguf: Sm70GgufConfig = Field(default_factory=Sm70GgufConfig)
     """Native GGUF admission and Volta tensor-core prefill policy."""
 
+    sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
+    """SM70 ring collective policy, resolved from actual peer capabilities."""
+
+    collective_kernel_selections: dict[str, Any] = Field(
+        default_factory=dict, init=False
+    )
+    """Observed per-group collective capabilities and rejection reasons."""
+
     sm70_sparse: Sm70SparseConfig = Field(default_factory=Sm70SparseConfig)
     """SM70 sparse attention policy; admission uses actual tensor capabilities."""
 
@@ -506,6 +537,12 @@ class KernelConfig:
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
+    ple_disk_row_gather: bool = True
+    """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
+    ple_disk_row_readers: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed CPU row-reader admission and startup byte/performance checks."""
     ple_disk_cascade_active: bool = Field(default=False, init=False)
     """Resolved FP8 storage, dtype and pipeline capability admission."""
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
@@ -542,11 +579,14 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
+            "collective_kernel_selections",
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+            "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
         }
         if not self.sm70_skinny_moe_applicable:

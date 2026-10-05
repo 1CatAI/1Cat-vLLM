@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF decoder families and prepared fallback operator capabilities."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -72,6 +72,93 @@ class GGUFOperatorCapability:
 
     def supports_m(self, m: int) -> bool:
         return m >= self.min_m and (self.max_m is None or m <= self.max_m)
+
+
+def iq3_gated_pair_capability(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> GGUFOperatorCapability:
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_types != (21, 21) or (k, n) != (5120, 4352):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, "gguf_iq3_gated_sm70_out"):
+        reason = "operator_missing:gguf_iq3_gated_sm70_out"
+    return GGUFOperatorCapability(
+        GGUFDecoderFamily.LATTICE,
+        "IQ3_S",
+        "gguf_iq3_gated_sm70_out",
+        True,
+        min_m=8,
+        max_m=8,
+        reason=reason,
+    )
+
+
+def native_gated_pair_capabilities(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Joint original-byte readers; only measured M8 shapes are admitted."""
+    if source_types not in (
+        (21, 23),
+        (23, 21),
+        (18, 21),
+        (21, 18),
+        (12, 23),
+        (23, 12),
+        (12, 21),
+        (21, 12),
+        (18, 23),
+        (22, 21),
+        (21, 22),
+        (22, 18),
+        (18, 22),
+        (17, 18),
+        (22, 17),
+        (29, 22),
+        (10, 21),
+        (17, 16),
+        (16, 22),
+    ):
+        return ()
+    operator = "gguf_native_pair_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (k, n) != (5120, 4352):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=8,
+            max_m=8,
+            reason=reason,
+        )
+        for source_type in source_types
+    )
 
 
 def dense_fp16_cache_capabilities(
@@ -174,6 +261,163 @@ def select_lattice_grouped_capability(capabilities, m: int) -> GGUFOperatorCapab
         if capability.reason is None and capability.supports_m(m):
             return capability
     raise ValueError("No prepared lattice grouped operator admits this descriptor")
+
+
+def raw_grouped_gate_up_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+    original_storage_available: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Joint raw projections; M denotes original tokens before top-k routing.
+
+    Only measured original batch sizes are admitted. In particular IQ2_S
+    at M=20 retains canonical grouped GEMM; neighboring batches are not
+    inferred from the three measured points.
+    """
+    operator = "gguf_lattice_raw_grouped_gate_up_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif source_type not in (18, 21, 22):
+        reason = "raw_grouped_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (k, n, num_experts) != (2560, 160, 512):
+        reason = "raw_grouped_shape_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    elif not original_storage_available:
+        reason = "original_expert_bank_not_retained"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=m,
+            max_m=m,
+            reason=reason
+            or (
+                "measured_slower_than_canonical_grouped_gemm"
+                if source_type == 22 and m == 20
+                else None
+            ),
+        )
+        for m in (1, 5, 20)
+    )
+
+
+def dp4a_expert_capabilities(
+    source_type: int,
+    down_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+    original_storage_available: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Original M bands for Q8_1 gate/up plus integer down and route reduction."""
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_type not in (18, 21, 22) or down_type not in (20, 42):
+        reason = "dp4a_expert_source_formats_unavailable"
+    elif (k, n, num_experts) != (2560, 160, 512):
+        reason = "dp4a_expert_shape_has_no_calibration"
+    elif not original_storage_available:
+        reason = "original_expert_bank_not_retained"
+    else:
+        for operator in (
+            "gguf_quantize_q8_1_sm70_out",
+            "gguf_dp4a_gate_up_sm70_out",
+            "gguf_dp4a_down_unroute_sm70_out",
+        ):
+            if not hasattr(torch.ops._C, operator):
+                reason = f"operator_missing:{operator}"
+                break
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            "gguf_expert_dp4a",
+            True,
+            min_m=m,
+            max_m=m,
+            reason=reason,
+        )
+        for m in (5, 20)
+    )
+
+
+def q8_intermediate_expert_capabilities(*args, **kwargs):
+    """Same calibrated bands, with the packaged routed-Q8 protocol required."""
+    capabilities = dp4a_expert_capabilities(*args, **kwargs)
+    packet = getattr(torch.ops._C, "gguf_dp4a_gate_up_sm70_out", None)
+    supported = "lanes_per_row" in str(getattr(packet, "_schemas", {}))
+    return tuple(
+        replace(
+            c,
+            reason=c.reason
+            or (None if supported else "routed_q8_operator_protocol_unavailable"),
+        )
+        for c in capabilities
+    )
+
+
+def small_grouped_vector_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Measured canonical down vectors; M counts routed rows, not input tokens."""
+    name = "gguf_small_grouped_vec_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_type not in (20, 42):
+        reason = "requires_iq4_nl_or_q2_0_canonical_storage"
+    elif (k, n, num_experts) != (160, 2560, 512):
+        reason = "grouped_vector_shape_has_no_calibration"
+    elif not hasattr(torch.ops._C, name):
+        reason = f"operator_missing:{name}"
+    # Cold weight sweeps at original M=1/5/20, top-k=10. M=20
+    # regresses for both formats; do not interpolate unmeasured batches.
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            name,
+            True,
+            min_m=m,
+            max_m=m,
+            reason=reason,
+        )
+        for m in (10, 50)
+    )
 
 
 def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapability:

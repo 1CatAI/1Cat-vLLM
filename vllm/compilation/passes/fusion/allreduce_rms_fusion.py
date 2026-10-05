@@ -596,6 +596,49 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
         )
 
 
+class Sm70Tp4PushGemmaRMSNormPattern(BasePattern):
+    def __init__(self, dtype: torch.dtype, device: str | None) -> None:
+        super().__init__(dtype, device)
+        self.group_name = get_tp_group().unique_name
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [self.empty(8, 5120), self.empty_f32(8, 5120), self.empty(5120)]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(input, residual, weight):
+            reduced = tensor_model_parallel_all_reduce(input)
+            return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
+                reduced, residual, weight, 1e-6
+            )
+
+        def replacement(input, residual, weight):
+            return torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm(
+                input, residual, weight, 1e-6, group_name=self.group_name
+            )
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_sm70_ar_gemma_rms_match,
+        )
+
+        # Final normalization can discard its residual output.
+        def normalized_only(fn):
+            return lambda a, b, c: fn(a, b, c)[0]
+
+        pm.register_replacement(
+            normalized_only(pattern),
+            normalized_only(replacement),
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_sm70_ar_gemma_rms_match,
+        )
+
+
 class Sm70Tp4LongPrefillFusedNormPattern(BasePattern):
     """Fuse TP4 AR plus the accepted opaque mixed-dtype Gemma norm."""
 
@@ -1040,13 +1083,26 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             and config.parallel_config.pipeline_parallel_size == 1
             and config.speculative_config is None
         )
+        device_comm = get_tp_group().device_communicator
+        ca_comm = None if device_comm is None else getattr(device_comm, "ca_comm", None)
+        self.sm70_tp4_push_mode = (
+            self.tp_size == 4
+            and sm70_common
+            and isinstance(ca_comm, CustomAllreduce)
+            and not ca_comm.disabled
+            and ca_comm.fully_connected
+            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
+            and not self.sm70_tp4_long_mode
+        )
         self.sm70_tp4_model_expected_patterns = (
             2 * config.model_config.get_num_layers(config.parallel_config) - 1
             if self.sm70_tp4_long_mode
             else 0
         )
         self.sm70_tp4_total_matches = 0
-        self.sm70_mode = self.sm70_tp2_mode or self.sm70_tp4_long_mode
+        self.sm70_mode = (
+            self.sm70_tp2_mode or self.sm70_tp4_long_mode or self.sm70_tp4_push_mode
+        )
         if self.sm70_mode:
             device_comm = get_tp_group().device_communicator
             ca_comm = (
@@ -1151,6 +1207,15 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 
     @enable_fake_mode
     def register_sm70_patterns(self) -> None:
+        if self.sm70_tp4_push_mode:
+            # Import registers the norm boundary even when the model is traced later.
+            import vllm.model_executor.layers.layernorm  # noqa: F401
+
+            Sm70Tp4PushGemmaRMSNormPattern(self.model_dtype, self.device).register(
+                self.patterns
+            )
+            self.disabled = False
+            return
         if self.sm70_tp4_long_mode:
             Sm70Tp4LongPrefillFusedNormPattern(
                 1e-6,
@@ -1220,6 +1285,11 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("AllReduce fusion pass is disabled.")
             return False
+        if getattr(self, "sm70_tp4_push_mode", False):
+            # The SM70 replacement checks M=8 at runtime and preserves the
+            # original collective/norm for other row counts. It is safe for
+            # the mixed prefill/decode range, including the extra capture row.
+            return True
         if getattr(self, "sm70_tp4_long_mode", False):
             return bool(
                 compile_range.is_single_size()

@@ -421,24 +421,30 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Embedding branch: pre-norm -> fc_embedding -> [T, H].
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-        inputs_embeds = self.fc_embedding(inputs_embeds)
+        from .sm70_mtp_fc import maybe_combine_fc
 
-        # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-        # the main model truly emits the pre-final-mixer multi stream
-        # on the first step; subsequent steps reuse the prior draft
-        # step's multi stream).
-        num_tokens = hidden_states.shape[0]
-        hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-            num_tokens, hc_count, hidden_size
-        )
-        hidden_states = self.fc_hidden(hidden_states)
-        # Add the embedding residual to every branch, then fold back
-        # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-        hidden_states = hidden_states.flatten(-2)
+        combined = maybe_combine_fc(self, inputs_embeds, hidden_states)
+        if combined is not None:
+            hidden_states = combined
+        else:
+            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+            inputs_embeds = self.fc_embedding(inputs_embeds)
+
+            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
+            # the main model truly emits the pre-final-mixer multi stream
+            # on the first step; subsequent steps reuse the prior draft
+            # step's multi stream).
+            num_tokens = hidden_states.shape[0]
+            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
+            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+                num_tokens, hc_count, hidden_size
+            )
+            hidden_states = self.fc_hidden(hidden_states)
+            # Add the embedding residual to every branch, then fold back
+            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
+            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+            hidden_states = hidden_states.flatten(-2)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
@@ -595,8 +601,19 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        self._sm70_draft_head = None
+
+    def prepare_sm70_draft_head(self) -> None:
+        # Called after checkpoint loading and target-head sharing, before KV
+        # allocation and warmup consume the startup quantization workspace.
+        if self._sm70_draft_head is None:
+            from .sm70_mtp_head import prepare_mtp_qpn8_head
+
+            self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
 
     def prepare_sm70_decode_graph_model(self) -> bool:
+        # Retain the fallback for callers that do not use the Eagle loader.
+        self.prepare_sm70_draft_head()
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
             return False
         if self._sm70_decode_graph_model is None:
@@ -629,6 +646,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             backbone = self._sm70_decode_graph_model
             if backbone is None:
                 raise RuntimeError("SM70 Qwen3.8 MTP decode compiler was not prepared")
+            if inputs_embeds is None:
+                assert input_ids is not None
+                # Keep the unchanged vocabulary lookup outside the compiled
+                # backbone. Combo-kernel benchmarking otherwise synthesizes a
+                # full 304-MiB TP vocabulary shard during graph startup. The
+                # outer CUDA graph still captures lookup and its TP reduction.
+                inputs_embeds = self.model.embed_input_ids(input_ids)
         return backbone(
             input_ids,
             positions,
@@ -641,12 +665,18 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        head = (
+            self._sm70_draft_head if self._sm70_draft_head is not None else self.lm_head
+        )
+        return self.logits_processor(head, hidden_states)
 
     def get_top_tokens(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = (
+            self._sm70_draft_head if self._sm70_draft_head is not None else self.lm_head
+        )
+        return self.logits_processor.get_top_tokens(head, hidden_states)
 
     def skip_checkpoint_weight(self, name: str) -> bool:
         # The drafter ships inside its target's checkpoint; without this the

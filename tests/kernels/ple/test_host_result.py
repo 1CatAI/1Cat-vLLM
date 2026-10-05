@@ -76,3 +76,57 @@ def test_worker_publishes_exact_rows_without_cuda_submission(monkeypatch):
         assert torch.equal(buffer[:3], torch.tensor([11, 12, 13])[:, None].expand(3, 7))
         assert (buffer[3:] == -1).all()
         assert flag[0].item() == 1
+
+
+@pytest.mark.parametrize(
+    "method,expected",
+    [(None, "mapped"), ("mtp", "mapped"), ("eagle", "cuda"), ("dflash", "cuda")],
+)
+def test_mtp_mapped_result_transport_admission(monkeypatch, method, expected):
+    from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
+    from vllm.v1.ple_offload import connector as module
+
+    class Layer(PleOffloadLayer):
+        def forward_impl(self, *args, **kwargs):
+            raise AssertionError("Layer execution is outside transport setup")
+
+        def get_offload_output_dtype(self, dtype):
+            return dtype
+
+        def setup_cross_process_offload(self, output, sem):
+            self.output = output
+
+    layer = Layer()
+    allocate = torch.empty
+    monkeypatch.setattr(
+        module.torch, "empty", lambda *a, **kw: allocate(*a, **{**kw, "device": "cpu"})
+    )
+    monkeypatch.setattr(module.envs, "VLLM_SM70_QWEN38_HYBRID_PLE", False)
+    monkeypatch.setattr(
+        module.HostResultRegion,
+        "create",
+        lambda output: SimpleNamespace(
+            result=torch.empty_like(output),
+            pinned_bytes=output.numel() * output.element_size(),
+        ),
+    )
+    monkeypatch.setattr(module, "CpuGpuSemaphore", lambda *a, **kw: SimpleNamespace())
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(ple_embed_dim=7), dtype=torch.float16
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=10),
+        kernel_config=SimpleNamespace(
+            ple_result_transport="auto", ple_result_transports={}
+        ),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+    )
+    connector = module.PleOffloadConnector.__new__(module.PleOffloadConnector)
+    connector.device = torch.device("cpu")
+    model = SimpleNamespace(named_modules=lambda: [("ple", layer)])
+    connector._setup_layers(config, model)
+    transport = config.kernel_config.ple_result_transports["ple"]
+    assert transport["mode"] == expected
+    assert transport["reason"] == (
+        None if expected == "mapped" else "speculative_transport_not_qualified"
+    )

@@ -812,14 +812,17 @@ def _decode_cublas_blocker(
     table_rows_per_request: int,
 ) -> str | None:
     """The first requirement of `_decode_logits_cublas` this call misses."""
-    if (
-        is_forward_context_available()
-        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
-    ):
-        # cuBLAS processes the whole static key bucket. The paged kernel skips
-        # inactive keys on replay, so keep it for graphs whose live length can
-        # be much shorter than the bucket. Eager/piecewise calls use live bounds.
-        return "a live key bound rather than a fixed full-graph bucket"
+    if is_forward_context_available():
+        context = get_forward_context()
+        descriptor = context.batch_descriptor
+        if context.cudagraph_runtime_mode == CUDAGraphMode.FULL and (
+            descriptor is None or descriptor.attention_context_bucket is None
+        ):
+            # cuBLAS processes the whole static key bound. A full graph without
+            # a context bucket is bound by the model's maximum length, where the
+            # paged kernel, which skips inactive keys on replay, is cheaper.
+            # Context-bucket graphs and eager/piecewise calls bound it closely.
+            return "a context-bucket or live key bound rather than the full length"
     total_rows = q.shape[0]
 
     def num_requests() -> int:

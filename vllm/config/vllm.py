@@ -300,11 +300,11 @@ def checkpoint_kv_quant_allowed(cfg: "VllmConfig") -> bool:
     return not _any_participating_device_is_pre_ampere(cfg)
 
 
-def _apply_sm70_qwen38_hybrid_ple_defaults(
+def _apply_sm70_qwen38_disk_ple_defaults(
     parallel_config: ParallelConfig,
 ) -> None:
-    """Enable hybrid PLE and complete its late-bound parallel config."""
-    os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
+    """Keep PLE disk-backed and complete its late-bound parallel config."""
+    os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "0"
     os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
     os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
     # ParallelConfig is validated before these model-aware defaults are
@@ -341,8 +341,8 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
         or envs.VLLM_PLE_CPU_OFFLOAD
     ):
         reason = "existing explicit PLE placement takes precedence"
-    elif cfg.load_config.load_format not in ("auto", "safetensors"):
-        reason = "requires file-backed safetensors shards"
+    elif cfg.load_config.load_format not in ("auto", "safetensors", "gguf"):
+        reason = "requires file-backed safetensors or GGUF shards"
     elif cfg.parallel_config.prefill_context_parallel_size != 1:
         reason = "PLE worker does not yet support prefill context-parallel groups"
     elif (
@@ -386,7 +386,10 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
                 for layer_id in layers
             ]
             if any(method is None for method in methods):
-                reason = "checkpoint metadata does not provide raw E4M3 PLE storage"
+                reason = (
+                    "checkpoint metadata does not provide raw E4M3 or packed GGUF "
+                    "PLE storage"
+                )
     policy.ple_disk_cascade_reason = reason
     policy.ple_disk_cascade_active = reason is None
     return policy.ple_disk_cascade_active
@@ -668,8 +671,12 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
         )
 
     sm70_gemma_tp = (
-        envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
-        and cfg.parallel_config.tensor_parallel_size == 2
+        (
+            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+            and cfg.parallel_config.tensor_parallel_size == 2
+        )
+        # TP4 admission is checked against the active communicator by the pass.
+        or cfg.parallel_config.tensor_parallel_size == 4
     )
     if sm70_gemma_tp:
         return (
@@ -2141,8 +2148,8 @@ class VllmConfig:
                     self.parallel_config,
                 )
                 and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
-                # Hybrid PLE has its own placement requirements. Other PP/DP
-                # layouts still use the independently admitted FP16 operators.
+                # The disk offload worker needs local multiprocessing endpoints.
+                # Independently admitted projection operators retain their guards.
                 and self.parallel_config.pipeline_parallel_size == 1
                 and self.parallel_config.data_parallel_backend == "mp"
                 and self.parallel_config.data_parallel_size_local
@@ -2156,11 +2163,10 @@ class VllmConfig:
                     )
                 )
             ):
-                _apply_sm70_qwen38_hybrid_ple_defaults(self.parallel_config)
+                _apply_sm70_qwen38_disk_ple_defaults(self.parallel_config)
                 logger.info_once(
-                    "Auto-enabling hybrid PLE for the SM70 Qwen3.8 "
-                    "dual-compile lane: async disk-mmap prefill plus local "
-                    "pinned-UVA decode."
+                    "Auto-enabling disk-mmap PLE for the SM70 Qwen3.8 "
+                    "dual-compile lane: bounded result staging, no resident table."
                 )
         if self.speculative_config is not None:
             policy = self.speculative_config.sm70_dflash2

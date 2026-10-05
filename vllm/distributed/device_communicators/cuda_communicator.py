@@ -90,7 +90,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_top1_custom_ar = envs.VLLM_SM70_TOP1_CUSTOM_AR
+            use_top1_custom_ar = (
+                envs.VLLM_SM70_TOP1_CUSTOM_AR
+                and current_platform.is_device_capability(70)
+            )
             use_sm70_awq_mlp_down_tile_ar = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR
             use_sm70_awq_mlp_down_tile_overlap = (
                 envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
@@ -198,6 +201,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     scope="global",
                 )
 
+        from .sm70_ring import Sm70RingCommunicator
+
+        self.ring_comm = Sm70RingCommunicator(
+            self.cpu_group, self.device, self.unique_name, use_custom_allreduce
+        )
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -275,6 +283,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """
         all_potential_ar_backends = [
             "NCCL_SYMM_MEM",
+            "SM70_RING",
             "QUICK_REDUCE",
             "FLASHINFER",
             "CUSTOM",
@@ -298,6 +307,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             or self.world_size
             > NCCL_SYMM_MEM_ALL_REDUCE_CONFIG["always_use_above_world_size"]
         )
+        if self.ring_comm.status["enabled"]:
+            enabled_ar_backends.append("SM70_RING")
         if (
             self.pynccl_comm is not None
             and not self.pynccl_comm.disabled
@@ -331,6 +342,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        ring_out = self.ring_comm.all_reduce(input_)
+        if ring_out is not None:
+            _trace_all_reduce_path(self, "sm70_ring", input_)
+            return ring_out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -446,6 +461,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return normalized_fp32.to(input_.dtype), residual_out
         return ca_comm.sm70_tp2_all_reduce_gemma_rms_norm(
             input_, residual, weight, epsilon
+        )
+
+    def sm70_tp4_all_reduce_gemma_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ca_comm = self.ca_comm
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
+            and input_.shape[0] == 8
+            and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
+        ):
+            return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
+                input_, residual, weight, epsilon
+            )
+        from vllm.model_executor.layers.layernorm import (
+            _sm70_dflash2_gemma_fused_add_rms_norm,
+        )
+
+        return _sm70_dflash2_gemma_fused_add_rms_norm(
+            self.all_reduce(input_), residual, weight, epsilon
         )
 
     def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
@@ -617,6 +658,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        ring_comm = getattr(self, "ring_comm", None)
+        if ring_comm is not None:
+            ring_comm.close()
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

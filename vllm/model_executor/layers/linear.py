@@ -405,6 +405,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if not current_platform.is_cuda_alike():
             return
 
+        from vllm.model_executor.layers.quantization.sm70_dflash2_fp8 import (
+            prepare_dflash2_fp8_m8,
+        )
+        from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+            prepare_dflash2_fp16_m8,
+        )
+
+        if not prepare_dflash2_fp8_m8(layer):
+            prepare_dflash2_fp16_m8(layer)
+
         from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
             maybe_prepare_online_qpn8,
         )
@@ -477,6 +487,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.sm70_dflash2_fp8 import (
+            apply_dflash2_fp8_m8,
+        )
+
+        draft_fp8 = apply_dflash2_fp8_m8(layer, x, bias)
+        if draft_fp8 is not None:
+            return draft_fp8
+        from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+            apply_dflash2_fp16_m8,
+        )
+
+        draft_m8 = apply_dflash2_fp16_m8(layer, x, bias)
+        if draft_m8 is not None:
+            return draft_m8
         from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
             maybe_apply_online_qpn8,
         )

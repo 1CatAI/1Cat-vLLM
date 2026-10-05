@@ -19,6 +19,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 #include "cub_helpers.h"
 #include "sm70_tile_runtime_signal.cuh"
@@ -135,7 +136,8 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
-constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
+// Full-K down finish owns 44 column-pair counters per eight-token tile.
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 512;
 constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
@@ -148,10 +150,37 @@ constexpr int kSm70Qwen38HcBatchFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcBatchFusedOffset =
     kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70Tp4PushAllreduceLegacyBufferBytes =
     kSm70Qwen38HcBatchFusedOffset +
     kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t) +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
+// Private packets keep norm collectives separate from ordinary/HC push traffic.
+constexpr int kSm70PushNormRows = 8;
+constexpr int kSm70PushNormParts = 5;
+struct alignas(8) Sm70PushNormMeta {
+  uint32_t generation[kSm70PushNormRows];
+  // Sum-of-squares partials double as readiness payloads. -1 is empty.
+  float partial[kSm70Tp4PushAllreduceEpochs][kSm70PushNormRows]
+               [kSm70PushNormParts];
+  uint64_t inverse_packet[kSm70PushNormRows];
+};
+struct Sm70PushNormReferenceMeta {
+  uint32_t generation[kSm70PushNormRows];
+  uint32_t ready[kSm70PushNormRows][kSm70PushNormParts];
+  uint32_t normalized[kSm70PushNormRows];
+  float partial[kSm70PushNormRows][kSm70PushNormParts];
+  float inverse[kSm70PushNormRows];
+};
+constexpr size_t kSm70PushNormMetaBytes =
+    ((sizeof(Sm70PushNormMeta) + 127) / 128) * 128;
+static_assert(kSm70PushNormMetaBytes == 512);
+constexpr size_t kSm70PushNormOffset =
+    ((kSm70Tp4PushAllreduceLegacyBufferBytes + 127) / 128) * 128;
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70PushNormOffset + kSm70PushNormMetaBytes +
+    kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
+        kSm70Tp4PushAllreduceM8Bytes;
+
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
@@ -1654,24 +1683,31 @@ __global__ void __launch_bounds__(512, 1)
 template <int ngpus>
 __global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
                                          Signal* self_sg, int64_t* output,
-                                         int rank) {
+                                         int rank, int rows) {
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
-  if (threadIdx.x == 0) {
+  const int row = threadIdx.x;
+  if (row < rows) {
     float best_value = -std::numeric_limits<float>::infinity();
     int64_t best_index = std::numeric_limits<int64_t>::max();
 
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
       const float* pair = reinterpret_cast<const float*>(_dp->ptrs[i]);
-      const float value = pair[0];
-      const int64_t index = static_cast<int64_t>(llrintf(pair[1]));
-      if (value > best_value || (value == best_value && index < best_index)) {
+      const float value = pair[2 * row];
+      const int64_t index = static_cast<int64_t>(llrintf(pair[2 * row + 1]));
+      // Match full-vocabulary argmax: NaNs precede finite values, and the
+      // first original vocabulary ID wins among NaNs or equal logits.
+      const bool value_nan = isnan(value), best_nan = isnan(best_value);
+      if ((value_nan && (!best_nan || index < best_index)) ||
+          (!value_nan && !best_nan &&
+           (value > best_value ||
+            (value == best_value && index < best_index)))) {
         best_value = value;
         best_index = index;
       }
     }
-    output[0] = best_index;
+    output[row] = best_index;
   }
 
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
@@ -1680,6 +1716,204 @@ __global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
+
+// All 40 CTAs fit on SM70. The row leader waits only for four local
+// partial reductions; no grid-wide synchronization is required.
+template <typename WeightT, bool Reference = false>
+__global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
+    vllm::RankData buffers, const half* input, const float* residual,
+    const WeightT* weight, half* output, float* residual_out, int rank,
+    float epsilon) {
+  constexpr int Threads = 128, Parts = kSm70PushNormParts;
+  constexpr int Width = kSm70GemmaRmsNormHiddenSize;
+  constexpr int Elements = kSm70PushNormRows * Width;
+  static_assert(Width % Parts == 0);
+  using P = typename vllm::packed_t<half>::P;
+  using A = typename vllm::packed_t<half>::A;
+  constexpr int PacksPerPart = Width / Parts / P::size;
+  static_assert(PacksPerPart <= Threads);
+  const int row = blockIdx.x / Parts, part = blockIdx.x % Parts;
+  const int tid = threadIdx.x;
+  char* local =
+      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
+      kSm70PushNormOffset;
+  using Meta = std::conditional_t<Reference, Sm70PushNormReferenceMeta,
+                                  Sm70PushNormMeta>;
+  auto* meta = reinterpret_cast<volatile Meta*>(local);
+  const uint32_t generation = meta->generation[row] + 1;
+  const int epoch_offset = (generation & 1) * 4 * (Elements / P::size);
+  const int pack = row * (Width / P::size) + part * PacksPerPart + tid;
+  float values[P::size] = {};
+  float variance = 0;
+  if (tid < PacksPerPart) {
+    P value = reinterpret_cast<const P*>(input)[pack];
+#pragma unroll
+    for (int i = 0; i < P::size; ++i)
+      vllm::sm70_push_escape_sentinel(value.data[i]);
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      auto* base =
+          const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+          kSm70PushNormOffset;
+      vllm::sm70_push_store_volatile_16b(
+          value,
+          base + kSm70PushNormMetaBytes +
+              (epoch_offset + rank * (Elements / P::size)) * sizeof(P),
+          pack);
+    }
+    P peers[4];
+    while (true) {
+      bool missing = false;
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        vllm::sm70_push_load_volatile_16b(
+            peers[peer],
+            local + kSm70PushNormMetaBytes +
+                (epoch_offset + peer * (Elements / P::size)) * sizeof(P),
+            pack);
+#pragma unroll
+        for (int i = 0; i < P::size; ++i)
+          missing |= vllm::sm70_push_is_sentinel(peers[peer].data[i]);
+      }
+      if (!missing) break;
+    }
+    const P sum = vllm::sm70_push_reduce<P, 4, A>(peers);
+    const float4 residual_a =
+        reinterpret_cast<const float4*>(residual)[pack * 2];
+    const float4 residual_b =
+        reinterpret_cast<const float4*>(residual)[pack * 2 + 1];
+    const float residual_values[8] = {residual_a.x, residual_a.y, residual_a.z,
+                                      residual_a.w, residual_b.x, residual_b.y,
+                                      residual_b.z, residual_b.w};
+#pragma unroll
+    for (int i = 0; i < P::size; ++i) {
+      values[i] = __half2float(sum.data[i]) + residual_values[i];
+      variance += values[i] * values[i];
+    }
+    reinterpret_cast<float4*>(residual_out)[pack * 2] =
+        make_float4(values[0], values[1], values[2], values[3]);
+    reinterpret_cast<float4*>(residual_out)[pack * 2 + 1] =
+        make_float4(values[4], values[5], values[6], values[7]);
+    P empty;
+#pragma unroll
+    for (int i = 0; i < P::size; ++i)
+      *reinterpret_cast<uint16_t*>(&empty.data[i]) =
+          vllm::kSm70Tp4PushAllreduceSentinel;
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer)
+      vllm::sm70_push_store_volatile_16b(
+          empty,
+          local + kSm70PushNormMetaBytes +
+              (epoch_offset + peer * (Elements / P::size)) * sizeof(P),
+          pack);
+  }
+  using Reduce = cub::BlockReduce<float, Threads>;
+  __shared__ typename Reduce::TempStorage storage;
+  __shared__ float inverse;
+  variance = Reduce(storage).Reduce(variance, CubAddOp{}, Threads);
+  __syncthreads();
+  if constexpr (Reference) {
+    if (tid == 0) {
+      meta->partial[row][part] = variance;
+      __threadfence();
+      meta->ready[row][part] = generation;
+      if (part == 0) {
+#pragma unroll
+        for (int p = 0; p < Parts; ++p)
+          while (meta->ready[row][p] != generation) {
+          }
+        float total = 0;
+#pragma unroll
+        for (int p = 0; p < Parts; ++p) total += meta->partial[row][p];
+        meta->inverse[row] = rsqrtf(total / Width + epsilon);
+        __threadfence();
+        meta->normalized[row] = generation;
+        // Every part has read generation before publishing its partial.
+        meta->generation[row] = generation;
+      } else {
+        while (meta->normalized[row] != generation) {
+        }
+      }
+      inverse = meta->inverse[row];
+    }
+  } else {
+    // A nonnegative sum of squares is its own readiness payload. There is
+    // no separate flag that needs a fence after storing the value.
+    const int phase = generation & 1;
+    if (tid == 0) meta->partial[phase][row][part] = variance;
+    __syncwarp();
+    if (part == 0 && tid < 32) {
+      float own_partial = 0;
+      if (tid < Parts) {
+        while (true) {
+          own_partial = meta->partial[phase][row][tid];
+          if (__float_as_uint(own_partial) != __float_as_uint(-1.0f)) break;
+        }
+      }
+      __syncwarp();
+      float total = 0;
+#pragma unroll
+      for (int p = 0; p < Parts; ++p)
+        total += __shfl_sync(0xffffffff, own_partial, p);
+      if (tid < Parts) meta->partial[phase][row][tid] = -1.0f;
+      if (tid == 0) {
+        inverse = rsqrtf(total / Width + epsilon);
+        const uint64_t packet =
+            (uint64_t(generation) << 32) | __float_as_uint(inverse);
+        // The generation and inverse are one naturally aligned 64-bit store.
+        // Partial resets are only reused after the complete kernel finishes.
+        asm volatile("st.volatile.global.u64 [%0], %1;" ::"l"(
+                         &meta->inverse_packet[row]),
+                     "l"(packet)
+                     : "memory");
+        meta->generation[row] = generation;
+      }
+    } else if (part != 0 && tid == 0) {
+      uint64_t packet;
+      do {
+        asm volatile("ld.volatile.global.u64 %0, [%1];"
+                     : "=l"(packet)
+                     : "l"(&meta->inverse_packet[row])
+                     : "memory");
+      } while (uint32_t(packet >> 32) != generation);
+      inverse = __uint_as_float(uint32_t(packet));
+    }
+  }
+  __syncthreads();
+  if (tid < PacksPerPart) {
+    const int column = (part * PacksPerPart + tid) * P::size;
+    float weights[8];
+    if constexpr (std::is_same_v<WeightT, float>) {
+      const float4 a = reinterpret_cast<const float4*>(weight + column)[0];
+      const float4 b = reinterpret_cast<const float4*>(weight + column)[1];
+      weights[0] = a.x;
+      weights[1] = a.y;
+      weights[2] = a.z;
+      weights[3] = a.w;
+      weights[4] = b.x;
+      weights[5] = b.y;
+      weights[6] = b.z;
+      weights[7] = b.w;
+    } else {
+      const P packed_weight =
+          reinterpret_cast<const P*>(weight)[column / P::size];
+#pragma unroll
+      for (int i = 0; i < P::size; ++i)
+        weights[i] = __half2float(packed_weight.data[i]);
+    }
+    P normalized;
+#pragma unroll
+    for (int i = 0; i < P::size; ++i)
+      normalized.data[i] =
+          __float2half_rn(values[i] * inverse * (weights[i] + 1.f));
+    const auto* words = reinterpret_cast<const uint32_t*>(&normalized);
+    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(reinterpret_cast<P*>(output) + pack), "r"(words[0]),
+                   "r"(words[1]), "r"(words[2]), "r"(words[3])
+                 : "memory");
+  }
+}
 
 class CustomAllreduce {
  public:
@@ -1829,6 +2063,18 @@ class CustomAllreduce {
     CUDACHECK(cudaMemset(
         hc_up, 0,
         kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcUpFusedEpochOffset));
+    auto* norm_meta = static_cast<char*>(ptrs[rank_]) + kSm70PushNormOffset;
+    Sm70PushNormMeta initial_norm{};
+    for (int epoch = 0; epoch < kSm70Tp4PushAllreduceEpochs; ++epoch)
+      for (int row = 0; row < kSm70PushNormRows; ++row)
+        for (int part = 0; part < kSm70PushNormParts; ++part)
+          initial_norm.partial[epoch][row][part] = -1.0f;
+    CUDACHECK(cudaMemcpy(norm_meta, &initial_norm, sizeof(initial_norm),
+                         cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemset(norm_meta + kSm70PushNormMetaBytes,
+                         kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceBufferBytes -
+                             kSm70PushNormOffset - kSm70PushNormMetaBytes));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -2103,7 +2349,8 @@ class CustomAllreduce {
                                      const WeightT* weight,
                                      half* normalized_out, float* residual_out,
                                      int num_tokens, int hidden_size,
-                                     float epsilon) {
+                                     float epsilon,
+                                     bool benchmark_reference = false) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2119,6 +2366,23 @@ class CustomAllreduce {
           "SM70 Gemma RMSNorm prototype supports tokens in [1, " +
           std::to_string(kMaxTokens) + "]. Got " + std::to_string(num_tokens) +
           ".");
+    }
+
+    if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
+      if (num_tokens == kSm70PushNormRows && fully_connected_ &&
+          sm70_tp4_push_buffers_registered_) {
+        if (benchmark_reference) {
+          sm70_push_allreduce_gemma_rms_norm<WeightT, true>
+              <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,
+                                       weight, normalized_out, residual_out,
+                                       rank_, epsilon);
+        } else {
+          sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
+              sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
+              residual_out, rank_, epsilon);
+        }
+        return;
+      }
     }
 
     RankData* ptrs = rank_data_for_buffer(stream, input,
@@ -2553,7 +2817,8 @@ class CustomAllreduce {
 #undef TILE_RUNTIME_WAIT_REDUCE_CASE
   }
 
-  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output) {
+  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output,
+                   int rows) {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CUDACHECK(cudaStreamIsCapturing(stream, &status));
@@ -2570,11 +2835,11 @@ class CustomAllreduce {
       ptrs = it->second;
     }
 
-#define TOP1_CASE(ngpus)                                            \
-  case ngpus: {                                                     \
-    cross_device_top1_argmax<ngpus>                                 \
-        <<<1, 32, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_); \
-    break;                                                          \
+#define TOP1_CASE(ngpus)                                                   \
+  case ngpus: {                                                            \
+    cross_device_top1_argmax<ngpus>                                        \
+        <<<1, 128, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, rows); \
+    break;                                                                 \
   }
 
     switch (world_size_) {

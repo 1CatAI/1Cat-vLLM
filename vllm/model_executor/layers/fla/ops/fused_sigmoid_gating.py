@@ -504,11 +504,12 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     num_accepted_tokens: torch.Tensor | None = None,
     ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
-    if not mixed_qkv.is_contiguous():
+    if mixed_qkv.stride(1) != 1:
         mixed_qkv = mixed_qkv.contiguous()
 
     T = mixed_qkv.shape[0]
@@ -520,10 +521,11 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     q_size = H * K
     k_size = H * K
     v_size = HV * V
-    qkv_stride = q_size + k_size + v_size
-    if mixed_qkv.shape[1] != qkv_stride:
+    qkv_width = q_size + k_size + v_size
+    qkv_stride = mixed_qkv.stride(0)
+    if mixed_qkv.shape[1] != qkv_width:
         raise ValueError(
-            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_stride}."
+            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_width}."
         )
 
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -541,7 +543,17 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = mixed_qkv.new_empty(NK, B, T, HV, V)
+    if out is None:
+        o = mixed_qkv.new_empty(NK, B, T, HV, V)
+    else:
+        if (
+            out.shape != (B, T, HV, V)
+            or not out.is_contiguous()
+            or out.dtype != mixed_qkv.dtype
+            or out.device != mixed_qkv.device
+        ):
+            raise ValueError("out must be a contiguous matching [B, T, HV, V] buffer")
+        o = out.unsqueeze(0)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -748,6 +760,28 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         # Same K128 reduction, one warp, gating and recurrent arithmetic.
         # Split the independent V columns across more CTAs for this q8 case.
         BV = 2
+    if (
+        (N, T, H, HV, K, V) == (1, 8, 4, 12, 128, 128)
+        and (BV, num_warps) == (8, 1)
+        and match_recurrent_schedule
+        and match_recurrent_numerics
+        and use_precomputed_gating
+        and kernel_a.dtype == kernel_b.dtype == torch.float32
+        and initial_state.dtype == torch.float32
+        and mixed_qkv.dtype == out.dtype == torch.float16
+        and num_accepted_tokens is not None
+        and use_qk_l2norm_in_kernel
+        and not quantize_state_each_step
+        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+    ):
+        from .fused_recurrent import _SM70_FLA_HAS_LEGACY_OVERRIDE
+
+        if not _SM70_FLA_HAS_LEGACY_OVERRIDE:
+            # Independent V tiles share the unchanged K128 reduction. Smaller
+            # one-warp tiles shorten the single-request verifier's register
+            # dependency chains; output and all eight snapshots stay bitwise
+            # identical. Batched requests retain their qualified geometry.
+            BV = 2
     if (
         4 <= N <= 32
         and (T, H, HV, K, V) == (N * 8, 4, 12, 128, 128)

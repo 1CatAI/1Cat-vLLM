@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from multiprocessing.connection import Connection
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
@@ -59,6 +59,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -315,6 +316,7 @@ class PleOffloadWorkerHandle:
     proc: Any
     death_writer: Connection | None
     ready_pipe_reader: Connection | None
+    row_readers: dict[str, Any] = field(default_factory=dict)
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
@@ -457,6 +459,7 @@ class PleOffloadWorker:
                 f"{message.get('error', 'unknown error')}"
             )
         layer_names = message["layer_names"]
+        handle.row_readers = message.get("row_readers", {})
         logger.info(
             "Worker ready - %d PleOffloadLayer(s): %s",
             len(layer_names),
@@ -529,6 +532,7 @@ class PleOffloadWorker:
                 {
                     "status": PleOffloadWorker.READY_STR,
                     "layer_names": sorted(runner.layer_names),
+                    "row_readers": vllm_config.kernel_config.ple_disk_row_readers,
                 }
             )
             ready_writer.close()
@@ -660,7 +664,7 @@ class PleOffloadRunner:
             )
             for layer in offload_layers.values():
                 initialize_dummy_weights(layer, model_config)
-        elif isinstance(loader, DefaultModelLoader):
+        elif isinstance(loader, (DefaultModelLoader, GGUFModelLoader)):
             # Skip the rest before it is touched: handing out even a mapped
             # tensor reads it with readahead, which made this process read the
             # whole checkpoint through the page cache (2026-09-29, Flash-Next).
@@ -705,7 +709,7 @@ class PleOffloadRunner:
             )
         else:
             raise NotImplementedError(
-                "PLE offload requires the default or dummy model loader, got "
+                "PLE offload requires the default, GGUF or dummy model loader, got "
                 f"{type(loader).__name__}"
             )
 

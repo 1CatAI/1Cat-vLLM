@@ -21,6 +21,10 @@ from vllm.v1.worker.utils import AttentionGroup
 
 
 class DefaultModelState(ModelState):
+    # Position preparation reads only request/token buffers prepared by the
+    # runner; it does not depend on attention metadata or recurrent state.
+    supports_early_input_preparation = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,

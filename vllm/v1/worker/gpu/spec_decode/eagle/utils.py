@@ -39,7 +39,9 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     draft_model_config = speculative_config.draft_model_config
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
+            vllm_config=vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     target_language_model = (
@@ -88,5 +90,11 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         if hasattr(draft_inner, "topk_indices_buffer"):
             del draft_inner.topk_indices_buffer
         draft_inner.topk_indices_buffer = target_inner.topk_indices_buffer
+
+    # Specialized draft packs must use the final shared checkpoint head and
+    # be resident before KV allocation/graph warmup reduce startup headroom.
+    prepare_head = getattr(eagle_model, "prepare_sm70_draft_head", None)
+    if prepare_head is not None:
+        prepare_head()
 
     return eagle_model

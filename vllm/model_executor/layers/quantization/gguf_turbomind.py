@@ -11,6 +11,7 @@ from torch.nn import Module, Parameter
 
 from vllm.model_executor.kernels.gguf import (
     GGUFOperatorCapability,
+    decoder_family,
     dense_fp16_cache_capabilities,
 )
 from vllm.model_executor.kernels.linear import (
@@ -19,11 +20,19 @@ from vllm.model_executor.kernels.linear import (
     Sm70GgufLut4Config,
     choose_mp_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_gguf import (
+    _get_affine_blas_workspace,
+)
+from vllm.model_executor.layers.quantization.gguf_fp16_projection import (
+    FP16_SOURCE_TYPES,
+    fp16_projection_capabilities,
+)
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
     transcode_lattice,
 )
+from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
     LUT4_TYPES,
     Lut4GGUFProjection,
@@ -40,11 +49,290 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
+from vllm.utils.torch_utils import direct_register_custom_op
 
 _AFFINE_TYPES = AFFINE_GROUP32_TYPES | AFFINE_U2_TYPES | AFFINE_BITPLANE_TYPES
 
 
-def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
+def _supports_band(rows: int, bands: list[int]) -> bool:
+    return any(
+        rows >= bands[i] and (bands[i + 1] < 0 or rows <= bands[i + 1])
+        for i in range(0, len(bands), 2)
+    )
+
+
+def _prepared_gguf_projection(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    cache: torch.Tensor | None,
+    family: int,
+    decoder: int,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    logical_size: int,
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    # Keep M-dependent policy behind an opaque op: vLLM's range compilation
+    # drops Dynamo guards and would otherwise freeze the prefill branch.
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    if cache is not None and _supports_band(rows.shape[0], cache_bands):
+        return torch.mm(rows, cache.T).reshape(*x.shape[:-1], logical_size)
+    output = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
+    if _supports_band(rows.shape[0], blas_bands):
+        # The already prepared shared scratch is internal to this op. Passing
+        # its aliased views through Dynamo would materialize full-size clones
+        # and copybacks even when decode never touches the scratch.
+        workspace = _get_affine_blas_workspace(codes)
+        if workspace is None:
+            raise RuntimeError("Admitted GGUF BLAS workspace is unavailable")
+        scratch = workspace[: rows.shape[1] * output_size].view(
+            rows.shape[1], output_size
+        )
+        if family == 0:
+            torch.ops._C.gguf_affine_blas_sm70_out(
+                output, rows, codes, stats, decoder, scratch, group_size
+            )
+        else:
+            torch.ops._C.gguf_lattice_blas_sm70_out(
+                output, rows, codes, stats, decoder, scratch, group_size
+            )
+    elif family == 0:
+        torch.ops._C.gguf_affine_gemm_sm70_out(
+            output, rows, codes, stats, decoder, k_ld, q_ld, group_size
+        )
+    elif family == 1:
+        torch.ops._C.gguf_lut4_gemm_sm70_out(
+            output, rows, codes, stats, decoder, k_ld, q_ld, group_size
+        )
+    else:
+        torch.ops._C.gguf_lattice_gemm_sm70_out(
+            output, rows, codes, stats, decoder, k_ld, q_ld, group_size
+        )
+    # Return a separate contiguous result so the fake and real strides agree
+    # even when the prepared output pack contains padding.
+    return output[:, :logical_size].contiguous().reshape(*x.shape[:-1], logical_size)
+
+
+def _prepared_gguf_projection_fake(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    cache: torch.Tensor | None,
+    family: int,
+    decoder: int,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    output_size: int,
+    logical_size: int,
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], logical_size), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="prepared_gguf_projection",
+    op_func=_prepared_gguf_projection,
+    fake_impl=_prepared_gguf_projection_fake,
+)
+
+
+def _prepared_gguf_mixed_projection(
+    x: torch.Tensor,
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
+    cache_offset = blas_offset = 0
+    policies = []
+    for spec in specs:
+        cache_count, blas_count = spec[-2:]
+        policies.append(
+            (
+                cache_bands[cache_offset : cache_offset + cache_count],
+                blas_bands[blas_offset : blas_offset + blas_count],
+            )
+        )
+        cache_offset += cache_count
+        blas_offset += blas_count
+    # Retain the calibrated per-projection policy outside measured target
+    # verification sizes. This decision must use actual M inside the op.
+    direct = rows.shape[0] in (5, 20) and all(
+        not _supports_band(rows.shape[0], cb) and not _supports_band(rows.shape[0], bb)
+        for cb, bb in policies
+    )
+    if not direct:
+        outputs = [
+            _prepared_gguf_projection(
+                x,
+                c,
+                s,
+                cache,
+                spec[0],
+                spec[1],
+                spec[2],
+                spec[3],
+                spec[4],
+                spec[5],
+                spec[6],
+                cb,
+                bb,
+            )
+            for c, s, cache, spec, (cb, bb) in zip(
+                codes, stats, caches, specs, policies
+            )
+        ]
+        return torch.cat(outputs, dim=-1)
+    total = sum(spec[6] for spec in specs)
+    output = torch.empty((rows.shape[0], total), dtype=x.dtype, device=x.device)
+    offset = 0
+    for c, s, spec in zip(codes, stats, specs):
+        family, decoder, group, k_ld, q_ld, output_size, logical_size = spec[:7]
+        destination = output[:, offset : offset + logical_size]
+        if family == 0:
+            torch.ops._C.gguf_affine_gemm_sm70_out(
+                destination, rows, c, s, decoder, k_ld, q_ld, group
+            )
+        elif family == 1:
+            torch.ops._C.gguf_lut4_gemm_sm70_out(
+                destination, rows, c, s, decoder, k_ld, q_ld, group
+            )
+        else:
+            torch.ops._C.gguf_lattice_gemm_sm70_out(
+                destination, rows, c, s, decoder, k_ld, q_ld, group
+            )
+        offset += logical_size
+    return output.reshape(*x.shape[:-1], total)
+
+
+def _prepared_gguf_mixed_projection_fake(
+    x: torch.Tensor,
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    total = sum(descriptors[6::9])
+    return torch.empty((*x.shape[:-1], total), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="prepared_gguf_mixed_projection",
+    op_func=_prepared_gguf_mixed_projection,
+    fake_impl=_prepared_gguf_mixed_projection_fake,
+)
+
+
+def mixed_projection_capabilities(projections):
+    """Declare output-view eligibility independently of quantization family."""
+    if len(projections) < 2 or any(p.kernel is None for p in projections):
+        # An imported fallback format may not have a canonical family at all.
+        # Its existing projection admission carries the rejection reason.
+        return ()
+    capabilities = []
+    for projection in projections:
+        reason = projection.rejection_reason
+        if projection.kernel is None:
+            reason = reason or "projection_not_prepared"
+        elif projection.output_padding:
+            reason = "mixed_output_has_padded_projection"
+        elif projection.logical_output_size % 32:
+            reason = "mixed_output_cuts_output_pack"
+        for m in (5, 20):
+            capabilities.append(
+                GGUFOperatorCapability(
+                    decoder_family(projection.source_type),
+                    quant_type_name(projection.source_type),
+                    "prepared_gguf_mixed_projection",
+                    True,
+                    min_m=m,
+                    max_m=m,
+                    reason=reason,
+                )
+            )
+    return tuple(capabilities)
+
+
+def apply_prepared_gguf_projections(x, projections):
+    capabilities = mixed_projection_capabilities(projections)
+    if not capabilities or any(c.reason is not None for c in capabilities):
+        outputs = [projection(x) for projection in projections]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+    return torch.ops.vllm.prepared_gguf_mixed_projection(
+        x, *prepared_projection_arguments(projections)
+    )
+
+
+def prepared_projection_arguments(projections):
+    """Serialize canonical storage and runtime policies for opaque operators."""
+    codes: list[torch.Tensor] = []
+    stats: list[torch.Tensor] = []
+    caches: list[torch.Tensor | None] = []
+    descriptors: list[int] = []
+    cache_bands: list[int] = []
+    blas_bands: list[int] = []
+    for projection in projections:
+        kernel = projection.kernel
+        config = kernel.config
+        if isinstance(config, Sm70GgufAffineConfig):
+            family, decoder = 0, kernel.bits
+        elif isinstance(config, Sm70GgufLut4Config):
+            family, decoder = 1, kernel.lut_id
+        else:
+            family, decoder = 2, kernel.source_type
+        cb = _admitted_bands(projection.cache_capabilities)
+        bb = _admitted_bands(
+            tuple(
+                c
+                for c in getattr(kernel, "operator_capabilities", ())
+                if "blas" in c.operator
+            )
+        )
+        codes.append(projection.codes)
+        stats.append(projection.stats)
+        caches.append(projection.fp16_cache)
+        descriptors.extend(
+            (
+                family,
+                decoder,
+                config.group_size,
+                projection.gguf_tm_k_ld,
+                projection.gguf_tm_q_ld,
+                config.partition_weight_shape[1],
+                projection.logical_output_size,
+                len(cb),
+                len(bb),
+            )
+        )
+        cache_bands.extend(cb)
+        blas_bands.extend(bb)
+    return codes, stats, caches, descriptors, cache_bands, blas_bands
+
+
+def _admitted_bands(capabilities):
+    return [
+        bound
+        for capability in capabilities
+        if capability.reason is None
+        for bound in (capability.min_m, capability.max_m or -1)
+    ]
+
+
+def prepare_gguf_projections(
+    sources, act_dtype, enabled, prefill_min_m, input_layout=None
+):
     """Coalesce adjacent compatible shards without changing projection order."""
     groups: list[tuple[list[torch.Tensor], int]] = []
     for weight, source_type in sources:
@@ -67,21 +355,38 @@ def prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m):
             act_dtype,
             enabled,
             prefill_min_m,
+            input_layout=input_layout,
         )
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
+    if input_layout is not None and not all(
+        projection.input_layout_restored for projection in projections
+    ):
+        # Keep every shard in the same input order when one cannot be restored.
+        reasons = [
+            p.rejection_reason for p in projections if not p.input_layout_restored
+        ]
+        fallback = prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m)
+        for projection in fallback:
+            projection.input_layout_rejection_reasons = reasons
+        return fallback
     return projections
 
 
 class GGUFPreparedProjection(Module):
     """One mixed projection; canonical preparation never changes its row order."""
 
-    def __init__(self, weight, source_type, act_dtype, enabled, prefill_min_m):
+    def __init__(
+        self, weight, source_type, act_dtype, enabled, prefill_min_m, input_layout=None
+    ):
         super().__init__()
         self.source_type = int(source_type)
         self.enabled = enabled
         self.prefill_min_m = prefill_min_m
         self.kernel = None
+        self.input_layout = input_layout
+        self.input_layout_restored = False
+        self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]
         self.source_output_sizes = (self.logical_output_size,)
         self.output_padding = 0
@@ -96,6 +401,13 @@ class GGUFPreparedProjection(Module):
                     requires_grad=False,
                 ),
             )
+        self.fp16_capabilities = (
+            fp16_projection_capabilities(self.source_type, weight, act_dtype, enabled)
+            if self.source_type in FP16_SOURCE_TYPES
+            else ()
+        )
+        if self.fp16_capabilities:
+            self.rejection_reason = self.fp16_capabilities[0].reason
 
     def _prepare(self, weight, act_dtype):
         if not self.enabled:
@@ -129,6 +441,28 @@ class GGUFPreparedProjection(Module):
             canonical = transcode(weight.detach().cpu().numpy(), self.source_type)
         except ValueError as error:
             return f"canonical_transcode_rejected:{error}"
+        if self.input_layout is not None:
+            if not isinstance(self.input_layout, GGUFHeadTilingLayout):
+                return "input_layout_codec_unavailable"
+            if not isinstance(canonical, AffineGGUFProjection):
+                return "input_layout_requires_affine_groups"
+            head_span, remainder = divmod(
+                self.input_layout.head_dim, canonical.group_size
+            )
+            if remainder:
+                return "input_layout_cuts_canonical_group"
+            canonical = replace(
+                canonical,
+                codes=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.codes), dim=1
+                ).numpy(),
+                scales=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
+                ).numpy(),
+                mins=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
+                ).numpy(),
+            )
         padding = -n % 32
         if padding:
             canonical = replace(
@@ -177,6 +511,7 @@ class GGUFPreparedProjection(Module):
             config, "codes", "stats", "mins" if config.zero_points else None
         )
         self.kernel.process_weights_after_loading(self)
+        self.input_layout_restored = self.input_layout is not None
         self.output_padding = padding
         self.cache_capabilities = dense_fp16_cache_capabilities(
             self.source_type, k, n, act_dtype, self.enabled
@@ -193,8 +528,12 @@ class GGUFPreparedProjection(Module):
         result = {
             "source_type": quant_type_name(self.source_type),
             "reason": self.rejection_reason,
+            "input_layout_restored": self.input_layout_restored,
+            "input_layout_rejection_reasons": self.input_layout_rejection_reasons,
             "source_output_sizes": list(self.source_output_sizes),
         }
+        if self.fp16_capabilities:
+            result["operators"] = [asdict(c) for c in self.fp16_capabilities]
         if self.kernel is not None:
             result["kernel"] = type(self.kernel).__name__
             result["local_weight_shape"] = list(
@@ -216,18 +555,35 @@ class GGUFPreparedProjection(Module):
         return result
 
     def forward(self, x):
+        if self.fp16_capabilities and self.fp16_capabilities[0].reason is None:
+            return torch.ops.vllm.prepared_gguf_fp16_projection(
+                x, self.weight, self.source_type, self.enabled
+            )
         if self.kernel is not None:
-            rows = x.numel() // x.shape[-1]
-            if self.fp16_cache is not None and any(
-                c.reason is None and c.supports_m(rows) for c in self.cache_capabilities
-            ):
-                output = torch.mm(x.reshape(-1, x.shape[-1]), self.fp16_cache.T)
-                return output.reshape(*x.shape[:-1], self.logical_output_size)
-            output = self.kernel.apply_weights(self, x)
-            return (
-                output[..., : self.logical_output_size]
-                if self.output_padding
-                else output
+            kernel = self.kernel
+            config = kernel.config
+            if isinstance(config, Sm70GgufAffineConfig):
+                family, decoder = 0, kernel.bits
+            elif isinstance(config, Sm70GgufLut4Config):
+                family, decoder = 1, kernel.lut_id
+            else:
+                family, decoder = 2, kernel.source_type
+            capabilities = getattr(kernel, "operator_capabilities", ())
+            blas = tuple(c for c in capabilities if "blas" in c.operator)
+            return torch.ops.vllm.prepared_gguf_projection(
+                x,
+                self.codes,
+                self.stats,
+                self.fp16_cache,
+                family,
+                decoder,
+                config.group_size,
+                self.gguf_tm_k_ld,
+                self.gguf_tm_q_ld,
+                config.partition_weight_shape[1],
+                self.logical_output_size,
+                _admitted_bands(self.cache_capabilities),
+                _admitted_bands(blas),
             )
         # Imported lazily because the GGUF method owns fallback dispatch.
         from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf

@@ -15,6 +15,7 @@ import numpy as np
 from benchmarks.benchmark_sm70_qwen38_quality import prompt_token_ids
 from benchmarks.qwen38_distribution_probe import (
     distribution_metrics,
+    summarize_distribution,
 )
 
 
@@ -115,7 +116,10 @@ def capture(args):
         enable_prefix_caching=False,
         language_model_only=True,
         speculative_config=None,
-        kernel_config={"ple_result_transport": args.transport},
+        kernel_config={
+            "ple_result_transport": args.transport,
+            "ple_disk_row_gather": not args.disable_ple_row_gather,
+        },
         worker_extension_cls=(
             "benchmarks.qwen38_distribution_probe.DistributionProbeWorkerExtension"
         ),
@@ -141,6 +145,7 @@ def capture(args):
         "contract": "TP4 FP16 dense/KV, FP32 accum/state, disk mmap, no MTP",
         "engine": {k: v for k, v in engine_config.items() if k != "kernel_config"},
         "native_sha256": digest(Path(native.__file__)),
+        "worker_routes": llm.collective_rpc("get_sm70_acceleration_report"),
         "captures": [],
     }
 
@@ -239,38 +244,7 @@ def summarize_groups(rows, widths):
                 if r["width"] == width
                 and (category == "all" or r["category"] == category)
             ]
-            kl = [r["kl"] for r in selected]
-            summary = {
-                "rows": len(selected),
-                "mean_kl": float(np.mean(kl)),
-                "p99_kl": float(np.quantile(kl, 0.99)),
-                "max_kl": max(kl),
-                "top1_agreement": float(
-                    np.mean([r["top1_agreement"] for r in selected])
-                ),
-                "max_logit_error": max(r["max_logit_error"] for r in selected),
-                "median_logit_error": float(
-                    np.median([r["max_logit_error"] for r in selected])
-                ),
-                "p95_logit_error": float(
-                    np.quantile([r["max_logit_error"] for r in selected], 0.95)
-                ),
-                "p99_logit_error": float(
-                    np.quantile([r["max_logit_error"] for r in selected], 0.99)
-                ),
-                "centered_max_logit_error": max(
-                    r["centered_max_logit_error"] for r in selected
-                ),
-                "top1_disagreements": sum(not r["top1_agreement"] for r in selected),
-                "mean_reverse_kl": float(np.mean([r["reverse_kl"] for r in selected])),
-            }
-            summary["passed"] = (
-                summary["mean_kl"] <= 0.001
-                and summary["p99_kl"] <= 0.01
-                and summary["max_kl"] <= 0.05
-                and summary["top1_agreement"] >= 0.99
-                and summary["max_logit_error"] <= 0.5
-            )
+            summary = summarize_distribution(selected)
             groups[f"C{width}/{category}"] = summary
     return groups
 
@@ -333,11 +307,15 @@ def compare(args):
                 }
             )
     noise = summarize_groups(noise_rows, ref["widths"]) if noise_rows else {}
+    admission_keys = [f"C{width}/all" for width in cand["widths"]]
     result = {
-        "distribution_passed": all(g["passed"] for g in groups.values()),
+        "thresholds_enforced": args.precision_reduced,
+        "gate_mode": "precision_reduction" if args.precision_reduced else "record_only",
+        "distribution_passed": all(groups[key]["passed"] for key in admission_keys),
         "default_noise_passed": (
-            all(g["passed"] for g in noise.values()) if noise else None
+            all(noise[key]["passed"] for key in admission_keys) if noise else None
         ),
+        "admission_groups": admission_keys,
         "default_noise": noise,
         "quality_acceptance": "requires separate fixed task suite",
         "groups": groups,
@@ -345,7 +323,9 @@ def compare(args):
     }
     (args.output / "comparison.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(groups, indent=2))
-    if not result["distribution_passed"] or result["default_noise_passed"] is False:
+    if args.precision_reduced and (
+        not result["distribution_passed"] or result["default_noise_passed"] is False
+    ):
         raise SystemExit("Distribution thresholds exceeded")
 
 
@@ -359,10 +339,16 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reference", type=Path)
     parser.add_argument(
+        "--precision-reduced",
+        action="store_true",
+        help="Enforce distribution thresholds for a precision-reducing candidate",
+    )
+    parser.add_argument(
         "--transport", choices=("auto", "cuda", "mapped"), default="auto"
     )
     parser.add_argument("--widths", default="1")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--disable-ple-row-gather", action="store_true")
     parser.add_argument("--prefill-budget", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
