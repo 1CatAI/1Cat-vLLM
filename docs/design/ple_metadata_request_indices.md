@@ -41,3 +41,22 @@ implementation only, without native overlays; `--profile --requests 1` allows
 a single CUDA-only profiler range. Use V100, CUDA12.8, Torch2.10cu128 and the
 ordinary installed artifact. Model replay spread and complete-round timings
 are checked separately before claiming end-to-end benefit.
+
+## Combined model check
+
+The final ordinary artifact includes this change and prepared GGUF head order.
+The full model's CUDA-only prefix API attribution has zero
+cudaStreamSynchronize calls on all four ranks. GGUF C1 I8192/O256 gives
+23.2973 and23.6183ms unobserved, with identical complete IDs across those
+controls and the earlier head-order run. C4 I128/O600 gives48.1459ms,
+with different trajectories from that earlier run; do not attribute its whole
+difference to metadata host work. The same-artifact NVFP4 controls are
+20.9488/20.5529ms C1 and46.3875ms C4.
+
+Actual GPU target entry spread has49.856us median but407.928us p90 and a
+14.722ms maximum under profiling. CPU replay submission still has1,366.582us
+median spread, with rank0 latest. Asynchronous submission overlaps preceding
+GPU work; eliminating these two stream waits does not eliminate all CPU
+asymmetry. No artificial rank barrier was introduced. Eight natural600-token
+prompts give paired acceptance44.246% versus45.204%, with difference95%
+interval −3.347 to+0.929pp. This small set cannot establish equivalence.
