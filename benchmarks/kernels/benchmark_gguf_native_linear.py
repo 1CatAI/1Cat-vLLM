@@ -8,6 +8,7 @@ admit any model shape. L2 eviction is outside the timed graph interval.
 
 import argparse
 import json
+from functools import partial
 from pathlib import Path
 
 import gguf
@@ -28,6 +29,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+")
+    parser.add_argument("--nvfp4-model", type=Path)
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -133,6 +135,56 @@ def main():
                     "clock_after": clocks(),
                 }
             )
+        nvfp4_reference = None
+        if args.nvfp4_model is not None:
+            from benchmark_sm70_nvfp4_qpn2 import _load_projection_shards
+
+            from vllm import _sm70_ops as ops
+
+            _, nv_down = _load_projection_shards(args.nvfp4_model, layer, 0, 4)
+            nv_codes, nv_scales = ops.nvfp4_qpn2_prepare_sm70(
+                nv_down.packed.cuda(), nv_down.scales.cuda()
+            )
+            nv_out = torch.empty_like(out)
+            nv_bytes = sum(t.numel() * t.element_size() for t in (nv_codes, nv_scales))
+            nv_timings = []
+            nv_call = partial(
+                ops.nvfp4_qpn2_gemm_sm70_out,
+                nv_out,
+                rows,
+                nv_codes,
+                nv_scales,
+                nv_down.inverse_global_scale,
+                16,
+                2,
+            )
+            for _ in range(2):
+                before = clocks()
+                us = cold_graph(
+                    nv_call,
+                    flush,
+                )
+                nv_timings.append(
+                    {
+                        "median_us": us,
+                        "effective_weight_gbps": nv_bytes / us / 1000,
+                        "clock_before": before,
+                        "clock_after": clocks(),
+                    }
+                )
+            nvfp4_reference = {
+                "model": args.nvfp4_model.name,
+                "layer": layer,
+                "m": 8,
+                "n": n,
+                "k": k,
+                "weight_stream_bytes": nv_bytes,
+                "operator": "nvfp4_qpn2_gemm_sm70_out",
+                "bn": 16,
+                "split_k": 2,
+                "timings": nv_timings,
+                "scope": "same-shape weights; no cross-model quality comparison",
+            }
         report["cases"].append(
             {
                 "layer": layer,
@@ -146,6 +198,7 @@ def main():
                 "checks": checks,
                 "graph_bitwise_equal": True,
                 "abba": timings,
+                "nvfp4_reference": nvfp4_reference,
             }
         )
         save()
