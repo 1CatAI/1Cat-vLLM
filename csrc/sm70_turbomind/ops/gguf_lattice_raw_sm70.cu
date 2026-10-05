@@ -540,7 +540,8 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
   uint8_t* tile = out + int64_t{first} * blocks * Decode::kBlockBytes +
                   int64_t{block} * width * Decode::kBlockBytes;
   const int packet_bytes = width * Decode::kPacketBytesPerRow;
-  for (int word = threadIdx.x; word < packet_bytes / 8; word += blockDim.x) {
+  for (int word = threadIdx.x; word < (packet_bytes + 7) / 8;
+       word += blockDim.x) {
     const int bit = word * 64;
     int index = bit / Decode::kPacketBits;
     int shift = -(bit % Decode::kPacketBits);
@@ -558,7 +559,8 @@ __global__ void compact_reorder_kernel(uint8_t* out, const uint8_t* source,
     // permutation; four natural uint16 writes avoid padding every macro-tile.
     auto* destination = reinterpret_cast<uint16_t*>(tile + word * 8);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) destination[j] = packed >> (j * 16);
+    for (int j = 0; j < 4; ++j)
+      if (word * 8 + j * 2 < packet_bytes) destination[j] = packed >> (j * 16);
   }
   if (threadIdx.x < width) {
     const auto* raw = source + int64_t{first + threadIdx.x} * stride +
