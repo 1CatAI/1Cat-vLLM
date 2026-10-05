@@ -169,10 +169,11 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
   }
 }
 
-template <int TileM, bool Activated>
-__global__ void raw_q6_dense(half* out, float* partial, const Q8_1* x,
-                             const uint8_t* weight, int m, int n, int k,
-                             int split, int out_stride, int row_stride) {
+template <int Reader, int TileM, bool Activated>
+__global__ void row_dense(half* out, float* partial, const Q8_1* x,
+                          const uint8_t* weight, const float* scales,
+                          const float* mins, int scale_stride, int m, int n,
+                          int k, int split, int out_stride, int row_stride) {
   extern __shared__ Q8_1 activations[];
   const int tiles_m = (m + TileM - 1) / TileM;
   const int begin_m = (blockIdx.x % tiles_m) * TileM;
@@ -193,7 +194,14 @@ __global__ void raw_q6_dense(half* out, float* partial, const Q8_1* x,
   const uint8_t* w = weight + int64_t{row} * row_stride;
   float values[TileM] = {};
   for (int group = begin + lane % 16; group < end; group += 16) {
-    const auto decoded = vllm::sm70_gguf::RawQ6KGroup::load(w, group);
+    const auto decoded = [&]() {
+      if constexpr (Reader == 0)
+        return vllm::sm70_gguf::RawQ6KGroup::load(w, group);
+      else
+        return vllm::sm70_gguf::RowIntegerGroup<Reader - 1>::load(
+            w, scales + int64_t{row} * scale_stride,
+            Reader == 2 ? mins + int64_t{row} * scale_stride : nullptr, group);
+    }();
 #pragma unroll
     for (int t = 0; t < TileM; ++t)
       if (begin_m + t < m)
@@ -214,24 +222,45 @@ __global__ void raw_q6_dense(half* out, float* partial, const Q8_1* x,
   }
 }
 
-template <int TileM, bool Activated>
-void launch_raw(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
-                torch::Tensor weight, int split) {
+template <int Reader, int TileM, bool Activated>
+void launch_row(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
+                torch::Tensor weight, torch::Tensor scales, torch::Tensor mins,
+                int split) {
   const int m = x.size(0), n = weight.size(0), k = x.size(1) * 32;
   const int shared = TileM * ((k / 32 + split - 1) / split) * sizeof(Q8_1);
   const auto stream = at::cuda::getCurrentCUDAStream();
-  raw_q6_dense<TileM, Activated>
+  row_dense<Reader, TileM, Activated>
       <<<dim3((n + 7) / 8 * ((m + TileM - 1) / TileM), split), 128, shared,
          stream>>>(reinterpret_cast<half*>(out.data_ptr()),
                    partial.data_ptr<float>(),
                    reinterpret_cast<const Q8_1*>(x.data_ptr()),
-                   weight.data_ptr<uint8_t>(), m, n, k, split, out.stride(0),
-                   weight.stride(0));
+                   weight.data_ptr<uint8_t>(),
+                   reinterpret_cast<const float*>(scales.data_ptr()),
+                   reinterpret_cast<const float*>(mins.data_ptr()),
+                   scales.dim() == 2 ? scales.stride(0) : 0, m, n, k, split,
+                   out.stride(0), weight.stride(0));
   if (Activated || split > 1)
     reduce_dense<Activated>
         <<<dim3(((Activated ? n / 2 : n) + 127) / 128, m), 128, 0, stream>>>(
             reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),
             m, n, split, out.stride(0));
+}
+
+template <int Reader>
+void dispatch_row(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
+                  torch::Tensor codes, torch::Tensor scales, torch::Tensor mins,
+                  int split, bool activated) {
+  if (x.size(0) == 1) {
+    if (activated)
+      launch_row<Reader, 1, true>(out, partial, x, codes, scales, mins, split);
+    else
+      launch_row<Reader, 1, false>(out, partial, x, codes, scales, mins, split);
+  } else {
+    if (activated)
+      launch_row<Reader, 5, true>(out, partial, x, codes, scales, mins, split);
+    else
+      launch_row<Reader, 5, false>(out, partial, x, codes, scales, mins, split);
+  }
 }
 
 template <int Kind, int TileM, bool Activated>
@@ -321,10 +350,22 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
     TORCH_CHECK(t.device() == x.device(),
                 "Integer GEMM tensors must share a CUDA device");
   if (codes.scalar_type() == torch::kUInt8) {
-    TORCH_CHECK(source_type == 14 && codes.dim() == 2 &&
-                    codes.is_contiguous() && codes.size(0) > 0 &&
-                    codes.size(1) == k / 256 * 210,
-                "Raw integer dense currently requires complete Q6_K rows");
+    const bool normalized = d.scalar_type() == torch::kFloat32;
+    const int group = source_type == 14 ? 16 : 32;
+    TORCH_CHECK(
+        codes.dim() == 2 && codes.is_contiguous() && codes.size(0) > 0 &&
+            codes.size(1) == (normalized ? k / (source_type == 14 ? 1 : 2)
+                                         : k / 256 * 210) &&
+            (normalized || source_type == 14),
+        "Invalid row integer storage");
+    if (normalized) {
+      TORCH_CHECK(d.dim() == 2 && d.is_contiguous() &&
+                      d.size(0) == codes.size(0) && d.size(1) == k / group &&
+                      dmin.scalar_type() == torch::kFloat32 &&
+                      dmin.is_contiguous() &&
+                      (source_type != 12 || dmin.sizes() == d.sizes()),
+                  "Invalid exact FP32 row coefficient storage");
+    }
     const int n = codes.size(0);
     TORCH_CHECK(!cooperative,
                 "Raw integer dense cooperative reduction unavailable");
@@ -340,17 +381,14 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
     const auto* props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(props->major == 7 && props->minor == 0,
                 "Integer GEMM requires SM70");
-    if (m == 1) {
-      if (activated)
-        launch_raw<1, true>(out, partial, x, codes, split);
-      else
-        launch_raw<1, false>(out, partial, x, codes, split);
-    } else {
-      if (activated)
-        launch_raw<5, true>(out, partial, x, codes, split);
-      else
-        launch_raw<5, false>(out, partial, x, codes, split);
-    }
+    if (!normalized)
+      dispatch_row<0>(out, partial, x, codes, d, dmin, split, activated);
+    else if (source_type == 14)
+      dispatch_row<1>(out, partial, x, codes, d, dmin, split, activated);
+    else if (source_type == 12)
+      dispatch_row<2>(out, partial, x, codes, d, dmin, split, activated);
+    else
+      dispatch_row<3>(out, partial, x, codes, d, dmin, split, activated);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }

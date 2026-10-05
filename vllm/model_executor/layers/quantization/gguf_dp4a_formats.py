@@ -97,6 +97,32 @@ class GGUFIntegerDotProjection:
             empty_s if small_mins is None else np.ascontiguousarray(small_mins.T),
         )
 
+    def row_storage(self, input_layout=None):
+        """Row integer codes with exact FP32 subgroup coefficients.
+
+        Half base scales times integer subgroup scales fit FP32 exactly. This
+        expands coefficients without introducing weight rounding, and avoids
+        repeated scale-level decoding in small matrix products.
+        """
+        packets, base, small, minimum, mins = self.packed(input_layout)
+        n, k = self.shape
+        words = packets.transpose(0, 2, 1).copy().reshape(n, -1)
+        codes = words.view(np.uint8).reshape(n, k if self.source_type == 14 else k // 2)
+        coefficients = base.T.astype(np.float32) * small.T.astype(np.float32)
+        offsets = (
+            np.empty(0, dtype=np.float32)
+            if self.dmin is None
+            else minimum.T.astype(np.float32) * mins.T.astype(np.float32)
+        )
+        empty = np.empty(0, dtype=np.int8)
+        return (
+            np.ascontiguousarray(codes),
+            np.ascontiguousarray(coefficients),
+            empty,
+            np.ascontiguousarray(offsets),
+            empty,
+        )
+
 
 def transcode_integer_dot(data: np.ndarray, source_type: int):
     if source_type not in (12, 14, 23):

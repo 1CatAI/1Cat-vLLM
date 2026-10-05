@@ -79,3 +79,22 @@ def test_integer_dot_preserves_official_fp32_weights_and_packed_codes(
     if kind == 12:
         reconstructed -= (dmin.T.astype(np.float32) * mins.T).repeat(32, axis=1)
     np.testing.assert_array_equal(reconstructed, restored(dequantize(raw, kind), 128))
+
+    row_codes, row_scales, _, row_mins, _ = codec.row_storage(layout)
+    if kind == 14:
+        row_values = row_codes.view(np.int8).astype(np.float32)
+    else:
+        nibble_words = row_codes.copy().view("<u4")
+        indices = (
+            (nibble_words[..., None] >> (4 * np.arange(8, dtype=np.uint32))) & 15
+        ).reshape(n, k)
+        if kind == 23:
+            row_values = np.asarray(gguf.quants.IQ4_NL.kvalues, dtype=np.float32)[
+                indices
+            ]
+        else:
+            row_values = indices.astype(np.float32)
+    row_reference = row_values * row_scales.repeat(codec.group_size, axis=1)
+    if kind == 12:
+        row_reference -= row_mins.repeat(32, axis=1)
+    np.testing.assert_array_equal(row_reference, restored(dequantize(raw, kind), 128))

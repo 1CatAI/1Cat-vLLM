@@ -125,6 +125,69 @@ struct LatticeDot {
 };
 using IQ3SDot = LatticeDot<21>;
 
+__device__ __forceinline__ uint32_t unpack_u4_word(uint32_t nibbles) {
+  return __byte_perm(nibbles & 0x0f0fU, (nibbles >> 4) & 0x0f0fU, 0x5140);
+}
+
+template <int Kind>
+struct RowIntegerGroup {
+  int words[8];
+  float scale0, scale1, minimum;
+  __device__ static RowIntegerGroup load(const uint8_t* row,
+                                         const float* scales, const float* mins,
+                                         int group) {
+    RowIntegerGroup result;
+    if constexpr (Kind == 0) {
+      const auto* packets = reinterpret_cast<const int4*>(row + group * 32);
+      const int4 a = packets[0], b = packets[1];
+      result.words[0] = a.x;
+      result.words[1] = a.y;
+      result.words[2] = a.z;
+      result.words[3] = a.w;
+      result.words[4] = b.x;
+      result.words[5] = b.y;
+      result.words[6] = b.z;
+      result.words[7] = b.w;
+      result.scale0 = scales[group * 2];
+      result.scale1 = scales[group * 2 + 1];
+      result.minimum = 0.f;
+    } else {
+      const int4 packet = *reinterpret_cast<const int4*>(row + group * 16);
+      const int packed[4] = {packet.x, packet.y, packet.z, packet.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t value = packed[i];
+        if constexpr (Kind == 1) {
+          result.words[2 * i] = unpack_u4_word(value);
+          result.words[2 * i + 1] = unpack_u4_word(value >> 16);
+        } else {
+          using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+          result.words[2 * i] = Lut::iq_values(value) ^ 0x80808080U;
+          result.words[2 * i + 1] = Lut::iq_values(value >> 16) ^ 0x80808080U;
+        }
+      }
+      result.scale0 = result.scale1 = scales[group];
+      result.minimum = Kind == 1 ? mins[group] : 0.f;
+    }
+    return result;
+  }
+  __device__ float dot(const Q8_1& x) const {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int a = 0, b = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) a = __dp4a(words[i], activation[i], a);
+#pragma unroll
+    for (int i = 4; i < 8; ++i) b = __dp4a(words[i], activation[i], b);
+    float result;
+    if constexpr (Kind == 0)
+      result = (float(a) * scale0 + float(b) * scale1) * __low2float(x.ds);
+    else
+      result = float(a + b) * scale0 * __low2float(x.ds);
+    if constexpr (Kind == 1) result -= minimum * __high2float(x.ds);
+    return result;
+  }
+};
+
 // Raw Q6_K integer groups share Q8_1 and dp4a arithmetic with lattice
 // projections. Signed subgroup scales stay in the integer dot domain.
 struct RawQ6KGroup {

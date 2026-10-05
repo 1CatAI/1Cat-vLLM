@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--join", nargs="+", default=[])
     parser.add_argument("--activated", action="store_true")
     parser.add_argument("--raw-source", action="store_true")
+    parser.add_argument("--row-major", action="store_true")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 20])
     parser.add_argument("--split", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--iterations", type=int, default=20)
@@ -98,6 +99,9 @@ def main():
     codec = transcode_integer_dot(raw, kind)
     n, k = codec.shape
     packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+    if args.row_major:
+        assert not args.raw_source
+        packed = [torch.from_numpy(t).cuda() for t in codec.row_storage()]
     if args.raw_source:
         assert kind == 14
         packed = [
@@ -125,7 +129,13 @@ def main():
         cache_policy="cold_L2_32MiB_read_write_eviction_before_each_projection",
         tensor=[args.tensor, *args.join],
         activated=args.activated,
-        storage="raw_Q6_K" if args.raw_source else "N32_integer_packets",
+        storage=(
+            "row_integer_fp32_coefficients"
+            if args.row_major
+            else "raw_Q6_K"
+            if args.raw_source
+            else "N32_integer_packets"
+        ),
         shape=[n, k],
         source_type=kind,
         tp_rank=args.rank,

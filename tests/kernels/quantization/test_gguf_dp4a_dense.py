@@ -23,23 +23,31 @@ def oracle(x):
 
 
 @pytest.mark.parametrize(
-    "kind,activated,raw_source",
+    "kind,activated,raw_source,row_major",
     [
-        (12, False, False),
-        (14, False, False),
-        (23, False, False),
-        (12, True, False),
-        (14, True, False),
-        (23, True, False),
-        (14, False, True),
-        (14, True, True),
+        (kind, activated, raw_source, False)
+        for kind, activated, raw_source in [
+            (12, False, False),
+            (14, False, False),
+            (23, False, False),
+            (12, True, False),
+            (14, True, False),
+            (23, True, False),
+            (14, False, True),
+            (14, True, True),
+        ]
+    ]
+    + [
+        (kind, activated, False, True)
+        for kind in (12, 14, 23)
+        for activated in (False, True)
     ],
 )
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("cooperative", [False, True])
 def test_dense_matches_official_q8_formula_and_output_views(
-    kind, activated, raw_source, m, split, cooperative
+    kind, activated, raw_source, row_major, m, split, cooperative
 ):
     n, k = 64, 768
     _, size = quant_size(kind)
@@ -56,6 +64,8 @@ def test_dense_matches_official_q8_formula_and_output_views(
     raw = blocks.reshape(n, -1)
     codec = transcode_integer_dot(raw, kind)
     packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+    if row_major:
+        packed = [torch.from_numpy(t).cuda() for t in codec.row_storage()]
     if raw_source:
         packed = [
             torch.from_numpy(raw).cuda(),
@@ -97,7 +107,7 @@ def test_dense_matches_official_q8_formula_and_output_views(
         assert torch.isfinite(out).all()
         assert torch.all(parent[:, :8] == -3) and torch.all(parent[:, -8:] == -3)
 
-    if raw_source and cooperative:
+    if (raw_source or row_major) and cooperative:
         with pytest.raises(
             RuntimeError, match="Raw integer dense cooperative reduction unavailable"
         ):
