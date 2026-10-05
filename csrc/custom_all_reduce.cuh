@@ -163,6 +163,13 @@ struct alignas(8) Sm70PushNormMeta {
                [kSm70PushNormParts];
   uint64_t inverse_packet[kSm70PushNormRows];
 };
+struct Sm70PushNormReferenceMeta {
+  uint32_t generation[kSm70PushNormRows];
+  uint32_t ready[kSm70PushNormRows][kSm70PushNormParts];
+  uint32_t normalized[kSm70PushNormRows];
+  float partial[kSm70PushNormRows][kSm70PushNormParts];
+  float inverse[kSm70PushNormRows];
+};
 constexpr size_t kSm70PushNormMetaBytes =
     ((sizeof(Sm70PushNormMeta) + 127) / 128) * 128;
 static_assert(kSm70PushNormMetaBytes == 512);
@@ -1704,7 +1711,7 @@ static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
 // All 40 CTAs fit on SM70. The row leader waits only for four local
 // partial reductions; no grid-wide synchronization is required.
-template <typename WeightT>
+template <typename WeightT, bool Reference = false>
 __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
     const WeightT* weight, half* output, float* residual_out, int rank,
@@ -1722,7 +1729,9 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   char* local =
       const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
       kSm70PushNormOffset;
-  auto* meta = reinterpret_cast<volatile Sm70PushNormMeta*>(local);
+  using Meta = std::conditional_t<Reference, Sm70PushNormReferenceMeta,
+                                  Sm70PushNormMeta>;
+  auto* meta = reinterpret_cast<volatile Meta*>(local);
   const uint32_t generation = meta->generation[row] + 1;
   const int epoch_offset = (generation & 1) * 4 * (Elements / P::size);
   const int pack = row * (Width / P::size) + part * PacksPerPart + tid;
@@ -1795,46 +1804,72 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   __shared__ float inverse;
   variance = Reduce(storage).Reduce(variance, CubAddOp{}, Threads);
   __syncthreads();
-  // A nonnegative sum of squares is its own readiness payload. There is
-  // no separate flag that needs a fence after storing the value.
-  const int phase = generation & 1;
-  if (tid == 0) meta->partial[phase][row][part] = variance;
-  __syncwarp();
-  if (part == 0 && tid < 32) {
-    float own_partial = 0;
-    if (tid < Parts) {
-      while (true) {
-        own_partial = meta->partial[phase][row][tid];
-        if (__float_as_uint(own_partial) != __float_as_uint(-1.0f)) break;
-      }
-    }
-    __syncwarp();
-    float total = 0;
-#pragma unroll
-    for (int p = 0; p < Parts; ++p)
-      total += __shfl_sync(0xffffffff, own_partial, p);
-    if (tid < Parts) meta->partial[phase][row][tid] = -1.0f;
+  if constexpr (Reference) {
     if (tid == 0) {
-      inverse = rsqrtf(total / Width + epsilon);
-      const uint64_t packet =
-          (uint64_t(generation) << 32) | __float_as_uint(inverse);
-      // The generation and inverse are one naturally aligned 64-bit store.
-      // Partial resets are only reused after the complete kernel finishes.
-      asm volatile(
-          "st.volatile.global.u64 [%0], %1;" ::"l"(&meta->inverse_packet[row]),
-          "l"(packet)
-          : "memory");
-      meta->generation[row] = generation;
+      meta->partial[row][part] = variance;
+      __threadfence();
+      meta->ready[row][part] = generation;
+      if (part == 0) {
+#pragma unroll
+        for (int p = 0; p < Parts; ++p)
+          while (meta->ready[row][p] != generation) {
+          }
+        float total = 0;
+#pragma unroll
+        for (int p = 0; p < Parts; ++p) total += meta->partial[row][p];
+        meta->inverse[row] = rsqrtf(total / Width + epsilon);
+        __threadfence();
+        meta->normalized[row] = generation;
+        // Every part has read generation before publishing its partial.
+        meta->generation[row] = generation;
+      } else {
+        while (meta->normalized[row] != generation) {
+        }
+      }
+      inverse = meta->inverse[row];
     }
-  } else if (part != 0 && tid == 0) {
-    uint64_t packet;
-    do {
-      asm volatile("ld.volatile.global.u64 %0, [%1];"
-                   : "=l"(packet)
-                   : "l"(&meta->inverse_packet[row])
-                   : "memory");
-    } while (uint32_t(packet >> 32) != generation);
-    inverse = __uint_as_float(uint32_t(packet));
+  } else {
+    // A nonnegative sum of squares is its own readiness payload. There is
+    // no separate flag that needs a fence after storing the value.
+    const int phase = generation & 1;
+    if (tid == 0) meta->partial[phase][row][part] = variance;
+    __syncwarp();
+    if (part == 0 && tid < 32) {
+      float own_partial = 0;
+      if (tid < Parts) {
+        while (true) {
+          own_partial = meta->partial[phase][row][tid];
+          if (__float_as_uint(own_partial) != __float_as_uint(-1.0f)) break;
+        }
+      }
+      __syncwarp();
+      float total = 0;
+#pragma unroll
+      for (int p = 0; p < Parts; ++p)
+        total += __shfl_sync(0xffffffff, own_partial, p);
+      if (tid < Parts) meta->partial[phase][row][tid] = -1.0f;
+      if (tid == 0) {
+        inverse = rsqrtf(total / Width + epsilon);
+        const uint64_t packet =
+            (uint64_t(generation) << 32) | __float_as_uint(inverse);
+        // The generation and inverse are one naturally aligned 64-bit store.
+        // Partial resets are only reused after the complete kernel finishes.
+        asm volatile("st.volatile.global.u64 [%0], %1;" ::"l"(
+                         &meta->inverse_packet[row]),
+                     "l"(packet)
+                     : "memory");
+        meta->generation[row] = generation;
+      }
+    } else if (part != 0 && tid == 0) {
+      uint64_t packet;
+      do {
+        asm volatile("ld.volatile.global.u64 %0, [%1];"
+                     : "=l"(packet)
+                     : "l"(&meta->inverse_packet[row])
+                     : "memory");
+      } while (uint32_t(packet >> 32) != generation);
+      inverse = __uint_as_float(uint32_t(packet));
+    }
   }
   __syncthreads();
   if (tid < PacksPerPart) {
@@ -2306,7 +2341,8 @@ class CustomAllreduce {
                                      const WeightT* weight,
                                      half* normalized_out, float* residual_out,
                                      int num_tokens, int hidden_size,
-                                     float epsilon) {
+                                     float epsilon,
+                                     bool benchmark_reference = false) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2327,9 +2363,16 @@ class CustomAllreduce {
     if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
       if (num_tokens == kSm70PushNormRows && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
-        sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
-            sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
-            residual_out, rank_, epsilon);
+        if (benchmark_reference) {
+          sm70_push_allreduce_gemma_rms_norm<WeightT, true>
+              <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,
+                                       weight, normalized_out, residual_out,
+                                       rank_, epsilon);
+        } else {
+          sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
+              sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
+              residual_out, rank_, epsilon);
+        }
         return;
       }
     }
