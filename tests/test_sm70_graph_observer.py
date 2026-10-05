@@ -53,3 +53,46 @@ def test_bounded_observer_reports_dropped_events():
     with rec.stage("second"):
         pass
     assert rec.read()["dropped"] == 1
+
+
+def test_target_replay_marks_actual_graph_and_excludes_draft():
+    class Graph:
+        def replay(self):
+            return "result"
+
+    graph = Graph()
+    manager = SimpleNamespace(run_fullgraph=lambda desc: graph.replay())
+    desc = SimpleNamespace(num_tokens=5, num_reqs=1, uniform_token_count=5)
+    rec = CPUStageRecorder(0)
+    rec.wrap_target_replay(manager, Graph)
+    assert manager.run_fullgraph(desc) == "result"
+    assert not rec.events
+    rec.enabled = True
+    assert manager.run_fullgraph(desc) == "result"
+    assert graph.replay() == "result"
+    assert [e["label"] for e in rec.events] == ["target.replay", "target.manager"]
+    assert rec.events[0]["tokens"] == 5
+    assert rec.events[1]["start_ns"] <= rec.events[0]["start_ns"]
+    assert rec.events[0]["end_ns"] <= rec.events[1]["end_ns"]
+
+
+def test_failed_manager_clears_target_context():
+    class Graph:
+        def replay(self):
+            return None
+
+    def fail(desc):
+        raise ValueError("manager failure")
+
+    rec = CPUStageRecorder(0)
+    rec.enabled = True
+    desc = SimpleNamespace(num_tokens=5, num_reqs=1, uniform_token_count=5)
+    # Call the wrapper retained on the manager, then verify an unrelated graph
+    # is not mistaken for a target replay after the exception.
+    manager = SimpleNamespace(run_fullgraph=fail)
+    rec.wrap_target_replay(manager, Graph)
+    with pytest.raises(ValueError, match="manager failure"):
+        manager.run_fullgraph(desc)
+    before = len(rec.events)
+    Graph().replay()
+    assert len(rec.events) == before

@@ -19,6 +19,7 @@ class CPUStageRecorder:
         self.events = []
         self.step = 0
         self.dropped = 0
+        self._target = threading.local()
 
     @contextmanager
     def stage(self, label, metadata=None):
@@ -64,6 +65,39 @@ class CPUStageRecorder:
 
         setattr(owner, name, observed)
 
+    def wrap_target_replay(self, manager, graph_class):
+        original_manager = manager.run_fullgraph
+        original_replay = graph_class.replay
+
+        @wraps(original_manager)
+        def managed(desc):
+            if not self.enabled:
+                return original_manager(desc)
+            fields = {
+                "tokens": desc.num_tokens,
+                "requests": desc.num_reqs,
+                "uniform": desc.uniform_token_count,
+            }
+            self._target.fields = fields
+            try:
+                with self.stage("target.manager", fields):
+                    return original_manager(desc)
+            finally:
+                self._target.fields = None
+
+        @wraps(original_replay)
+        def replay(graph):
+            fields = getattr(self._target, "fields", None)
+            if not self.enabled or fields is None:
+                return original_replay(graph)
+            # Timestamp immediately before the actual replay API, after any
+            # manager-side offloader wait. Drafter graphs remain excluded.
+            with self.stage("target.replay", fields):
+                return original_replay(graph)
+
+        manager.run_fullgraph = managed
+        graph_class.replay = replay
+
     def read(self, stop=True):
         if stop:
             self.enabled = False
@@ -108,16 +142,9 @@ class GraphParityWorkerExtension:
             rec.wrap(runner.block_tables, "apply_staged_writes", "block_tables.apply")
             rec.wrap(runner.speculator, "propose", "draft.propose")
             rec.wrap(runner._ple_offload_connector, "prepare_forward", "ple.prepare")
-            rec.wrap(
-                runner.cudagraph_manager,
-                "run_fullgraph",
-                "target.replay",
-                metadata=lambda desc: {
-                    "tokens": desc.num_tokens,
-                    "requests": desc.num_reqs,
-                    "uniform": desc.uniform_token_count,
-                },
-            )
+            import torch
+
+            rec.wrap_target_replay(runner.cudagraph_manager, torch.cuda.CUDAGraph)
             rec.wrap(AsyncOutput, "get_output", "output.materialize")
             rec.wrap(WorkerProc, "enqueue_output", "output.serialize")
         rec = self._graph_parity_recorder
