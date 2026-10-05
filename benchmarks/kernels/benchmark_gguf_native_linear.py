@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+")
     parser.add_argument("--nvfp4-model", type=Path)
+    parser.add_argument("--n64", action="store_true")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -77,10 +78,64 @@ def main():
             gguf.quants.dequantize(raw, tensor.tensor_type)
         ).cuda()
         assert official.shape == (n, k)
+        # Recover every operand in one actual K256 block with unit inputs.
+        # This also covers empty/unequal warp partitions, independently of
+        # random GEMM error norms and the existing pair's K1024 constraint.
+        block_size = raw.shape[1] // (k // 256)
+        block_n = 64 if args.n64 else 32
+        block_records = torch.from_numpy(
+            _SOURCE_PACKERS[source_type](
+                np.ascontiguousarray(raw[:block_n, :block_size])
+            )
+        ).cuda()
+        basis = torch.zeros(8, 256, dtype=torch.float16, device="cuda")
+        block_out = torch.empty(8, block_n, dtype=torch.float16, device="cuda")
+        block_partials = torch.empty(
+            block_n // 64, 2, 512, dtype=torch.float32, device="cuda"
+        )
+        block_counters = torch.zeros(block_n // 64, dtype=torch.int32, device="cuda")
+        for begin in range(0, 256, 8):
+            basis.zero_()
+            basis[:, begin : begin + 8].copy_(
+                torch.eye(8, dtype=torch.float16, device="cuda")
+            )
+            if args.n64:
+                torch.ops._C.gguf_native_linear_n64_sm70_out(
+                    block_out,
+                    basis,
+                    block_records,
+                    block_partials,
+                    block_counters,
+                    source_type,
+                )
+            else:
+                torch.ops._C.gguf_native_linear_sm70_out(
+                    block_out, basis, block_records, source_type
+                )
+            torch.testing.assert_close(
+                block_out,
+                official[:block_n, begin : begin + 8].T.half(),
+                rtol=0,
+                atol=0,
+            )
         out = torch.empty(8, n, dtype=torch.float16, device="cuda")
+        partials = torch.empty(n // 64, 2, 512, dtype=torch.float32, device="cuda")
+        counters = torch.zeros(n // 64, dtype=torch.int32, device="cuda")
 
-        def native(x, out=out, records=records, source_type=source_type):
-            torch.ops._C.gguf_native_linear_sm70_out(out, x, records, source_type)
+        def native(
+            x,
+            out=out,
+            records=records,
+            source_type=source_type,
+            partials=partials,
+            counters=counters,
+        ):
+            if args.n64:
+                torch.ops._C.gguf_native_linear_n64_sm70_out(
+                    out, x, records, partials, counters, source_type
+                )
+            else:
+                torch.ops._C.gguf_native_linear_sm70_out(out, x, records, source_type)
             return out
 
         def canonical(x, projections=projections):
@@ -114,6 +169,9 @@ def main():
                 graph.replay()
                 torch.accelerator.synchronize()
                 torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        if args.n64:
+            assert torch.count_nonzero(counters).item() == 0
+            assert torch.count_nonzero(block_counters).item() == 0
         flush = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
         timings = []
         for label, call in (
@@ -180,8 +238,8 @@ def main():
                 "k": k,
                 "weight_stream_bytes": nv_bytes,
                 "operator": "nvfp4_qpn2_gemm_sm70_out",
-                "bn": 16,
-                "split_k": 2,
+                "split_k": 16,
+                "accumulator_chains": 2,
                 "timings": nv_timings,
                 "scope": "same-shape weights; no cross-model quality comparison",
             }
@@ -194,9 +252,11 @@ def main():
                 "n": n,
                 "k": k,
                 "source_bytes": raw.nbytes,
+                "n64": args.n64,
                 "canonical_bytes": canonical_bytes,
                 "checks": checks,
                 "graph_bitwise_equal": True,
+                "official_half_operand_basis_equal": True,
                 "abba": timings,
                 "nvfp4_reference": nvfp4_reference,
             }
