@@ -158,3 +158,28 @@ The comparison precedes the inactive-row tag-reuse guard described in
 [the HC design](sm70_hc_ll_shards.md). The guard is qualified separately in a
 fresh normal extension; these round numbers are not relabeled as timings of
 that newer extension.
+
+## Guarded whole-model trace
+
+A subsequent complete installed extension includes inactive-row invalidation
+for HC tag wrap. Its Nsight graph-node trace has 1,263 target kernels per
+verification. The ordinary 48 input segment launches have mean service time
+24.91us. Shared gate/up plus SiLU launches 48 times at 16.87us, and its down
+stage uses the same segment decoder on the auxiliary stream. Across 45 complete
+rank-0 target-entry intervals, these shared stages total 1.293ms of service;
+1.142ms overlaps active main-stream kernels and only 0.151ms is uncovered.
+This overlap is diagnostic, not a removable unprofiled latency estimate.
+
+The measured expert integer route covers 47 layers: 20 IQ2_S, 17 IQ3_XXS and
+10 IQ3_S gate/up projections. Gate/up, down/unroute and activation encoding
+service total 2.789ms per target. The final IQ4_XS expert layer retains three
+TurboMind launches, 0.174ms total. HC has 96 down and 96 up launches, with
+combined service 2.450ms; independent microbenchmark timings do not include
+this model's arrival imbalance. Common router, attention and GDN routes are
+also present. No new implementation of those shared layer kernels is added.
+
+GPU target-entry skew is p50 0.586ms and p90 0.663ms. Rank-0 profiled complete
+rounds average 24.555ms: target envelope 18.284ms, target kernel interval union
+13.612ms, and tail envelope 6.270ms. The remaining target gaps include profiler
+instrumentation; these numbers are not substituted for the 22.107ms unprofiled
+joint result. The 18.5ms stage target and 0.1ms entry target remain unmet.
