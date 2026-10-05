@@ -455,7 +455,9 @@ def _dequantize_gguf_rows(
     )
     if dequant is None:
         dequant = ops.ggml_dequantize(quant, qweight_type, hidden_size, rows, dtype)
-    return dequant
+    # The legacy operator labels its dimensions in the opposite order;
+    # its contiguous payload is still a row-major embedding matrix.
+    return dequant.view(rows, hidden_size)
 
 
 def _dequantize_gguf_rows_fake(
