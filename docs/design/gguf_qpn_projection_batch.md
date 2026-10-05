@@ -69,3 +69,26 @@ A single post-batch capture follows the same historical trace fixture:
 The trace fixture uses top-p 0.95; the sixteen-prompt unprofiled comparison
 uses top-p 0.9. These contracts remain separate. Graph-linked results and
 projection/tail/gap attribution will be recorded after that capture completes.
+
+## Remaining shared integration boundaries
+
+The target-owned output head is called once by target rejection and once by
+draft proposal. The inputs are distinct and data dependent; the earlier trace
+does not establish an exact way to merge those GEMMs. Each reads 198656000
+canonical bytes per rank. Head arithmetic and sampling stay unchanged in this
+projection batch.
+
+The draft attention contract is FP16 KV, D128, eight query heads, two KV heads,
+832-token pages and non-causal 2048-token windows. The current FP16 grouped
+verifier is qualified for D256, six/one heads and full causal context.
+Enabling its model guard alone cannot serve the draft. A window-aware D128
+implementation or split-KV path needs separate operator/context checks.
+
+The shared TP4 push all-reduce/Gemma-RMS compiler pattern is available, but
+the model's direct-attention-output guard currently requires
+`quantization == "compressed-tensors"`. The GDN outer-all-reduce switch
+depends on that guard, leaving the GGUF collective inside the whole-layer
+operator. The compiler consequently cannot see it adjacent to the following
+norm. A shared implementation that admits operand capabilities can expose
+this boundary without adding a separate GGUF collective or norm kernel.
+The guard finding is a source inspection; no communication speedup is claimed.
