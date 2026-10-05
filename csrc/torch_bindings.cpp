@@ -243,6 +243,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
            &gguf_dp4a_down_unroute_sm70_out);
   ops.def(
+      "gguf_dense_restore_canonical_sm70_out(Tensor(a!) weight, Tensor(b!) "
+      "stats, "
+      "Tensor codes, Tensor high, Tensor scale, int fmt, int k, int n) -> ()");
+  ops.impl("gguf_dense_restore_canonical_sm70_out", torch::kCUDA,
+           &gguf_dense_restore_canonical_sm70_out);
+  ops.def(
+      "gguf_dense_segments_sm70_out(Tensor x, Tensor[] codes, Tensor[] high, "
+      "Tensor[] scale, Tensor(a!)[] out, int[] fmt, int[] n, int k, int split, "
+      "int warps, Tensor(b!) ws, Tensor(c!) cnt, Tensor? sgate=None) -> ()");
+  ops.impl("gguf_dense_segments_sm70_out", torch::kCUDA,
+           &gguf_dense_segments_sm70_out);
+  ops.def(
+      "gguf_shared_gate_up_sm70_out(Tensor x, Tensor[] gate, Tensor[] up, "
+      "int[] fmts, Tensor wg, Tensor(a!) h, Tensor(b!) sg, Tensor(c!) ws, "
+      "Tensor(d!) cnt, int split, int warps) -> ()");
+  ops.impl("gguf_shared_gate_up_sm70_out", torch::kCUDA,
+           &gguf_shared_gate_up_sm70_out);
+
+  ops.def(
       "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
       "cnt, "
       "int[] ll, Tensor(c!) seq, int rank, int variant) -> ()");
@@ -252,6 +271,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
       "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps) -> ()");
   ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
+
   ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
   ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
            &gguf_quantize_q8_1_sm70_out);

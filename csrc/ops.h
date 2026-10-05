@@ -990,6 +990,24 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor up, int64_t source_type,
                                 bool activated, int64_t lanes_per_row);
 
+void gguf_dense_segments_sm70_out(
+    torch::Tensor x, std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> high, std::vector<torch::Tensor> scale,
+    std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+    std::vector<int64_t> n, int64_t k, int64_t split, int64_t warps,
+    torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate);
+void gguf_shared_gate_up_sm70_out(torch::Tensor x,
+                                  std::vector<torch::Tensor> gate,
+                                  std::vector<torch::Tensor> up,
+                                  std::vector<int64_t> fmts, torch::Tensor wg,
+                                  torch::Tensor h, torch::Tensor sg,
+                                  torch::Tensor ws, torch::Tensor cnt,
+                                  int64_t split, int64_t warps);
+
+void gguf_dense_restore_canonical_sm70_out(
+    torch::Tensor weight, torch::Tensor stats, torch::Tensor codes,
+    torch::Tensor high, torch::Tensor scale, int64_t fmt, int64_t k, int64_t n);
+
 void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
                          torch::Tensor cnt, std::vector<int64_t> ll,
                          torch::Tensor seq, int64_t rank, int64_t variant);
