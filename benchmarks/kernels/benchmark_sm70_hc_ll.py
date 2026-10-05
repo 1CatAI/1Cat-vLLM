@@ -22,10 +22,50 @@ from vllm.distributed.device_communicators.sm70_hc_ll import Sm70HcLLCommunicato
 from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import _pack_hc_batch_weight
 
 
+def tag_wrap_case(owner, packed, rank):
+    torch.manual_seed(714)
+    old_x = torch.randn(20, 10240, device="cuda", dtype=torch.float16) * 0.5
+    new_x = torch.randn(20, 10240, device="cuda", dtype=torch.float16) * 0.5
+    pd, pu, sd, su = packed
+    partial = torch.empty((20, 20, 352), device="cuda", dtype=torch.float32)
+    lora = torch.empty((20, 320), device="cuda", dtype=torch.float16)
+    reference = torch.empty((20, 2560), device="cuda", dtype=torch.float16)
+    injection = torch.empty((20, 4), device="cuda", dtype=torch.float16)
+    ops.sm70_qwen38_hc_replicated(new_x, pd, pu, partial, lora, reference, injection)
+    owner.down_seq.fill_(255)
+    owner.up_seq.fill_(255)
+    owner.apply(old_x, sd, su)  # Page zero holds tag 257 in twenty rows.
+    torch.accelerator.synchronize()
+    dist.barrier()
+    # Skip complete tag cycles while preserving page parity. The last two
+    # small batches recreate the receive state of a long M5-only interval.
+    owner.down_seq.fill_(131323)
+    owner.up_seq.fill_(131323)
+    for _ in range(2):
+        owner.apply(new_x[:5], sd, su)
+    torch.accelerator.synchronize()
+    dist.barrier()
+    if rank == 0:
+        time.sleep(0.005)
+    candidate = owner.apply(new_x, sd, su)
+    torch.accelerator.synchronize()
+    assert candidate is not None
+    errors = [
+        float(
+            (a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-6)
+        )
+        for a, b in zip(candidate, (reference, injection))
+    ]
+    records = [None] * 4
+    dist.all_gather_object(records, dict(rank=rank, relative_max=errors))
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("weights", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--tag-wrap-only", action="store_true")
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(rank)
@@ -53,6 +93,14 @@ def main():
                 _pack_hc_batch_weight(full_up, "up", owner.logical_rank).cuda(),
             ]
         )
+    if args.tag_wrap_only:
+        records = tag_wrap_case(owner, packed[0], rank)
+        if rank == 0:
+            args.output.write_text(json.dumps(dict(wrap_records=records), indent=2))
+        owner.close()
+        dist.destroy_process_group()
+        assert all(max(r["relative_max"]) < 0.001 for r in records), records
+        return
     rows = []
     for m in (1, 5, 8, 20):
         torch.manual_seed(73)

@@ -92,6 +92,7 @@ __global__ void __launch_bounds__(32 * WARPS)
   const int packet = blockIdx.x, token_group = packet / 3;
   const int tile = packet % 3, s = blockIdx.y;
   const int first_row = token_group * 8;
+  const int total_m = M;
   const int groups_m = (M + 7) / 8;
   M = min(8, M - first_row);
   x += first_row * KD;
@@ -99,6 +100,12 @@ __global__ void __launch_bounds__(32 * WARPS)
   for (int i = 0; i < 4; ++i)
     if (pr.ll[i])
       pr.ll[i] += first_row * LW + ((ld_vol(pr.seq) + 1) & 1u) * 24 * LW;
+  // Inactive rows must not retain matching tags from an earlier modulo
+  // cycle. Only this generation's page is touched: a faster peer may
+  // already be writing the next page. All ranks have the same total_m.
+  if (packet == 0 && s == 0)
+    for (int i = threadIdx.x; i < (20 - total_m) * LW; i += blockDim.x)
+      pr.ll[pr.rank][total_m * LW + i] = 0;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3;
   const int col = quad * 8 + r;
@@ -206,6 +213,7 @@ __global__ void __launch_bounds__(32 * WARPS)
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int tile = blockIdx.x % 80, token_group = blockIdx.x / 80;
   const int first_row = token_group * 8;
+  const int total_m = M;
   M = min(8, M - first_row);
   x += first_row * KD;
   ll_lora += first_row * LW + (ld_vol(down_seq) & 1u) * 24 * LW;
@@ -219,6 +227,12 @@ __global__ void __launch_bounds__(32 * WARPS)
   const int branch = (lane >> 2) & 3;
   const int col = branch * 8 + r;
   const int rk = pr.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
+  if (token_group == 0)
+    for (int i = threadIdx.x; i < (20 - total_m) * 32; i += blockDim.x) {
+      const int row = total_m + i / 32, c = i % 32, src = c / 8;
+      // The local slice is written directly to out and is never polled.
+      if (src != rk) pr.ll[rk][row * HD + src * SW + tile * 8 + c % 8] = 0;
+    }
   const half* w = wu + static_cast<size_t>(tile) * 320 * 32;
   // Issue this CTA's weight loads first; they do not depend on the exchange.
   uint4 wlo[GW], whi[GW];
