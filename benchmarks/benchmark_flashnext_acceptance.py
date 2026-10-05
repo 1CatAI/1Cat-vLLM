@@ -93,12 +93,13 @@ def main():
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Use a normal installed source-containing wheel")
     if args.require_installed:
-        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
-
         import flash_attn_v100
 
         if "site-packages" not in Path(flash_attn_v100.__file__).parts:
             raise RuntimeError("Flash-V100 must resolve from the installed artifact")
+
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
         if "site-packages" not in Path(flash_attn_v100_cuda.__file__).parts:
             raise RuntimeError("Flash-V100 extension must resolve from the artifact")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False

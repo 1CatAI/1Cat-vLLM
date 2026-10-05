@@ -49,3 +49,34 @@ with rank 0 last in all 45 stable rounds. The other ranks differ by at most
 about 16us at p90. CPU stage observations show rank-0 PLE submission about
 120us longer than other ranks; output materialization includes GPU waits.
 This change does not reinterpret those waits as removable CPU work.
+
+## Installed-model results
+
+One installed Flash-Next IQ3_S TP4 model, FP16 MTP4, FULL target decode,
+FP16 KV and FP32 recurrent state compares both input implementations without
+reloading weights. C1 unobserved median is 21.671ms for the reference and
+21.551ms for fusion, p90 21.881ms and 21.767ms. Means are 21.692ms and
+21.970ms: fusion includes a transient outlier, so the mean is not reported as
+a speedup. Both cohorts emit 4.886 tokens per measured round. All four C1
+cohorts, including two CPU-observed runs, return identical output tokens.
+
+C4 reference/fused medians are 57.630/50.396ms, means 57.220/50.263ms.
+Output tokens match exactly and the candidate has no observed C4 regression.
+The reference is the first C4 cohort; its unusually large gap is not assigned
+to the input operator alone. These are node-validation measurements and do
+not establish a seven-millisecond isolated fusion gain.
+
+CPU submission skew medians are 0.927ms reference and 0.662ms fused.
+The fused observer has long submission outliers, p90 18.565ms; reference p90
+is 1.399ms. CPU launch times may lead queued GPU work. This does not establish
+the 0.1ms GPU-entry goal, and no new GPU-entry speed claim is made.
+
+Two bounded natural completions terminate normally. Sixty-four matched
+teacher distributions and eight natural-prompt acceptance records are retained
+alongside the model comparison. The 18.5ms C1 stage target remains open.
+
+The previous graph-node trace separates asynchronous output materialization:
+median 24.116ms total contains 24.086ms in cudaEventSynchronize. Work after
+that wait has median 30.311us and p90 84.625us. These profiled edge-inclusive
+ranges do not support treating the full materialization interval as CPU
+serialization overhead.
