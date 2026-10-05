@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.gguf_native_pair import (
 )
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
     _prepared_gguf_mixed_projection,
+    _prepared_gguf_projection,
     prepared_projection_arguments,
 )
 from vllm.platforms import current_platform
@@ -42,9 +43,26 @@ def _native_qkvz(
             out, rows, weights, scales, types, partials, counters
         )
     else:
-        quantized = _prepared_gguf_mixed_projection(
-            rows, codes, stats, caches, descriptors, cache_bands, blas_bands
-        )
+        if len(codes) == 1:
+            quantized = _prepared_gguf_projection(
+                rows,
+                codes[0],
+                stats[0],
+                caches[0],
+                descriptors[0],
+                descriptors[1],
+                descriptors[2],
+                descriptors[3],
+                descriptors[4],
+                descriptors[5],
+                descriptors[6],
+                cache_bands,
+                blas_bands,
+            )
+        else:
+            quantized = _prepared_gguf_mixed_projection(
+                rows, codes, stats, caches, descriptors, cache_bands, blas_bands
+            )
         outputs = [quantized]
         for weight in floating:
             outputs.append(
