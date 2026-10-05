@@ -184,6 +184,9 @@ and FP32 QK/PV accumulation with FP16 probability materialization.
 | --- | ---: | ---: | ---: | ---: |
 | HC, fixed normalization producers | 16 | 0.286003 / 0.439747 | 0.553579 / 1.103773 | 64 / 32 |
 | HC, fixed producers and preceding reduction | 16 | 0.351396 / 0.596746 | 0.663565 / 2.112250 | 80 / 32 |
+| HC, vector loads | 16 | 0.285962 / 0.434831 | 0.553473 / 1.101521 | 64 / 32 |
+| HC, vector loads and preceding reduction | 16 | 0.350290 / 0.586383 | 0.663231 / 2.078326 | 80 / 32 |
+| Packed per-token router and experts | 4 | 0.126536 / 0.497111 | 0.367809 / 0.857393 | 16 / 4 |
 | Experts with frozen native routing | 4 | 0.081592 / 0.112855 | 0.289295 / 0.456638 | 8 / 4 |
 | QSA, parallel heads | 12 | 0.554906 / 1.146860 | 1.032283 / 3.728270 | 48 / 12 |
 | QSA, Tensor Core QK/PV | 12 | 0.556790 / 0.665313 | 1.032655 / 1.981976 | 48 / 12 |
@@ -213,3 +216,20 @@ one invocation; it contributes no timing result.
 The account cannot change application clocks, so the historical/current clock
 difference remains unquantified. No clock setting changed. No runtime dispatch
 has changed and no candidate has passed model distribution admission.
+
+The packed-router follow-up uses a lossless layout matched to SM70 MMA
+fragments and one multi-warp router CTA per token. Routing IDs match for all
+four weight banks and all three activation scales; maximum output error is
+3.81e-6. M5 driver graph counts are 24 / 4, with zero single-CTA kernels in
+both arms. Packing removes much of the first router prototype's penalty but
+the complete segment remains slower at both widths and is rejected. The HC
+vector-load follow-up also remains slower at both widths, with and without
+the preceding production reduction, and is rejected.
+
+A forty-producer shared-M1 implementation is being prepared for the ordinary
+SM70 extension and opaque Python dispatch. M5 retains its existing native
+batched-up route; prefill retains ordinary projections. Standalone complete
+non-PLE decoder-layer captures retain actual M1 inputs and MTP4 verifier M5
+metadata. Those layer graphs are explicitly separated from the compiled
+whole-model endpoint. Ordinary-artifact build, layer and model distribution
+validation are still pending; no production admission is claimed.

@@ -49080,3 +49080,12 @@ without a veto, and FP32 reassociation does not require bit identity. Matching
 teacher-forcing KL mean/p99/max, top-1 agreement and natural termination remain
 required. Earlier producer/consumer expert and router variants regressed;
 the intermediate-fused and one-router-CTA schedules are distinct experiments.
+
+Flash-Next layer follow-up: vector-load HC is rejected (16 calls, M1
+0.285962→0.434831 ms; preceding native reduction 0.350290→0.586383 ms).
+Lossless packed per-token router plus experts is also rejected (four calls,
+M1 0.126536→0.497111 ms and M5 0.367809→0.857393 ms). Exact routing and
+smaller grids do not compensate for the segment latency. Shared M1 remains
+the only candidate with a material segment gain; ordinary native build and
+complete non-PLE decoder-layer validation are pending. M5 keeps the existing
+native batch route. None of these deltas is an admitted endpoint saving.

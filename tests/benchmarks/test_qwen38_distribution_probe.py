@@ -124,3 +124,17 @@ def test_distribution_thresholds_only_block_precision_reduction(
     assert result["distribution_passed"]
     assert not result["default_noise_passed"]
     assert result["thresholds_enforced"] == precision_reduced
+
+
+def test_distribution_summary_records_raw_error_without_veto():
+    from benchmarks.benchmark_sm70_qwen38_distribution import summarize_groups
+
+    row = {
+        "width": 1,
+        "category": "english",
+        **distribution_metrics([0, 1, 2], [4, 5, 6]),
+    }
+    summary = summarize_groups([row], [1])["C1/all"]
+    assert summary["passed"]
+    assert summary["max_logit_error"] == 4
+    assert summary["top1_agreement"] == 1
