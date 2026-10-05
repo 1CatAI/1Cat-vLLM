@@ -239,15 +239,20 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
                 data.numpy(), self._source_type, self.embedding_dim, self.org_vocab_size
             )
         else:
+            from vllm.model_executor.kernels.ple.gguf_pinned import (
+                pinned_table_load_affinity,
+            )
+
             self.materialize_tables()
             assert self.ple_device_table is not None
             assert self.ple_host_storage is not None
             start = self.shard_indices.org_vocab_start_index
             local = data[start : start + self.num_embeddings_per_partition]
             self.ple_device_table.copy_(local[: self._device_rows])
-            self.ple_host_storage.copy_(
-                local[self._device_rows : self._device_rows + self._host_rows]
-            )
+            with pinned_table_load_affinity():
+                self.ple_host_storage.copy_(
+                    local[self._device_rows : self._device_rows + self._host_rows]
+                )
         self._checkpoint_shard_loaded = True
 
     def materialize_tables(self):
@@ -260,12 +265,17 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
         self.ple_device_table = torch.empty(
             (placement.vram_rows, self._storage_dim), dtype=torch.uint8, device=device
         )
-        self.ple_host_storage = torch.empty(
-            (placement.host_rows, self._storage_dim),
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=placement.host_rows > 0,
+        from vllm.model_executor.kernels.ple.gguf_pinned import (
+            pinned_table_load_affinity,
         )
+
+        with pinned_table_load_affinity():
+            self.ple_host_storage = torch.empty(
+                (placement.host_rows, self._storage_dim),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=placement.host_rows > 0,
+            )
         self._device_rows, self._host_rows, self._disk_rows = (
             placement.vram_rows,
             placement.host_rows,

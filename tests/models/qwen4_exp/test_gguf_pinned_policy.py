@@ -111,3 +111,42 @@ def test_connector_only_skips_requests_for_owned_local_decode(
         connector, 4, 20, dummy_run=False, use_local_model=local_model
     )
     assert calls == ([] if local_model and pinned else [(4, 20)])
+
+
+def test_pinned_first_touch_affinity_restored_after_loader_error(monkeypatch):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm import platforms
+    from vllm.model_executor.kernels.ple import gguf_pinned as module
+
+    calls = []
+    monkeypatch.setattr(module, "pinned_decode_active", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 2)
+    monkeypatch.setattr(
+        platforms, "current_platform", SimpleNamespace(get_device_numa_node=lambda i: 1)
+    )
+    monkeypatch.setattr(module.Path, "read_text", lambda p: "24-25,72-73")
+    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: {0, 24, 72})
+    monkeypatch.setattr(
+        module.os, "sched_setaffinity", lambda _, cpus: calls.append(cpus)
+    )
+    with (
+        pytest.raises(ValueError, match="loader error"),
+        module.pinned_table_load_affinity(),
+    ):
+        assert calls == [{24, 72}]
+        raise ValueError("loader error")
+    assert calls == [{24, 72}, {0, 24, 72}]
+
+
+def test_disabled_pinned_load_keeps_existing_affinity(monkeypatch):
+    from vllm.model_executor.kernels.ple import gguf_pinned as module
+
+    monkeypatch.setattr(module, "pinned_decode_active", lambda: False)
+    calls = []
+    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: calls.append(True))
+    with module.pinned_table_load_affinity():
+        pass
+    assert calls == []

@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Admission for bounded, TP-sharded pinned GGUF PLE decode tables."""
 
+import os
+from contextlib import contextmanager
+from pathlib import Path
+
 from vllm.config import get_current_vllm_config_or_none
 
 
@@ -13,6 +17,39 @@ def pinned_decode_active(config=None) -> bool:
             getattr(config, "kernel_config", None), "ple_pinned_decode_active", False
         )
     )
+
+
+@contextmanager
+def pinned_table_load_affinity():
+    """First-touch pinned pages near this GPU, restoring the loader thread."""
+    original = None
+    if pinned_decode_active() and hasattr(os, "sched_getaffinity"):
+        import torch
+
+        from vllm.platforms import current_platform
+        from vllm.utils.cpu_resource_utils import parse_id_list
+
+        try:
+            device = torch.accelerator.current_device_index()
+            node = current_platform.get_device_numa_node(device)
+            if node is not None:
+                cpus = parse_id_list(
+                    Path(f"/sys/devices/system/node/node{node}/cpulist").read_text()
+                )
+                allowed = os.sched_getaffinity(0)
+                local = set(cpus) & allowed
+                if local:
+                    os.sched_setaffinity(0, local)
+                    original = allowed
+        except (OSError, AttributeError, ValueError):
+            # A restricted affinity or unknown topology keeps the existing
+            # placement. It does not change the packed-row numerical contract.
+            pass
+    try:
+        yield
+    finally:
+        if original is not None:
+            os.sched_setaffinity(0, original)
 
 
 def pinned_table_capability(

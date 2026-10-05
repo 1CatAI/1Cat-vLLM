@@ -15,6 +15,8 @@ def test_pinned_iq4nl_official_values_and_changed_graph_ids(rows):
     generator = np.random.default_rng(730)
     raw = generator.integers(0, 256, (512, 5, 18), dtype=np.uint8)
     scales = generator.uniform(0, 0.02, (512, 5)).astype(np.float16)
+    scales[0] = np.array([0, -0.0, 2**-24, -(2**-24), 2**-14], dtype=np.float16)
+    scales[1] *= -1
     raw[:, :, :2] = scales.view(np.uint8).reshape(512, 5, 2)
     raw = raw.reshape(512, 90)
     host = torch.empty(raw.shape, dtype=torch.uint8, pin_memory=True)
