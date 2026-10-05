@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// IQ3_S M8 gated pair, using a lossless source-byte permutation.
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
-#include "gguf_lattice_compact.cuh"
+#include "gguf_iq3_nibble_book.cuh"
 #include "src/turbomind/kernels/gemm/arch/mma_sm70.h"
 
 #define VLLM_SM70_MMA_8N8K4(C, A0, A1, B0, B1)                      \
@@ -17,20 +16,6 @@
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 namespace {
-// Reader only: original 26-bit packets stay tightly packed, without warp
-// shuffles.
-template <int CacheHint>
-__device__ uint2 direct_packet(const uint8_t* tile, int width, int octet,
-                               int col) {
-  const uint32_t* words = reinterpret_cast<const uint32_t*>(tile) + octet * 26;
-  const int bit = col * 26;
-  const uint32_t low =
-      CacheHint == 1 ? __ldcs(words + (bit >> 5)) : __ldcg(words + (bit >> 5));
-  const uint32_t high = CacheHint == 1 ? __ldcs(words + (bit >> 5) + 1)
-                                       : __ldcg(words + (bit >> 5) + 1);
-  return make_uint2(low, high);
-}
-
 // Fixed fields in aligned uint4 records. Crossing fields use one PRMT
 // byte window, with no dynamic funnelshift or address recomputation.
 template <int Bit>
@@ -51,7 +36,7 @@ __device__ __forceinline__ uint32_t signed_index(const uint32_t (&words)[13]) {
 }
 
 template <int SplitK, bool TwoChains, bool FullActivation = false,
-          int CacheHint = 1>
+          int CacheHint = 1, bool SharedA = false>
 __global__ void iq3_pair_kernel(half* __restrict__ output,
                                 const half* __restrict__ input,
                                 const uint8_t* __restrict__ gate,
@@ -60,12 +45,13 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
                                 int partitions) {
   constexpr int NAcc = TwoChains ? 2 : 1, RowTiles = 1;
   constexpr bool M1Only = false;
-  using D = vllm::sm70_gguf::LatticeCompactDecoder<21>;
+  using D = vllm::sm70_gguf::Iq3NibbleBookDecoder;
   union alignas(16) Storage {
     uint8_t grid[D::kSignedCodebookBytes];
     float partials[2][SplitK][256];
   };
   __shared__ Storage storage;
+  __shared__ half staged_a[SharedA ? SplitK : 1][8][136];
   uint8_t* grid = storage.grid;
   D::initialize<true>(grid);
   static_assert(RowTiles == 1 || RowTiles == 2,
@@ -102,6 +88,25 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       input + static_cast<size_t>(row) * k + part_begin * 128;
   int half_block = part_begin & 1;
   for (int part = 0; part < parts_per_warp; ++part) {
+    if constexpr (SharedA) {
+      // Every original activation vector is loaded by exactly one CTA thread.
+      // All K warps participate; both projection groups then read the same
+      // tile.
+      for (int vector = threadIdx.x; vector < SplitK * 8 * 16;
+           vector += blockDim.x) {
+        const int k_warp = vector / 128;
+        const int input_row = (vector / 16) & 7;
+        const int k_vector = vector & 15;
+        const int input_k =
+            k_warp * groups_per_warp * 16 + part * 128 + k_vector * 8;
+        const uint4 value = *reinterpret_cast<const uint4*>(
+            input + static_cast<size_t>(input_row) * k + input_k);
+        *reinterpret_cast<uint4*>(&staged_a[k_warp][input_row][k_vector * 8]) =
+            value;
+      }
+      __syncthreads();
+    }
+    const half* current_a = SharedA ? &staged_a[warp][row][0] : activation;
     if (part == 0 || half_block == 0) {
       const half d = reinterpret_cast<const half*>(metadata)[col];
       parameters.base = __halves2half2(d, d);
@@ -124,8 +129,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<26>(words), signed_index<39>(words),
           grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 0);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 8);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 0);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 8);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -141,8 +146,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<78>(words), signed_index<91>(words),
           grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 16);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 24);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 16);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 24);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -158,8 +163,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<130>(words),
           signed_index<143>(words), grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 32);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 40);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 32);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 40);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -175,8 +180,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<182>(words),
           signed_index<195>(words), grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 48);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 56);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 48);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 56);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -192,8 +197,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<234>(words),
           signed_index<247>(words), grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 64);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 72);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 64);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 72);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -209,8 +214,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<286>(words),
           signed_index<299>(words), grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 80);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 88);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 80);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 88);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -226,8 +231,8 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<338>(words),
           signed_index<351>(words), grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 96);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 104);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 96);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 104);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
@@ -243,14 +248,19 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
       const auto b1 = D::fragment_signed<half, true>(
           parameters, nibble, signed_index<390>(words),
           signed_index<403>(words), grid);
-      const uint4 a0 = *reinterpret_cast<const uint4*>(activation + 112);
-      const uint4 a1 = *reinterpret_cast<const uint4*>(activation + 120);
+      const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 112);
+      const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 120);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
       const unsigned* c = reinterpret_cast<const unsigned*>(&b1);
       VLLM_SM70_MMA_8N8K4(accum[0][0], a0.x, a0.y, b[0], b[1]);
       VLLM_SM70_MMA_8N8K4(accum[0][1 % NAcc], a0.z, a0.w, b[2], b[3]);
       VLLM_SM70_MMA_8N8K4(accum[0][2 % NAcc], a1.x, a1.y, c[0], c[1]);
       VLLM_SM70_MMA_8N8K4(accum[0][3 % NAcc], a1.z, a1.w, c[2], c[3]);
+    }
+    if constexpr (SharedA) {
+      // Shared A must remain live until both projection groups finish this
+      // tile.
+      __syncthreads();
     }
     payload += 1536;
     high_ptr += 32;
@@ -354,10 +364,10 @@ void gguf_iq3_gated_sm70_out(torch::Tensor out, torch::Tensor input,
               "IQ3 gated pair signed-record storage mismatch");
   const c10::cuda::CUDAGuard guard(input.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(
-      cudaFuncSetAttribute(iq3_pair_kernel<8, false, true, 1>,
-                           cudaFuncAttributePreferredSharedMemoryCarveout, 66));
-  iq3_pair_kernel<8, false, true, 1><<<136, 512, 0, stream>>>(
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      iq3_pair_kernel<8, false, true, 1, true>,
+      cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  iq3_pair_kernel<8, false, true, 1, true><<<136, 512, 0, stream>>>(
       (half*)out.data_ptr(), (const half*)input.data_ptr(),
       gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), 4352, 5120, 8, nullptr,
       nullptr, 1);

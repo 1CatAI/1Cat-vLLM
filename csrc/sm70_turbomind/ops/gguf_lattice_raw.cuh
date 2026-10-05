@@ -91,62 +91,6 @@ struct LatticeRawDecoder {
     }
   }
 
-  // Four biased codebook bytes have magnitudes strictly between -128 and
-  // 128 and are nonzero. Scatter four signs to byte MSBs; the addition has
-  // no inter-byte carries. Restore signs before the existing exact PRMT
-  // conversion and scale operations, without an expanded codebook.
-  __device__ static uint32_t signed_grid_bytes(uint32_t packed,
-                                               uint32_t signs) {
-    const uint32_t msbs = ((signs & 15U) * 0x10204080U) & 0x80808080U;
-    const uint32_t ones = msbs >> 7;
-    const uint32_t mask = (msbs - ones) | msbs;
-    return (packed ^ mask) + ones;
-  }
-
-  // Exact final FP16 operand formation, not an expanded coefficient. The
-  // small coefficient times a grid integer is exactly representable in half
-  // (IQ3_S <= 465, IQ2_S <= 1333/8). Original d has <= 11 significant bits,
-  // so the reference FP32 product is exact too. One final half2 multiply
-  // therefore matches FP32 dequantization followed by round-to-nearest half.
-  // Float output and vector FMA still use the original FP32 scale formula.
-  template <class Output, bool CachedBase = false>
-  __device__ static turbomind::Array<Output, 8> signed_table_fragment(
-      uint64_t packed, uint32_t signs, float d, int nibble,
-      half2 cached_base = {}) {
-    const uint32_t low =
-        signed_grid_bytes(static_cast<uint32_t>(packed), signs);
-    const uint32_t high =
-        signed_grid_bytes(static_cast<uint32_t>(packed >> 32), signs >> 4);
-    packed = low | (uint64_t{high} << 32);
-    signs = 0;
-    if constexpr (std::is_same_v<Output, half>) {
-      const float small =
-          Type == 21 ? float(1 + 2 * nibble) : (0.5f + nibble) * 0.25f;
-      const half2 factor = __float2half2_rn(small);
-      // The correction is exact in half: multiples of 128 for IQ3_S and
-      // 144 for IQ2_S. Fusing bias removal preserves the rounded operand.
-      const half2 correction = __hmul2(factor, __float2half2_rn(-1152.0f));
-      const half2 base = CachedBase ? cached_base : __float2half2_rn(d);
-      turbomind::Array<half, 8> result;
-#pragma unroll
-      for (int i = 0; i < 8; i += 2) {
-        constexpr uint32_t magic = 0x64006400U;
-        const uint32_t bytes = static_cast<uint32_t>(packed >> ((i / 4) * 32));
-        const uint32_t pair =
-            __byte_perm(bytes, magic, (i % 4) ? 0x7372 : 0x7170);
-        const half2 exact_factor =
-            __hfma2((const half2&)pair, factor, correction);
-        (half2&)result[i] = __hmul2(exact_factor, base);
-      }
-      return result;
-    } else {
-      static_assert(std::is_same_v<Output, float>);
-      const float scale =
-          Type == 21 ? d * (1 + 2 * nibble) : (d * (0.5f + nibble)) * 0.25f;
-      return table_values(packed, signs, scale);
-    }
-  }
-
   // Preserve the official multiplication order for both original scale levels.
   __device__ static float block_scale(const uint8_t* block, int base) {
     const float d = __half2float(*reinterpret_cast<const half*>(block));

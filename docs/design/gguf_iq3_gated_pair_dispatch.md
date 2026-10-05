@@ -31,8 +31,8 @@ A single dynamic compilation covers M=512/8/16/512 and keeps exactly one
 opaque gated-pair node. The existing runtime projection tests are rerun.
 Six targeted CPU tests passed with Torch 2.10 / CUDA 12.8.
 
-The native decoder uses the existing raw lattice device formula, with
-signed lookup and exact half unpacking. The original d and small scale
+The public nibble-book decoder uses exact signed lookup and half unpacking;
+the existing raw lattice device API remains intact. The original d and small scale
 remain separate. The reference forms GGUF weights using the official reader,
 and forms projection products with FP32 GEMM. Projection results and SiLU
 round to FP16 as in the existing path; the dot products and reduction remain
@@ -60,6 +60,27 @@ Duplicating the book was numerically bitwise equal to the retained control
 but gave no timing improvement. It is not selected. Read-only-cache,
 texture and bank-permutation variants are already rejected and are not
 repeated. Register prefetch/interleaving experiments are also closed.
+
+A subsequent matched shared-activation prototype loads A once per CTA into
+padded shared rows, reused by gate and up. Its ABBA medians are
+63.488 / 50.176 / 50.176 / 63.488us (non-staged / staged / staged / non-staged),
+with the original single-book control at 62.464us and NVFP4 at
+51.200/52.224us for split8/16. SM/memory remain 1290/877MHz. Output is
+bitwise equal to the retained IQ3 control; official-reference relative L2
+is 0.000495 and maximum absolute error 0.00390625, unchanged. The staged
+kernel uses 48 registers, 33,792 shared bytes, and no spills. Static loop
+instructions increase to 82.375/K16 while global-load sites decrease from
+22 to 7. This validates activation sharing rather than instruction-count
+reduction. The packaged candidate uses this measured N32 shared-A version.
+
+Wider N64 tasks with partition2 last-CTA reduction were also tested in one
+matched sweep. Grid80 gave 58.368us and grid160 gave 53.248us, repeated
+with unchanged results against N32 controls of 50.176us. The candidates
+used 62 registers, no spills and 41,472 shared bytes. The changed FP32
+reduction tree produced relative L2 7.153e-6 versus the retained output;
+all counters reset correctly across the 84-sample graph replay. These
+variants are slower and are not admitted. No separate reduction launch was
+introduced.
 
 Only eight layers have two IQ3_S FFN projections. Their source byte share is
 12.765% of all gate/up pairs. A 62.5us pair versus the recorded 76–81us
@@ -92,9 +113,9 @@ The 44.56MB source-correlated value is theoretical sector demand before
 cache hits; it does not mean measured activation-only L2 bytes. The
 hardware counter provides total L2 bytes, without separating A and B.
 The repeated activation demand justifies CTA-local staging and gate/up
-reuse. Actual shared-A and wider-N changes require their own correctness,
-resource and matched graph comparison before replacing this calibrated
-route.
+reuse. The matched shared-A result is recorded above. Wider-N changes require
+their own correctness, resource and matched graph comparison before replacing
+that candidate.
 
 ## Reproduction
 
