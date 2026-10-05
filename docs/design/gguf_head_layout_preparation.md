@@ -31,7 +31,7 @@ FP16 projection differences:
 M5 saves2.441us per projection, or about0.088ms for36 projections; this is
 an operator-based estimate, not measured full-model latency. M20 saves about
 0.085ms for36 projections. The expected graph-node reduction is one copy per
-restored projection. Model integration and graph-entry checks are pending.
+restored projection. Model checks are recorded below.
 
 Reproduce with `benchmarks/benchmark_gguf_head_layout.py MODEL.gguf OUTPUT.json`
 using the installed ordinary wheel, CUDA12.8/Torch2.10cu128, V100/SM70, FP16
@@ -51,3 +51,28 @@ projection across the complete layer bank is:
 Maximum FP16 output differences remain1.2207e-4 for M1 and2.4414e-4 for
 M5/M20. These are alternating-order CUDA graph microbenchmarks, not model
 round timings. Use `--all-output-projections` to run this complete bank.
+
+## Model check
+
+The ordinary wheel from the combined source `8a16ac46d0` runs Flash-Next
+IQ3_S with FP16 MTP4, TP4 V100, FULL graphs, FP16 KV/activations and FP32
+recurrent state. All36 output projections report restored input layouts.
+Eight natural prompts with a128-token budget produce plausible text and reach
+the length limit. Compared with the earlier600-token baseline, two128-token
+prefixes match exactly; six diverge at positions26,28,47,55,100 and123.
+These model outputs are not a bitwise-parity claim. A final600-token paired
+acceptance comparison is required after the remaining metadata changes.
+
+Independent C1 I8192/O256 probes give23.5600 and23.5698ms unobserved, with
+identical complete IDs across those controls and the23.6095ms observed arm.
+C4 I128/O600 gives49.2792ms. These are absolute measurements; the changed
+speculative trajectories do not support attributing the full difference from
+older model runs to this layout change. Operator-bank savings remain0.1066ms
+for M5 and0.1115ms for M20.
+
+Actual CPU replay entry over39 middle rounds has median69.925us,
+p90177.035us and maximum262.763us. This cohort meets the100us median
+objective, but its tail still exceeds100us. The benchmark's one-shot transfer
+diagnostic recorded no blocking-transfer stacks in this run, so those empty
+records are not evidence for a particular source call. A direct metadata
+microbenchmark is used to validate the separately scoped index-copy change.
