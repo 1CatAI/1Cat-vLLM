@@ -80,9 +80,20 @@ struct Transform_HMMA_SM70_Lattice {
         if constexpr (Original) {
           static_assert(Type == 21 || Type == 22);
           const int small = (metadata >> (Type == 21 ? 56 : 20)) & 15;
-          const half factor = __float2half_rn(Type == 21 ? 1.f + 2.f * small :
-                                                            (small + 0.5f) * 0.25f);
-          values = __hmul2(values, __halves2half2(factor, factor));
+          if constexpr (Type == 21) {
+            // Grid integers are positive 1..15. Both packed 16-bit
+            // products are <=465, so the FP16 magic conversion is exact.
+            const uint32_t integers = __byte_perm(bytes, 0, 0x4140) - 0x00800080U;
+            const uint32_t products = integers * (1 + 2 * small) + magic;
+            values = __hsub2((const half2&)products, (const half2&)magic);
+            const uint32_t signs = metadata >> (16 + base);
+            uint32_t sign_mask = ((signs >> i) & 1) << 15;
+            sign_mask |= ((signs >> (i + 1)) & 1) << 31;
+            (uint32_t&)values ^= sign_mask;
+          } else {
+            const half factor = __float2half_rn((small + 0.5f) * 0.25f);
+            values = __hmul2(values, __halves2half2(factor, factor));
+          }
         }
         (half2&)decoded[i] = __hmul2(values,(const half2&)scale);
       }

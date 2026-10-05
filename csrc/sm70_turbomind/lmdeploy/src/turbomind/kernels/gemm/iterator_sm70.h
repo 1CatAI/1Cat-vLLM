@@ -248,9 +248,11 @@ struct GmemIteratorSm70 {
       for (int c = 0; c < Map::kIterC; ++c) {
         if constexpr (kOriginalStats) {
           if (tile_mask && g_mask && pred_(s, c)) {
-            LoadOriginalBatch(frags[s][c],
-                original_row_ + c * Map::kDeltaC,
-                original_group_ + s * Map::kDeltaS);
+            PRAGMA_UNROLL
+            for (int i = 0; i < Map::kAccessC; ++i)
+              frags[s][c][i] = LoadOriginal(
+                  original_row_ + c * Map::kDeltaC + i,
+                  original_group_ + s * Map::kDeltaS);
           }
         } else {
           Copy2(frags[s][c], src_data_ + src_step_c_ * c,
@@ -289,46 +291,6 @@ struct GmemIteratorSm70 {
           turbomind::Store(dst, frags[s][c]);
         }
       }
-    }
-  }
-
-  __device__ void LoadOriginalBatch(AccessType& frag, int row, int group) const {
-    const int64_t count = int64_t{original_n_} * original_blocks_;
-    const auto* d = original_data_ + count * 64;
-    const auto* scales = original_data_ + count * 66;
-    const auto* high = scales + count * (OriginalType == 21 ? 4 : 8);
-    const int64_t index = int64_t{group} * original_n_ + row;
-    // N32 tiles and the map's vector alignment make each source word aligned.
-    // Load adjacent rows together, keeping original nibbles and d bits intact.
-    if constexpr (OriginalType == 21 && Map::kAccessC == 2) {
-      static_assert(Map::kDeltaC % 2 == 0);
-      const uint32_t ds = __ldg(reinterpret_cast<const uint32_t*>(d) +
-          (int64_t{group / 8} * original_n_ + row) / 2);
-      const uint8_t small = __ldg(scales + index / 2);
-      const uint16_t hi = __ldg(reinterpret_cast<const uint16_t*>(high) + index / 2);
-      const uint64_t signs = __ldg(reinterpret_cast<const uint64_t*>(high + count * 8) + index / 2);
-      PRAGMA_UNROLL
-      for (int i = 0; i < 2; ++i) {
-        frag[i] = uint64_t{(ds >> (16 * i)) & 65535} |
-            (uint64_t{static_cast<uint32_t>(signs >> (32 * i))} << 16) |
-            (uint64_t{(hi >> (8 * i)) & 255} << 48) |
-            (uint64_t{(small >> (4 * i)) & 15} << 56);
-      }
-    } else if constexpr (OriginalType == 22 && Map::kAccessC == 4) {
-      static_assert(Map::kDeltaC % 4 == 0);
-      const uint64_t ds = __ldg(reinterpret_cast<const uint64_t*>(d) +
-          (int64_t{group / 16} * original_n_ + row) / 4);
-      const uint16_t small = __ldg(reinterpret_cast<const uint16_t*>(scales) + index / 4);
-      const uint16_t hi = __ldg(reinterpret_cast<const uint16_t*>(high) + index / 4);
-      PRAGMA_UNROLL
-      for (int i = 0; i < 4; ++i) {
-        frag[i] = static_cast<uint32_t>((ds >> (16 * i)) & 65535) |
-            (((hi >> (4 * i)) & 15) << 16) | (((small >> (4 * i)) & 15) << 20);
-      }
-    } else {
-      PRAGMA_UNROLL
-      for (int i = 0; i < Map::kAccessC; ++i)
-        frag[i] = LoadOriginal(row + i, group);
     }
   }
 
