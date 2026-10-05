@@ -11,7 +11,8 @@ reasons. This changes no decoder, activation dtype or accumulation precision.
 The validation fixture covers head-group factors2 and3, M1/M5/M20/M512,
 official Q6_K dequantization and changed-input CUDA graph replay. Flash-Next
 uses factor3 and head dimension128; the TP4 output shape isN2560/K1536.
-Ten GPU checks and15 dense-admission CPU checks pass.
+Twenty-six GPU checks cover Q4_K/Q5_K/Q6_K, both head-group factors and
+all four M sizes;15 dense-admission CPU checks pass.
 
 A CUDA graph microbenchmark cycles six distinct real Q6_K output weights,
 with alternating A/B order over eight epochs. The six packed banks exceed
@@ -36,3 +37,17 @@ Reproduce with `benchmarks/benchmark_gguf_head_layout.py MODEL.gguf OUTPUT.json`
 using the installed ordinary wheel, CUDA12.8/Torch2.10cu128, V100/SM70, FP16
 activation/weights and FP32 accumulation. The stock gguf reader cannot open
 this mixed file because Q2_0 has type42; use the project's compatibility reader.
+
+The expanded benchmark cycles all36 real output projections (29 Q6_K,
+4 Q5_K,3 Q4_K) with the same TP4N2560/K1536 geometry. Mean time per
+projection across the complete layer bank is:
+
+|M|Input permutation(us)|Restored weights(us)|Saving for all36 projections(ms)|
+|---|---:|---:|---:|
+|1|19.036|14.397|0.1670|
+|5|18.010|15.048|0.1066|
+|20|21.081|17.984|0.1115|
+
+Maximum FP16 output differences remain1.2207e-4 for M1 and2.4414e-4 for
+M5/M20. These are alternating-order CUDA graph microbenchmarks, not model
+round timings. Use `--all-output-projections` to run this complete bank.
