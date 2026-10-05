@@ -23,7 +23,7 @@ from torch.utils.cpp_extension import load
 from vllm import _sm70_ops as ops
 
 
-def source_for_screen(source: Path) -> str:
+def source_for_screen(source: Path, decoder: str = "production") -> str:
     original = source.read_text()
     # Keep the exact production dequantization functions and MMA macro.
     helpers = original[
@@ -31,6 +31,27 @@ def source_for_screen(source: Path) -> str:
             "// Batch kernels share"
         )
     ]
+    if decoder == "prmt":
+        begin = helpers.index("__device__ __forceinline__ void dequant_e2m1x8")
+        helpers = (
+            helpers[:begin]
+            + """
+__device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
+                                             half2 output[4]) {
+  // Exact high bytes of half(0, .5, 1, 1.5, 2, 3, 4, 6). Low bytes are zero.
+  constexpr unsigned lo = 0x3e3c3800u;
+  constexpr unsigned hi = 0x46444240u;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const unsigned selector = ((packed >> (4*i)) & 7u) << 4 |
+                              ((packed >> (16+4*i)) & 7u) << 12;
+    const unsigned sign = (packed << (12-4*i)) & 0x80008000u;
+    unsigned bits = __byte_perm(lo, hi, selector) | sign;
+    output[i] = __hmul2(*reinterpret_cast<half2*>(&bits), scale);
+  }
+}
+"""
+        )
     macro = original[
         original.index("#define VLLM_SM70_QPN2_MMA") : original.index(
             "// Four row tiles reuse"
@@ -154,6 +175,9 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
+        "--decoder", choices=("production", "prmt"), default="production"
+    )
+    parser.add_argument(
         "--profile-launches-only",
         action="store_true",
         help="Collect hardware counters from direct launches without event graphs",
@@ -167,7 +191,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     cuda_source = args.source_root / "csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu"
     generated = args.out / "qpn2-stage-skeleton.cu"
-    generated.write_text(source_for_screen(cuda_source))
+    generated.write_text(source_for_screen(cuda_source, args.decoder))
     if args.extension is None:
         extension = load(
             name="round12_qpn2_stage_skeleton",
@@ -286,6 +310,7 @@ def main():
         research_only=True,
         measured_dram_bandwidth="Use NCU counters, not bytes/time",
         profiler_launches_only=args.profile_launches_only,
+        decoder=args.decoder,
     )
     (args.out / "result.json").write_text(json.dumps(record, indent=2))
     print(json.dumps(record), flush=True)
