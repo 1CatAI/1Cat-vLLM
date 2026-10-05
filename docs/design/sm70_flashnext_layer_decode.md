@@ -93,3 +93,32 @@ Compilation and Python syntax/lint checks have passed. GPU measurements,
 matched endpoint qualification and model distribution gates are pending. No
 speed improvement, kernel-count acceptance or default production admission is
 claimed yet.
+
+## Initial measurements
+
+The fresh integration-base endpoint records six samples at 11.889218,
+11.884385, 11.892540, 11.687132, 11.818170 and 11.590987 ms/token: median
+11.851278 ms/token. The arithmetic and exact-copy health prompts stop naturally
+with the requested answers. All four worker reports confirm FULL M1 capture.
+This establishes current-source reproduction, not a completed regression fix
+or distribution admission for a candidate.
+
+The complete-head GDN screen is rejected:
+
+| Width | Native core plus norm, 36 calls (ms) | Fused complete heads (ms) | Graph kernels, native/fused |
+| --- | ---: | ---: | ---: |
+| M1 | 0.229089 | 0.302019 | 72 / 36 |
+| M5 | 0.649751 | 1.098775 | 72 / 36 |
+
+Its independent FP32 state oracle has maximum error 7.45e-9. M1 output error
+is zero; M5 maximum output error is 3.05e-5, relative L2 2.23e-6. These are
+segment arithmetic checks, not model distribution gates. Twelve complete-head
+CTAs remove launch boundaries but lose the native state's tile parallelism.
+Do not tune this variant. A distinct screen preserves 192 state-tile producers
+and twelve fixed norm consumers in one resident kernel. The original negative
+measurement used profiler event counts; no measured grid geometry was exported.
+
+The initial shared-expert invocation failed before candidate execution because
+its control called a removed Python wrapper. Its corrected control calls the
+normal registered SiLU operator. This is benchmark plumbing, with no speed
+measurement or numerical admission from the failed invocation.
