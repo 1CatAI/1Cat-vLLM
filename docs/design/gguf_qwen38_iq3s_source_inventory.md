@@ -28,6 +28,10 @@ NVFP4, or Q2_0 tensors. IQ3_S alone occupies 30.975%; the filename does not
 mean that every weight uses that format. The three FFN projections account
 for **62.903%** of the payload.
 
+The checked-in [complete 64-layer type and projection table](gguf_qwen38_iq3s_layer_types.csv)
+records source bytes and each type’s share of its layer. Its 320 rows include
+floating parameters as well as quantized projections.
+
 Complete per-type/per-position/per-layer records are emitted in
 `by_type_role.csv`, `by_layer_type.csv` and `tensors.csv`, including logical N/K shapes, original
 source bytes, and GGUF data offsets. The position table above shows only the
