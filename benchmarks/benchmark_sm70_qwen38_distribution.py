@@ -273,7 +273,6 @@ def summarize_groups(rows, widths):
                 and summary["p99_kl"] <= 0.01
                 and summary["max_kl"] <= 0.05
                 and summary["top1_agreement"] >= 0.99
-                and summary["max_logit_error"] <= 0.5
             )
             groups[f"C{width}/{category}"] = summary
     return groups

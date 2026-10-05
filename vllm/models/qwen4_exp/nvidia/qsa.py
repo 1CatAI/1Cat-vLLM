@@ -834,6 +834,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+
+        if (
+            getattr(self, "_sm70_qwen38_qsa_jointprep", False)
+            and use_sm70_decode_graph_semantics()
+            and hidden_states.shape[0] in (1, 5)
+        ):
+            from .sm70_qsa_jointprep import joint_decode_forward
+
+            return joint_decode_forward(self, positions, output, hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]

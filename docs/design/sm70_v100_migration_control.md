@@ -49029,3 +49029,84 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## Flash-Next whole-layer decode campaign, 2026-10-05
+
+The owned line starts from `615710ae5106beeeab87950599fff28977e92962` and targets
+TP4 SM70 M1 decode, M5 verification, <=600 nodes with zero single-CTA kernels,
+and <=7.5 ms ordinary pure decode. PR #831 records disk/mapped PLE at
+10.98609 ms; the newer PR #885 requalification records 11.95157/11.87902 ms
+for reference/native CPU readers. This is separate from the earlier roughly
+97.7 tok/s pinned-UVA lane. The retained normal `fd65333826e9` package has
+identical CUDA/NVFP4 sources to the integration base; their differences are
+four GGUF Python files. Compare the old and recent disk artifacts under the
+same frozen contract before attributing a regressing commit.
+
+Five segment research implementations compile: two-kernel HC with redundant
+combine/norm and producer-pushed tagged packets, including a preceding
+all-reduce variant; one-kernel shared expert with intermediate tiling and
+ordered sums; one-kernel GDN recurrence plus gated norm with all M5 states;
+QSA selection/expansion/core/merge/gate; and router/expert compute with a
+single multiwarp router CTA, fused intermediate tiles and ordered W2 sums.
+No last-finisher CTA or floating atomic reduction is used. Cooperative launches
+ensure residency where required and do not contain a grid barrier.
+The same-contract current/PR #831 endpoint medians are 11.851278/11.882033
+ms/token, with all six timing token sequences identical. That recent source
+regression is not reproduced. Earlier 10.3 ms timings use pinned-UVA; historical
+disk records also have different active SM clocks (1507–1530 versus current
+1290 MHz), whose effect has not been quantified. Do not assign a regression
+commit from these unmatched records.
+
+All seven initial M1 segment screens reduce launch counts but fail the speed
+screen and are rejected. The tile-preserving GDN variant improves only the M5
+hot-state proxy, not M1 or a complete layer. Fixed HC normalization and batched
+Tensor Core shared-expert follow-ups are compiled and awaiting their lease;
+an expert-only graph isolates expert fusion from the single-CTA router.
+Those HC and expert follow-ups also regress M1. Three QSA schedules, including
+Tensor Core QK/PV with native exact selection, fail the segment speed screen.
+Forty K-partitioned shared-expert producers are the first M1 segment candidate:
+sixteen real weight banks measure 0.289782 / 0.193219 ms, 80 / 16 graph kernels,
+32 / 0 single-CTA kernels. This does not establish a complete-layer or model
+gain. Against the shipped MTP batched-up control, M5 measures 0.308644 /
+0.322171 ms and regresses; retain its existing route. The faster strict-FP32
+cuBLAS comparison is a separate policy and cannot be relabeled as MTP speed.
+New graph captures count driver nodes and dimensions directly rather than
+treat incomplete profiler events as complete counts. No route/default
+change or endpoint saving is accepted. Retain exclusions and exact-shape
+contracts in [the campaign record](sm70_flashnext_layer_decode.md).
+
+For this owner-directed campaign, maximum raw-logit difference is recorded
+without a veto, and FP32 reassociation does not require bit identity. Matching
+teacher-forcing KL mean/p99/max, top-1 agreement and natural termination remain
+required. Earlier producer/consumer expert and router variants regressed;
+the intermediate-fused and one-router-CTA schedules are distinct experiments.
+
+Flash-Next layer follow-up: vector-load HC is rejected (16 calls, M1
+0.285962→0.434831 ms; preceding native reduction 0.350290→0.586383 ms).
+Lossless packed per-token router plus experts is also rejected (four calls,
+M1 0.126536→0.497111 ms and M5 0.367809→0.857393 ms). Exact routing and
+smaller grids do not compensate for the segment latency. Shared M1 remains
+the only candidate with a material segment gain; ordinary native build and
+complete non-PLE decoder-layer validation are pending. M5 keeps the existing
+native batch route. None of these deltas is an admitted endpoint saving.
+
+Flash-Next coalesced HC is rejected: sixteen pairs, M1 0.285737→0.563507 ms
+and M5 0.553627→1.540300 ms; with preceding reduction, M1
+0.355041→0.807260 ms and M5 0.665983→2.927887 ms. Grouped peer writes do not
+recover the failed dataflow. Shared M1 gain reproduces in the ordinary native
+package (0.287642→0.192553 ms, eighty→sixteen kernels). M5 fallback has
+identical outputs and unchanged kernel count. Complete-layer compile plumbing
+is being corrected; no layer timing, KL, top-1 or natural-EOS candidate gate
+has passed yet.
+
+Flash-Next ordinary M1 complete-layer graphs now pass timing collection:
+GDN 0.152791→0.149709 ms, 25→21 kernels; QSA 0.304732→0.301912 ms,
+37→33. These are layer medians, not endpoint savings. The first shared model
+gate fails (192 rows, KL mean/p99/max 0.002515/0.032982/0.046212,
+top-1 97.396%), while both natural requests stop. All first prefill rows are
+exact; the missing native FP16 SiLU-before-multiply boundary is restored and
+the ordinary extension rebuilt for requalification. No raw-logit maximum veto
+is used. MTP layer collection retries at 32K capacity and 88% memory after
+64K attempts failed prefill memory and startup KV admission. QSA preparation,
+sigmoid-gated GDN convolution/core/norm and consumer-side HC gather layer
+screens remain pending; the global latency and kernel-count targets are open.
