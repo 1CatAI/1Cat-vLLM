@@ -531,6 +531,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     report["ple_result_transports"] = cfg.kernel_config.ple_result_transports
     report["ple_pinned_decoders"] = cfg.kernel_config.ple_pinned_decoders
+    report["ple_input_preparations"] = cfg.kernel_config.ple_input_preparations
     # Configuration policy is resolved once per engine. Actual kernel selection
     # still needs each loaded layer's local layout and native capabilities.
     policy = getattr(cfg.kernel_config, "sm70_nvfp4", None)
