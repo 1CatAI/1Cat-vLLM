@@ -90,6 +90,14 @@ def main():
         args.probe = args.node_trace = True
     if args.require_installed and "site-packages" not in vllm.__file__:
         raise RuntimeError("Use a normal installed source-containing wheel")
+    if args.require_installed:
+        import flash_attn_v100
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+        if "site-packages" not in Path(flash_attn_v100.__file__).parts:
+            raise RuntimeError("Flash-V100 must resolve from the installed artifact")
+        if "site-packages" not in Path(flash_attn_v100_cuda.__file__).parts:
+            raise RuntimeError("Flash-V100 extension must resolve from the artifact")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     prompts = json.loads(args.prompts.read_text())
@@ -146,6 +154,14 @@ def main():
         completions=[],
         trace_only=args.trace_only,
     )
+    if args.require_installed:
+        report["flash_v100_artifact"] = {
+            "package": flash_attn_v100.__file__,
+            "extension": flash_attn_v100_cuda.__file__,
+            "sha256": hashlib.sha256(
+                Path(flash_attn_v100_cuda.__file__).read_bytes()
+            ).hexdigest(),
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():

@@ -367,6 +367,9 @@ class Sm70GgufConfig:
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 
+    q8_expert_intermediate: bool = True
+    """Encode routed intermediates once in qualified integer expert gate/up."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 

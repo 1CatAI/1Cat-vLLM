@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF decoder families and prepared fallback operator capabilities."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -361,6 +361,21 @@ def dp4a_expert_capabilities(
             reason=reason,
         )
         for m in (5, 20)
+    )
+
+
+def q8_intermediate_expert_capabilities(*args, **kwargs):
+    """Same calibrated bands, with the packaged routed-Q8 protocol required."""
+    capabilities = dp4a_expert_capabilities(*args, **kwargs)
+    packet = getattr(torch.ops._C, "gguf_dp4a_gate_up_sm70_out", None)
+    supported = "lanes_per_row" in str(getattr(packet, "_schemas", {}))
+    return tuple(
+        replace(
+            c,
+            reason=c.reason
+            or (None if supported else "routed_q8_operator_protocol_unavailable"),
+        )
+        for c in capabilities
     )
 
 

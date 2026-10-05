@@ -988,7 +988,7 @@ void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
-                                bool activated);
+                                bool activated, int64_t lanes_per_row);
 
 void gguf_canonical_linear_n64_sm70_out(
     torch::Tensor output, torch::Tensor input, torch::Tensor weight,
