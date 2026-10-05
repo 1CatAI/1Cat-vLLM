@@ -81,3 +81,42 @@ def test_runtime_m_preserves_single_canonical_call(monkeypatch, source_type):
     assert calls[1] == (
         ("affine", 2, 16) if source_type == 10 else ("raw", source_type)
     )
+
+
+def test_dynamic_export_keeps_runtime_m_decision_opaque():
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("records", torch.empty(0, dtype=torch.uint8))
+            self.register_buffer("partials", torch.empty(80, 2, 512))
+            self.register_buffer("counters", torch.zeros(80, dtype=torch.int32))
+            self.register_buffer("codes", torch.empty(0, dtype=torch.int32))
+            self.register_buffer("stats", torch.empty(0, dtype=torch.int64))
+
+        def forward(self, x):
+            return torch.ops.vllm.gguf_native_linear(
+                x,
+                self.records,
+                self.partials,
+                self.counters,
+                21,
+                [self.codes],
+                [self.stats],
+                [None],
+                [2, 21, 32, 0, 0, 5120, 5120, 0, 0],
+                [],
+                [],
+            )
+
+    export = torch.export.export(
+        Model(),
+        (torch.empty(512, 4352, dtype=torch.float16),),
+        dynamic_shapes={"x": {0: torch.export.Dim("rows", min=1, max=8192)}},
+    )
+    nodes = [n for n in export.graph.nodes if n.op == "call_function"]
+    assert len(nodes) == 1
+    assert nodes[0].target == torch.ops.vllm.gguf_native_linear.default
+    value = nodes[0].meta["val"]
+    assert value.shape[1] == 5120
+    assert value.dtype == torch.float16
+    assert len(export.range_constraints) == 1
