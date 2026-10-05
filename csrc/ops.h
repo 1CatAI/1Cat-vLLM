@@ -943,3 +943,11 @@ void gguf_small_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor stats_ptrs,
                                      int64_t source_type, int64_t num_experts,
                                      int64_t group_size);
+
+void gguf_lattice_raw_dequantize_sm70_out(torch::Tensor out,
+                                          torch::Tensor weight,
+                                          int64_t source_type);
+void gguf_lattice_raw_grouped_gate_up_sm70_out(
+    torch::Tensor gate, torch::Tensor up, torch::Tensor input,
+    torch::Tensor gate_weights, torch::Tensor up_weights, torch::Tensor offsets,
+    torch::Tensor ids, int64_t source_type, int64_t top_k);

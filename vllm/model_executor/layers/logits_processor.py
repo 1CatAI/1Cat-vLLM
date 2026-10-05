@@ -548,6 +548,22 @@ class LogitsProcessor(PluggableLayer):
             logits = logits[..., : self.org_vocab_size]
         return self._apply_logits_transforms(logits)
 
+    def get_compact_target_probe_with_fallback(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        """Select a target probe whose caller restores ties and guards cutoffs."""
+        return self._get_topk_tokens_and_logits(
+            lm_head,
+            hidden_states,
+            top_k,
+            None,
+            retain_local_logits=True,
+            compact_target_probe=True,
+        )
+
     def _get_topk_tokens_and_logits(
         self,
         lm_head: VocabParallelEmbedding,
@@ -556,6 +572,7 @@ class LogitsProcessor(PluggableLayer):
         embedding_bias: torch.Tensor | None,
         *,
         retain_local_logits: bool,
+        compact_target_probe: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         """Vocab-parallel global top-k logits without gathering full vocab."""
         if top_k <= 0:
@@ -602,23 +619,33 @@ class LogitsProcessor(PluggableLayer):
                     logits = logits.clone()
                 logits[..., -num_pad:] = -float("inf")
 
-            logits_float = logits.float()
+            logits_float = logits.float() if not compact_target_probe else None
             postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
-            local_k = min(top_k, logits_float.shape[-1])
+            local_k = min(top_k, logits.shape[-1])
             stage_start = _cuda_stage_start(profile_enabled)
-            local_vals, local_indices = torch.topk(
-                logits_float,
-                k=local_k,
-                dim=-1,
-            )
+            selected = None
+            if compact_target_probe and local_k == 64:
+                from vllm.model_executor.layers.sm70_compact_topk import (
+                    compact_half_topk,
+                )
+
+                selected = compact_half_topk(logits)
+            if selected is None:
+                local_vals, local_indices = torch.topk(
+                    logits.float() if logits_float is None else logits_float,
+                    k=local_k,
+                    dim=-1,
+                )
+            else:
+                local_vals, local_indices = selected
             local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             stage_start = _cuda_stage_start(profile_enabled)
             vocab_start = lm_head.shard_indices.org_vocab_start_index
             local_global_indices = local_indices + vocab_start
             local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
-            local_vocab_size = int(logits_float.shape[-1])
+            local_vocab_size = int(logits.shape[-1])
         else:
             local_vals, local_global_indices = local_candidates
             local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)

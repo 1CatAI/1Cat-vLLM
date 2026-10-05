@@ -78,11 +78,13 @@ def _qwen38_gdn_projection_split_kernel(
     B: tl.constexpr,
     A: tl.constexpr,
     BLOCK: tl.constexpr,
+    COPY_QKV: tl.constexpr,
 ):
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
-    tl.store(qkv + row * QKV + col, value, col < QKV)
+    if COPY_QKV:
+        tl.store(qkv + row * QKV + col, value, col < QKV)
     tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
     if tl.program_id(1) == 0:
         tl.static_assert(B + A <= BLOCK)
@@ -104,10 +106,35 @@ def _split_gdn_projection_outputs(qkvz, ba):
         B=12,
         A=12,
         BLOCK=256,
+        COPY_QKV=True,
         num_warps=4,
         num_stages=1,
     )
     return out
+
+
+def _split_gdn_projection_tails(qkvz, ba, z_out):
+    """Copy z/b/a together while preserving the input QKV view and stride."""
+    m = qkvz.shape[0]
+    qkv = qkvz[:, :2560]
+    b, a = (qkvz.new_empty((m, 12)) for _ in range(2))
+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
+        qkvz,
+        ba,
+        qkv,
+        z_out,
+        b,
+        a,
+        QKV=2560,
+        Z=1536,
+        B=12,
+        A=12,
+        BLOCK=256,
+        COPY_QKV=False,
+        num_warps=4,
+        num_stages=1,
+    )
+    return qkv, b, a
 
 
 def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool:
