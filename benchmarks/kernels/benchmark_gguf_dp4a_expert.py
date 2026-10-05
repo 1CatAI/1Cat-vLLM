@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Real IQ3_S TP4 expert dots, including quantization/routing accounting."""
+"""Real lattice TP4 expert dots, including quantization/routing accounting."""
 
 import argparse
 import hashlib
@@ -87,6 +87,7 @@ def main():
     parser.add_argument("--m", type=int, nargs="+", default=[5, 20])
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--activation-std", type=float, default=1.0)
     parser.add_argument("--nvfp4", type=Path)
     args = parser.parse_args()
     assert "site-packages" in vllm.__file__, vllm.__file__
@@ -101,11 +102,15 @@ def main():
         )
         for name in ("gate", "up")
     ]
-    assert all(int(t.tensor_type) == 21 for t in tensors)
+    source_type = int(tensors[0].tensor_type)
+    assert source_type in (18, 21, 22)
+    assert all(int(t.tensor_type) == source_type for t in tensors)
     banks, sources = [], []
     for tensor in tensors:
         raw = [
-            RawGGUFProjection.from_rows(rows, 21).tp_slice(args.rank, 4, axis=0)
+            RawGGUFProjection.from_rows(rows, source_type).tp_slice(
+                args.rank, 4, axis=0
+            )
             for rows in tensor.data
         ]
         banks.append(torch.from_numpy(np.stack([r.data for r in raw])).cuda())
@@ -118,16 +123,20 @@ def main():
         "core_sha256": hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest(),
         "shape": [experts, n, k],
         "layer": args.layer,
+        "source_type": source_type,
+        "activation_std": args.activation_std,
+        "calls_per_graph": 16,
         "cases": [],
     }
     for m in args.m:
         torch.manual_seed(20261005 + m)
-        x = (torch.randn((m, k), device="cuda") * 0.125).half()
-        ids = torch.randn((m, experts), device="cuda").topk(10, dim=1).indices
+        x = (torch.randn((m, k), device="cuda") * args.activation_std).half()
+        ids = torch.randn((m, experts), device="cuda").topk(10, dim=1).indices.int()
         sorted_ids, order = ids.flatten().sort(stable=True)
         offsets = torch.searchsorted(
             sorted_ids, torch.arange(experts + 1, device="cuda")
         ).int()
+        sorted_i64 = sorted_ids.long()
         routed = x[order // 10].contiguous()
         old_gate, old_up = [
             torch.empty((m * 10, n), device="cuda", dtype=torch.float16)
@@ -143,17 +152,19 @@ def main():
         def native(
             old_gate=old_gate,
             old_up=old_up,
+            sorted_i64=sorted_i64,
             routed=routed,
             banks=banks,
             offsets=offsets,
-            sorted_ids=sorted_ids,
         ):
             torch.ops._C.gguf_lattice_raw_grouped_gate_up_sm70_out(
-                old_gate, old_up, routed, *banks, offsets, sorted_ids, 21, 10
+                old_gate, old_up, routed, *banks, offsets, sorted_i64, source_type, 10
             )
 
         def dp4a(fused=fused, q8=q8, ids=ids, banks=banks):
-            torch.ops._C.gguf_dp4a_gate_up_sm70_out(fused, q8, ids, *banks, 21, True)
+            torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+                fused, q8, ids, *banks, source_type, True
+            )
 
         def combined(quantize=quantize, dp4a=dp4a):
             quantize()
@@ -161,7 +172,9 @@ def main():
 
         quantize()
         native()
-        torch.ops._C.gguf_dp4a_gate_up_sm70_out(debug, q8, ids, *banks, 21, False)
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            debug, q8, ids, *banks, source_type, False
+        )
         dp4a()
         integer_x = q8[:, :, 4:].view(torch.int8).float()
         d = q8[:, :, :2].contiguous().view(torch.float16).float()
@@ -171,7 +184,7 @@ def main():
             expected = torch.empty((m, 10, n), dtype=torch.float32, device="cuda")
             for expert in ids.unique().tolist():
                 weight = torch.from_numpy(
-                    dequantize(sources[projection][expert], 21)
+                    dequantize(sources[projection][expert], source_type)
                 ).cuda()
                 locations = (ids == expert).nonzero()
                 expected[locations[:, 0], locations[:, 1]] = (

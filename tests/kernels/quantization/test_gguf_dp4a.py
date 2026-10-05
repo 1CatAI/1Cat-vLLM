@@ -55,25 +55,33 @@ def test_q8_1_matches_round_away_oracle_and_graph(m):
 
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("activated", [False, True])
-def test_iq3_s_dot_matches_official_weight_and_q8_oracle(m, activated):
+@pytest.mark.parametrize("source_type,block_bytes", [(18, 98), (21, 110), (22, 82)])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_lattice_dot_matches_official_weight_and_q8_oracle(
+    m, activated, source_type, block_bytes, index_dtype
+):
     experts, n, k, top_k = 4, 7, 768, 2
     rng = np.random.default_rng(21)
     weights, reference = [], []
     for _ in range(2):
-        data = rng.integers(0, 256, (experts * n, k // 256, 110), dtype=np.uint8)
+        data = rng.integers(
+            0, 256, (experts * n, k // 256, block_bytes), dtype=np.uint8
+        )
         d = rng.uniform(0.001, 0.005, data.shape[:2]).astype("<f2")
         data[:, :, :2] = d[..., None].view(np.uint8)
         data = data.reshape(experts * n, -1)
-        raw = RawGGUFProjection.from_rows(data, 21)
+        raw = RawGGUFProjection.from_rows(data, source_type)
         weights.append(torch.from_numpy(raw.data.reshape(experts, n, -1)).cuda())
         reference.append(
-            torch.from_numpy(dequantize(data, 21)).reshape(experts, n, k).cuda()
+            torch.from_numpy(dequantize(data, source_type))
+            .reshape(experts, n, k)
+            .cuda()
         )
     torch.manual_seed(970 + m)
     x = (torch.randn((m, k), device="cuda") * 0.125).half()
     ids = torch.stack(
         (torch.zeros(m, dtype=torch.int64), torch.arange(m) % 3 + 1), 1
-    ).cuda()
+    ).to(device="cuda", dtype=index_dtype)
     q8 = torch.empty((m, k // 32, 36), dtype=torch.uint8, device="cuda")
     out = torch.empty(
         (m, top_k, n) if activated else (m, top_k, 2, n),
@@ -83,7 +91,9 @@ def test_iq3_s_dot_matches_official_weight_and_q8_oracle(m, activated):
 
     def run():
         torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
-        torch.ops._C.gguf_dp4a_gate_up_sm70_out(out, q8, ids, *weights, 21, activated)
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            out, q8, ids, *weights, source_type, activated
+        )
 
     def check():
         q, d, _ = quantize_reference(x)

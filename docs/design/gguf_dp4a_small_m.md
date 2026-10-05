@@ -61,3 +61,30 @@ the same Q8_1 activations is0.00020–0.00021; against the FP16-activation
 control it is0.0053–0.0054. These are projection measurements, not model
 KL, top1, acceptance or end-to-end latency evidence. No model dispatch is
 enabled by this initial result.
+
+## Two-row layout
+
+Nsight Compute on the first IQ3_S M5 kernel confirms37.7% long-scoreboard
+stalls,56 registers per thread, and762,602 shared-load bank conflicts.
+DRAM bytes read are17.41MB, consistent with the unique-source estimate;
+profiled kernel duration is not substituted for unprofiled timing.
+Reducing registers to40 introduces stack spills and regresses M5 to68.54us
+and M20 to194.75us. That variant is removed.
+
+Using16 lanes per row instead gives two rows per warp and keeps all lanes
+busy for K2560's80 activation groups. It retains56 registers without spills.
+Sixteen calls per graph replay remove host starvation from the short encoder.
+The new input standard deviation is1.0, reported with the benchmark.
+
+| M | Native gate/up | dp4a fused | Q8_1 plus fused | Unique-source bandwidth |
+|---|---:|---:|---:|---:|
+|5|63.61us|34.28us|35.71us|505.00GB/s|
+|20|213.83us|111.88us|113.55us|530.47GB/s|
+
+M5 reaches1530MHz after the warm-up epochs; its later candidate epochs are
+34.19–34.35us. The same M5 NVFP4 plan/W13 control is39.17us. M20's heavier
+workload runs at1470–1485MHz. This passes the IQ3_S expansion threshold in
+the sustained M5 clock band; it does not assert450GB/s at1290MHz.
+The nine focused tests and real-weight oracle checks still pass. The operator
+remains separate from model dispatch pending format, down-reduction and
+model-quality checks.
