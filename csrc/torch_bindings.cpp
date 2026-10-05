@@ -56,6 +56,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor[] weights, Tensor[] stats, int[] types, "
       "Tensor(b!) partials, Tensor(c!) counters) -> ()");
   ops.impl("gguf_qkvz_sm70_out", torch::kCUDA, &gguf_qkvz_sm70_out);
+  ops.def(
+      "gguf_small_output_sm70_out(Tensor(a!) output, Tensor input, Tensor "
+      "weight, "
+      "Tensor(b!) partials, Tensor(c!) counters, int type, int splits, bool "
+      "gdn_head_tiling) -> ()");
+  ops.impl("gguf_small_output_sm70_out", torch::kCUDA,
+           &gguf_small_output_sm70_out);
   ops.impl("gguf_native_linear_sm70_out", torch::kCUDA,
            &gguf_native_linear_sm70_out);
   ops.def(

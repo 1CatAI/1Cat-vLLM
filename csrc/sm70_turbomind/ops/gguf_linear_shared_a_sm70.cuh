@@ -55,14 +55,15 @@ struct CanonicalAffineReader {
 // Two N32 subtiles share the pair's activation staging and codebook. Two
 // global K partitions expose 160 CTAs for N5120, with no separate reduction
 // launch. Partial sums remain FP32 until the last CTA writes the output.
-template <class Reader, bool Canonical = false>
+template <class Reader, bool Canonical = false, int GlobalSplitK = 2,
+          bool HeadTiledInput = false>
 __device__ __forceinline__ void native_linear_n64_body(
     half* __restrict__ output, const half* __restrict__ input,
     const uint8_t* __restrict__ weight, const uint32_t* __restrict__ stats,
     float* __restrict__ partials, int* __restrict__ counters, int n, int k,
     int tile, int scratch_tile, int output_stride, int output_offset,
     int stats_stride, uint8_t* shared) {
-  constexpr int SplitK = 8, GlobalSplitK = 2;
+  constexpr int SplitK = 8;
   uint8_t* book = shared;
   auto* reductions = reinterpret_cast<float (*)[SplitK][256]>(shared);
   auto* staged_a = reinterpret_cast<half(*)[8][136]>(shared + 16384);
@@ -99,8 +100,14 @@ __device__ __forceinline__ void native_linear_n64_body(
           global_first + k_warp * local_parts / SplitK + part;
       const int end_part = global_first + (k_warp + 1) * local_parts / SplitK;
       if (input_part < end_part) {
+        int logical_part = input_part;
+        if constexpr (HeadTiledInput) {
+          // The TP4 GDN shard contains four groups of three 128-wide heads.
+          // Restore the adapter's head order while staging A, without a copy.
+          logical_part = (input_part % 4) * 3 + input_part / 4;
+        }
         const uint4 value = *reinterpret_cast<const uint4*>(
-            input + int64_t{input_row} * k + input_part * 128 + k_vector * 8);
+            input + int64_t{input_row} * k + logical_part * 128 + k_vector * 8);
         *reinterpret_cast<uint4*>(&staged_a[k_warp][input_row][k_vector * 8]) =
             value;
       }
@@ -127,6 +134,13 @@ __device__ __forceinline__ void native_linear_n64_body(
 #pragma unroll
   for (int part = 0; part < SplitK; ++part)
     sum += reductions[subtile][part][element];
+  if constexpr (GlobalSplitK == 1) {
+    const int column = tile * 64 + subtile * 32 + element % 32;
+    if (column < n)
+      output[int64_t{element / 32} * output_stride + output_offset + column] =
+          __float2half_rn(sum);
+    return;
+  }
   const int partial_base = (scratch_tile * GlobalSplitK + blockIdx.y) * 512;
   volatile float* published = partials;
   published[partial_base + threadIdx.x] = sum;
