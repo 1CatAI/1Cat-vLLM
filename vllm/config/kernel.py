@@ -552,6 +552,13 @@ class KernelConfig:
     )
     """Observed per-layer result transport and small pinned-buffer sizes."""
 
+    ple_input_prepare: bool = True
+    """Fuse qualified SM70 PLE context gathering and query-boundary staging."""
+    ple_input_preparations: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed PLE input operator selection and fallback reasons."""
+
     @field_validator("moe_backend", mode="before")
     @classmethod
     def _normalize_moe_backend(cls, value: Any) -> Any:
@@ -582,6 +589,8 @@ class KernelConfig:
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_result_transports",
+            "ple_input_prepare",  # Input staging is outside the compiled model.
+            "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
