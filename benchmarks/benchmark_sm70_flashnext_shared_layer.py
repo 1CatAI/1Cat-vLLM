@@ -38,6 +38,7 @@ def snapshot(value):
 class SharedLayerWorkerExtension:
     def reset_layer_research_routes(self):
         self._qsa_jointprep = self._gdn_conv_chain = self._hc_sharded = False
+        self._qsa_package = False
         for layer, *_ in self._shared_layer_records.values():
             gdn = getattr(layer, "linear_attn", None)
             qsa = getattr(layer, "self_attn", None)
@@ -48,6 +49,11 @@ class SharedLayerWorkerExtension:
             for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
                 if hasattr(hc, "_hc_sharded_enabled"):
                     hc._hc_sharded_enabled = False
+
+    def enable_retained_shared_chain(self, layers):
+        self.reset_layer_research_routes()
+        # Leave the admitted QSA route fixed in both shared-expert arms.
+        return {"rank": self.rank, "shared_layers": layers}
 
     def enable_retained_qsa_jointprep(self, layers):
         from benchmarks.kernels.sm70_qsa_jointprep_research import attach
@@ -521,6 +527,12 @@ def main():
         # Keep successful phases even if a later research phase fails.
         save()
         for enabled, name, layer_ids, method in (
+            (
+                args.qsa_package and args.width == 1,
+                "shared_expert_with_qsa_package",
+                args.layers,
+                "enable_retained_shared_chain",
+            ),
             (
                 args.also_qsa_jointprep,
                 "qsa_jointprep",

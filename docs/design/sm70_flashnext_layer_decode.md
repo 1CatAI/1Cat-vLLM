@@ -348,5 +348,8 @@ credited to this production variant before measurement.
 The new HC peer-push/sharded-up phase reduces four graph kernels per decoder
 layer but regresses M1 complete-layer time: GDN 0.147343/0.195369 ms and QSA
 0.303332/0.339579 ms. Counts are 21/17 and 33/29, respectively. It is rejected
-for M1 without further tuning. The already queued actual-MTP M5 screen remains
-pending; no production HC dispatch is added.
+without further tuning. Actual MTP4 M5 also regresses: GDN
+0.276275/0.447232 ms (28/24 kernels), QSA 0.453240/0.612452 ms (41/37).
+The GDN M5 profiler includes one additional event in each arm, so its event
+stream is marked incomplete; counts above come from retained CUDA driver graph
+nodes. No production HC dispatch is added.
