@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Validate installed IQ3_S/IQ4_XS gated pairs on actual TP4 weight slices."""
+"""Validate installed mixed gated pairs on actual TP4 weight slices."""
 
 import argparse
 import json
@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+", default=[39, 42])
+    parser.add_argument(
+        "--prototype-iq3-xxs",
+        action="store_true",
+        help="Test the unadmitted IQ3_XXS reader through the raw operator",
+    )
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -36,7 +41,12 @@ def main():
     for layer in args.layers:
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
-        assert tuple(types) in ((21, 23), (23, 21)), types
+        allowed = (
+            ((18, 21), (21, 18))
+            if args.prototype_iq3_xxs
+            else ((21, 23), (23, 21), (18, 21), (21, 18))
+        )
+        assert tuple(types) in allowed, types
         raw = [tensors[name].data[:4352].copy() for name in names]
         sources = [
             (torch.from_numpy(data).cuda(), kind) for data, kind in zip(raw, types)
@@ -45,8 +55,32 @@ def main():
         layer_module = torch.nn.Module()
         layer_module.prefix = f"model.layers.{layer}.mlp.gate_up_proj"
         layer_module.gguf_tm_projections = torch.nn.ModuleList(projections)
-        admission = prepare_native_gated_pair(layer_module, sources, projections, True)
-        assert admission["reason"] is None, admission
+        if args.prototype_iq3_xxs:
+            from vllm.model_executor.layers.quantization.gguf_iq3_records import (
+                signed_index_records,
+            )
+            from vllm.model_executor.layers.quantization.gguf_iq3_xxs_records import (
+                pack_iq3_xxs_records,
+            )
+
+            layer_module.gguf_native_gated_records = torch.nn.ParameterList(
+                torch.nn.Parameter(
+                    torch.from_numpy(
+                        (pack_iq3_xxs_records if kind == 18 else signed_index_records)(
+                            data
+                        )
+                    ).cuda(),
+                    False,
+                )
+                for data, kind in zip(raw, types)
+            )
+            layer_module.gguf_native_gated_types = tuple(types)
+            admission = {"model_admitted": False, "reason": "prototype_not_calibrated"}
+        else:
+            admission = prepare_native_gated_pair(
+                layer_module, sources, projections, True
+            )
+            assert admission["reason"] is None, admission
         references = [
             torch.from_numpy(
                 gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))

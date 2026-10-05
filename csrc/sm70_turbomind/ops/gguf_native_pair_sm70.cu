@@ -8,14 +8,30 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "gguf_pair_shared_a_sm70.cuh"
 
+using R18 = vllm::sm70_gguf::NativePairReader<18>;
 using R21 = vllm::sm70_gguf::NativePairReader<21>;
 using R23 = vllm::sm70_gguf::NativePairReader<23>;
+namespace {
+template <class Gate, class Up>
+void launch_pair(torch::Tensor output, torch::Tensor input, torch::Tensor gate,
+                 torch::Tensor up, int n, int k, cudaStream_t stream) {
+  using namespace vllm::sm70_gguf;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      native_pair_shared_a_kernel<Gate, Up>,
+      cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  native_pair_shared_a_kernel<Gate, Up><<<n / 32, 512, 0, stream>>>(
+      reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), n, k);
+}
+}  // namespace
+
 void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
                                torch::Tensor gate, torch::Tensor up,
                                int64_t gate_type, int64_t up_type) {
-  TORCH_CHECK(
-      (gate_type == 21 && up_type == 23) || (gate_type == 23 && up_type == 21),
-      "GGUF native pair requires IQ3_S/IQ4_XS in either orientation");
+  TORCH_CHECK((gate_type == 21 && (up_type == 23 || up_type == 18)) ||
+                  ((gate_type == 23 || gate_type == 18) && up_type == 21),
+              "GGUF native pair requires IQ3_S with IQ4_XS or IQ3_XXS");
   TORCH_CHECK(output.is_cuda() && input.is_cuda() && gate.is_cuda() &&
                   up.is_cuda() && output.device() == input.device() &&
                   gate.device() == input.device() &&
@@ -33,31 +49,24 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(m == 8 && output.size(0) == m && n > 0 && n % 32 == 0 && k > 0 &&
                   k % 1024 == 0 && n <= INT_MAX && k <= INT_MAX,
               "GGUF native pair requires M8/N32/K1024");
-  TORCH_CHECK(gate.numel() == n * (k / 256) * (gate_type == 21 ? 110 : 136) &&
-                  up.numel() == n * (k / 256) * (up_type == 21 ? 110 : 136),
+  const auto block_bytes = [](int64_t type) {
+    return type == 18 ? 98 : type == 21 ? 110 : 136;
+  };
+  TORCH_CHECK(gate.numel() == n * (k / 256) * block_bytes(gate_type) &&
+                  up.numel() == n * (k / 256) * block_bytes(up_type),
               "Mixed pair record byte count mismatch");
   const c10::cuda::CUDAGuard guard(input.device());
   const auto* properties = at::cuda::getDeviceProperties(input.get_device());
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "GGUF native pair requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  using namespace vllm::sm70_gguf;
-  if (gate_type == 21) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        native_pair_shared_a_kernel<R21, R23>,
-        cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    native_pair_shared_a_kernel<R21, R23><<<n / 32, 512, 0, stream>>>(
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-        gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), n, k);
-  } else {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
-        native_pair_shared_a_kernel<R23, R21>,
-        cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-    native_pair_shared_a_kernel<R23, R21><<<n / 32, 512, 0, stream>>>(
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-        gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(), n, k);
-  }
+  if (gate_type == 21 && up_type == 23)
+    launch_pair<R21, R23>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 23)
+    launch_pair<R23, R21>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 18)
+    launch_pair<R18, R21>(output, input, gate, up, n, k, stream);
+  else
+    launch_pair<R21, R18>(output, input, gate, up, n, k, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

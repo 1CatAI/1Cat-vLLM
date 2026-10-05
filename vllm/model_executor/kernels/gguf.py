@@ -112,8 +112,8 @@ def native_gated_pair_capabilities(
     enabled: bool = True,
     compute_capability: int = 70,
 ) -> tuple[GGUFOperatorCapability, ...]:
-    """Joint IQ3_S/IQ4_XS readers; only measured M8 shapes are admitted."""
-    if source_types not in ((21, 23), (23, 21)):
+    """Joint original-byte readers; only measured M8 shapes are admitted."""
+    if source_types not in ((21, 23), (23, 21), (18, 21), (21, 18)):
         return ()
     operator = "gguf_native_pair_sm70_out"
     reason = None
