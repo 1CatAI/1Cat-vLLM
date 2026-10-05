@@ -168,13 +168,27 @@ void run(torch::Tensor x, torch::Tensor w13, torch::Tensor w2,
               partial.numel() >= 10 * m * 2560 && flags.numel() >= 80 &&
               epochs.numel() >= 40);
   const auto* props = at::cuda::getCurrentDeviceProperties();
+  int active = 0;
+  TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                  &active, shared_expert_mma_chain, 256, 0) == cudaSuccess);
   TORCH_CHECK(props->major == 7 && props->minor == 0 &&
-              props->multiProcessorCount >= 40);
-  shared_expert_mma_chain<<<40, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
-      (half*)x.data_ptr(), (half*)w13.data_ptr(), (half*)w2.data_ptr(),
-      (half*)gate.data_ptr(), projection.data_ptr<float>(),
-      partial.data_ptr<float>(), (uint32_t*)flags.data_ptr(),
-      (uint32_t*)epochs.data_ptr(), (half*)out.data_ptr(), m);
+              props->cooperativeLaunch &&
+              active * props->multiProcessorCount >= 40);
+  auto* xp = (half*)x.data_ptr();
+  auto* up = (half*)w13.data_ptr();
+  auto* down = (half*)w2.data_ptr();
+  auto* gp = (half*)gate.data_ptr();
+  auto* proj = projection.data_ptr<float>();
+  auto* part = partial.data_ptr<float>();
+  auto* flag = (uint32_t*)flags.data_ptr();
+  auto* epoch = (uint32_t*)epochs.data_ptr();
+  auto* output = (half*)out.data_ptr();
+  void* arguments[] = {&xp,   &up,   &down,  &gp,     &proj,
+                       &part, &flag, &epoch, &output, (void*)&m};
+  TORCH_CHECK(cudaLaunchCooperativeKernel(
+                  (void*)shared_expert_mma_chain, dim3(40), dim3(256),
+                  arguments, 0,
+                  c10::cuda::getCurrentCUDAStream().stream()) == cudaSuccess);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) { module.def("run", &run); }
