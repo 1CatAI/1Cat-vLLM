@@ -5,12 +5,15 @@ The acceptance targets are at most 600 kernels per step, no single-CTA kernels,
 and ordinary pure decode at most 7.5 ms/token before the final 6 ms target.
 These targets have not been achieved by this screen.
 
-The independently qualified direction is ordinary QSA preparation. Its M1
-layer improves 0.285542→0.250563 ms (37→27 kernels), and actual MTP4 M5
-improves 0.448010→0.418263 ms (41→32). All layer outputs and selection IDs
-match; all 192 full-vocabulary teacher-forcing rows match exactly, and both
-natural requests stop. These are independent QSA results, not qualification
-of the current combined branch or a measured endpoint speedup.
+The retained direction is ordinary QSA preparation. Fresh cold-start M1
+whole-layer graphs improve 0.285839→0.250696 ms (37→27 kernels, nine→six
+single-CTA kernels). Actual MTP4 M5 improves 0.448645→0.419471 ms
+(41→32 kernels, one single-CTA kernel in both arms). All layer outputs and
+selection IDs match on four ranks; retained driver nodes and profiler counts
+agree. The dynamic M5 compilation fix preserves these layer gains. Earlier
+independent QSA qualification matches all 192 full-vocabulary teacher-forcing
+rows exactly and both natural requests stop. Fresh current-source distribution,
+natural completion, endpoint and whole-model trace remain pending.
 
 Shared-expert default preparation has been removed after its model gate
 failed twice. The GDN convolution/core/norm prototype improves both research
@@ -464,5 +467,16 @@ forward. The branch now lives inside an opaque whole-QSA operation with a
 shape-preserving fake result. Unsupported widths and partially padded
 metadata use the original forward. CPU FakeTensor and fullgraph AOT checks
 pass for M1 and marked-dynamic M5; targeted source hooks pass. Fresh ordinary
-M1/M5 layer, model-distribution and endpoint qualification remain pending.
-Earlier QSA timing/count admission does not qualify this new compiler boundary.
+M1 and actual MTP4 M5 layer qualification both complete, with the results
+reported at the start of this document. Model-distribution, natural completion,
+endpoint and whole-model node qualification are pending. The earlier
+independent quality result does not qualify this new compiler boundary.
+
+Projection/ordered-peer reduction also regresses actual MTP4 M5 complete
+layers after the cold-start fix: GDN 0.277443→0.337920 ms (28→27 kernels)
+and QSA 0.423692→0.485125 ms (32→31). Both retain one single-CTA kernel.
+GDN active convolution/recurrent states match; layer output error is at most
+1.22e-4. QSA output error is at most 3.05e-5 and selection IDs match on all
+ranks. QSA profiler and driver counts agree; GDN profiler reports one extra
+event in each arm, so use the retained driver counts and mark its event
+trace incomplete. No further tuning or production promotion is justified.

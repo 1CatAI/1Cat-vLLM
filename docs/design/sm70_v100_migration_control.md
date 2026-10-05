@@ -49154,3 +49154,27 @@ and helper solely for explicit research reproduction; no normal GDN quality or
 endpoint improvement is credited. Output-projection/ordered-peer reduction is
 compiled as the remaining structural all-reduce screen; M1/M5 complete-layer
 measurements are pending.
+
+The projection/ordered-peer reduction M1 screen regresses complete GDN/QSA
+layers (0.153334→0.162058 and 0.271884→0.277251 ms), saving just one kernel
+each and no single-CTA kernels. Reject it without tuning. Its initial M5
+startup fails before candidate execution because QSA's Python width selection
+specializes a marked-dynamic token dimension to five. Move width selection
+inside an opaque shape-preserving QSA forward, retaining the original path
+for unsupported or padded batches. CPU dynamic M5 AOT and source hooks pass.
+Fresh ordinary cold-start layers retain QSA gains: M1 0.285839→0.250696 ms,
+37→27 kernels, 9→6 single-CTA; actual MTP4 M5 0.448645→0.419471 ms,
+41→32 kernels, 1→1 single-CTA. Outputs and selection IDs match on all ranks;
+driver and profiler counts agree. Current-source full-vocabulary distribution,
+natural completion, matched endpoint and whole-model node trace are queued
+after the remaining projection M5 coverage. Older independent QSA quality
+does not qualify the new compiler boundary.
+
+Actual MTP4 M5 projection/peer reduction coverage is now complete and also
+regresses: GDN 0.277443→0.337920 ms (28→27 driver nodes), QSA
+0.423692→0.485125 ms (32→31). Single-CTA counts remain one in both arms.
+GDN states and QSA selection IDs match. GDN event tracing contains one extra
+event per arm; retain driver geometry and mark the profiler incomplete.
+Reject this remaining all-reduce schedule. The final normal QSA-only campaign
+has acquired its complete GPU lease and begins fresh reference/candidate
+teacher-forcing capture before endpoint and whole-model trace qualification.
