@@ -125,6 +125,19 @@ work outside graph envelopes; the last tail kernel to target gap is only
 10.570us. These definitions overlap;
 service sums, unions and gaps must not be added as independent wall times.
 
+| Head | Calls/round | us/call | Bytes/call/rank | Effective GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| target_head | 1 | 271.681 | 198656000 | 731.2 |
+| draft_shared_head | 1 | 277.080 | 198656000 | 717.0 |
+
+The full-vocabulary channel-FP8 QPN counterpart from the NVFP4 checkpoint
+uses M8/N62080/K5120, FP16 operands/output and FP32 accumulation. Two cold
+L2 graph arms at 1290/877MHz both take 412.672us, reading 317973760B per
+rank (770.5 effective GB/s). The reference norm is 0.000208 and one thousand
+graph replays are bitwise stable. This compares the same-shape operator;
+it does not establish the NVFP4 model's selected end-to-end head route or
+cross-checkpoint numerical equivalence.
+
 ## Draft attention, heads and communication decisions
 
 The five draft attention calls have D128, local Q/KV heads 8/2, FP16 KV,
@@ -157,3 +170,9 @@ same-clock checkpoint counterpart arms. Installed `dev59+g6d11576ee9` native
 hashes match the complete normal wheel, with 648 native/build source inputs
 identical to the qualified projection binary. The later fallback-report
 change leaves kernel admission and numerical execution unchanged.
+
+The normal `dev60+g5cbe3aea29` package also passes installed-native auditing
+for the fallback-report update. Eighty-six existing pair/input/output checks
+pass, as does the added full-admission rejection check. Interval support alone
+does not admit a capability with a rejection reason. No new GPU route or
+precision change is introduced by that reporting update.

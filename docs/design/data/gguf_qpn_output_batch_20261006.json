@@ -1732,5 +1732,44 @@
         }
       ]
     }
-  ]
+  ],
+  "head_operator_counterpart": {
+    "complete": true,
+    "model": "Qwen3.8-27B-NVFP4",
+    "runtime": "1.5.2.dev59+g6d11576ee9",
+    "role": "head_full_vocab",
+    "m": 8,
+    "n": 62080,
+    "k": 5120,
+    "weight_stream_bytes": 317973760,
+    "operator": "fp8_qpn8_gemm_sm70_out",
+    "split_k": 16,
+    "accumulator_chains": 2,
+    "out_dtype": "float16",
+    "activation_dtype": "float16",
+    "accumulation": "float32",
+    "relative_l2": 0.0002079766127280891,
+    "graph_replays": 1000,
+    "timings": [
+      {
+        "median_us": 412.6720130443573,
+        "clock_before": "1290, 877, 300.00",
+        "clock_after": "1290, 877, 300.00"
+      },
+      {
+        "median_us": 412.6720130443573,
+        "clock_before": "1290, 877, 300.00",
+        "clock_after": "1290, 877, 300.00"
+      }
+    ],
+    "scope": "Full-vocabulary same-shape channel-FP8 QPN counterpart; no cross-checkpoint numerical equivalence or model-dispatch claim"
+  },
+  "report_change_validation": {
+    "source": "5cbe3aea29ebf4933ea917aaaebaa43f2439e03a",
+    "runtime": "dev60",
+    "native_build_input_differences": [],
+    "existing_checks_passed": 86,
+    "corrected_added_admission_check_passed": true,
+    "execution_changes": false
+  }
 }
