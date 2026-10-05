@@ -80,6 +80,11 @@ def main():
     parser.add_argument("--input-phase-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--diagnose-attention-transfers", action="store_true")
+    parser.add_argument("--kernel-config", type=json.loads, default={})
+    parser.add_argument("--completion-prompts", type=Path)
+    parser.add_argument("--teacher-forcing", action="store_true")
+    parser.add_argument("--teacher-reference", type=Path)
+    parser.add_argument("--teacher-positions", type=int, default=8)
     args = parser.parse_args()
     if args.trace_only:
         args.probe = args.node_trace = True
@@ -104,7 +109,12 @@ def main():
         disable_log_stats=False,
         language_model_only=True,
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
-        worker_extension_cls="vllm.sm70_graph_observer.GraphParityWorkerExtension",
+        worker_extension_cls=(
+            "vllm.sm70_gguf_quality.GGUFTeacherWorkerExtension"
+            if args.teacher_forcing
+            else "vllm.sm70_graph_observer.GraphParityWorkerExtension"
+        ),
+        kernel_config=args.kernel_config,
         speculative_config={
             "method": "mtp",
             "model": str(args.draft),
@@ -133,6 +143,7 @@ def main():
         prompt_text_sha256=digest(prompts),
         rows=[],
         probes=[],
+        completions=[],
         trace_only=args.trace_only,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +225,24 @@ def main():
                 ),
                 flush=True,
             )
+        if args.completion_prompts is not None:
+            for prompt in json.loads(args.completion_prompts.read_text()):
+                rendered = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                output = llm.generate(rendered, params, use_tqdm=False)[0].outputs[0]
+                report["completions"].append(
+                    dict(
+                        prompt=prompt,
+                        text=output.text,
+                        output_token_ids=list(output.token_ids),
+                        finish_reason=output.finish_reason,
+                    )
+                )
+                save()
         if args.probe:
             reference = tokenized[1]
             fixed_ids = (reference * (8192 // len(reference) + 1))[:8192]
@@ -314,6 +343,63 @@ def main():
                     save()
                 finally:
                     llm.collective_rpc("stop_graph_parity_capture", timeout=30)
+        if args.teacher_forcing:
+            reference = (
+                json.loads(args.teacher_reference.read_text())
+                if args.teacher_reference is not None
+                else report
+            )
+            if reference["prompt_tokens_sha256"] != report["prompt_tokens_sha256"]:
+                raise RuntimeError(
+                    "Teacher prompts/tokenizer differ from the reference"
+                )
+            root = args.output.with_suffix("").with_name(args.output.stem + "-teacher")
+            root.mkdir(parents=True, exist_ok=True)
+            report["teacher_forcing"] = dict(directory=str(root), rows=[])
+            for row in reference["rows"]:
+                if len(row["output_token_ids"]) <= args.teacher_positions:
+                    raise RuntimeError("Teacher continuation is too short")
+                for position in range(args.teacher_positions):
+                    prefix = (
+                        row["prompt_token_ids"] + row["output_token_ids"][:position]
+                    )
+                    forced = row["output_token_ids"][position]
+                    key = f"{row['id']}-{position:03d}"
+                    llm.collective_rpc(
+                        "start_teacher_capture", args=(str(root), key), timeout=30
+                    )
+                    try:
+                        llm.generate(
+                            {"prompt_token_ids": prefix},
+                            SamplingParams(
+                                temperature=0, max_tokens=6, allowed_token_ids=[forced]
+                            ),
+                            use_tqdm=False,
+                        )
+                    finally:
+                        workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
+                    if any(w["captured"] != 1 for w in workers):
+                        raise RuntimeError(
+                            f"M5 teacher target was not captured: {workers}"
+                        )
+                    captured = torch.load(root / f"{key}.pt", weights_only=True)
+                    if (
+                        captured["position"].item() != len(prefix)
+                        or captured["input_ids"].item() != forced
+                    ):
+                        raise RuntimeError(
+                            "Captured distribution has different teacher conditioning"
+                        )
+                    report["teacher_forcing"]["rows"].append(
+                        dict(
+                            key=key,
+                            prefix_sha256=digest(prefix),
+                            forced=forced,
+                            position=len(prefix),
+                            workers=workers,
+                        )
+                    )
+                    save()
         report["complete"] = True
         save()
     finally:

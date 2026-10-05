@@ -967,3 +967,15 @@ void gguf_iq3_gated_sm70_out(torch::Tensor out, torch::Tensor input,
 void gguf_native_pair_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor gate, torch::Tensor up,
                                int64_t gate_type, int64_t up_type);
+
+void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor ids,
+                                     torch::Tensor route_weights,
+                                     torch::Tensor weight_ptrs,
+                                     torch::Tensor stats_ptrs,
+                                     int64_t source_type, int64_t num_experts);
+void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
+void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
+                                torch::Tensor ids, torch::Tensor gate,
+                                torch::Tensor up, int64_t source_type,
+                                bool activated);
