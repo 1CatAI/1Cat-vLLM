@@ -402,6 +402,15 @@ def prepare_qsa_joint_decode(module: torch.nn.Module, vllm_config) -> int:
             continue
         if layer.kv_cache_dtype != "float16" or layer.qsa_dcp_sharded:
             continue
+        indexer = layer.indexer
+        if (
+            indexer.index_n_heads,
+            indexer.index_kv_heads,
+            indexer.index_head_dim,
+            indexer.compress_ratio,
+            indexer.token_topk,
+        ) != (4, 1, 128, 4, 2048):
+            continue
         if not (
             layer.indexer.use_fused_pre_indexer
             and layer.use_fused_qk_norm_rope_gate
