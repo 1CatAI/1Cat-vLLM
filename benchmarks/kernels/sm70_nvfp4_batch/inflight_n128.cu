@@ -5,9 +5,6 @@
 // See LICENSE.v100-skinny in this directory for the retained MIT notice.
 
 #include <mma.h>
-#include <map>
-#include <mutex>
-#include <tuple>
 #include <torch/all.h>
 #include <torch/library.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -15,8 +12,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "nvfp4_qpn2_layout.cuh"
 #include "activation_pack_sm70.cuh"
-
-namespace {
 __device__ __forceinline__ half2 fp8e4m3_to_half2(uint8_t value) {
   const unsigned short bits =
       ((static_cast<unsigned short>(value) & 0x80u) << 8) |
@@ -66,11 +61,10 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-// N128 tile: direct HMMA884 with shared A and register B.
+// Research-only N128 tile, direct HMMA884 with shared A and register B.
 // Each warp owns N32; all column/projection warps reuse each A stage.
-// Read original K16 input fragments directly, without pack_k16_input.
 template <int Rows, bool Gated>
-__global__ void nvfp4_qpn2_m64_n128_kernel(const half* input,
+__global__ void batch_n128_inflight_kernel(const half* input,
                                            const uint8_t* codes,
                                            const uint8_t* scales, float* output,
                                            int width, int k, float gs) {
@@ -160,6 +154,8 @@ __global__ void nvfp4_qpn2_m64_n128_kernel(const half* input,
   for (int rt = 0; rt < RowTiles; rt++) {
 #pragma unroll
     for (int i = 0; i < 8; i++) {
+      int r = rt * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+      int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
       output[(static_cast<size_t>(blockIdx.z) * P + projection) * Rows * width +
              (blockIdx.x * 4 + nt) * Rows * 32 + (rg * RowTiles + rt) * 256 +
              i * 32 + lane] = accum[rt][i];
@@ -168,8 +164,8 @@ __global__ void nvfp4_qpn2_m64_n128_kernel(const half* input,
 }
 
 template <bool Gated>
-__global__ void nvfp4_qpn2_m64_n128_finish(half* output, const float* partial,
-                                           int width, int rows) {
+__global__ void finish_n128(half* output, const float* partial, int width,
+                            int rows) {
   constexpr int P = Gated ? 2 : 1, Parts = Gated ? 5 : 4;
   int tid = threadIdx.x, lane = tid & 31, i = tid >> 5, rt = blockIdx.y;
   int r = rt * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
@@ -191,74 +187,52 @@ __global__ void nvfp4_qpn2_m64_n128_finish(half* output, const float* partial,
   output[r * width + blockIdx.x * 32 + c] = h;
 }
 
-}  // namespace
-
-// The dispatcher admits only the two qualified TP4 MLP shapes. Each stream
-// owns its partials; sharing across sequential layers avoids graph-pool copies
-// of this scratch. Both shapes share a fixed-size buffer whose pointer stays
-// live for earlier captured graphs. Every used partial is overwritten.
-void nvfp4_qpn2_m64_n128_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor codes, torch::Tensor scales,
-                                  double global_scale, bool gated_silu) {
-  TORCH_CHECK(input.is_cuda() && out.is_cuda() && codes.is_cuda() &&
-                  scales.is_cuda() && input.device() == out.device() &&
-                  input.device() == codes.device() &&
-                  input.device() == scales.device(),
-              "M64 QPN2 tensors must share a CUDA device");
-  TORCH_CHECK(
-      input.scalar_type() == torch::kFloat16 &&
-          out.scalar_type() == torch::kFloat16 &&
-          codes.scalar_type() == torch::kUInt8 &&
-          scales.scalar_type() == torch::kUInt8 && input.is_contiguous() &&
-          out.is_contiguous() && codes.is_contiguous() &&
-          scales.is_contiguous(),
-      "M64 QPN2 requires contiguous FP16 activations and uint8 layouts");
-  const int rows = input.size(0), k = input.size(1), width = out.size(1);
-  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && rows == 64 &&
-                  out.size(0) == rows &&
-                  ((gated_silu && k == 5120 && width == 4352) ||
-                   (!gated_silu && k == 4352 && width == 5120)),
-              "M64 QPN2 requires a qualified TP4 MLP shape");
-  const int projections = gated_silu ? 2 : 1;
-  const int parts = gated_silu ? 5 : 4;
-  TORCH_CHECK(codes.numel() == int64_t(k) * width * projections / 2 &&
-                  scales.numel() == int64_t(k) * width * projections / 16,
-              "M64 QPN2 layout size mismatch");
-  const at::cuda::OptionalCUDAGuard guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  using Key = std::tuple<int, cudaStream_t>;
-  static std::mutex mutex;
-  static std::map<Key, torch::Tensor> scratch;
-  constexpr int64_t kMaxElements = int64_t(5) * 2 * 64 * 4352;
-  torch::Tensor storage;
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    auto& cached = scratch[{input.get_device(), stream}];
-    if (!cached.defined()) {
-      cached =
-          torch::empty({kMaxElements}, input.options().dtype(torch::kFloat32));
-    }
-    storage = cached;
-  }
-  const auto* a = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
-  const auto* b = codes.data_ptr<uint8_t>();
-  const auto* s = scales.data_ptr<uint8_t>();
-  auto* partial = storage.data_ptr<float>();
-  auto* output = reinterpret_cast<half*>(out.data_ptr<at::Half>());
-  if (gated_silu) {
-    nvfp4_qpn2_m64_n128_kernel<64, true>
-        <<<dim3(width / 128, 1, parts), 512, 0, stream>>>(
-            a, b, s, partial, width, k, global_scale);
-    nvfp4_qpn2_m64_n128_finish<true>
-        <<<dim3(width / 32, rows / 8), 256, 0, stream>>>(output, partial, width,
-                                                         rows);
+template <int Rows, bool Gated>
+void launch(const half* a, const uint8_t* b, const uint8_t* s, float* tmp,
+            int width, int k, float gs, cudaStream_t stream) {
+  batch_n128_inflight_kernel<Rows, Gated>
+      <<<dim3(width / 128, 1, Gated ? 5 : 4),
+         (Gated ? 8 : 4) * (Rows == 64 ? 2 : 1) * 32, 0, stream>>>(
+          a, b, s, tmp, width, k, gs);
+}
+void run(torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+         torch::Tensor scales, torch::Tensor packed, torch::Tensor scratch,
+         double gs, bool gated) {
+  int m = input.size(0), k = input.size(1), width = out.size(1);
+  TORCH_CHECK((m == 16 || m == 32 || m == 64) && k % 32 == 0 &&
+              width % 128 == 0 && input.is_contiguous());
+  TORCH_CHECK(scratch.numel() >= 8 * (gated ? 2 : 1) * m * width);
+  at::cuda::OptionalCUDAGuard guard(device_of(input));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto* a = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+  auto* b = reinterpret_cast<const uint8_t*>(codes.data_ptr());
+  auto* sc = scales.data_ptr<uint8_t>();
+  auto* o = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+  auto* tmp = scratch.data_ptr<float>();
+#define LAUNCH(R)                                         \
+  if (gated)                                              \
+    launch<R, true>(a, b, sc, tmp, width, k, gs, stream); \
+  else                                                    \
+    launch<R, false>(a, b, sc, tmp, width, k, gs, stream)
+  if (m == 16) {
+    LAUNCH(16);
+  } else if (m == 32) {
+    LAUNCH(32);
   } else {
-    nvfp4_qpn2_m64_n128_kernel<64, false>
-        <<<dim3(width / 128, 1, parts), 256, 0, stream>>>(
-            a, b, s, partial, width, k, global_scale);
-    nvfp4_qpn2_m64_n128_finish<false>
-        <<<dim3(width / 32, rows / 8), 256, 0, stream>>>(output, partial, width,
-                                                         rows);
+    LAUNCH(64);
   }
+#undef LAUNCH
+  if (gated)
+    finish_n128<true>
+        <<<dim3(width / 32, m / 8), 256, 0, stream>>>(o, tmp, width, m);
+  else
+    finish_n128<false>
+        <<<dim3(width / 32, m / 8), 256, 0, stream>>>(o, tmp, width, m);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+TORCH_LIBRARY_FRAGMENT(_qwen_batch_screen, ops) {
+  ops.def(
+      "run(Tensor(a!) out, Tensor input, Tensor codes, Tensor scales, "
+      "Tensor(b!) packed, Tensor(c!) scratch, float scale, bool gated) -> ()");
+  ops.impl("run", torch::kCUDA, &run);
 }

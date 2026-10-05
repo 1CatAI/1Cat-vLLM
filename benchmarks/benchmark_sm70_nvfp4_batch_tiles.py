@@ -10,6 +10,7 @@ is diagnostic and does not substitute for a teacher-forcing quality gate.
 import argparse
 import hashlib
 import json
+import os
 import statistics
 from pathlib import Path
 
@@ -29,6 +30,9 @@ p.add_argument("--ncu-candidate", action="store_true")
 p.add_argument("--candidate", type=Path)
 p.add_argument("--candidate-so", type=Path)
 a = p.parse_args()
+# Match the resolved serving profile's existing TurboMind tuning capacity.
+# An untuned M64 control selects a different kernel and gives false gains.
+os.environ.setdefault("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "64")
 if a.ncu_candidate and not (a.candidate or a.candidate_so):
     p.error("--ncu-candidate requires a candidate source or binary")
 a.out.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +51,9 @@ elif a.candidate:
         load_extension(
             name=extension_name,
             sources=[str(a.candidate)],
+            extra_include_paths=[
+                str(Path(__file__).resolve().parents[1] / "csrc/sm70_turbomind/ops")
+            ],
             extra_cuda_cflags=[
                 "-O3",
                 "--use_fast_math",
@@ -92,6 +99,7 @@ result = {
         else None
     ),
     "torch": torch.__version__,
+    "baseline_dense_tune_max_m": int(os.environ["VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M"]),
     "gpu": torch.cuda.get_device_name(),
     "cold_l2_bytes": 128 * 1024 * 1024,
     "activation_fixture": "seeded Gaussian FP16, standard deviation 0.1",

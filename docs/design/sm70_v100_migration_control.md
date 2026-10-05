@@ -49084,3 +49084,16 @@ for decode accounting. A corrected pure-decode capture confirms 64 gate/up
 and 64 down calls per round, plus 140 two-stage collectives. Their matched
 baseline attribution remains pending. Do not promote this route based on the
 local MLP gain; full-model speed and teacher-forcing gates are not passed.
+
+### Correct the M64 microbenchmark control
+
+The serving profile enables existing TurboMind dense tuning through M64;
+the original standalone process left its default limit at M16. Its control
+therefore selected a different, slower M64 kernel. With the serving tuning
+capacity, the real-weight cold MLP graph is 208.896 microseconds for the
+control and 251.904 for the prototype: the candidate regresses. The matched
+model traces show about 175 versus 262 microseconds per MLP including its
+postprocessing, accounting for most of the full-round regression. The
+prototype is retained only as a standalone benchmark; its serving dispatch,
+normal-build source entry and serving-only tests have been removed. Future
+candidates must match the serving baseline's tuned route before model tests.

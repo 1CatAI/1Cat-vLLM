@@ -22,3 +22,10 @@ profile only the candidate region with `--ncu --ncu-candidate`; use
 `--candidate-so` to reuse the exact measured extension binary. Preserve the
 source and binary hashes with counter results. Full model numerical and
 concurrent decode gates remain required before production admission.
+
+`inflight_n128.cu` retains the later four-group in-flight load variant.
+The driver defaults the existing TurboMind dense tuning capacity to M64,
+matching the serving profile, and records that setting. The original untuned
+M64 comparison gave a false positive; after correcting the control, this
+variant regresses and has no serving dispatch. Match actual kernel selection
+as well as matrix shapes before estimating model gains.
