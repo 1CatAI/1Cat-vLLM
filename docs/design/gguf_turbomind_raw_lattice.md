@@ -1589,3 +1589,36 @@ checks but measures 101.453 µs versus 89.577 µs canonical (exact planes
 than the workspace path. Remove this shape-specific tactic rather than retain
 an extra unsuccessful specialization. Original rounded-scale operators remain
 explicit candidates with no default promotion.
+
+### Original IQ3_XXS operators
+
+Extend original-block FP32 vector, mma884 and prefill workspace operators to
+IQ3_XXS (98 bytes per 256 weights). Sign indices retain their seven original
+bits; decoding restores the eighth sign from parity. Factored FP32 vector
+scales follow the official multiplication order. Initial native source
+`62225727b0` passes 145 focused checks.
+
+Actual Flash-Next IQ3_XXS `blk.35.ffn_gate_exps.weight`, expert zero, TP4 N160/
+K2560 uses 80 distinct weight banks in full CUDA graphs. Original rows have
+156,800 payload bytes plus 640 alignment bytes versus 204,800 canonical bytes.
+Best original projection times at M1/5/8/16 are 6.219/9.195/9.323/10.055 µs,
+versus 15.954/16.859/13.235/12.525 µs current canonical dispatch. M512 original
+dequantization plus cuBLAS remains slower: 30.773 versus 23.117 µs. These
+projection measurements exclude routing, the rest of the FFN and model step
+latency; they do not justify prefill default promotion.
+
+After 64 MiB eviction, NCU at M8 records 217,472 main-kernel DRAM read bytes,
+versus 197,760 bytes of source payload plus activation. Reduction reads a
+further 54,944 bytes. The main kernel uses 64 registers, 15.14% active warps and
+31.67% long-scoreboard stalls. Other traffic is included; this is not a
+weight-only byte count. Profiler node times are not model latency.
+
+IQ3_XXS equal-byte packets use 23 bits per K8 octet: two eight-bit grid indices
+and seven sign bits. Thirty-two packets take 92 bytes; original FP16 d and
+four scale bytes bring the total to exactly 98 bytes. Group scale/sign
+packing is lossless and independently inverted. Initial compact validation
+passes 150 checks and catches three odd-width tail inverses: the old reorder
+loop discarded the final four bytes of a partial 64-bit word. The fix writes
+only existing packet halfwords and leaves final alignment at at most seven
+bytes. Rebuilt validation and performance remain pending until shared GPU
+resources are available. No model storage or default is promoted.
