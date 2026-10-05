@@ -199,6 +199,7 @@ def _dflash2_gdn_group_metadata_kernel(
     USE_STATE_START: tl.constexpr,
     USE_SEQ_LEN_START: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    WY_STATE: tl.constexpr,
 ):
     """Write every GDN group's state IDs and the shared graph metadata."""
     group_id = tl.program_id(0)
@@ -212,6 +213,8 @@ def _dflash2_gdn_group_metadata_kernel(
     output_mask = offsets < batch_size * WIDTH
     live_state_mask = output_mask & (rows < num_spec_decodes)
     state_columns = columns
+    if WY_STATE:
+        state_columns = tl.full((BLOCK,), 0, tl.int32)
     if USE_STATE_START:
         req_indices = tl.load(
             req_index_mapping + rows,
@@ -224,11 +227,11 @@ def _dflash2_gdn_group_metadata_kernel(
             mask=live_state_mask,
             other=-1,
         )
-        state_columns = columns + state_starts
+        state_columns = state_columns + state_starts
         live_state_mask &= (state_starts >= 0) & (state_columns < block_table_stride)
     if USE_SEQ_LEN_START:
         seq_len = tl.load(seq_lens + rows, mask=live_state_mask, other=0)
-        state_columns = columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
+        state_columns = state_columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
         live_state_mask &= state_columns < block_table_stride
     state_ids = tl.load(
         block_table + rows * block_table_stride + state_columns,
@@ -2473,6 +2476,7 @@ def prepare_dflash2_gdn_group_metadata(
     block = triton.next_power_of_2(
         max(num_actual_tokens * width, num_actual_tokens + 1)
     )
+    assert isinstance(first_builder.kv_cache_spec, MambaSpec)
     _dflash2_gdn_group_metadata_kernel[(len(input_tables),)](
         descriptor.block_table_ptrs,
         descriptor.state_output_ptrs,
@@ -2495,6 +2499,7 @@ def prepare_dflash2_gdn_group_metadata(
         USE_STATE_START=use_state_start,
         USE_SEQ_LEN_START=use_seq_len_start,
         MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
+        WY_STATE=first_builder.kv_cache_spec.gdn_wy,
         num_warps=1,
     )
     common_buffers.initialized_key = (

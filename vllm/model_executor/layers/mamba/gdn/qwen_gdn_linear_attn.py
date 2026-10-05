@@ -2290,6 +2290,12 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if self.gdn_wy_cache is not None:
+            return self.gdn_wy_cache.cache_spec(spec)
+        return spec
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -2314,6 +2320,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Runtime forward/capture need not retain the initialization config.
         # Capture LoRA exclusion while the owning configuration is available.
         self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
+        self.gdn_wy_cache = None
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -2323,6 +2330,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        from vllm.model_executor.layers.mamba.gdn.sm70_wy import (
+            WYStateCache,
+            admits_wy_cache,
+        )
+
+        if admits_wy_cache(vllm_config, self):
+            self.gdn_wy_cache = WYStateCache(
+                vllm_config.scheduler_config.max_num_seqs,
+                current_platform.current_device(),
+            )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -5315,7 +5332,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
     ) -> bool:
-        return bool(
+        eligible = bool(
             self.enable_sm70_dflash2_fused_gdn_verify
             and mixed_qkv is not None
             and attn_metadata.spec_sequence_masks is not None
@@ -5343,6 +5360,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and b.is_contiguous()
             and core_attn_out.is_contiguous()
         )
+
+        if (
+            self.gdn_wy_cache is not None
+            and attn_metadata.num_spec_decodes > 0
+            and not eligible
+        ):
+            raise RuntimeError(
+                "Snapshot-free GDN cache requires the indexed WY verifier; "
+                "cannot fall back to a snapshot writer on collapsed state pages."
+            )
+        return eligible
 
     def _can_use_sm70_gdn_preprocess(self, mixed_qkv, a, b, conv_state, metadata):
         # Restrict the first admission to a complete single-request verifier.
@@ -5434,6 +5462,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
+        if self.gdn_wy_cache is not None:
+            metadata_raw = get_forward_context().attn_metadata
+            assert isinstance(metadata_raw, dict)
+            metadata = metadata_raw[self.prefix]
+            assert isinstance(metadata, GDNAttentionMetadata)
+            self.gdn_wy_cache.verify(
+                self,
+                mixed_qkv,
+                a,
+                b,
+                out,
+                ssm_state,
+                spec_query_start_loc,
+                spec_state_indices_tensor,
+                metadata.spec_sequence_masks,
+                num_spec_decodes,
+            )
+            _log_runtime_route_once(
+                "SM70 indexed snapshot-free WY GDN verify route hit."
+            )
+            return out.transpose(0, 1)
         # Match the ordinary speculative verifier's FP32 beta materialization.
         # The gating helper otherwise defaults to the FP16 dtype of b.
         if precomputed_gating is None:

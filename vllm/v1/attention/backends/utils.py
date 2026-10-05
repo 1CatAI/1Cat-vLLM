@@ -937,4 +937,9 @@ def mamba_get_block_table_tensor(
             dtype=torch.int32,
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
-        return torch.gather(block_table, 1, indices_to_gather)
+        result = torch.gather(block_table, 1, indices_to_gather)
+        if kv_cache_spec.gdn_wy:
+            # Convolution retains its speculative history, but all SSM token
+            # selectors refer to the same published running state page.
+            return result.expand(-1, 8)
+        return result

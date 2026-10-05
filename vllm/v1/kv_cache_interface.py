@@ -690,6 +690,9 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    # GDN verification stores FP32 factors in a per-request workspace and
+    # publishes accepted state before scheduler/cache operations.
+    gdn_wy: bool = False
     # PLE short-conv state is replicated; GDN state is TP-sharded.
     tp_replicated: bool = False
 
