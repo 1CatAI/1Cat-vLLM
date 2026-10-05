@@ -3890,7 +3890,8 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 
 void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
-                                       int64_t source_type) {
+                                       int64_t source_type,
+                                       bool rounded_scale) {
   TORCH_CHECK(source_type == 21 || source_type == 22,
               "Planar GGUF supports IQ3_S and IQ2_S");
   TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
@@ -3929,13 +3930,17 @@ void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   turbomind::gemm::Operation operation{};
   operation.dispatch = select_dense_dispatch_policy_impl(
       device, m, n, k, group, stream,
-      static_cast<TuneKeyKind>(source_type == 21 ? 26 : 27), true, false,
-      INT_MAX);
+      static_cast<TuneKeyKind>(rounded_scale ? (source_type == 21 ? 28 : 29)
+                                             : (source_type == 21 ? 26 : 27)),
+      true, false, INT_MAX);
   operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
-  operation.quant_b = {source_type == 21
-                           ? turbomind::gemm::QuantType::kOriginalIQ3S
-                           : turbomind::gemm::QuantType::kOriginalIQ2S,
-                       group};
+  using QuantType = turbomind::gemm::QuantType;
+  operation.quant_b = {
+      rounded_scale ? (source_type == 21 ? QuantType::kRoundedOriginalIQ3S
+                                         : QuantType::kRoundedOriginalIQ2S)
+                    : (source_type == 21 ? QuantType::kOriginalIQ3S
+                                         : QuantType::kOriginalIQ2S),
+      group};
   auto& workspace = get_workspace(device, stream);
   const int result = get_gemm(device).Run(
       operation, 1.f, input.data_ptr(), a, nullptr, {}, weight.data_ptr(),
@@ -7120,9 +7125,10 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 
 void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
-                                       int64_t source_type) {
+                                       int64_t source_type,
+                                       bool rounded_scale) {
   vllm::awq_sm70::gguf_lattice_planar_gemm_sm70_out(out, input, weight,
-                                                    source_type);
+                                                    source_type, rounded_scale);
 }
 
 void gguf_lattice_grouped_gemm_sm70_out(

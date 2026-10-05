@@ -32,7 +32,7 @@ inline __device__ void _Ld(Array<T, N>& dst, const T* src) {
 }
 
 template <class T, class Map, class SmemLayout, Pack kPack, Order kOrder,
-          bool AlignedC, bool AlignedS, Striding mode, class Policy_, int OriginalType = 0>
+          bool AlignedC, bool AlignedS, Striding mode, class Policy_, int OriginalType = 0, bool RoundedScale = false>
 struct GmemIteratorSm70 {
   static constexpr bool kOriginalStats = OriginalType != 0;
   static_assert(!kOriginalStats || (mode != Striding::kIndexed &&
@@ -303,7 +303,15 @@ struct GmemIteratorSm70 {
     const auto* scales = original_data_ + count * 66;
     const int64_t index = int64_t{group} * original_n_ + row;
     const uint32_t small = (__ldg(scales + index / 2) >> (4 * (index & 1))) & 15;
-    const uint64_t bits = __ldg(d + int64_t{group / groups} * original_n_ + row);
+    uint64_t bits = __ldg(d + int64_t{group / groups} * original_n_ + row);
+    if constexpr (RoundedScale) {
+      // Round only the transient group coefficient; persistent GGUF bits
+      // remain unchanged. Match canonical FP16-scale decoding.
+      const float factor = OriginalType == 21 ? 1.f + 2.f * small :
+                                               (small + 0.5f) * 0.25f;
+      const float coefficient = __half2float(__ushort_as_half(bits)) * factor;
+      bits = __half_as_ushort(__float2half_rn(coefficient));
+    }
     const auto* high = scales + count * (OriginalType == 21 ? 4 : 8);
     if constexpr (OriginalType == 21) {
       const auto* signs = reinterpret_cast<const uint32_t*>(high + count * 8);
@@ -354,13 +362,14 @@ struct IteratorSm70 {
                                 AlignedS, mode, Policy>;
 };
 
-template <int SourceType, Striding mode, class Policy, bool FullTiles>
+template <int SourceType, Striding mode, class Policy, bool FullTiles,
+          bool RoundedScale = false>
 struct IteratorSm70Original {
   template <class T, class Map, class SmemLayout, Pack kPack, Order kOrder,
             bool AlignedC, bool AlignedS>
   using Type_ = GmemIteratorSm70<T, Map, SmemLayout, kPack, kOrder,
       FullTiles || AlignedC, FullTiles || AlignedS, mode, Policy,
-      (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) ? SourceType : 0>;
+      (std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t>) ? SourceType : 0, RoundedScale>;
   template <class T, class Map, class SmemLayout, Pack kPack, Order kOrder,
             bool AlignedC, bool AlignedS>
   using Type = Type_<T, Map, SmemLayout, kPack, kOrder, AlignedC, AlignedS>;

@@ -198,7 +198,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &gguf_lattice_planar_reorder_sm70_out);
   ops.def(
       "gguf_lattice_planar_gemm_sm70_out(Tensor(a!) out, Tensor input, "
-      "Tensor weight, int source_type) -> ()");
+      "Tensor weight, int source_type, bool rounded_scale=False) -> ()");
   ops.impl("gguf_lattice_planar_gemm_sm70_out", torch::kCUDA,
            &gguf_lattice_planar_gemm_sm70_out);
   ops.def(

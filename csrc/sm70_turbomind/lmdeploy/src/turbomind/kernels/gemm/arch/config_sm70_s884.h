@@ -21,7 +21,7 @@
 namespace turbomind::gemm::sm70_s884 {
 
 template <class A, class TransformA, class U, class B, class TransformB,
-          class V, Order order_C, class Tc, Order raster_order, int group_axis, int OriginalType = 0>
+          class V, Order order_C, class Tc, Order raster_order, int group_axis, int OriginalType = 0, bool RoundedScale = false>
 struct Sm70_s884 {
   static_assert(A::SmemCopyAtom::K == B::SmemCopyAtom::K);
 
@@ -57,7 +57,7 @@ struct Sm70_s884 {
                            IteratorSm70<MODE_A, PolicyA>>;
     using IteratorB =
         std::conditional_t<OriginalType != 0,
-            IteratorSm70Original<OriginalType, MODE_B, PolicyB, FullTiles>,
+            IteratorSm70Original<OriginalType, MODE_B, PolicyB, FullTiles, RoundedScale>,
             std::conditional_t<FullTiles, IteratorSm70FullTile<MODE_B, PolicyB>,
                                IteratorSm70<MODE_B, PolicyB>>>;
 
@@ -146,12 +146,12 @@ using Config_GgufLattice = Sm70_s884<Operand_A<half>, Transform_Default, VoidOpe
         std::conditional_t<Type == 19 || Type == 29,uint16_t,uint32_t>>>,
     kRowMajor, half, raster_order, group_axis>;
 
-template<int Type, int GroupSize, Order raster_order>
+template<int Type, int GroupSize, Order raster_order, bool RoundedScale = false>
 using Config_GgufLatticeOriginal = Sm70_s884<Operand_A<half>, Transform_Default,
     VoidOperand, Operand_B_Pack<uint2_t>,
-    Transform_HMMA_SM70_Lattice<Type, GroupSize, 1, true>,
+    Transform_HMMA_SM70_Lattice<Type, GroupSize, 1, true, RoundedScale>,
     Operand_V_Pack<std::conditional_t<Type == 21, uint64_t, uint32_t>>,
-    kRowMajor, half, raster_order, -1, Type>;
+    kRowMajor, half, raster_order, -1, Type, RoundedScale>;
 
 template <Order raster_order, int group_axis = -1>
 using Config_GgufLut4_IQ =

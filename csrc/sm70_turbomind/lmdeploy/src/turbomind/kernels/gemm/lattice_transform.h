@@ -6,13 +6,13 @@
 #include "src/turbomind/kernels/core/array.h"
 namespace turbomind::gemm {
 
-template<int Type, int GroupSize, int Replicas = 1, bool Original = false>
+template<int Type, int GroupSize, int Replicas = 1, bool Original = false, bool RoundedScale = false>
 struct Transform_HMMA_SM70_Lattice {
   using Codebook = LatticeCodebook<Type>;
   static constexpr int kReplicas = Replicas;
   static_assert(kReplicas == 1 || (Codebook::kWidth == 4 && kReplicas == 8));
   static constexpr int kCodebookBytes = Codebook::kBytes * kReplicas;
-  static constexpr auto kQuantType = static_cast<QuantType>(Original ? (Type == 21 ? 15 : 16) : 8 + (
+  static constexpr auto kQuantType = static_cast<QuantType>(Original ? (RoundedScale ? (Type == 21 ? 17 : 18) : (Type == 21 ? 15 : 16)) : 8 + (
       Type == 16 ? 0 : Type == 17 ? 1 : Type == 18 ? 2 : Type == 19 ? 3 :
       Type == 21 ? 4 : Type == 22 ? 5 : 6));
   __device__ static void initialize(uint8_t* shared) {
@@ -77,7 +77,7 @@ struct Transform_HMMA_SM70_Lattice {
           sign_mask |= ((signs >> (i+1)) & 1) << 31;
           (uint32_t&)values ^= sign_mask;
         }
-        if constexpr (Original) {
+        if constexpr (Original && !RoundedScale) {
           static_assert(Type == 21 || Type == 22);
           const int small = (metadata >> (Type == 21 ? 56 : 20)) & 15;
           if constexpr (Type == 21) {

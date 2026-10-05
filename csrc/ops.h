@@ -1001,7 +1001,7 @@ void gguf_lattice_planar_reorder_sm70_out(torch::Tensor out, torch::Tensor raw,
                                           int64_t logical_k);
 void gguf_lattice_planar_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor weight,
-                                       int64_t source_type);
+                                       int64_t source_type, bool rounded_scale);
 
 void gguf_small_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor offsets,

@@ -929,3 +929,72 @@ def test_compact_workspace_thread_layout_graph(kind, threads):
         torch.ops._C.gguf_lattice_compact_blas_sm70_out(
             out, x, weight, kind, scratch, False, 111, 4, True, 512
         )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_planar_rounded_scale_matches_canonical_and_graph(kind):
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        transcode_lattice,
+    )
+
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    n, k, m = 160, 768, 512
+    data = packed(kind, n=n, k=k)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_planar_reorder_sm70_out(weight, original, kind, k)
+    canonical = transcode_lattice(data, kind).dequantize().astype(np.float16)
+    official = gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    assert (
+        np.linalg.norm(canonical.astype(np.float32) - official)
+        / np.linalg.norm(official)
+        < 0.001
+    )
+    reference = torch.from_numpy(canonical).cuda().float()
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_planar_gemm_sm70_out, out, x, weight, kind, True
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), x.float() @ reference.T, rtol=0.001, atol=0.003
+        )
+    assert np.array_equal(restore_planar(weight.cpu().numpy(), kind, n, k), data)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_planar_rounded_scale_retains_fp32_cancellation(kind):
+    n, k, m = 160, 2560, 512
+    _, size = quant_size(kind)
+    blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+    blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    data = blocks.reshape(n, -1)
+    official = gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    assert np.array_equal(official, np.ones((n, k), dtype=np.float32))
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_planar_reorder_sm70_out(weight, original, kind, k)
+    x = torch.full((m, k), 128.0, device="cuda", dtype=torch.float16)
+    x[:, k // 2 :] = -128.0
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_planar_gemm_sm70_out, out, x, weight, kind, True
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.neg_()
+        graph.replay()
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
