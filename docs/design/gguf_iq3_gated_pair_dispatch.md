@@ -137,9 +137,45 @@ means are 2.959 and 2.958; they are distinct from observed emitted batches.
 TTFT includes prefill and scheduling; pure prefill is not measured separately.
 C4 completes four nonempty reasonable answers in 4.688s; all reach the chosen
 96-token limit. It is a smoke, not a matched concurrency throughput claim.
-The previous round means were 34.940/35.398ms. The latest graph-boundary
-trace is queued to explain remaining service and gaps; no 25ms prediction
-is presented as a measured result.
+The previous round means were 34.940/35.398ms. No 25ms prediction is
+presented as a measured result.
+
+## Latest-main graph-boundary ledger
+
+The single new node trace uses the historical trace contract: maximum length
+32768, input 1024, output 64, TP4 and the same normal baseline wheel. It is
+separate from the unprofiled 262144-context contract above. Target launches
+are linked to GPU nodes by process and correlation ID. Each round starts at
+one target graph's first GPU node and ends at the next target graph's first
+node; host NVTX submission intervals are not used as GPU boundaries.
+Four ranks contain fourteen retained steady rounds each.
+
+Rank0's mean full round is 36.259ms, its target graph envelope is 32.379ms,
+kernel busy union is 33.977ms and uncovered residual is 2.283ms. Taking the
+maximum rank at each replay ordinal gives 36.294ms. These profiled times do
+not replace unprofiled end-to-end measurements. Kernel service categories
+below overlap and must not be added into another wall-time estimate.
+
+| Rank0 category | Calls/round | Service/round |
+| --- | ---: | ---: |
+| TurboMind projections | 379 | 14.644ms |
+| Single-CTA CUTLASS floating shards | 96 | 11.525ms |
+| Communication/reduction | 152 | 1.852ms |
+| Attention | 37 | 1.552ms |
+| Copy/concatenation | 212 | 0.912ms |
+| cuBLAS FP16 | 1 | 0.013ms |
+
+There are no whole-weight lattice/affine dequantization or raw Q4_K MMQ
+calls in the retained rounds. The one remaining s884gemm is a small 13us
+call, rather than the previous prefill projection path. Target attention
+selects sixteen grouped FP16 verifier partial kernels, totaling 0.881ms.
+LM head's two canonical GEMMs total 0.546ms. The remaining 96 single-CTA
+calls confirm that BF16 a/b shards in mixed qkvz projections still require
+independent floating-shard admission: converting an entirely floating
+projection does not cover a floating shard inside a quantized projection.
+Their mean service is 120.1us per call. Reuse of the existing FP32 row GEMV
+must pass its own actual-weight microbenchmark before admission; this ledger
+does not claim the proposed saving has been achieved.
 
 ## Activation traffic
 
@@ -176,7 +212,7 @@ checks runtime canonical fallbacks. Acquire the shared GPU lock and the
 selected device lock before running it. The complete source inventory is
 reproducible with `benchmark_gguf_quantization_inventory.py`.
 
-Latest-main end-to-end and secondary-machine packaged operator checks are
-recorded above. The primary-machine operator comparison, graph-boundary ledger
-and native-route natural termination check are pending. No end-to-end gain is
-claimed from isolated operator timings.
+Latest-main end-to-end, graph-boundary ledger and secondary-machine packaged
+operator checks are recorded above. The primary-machine operator comparison
+and native-route natural termination check are pending. No end-to-end gain
+is claimed from isolated operator timings.
