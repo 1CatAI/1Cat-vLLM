@@ -518,6 +518,13 @@ class GGUFModelLoader(BaseModelLoader):
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
 
+        if adapter is not None:
+            from vllm.model_executor.kernels.ple.gguf_pinned import (
+                prepare_pinned_gguf_ple,
+            )
+
+            prepare_pinned_gguf_ple(vllm_config, self._native_tensors, gguf_weights_map)
+
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
