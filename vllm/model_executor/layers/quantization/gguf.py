@@ -667,6 +667,14 @@ class GGUFLinearMethod(LinearMethodBase):
             projections = prepare_gguf_projections(
                 sources, self.params_dtype, self.native_enabled, self.prefill_min_m
             )
+            from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+                prepare_iq3_gated_pair,
+            )
+
+            if self.layout is None and not isinstance(self, GGUFEmbeddingMethod):
+                self.native_admission["gated_pair"] = prepare_iq3_gated_pair(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
@@ -737,6 +745,15 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+
+    def apply_fused_silu_and_mul(self, layer, x):
+        if not hasattr(layer, "gguf_iq3_gated_records"):
+            return None
+        from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
+            apply_iq3_gated_pair,
+        )
+
+        return apply_iq3_gated_pair(layer, x)
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
