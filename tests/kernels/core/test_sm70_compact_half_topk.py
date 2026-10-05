@@ -14,10 +14,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("rows,width", [(8, 62080), (32, 65535), (8, 1025)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @torch.inference_mode()
-def test_half_source_values_and_live_graph(rows, width):
+def test_source_values_and_live_graph(rows, width, dtype):
     torch.manual_seed(1530)
-    logits = torch.randn(rows, width, dtype=torch.float16, device="cuda")
+    logits = torch.randn(rows, width, dtype=dtype, device="cuda")
     assert compact_half_topk(logits) is not None
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -47,14 +48,26 @@ def test_half_source_values_and_live_graph(rows, width):
 
 
 @torch.inference_mode()
-def test_fp32_source_never_qualifies():
-    logits = torch.randn(8, 62080, device="cuda", dtype=torch.float32)
+def test_fp64_source_never_qualifies():
+    logits = torch.randn(8, 62080, device="cuda", dtype=torch.float64)
     assert compact_half_topk(logits) is None
 
 
-@pytest.mark.parametrize("rows", [8, 32])
 @torch.inference_mode()
-def test_target_probe_preserves_dense_token_mask(rows):
+def test_fp32_ranking_retains_values_that_collapse_in_fp16():
+    logits = torch.full((8, 62080), -20.0, device="cuda", dtype=torch.float32)
+    logits[:, :128] = 1.0 + torch.arange(128, device="cuda") * 2**-20
+    assert torch.unique(logits[:, :128].half()).numel() == 1
+    values, ids = compact_half_topk(logits)
+    expected = logits.topk(64, dim=-1)
+    assert torch.equal(ids, expected.indices)
+    assert torch.equal(values.view(torch.int32), expected.values.view(torch.int32))
+
+
+@pytest.mark.parametrize("rows", [8, 32])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@torch.inference_mode()
+def test_target_probe_preserves_dense_token_mask(rows, dtype):
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
     from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
     from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
@@ -62,7 +75,7 @@ def test_target_probe_preserves_dense_token_mask(rows):
     )
 
     torch.manual_seed(1530)
-    logits = torch.randn(rows, 248320, dtype=torch.float16, device="cuda") * 1.5
+    logits = torch.randn(rows, 248320, dtype=dtype, device="cuda") * 1.5
     logits[0].fill_(1)
     logits[1].fill_(-20)
     logits[1, :160] = 3

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lossless FP16-source selection for a guarded DFlash2 target probe."""
+"""Lossless FP16/FP32-source selection for a guarded DFlash2 target probe."""
 
 import torch
 
@@ -13,11 +13,11 @@ def compact_half_topk(
     """Return a sorted top-64 probe; the caller must retain the tie guard.
 
     This does not implement the draft selector's tie contract. Never cast
-    FP32 logits to FP16 to qualify: ranking uses the original FP16 values.
+    FP32 logits to FP16 to qualify: ranking uses the original source values.
     """
     if (
         not logits.is_cuda
-        or logits.dtype != torch.float16
+        or logits.dtype not in (torch.float16, torch.float32)
         or logits.ndim != 2
         or not 1 <= logits.shape[0] <= 32
         or not 64 <= logits.shape[1] <= 65535
@@ -30,7 +30,7 @@ def compact_half_topk(
     rows, width = logits.shape
     partial = torch.empty(
         (rows, ((width + 1023) // 1024) * 64),
-        dtype=torch.uint32,
+        dtype=torch.uint32 if logits.dtype == torch.float16 else torch.uint64,
         device=logits.device,
     )
     values = torch.empty((rows, 64), dtype=torch.float32, device=logits.device)
