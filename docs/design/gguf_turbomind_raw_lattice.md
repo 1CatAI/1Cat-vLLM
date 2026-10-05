@@ -1510,3 +1510,17 @@ workspace gap: profiled means are 16.569 µs DQ, 91.450 µs FP32-output GEMM and
 4.207 µs final cast, versus 108.704 µs canonical fused GEMM. Profiling changes
 these absolute times; matched unprofiled comparisons remain about 92.3 versus
 90.0 µs. Model defaults and end-to-end savings remain pending.
+
+### Existing canonical scale rounding
+
+A CPU comparison quantifies the existing canonical group-scale rounding; it
+is not a new original-byte operator. Compared with official FP32 weights,
+maximum relative error is 0.0487% in the measured IQ3_S/IQ2_S projections.
+After final FP16 operand formation, weight relative L2 is 0.0352% for Flash
+dense gate, 0.0347%/0.0346% for 27B gate/down and 0.0337% for the IQ2_S expert.
+The corresponding maximum absolute FP16 weight differences are 0.0002441,
+0.0001221, 0.0001221 and 0.0000610. All measured weights remain finite.
+
+These rounding statistics are not output-quality or speed evidence for a
+new decoder. The current original-byte operators retain exact final operands
+and FP32 accumulation; no pre-rounded-scale original-byte path is implemented.
