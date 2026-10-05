@@ -140,7 +140,8 @@ def apply_iq3_gated_pair(layer, x):
     blas_bands = _admitted_bands(tuple(c for c in capabilities if "blas" in c.operator))
     return torch.ops.vllm.gguf_iq3_gated_pair(
         x,
-        *layer.gguf_iq3_gated_records,
+        layer.gguf_iq3_gated_records[0],
+        layer.gguf_iq3_gated_records[1],
         [p.codes for p in projections],
         [p.stats for p in projections],
         [p.gguf_tm_k_ld for p in projections],
