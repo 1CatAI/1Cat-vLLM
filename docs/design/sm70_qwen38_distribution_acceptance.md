@@ -43,8 +43,10 @@ from stable log-softmax. Report reverse KL as a diagnostic. Never compare
 free-running continuations with different prefixes. Ignore padded vocabulary
 entries using the tokenizer/model vocabulary contract, not probability cutoff.
 
-For precision-reducing changes such as online QPN8, the initial limits
-remain unchanged (globally and in each language/task stratum):
+For precision-reducing changes such as online QPN8, admission limits are shared
+by no-MTP, target verification and draft probes. Apply them separately to the
+pooled aligned positions for each role; retain per-prompt and language/task
+stratum summaries for diagnosis:
 
 | Metric | Initial limit |
 | --- | ---: |
@@ -52,15 +54,15 @@ remain unchanged (globally and in each language/task stratum):
 | p99 forward KL, nats | <= 0.01 |
 | Maximum forward KL, nats | <= 0.05 |
 | Top-1 agreement | >= 99% |
-| Maximum absolute raw-logit error | <= 0.5 |
+| Maximum absolute raw-logit error | record only |
 | Nonfinite logits | zero |
 
 Also report median/p95/p99 logit error, additive-offset-centered maximum
 error, top-1 margin and disagreement counts. A common logit offset has no
-probability effect; raw and centered errors must both be visible. The raw
-maximum limit is a conservative investigation gate, not a mathematical claim
-that this alone bounds KL. A gate failure requires investigation and an explicit
-contract revision with evidence; it must not silently trigger relaxed limits.
+probability effect; raw and centered errors must both be visible. Maximum raw and centered logit errors are diagnostics, not admission gates.
+A common offset or FP32 reassociation must not reject a candidate whose
+distribution passes.
+Mean/p99/maximum KL, top-1 agreement and finite-logit checks remain gates.
 
 The mean-KL limit is 22x and 58x below the cross-implementation examples
 (0.022 and 0.058) supplied by the owner. Those examples are contextual reference

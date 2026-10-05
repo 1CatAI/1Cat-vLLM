@@ -41,6 +41,38 @@ def test_tied_cutoffs_match_full_vocabulary_reference(case, top_p, rows):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [1, 19, 20])
+@pytest.mark.parametrize("top_k,top_p", [(20, 0.95), (50, 0.9)])
+def test_compact_fallback_bounds_full_vocabulary_sort_workspace(
+    monkeypatch, rows, top_k, top_p
+):
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    # MTP4 at C4 has 20 target rows. Uniform logits force the ambiguous tie
+    # fallback, which previously sorted the entire expanded batch together.
+    logits = torch.ones((rows, 248320), device="cuda")
+    k = torch.full((rows,), top_k, dtype=torch.int32, device="cuda")
+    p = torch.full((rows,), top_p, device="cuda")
+    expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    reference_rows = []
+
+    def bounded_reference(x, k, p, **kwargs):
+        reference_rows.append(x.shape[0])
+        if rows > 1:
+            assert kwargs["rowwise_sort"]
+        return apply_top_k_top_p_pytorch(x, k, p, **kwargs)
+
+    monkeypatch.setattr(
+        topk_topp_sampler, "apply_top_k_top_p_pytorch", bounded_reference
+    )
+    actual = apply_top_k_top_p_triton(logits, k, p)
+    assert reference_rows == ([1] if rows == 1 else [2] * ((rows + 1) // 2))
+    assert torch.equal(actual, expected)
+    # Both the compact route and singleton reference permit in-place masking.
+    assert actual.data_ptr() == logits.data_ptr()
+
+
 @pytest.mark.parametrize("mask_value", [-float("inf"), -123.0])
 @pytest.mark.parametrize("use_top_k", [False, True])
 def test_single_row_direct_entry_keeps_grammar_ties_on_reference(
@@ -230,16 +262,20 @@ def test_compact_dense_fallback_bounds_temporary_rows(monkeypatch, rows):
     expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
     dense_batch_sizes = []
 
-    def reference(chunk, chunk_k, chunk_p):
+    def reference(chunk, chunk_k, chunk_p, *, rowwise_sort=False):
         dense_batch_sizes.append(chunk.shape[0])
-        return apply_top_k_top_p_pytorch(chunk, chunk_k, chunk_p)
+        assert rowwise_sort
+        return apply_top_k_top_p_pytorch(
+            chunk, chunk_k, chunk_p, rowwise_sort=rowwise_sort
+        )
 
     monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_pytorch", reference)
     actual = _apply_top_k_top_p_compact(logits, k, p, -float("inf"))
     assert torch.equal(actual, expected)
     assert actual.data_ptr() == logits.data_ptr()
-    assert sum(dense_batch_sizes) == rows
-    assert max(dense_batch_sizes) <= 16
+    # An odd final chunk repeats one row to retain the batched softmax scan.
+    assert sum(dense_batch_sizes) == rows + rows % 2
+    assert max(dense_batch_sizes) <= 2
 
 
 @pytest.mark.parametrize("rows", [2, 8, 32])

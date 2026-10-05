@@ -57,6 +57,7 @@ def prepare_on_cpu(layer, monkeypatch, *, native_available=True):
         for name in (
             "qwen38_router_batch_sm70_out",
             "qwen38_shared_up_batch_sm70_out",
+            "qwen38_shared_up_batch_fp32_sm70_out",
         ):
             if native_available:
                 m.setattr(torch.ops._C, name, lambda *args: None, raising=False)
@@ -66,7 +67,7 @@ def prepare_on_cpu(layer, monkeypatch, *, native_available=True):
 @pytest.mark.parametrize(
     "reduced,accumulation,reason",
     [
-        (False, False, "fp16_reduced_precision_reduction_disabled"),
+        (False, False, None),
         (True, True, "fp16_accumulation_enabled"),
         (True, False, None),
     ],
@@ -74,6 +75,12 @@ def prepare_on_cpu(layer, monkeypatch, *, native_available=True):
 def test_precision_skip_info_once_per_role(reduced, accumulation, reason, monkeypatch):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced
     torch.backends.cuda.matmul.allow_fp16_accumulation = accumulation
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen38_shared_up_batch_fp32_sm70_out",
+        lambda *args: None,
+        raising=False,
+    )
     # A dedicated logger exercises the real info_once deduplication without
     # depending on earlier loader tests or an initialized distributed group.
     logger = init_logger(f"test_mtp_packing_policy.{reduced}.{accumulation}")
@@ -119,7 +126,7 @@ def test_loader_skips_only_precision_rejected_packs(
     hook = getattr(layer, "forward_fused_silu_and_mul", None)
     prepare_on_cpu(layer, monkeypatch)
 
-    admitted = (reduced or role == "router") and not accumulation
+    admitted = not accumulation
     buffer_name = f"_sm70_mtp_{role}_packed"
     assert hasattr(layer, buffer_name) == admitted
     assert layer.weight is weight and torch.equal(layer.weight, before)
@@ -138,11 +145,7 @@ def test_loader_skips_only_precision_rejected_packs(
         assert report["prepared_buffers"] == [buffer_name]
         assert reason_name not in report["reasons"]
     else:
-        expected = (
-            "fp16_reduced_precision_reduction_disabled"
-            if role != "router" and not reduced
-            else "fp16_accumulation_enabled"
-        )
+        expected = "fp16_accumulation_enabled"
         assert report["reasons"][reason_name] == expected
         assert report["prepared_buffers"] == []
 
@@ -150,7 +153,7 @@ def test_loader_skips_only_precision_rejected_packs(
 @pytest.mark.parametrize("role", ["router", "shared"])
 def test_rejected_pack_does_not_require_native_operator(role, monkeypatch):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    torch.backends.cuda.matmul.allow_fp16_accumulation = role == "router"
+    torch.backends.cuda.matmul.allow_fp16_accumulation = True
     layer = make_layer(role)
     prepare_on_cpu(layer, monkeypatch, native_available=False)
     assert not hasattr(layer, f"_sm70_mtp_{role}_packed")
@@ -245,3 +248,12 @@ def test_fp32_router_preparation_matches_runtime_guard(reduced, rows, monkeypatc
         assert gemv._router_batch_runtime_ok(x, layer._sm70_mtp_router_packed)
         torch.backends.cuda.matmul.allow_fp16_accumulation = True
         assert not gemv._router_batch_runtime_ok(x, layer._sm70_mtp_router_packed)
+
+
+def test_missing_fp32_shared_binary_keeps_vendor_fallback(monkeypatch):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    layer = make_layer("shared")
+    prepare_on_cpu(layer, monkeypatch, native_available=False)
+    assert not hasattr(layer, "_sm70_mtp_shared_packed")
+    assert layer._sm70_mtp_shared_batch_reason == "fp32_shared_operator_missing"

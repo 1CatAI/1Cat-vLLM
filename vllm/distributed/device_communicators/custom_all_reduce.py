@@ -390,13 +390,16 @@ class CustomAllreduce:
         It records all the buffer addresses used in the CUDA graph.
         """
         with _disable_expandable_segments_for_cuda_ipc(not self.disabled):
+            self._IS_CAPTURING = True
             try:
-                self._IS_CAPTURING = True
                 yield
             finally:
                 self._IS_CAPTURING = False
-                if not self.disabled:
-                    self.register_graph_buffers()
+            # Register only after successful capture. On failure a peer can
+            # still be inside CUDA work: a CPU collective here hides the error
+            # and prevents the executor from terminating the failed worker.
+            if not self.disabled:
+                self.register_graph_buffers()
 
     def register_graph_buffers(self):
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
@@ -514,6 +517,7 @@ class CustomAllreduce:
             cooperative,
             full_unroll,
             fused_chain,
+            8 if fused_chain else 0,
         )
 
     def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
@@ -744,7 +748,9 @@ class CustomAllreduce:
         registered: bool = False,
     ) -> torch.Tensor:
         if out is None:
-            out = torch.empty((1,), dtype=torch.int64, device=input_pair.device)
+            out = torch.empty(
+                (input_pair.numel() // 2,), dtype=torch.int64, device=input_pair.device
+            )
         if registered:
             ops.top1_argmax(self._ptr, input_pair, out, 0, 0)
         else:
@@ -943,7 +949,11 @@ class CustomAllreduce:
     def custom_top1_argmax(self, input_pair: torch.Tensor) -> torch.Tensor | None:
         if self.disabled:
             return None
-        if input_pair.dtype != torch.float32 or input_pair.numel() != 2:
+        if (
+            input_pair.dtype != torch.float32
+            or not 2 <= input_pair.numel() <= 256
+            or input_pair.numel() % 2 != 0
+        ):
             return None
         if not is_weak_contiguous(input_pair):
             return None
