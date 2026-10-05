@@ -49089,3 +49089,12 @@ smaller grids do not compensate for the segment latency. Shared M1 remains
 the only candidate with a material segment gain; ordinary native build and
 complete non-PLE decoder-layer validation are pending. M5 keeps the existing
 native batch route. None of these deltas is an admitted endpoint saving.
+
+Flash-Next coalesced HC is rejected: sixteen pairs, M1 0.285737→0.563507 ms
+and M5 0.553627→1.540300 ms; with preceding reduction, M1
+0.355041→0.807260 ms and M5 0.665983→2.927887 ms. Grouped peer writes do not
+recover the failed dataflow. Shared M1 gain reproduces in the ordinary native
+package (0.287642→0.192553 ms, eighty→sixteen kernels). M5 fallback has
+identical outputs and unchanged kernel count. Complete-layer compile plumbing
+is being corrected; no layer timing, KL, top-1 or natural-EOS candidate gate
+has passed yet.

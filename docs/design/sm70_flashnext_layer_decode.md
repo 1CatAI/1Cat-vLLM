@@ -186,6 +186,8 @@ and FP32 QK/PV accumulation with FP16 probability materialization.
 | HC, fixed producers and preceding reduction | 16 | 0.351396 / 0.596746 | 0.663565 / 2.112250 | 80 / 32 |
 | HC, vector loads | 16 | 0.285962 / 0.434831 | 0.553473 / 1.101521 | 64 / 32 |
 | HC, vector loads and preceding reduction | 16 | 0.350290 / 0.586383 | 0.663231 / 2.078326 | 80 / 32 |
+| HC, coalesced eight-row peer packets | 16 | 0.285737 / 0.563507 | 0.553627 / 1.540300 | 64 / 32 |
+| HC, coalesced packets and preceding reduction | 16 | 0.355041 / 0.807260 | 0.665983 / 2.927887 | 80 / 32 |
 | Packed per-token router and experts | 4 | 0.126536 / 0.497111 | 0.367809 / 0.857393 | 16 / 4 |
 | Experts with frozen native routing | 4 | 0.081592 / 0.112855 | 0.289295 / 0.456638 | 8 / 4 |
 | QSA, parallel heads | 12 | 0.554906 / 1.146860 | 1.032283 / 3.728270 | 48 / 12 |
@@ -233,3 +235,29 @@ non-PLE decoder-layer captures retain actual M1 inputs and MTP4 verifier M5
 metadata. Those layer graphs are explicitly separated from the compiled
 whole-model endpoint. Ordinary-artifact build, layer and model distribution
 validation are still pending; no production admission is claimed.
+
+The coalesced HC experiment replaces one-row producers with two K partitions
+per eight-row group and contiguous peer publications. Its first kernel has
+twenty-two projection producers, four normalization producers and one fixed
+gather consumer. Although its arithmetic checks pass and both complete HC
+widths use two graph kernels, it remains slower and is rejected. Do not tune
+this variant.
+
+The ordinary CMake SM70 extension now builds the shared-expert operator. Its
+paired sixteen-bank M1 segment measures 0.287642 / 0.192553 ms, 80 / 16
+kernels and 32 / 0 single-CTA kernels; maximum output error is 9.54e-7. The
+production M5 fallback measures 0.399836 / 0.401592 ms with identical outputs
+and 96 kernels in both arms. These paired measurements use the same fresh
+ordinary artifacts and do not replace the earlier artifact's endpoint
+baseline. The reference source retains original Python model dispatch and
+includes the unused additive CUDA registration, so reference and candidate
+quality runs can use identical native artifacts.
+
+Fake schemas preserve output shape/dtype at M1, M5, M17 and M33. Six
+distribution-probe unit tests pass, including diagnostic-only raw logit
+differences. The first standalone decoder-layer compile failed before timing
+because eager collection selected a Python CUDA norm wrapper that could not
+be traced. A subsequent capture re-selects the compiled model's CustomOp
+policy while preserving explicitly enforced operators and the chosen GDN
+backend. Complete-layer timing and model distribution admission remain
+pending.
