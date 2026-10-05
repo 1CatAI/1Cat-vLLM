@@ -323,3 +323,30 @@ previous coalesced M1 screen already used the native TP-sharded up operator;
 its regression must not be attributed to replicated M1 up computation. The
 replicated MMA up implementation belongs to its M5 research arm. CPU build
 of the new two-phase HC passes; whole-layer M1/M5 timing is pending.
+
+The corrected QSA preparation prototype passes the complete M1 layer screen:
+critical-rank control/candidate medians are 0.285102/0.249477 ms, 33/23
+kernels and 7/4 single-CTA kernels. All layer outputs and selection IDs match.
+This paired run uses ordinary model initialization, the 8192-token prefix,
+262144 startup capacity and 94% memory; the existing shared-M1 chain is enabled
+in both arms. It does not replace the earlier artifact's endpoint baseline.
+Actual MTP4 M5, at 32768 startup capacity and 88% memory with the same 8192-token
+prefix, also passes: 0.457075/0.410872 ms, 41/30 kernels and 1/1 single-CTA
+kernels. Layer outputs and selection IDs match on all four ranks. The shared
+M5 fallback separately measures 0.269107/0.269425 ms for GDN layer 2 and
+0.455547/0.456874 ms for QSA layer 3, with identical outputs and unchanged
+28/41 kernel counts. These measurements describe verifier layers, not latency
+per emitted speculative token.
+
+The admitted preparation direction is being moved into a normal Python/Triton
+module. Its M1 joint projection selects the original two weight pointers,
+avoiding a persistent concatenated-weight copy. M5 preserves the two original
+batch projections and fuses their subsequent preparation. Ordinary-route layer
+and model qualification remain pending; the research M5 count cannot be
+credited to this production variant before measurement.
+
+The new HC peer-push/sharded-up phase reduces four graph kernels per decoder
+layer but regresses M1 complete-layer time: GDN 0.147343/0.195369 ms and QSA
+0.303332/0.339579 ms. Counts are 21/17 and 33/29, respectively. It is rejected
+for M1 without further tuning. The already queued actual-MTP M5 screen remains
+pending; no production HC dispatch is added.

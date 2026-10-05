@@ -76,7 +76,13 @@ class SharedLayerWorkerExtension:
         return {"rank": self.rank, "gdn_layers": layers}
 
     def retain_shared_layer_inputs(
-        self, width, layers, qsa_jointprep=False, gdn_conv_chain=False, hc_sharded=False
+        self,
+        width,
+        layers,
+        qsa_jointprep=False,
+        gdn_conv_chain=False,
+        hc_sharded=False,
+        qsa_package=False,
     ):
         from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
         from vllm.config import CUDAGraphMode
@@ -87,6 +93,7 @@ class SharedLayerWorkerExtension:
         self._qsa_jointprep = qsa_jointprep
         self._gdn_conv_chain = gdn_conv_chain
         self._hc_sharded = hc_sharded
+        self._qsa_package = qsa_package
         self._shared_layer_records = {}
         self._shared_layer_hooks = []
         model = self.model_runner.get_model()
@@ -263,8 +270,19 @@ class SharedLayerWorkerExtension:
                             if self._qsa_jointprep
                             or self._gdn_conv_chain
                             or self._hc_sharded
+                            or self._qsa_package
                             else arm == "candidate"
                         )
+                        if self._qsa_package and layer.layer_type == "full_attention":
+                            if not hasattr(
+                                layer.self_attn, "_sm70_qwen38_qsa_jointprep"
+                            ):
+                                raise RuntimeError(
+                                    "Ordinary QSA preparation not selected"
+                                )
+                            layer.self_attn._sm70_qwen38_qsa_jointprep = (
+                                arm == "candidate"
+                            )
                         if self._qsa_jointprep and layer.layer_type == "full_attention":
                             layer.self_attn._qsa_jointprep_enabled = arm == "candidate"
                         if self._gdn_conv_chain and gdn is not None:
@@ -304,7 +322,9 @@ class SharedLayerWorkerExtension:
                             cache.index_select(0, ids).clone()
                             for cache, ids, _ in state
                         ]
-                        if self._qsa_jointprep and layer.layer_type == "full_attention":
+                        if (
+                            self._qsa_jointprep or self._qsa_package
+                        ) and layer.layer_type == "full_attention":
                             selected_ids[arm] = layer.self_attn.topk_indices_buffer[
                                 :width
                             ].clone()
@@ -405,6 +425,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--eager-layer", action="store_true")
     parser.add_argument("--qsa-jointprep", action="store_true")
+    parser.add_argument("--qsa-package", action="store_true")
     parser.add_argument("--also-qsa-jointprep", action="store_true")
     parser.add_argument("--gdn-conv-chain", action="store_true")
     parser.add_argument("--hc-sharded-chain", action="store_true")
@@ -442,6 +463,7 @@ def main():
                 args.qsa_jointprep,
                 args.gdn_conv_chain,
                 args.hc_sharded_chain,
+                args.qsa_package,
             ),
         )
         tokenizer = llm.get_tokenizer()
@@ -469,7 +491,9 @@ def main():
             "scope": "complete non-PLE decoder layers; standalone layer CUDA graphs",
             "compiler": "eager" if args.eager_layer else "standalone_inductor",
             "candidate": (
-                "hc_sharded_chain"
+                "qsa_package"
+                if args.qsa_package
+                else "hc_sharded_chain"
                 if args.hc_sharded_chain
                 else "gdn_conv_chain"
                 if args.gdn_conv_chain
