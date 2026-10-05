@@ -17,6 +17,7 @@ from vllm.model_executor.kernels.gguf import (
     decoder_family,
     dp4a_expert_capabilities,
     lattice_grouped_capabilities,
+    q8_intermediate_expert_capabilities,
     raw_grouped_gate_up_capabilities,
     select_lattice_grouped_capability,
     small_grouped_vector_capabilities,
@@ -205,6 +206,7 @@ def _expert_dp4a(
     vector_bands: list[int],
     down_vector_batches: list[int],
     dp4a_batches: list[int],
+    q8_intermediate_batches: list[int],
 ) -> torch.Tensor:
     # Resolve actual M inside the opaque boundary so range compilation cannot
     # freeze a prefill choice into an MTP verification graph.
@@ -223,9 +225,22 @@ def _expert_dp4a(
             m,
         )
         q8 = torch.empty((m, x.shape[1] // 32, 36), dtype=torch.uint8, device=x.device)
-        hidden = x.new_empty((m, top_k, intermediate))
+        quantized_hidden = m in q8_intermediate_batches
+        hidden = (
+            torch.empty(
+                (m, top_k, intermediate // 32, 36), dtype=torch.uint8, device=x.device
+            )
+            if quantized_hidden
+            else x.new_empty((m, top_k, intermediate))
+        )
         output = torch.empty_like(x)
         torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
+        if quantized_hidden:
+            logger.info_once(
+                "SM70 GGUF routed Q8 intermediate enabled (type=%d, M=%d).",
+                source_type,
+                m,
+            )
         torch.ops._C.gguf_dp4a_gate_up_sm70_out(
             hidden, q8, ids, raw_gate, raw_up, source_type, True
         )
@@ -300,6 +315,7 @@ def _expert_dp4a_fake(
     vector_bands,
     down_vector_batches,
     dp4a_batches,
+    q8_intermediate_batches,
 ):
     return torch.empty_like(x)
 
@@ -526,6 +542,11 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         self.dp4a_enabled = self.native_enabled and (
             config.kernel_config.sm70_gguf.small_m_dp4a if config is not None else True
         )
+        self.q8_intermediate_enabled = self.dp4a_enabled and (
+            config.kernel_config.sm70_gguf.q8_expert_intermediate
+            if config is not None
+            else True
+        )
 
     def load_expert(self, layer, param, weight, shard_id, expert_id):
         if param.is_gguf_weight_type:
@@ -614,6 +635,20 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         self.dp4a_batches = [
             c.min_m for c in self.dp4a_capabilities if c.reason is None
         ]
+        q8_capabilities = q8_intermediate_expert_capabilities(
+            gate.source_type,
+            down.source_type,
+            gate.k,
+            gate.n,
+            self.num_experts,
+            self.params_dtype,
+            is_sm70=current_platform.is_device_capability(70),
+            enabled=self.q8_intermediate_enabled,
+            original_storage_available=self.raw_gate_up,
+        )
+        self.q8_intermediate_batches = [
+            c.min_m for c in q8_capabilities if c.reason is None
+        ]
         self.native_admission = {
             "enabled": True,
             "tp_size": layer.tp_size,
@@ -624,6 +659,13 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 "accumulation": "FP32",
                 "operators": [asdict(c) for c in self.dp4a_capabilities],
                 "outside_m_band": "canonical_grouped_operator",
+            },
+            "q8_intermediate": {
+                "enabled": bool(self.q8_intermediate_batches),
+                "format": "Q8_1",
+                "lanes_per_row": 16,
+                "operators": [asdict(c) for c in q8_capabilities],
+                "outside_m_band": "fp16_intermediate",
             },
             "joint_gate_up": {
                 "enabled": self.raw_gate_up,
@@ -694,6 +736,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 self.vector_bands,
                 down.down_vector_batches,
                 self.dp4a_batches,
+                self.q8_intermediate_batches,
             )
         ids = topk_ids
         mask = None
