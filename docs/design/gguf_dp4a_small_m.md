@@ -186,3 +186,13 @@ Mean acceptance length is2.793 versus2.846, delta +0.053 and95% interval
 [-0.084,+0.198]. This sample does not show a decrease; the broad interval
 does not prove equivalence. Both arms use the same installed extension and
 tokenized prompt hashes. C1/C4 raw means, medians and the outlier are retained.
+
+## Attention artifact correction
+
+The recorded 23.261/20.683 ms model comparison used a Triton QSA fallback.
+A token-metrics helper inserted an unbuilt Flash-V100 checkout ahead of the
+installed package, masking the available extension. The matched operator and
+fallback-route comparisons remain retained evidence, but they do not qualify
+native QSA throughput. The installed-import fix in #989 preserves packaged
+modules and records the Flash-V100 extension origin and SHA before model
+loading. The native-backend model comparison is being repeated.
