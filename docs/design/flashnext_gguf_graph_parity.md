@@ -275,3 +275,12 @@ Q6_K/Q4_K/IQ4 projections at hidden width2560 do not match those capabilities.
 The raw expert route is separate and hits all17 IQ3_XXS layers. IQ2_S M20
 keeps canonical fallback. No unmerged dense decoder or duplicate GEMV is
 introduced on this line.
+
+The newly merged floating-shard specialization admits only converted FP16
+sources1/30 with M8 and N12 or24/K5120. Flash-Next uses M5/M20 verification
+and K2560, so it is not admitted by that specialization. Its ordinary dense
+GDN a/b tensors already hit the common FP16 row GEMV (36 calls per target
+graph). The merged IQ3_S/IQ4_XS mixed native pair also admits M8/N4352/K5120;
+Flash-Next shared gate/up uses Q4_K/IQ4_XS at different geometry. These
+capability exclusions are expected. Changing those operator shapes remains
+with the GGUF dense operator line, without adding duplicate implementations.
