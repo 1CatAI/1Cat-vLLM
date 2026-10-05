@@ -67,6 +67,54 @@ N24, K5120, block K256 and four warps. Both require 16 bytes of shared memory;
 compilation did not initialize or launch a GPU kernel. This is a compiler
 check, not a numerical or performance result.
 
-The candidate has not passed GPU numerical, CUDA Graph replay or same-session
-timing gates. It must pass those gates on real B/A shards and the normal
-packaged runtime before integration. No speed improvement is claimed here.
+## Real B/A operator verification
+
+The standalone operator was tested on `blk.6.ssm_beta.weight` and
+`blk.6.ssm_alpha.weight` from Qwen3.8-27B GSQ-RCO IQ3_S. The normal adapter
+restores head order and converts the original BF16 matrices to FP16 before
+taking TP4 rank-zero N12/K5120 shards. Their operands match official GGUF
+Float dequantization followed by Half conversion bit for bit. Conversion's
+maximum absolute error is 2.9802322387695312e-08; all values remain finite.
+
+The installed normal wheel contains the wrapper, existing Triton row source
+and declared dev14 native libraries. No source overlay or private DSO was
+used. The updated native libraries include the CPU PLE registration. Extra
+signed-pair native APIs are present but are not used by this floating operator.
+The source tree does not include the signed-pair model dispatch changes.
+
+Workload: local Tesla V100-SXM2-32GB, SM70, clocks 1290/877 MHz, Torch
+2.10.0+cu128, Triton 3.6.0, FP16 activations and operands, FP32 accumulation.
+This machine is distinct from the primary benchmark host. The test uses
+real weights, synthetic seeded activations and standalone CUDA Graphs.
+
+| Projection | Original mm, A arms (µs) | Row GEMV, B arms (µs) | Source bytes | Source-byte bandwidth (GB/s) |
+| --- | --- | --- | --- | --- |
+| b | 149.056 / 149.040 | 7.296 / 7.296 | 122,880 | 16.84 |
+| a | 152.336 / 152.256 | 7.296 / 7.312 | 122,880 | 16.81–16.84 |
+
+Each ABBA arm contains 84 timing samples, with a 16 MiB cache flush before
+each call inside graph replay. Source-byte bandwidth is source storage divided
+by kernel time; it is not a measured DRAM traffic counter. Both M8 projections
+match official Float FP32 dot products rounded to Half and original mm
+outputs bit for bit.
+
+The runtime sequence M512 → M8 → M1 → M16 → M32 → M8 retains a single opaque
+operation in each compiled graph. PyTorch creates a second graph for its M1
+specialization. Both M8 points launch the existing row kernel; other points
+retain matrix multiplication. Every captured/replayed output is bitwise
+identical to its uncaptured counterpart. The unchanged M512 fallback has
+relative L2 error 2.28e-05 against the official Float reference.
+
+On the separate model trace, 96 old B/A calls occupy 11.5252 ms. Replacing
+them with these standalone local timings projects about 0.70 ms of B/A work,
+or 10.82 ms saved per round. That is a projection across machines, not an
+end-to-end measurement. Primary-host operator confirmation and model-level
+route/quality validation remain pending; no model speedup is claimed.
+
+Reproduce the operator test from a normally installed wheel, holding the
+shared GPU reservation and individual GPU lock:
+
+```bash
+python benchmarks/kernels/benchmark_gguf_fp16_projection.py MODEL.gguf \
+  --operator-sha SOURCE_SHA --native-base-sha NATIVE_SHA --output result.json
+```
