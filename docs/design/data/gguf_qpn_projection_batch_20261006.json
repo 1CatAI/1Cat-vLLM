@@ -142,5 +142,1010 @@
   "raw_sha256": {
     "integration-full-path-562.json": "75a4f2b75e907f416f2c05467cad439424fdb8253dd2c0dd017f49644b793d0a",
     "integration-projection-batch.json": "02720a935184a436555461b4af52401bbd5c1a4d1616f51551c42d68f5520069"
+  },
+  "trace": {
+    "source": "49ac1c58ffa8d91a3ef4b1ea068178362cf28b2f",
+    "input_tokens": 1024,
+    "output_tokens": 64,
+    "max_model_len": 32768,
+    "top_p": 0.95,
+    "clock_sm_mhz": 1290,
+    "clock_memory_mhz": 877,
+    "boundary": "First GPU node of target graph to first GPU node of next target graph",
+    "ranks": [
+      {
+        "rank": 0,
+        "retained_rounds": 12,
+        "means": {
+          "round_ms": 22.285762583333334,
+          "target_graph_ms": 18.38260325,
+          "target_kernel_union_ms": 16.87596725,
+          "target_inter_kernel_gap_ms": 1.506636,
+          "after_target_ms": 3.9031593333333334,
+          "after_target_kernel_union_ms": 3.285966833333333,
+          "after_target_inter_kernel_gap_ms": 0.6171925,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.095833333333333,
+          "graph_boundary_idle_us": 355.65083333333337,
+          "draft_graph_end_to_next_target_us": 214.75650000000002,
+          "last_tail_graph_to_next_target_us": 214.75650000000002
+        },
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 43.635394097222225,
+            "service_ms_per_round": 2.0944989166666668,
+            "weight_stream_bytes_per_call": 9973760.0,
+            "effective_weight_gbps": 228.57041184910295
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 25.31924652777778,
+            "service_ms_per_round": 1.2153238333333334,
+            "weight_stream_bytes_per_call": 4218880.0,
+            "effective_weight_gbps": 166.62739135508878
+          },
+          "gate_up.native": {
+            "calls_per_round": 60.0,
+            "us_per_call": 61.87322916666666,
+            "service_ms_per_round": 3.71239375,
+            "weight_stream_bytes_per_call": 18423466.666666668,
+            "effective_weight_gbps": 297.7615184272951
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 36.76733203125,
+            "service_ms_per_round": 2.35310925,
+            "weight_stream_bytes_per_call": 10564480.0,
+            "effective_weight_gbps": 287.3333314209699
+          },
+          "attention.q": {
+            "calls_per_round": 15.0,
+            "us_per_call": 37.659661111111106,
+            "service_ms_per_round": 0.5648949166666666,
+            "weight_stream_bytes_per_call": 7929856.0,
+            "effective_weight_gbps": 210.56631329219198
+          },
+          "attention.k+v": {
+            "calls_per_round": 6.0,
+            "us_per_call": 29.086708333333334,
+            "service_ms_per_round": 0.17452025000000002,
+            "weight_stream_bytes_per_call": 1556480.0,
+            "effective_weight_gbps": 53.51172714914172
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 23.04988541666667,
+            "service_ms_per_round": 0.3687981666666667,
+            "weight_stream_bytes_per_call": 4177920.0,
+            "effective_weight_gbps": 181.2555648098395
+          },
+          "attention.k": {
+            "calls_per_round": 9.0,
+            "us_per_call": 33.60525,
+            "service_ms_per_round": 0.30244725,
+            "weight_stream_bytes_per_call": 728177.7777777778,
+            "effective_weight_gbps": 21.6685719575893
+          },
+          "attention.v": {
+            "calls_per_round": 10.0,
+            "us_per_call": 32.16169166666666,
+            "service_ms_per_round": 0.32161691666666664,
+            "weight_stream_bytes_per_call": 720896.0,
+            "effective_weight_gbps": 22.414741347301643
+          },
+          "attention.q+k": {
+            "calls_per_round": 1.0,
+            "us_per_call": 38.10283333333333,
+            "service_ms_per_round": 0.03810283333333333,
+            "weight_stream_bytes_per_call": 9584640.0,
+            "effective_weight_gbps": 251.54664788707754
+          },
+          "gate_up.canonical": {
+            "calls_per_round": 4.0,
+            "us_per_call": 56.54295833333333,
+            "service_ms_per_round": 0.22617183333333332,
+            "weight_stream_bytes_per_call": 25067520.0,
+            "effective_weight_gbps": 443.3358412593375
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.81053141025641,
+            "service_ms_per_round": 1.5353690833333333
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.1136356589147285,
+            "service_ms_per_round": 0.788659
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.436978587962964,
+            "service_ms_per_round": 1.2149249166666667
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.834265625,
+            "service_ms_per_round": 0.490786
+          },
+          "layout_or_copy": {
+            "calls_per_round": 95.0,
+            "us_per_call": 4.771897368421053,
+            "service_ms_per_round": 0.45333025
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 31.940213541666665,
+            "service_ms_per_round": 1.0220868333333333
+          },
+          "unfused_FFN_epilogue": {
+            "calls_per_round": 4.0,
+            "us_per_call": 3.743895833333333,
+            "service_ms_per_round": 0.014975583333333332
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.857304556354916,
+            "service_ms_per_round": 0.8141653333333334
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.33655797101449,
+            "service_ms_per_round": 0.9967408333333333
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 12.998009259259259,
+            "service_ms_per_round": 0.23396416666666667
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 274.7439166666667,
+            "service_ms_per_round": 0.2747439166666667
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.39629347826087,
+            "service_ms_per_round": 0.17011474999999998
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 103.96546666666667,
+            "service_ms_per_round": 0.5198273333333333
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 276.63983333333334,
+            "service_ms_per_round": 0.27663983333333336
+          }
+        }
+      },
+      {
+        "rank": 1,
+        "retained_rounds": 12,
+        "means": {
+          "round_ms": 22.3358915,
+          "target_graph_ms": 18.4268435,
+          "target_kernel_union_ms": 16.885130166666666,
+          "target_inter_kernel_gap_ms": 1.5417133333333333,
+          "after_target_ms": 3.909048,
+          "after_target_kernel_union_ms": 3.268909416666667,
+          "after_target_inter_kernel_gap_ms": 0.6401385833333333,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.917166666666667,
+          "graph_boundary_idle_us": 373.492,
+          "draft_graph_end_to_next_target_us": 220.98766666666666,
+          "last_tail_graph_to_next_target_us": 220.98766666666666
+        },
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 43.81830729166667,
+            "service_ms_per_round": 2.10327875,
+            "weight_stream_bytes_per_call": 9973760.0,
+            "effective_weight_gbps": 227.6162776807401
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 25.434743055555558,
+            "service_ms_per_round": 1.2208676666666667,
+            "weight_stream_bytes_per_call": 4218880.0,
+            "effective_weight_gbps": 165.87075366890707
+          },
+          "gate_up.native": {
+            "calls_per_round": 60.0,
+            "us_per_call": 61.96071944444444,
+            "service_ms_per_round": 3.717643166666667,
+            "weight_stream_bytes_per_call": 18423466.666666668,
+            "effective_weight_gbps": 297.3410707922076
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 36.93976171875,
+            "service_ms_per_round": 2.36414475,
+            "weight_stream_bytes_per_call": 10564480.0,
+            "effective_weight_gbps": 285.99209925703576
+          },
+          "attention.q": {
+            "calls_per_round": 15.0,
+            "us_per_call": 37.67323888888889,
+            "service_ms_per_round": 0.5650985833333333,
+            "weight_stream_bytes_per_call": 7929856.0,
+            "effective_weight_gbps": 210.49042327865214
+          },
+          "attention.k+v": {
+            "calls_per_round": 6.0,
+            "us_per_call": 29.18798611111111,
+            "service_ms_per_round": 0.17512791666666666,
+            "weight_stream_bytes_per_call": 1556480.0,
+            "effective_weight_gbps": 53.32604976838359
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 23.165067708333336,
+            "service_ms_per_round": 0.37064108333333334,
+            "weight_stream_bytes_per_call": 4177920.0,
+            "effective_weight_gbps": 180.35431851973595
+          },
+          "attention.k": {
+            "calls_per_round": 9.0,
+            "us_per_call": 33.51921296296296,
+            "service_ms_per_round": 0.3016729166666666,
+            "weight_stream_bytes_per_call": 728177.7777777778,
+            "effective_weight_gbps": 21.724190797151994
+          },
+          "attention.v": {
+            "calls_per_round": 10.0,
+            "us_per_call": 32.20959166666667,
+            "service_ms_per_round": 0.32209591666666665,
+            "weight_stream_bytes_per_call": 720896.0,
+            "effective_weight_gbps": 22.38140760865488
+          },
+          "attention.q+k": {
+            "calls_per_round": 1.0,
+            "us_per_call": 38.302749999999996,
+            "service_ms_per_round": 0.038302749999999997,
+            "weight_stream_bytes_per_call": 9584640.0,
+            "effective_weight_gbps": 250.23372995411557
+          },
+          "gate_up.canonical": {
+            "calls_per_round": 4.0,
+            "us_per_call": 59.369458333333334,
+            "service_ms_per_round": 0.23747783333333333,
+            "weight_stream_bytes_per_call": 25067520.0,
+            "effective_weight_gbps": 422.2292185867172
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.346425,
+            "service_ms_per_round": 1.47503525
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.146229974160207,
+            "service_ms_per_round": 0.7928636666666666
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.468758680555556,
+            "service_ms_per_round": 1.21950125
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.9767102864583332,
+            "service_ms_per_round": 0.5090189166666667
+          },
+          "layout_or_copy": {
+            "calls_per_round": 95.0,
+            "us_per_call": 4.737434210526316,
+            "service_ms_per_round": 0.45005625000000005
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.061479166666665,
+            "service_ms_per_round": 1.0259673333333332
+          },
+          "unfused_FFN_epilogue": {
+            "calls_per_round": 4.0,
+            "us_per_call": 3.4558958333333334,
+            "service_ms_per_round": 0.013823583333333334
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.903205635491607,
+            "service_ms_per_round": 0.8205455833333334
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.687815217391304,
+            "service_ms_per_round": 1.00481975
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 10.52161574074074,
+            "service_ms_per_round": 0.18938908333333332
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 281.40433333333334,
+            "service_ms_per_round": 0.28140433333333337
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.426811594202898,
+            "service_ms_per_round": 0.1708166666666667
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.41793333333334,
+            "service_ms_per_round": 0.5220896666666667
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 280.0043333333333,
+            "service_ms_per_round": 0.28000433333333336
+          }
+        }
+      },
+      {
+        "rank": 2,
+        "retained_rounds": 12,
+        "means": {
+          "round_ms": 22.318532833333332,
+          "target_graph_ms": 18.4140995,
+          "target_kernel_union_ms": 16.896426083333335,
+          "target_inter_kernel_gap_ms": 1.5176734166666666,
+          "after_target_ms": 3.9044333333333334,
+          "after_target_kernel_union_ms": 3.2871769166666667,
+          "after_target_inter_kernel_gap_ms": 0.6172564166666666,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.874333333333333,
+          "graph_boundary_idle_us": 355.74091666666664,
+          "draft_graph_end_to_next_target_us": 216.45183333333333,
+          "last_tail_graph_to_next_target_us": 216.45183333333333
+        },
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 43.91259548611111,
+            "service_ms_per_round": 2.107804583333333,
+            "weight_stream_bytes_per_call": 9973760.0,
+            "effective_weight_gbps": 227.12754483288398
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 25.483461805555557,
+            "service_ms_per_round": 1.2232061666666667,
+            "weight_stream_bytes_per_call": 4218880.0,
+            "effective_weight_gbps": 165.5536454266295
+          },
+          "gate_up.native": {
+            "calls_per_round": 60.0,
+            "us_per_call": 62.053575,
+            "service_ms_per_round": 3.7232145,
+            "weight_stream_bytes_per_call": 18423466.666666668,
+            "effective_weight_gbps": 296.8961363896708
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 37.05981640625,
+            "service_ms_per_round": 2.37182825,
+            "weight_stream_bytes_per_call": 10564480.0,
+            "effective_weight_gbps": 285.065632387168
+          },
+          "attention.q": {
+            "calls_per_round": 15.0,
+            "us_per_call": 37.83367222222222,
+            "service_ms_per_round": 0.5675050833333334,
+            "weight_stream_bytes_per_call": 7929856.0,
+            "effective_weight_gbps": 209.5978406067141
+          },
+          "attention.k+v": {
+            "calls_per_round": 6.0,
+            "us_per_call": 29.24308333333333,
+            "service_ms_per_round": 0.1754585,
+            "weight_stream_bytes_per_call": 1556480.0,
+            "effective_weight_gbps": 53.225577558226014
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 23.262817708333333,
+            "service_ms_per_round": 0.37220508333333335,
+            "weight_stream_bytes_per_call": 4177920.0,
+            "effective_weight_gbps": 179.5964724644411
+          },
+          "attention.k": {
+            "calls_per_round": 9.0,
+            "us_per_call": 33.78909259259259,
+            "service_ms_per_round": 0.30410183333333335,
+            "weight_stream_bytes_per_call": 728177.7777777778,
+            "effective_weight_gbps": 21.550675733074065
+          },
+          "attention.v": {
+            "calls_per_round": 10.0,
+            "us_per_call": 32.111,
+            "service_ms_per_round": 0.32110999999999995,
+            "weight_stream_bytes_per_call": 720896.0,
+            "effective_weight_gbps": 22.450126125003894
+          },
+          "attention.q+k": {
+            "calls_per_round": 1.0,
+            "us_per_call": 38.17483333333333,
+            "service_ms_per_round": 0.03817483333333333,
+            "weight_stream_bytes_per_call": 9584640.0,
+            "effective_weight_gbps": 251.07221598871857
+          },
+          "gate_up.canonical": {
+            "calls_per_round": 4.0,
+            "us_per_call": 59.34610416666666,
+            "service_ms_per_round": 0.23738441666666665,
+            "weight_stream_bytes_per_call": 25067520.0,
+            "effective_weight_gbps": 422.39537627610355
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.34328782051282,
+            "service_ms_per_round": 1.4746274166666664
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.157681524547804,
+            "service_ms_per_round": 0.7943409166666666
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.480357060185185,
+            "service_ms_per_round": 1.2211714166666667
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.8328665364583334,
+            "service_ms_per_round": 0.49060691666666667
+          },
+          "layout_or_copy": {
+            "calls_per_round": 95.0,
+            "us_per_call": 4.776015789473684,
+            "service_ms_per_round": 0.45372150000000006
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.0563203125,
+            "service_ms_per_round": 1.02580225
+          },
+          "unfused_FFN_epilogue": {
+            "calls_per_round": 4.0,
+            "us_per_call": 3.1904583333333334,
+            "service_ms_per_round": 0.012761833333333333
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.914982613908873,
+            "service_ms_per_round": 0.8221825833333334
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.6889384057971,
+            "service_ms_per_round": 1.0048455833333334
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 11.38187037037037,
+            "service_ms_per_round": 0.20487366666666665
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 280.62558333333334,
+            "service_ms_per_round": 0.2806255833333333
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.47468115942029,
+            "service_ms_per_round": 0.1719176666666667
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.48468333333334,
+            "service_ms_per_round": 0.5224234166666666
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 280.4284166666667,
+            "service_ms_per_round": 0.2804284166666667
+          }
+        }
+      },
+      {
+        "rank": 3,
+        "retained_rounds": 12,
+        "means": {
+          "round_ms": 22.328287833333334,
+          "target_graph_ms": 18.42844716666667,
+          "target_kernel_union_ms": 16.935291333333332,
+          "target_inter_kernel_gap_ms": 1.4931558333333332,
+          "after_target_ms": 3.8998406666666665,
+          "after_target_kernel_union_ms": 3.2868921666666666,
+          "after_target_inter_kernel_gap_ms": 0.6129485,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.746166666666667,
+          "graph_boundary_idle_us": 352.8575833333333,
+          "draft_graph_end_to_next_target_us": 212.72091666666665,
+          "last_tail_graph_to_next_target_us": 212.72091666666665
+        },
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 44.05744791666667,
+            "service_ms_per_round": 2.1147575,
+            "weight_stream_bytes_per_call": 9973760.0,
+            "effective_weight_gbps": 226.38079306965454
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 25.361869791666667,
+            "service_ms_per_round": 1.21736975,
+            "weight_stream_bytes_per_call": 4218880.0,
+            "effective_weight_gbps": 166.34735666793102
+          },
+          "gate_up.native": {
+            "calls_per_round": 60.0,
+            "us_per_call": 61.82284444444444,
+            "service_ms_per_round": 3.709370666666666,
+            "weight_stream_bytes_per_call": 18423466.666666668,
+            "effective_weight_gbps": 298.0041897493483
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 36.80348567708334,
+            "service_ms_per_round": 2.3554230833333336,
+            "weight_stream_bytes_per_call": 10564480.0,
+            "effective_weight_gbps": 287.0510715396247
+          },
+          "attention.q": {
+            "calls_per_round": 15.0,
+            "us_per_call": 37.61365,
+            "service_ms_per_round": 0.56420475,
+            "weight_stream_bytes_per_call": 7929856.0,
+            "effective_weight_gbps": 210.82388973152032
+          },
+          "attention.k+v": {
+            "calls_per_round": 6.0,
+            "us_per_call": 29.259069444444442,
+            "service_ms_per_round": 0.17555441666666663,
+            "weight_stream_bytes_per_call": 1556480.0,
+            "effective_weight_gbps": 53.19649700259132
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 23.16721354166667,
+            "service_ms_per_round": 0.3706754166666667,
+            "weight_stream_bytes_per_call": 4177920.0,
+            "effective_weight_gbps": 180.3376134331361
+          },
+          "attention.k": {
+            "calls_per_round": 9.0,
+            "us_per_call": 33.560027777777776,
+            "service_ms_per_round": 0.30204025,
+            "weight_stream_bytes_per_call": 728177.7777777778,
+            "effective_weight_gbps": 21.697770413049252
+          },
+          "attention.v": {
+            "calls_per_round": 10.0,
+            "us_per_call": 32.076541666666664,
+            "service_ms_per_round": 0.3207654166666667,
+            "weight_stream_bytes_per_call": 720896.0,
+            "effective_weight_gbps": 22.474243248895547
+          },
+          "attention.q+k": {
+            "calls_per_round": 1.0,
+            "us_per_call": 38.241166666666665,
+            "service_ms_per_round": 0.038241166666666666,
+            "weight_stream_bytes_per_call": 9584640.0,
+            "effective_weight_gbps": 250.63670477277978
+          },
+          "gate_up.canonical": {
+            "calls_per_round": 4.0,
+            "us_per_call": 56.34939583333334,
+            "service_ms_per_round": 0.22539758333333335,
+            "weight_stream_bytes_per_call": 25067520.0,
+            "effective_weight_gbps": 444.858718168747
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 12.224596794871795,
+            "service_ms_per_round": 1.5891975833333334
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.120818475452197,
+            "service_ms_per_round": 0.7895855833333334
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.458471643518518,
+            "service_ms_per_round": 1.2180199166666665
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.7163216145833333,
+            "service_ms_per_round": 0.4756891666666667
+          },
+          "layout_or_copy": {
+            "calls_per_round": 95.0,
+            "us_per_call": 4.773835964912281,
+            "service_ms_per_round": 0.45351441666666664
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 31.8610390625,
+            "service_ms_per_round": 1.01955325
+          },
+          "unfused_FFN_epilogue": {
+            "calls_per_round": 4.0,
+            "us_per_call": 3.51525,
+            "service_ms_per_round": 0.014061
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.9026288968824945,
+            "service_ms_per_round": 0.8204654166666668
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.695322463768115,
+            "service_ms_per_round": 1.0049924166666666
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 11.130731481481481,
+            "service_ms_per_round": 0.20035316666666667
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 281.5,
+            "service_ms_per_round": 0.2815
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.409978260869565,
+            "service_ms_per_round": 0.17042949999999998
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 105.56498333333333,
+            "service_ms_per_round": 0.5278249166666666
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 281.48675,
+            "service_ms_per_round": 0.28148674999999995
+          }
+        }
+      }
+    ],
+    "counterparts": [
+      {
+        "role": "gate_up",
+        "m": 8,
+        "n": 4352,
+        "k": 5120,
+        "weight_stream_bytes": 25067520,
+        "parameters": {
+          "operator": "nvfp4_qpn2_gated_sm70_out",
+          "split_k": 8,
+          "accumulator_chains": 2
+        },
+        "timings": [
+          {
+            "median_us": 53.247999399900436,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 50.175998359918594,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "down",
+        "m": 8,
+        "n": 5120,
+        "k": 4352,
+        "weight_stream_bytes": 12533760,
+        "parameters": {
+          "operator": "nvfp4_qpn2_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2
+        },
+        "timings": [
+          {
+            "median_us": 26.623999699950218,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 26.623999699950218,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "qkvz",
+        "m": 8,
+        "n": 4096,
+        "k": 5120,
+        "weight_stream_bytes": 20979712,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020872967434115708
+        },
+        "timings": [
+          {
+            "median_us": 38.91199827194214,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 35.840000957250595,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "GDN_out",
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "weight_stream_bytes": 7874560,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 1,
+          "fast_decoder": true,
+          "relative_l2": 0.00019928715482819825
+        },
+        "timings": [
+          {
+            "median_us": 18.432000651955605,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 18.432000651955605,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_qkv",
+        "m": 8,
+        "n": 3584,
+        "k": 5120,
+        "weight_stream_bytes": 18357248,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020985465380363166
+        },
+        "timings": [
+          {
+            "median_us": 34.81600061058998,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 31.74399957060814,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_q",
+        "m": 8,
+        "n": 3072,
+        "k": 5120,
+        "weight_stream_bytes": 15734784,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020705357019323856
+        },
+        "timings": [
+          {
+            "median_us": 31.74399957060814,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 30.719999223947525,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_k",
+        "m": 8,
+        "n": 256,
+        "k": 5120,
+        "weight_stream_bytes": 1311232,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020819861674681306
+        },
+        "timings": [
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_v",
+        "m": 8,
+        "n": 256,
+        "k": 5120,
+        "weight_stream_bytes": 1311232,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020196763216517866
+        },
+        "timings": [
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 19.967999309301376,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_kv",
+        "m": 8,
+        "n": 512,
+        "k": 5120,
+        "weight_stream_bytes": 2622464,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020581770513672382
+        },
+        "timings": [
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 20.479999482631683,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_qk",
+        "m": 8,
+        "n": 3328,
+        "k": 5120,
+        "weight_stream_bytes": 17046016,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 2,
+          "fast_decoder": true,
+          "relative_l2": 0.00020763601060025394
+        },
+        "timings": [
+          {
+            "median_us": 33.28000009059906,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 31.74399957060814,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "attention_o",
+        "m": 8,
+        "n": 5120,
+        "k": 1536,
+        "weight_stream_bytes": 7874560,
+        "parameters": {
+          "operator": "fp8_qpn8_gemm_sm70_out",
+          "split_k": 16,
+          "accumulator_chains": 1,
+          "fast_decoder": true,
+          "relative_l2": 0.00020659450092352927
+        },
+        "timings": [
+          {
+            "median_us": 19.45599913597107,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 18.432000651955605,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "role": "qkvz_ab",
+        "m": 8,
+        "n": 2560,
+        "k": 5120,
+        "weight_stream_bytes": 21225472,
+        "parameters": {
+          "operator": "fp8_qpn8_dispatch_ba_split_sm70_out",
+          "output_n": 4120
+        },
+        "timings": [
+          {
+            "median_us": 35.840000957250595,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          },
+          {
+            "median_us": 35.840000957250595,
+            "clock_before": "1290, 877, 300.00",
+            "clock_after": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "raw_sqlite_sha256": "da49f41cf492b19e18a4736fedb380996a3e6e45c7f43f128d1855d23dc6135b",
+    "byte_provenance": "Down original records: captured direct parameter counts. Joint qkvz: exact installed-operator-validated source tuple/stream geometry and padded N64 FP16 B/A. ParameterList children were omitted by capture inventory. Other projections: captured code/stat or original-record inventory; excludes activation, workspace and repeated traffic."
   }
 }

@@ -64,11 +64,115 @@ from the steady measurements.
 
 ## Graph-linked decomposition
 
-A single post-batch capture follows the same historical trace fixture:
+One completed post-batch capture follows the historical trace fixture:
 1024 input tokens, 64 output tokens, maximum length 32768 and one sequence.
 The trace fixture uses top-p 0.95; the sixteen-prompt unprofiled comparison
-uses top-p 0.9. These contracts remain separate. Graph-linked results and
-projection/tail/gap attribution will be recorded after that capture completes.
+uses top-p 0.9. These contracts remain separate. A prior initialization
+attempt ran out of disk before profiler capture; no GPU trace was collected
+in that attempt. Twelve full graph-linked rounds per rank remain after
+transition filtering. Rank0 contains 281 target matrix launches per round,
+compared with 412 in the previous ledger.
+
+| Rank | Full GPU round ms | Target graph ms | After target ms |
+| --- | ---: | ---: | ---: |
+| 0 | 22.285763 | 18.382603 | 3.903159 |
+| 1 | 22.335891 | 18.426844 | 3.909048 |
+| 2 | 22.318533 | 18.414099 | 3.904433 |
+| 3 | 22.328288 | 18.428447 | 3.899841 |
+
+Rank0 decreases from 24.093242 to 22.285763ms. The target graph decreases
+from 20.189812 to 18.382603ms, while the tail remains 3.903159ms
+(previously 3.903430ms). These are profiler diagnostics, separate from
+20.639314/21.734425ms in the unprofiled sixteen-prompt comparison.
+
+### Target projection service and counterpart operators
+
+Kernel service is summed and divided by call count. Weight bytes describe
+unique streams per rank, including the padded B/A tile. The capture inventory
+omitted joint-projection ParameterList children; qkvz bytes are reconstructed
+from its ordered admitted source tuple and the exact stream lengths validated
+by the installed operator. Down uses captured original-record parameter sizes
+or the captured canonical code/stat streams. No second capture is needed.
+Effective GB/s excludes activation, workspace, codebook and repeated traffic;
+it is not an NCU DRAM measurement.
+
+The counterpart column is a separate same-machine, 1290/877MHz, real-weight
+cold-L2 graph operator measurement. It is NVFP4 for FFN and channel FP8 for
+GDN/attention in the NVFP4 checkpoint. Profiling and event-timing regimes
+remain distinct; their differences are not complete-round speedups. All
+counterpart arms and source formats are retained in the aggregate JSON.
+
+| Role | Calls/round | Trace us/call | ms/round | Bytes/call/rank | Effective GB/s | Counterpart operator us |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| qkvz+a_b | 48 | 43.635 | 2.094499 | 9973760 | 228.6 | 35.840–35.840 |
+| gdn_out | 48 | 25.319 | 1.215324 | 4218880 | 166.6 | 18.432–18.432 |
+| gate_up.native | 60 | 61.873 | 3.712394 | 18423467 | 297.8 | 50.176–53.248 |
+| down | 64 | 36.767 | 2.353109 | 10564480 | 287.3 | 26.624–26.624 |
+| attention.q | 15 | 37.660 | 0.564895 | 7929856 | 210.6 | 30.720–31.744 |
+| attention.k+v | 6 | 29.087 | 0.174520 | 1556480 | 53.5 | 20.480–20.480 |
+| attention.o | 16 | 23.050 | 0.368798 | 4177920 | 181.3 | 18.432–19.456 |
+| attention.k | 9 | 33.605 | 0.302447 | 728178 | 21.7 | 20.480–20.480 |
+| attention.v | 10 | 32.162 | 0.321617 | 720896 | 22.4 | 19.968–20.480 |
+| attention.q+k | 1 | 38.103 | 0.038103 | 9584640 | 251.5 | 31.744–33.280 |
+| gate_up.canonical | 4 | 56.543 | 0.226172 | 25067520 | 443.3 | 50.176–53.248 |
+
+QKVZ and a/b now share 48 launches, so no arbitrary portion of one kernel
+is assigned to a/b alone. The 60 original-record gate/up pairs comprise
+eight IQ3_S, forty mixed and twelve pure IQ3_XXS layers. The four remaining
+canonical pairs are pure IQ4_XS. The 64 down calls mix 37 QPN and 27 canonical
+layers; their aggregate is not the latency of one quantization type.
+Attention retains 41 physical q/k/v launches across sixteen layers.
+
+### Target auxiliary service
+
+| Category | Calls/round | us/call | ms/round |
+| --- | ---: | ---: | ---: |
+| communication_or_reduction | 130 | 11.811 | 1.535369 |
+| rms_norm | 129 | 6.114 | 0.788659 |
+| GDN_state_or_gating | 144 | 8.437 | 1.214925 |
+| other_target | 128 | 3.834 | 0.490786 |
+| layout_or_copy | 95 | 4.772 | 0.453330 |
+| attention | 32 | 31.940 | 1.022087 |
+| unfused_FFN_epilogue | 4 | 3.744 | 0.014976 |
+
+Layout/copy calls decrease from 143 to 95 and unfused FFN epilogues from
+16 to four. Communication and normalization remain at 130 and 129 calls.
+
+### Work after the target graph
+
+The tail still contains 210 kernels per round. The two head calls remain
+separate: target rejection and draft proposal with distinct hidden inputs.
+
+| Category | Calls/round | us/call | ms/round |
+| --- | ---: | ---: | ---: |
+| other_tail | 139 | 5.857 | 0.814165 |
+| draft_GEMM | 23 | 43.337 | 0.996741 |
+| communication_or_reduction | 18 | 12.998 | 0.233964 |
+| target_head | 1 | 274.744 | 0.274744 |
+| sampling_and_sorting | 23 | 7.396 | 0.170115 |
+| draft_attention | 5 | 103.965 | 0.519827 |
+| draft_shared_head | 1 | 276.640 | 0.276640 |
+
+Each head reads 198656000 canonical bytes per rank, giving 723.1 and 718.1GB/s.
+The graph does not establish an exact merge of these data-dependent calls.
+Draft attention remains five paged calls with only eight CTAs each.
+
+### Idle intervals and closure
+
+| Rank0 interval | Mean |
+| --- | ---: |
+| Target kernel interval union | 16.875967 ms |
+| Target gaps between kernels | 1.506636 ms |
+| Tail kernel interval union | 3.285967 ms |
+| Tail gaps | 0.617193 ms |
+| Pure idle between graph boundaries | 355.650833 us |
+| Draft graph end to next target envelope | 214.756500 us |
+| Last tail kernel to next target | 11.095833 us |
+
+The draft-end envelope includes intervening head and sampling work. Only
+355.651us of graph-boundary idle remains after subtracting kernel interval
+unions; the final kernel-to-target gap is 11.096us. Service totals overlap
+and are not added to close the round; interval unions retain their residuals.
 
 ## Remaining shared integration boundaries
 
