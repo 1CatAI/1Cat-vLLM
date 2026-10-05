@@ -35,7 +35,10 @@ def test_dense_matches_official_q8_formula_and_output_views(
     _, size = quant_size(kind)
     rng = np.random.default_rng(kind)
     blocks = rng.integers(0, 256, (n, k // 256, size), dtype=np.uint8)
-    d = rng.uniform(0.001, 0.01, blocks.shape[:2]).astype("<f2")
+    # Keep the fused FP16 multiplication finite; arbitrary full-range IQ4
+    # scale bytes otherwise overflow both the official oracle and the kernel.
+    upper = 0.001 if activated else 0.01
+    d = rng.uniform(upper / 10, upper, blocks.shape[:2]).astype("<f2")
     start = 208 if kind == 14 else 0
     blocks[:, :, start : start + 2] = d[..., None].view(np.uint8)
     if kind == 12:
