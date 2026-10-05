@@ -64,3 +64,61 @@ also match at four input amplitudes. The paired cold-graph full kernel is
 Decode-only gate/up improves by one event-clock bin, 45.056 → 44.032 µs;
 complete-kernel timing does not improve. Reject this fold alone rather than
 claiming a model benefit or repeating expensive end-to-end gates.
+
+A further norm placement screen moves the 128-column gated norm into each
+head-local warp of the SplitK12 out projection. It leaves delta and weight
+addresses unchanged and replaces activation loads with warp operand exchange.
+Cold 9609 real-weight norm-plus-projection timing regresses from 19.036 to
+49.505 microseconds despite reducing two compute kernels to one. Register use
+rises to 87 with a 128-byte stack frame (no spill instructions reported).
+The maximum output error at four input amplitudes is .001953125; this is a
+local tolerance screen, not model KL validation. Reject before whole-layer or
+model tests. CUDA compilation used toolkit 12.0 against Torch 2.10/cu128;
+this research artifact is not a release wheel.
+
+The retained PR983 WY layer screens on the full-NV2 54633 machine also fail the
+speed screen. Five configurations show 48-layer estimates including measured
+batched publication of -0.249, -0.458, -0.233, -0.253 and -0.625 milliseconds.
+The estimates exclude unchanged TP collectives, head and sampling. Original
+raw files are retained externally; this work did not rerun or change that
+implementation. State-memory savings do not establish a decode speedup.
+
+An 80-CTA cooperative M8 MLP loops over the original 136 gate/up tiles and
+160 down tiles in one resident grid. The two projections share their original
+16 KiB partial scratch and retain the exact decoder, weight addresses,
+accumulation and reduction order. A CUDA cooperative launch verifies residency
+before using its grid barrier; no unsafe global spin barrier is involved.
+Both intermediate and final output bits match at four amplitudes. The cold
+9609 pair regresses 69.811 -> 79.058 microseconds while reducing two compute
+kernels to one. The candidate uses 68 registers, 16 KiB shared memory and no
+stack/spills. Reject before a whole-layer or model run. Toolkit 12.0 research
+compilation against Torch 2.10/cu128 is recorded, not a release qualification.
+
+An assembly check of the norm-placement screen finds local array LDL/STL
+instructions despite ptxas reporting zero register spills. A fixed-index
+control explicitly expands the five reduction levels and eight operand steps.
+It removes the stack entirely and lowers registers from 87 to 68, but still
+regresses the cold pair from 19.072 to 33.987 microseconds. The output tolerance
+check remains unchanged; model numerical admission was not run. Both norm
+placement variants are rejected, without claiming that fewer nodes imply lower
+latency. Reproduction uses `benchmark_sm70_gdn_norm_operand.py`, with optional
+`--static-operands`, and `benchmark_sm70_qpn2_cooperative_pair.py`; each accepts
+`--model`, `--source-root`, `--out` and `--iters 200`. The new cooperative pair
+screen is separate from the existing TP4 publication benchmark.
+
+A residency control caps the cooperative pair at 64 registers with
+`__launch_bounds__(512, 2)` and launches 160 CTAs. Runtime occupancy confirms
+two resident CTAs per SM, 16 KiB shared memory, and no local memory or spills.
+Both intermediate and final bits still match. Cold 9609 timing is
+69.704 -> 69.381 microseconds: the optimistic 56-layer estimate is only
+.018 milliseconds, below integration admission. This control addresses the
+one-CTA residency limitation of the original 68-register/80-CTA screen; it is
+not a claimed whole-layer or endpoint speedup. Reproduce with `--blocks 160`.
+
+A separate CUDA-driver census reads the actual graph nodes for the fixed-index
+norm placement and 160-CTA MLP pair. Both capture two control kernel nodes and
+one candidate kernel node, with no child or conditional bodies omitted. The
+census has no L2 eviction or timing events and provides no latency evidence.
+Production model graphs remain unchanged because neither screen is admitted.
+The pair's single-microbenchmark paired saving interval is .179--.466
+microseconds; this is not an across-startup or endpoint confidence interval.
