@@ -36,6 +36,7 @@ def main():
     parser.add_argument("--prototype-iq2-s", action="store_true")
     parser.add_argument("--prototype-iq2-xs", action="store_true")
     parser.add_argument("--prototype-iq2-xxs", action="store_true")
+    parser.add_argument("--prototype-q2-k", action="store_true")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -51,6 +52,7 @@ def main():
                 args.prototype_iq2_s,
                 args.prototype_iq2_xs,
                 args.prototype_iq2_xxs,
+                args.prototype_q2_k,
             )
         )
         <= 1
@@ -65,7 +67,9 @@ def main():
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
         allowed = (
-            ((17, 16), (16, 22))
+            ((10, 21),)
+            if args.prototype_q2_k
+            else ((17, 16), (16, 22))
             if args.prototype_iq2_xxs
             else ((17, 18), (22, 17))
             if args.prototype_iq2_xs
@@ -93,6 +97,7 @@ def main():
                 (18, 22),
                 (17, 18),
                 (22, 17),
+                (10, 21),
                 (17, 16),
                 (16, 22),
             )
@@ -113,6 +118,7 @@ def main():
             or args.prototype_iq2_s
             or args.prototype_iq2_xs
             or args.prototype_iq2_xxs
+            or args.prototype_q2_k
         ):
             from vllm.model_executor.layers.quantization.gguf_iq3_records import (
                 signed_index_records,
@@ -122,6 +128,10 @@ def main():
             )
 
             packers = {18: pack_iq3_xxs_records, 21: signed_index_records}
+            if args.prototype_q2_k:
+                from vllm.model_executor.layers.quantization import gguf_q2_k_records
+
+                packers[10] = gguf_q2_k_records.pack_q2_k_records
             if args.prototype_iq2_s or args.prototype_iq2_xs or args.prototype_iq2_xxs:
                 from vllm.model_executor.layers.quantization.gguf_iq2_s_records import (
                     pack_iq2_s_records,
