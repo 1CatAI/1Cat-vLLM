@@ -49029,3 +49029,21 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## Concurrent DFlash2 head admission, 2026-10-05
+
+The QPN8 candidate head was limited to eight rows even when verification
+required M16-M64. The new admission uses the configured verifier width up to
+64 rows for FP32 rerank, retaining eight rows for the legacy FP16 reranker.
+Existing M16/M32 kernels provide the support search; final scores still use
+original head weights. No new runtime switch or C1 reduction is introduced.
+
+The cold-cache real-weight operator screen covers dense FP32 top-21 at
+M8/M16/M32/M64 on Gaussian inputs. Maximum selected logit error is 4.53e-6;
+maximum post-top-k/top-p probability error is 4.03e-7. This is a local
+operator check, not teacher-forcing qualification. Raw FP8 scores are not
+admitted as a replacement for final logits: their M16/M32 top-1 agreement
+was only 93.75% on this fixture. Keep the original-weight rerank.
+
+Operator timings suggest a useful concurrent gain; matched model timing,
+acceptance and clean wheel checks remain mandatory before promotion.
