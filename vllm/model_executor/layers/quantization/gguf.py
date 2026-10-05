@@ -701,7 +701,11 @@ class GGUFLinearMethod(LinearMethodBase):
             else:
                 sources = [(qweight, layer.qweight_type.weight_type)]
             projections = prepare_gguf_projections(
-                sources, self.params_dtype, self.native_enabled, self.prefill_min_m
+                sources,
+                self.params_dtype,
+                self.native_enabled,
+                self.prefill_min_m,
+                input_layout=self.layout,
             )
             from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
                 prepare_iq3_gated_pair,
@@ -727,6 +731,8 @@ class GGUFLinearMethod(LinearMethodBase):
             if any(projection.kernel is not None for projection in projections):
                 layer.gguf_tm_projections = torch.nn.ModuleList(projections)
                 self.canonical_projections = layer.gguf_tm_projections
+                if all(p.input_layout_restored for p in projections):
+                    self.layout = None
                 qweight.data_container.clear()
                 # Replace this layer's parameter rather than mutating shared
                 # checkpoint storage (for example a tied embedding parameter).
