@@ -7,12 +7,13 @@
 // k_i^T
 //   u_t = beta_t (v_t - e^{G_t} S0 k_t - sum_{i<t} e^{G_t-G_i} (k_i.k_t) u_i)
 //   o_t = e^{G_t} S0 q_t + sum_{i<=t} e^{G_t-G_i} (k_i.q_t) u_i
-// Rows of S are independent given the shared 8x8 coefficients.  The persistent
-// state slot holds the committed start state; at the start of a step the
-// previous step's accepted prefix (a tokens) is committed from the (u, k, G)
-// that step saved:
+// Rows of S are independent given the shared 8x8 coefficients. The persistent
+// state slot holds the committed start state. Production publishes the accepted
+// prefix in a separate, batched commit after sampling. The verifier can also
+// commit the previous step's accepted prefix (a tokens) from a separate bank:
 //   S0 = e^{Gp_a} S_prev + sum_{i<a} e^{Gp_a-Gp_i} up_i kp_i^T
-// One state read and one state write per step; FP32 throughout.
+// One state read during verify and one read/write during publication; FP32
+// throughout, without per-token state snapshots.
 #include <torch/types.h>
 #include <torch/library.h>
 #include <ATen/cuda/Exceptions.h>

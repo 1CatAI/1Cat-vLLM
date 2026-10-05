@@ -6,6 +6,9 @@ Tests use the shipped operator. Research runs may explicitly load an extension
 built from this same source before invoking pytest; no runtime depends on it.
 """
 
+import runpy
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -192,7 +195,7 @@ def test_commit_zero_copy_and_graph():
     torch.testing.assert_close(state[2], original[2], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("runner", ["v1", "v2"])
+@pytest.mark.parametrize("runner", ["v1", "v2", "v2_triton"])
 @pytest.mark.parametrize("same_block", [False, True])
 def test_batched_commit_saves_boundary_and_running_state(runner, same_block):
     require_op()
@@ -218,7 +221,9 @@ def test_batched_commit_saves_boundary_and_running_state(runner, same_block):
     accepted[mapping.long()] = batch_accepted
     updated_computed[mapping.long()] = computed + batch_accepted
     snapshot = accepted.clone()
-    next_counts = accepted.clone() if runner == "v2" else batch_accepted.clone()
+    next_counts = (
+        accepted.clone() if runner.startswith("v2") else batch_accepted.clone()
+    )
     next_selectors = next_counts.clone()
     for layer in range(nlayers):
         state = torch.randn(slots, HV, V, K, device="cuda") * 0.03
@@ -280,7 +285,7 @@ def test_batched_commit_saves_boundary_and_running_state(runner, same_block):
     desc = torch.tensor(descriptors, device="cuda", dtype=torch.int64)
     cd = torch.tensor(conv_desc, device="cuda", dtype=torch.int64)
     table_ptrs = torch.tensor([tables.data_ptr()], device="cuda", dtype=torch.int64)
-    if runner == "v2":
+    if runner.startswith("v2"):
         torch.ops._C.gdn_wy_commit_group_v2_sm70(
             states,
             pending,
@@ -308,13 +313,49 @@ def test_batched_commit_saves_boundary_and_running_state(runner, same_block):
         )
     # Existing postprocess consumes convolution prefixes before finish shifts
     # the running window. Exercise both same-block and distinct destinations.
-    for history in conv:
-        if same_block:
-            history[source[0], :3].copy_(history[source[0], 7:10].clone())
-        else:
-            for req in (0, 1):
-                history[dest[req], :4].copy_(history[source[req], 6:10])
-    if runner == "v2":
+    if runner == "v2_triton":
+        # Exercise the production copy kernel, including overlapping SD-layout
+        # convolution copies and the collapsed temporal-state copy guard.
+        module = runpy.run_path(
+            str(
+                Path(__file__).resolve().parents[3]
+                / "vllm/v1/worker/gpu/mamba_align.py"
+            )
+        )
+        tensors = [tensor for pair in zip(conv, states) for tensor in pair]
+
+        def metadata(values, dtype):
+            return torch.tensor(values, device="cuda", dtype=dtype)
+
+        kernel = module["_postprocess_mamba_align_kernel"]
+        kernel[(nreq, len(tensors), 16)](
+            snapshot,
+            next_counts,
+            torch.ones(nreq, device="cuda", dtype=torch.int32),
+            updated_computed,
+            table_ptrs,
+            tables.stride(0),
+            metadata([t.data_ptr() for t in tensors], torch.int64),
+            metadata([t.stride(0) * t.element_size() for t in tensors], torch.int64),
+            metadata([t.element_size() for t in tensors], torch.int32),
+            metadata([2560, HV * V * K] * nlayers, torch.int64),
+            metadata([10, 0] * nlayers, torch.int32),
+            metadata([0] * len(tensors), torch.int32),
+            metadata([False, True] * nlayers, torch.bool),
+            mapping,
+            nreq,
+            MAMBA_BLOCK_SIZE=256,
+            COPY_BLOCK_SIZE=1024,
+            TEMPORAL_TILES=16,
+        )
+    else:
+        for history in conv:
+            if same_block:
+                history[source[0], :3].copy_(history[source[0], 7:10].clone())
+            else:
+                for req in (0, 1):
+                    history[dest[req], :4].copy_(history[source[req], 6:10])
+    if runner.startswith("v2"):
         torch.ops._C.gdn_wy_finish_group_v2_sm70(
             pending,
             conv,
@@ -368,7 +409,7 @@ def test_batched_commit_saves_boundary_and_running_state(runner, same_block):
             )
         assert torch.equal(pending[layer], torch.full_like(pending[layer], -1))
     expected_counts = torch.ones_like(next_counts)
-    expected_counts[int(mapping[-1]) if runner == "v2" else nreq - 1] = 3
+    expected_counts[int(mapping[-1]) if runner.startswith("v2") else nreq - 1] = 3
     torch.testing.assert_close(next_counts, expected_counts, rtol=0, atol=0)
 
 
