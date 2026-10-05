@@ -55,6 +55,24 @@ TurboMind's existing `iq_values` helper. All 16 integers are exactly
 representable in FP16 and FP32. Direct lookup removes unity-scale Half
 conversion and promotion; original FP32 scaling and final operand rounding
 remain unchanged. A CPU oracle exhausts 65,536 four-nibble packets against
-the canonical constants and official GGUF codebook. New normal build,
-actual-weight output equivalence and matched performance checks remain
-pending; no additional model admission is enabled.
+the canonical constants and official GGUF codebook. The normal CUDA 12.8 build and complete wheel pass. Fifteen actual-weight
+outputs spanning layers 37/58/62 and already admitted layers 39/42, with
+three activation seeds each, are bitwise identical to the previous reader.
+No additional model admission is enabled while the primary performance
+comparison is pending.
+
+A second one-node NCU capture at the same 1290/877MHz and 300W measures
+11,921,488 warp instructions, 11.6% fewer, and 41.96% issue-active
+utilization. PRMT drops from 1,577,600 to 707,608 instructions; packed
+Half arithmetic is replaced by shared FP32 lookup. L1 reads are
+35,940,864 bytes, L2 reads 34,964,864 bytes and DRAM reads 24,870,944
+bytes, with 17,408 excess shared wavefronts. Profiled 79.936us service
+is recorded separately from unprofiled graph timing.
+
+In secondary matched graph runs at stable 1530/877MHz, layers 37 and 58
+measure 66.560–67.584us native versus 72.704us canonical, or
+360.6–366.2GB/s of original payload. Layer 62 changes SM clock during
+the comparison and is excluded. Existing IQ3_S/IQ4_XS orientations in
+layers 39 and 42 measure 53.248us native versus 80.896–81.920us
+canonical. Numerical, runtime-M and graph fallback checks pass. These
+secondary measurements do not replace the primary fixed-clock comparison.
