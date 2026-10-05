@@ -203,7 +203,10 @@ class Qwen2MoeMLP(nn.Module):
 
     def forward(self, x):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
-        if getattr(self, "_sm70_qwen38_shared_chain", False):
+        if (
+            getattr(self, "_sm70_qwen38_shared_chain", False)
+            and use_sm70_decode_graph_semantics()
+        ):
             from vllm.models.qwen4_exp.nvidia.sm70_shared_expert_chain import (
                 shared_expert_chain_forward,
             )

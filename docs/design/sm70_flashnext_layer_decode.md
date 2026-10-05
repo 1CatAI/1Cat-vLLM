@@ -297,3 +297,29 @@ there is no whole-grid barrier. It retains the MTP sliding convolution window
 and commits every speculative recurrent state through the actual slot table.
 CPU compilation passes; complete-layer output/state checks and timing at M1/M5
 remain pending. No production dispatch is installed by either research import.
+
+The first ordinary shared-chain model distribution run captures all 192
+teacher-forcing rows: mean KL 0.002515, p99 0.032982, maximum 0.046212 and
+top-1 agreement 97.396%. It fails the retained distribution gate; both natural
+health requests nevertheless stop normally. Raw maximum logit difference
+4.9375 is diagnostic only. All twelve first prefill rows match exactly, so
+the prefill-path hypothesis is rejected. Inspection finds that the fused
+shared chain omitted the native FP16 SiLU result boundary before multiplying
+the up branch. Restoring that boundary requires no additional kernel. The
+ordinary extension has been rebuilt; paired model requalification is pending.
+
+The QSA layer prototype initially assumed MRoPE attributes, although this
+language-only runtime uses ordinary RoPE. Its admission now follows the
+existing pre-indexer for both forms. The GDN layer prototype also initially
+assumed SiLU output gating; this model config selects sigmoid. That failed
+entry check contributes no performance result. The complete-layer research
+kernel now selects the actual output activation. Earlier SiLU GDN segment
+screens remain research proxies and cannot qualify this sigmoid layer.
+
+A new HC phase removes the first kernel's fixed gather consumer. Up/mix
+consumes the peer-pushed down packets, computes only its TP hidden stripe and
+publishes and collects output stripes inside its own resident kernel. The
+previous coalesced M1 screen already used the native TP-sharded up operator;
+its regression must not be attributed to replicated M1 up computation. The
+replicated MMA up implementation belongs to its M5 research arm. CPU build
+of the new two-phase HC passes; whole-layer M1/M5 timing is pending.

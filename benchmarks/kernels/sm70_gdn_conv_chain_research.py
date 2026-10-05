@@ -85,6 +85,7 @@ def _core(
         epochs,
         output,
         layer.norm.eps,
+        layer.norm.activation in ("silu", "swish"),
     )
     return output
 
@@ -111,7 +112,7 @@ def attach(layer):
     assert not layer.disable_tp_for_ba_proj and layer.conv1d.bias is None
     assert layer.conv1d.weight.shape == (2560, 1, 4)
     assert layer.norm.norm_before_gate and layer.norm.group_size is None
-    assert layer.norm.activation in ("silu", "swish")
+    assert layer.norm.activation in ("silu", "swish", "sigmoid")
     assert layer.sm70_qwen38_fp16_fused_input
     layer._gdn_conv_chain_original = layer.forward
     layer._gdn_conv_chain_enabled = False

@@ -56,7 +56,7 @@ __global__ __launch_bounds__(Threads, 3) void gdn_conv_tile_chain(
     float* states, half* core, float* norms, uint32_t* flags, uint32_t* epochs,
     half* output, int m, float eps, half* conv, const half* cw, const int* ids,
     const int* accepted, int qstride, int cstride, int cdstride, int ctstride,
-    int sstride) {
+    int sstride, bool silu_gate) {
   const int t = threadIdx.x, block = blockIdx.x;
   const uint32_t generation = epochs[block] + 1;
   const int conv_slot = ids[0];
@@ -159,7 +159,8 @@ __global__ __launch_bounds__(Threads, 3) void gdn_conv_tile_chain(
       const float zv = __half2float(z[index]);
       const float value =
           __half2float(core[index]) * normalizer_q * __half2float(weight[t]);
-      output[index] = __float2half_rn(value * zv / (1.f + expf(-zv)));
+      output[index] =
+          __float2half_rn(value * (silu_gate ? zv : 1.f) / (1.f + expf(-zv)));
       __syncthreads();
     }
     // Each V channel is read only by this head's producers. Q/K channels
@@ -185,7 +186,7 @@ void run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor al,
          torch::Tensor conv, torch::Tensor conv_weight, torch::Tensor state,
          torch::Tensor indices, torch::Tensor accepted, torch::Tensor core,
          torch::Tensor norms, torch::Tensor flags, torch::Tensor epochs,
-         torch::Tensor output, double epsilon) {
+         torch::Tensor output, double epsilon, bool silu_gate) {
   const int m = qkv.size(0);
   TORCH_CHECK((m == 1 || m == 5) && qkv.size(1) == 2560 && qkv.stride(1) == 1);
   TORCH_CHECK(conv_weight.sizes() == at::IntArrayRef({2560, 4}) &&
@@ -228,9 +229,9 @@ void run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor al,
   int qr = qkv.stride(0), cs = conv.stride(0), cd = conv.stride(1),
       ct = conv.stride(2), ss = state.stride(0);
   float eps = epsilon;
-  void* args[] = {&qp,  &ap,  &bp, &alp, &dp, &zp,       &wp,  &ip, &sp,
-                  &cp,  &np,  &fp, &ep,  &op, (void*)&m, &eps, &cv, &cw,
-                  &ids, &sel, &qr, &cs,  &cd, &ct,       &ss};
+  void* args[] = {&qp,  &ap,  &bp, &alp, &dp, &zp,       &wp,  &ip,       &sp,
+                  &cp,  &np,  &fp, &ep,  &op, (void*)&m, &eps, &cv,       &cw,
+                  &ids, &sel, &qr, &cs,  &cd, &ct,       &ss,  &silu_gate};
   C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
       (const void*)gdn_conv_tile_chain, dim3(Blocks), dim3(Threads), args, 0,
       c10::cuda::getCurrentCUDAStream()));

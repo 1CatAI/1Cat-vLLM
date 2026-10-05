@@ -36,19 +36,47 @@ def snapshot(value):
 
 
 class SharedLayerWorkerExtension:
+    def reset_layer_research_routes(self):
+        self._qsa_jointprep = self._gdn_conv_chain = self._hc_sharded = False
+        for layer, *_ in self._shared_layer_records.values():
+            gdn = getattr(layer, "linear_attn", None)
+            qsa = getattr(layer, "self_attn", None)
+            if hasattr(gdn, "_gdn_conv_chain_enabled"):
+                gdn._gdn_conv_chain_enabled = False
+            if hasattr(qsa, "_qsa_jointprep_enabled"):
+                qsa._qsa_jointprep_enabled = False
+            for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
+                if hasattr(hc, "_hc_sharded_enabled"):
+                    hc._hc_sharded_enabled = False
+
     def enable_retained_qsa_jointprep(self, layers):
         from benchmarks.kernels.sm70_qsa_jointprep_research import attach
 
+        self.reset_layer_research_routes()
         self._qsa_jointprep = True
         for index in layers:
             layer = self._shared_layer_records[index][0]
             if layer.layer_type != "full_attention":
                 raise ValueError("Joint preparation requires a QSA layer")
-            attach(layer.self_attn)
+            if not hasattr(layer.self_attn, "_qsa_jointprep_original"):
+                attach(layer.self_attn)
         return {"rank": self.rank, "qsa_layers": layers}
 
+    def enable_retained_gdn_conv_chain(self, layers):
+        from benchmarks.kernels.sm70_gdn_conv_chain_research import attach
+
+        self.reset_layer_research_routes()
+        self._gdn_conv_chain = True
+        for index in layers:
+            layer = self._shared_layer_records[index][0]
+            if layer.layer_type != "linear_attention":
+                raise ValueError("Convolution chain requires a GDN layer")
+            if not hasattr(layer.linear_attn, "_gdn_conv_chain_original"):
+                attach(layer.linear_attn)
+        return {"rank": self.rank, "gdn_layers": layers}
+
     def retain_shared_layer_inputs(
-        self, width, layers, qsa_jointprep=False, gdn_conv_chain=False
+        self, width, layers, qsa_jointprep=False, gdn_conv_chain=False, hc_sharded=False
     ):
         from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
         from vllm.config import CUDAGraphMode
@@ -58,6 +86,7 @@ class SharedLayerWorkerExtension:
 
         self._qsa_jointprep = qsa_jointprep
         self._gdn_conv_chain = gdn_conv_chain
+        self._hc_sharded = hc_sharded
         self._shared_layer_records = {}
         self._shared_layer_hooks = []
         model = self.model_runner.get_model()
@@ -67,6 +96,11 @@ class SharedLayerWorkerExtension:
         )
         if prepared != 48:
             raise RuntimeError(f"Expected 48 prepared shared experts, got {prepared}")
+        startup_epochs = [
+            int(m._sm70_shared_chain_epochs[0].item())
+            for m in model.modules()
+            if getattr(m, "_sm70_qwen38_shared_chain", False)
+        ]
 
         runner = self.model_runner
         self._shared_original_dispatch = runner.cudagraph_manager.dispatch
@@ -156,10 +190,19 @@ class SharedLayerWorkerExtension:
                     from benchmarks.kernels.sm70_gdn_conv_chain_research import attach
 
                     attach(layer.linear_attn)
+                if hc_sharded:
+                    from benchmarks.kernels.sm70_hc_sharded_chain_research import attach
+
+                    attach(layer.attn_hyper_connection, width)
+                    attach(layer.mlp_hyper_connection, width)
                 self._shared_layer_hooks.append(
                     layer.register_forward_pre_hook(retain, with_kwargs=True)
                 )
-        return {"rank": self.rank, "prepared_shared_experts": prepared}
+        return {
+            "rank": self.rank,
+            "prepared_shared_experts": prepared,
+            "startup_native_shared_epochs": startup_epochs,
+        }
 
     @torch.inference_mode()
     def measure_shared_layers(
@@ -217,13 +260,21 @@ class SharedLayerWorkerExtension:
                     for arm in ("control", "candidate"):
                         shared._sm70_qwen38_shared_chain = (
                             True
-                            if self._qsa_jointprep or self._gdn_conv_chain
+                            if self._qsa_jointprep
+                            or self._gdn_conv_chain
+                            or self._hc_sharded
                             else arm == "candidate"
                         )
                         if self._qsa_jointprep and layer.layer_type == "full_attention":
                             layer.self_attn._qsa_jointprep_enabled = arm == "candidate"
                         if self._gdn_conv_chain and gdn is not None:
                             gdn._gdn_conv_chain_enabled = arm == "candidate"
+                        if self._hc_sharded:
+                            for hc in (
+                                layer.attn_hyper_connection,
+                                layer.mlp_hyper_connection,
+                            ):
+                                hc._hc_sharded_enabled = arm == "candidate"
                         forward = (
                             layer.forward
                             if eager_layer
@@ -253,7 +304,7 @@ class SharedLayerWorkerExtension:
                             cache.index_select(0, ids).clone()
                             for cache, ids, _ in state
                         ]
-                        if self._qsa_jointprep:
+                        if self._qsa_jointprep and layer.layer_type == "full_attention":
                             selected_ids[arm] = layer.self_attn.topk_indices_buffer[
                                 :width
                             ].clone()
@@ -334,6 +385,14 @@ class SharedLayerWorkerExtension:
                 if original_cache is not None:
                     gdn.kv_cache = original_cache
                 shared._sm70_qwen38_shared_chain = True
+                if self._hc_sharded:
+                    for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection):
+                        hc._hc_sharded_enabled = False
+                if hasattr(gdn, "_gdn_conv_chain_enabled"):
+                    gdn._gdn_conv_chain_enabled = False
+                qsa = getattr(layer, "self_attn", None)
+                if hasattr(qsa, "_qsa_jointprep_enabled"):
+                    qsa._qsa_jointprep_enabled = False
                 restore()
         return {"rank": self.rank, "layers": results}
 
@@ -348,6 +407,8 @@ def main():
     parser.add_argument("--qsa-jointprep", action="store_true")
     parser.add_argument("--also-qsa-jointprep", action="store_true")
     parser.add_argument("--gdn-conv-chain", action="store_true")
+    parser.add_argument("--hc-sharded-chain", action="store_true")
+    parser.add_argument("--also-gdn-conv-chain", action="store_true")
     parser.add_argument("--input-len", type=int, default=8192)
     parser.add_argument("--max-model-len", type=int, default=262144)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.94)
@@ -375,7 +436,13 @@ def main():
     try:
         routes = llm.collective_rpc(
             "retain_shared_layer_inputs",
-            args=(args.width, args.layers, args.qsa_jointprep, args.gdn_conv_chain),
+            args=(
+                args.width,
+                args.layers,
+                args.qsa_jointprep,
+                args.gdn_conv_chain,
+                args.hc_sharded_chain,
+            ),
         )
         tokenizer = llm.get_tokenizer()
         piece = tokenizer.encode(
@@ -396,58 +463,71 @@ def main():
             args=(args.width, args.layers, str(args.output), args.eager_layer),
             timeout=600,
         )
-        additional = {}
-        if args.also_qsa_jointprep:
-            if args.qsa_jointprep or 3 not in args.layers:
+        import vllm._C as native
+
+        report = {
+            "scope": "complete non-PLE decoder layers; standalone layer CUDA graphs",
+            "compiler": "eager" if args.eager_layer else "standalone_inductor",
+            "candidate": (
+                "hc_sharded_chain"
+                if args.hc_sharded_chain
+                else "gdn_conv_chain"
+                if args.gdn_conv_chain
+                else "qsa_jointprep"
+                if args.qsa_jointprep
+                else "shared_expert_m1"
+            ),
+            "endpoint_speed_acceptance": False,
+            "actual_mtp_verifier": args.width == 5,
+            "input_tokens": args.input_len,
+            "max_model_len": args.max_model_len,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+            "prompt_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
+            "native_sha256": hashlib.sha256(
+                Path(native.__file__).read_bytes()
+            ).hexdigest(),
+            "routes": routes,
+            "ranks": result,
+            "additional_screens": {},
+        }
+
+        def save():
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
+
+        # Keep successful phases even if a later research phase fails.
+        save()
+        for enabled, name, layer_ids, method in (
+            (
+                args.also_qsa_jointprep,
+                "qsa_jointprep",
+                [3],
+                "enable_retained_qsa_jointprep",
+            ),
+            (
+                args.also_gdn_conv_chain,
+                "gdn_conv_chain",
+                [2],
+                "enable_retained_gdn_conv_chain",
+            ),
+        ):
+            if not enabled:
+                continue
+            if not set(layer_ids).issubset(args.layers):
                 raise ValueError(
-                    "Additional QSA screen requires shared layer 3 capture"
+                    f"Additional {name} requires retained layers {layer_ids}"
                 )
-            llm.collective_rpc("enable_retained_qsa_jointprep", args=([3],))
-            additional["qsa_jointprep"] = llm.collective_rpc(
+            llm.collective_rpc(method, args=(layer_ids,))
+            report["additional_screens"][name] = llm.collective_rpc(
                 "measure_shared_layers",
                 args=(
                     args.width,
-                    [3],
-                    str(args.output.with_name(args.output.stem + ".qsa.json")),
+                    layer_ids,
+                    str(args.output.with_name(args.output.stem + f".{name}.json")),
                     args.eager_layer,
                 ),
                 timeout=600,
             )
-        import vllm._C as native
-
-        args.output.write_text(
-            json.dumps(
-                {
-                    "scope": (
-                        "complete non-PLE decoder layers; standalone layer CUDA graphs"
-                    ),
-                    "compiler": "eager" if args.eager_layer else "standalone_inductor",
-                    "candidate": (
-                        "gdn_conv_chain"
-                        if args.gdn_conv_chain
-                        else "qsa_jointprep"
-                        if args.qsa_jointprep
-                        else "shared_expert_m1"
-                    ),
-                    "endpoint_speed_acceptance": False,
-                    "actual_mtp_verifier": args.width == 5,
-                    "input_tokens": args.input_len,
-                    "max_model_len": args.max_model_len,
-                    "gpu_memory_utilization": args.gpu_memory_utilization,
-                    "prompt_sha256": hashlib.sha256(
-                        json.dumps(ids).encode()
-                    ).hexdigest(),
-                    "native_sha256": hashlib.sha256(
-                        Path(native.__file__).read_bytes()
-                    ).hexdigest(),
-                    "routes": routes,
-                    "ranks": result,
-                    "additional_screens": additional,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
+            save()
     finally:
         llm.llm_engine.engine_core.shutdown()
 

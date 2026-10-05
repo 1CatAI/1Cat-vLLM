@@ -92,7 +92,8 @@ __global__ __launch_bounds__(256, 2) void shared_expert_mma_chain(
     }
     a = __half2float(__float2half_rn(a));
     b = __half2float(__float2half_rn(b));
-    activation[t] = __float2half_rn((a / (1.f + expf(-a))) * b);
+    activation[t] =
+        __hmul(__float2half_rn(a / (1.f + expf(-a))), __float2half_rn(b));
   }
   __syncthreads();
   uint4 a = {}, b = {};

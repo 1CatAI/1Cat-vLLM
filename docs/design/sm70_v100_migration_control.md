@@ -49098,3 +49098,15 @@ package (0.287642→0.192553 ms, eighty→sixteen kernels). M5 fallback has
 identical outputs and unchanged kernel count. Complete-layer compile plumbing
 is being corrected; no layer timing, KL, top-1 or natural-EOS candidate gate
 has passed yet.
+
+Flash-Next ordinary M1 complete-layer graphs now pass timing collection:
+GDN 0.152791→0.149709 ms, 25→21 kernels; QSA 0.304732→0.301912 ms,
+37→33. These are layer medians, not endpoint savings. The first shared model
+gate fails (192 rows, KL mean/p99/max 0.002515/0.032982/0.046212,
+top-1 97.396%), while both natural requests stop. All first prefill rows are
+exact; the missing native FP16 SiLU-before-multiply boundary is restored and
+the ordinary extension rebuilt for requalification. No raw-logit maximum veto
+is used. MTP layer collection retries at 32K capacity and 88% memory after
+64K attempts failed prefill memory and startup KV admission. QSA preparation,
+sigmoid-gated GDN convolution/core/norm and consumer-side HC gather layer
+screens remain pending; the global latency and kernel-count targets are open.

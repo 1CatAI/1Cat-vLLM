@@ -221,7 +221,8 @@ def _transaction(
     is_2d = positions.ndim == 2
     axis_stride = positions.stride(0) if is_2d else 0
     token_stride = positions.stride(-1)
-    section = tuple(indexer.rotary_emb.mrope_section)
+    mrope_section = getattr(indexer.rotary_emb, "mrope_section", None)
+    section = tuple(mrope_section) if mrope_section else (0, 0, 0)
     key_work = compressed.k_work_metadata.shape[0]
     base_grid = key_work + triton.cdiv(count, 2) * 2
     rope_positions = indexer.raw_key_cache.rope_position_cache is not None
@@ -276,7 +277,7 @@ def _transaction(
         STATE_SIZE=state.shape[1],
         COMP_PAGE_SIZE=compressed_cache.shape[1],
         IS_2D_POSITIONS=is_2d,
-        IS_K_MROPE=True,
+        IS_K_MROPE=bool(mrope_section),
         CACHE_HAS_ROPE_POS=rope_positions,
         CACHE_IS_FP16=True,
         MROPE_H=section[1],
