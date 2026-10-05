@@ -26,6 +26,26 @@ struct Iq3NibbleBookDecoder {
       vectors[i] = __ldg(source + i);
     __syncthreads();
   }
+
+  template <int Bit, int Words>
+  __device__ static __forceinline__ uint32_t
+  signed_index(const uint32_t (&words)[Words]) {
+    static_assert(Bit + 13 <= Words * 32);
+    constexpr int word = Bit / 32, offset = Bit % 32;
+    if constexpr (offset + 13 <= 32)
+      return (words[word] >> offset) & 8191;
+    else {
+      constexpr int byte = offset / 8;
+      constexpr int selector =
+          (byte + 3) * 4096 + (byte + 2) * 256 + (byte + 1) * 16 + byte;
+      uint32_t window;
+      asm("prmt.b32 %0,%1,%2,%3;"
+          : "=r"(window)
+          : "r"(words[word]), "r"(words[word + 1]), "n"(selector));
+      return (window >> (offset % 8)) & 8191;
+    }
+  }
+
   template <class Output = float, bool CachedBase = false>
   __device__ static turbomind::Array<Output, 8> fragment_signed(
       Parameters parameters, int nibble, uint32_t first, uint32_t second,

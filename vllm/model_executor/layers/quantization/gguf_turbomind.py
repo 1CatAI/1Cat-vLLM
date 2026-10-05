@@ -265,6 +265,13 @@ def apply_prepared_gguf_projections(x, projections):
     if not capabilities or any(c.reason is not None for c in capabilities):
         outputs = [projection(x) for projection in projections]
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
+    return torch.ops.vllm.prepared_gguf_mixed_projection(
+        x, *prepared_projection_arguments(projections)
+    )
+
+
+def prepared_projection_arguments(projections):
+    """Serialize canonical storage and runtime policies for opaque operators."""
     codes: list[torch.Tensor] = []
     stats: list[torch.Tensor] = []
     caches: list[torch.Tensor | None] = []
@@ -306,9 +313,7 @@ def apply_prepared_gguf_projections(x, projections):
         )
         cache_bands.extend(cb)
         blas_bands.extend(bb)
-    return torch.ops.vllm.prepared_gguf_mixed_projection(
-        x, codes, stats, caches, descriptors, cache_bands, blas_bands
-    )
+    return codes, stats, caches, descriptors, cache_bands, blas_bands
 
 
 def _admitted_bands(capabilities):
