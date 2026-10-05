@@ -104,6 +104,43 @@ def iq3_gated_pair_capability(
     )
 
 
+def native_gated_pair_capabilities(
+    source_types: tuple[int, ...],
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Joint IQ3_S/IQ4_XS readers; only measured M8 shapes are admitted."""
+    if source_types not in ((21, 23), (23, 21)):
+        return ()
+    operator = "gguf_native_pair_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif (k, n) != (5120, 4352):
+        reason = "gated_pair_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=8,
+            max_m=8,
+            reason=reason,
+        )
+        for source_type in source_types
+    )
+
+
 def dense_fp16_cache_capabilities(
     source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
 ) -> tuple[GGUFOperatorCapability, ...]:

@@ -677,6 +677,13 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.native_admission["gated_pair"] = prepare_iq3_gated_pair(
                     layer, sources, projections, self.native_enabled
                 )
+                from vllm.model_executor.layers.quantization.gguf_native_pair import (
+                    prepare_native_gated_pair,
+                )
+
+                self.native_admission["mixed_gated_pair"] = prepare_native_gated_pair(
+                    layer, sources, projections, self.native_enabled
+                )
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
@@ -752,6 +759,12 @@ class GGUFLinearMethod(LinearMethodBase):
         self._create_padded_weight_param(layer)
 
     def apply_fused_silu_and_mul(self, layer, x):
+        if hasattr(layer, "gguf_native_gated_records"):
+            from vllm.model_executor.layers.quantization.gguf_native_pair import (
+                apply_native_gated_pair,
+            )
+
+            return apply_native_gated_pair(layer, x)
         if not hasattr(layer, "gguf_iq3_gated_records"):
             return None
         from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
