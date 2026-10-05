@@ -93,6 +93,8 @@ def main():
                 (18, 22),
                 (17, 18),
                 (22, 17),
+                (17, 16),
+                (16, 22),
             )
         )
         assert tuple(types) in allowed, types
