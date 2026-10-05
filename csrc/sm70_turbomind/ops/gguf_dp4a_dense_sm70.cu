@@ -100,6 +100,7 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
                       const half* dmin, const int8_t* mins, int m, int n, int k,
                       int split, int out_stride) {
   __shared__ float sums[4][TileM][32];
+  extern __shared__ Q8_1 activations[];
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int tiles_m = (m + TileM - 1) / TileM;
   const int tile_n = blockIdx.x / tiles_m, tile_m = blockIdx.x % tiles_m;
@@ -107,6 +108,21 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
   const int groups = k / 32;
   const int begin = groups * blockIdx.y / split,
             end = groups * (blockIdx.y + 1) / split;
+  // Coalesce the activation transfer once per CTA. Broadcast shared loads
+  // feed every output column, avoiding repeated long-latency global loads
+  // inside the five-token integer-dot loop.
+  const int span = end - begin;
+  const int words = TileM * span * (sizeof(Q8_1) / sizeof(int));
+  auto* cached = reinterpret_cast<int*>(activations);
+  const auto* source = reinterpret_cast<const int*>(x);
+  for (int index = threadIdx.x; index < words; index += blockDim.x) {
+    const int token = index / (span * 9), offset = index % (span * 9);
+    cached[index] =
+        begin_m + token < m
+            ? source[((begin_m + token) * groups + begin) * 9 + offset]
+            : 0;
+  }
+  __syncthreads();
   float values[TileM] = {};
   for (int group = begin + warp; group < end; group += 4) {
     const auto weight = IntegerGroup<Kind>::load(codes, d, scales, dmin, mins,
@@ -114,7 +130,7 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
 #pragma unroll
     for (int t = 0; t < TileM; ++t)
       if (begin_m + t < m)
-        values[t] += weight.dot(x[(begin_m + t) * groups + group]);
+        values[t] += weight.dot(activations[t * span + group - begin]);
   }
 #pragma unroll
   for (int t = 0; t < TileM; ++t) sums[warp][t][lane] = values[t];
@@ -161,6 +177,8 @@ void launch(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
   int m = x.size(0), n = codes.size(0) * 32, k = x.size(1) * 32,
       stride = out.stride(0);
   dim3 grid(n / 32 * ((m + TileM - 1) / TileM), split);
+  const int shared_bytes =
+      TileM * ((k / 32 + split - 1) / split) * sizeof(Q8_1);
   const auto stream = at::cuda::getCurrentCUDAStream();
   auto output = reinterpret_cast<half*>(out.data_ptr());
   auto scratch = partial.data_ptr<float>();
@@ -173,8 +191,8 @@ void launch(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
   if (cooperative && (split > 1 || Activated)) {
     auto kernel = dense<Kind, TileM, true, Activated>;
     int blocks;
-    C10_CUDA_CHECK(
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, 128, 0));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, kernel, 128, shared_bytes));
     const auto* props = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(
         props->cooperativeLaunch &&
@@ -184,12 +202,12 @@ void launch(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
                          &sc,     &dm,      &mn,         &m,      &n,
                          &k,      &split,   &stride};
     C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(kernel),
-                                               grid, dim3(128), arguments, 0,
-                                               stream));
+                                               grid, dim3(128), arguments,
+                                               shared_bytes, stream));
   } else {
-    dense<Kind, TileM, false, Activated>
-        <<<grid, 128, 0, stream>>>(output, scratch, activation, weight, ds, sc,
-                                   dm, mn, m, n, k, split, stride);
+    dense<Kind, TileM, false, Activated><<<grid, 128, shared_bytes, stream>>>(
+        output, scratch, activation, weight, ds, sc, dm, mn, m, n, k, split,
+        stride);
     if (split > 1 || Activated)
       reduce_dense<Activated>
           <<<dim3(((Activated ? n / 2 : n) + 127) / 128, m), 128, 0, stream>>>(
