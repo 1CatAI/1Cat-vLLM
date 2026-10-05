@@ -67,6 +67,7 @@ def main():
     parser.add_argument("--join", nargs="+", default=[])
     parser.add_argument("--activated", action="store_true")
     parser.add_argument("--mixed-u4-pair", action="store_true")
+    parser.add_argument("--fold-q6-base", action="store_true")
     parser.add_argument("--raw-source", action="store_true")
     parser.add_argument("--row-major", action="store_true")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 20])
@@ -124,7 +125,12 @@ def main():
         raw = np.concatenate(shards, axis=0)
         codec = transcode_integer_dot(raw, kind)
         n, k = codec.shape
-        packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+        packed = [
+            torch.from_numpy(t).cuda()
+            for t in (
+                codec.packed(fold_q6_base=True) if args.fold_q6_base else codec.packed()
+            )
+        ]
         control = GGUFPreparedProjection(
             torch.from_numpy(raw).cuda(), kind, torch.float16, True, 8
         )
@@ -165,6 +171,7 @@ def main():
         shape=[n, k],
         source_type=kind,
         source_types=types,
+        fold_q6_base=args.fold_q6_base,
         tp_rank=args.rank,
         tp_size=4,
         axis=args.axis,

@@ -55,6 +55,11 @@ def test_integer_dot_preserves_official_fp32_weights_and_packed_codes(
     np.testing.assert_array_equal(codec.dequantize(), dequantize(raw, kind))
     layout = GGUFHeadTilingLayout(2, 128) if head_tiled else None
     packed, original_d, small, dmin, mins = codec.packed(layout)
+    if kind == 14:
+        folded = codec.packed(layout, fold_q6_base=True)
+        np.testing.assert_array_equal(folded[0], packed)
+        np.testing.assert_array_equal(folded[1].repeat(2, axis=0), original_d)
+        np.testing.assert_array_equal(folded[2], small)
 
     def restored(array, head_dim):
         if layout is None:

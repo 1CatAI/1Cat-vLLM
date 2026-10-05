@@ -64,7 +64,7 @@ class GGUFIntegerDotProjection:
             out -= mins.repeat(32, axis=1)
         return out.reshape(n, k)
 
-    def packed(self, input_layout=None):
+    def packed(self, input_layout=None, fold_q6_base=False):
         """N32 packets: signed int8 Q6 values, or logical eight-nibble U4 words.
 
         Expanding Q6 codes to int8 avoids decode arithmetic. Original signed
@@ -98,6 +98,13 @@ class GGUFIntegerDotProjection:
                 assert small_mins is not None
                 original_min = restore(original_min, span)
                 small_mins = restore(small_mins, span)
+        if fold_q6_base:
+            if self.source_type != 14 or not np.array_equal(
+                original_d[:, ::2].view(np.uint16),
+                original_d[:, 1::2].view(np.uint16),
+            ):
+                raise ValueError("Integer subgroup dot requires shared Q6 base scales")
+            original_d = original_d[:, ::2]
         if self.source_type == 14:
             packets = codes.reshape(n, k // 4, 4).view("<i4").squeeze(-1)
         else:

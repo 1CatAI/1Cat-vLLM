@@ -19,6 +19,7 @@ __device__ __forceinline__ uint32_t u4_word(uint32_t nibbles) {
 template <int Kind>
 struct IntegerGroup {
   int words[8];
+  int small0, small1;
   float scale0, scale1, minimum;
 
   __device__ static IntegerGroup load(const int* codes, const half* d,
@@ -26,13 +27,13 @@ struct IntegerGroup {
                                       const int8_t* mins, int n, int k, int col,
                                       int group) {
     IntegerGroup result;
-    constexpr int Words = Kind == 0 ? 8 : 4;
+    constexpr int Words = (Kind == 0 || Kind == 5) ? 8 : 4;
     const int64_t packet =
         (int64_t{col / 32} * (k / 32 * Words) + group * Words) * 32 + col % 32;
 #pragma unroll
     for (int i = 0; i < Words; ++i) {
       const uint32_t value = codes[packet + i * 32];
-      if constexpr (Kind == 0)
+      if constexpr (Kind == 0 || Kind == 5)
         result.words[i] = value;
       else {
         const bool lut = Kind == 2 || (Kind == 3 && col >= n / 2) ||
@@ -47,7 +48,12 @@ struct IntegerGroup {
         }
       }
     }
-    if constexpr (Kind == 0) {
+    if constexpr (Kind == 5) {
+      const int64_t index = int64_t{group * 2} * n + col;
+      result.small0 = scales[index];
+      result.small1 = scales[index + n];
+      result.scale0 = __half2float(d[int64_t{group} * n + col]);
+    } else if constexpr (Kind == 0) {
       const int64_t index = int64_t{group * 2} * n + col;
       result.scale0 = __half2float(d[index]) * float(scales[index]);
       result.scale1 = __half2float(d[index + n]) * float(scales[index + n]);
@@ -56,7 +62,7 @@ struct IntegerGroup {
       const int64_t index = int64_t{group} * n + col;
       result.scale0 = __half2float(d[index]) * float(scales[index]);
       result.scale1 = result.scale0;
-      result.minimum = (Kind == 1 || Kind >= 3)
+      result.minimum = (Kind == 1 || Kind == 3 || Kind == 4)
                            ? __half2float(dmin[index]) * float(mins[index])
                            : 0.f;
     }
@@ -70,8 +76,14 @@ struct IntegerGroup {
     for (int i = 0; i < 4; ++i) a = __dp4a(words[i], values[i], a);
 #pragma unroll
     for (int i = 4; i < 8; ++i) b = __dp4a(words[i], values[i], b);
-    float result = (float(a) * scale0 + float(b) * scale1) * __low2float(x.ds);
-    if constexpr (Kind == 1 || Kind >= 3)
+    float result;
+    if constexpr (Kind == 5)
+      // Q6 codes are -32..31. Both 16-value dots times signed int8 subgroup
+      // scales fit 24 bits together, so the int->float conversion is exact.
+      result = float(a * small0 + b * small1) * scale0 * __low2float(x.ds);
+    else
+      result = (float(a) * scale0 + float(b) * scale1) * __low2float(x.ds);
+    if constexpr (Kind == 1 || Kind == 3 || Kind == 4)
       result -= minimum * __high2float(x.ds);
     return result;
   }
@@ -414,15 +426,19 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
                   codes.size(1) == k / (source_type == 14 ? 4 : 8),
               "Invalid N32 integer packets");
   const int n = codes.size(0) * 32;
+  const bool integer_scales =
+      source_type == 14 && d.dim() == 2 && d.size(0) == k / 32;
   TORCH_CHECK(out.scalar_type() == torch::kFloat16 && out.dim() == 2 &&
                   out.size(0) == m && out.size(1) == (activated ? n / 2 : n) &&
                   out.stride(1) == 1 && out.stride(0) >= out.size(1) &&
                   (!activated || n % 64 == 0),
               "Invalid integer GEMM output view");
   TORCH_CHECK(d.scalar_type() == torch::kFloat16 && d.is_contiguous() &&
-                  d.dim() == 2 && d.size(0) == k / group && d.size(1) == n &&
-                  scales.scalar_type() == torch::kInt8 &&
-                  scales.is_contiguous() && scales.sizes() == d.sizes(),
+                  d.dim() == 2 &&
+                  d.size(0) == k / (integer_scales ? 32 : group) &&
+                  d.size(1) == n && scales.scalar_type() == torch::kInt8 &&
+                  scales.is_contiguous() && scales.dim() == 2 &&
+                  scales.size(0) == k / group && scales.size(1) == n,
               "Invalid original scale levels");
   TORCH_CHECK(dmin.scalar_type() == torch::kFloat16 && dmin.is_contiguous() &&
                   mins.scalar_type() == torch::kInt8 && mins.is_contiguous() &&
@@ -437,7 +453,10 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0,
               "Integer GEMM requires SM70");
-  if (paired_type == 23)
+  if (integer_scales)
+    dispatch<5>(out, partial, x, codes, d, scales, dmin, mins, split,
+                cooperative, activated);
+  else if (paired_type == 23)
     dispatch<3>(out, partial, x, codes, d, scales, dmin, mins, split,
                 cooperative, activated);
   else if (paired_type == 12)

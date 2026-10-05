@@ -48,7 +48,14 @@ def oracle(x):
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("cooperative", [False, True])
 def test_dense_matches_official_q8_formula_and_output_views(
-    kind, activated, raw_source, row_major, m, split, cooperative
+    kind,
+    activated,
+    raw_source,
+    row_major,
+    m,
+    split,
+    cooperative,
+    fold_q6_base=False,
 ):
     n, k = 64, 768
     _, size = quant_size(kind)
@@ -64,7 +71,9 @@ def test_dense_matches_official_q8_formula_and_output_views(
         blocks[:, :, 2:4] = (d * np.float16(0.5))[..., None].view(np.uint8)
     raw = blocks.reshape(n, -1)
     codec = transcode_integer_dot(raw, kind)
-    packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+    packed = [
+        torch.from_numpy(t).cuda() for t in codec.packed(fold_q6_base=fold_q6_base)
+    ]
     if row_major:
         packed = [torch.from_numpy(t).cuda() for t in codec.row_storage()]
     if raw_source:
@@ -122,6 +131,15 @@ def test_dense_matches_official_q8_formula_and_output_views(
     x.copy_(torch.randn_like(x))
     graph.replay()
     check()
+
+
+@pytest.mark.parametrize("m", [5, 20])
+@pytest.mark.parametrize("split", [4, 16])
+@pytest.mark.parametrize("activated", [False, True])
+def test_q6_integer_subgroup_dot(m, split, activated):
+    test_dense_matches_official_q8_formula_and_output_views(
+        14, activated, False, False, m, split, False, fold_q6_base=True
+    )
 
 
 @pytest.mark.parametrize("kinds", [(12, 23), (23, 12)])
