@@ -22,7 +22,7 @@ def packed(kind, n=7, k=768):
     return data.reshape(n, -1)
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 def test_original_payload_and_tp_slicing(kind):
     data = packed(kind, n=12, k=1024)
     raw = RawGGUFProjection.from_rows(data, kind)
@@ -39,7 +39,7 @@ def test_original_payload_and_tp_slicing(kind):
         RawGGUFProjection.from_rows(packed(kind, k=768), kind).tp_slice(0, 4, axis=1)
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("factor_scale", [False, True])
 def test_raw_dequant_and_vector_graph(kind, factor_scale):
     data = packed(kind)
@@ -76,7 +76,7 @@ def test_raw_dequant_and_vector_graph(kind, factor_scale):
             )
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("m", [5, 8, 16])
 def test_raw_mma_matches_fp32_accumulation_and_graph(kind, m):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -1055,3 +1055,47 @@ def test_compact_rounded_workspace_and_fp32_graph(kind, cancellation):
             torch.testing.assert_close(
                 out, x.float() @ reference.float().T, rtol=0.001, atol=0.003
             )
+
+
+def test_iq3_xxs_raw_prefill_workspace_and_changed_graph():
+    n, k, m, kind = 37, 768, 512, 18
+    data = packed(kind, n=n, k=k)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_raw_blas_sm70_out, out, x, original, kind, scratch
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+        torch.testing.assert_close(
+            out.float(), x.float() @ reference.float().T, rtol=0.001, atol=0.003
+        )
+
+
+def test_iq3_xxs_raw_capabilities_keep_compact_unavailable():
+    from vllm.model_executor.kernels.gguf import (
+        compact_lattice_capabilities,
+        raw_lattice_capabilities,
+    )
+
+    caps = raw_lattice_capabilities(18, 2560, 160, torch.float16)
+    assert all(cap.reason is None for cap in caps)
+    assert [cap.supports_m(1) for cap in caps] == [True, False, False]
+    assert all(
+        cap.reason == "raw_source_format_unavailable"
+        for cap in compact_lattice_capabilities(18, 2560, 160, torch.float16)
+    )

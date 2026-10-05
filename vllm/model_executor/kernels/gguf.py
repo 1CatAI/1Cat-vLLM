@@ -362,7 +362,7 @@ def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
     reason = None
     if not enabled:
         reason = "disabled_by_kernel_config"
-    elif source_type not in (21, 22):
+    elif source_type not in ((18, 21, 22) if layout == "raw" else (21, 22)):
         reason = "raw_source_format_unavailable"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"

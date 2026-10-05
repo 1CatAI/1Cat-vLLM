@@ -99,6 +99,9 @@ struct LatticeRawDecoder {
       const int nibble =
           (block[106 + base / 64] >> (4 * ((base / 32) % 2))) & 15;
       return d * (1 + 2 * nibble);
+    } else if constexpr (Type == 18) {
+      const int nibble = block[69 + 4 * (base / 32)] >> 4;
+      return (d * (0.5f + nibble)) * 0.5f;
     } else {
       const int nibble =
           (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
@@ -112,7 +115,6 @@ struct LatticeRawDecoder {
   __device__ static turbomind::Array<Output, 8> fragment(const uint8_t* block,
                                                          int base,
                                                          const uint8_t* grid) {
-    static_assert(Type != 18 || ApplyScale);
     const float d = __half2float(*reinterpret_cast<const half*>(block));
     const int octet = base / 8;
     if constexpr (Type == 18) {
@@ -130,8 +132,13 @@ struct LatticeRawDecoder {
           *reinterpret_cast<const uint32_t*>(grid + block[2 + 2 * octet] * 4);
       const uint32_t b =
           *reinterpret_cast<const uint32_t*>(grid + block[3 + 2 * octet] * 4);
-      return table_fragment<Output>(a | (uint64_t(b) << 32), signs, d,
-                                    aux >> 28);
+      if constexpr (ApplyScale) {
+        return table_fragment<Output>(a | (uint64_t(b) << 32), signs, d,
+                                      aux >> 28);
+      } else {
+        static_assert(std::is_same_v<Output, float>);
+        return table_values(a | (uint64_t(b) << 32), signs, 1.f);
+      }
     }
     const uint8_t high = block[66 + base / 32];
     const uint8_t signs = block[(Type == 21 ? 74 : 34) + octet];

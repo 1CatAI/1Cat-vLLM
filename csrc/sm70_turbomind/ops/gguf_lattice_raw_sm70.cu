@@ -882,7 +882,7 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
               "Raw GGUF vector requires FP16 M=1");
   const c10::cuda::CUDAGuard guard(weight.device());
   const int n = out.size(1), k = input.size(1);
-  validate_raw(weight, source_type, n, k);
+  validate_raw(weight, source_type, n, k, true);
   TORCH_CHECK(splits >= 1 && splits <= k / 256,
               "Invalid raw GGUF split-K count");
   if (splits > 1)
@@ -909,7 +909,13 @@ void gguf_lattice_raw_vec_sm70_out(torch::Tensor out, torch::Tensor input,
   } else {                           \
     RAW_VEC(TYPE, false, FACTOR);    \
   }
-  if (source_type == 21) {
+  if (source_type == 18) {
+    if (factor_scale) {
+      SELECT_RAW_VEC(18, true);
+    } else {
+      SELECT_RAW_VEC(18, false);
+    }
+  } else if (source_type == 21) {
     if (factor_scale) {
       SELECT_RAW_VEC(21, true);
     } else {
@@ -947,10 +953,14 @@ void gguf_lattice_raw_blas_sm70_out(torch::Tensor out, torch::Tensor input,
       "Raw GGUF BLAS requires FP16 [K,N] scratch");
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
-  validate_raw(weight, source_type, n, k);
+  validate_raw(weight, source_type, n, k, true);
   const auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid((n + 31) / 32, k / 256);
-  if (source_type == 21)
+  if (source_type == 18)
+    raw_dequant_transpose_kernel<18><<<grid, 128, 0, stream>>>(
+        reinterpret_cast<half*>(scratch.data_ptr()), weight.data_ptr<uint8_t>(),
+        n, k, weight.size(1));
+  else if (source_type == 21)
     raw_dequant_transpose_kernel<21><<<grid, 128, 0, stream>>>(
         reinterpret_cast<half*>(scratch.data_ptr()), weight.data_ptr<uint8_t>(),
         n, k, weight.size(1));
@@ -975,7 +985,7 @@ void gguf_lattice_raw_mma_sm70_out(torch::Tensor out, torch::Tensor input,
       "Raw GGUF MMA requires contiguous FP16 matrices and M <= 64");
   const c10::cuda::CUDAGuard guard(weight.device());
   const int m = input.size(0), n = out.size(1), k = input.size(1);
-  validate_raw(weight, source_type, n, k);
+  validate_raw(weight, source_type, n, k, true);
   TORCH_CHECK(splits >= 1 && splits <= k / 256 && (tile_n == 8 || tile_n == 32),
               "Invalid raw GGUF MMA tile or split-K count");
   if (splits > 1)
@@ -992,7 +1002,13 @@ void gguf_lattice_raw_mma_sm70_out(torch::Tensor out, torch::Tensor input,
     launch_mma<TYPE, NT, 16>(out, input, weight, partial, splits, stream); \
   else                                                                     \
     launch_mma<TYPE, NT, 32>(out, input, weight, partial, splits, stream)
-  if (source_type == 21) {
+  if (source_type == 18) {
+    if (tile_n == 8) {
+      LAUNCH_RAW_MMA(18, 8);
+    } else {
+      LAUNCH_RAW_MMA(18, 32);
+    }
+  } else if (source_type == 21) {
     if (tile_n == 8) {
       LAUNCH_RAW_MMA(21, 8);
     } else {
