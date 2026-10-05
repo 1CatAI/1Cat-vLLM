@@ -459,3 +459,41 @@ def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapabilit
     return GGUFOperatorCapability(
         family, quant_type_name(weight_type), operator, graph_safe, reason=reason
     )
+
+
+def native_linear_capability(
+    source_type: int,
+    k: int,
+    n: int,
+    dtype: torch.dtype | None,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> GGUFOperatorCapability:
+    """Cold-graph ABBA winners for the TP4 down projection at M8."""
+    operator = (
+        "gguf_canonical_linear_n64_sm70_out"
+        if source_type == 10
+        else "gguf_native_linear_n64_sm70_out"
+    )
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif source_type in (12, 23) and (k, n) == (4352, 5120):
+        reason = "measured_route_not_faster"
+    elif source_type not in (10, 17, 18, 21, 22) or (k, n) != (4352, 5120):
+        reason = "single_projection_shape_or_source_has_no_calibration"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    return GGUFOperatorCapability(
+        decoder_family(source_type) if source_type >= 0 else GGUFDecoderFamily.AFFINE,
+        quant_type_name(source_type) if source_type >= 0 else "mixed",
+        operator,
+        True,
+        min_m=8,
+        max_m=8,
+        reason=reason,
+    )
