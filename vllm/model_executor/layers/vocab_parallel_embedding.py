@@ -330,7 +330,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     # [max_rows, 20] allocation for top-16 leaves a row stride of 20 and makes
     # the result non-contiguous.  The TP all-gather requires contiguous inputs,
     # and inserting a runtime contiguous() copy would add work to both graphs.
-    for selector_k in (16, 20, 21):
+    for selector_k in (16, 20, 21, 64):
         layer.register_buffer(
             f"_sm70_dflash2_rerank_values_{selector_k}",
             torch.empty((max_rows, selector_k), dtype=rerank_dtype, device=device),
@@ -381,6 +381,10 @@ def _sm70_dflash2_rerank_output_buffers(
         values = layer._sm70_dflash2_rerank_values_21[:num_rows]
         positions = layer._sm70_dflash2_rerank_positions_21[:num_rows]
         ids = layer._sm70_dflash2_rerank_ids_21[:num_rows]
+    elif selector_k == 64:
+        values = layer._sm70_dflash2_rerank_values_64[:num_rows]
+        positions = layer._sm70_dflash2_rerank_positions_64[:num_rows]
+        ids = layer._sm70_dflash2_rerank_ids_64[:num_rows]
     else:
         raise ValueError(f"Unsupported DFlash2 rerank top-k: {selector_k}")
     return values, positions, ids
@@ -614,7 +618,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         return None
     if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
         return None
-    if selector_k not in (16, 20, 21) or bias is not None:
+    if selector_k not in (16, 20, 21, 64) or bias is not None:
         return None
     if (
         selector_k == 21
@@ -629,6 +633,11 @@ def _maybe_sm70_dflash2_qpn8_rerank(
 
     x_2d = x.reshape(-1, x.shape[-1])
     num_rows = x_2d.size(0)
+    if selector_k == 64 and (
+        num_rows <= 8 or not getattr(layer, "_sm70_dflash2_fp32_logits", False)
+    ):
+        # Preserve the C1 conditional sampler's existing dense probe/callback.
+        return None
     if not 1 <= num_rows <= layer._sm70_dflash2_qpn8_logits.shape[0]:
         return None
     if not x_2d.is_contiguous():

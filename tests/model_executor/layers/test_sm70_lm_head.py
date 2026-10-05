@@ -227,3 +227,32 @@ def test_qpn8_unconfigured_capacity_retains_small_head(monkeypatch, config):
         vocab_embedding, "get_current_vllm_config_or_none", lambda: config
     )
     assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == 8
+
+
+@pytest.mark.parametrize("rows,fp32", [(8, True), (16, False), (64, False)])
+def test_top64_rerank_retains_c1_and_legacy_dense_probe(monkeypatch, rows, fp32):
+    monkeypatch.setattr(
+        vocab_embedding, "_sm70_dflash2_qpn8_rerank_requested", lambda **kw: True
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
+    layer = SimpleNamespace(
+        _sm70_dflash2_qpn8_rerank_prepared=True,
+        _sm70_dflash2_fp32_logits=fp32,
+    )
+    assert (
+        vocab_embedding._maybe_sm70_dflash2_qpn8_rerank(
+            layer, _FakeCudaTensor((rows, 5120)), 64
+        )
+        is None
+    )
+
+
+def test_top64_rerank_output_has_contiguous_tp_layout():
+    layer = SimpleNamespace(
+        _sm70_dflash2_rerank_values_64=torch.empty(64, 64),
+        _sm70_dflash2_rerank_positions_64=torch.empty(64, 64, dtype=torch.int64),
+        _sm70_dflash2_rerank_ids_64=torch.empty(64, 64, dtype=torch.int64),
+    )
+    for rows in (16, 32, 64):
+        buffers = vocab_embedding._sm70_dflash2_rerank_output_buffers(layer, rows, 64)
+        assert all(x.shape == (rows, 64) and x.is_contiguous() for x in buffers)
