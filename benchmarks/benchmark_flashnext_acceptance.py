@@ -31,7 +31,7 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
-def observed_cohort(llm, fixed_ids, params):
+def observed_cohort(llm, fixed_ids, params, width=1):
     records = []
     client = llm.llm_engine.engine_core
     original = client.get_output
@@ -56,7 +56,10 @@ def observed_cohort(llm, fixed_ids, params):
     client.get_output = observed
     try:
         outputs = generate_cohort(
-            llm, [{"prompt_token_ids": fixed_ids}], params, atomic=True
+            llm,
+            [{"prompt_token_ids": fixed_ids} for _ in range(width)],
+            params,
+            atomic=True,
         )
     finally:
         client.get_output = original
@@ -226,6 +229,14 @@ def main():
                 report["probes"].append(probe)
                 save()
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
+            c4_ids = fixed_ids[:128]
+            c4_params = SamplingParams(temperature=0, max_tokens=600, ignore_eos=True)
+            steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
+            report["c4_probe"] = dict(
+                summary=summarize(steps, 4),
+                output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
+            )
+            save()
             if args.node_trace:
                 llm.collective_rpc(
                     "start_graph_parity_observer", args=(True,), timeout=30
@@ -240,6 +251,7 @@ def main():
                 finally:
                     llm.collective_rpc("stop_graph_parity_capture", timeout=30)
                 report["node_trace"] = dict(
+                    output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
                     summary=summarize(steps, 1),
                     workers=llm.collective_rpc(
                         "read_graph_parity_observer", timeout=30
