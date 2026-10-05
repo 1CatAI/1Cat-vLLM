@@ -30,6 +30,7 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--layer", type=int, default=47)
     parser.add_argument("--iterations", type=int, default=12)
+    parser.add_argument("--lanes-per-row", type=int, choices=(4, 8, 16), default=4)
     args = parser.parse_args()
     if "site-packages" not in vllm.__file__:
         raise ValueError("Requires an installed source-complete artifact")
@@ -63,6 +64,7 @@ def main():
         shape=[512, 160, 2560],
         source_types=kinds,
         layer=args.layer,
+        lanes_per_row=args.lanes_per_row,
         routing="seeded synthetic random top10; real weights",
         cache="32MiB eviction before each timed operation",
         cases=[],
@@ -101,7 +103,7 @@ def main():
                 banks[1].weight_ptrs,
                 banks[1].stat_ptrs,
                 512,
-                4,
+                args.lanes_per_row,
             )
             torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
                 output,
