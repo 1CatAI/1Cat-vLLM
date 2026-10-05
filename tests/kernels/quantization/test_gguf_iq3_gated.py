@@ -174,8 +174,14 @@ def test_registered_parameter_list_compiles_through_layer_wrapper():
             return apply_iq3_gated_pair(self, x)
 
     torch._dynamo.reset()
-    compiled = torch.compile(Layer(), backend="eager", fullgraph=True, dynamic=True)
+    layer = Layer()
+    compiled = torch.compile(layer, backend="eager", fullgraph=True, dynamic=True)
     for m in (512, 8, 16, 8):
         x = torch.empty(m, 5120, dtype=torch.float16, device="meta")
         assert compiled(x).shape == (m, 4352)
+    from torch._dynamo.convert_frame import fullgraph_capture
+    from torch._dynamo.utils import get_metrics_context
+
+    with get_metrics_context():
+        assert fullgraph_capture(layer, (x,), {}) is not None
     torch._dynamo.reset()
