@@ -542,6 +542,9 @@ class GGUFLinearMethod(LinearMethodBase):
         policy = config.kernel_config.sm70_gguf if config is not None else None
         self.native_enabled = policy.enabled if policy is not None else True
         self.prefill_min_m = policy.prefill_min_m if policy is not None else 8
+        self.dense_dp4a_enabled = bool(
+            policy is not None and policy.small_m_dp4a and policy.small_m_dense_dp4a
+        )
         self.native_prepared = False
         self.canonical_projections = ()
 
@@ -706,6 +709,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.native_enabled,
                 self.prefill_min_m,
                 input_layout=self.layout,
+                dp4a_enabled=self.dense_dp4a_enabled,
             )
             from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
                 prepare_iq3_gated_pair,

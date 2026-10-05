@@ -10,8 +10,10 @@ import torch
 from torch.nn import Module, Parameter
 
 from vllm.model_executor.kernels.gguf import (
+    DENSE_DP4A_SCHEDULES,
     GGUFOperatorCapability,
     decoder_family,
+    dense_dp4a_capabilities,
     dense_fp16_cache_capabilities,
 )
 from vllm.model_executor.kernels.linear import (
@@ -235,6 +237,75 @@ direct_register_custom_op(
 )
 
 
+def _prepared_gguf_dp4a_dense(
+    x: torch.Tensor,
+    payloads: list[torch.Tensor],
+    specs: list[int],
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    projections = list(zip(specs[::2], specs[1::2]))
+    schedules = [
+        DENSE_DP4A_SCHEDULES.get((kind, rows.shape[1], n, rows.shape[0]))
+        for kind, n in projections
+    ]
+    if any(schedule is None for schedule in schedules):
+        return _prepared_gguf_mixed_projection(
+            x, codes, stats, caches, descriptors, cache_bands, blas_bands
+        )
+    q8 = torch.empty(
+        (rows.shape[0], rows.shape[1] // 32, 36), device=x.device, dtype=torch.uint8
+    )
+    torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, rows)
+    total = sum(n for _, n in projections)
+    out = rows.new_empty((rows.shape[0], total))
+    offset = 0
+    for index, ((kind, n), schedule) in enumerate(zip(projections, schedules)):
+        assert schedule is not None
+        split, cooperative = schedule
+        scratch = torch.empty(
+            (split, rows.shape[0], n), device=x.device, dtype=torch.float32
+        )
+        torch.ops._C.gguf_dp4a_dense_sm70_out(
+            out[:, offset : offset + n],
+            scratch,
+            q8,
+            *payloads[index * 5 : (index + 1) * 5],
+            kind,
+            split,
+            cooperative,
+            False,
+        )
+        offset += n
+    return out.reshape(*x.shape[:-1], total)
+
+
+def _prepared_gguf_dp4a_dense_fake(
+    x: torch.Tensor,
+    payloads: list[torch.Tensor],
+    specs: list[int],
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], sum(specs[1::2])))
+
+
+direct_register_custom_op(
+    op_name="prepared_gguf_dp4a_dense",
+    op_func=_prepared_gguf_dp4a_dense,
+    fake_impl=_prepared_gguf_dp4a_dense_fake,
+)
+
+
 def mixed_projection_capabilities(projections):
     """Declare output-view eligibility independently of quantization family."""
     if len(projections) < 2 or any(p.kernel is None for p in projections):
@@ -266,6 +337,16 @@ def mixed_projection_capabilities(projections):
 
 
 def apply_prepared_gguf_projections(x, projections):
+    if projections and all(len(p.dp4a_payload) == 5 for p in projections):
+        payloads = [tensor for p in projections for tensor in p.dp4a_payload]
+        specs = [
+            value
+            for p in projections
+            for value in (p.source_type, p.logical_output_size)
+        ]
+        return torch.ops.vllm.prepared_gguf_dp4a_dense(
+            x, payloads, specs, *prepared_projection_arguments(projections)
+        )
     capabilities = mixed_projection_capabilities(projections)
     if not capabilities or any(c.reason is not None for c in capabilities):
         outputs = [projection(x) for projection in projections]
@@ -331,7 +412,7 @@ def _admitted_bands(capabilities):
 
 
 def prepare_gguf_projections(
-    sources, act_dtype, enabled, prefill_min_m, input_layout=None
+    sources, act_dtype, enabled, prefill_min_m, input_layout=None, dp4a_enabled=False
 ):
     """Coalesce adjacent compatible shards without changing projection order."""
     groups: list[tuple[list[torch.Tensor], int]] = []
@@ -356,6 +437,7 @@ def prepare_gguf_projections(
             enabled,
             prefill_min_m,
             input_layout=input_layout,
+            dp4a_enabled=dp4a_enabled,
         )
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
@@ -366,7 +448,9 @@ def prepare_gguf_projections(
         reasons = [
             p.rejection_reason for p in projections if not p.input_layout_restored
         ]
-        fallback = prepare_gguf_projections(sources, act_dtype, enabled, prefill_min_m)
+        fallback = prepare_gguf_projections(
+            sources, act_dtype, enabled, prefill_min_m, dp4a_enabled=dp4a_enabled
+        )
         for projection in fallback:
             projection.input_layout_rejection_reasons = reasons
         return fallback
@@ -377,7 +461,14 @@ class GGUFPreparedProjection(Module):
     """One mixed projection; canonical preparation never changes its row order."""
 
     def __init__(
-        self, weight, source_type, act_dtype, enabled, prefill_min_m, input_layout=None
+        self,
+        weight,
+        source_type,
+        act_dtype,
+        enabled,
+        prefill_min_m,
+        input_layout=None,
+        dp4a_enabled=False,
     ):
         super().__init__()
         self.source_type = int(source_type)
@@ -401,6 +492,34 @@ class GGUFPreparedProjection(Module):
                     requires_grad=False,
                 ),
             )
+        self.dp4a_capabilities = ()
+        self.dp4a_payload = torch.nn.ParameterList()
+        if self.source_type in (12, 14, 23) and self.kernel is not None:
+            k = self.kernel.config.partition_weight_shape[0]
+            self.dp4a_capabilities = dense_dp4a_capabilities(
+                self.source_type,
+                k,
+                self.logical_output_size,
+                act_dtype,
+                enabled=self.enabled and dp4a_enabled,
+                compute_capability=70
+                if weight.device.type == "cuda"
+                and current_platform.get_device_capability(weight.device.index)
+                == (7, 0)
+                else 0,
+            )
+            if any(c.reason is None for c in self.dp4a_capabilities):
+                from vllm.model_executor.layers.quantization.gguf_dp4a_formats import (
+                    transcode_integer_dot,
+                )
+
+                codec = transcode_integer_dot(
+                    weight.detach().cpu().numpy(), self.source_type
+                )
+                self.dp4a_payload.extend(
+                    Parameter(torch.from_numpy(data).to(weight.device), False)
+                    for data in codec.packed(input_layout)
+                )
         self.fp16_capabilities = (
             fp16_projection_capabilities(self.source_type, weight, act_dtype, enabled)
             if self.source_type in FP16_SOURCE_TYPES
@@ -550,11 +669,19 @@ class GGUFPreparedProjection(Module):
                         (self.kernel.capability,),
                     ),
                     *self.cache_capabilities,
+                    *self.dp4a_capabilities,
                 )
             ]
         return result
 
     def forward(self, x):
+        if len(self.dp4a_payload) == 5:
+            return torch.ops.vllm.prepared_gguf_dp4a_dense(
+                x,
+                list(self.dp4a_payload),
+                [self.source_type, self.logical_output_size],
+                *prepared_projection_arguments([self]),
+            )
         if self.fp16_capabilities and self.fp16_capabilities[0].reason is None:
             return torch.ops.vllm.prepared_gguf_fp16_projection(
                 x, self.weight, self.source_type, self.enabled
