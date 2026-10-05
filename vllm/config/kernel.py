@@ -367,6 +367,9 @@ class Sm70GgufConfig:
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 
+    small_m_hmma: bool = True
+    """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 

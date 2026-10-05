@@ -17,7 +17,8 @@ struct SwArgs {
   Seg gate, up;
   const half* x;
   int ldx;
-  const float* wg;
+  const void* wg;
+  bool gate_half;
   half* h;
   half* sg;
   float* ws;
@@ -84,7 +85,9 @@ __global__ void __launch_bounds__(32 * W) swiglu_mv(SwArgs a) {
     float* part = reinterpret_cast<float*>(smem);
     float acc[8] = {};
     for (int k = threadIdx.x; k < a.K; k += 32 * W) {
-      const float w = a.wg[k];
+      const float w = a.gate_half
+                          ? __half2float(static_cast<const half*>(a.wg)[k])
+                          : static_cast<const float*>(a.wg)[k];
 #pragma unroll
       for (int m = 0; m < 8; ++m)
         if (m < a.M) acc[m] = fmaf(__half2float(a.x[m * a.ldx + k]), w, acc[m]);
@@ -210,7 +213,9 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x, std::vector<torch::Tensor> g,
             t.is_contiguous(),
         "shared-expert storage must be contiguous and on the input device");
   };
-  same(wg, at::kFloat);
+  TORCH_CHECK(wg.scalar_type() == at::kFloat || wg.scalar_type() == at::kHalf,
+              "shared gate requires FP16 or FP32 dense weights");
+  same(wg, wg.scalar_type());
   same(h, at::kHalf);
   same(sg, at::kHalf);
   same(ws, at::kFloat);
@@ -242,7 +247,8 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x, std::vector<torch::Tensor> g,
   a.up = make_seg(u[0], u[1], u[2], fmts[1], I);
   a.x = reinterpret_cast<const half*>(x.data_ptr());
   a.ldx = static_cast<int>(x.stride(0));
-  a.wg = wg.data_ptr<float>();
+  a.wg = wg.data_ptr();
+  a.gate_half = wg.scalar_type() == at::kHalf;
   a.h = reinterpret_cast<half*>(h.data_ptr());
   a.sg = reinterpret_cast<half*>(sg.data_ptr());
   a.ws = ws.data_ptr<float>();

@@ -79,6 +79,19 @@ def _prepared_gguf_projection(
     # Keep M-dependent policy behind an opaque op: vLLM's range compilation
     # drops Dynamo guards and would otherwise freeze the prefill branch.
     rows = x.reshape(-1, x.shape[-1]).contiguous()
+    if family == 3:
+        from .gguf_dense_hmma import apply_segments, restore_and_apply
+
+        out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
+        if rows.shape[0] <= 8:
+            apply_segments(
+                rows, [codes], [stats], [cache], [decoder], [output_size], out, [out]
+            )
+        else:
+            restore_and_apply(
+                rows, codes, stats, cache, decoder, output_size, out, k_ld, q_ld
+            )
+        return out.reshape(*x.shape[:-1], logical_size)
     if cache is not None and _supports_band(rows.shape[0], cache_bands):
         return torch.mm(rows, cache.T).reshape(*x.shape[:-1], logical_size)
     output = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
@@ -153,6 +166,16 @@ def _prepared_gguf_mixed_projection(
 ) -> torch.Tensor:
     rows = x.reshape(-1, x.shape[-1]).contiguous()
     specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
+    if specs and all(spec[0] == 3 for spec in specs):
+        from .gguf_dense_hmma import apply_segments
+
+        ns = [spec[6] for spec in specs]
+        output = torch.empty((rows.shape[0], sum(ns)), dtype=x.dtype, device=x.device)
+        views = list(output.split(ns, dim=1))
+        apply_segments(
+            rows, codes, stats, caches, [spec[1] for spec in specs], ns, output, views
+        )
+        return output.reshape(*x.shape[:-1], sum(ns))
     cache_offset = blas_offset = 0
     policies = []
     for spec in specs:
@@ -167,9 +190,14 @@ def _prepared_gguf_mixed_projection(
         blas_offset += blas_count
     # Retain the calibrated per-projection policy outside measured target
     # verification sizes. This decision must use actual M inside the op.
-    direct = rows.shape[0] in (5, 20) and all(
-        not _supports_band(rows.shape[0], cb) and not _supports_band(rows.shape[0], bb)
-        for cb, bb in policies
+    direct = (
+        not any(spec[0] == 3 for spec in specs)
+        and rows.shape[0] in (5, 20)
+        and all(
+            not _supports_band(rows.shape[0], cb)
+            and not _supports_band(rows.shape[0], bb)
+            for cb, bb in policies
+        )
     )
     if not direct:
         outputs = [
@@ -302,7 +330,10 @@ def prepared_projection_arguments(projections):
         )
         codes.append(projection.codes)
         stats.append(projection.stats)
-        caches.append(projection.fp16_cache)
+        if hasattr(projection, "segment_format"):
+            family, decoder = 3, projection.segment_format
+            cb = bb = []
+        caches.append(projection.segment_high if family == 3 else projection.fp16_cache)
         descriptors.extend(
             (
                 family,
@@ -513,6 +544,17 @@ class GGUFPreparedProjection(Module):
         self.kernel.process_weights_after_loading(self)
         self.input_layout_restored = self.input_layout is not None
         self.output_padding = padding
+        from .gguf_dense_hmma import prepare_segment_bank, remember_descriptor
+
+        if prepare_segment_bank(self, canonical, weight.device):
+            remember_descriptor(
+                k,
+                n + padding,
+                self.segment_format,
+                self.gguf_tm_k_ld,
+                self.gguf_tm_q_ld,
+            )
+            return None
         self.cache_capabilities = dense_fp16_cache_capabilities(
             self.source_type, k, n, act_dtype, self.enabled
         )
@@ -550,6 +592,11 @@ class GGUFPreparedProjection(Module):
                         (self.kernel.capability,),
                     ),
                     *self.cache_capabilities,
+                    *(
+                        [self.segment_capability]
+                        if hasattr(self, "segment_capability")
+                        else []
+                    ),
                 )
             ]
         return result
@@ -568,13 +615,15 @@ class GGUFPreparedProjection(Module):
                 family, decoder = 1, kernel.lut_id
             else:
                 family, decoder = 2, kernel.source_type
+            if hasattr(self, "segment_format"):
+                family, decoder = 3, self.segment_format
             capabilities = getattr(kernel, "operator_capabilities", ())
             blas = tuple(c for c in capabilities if "blas" in c.operator)
             return torch.ops.vllm.prepared_gguf_projection(
                 x,
                 self.codes,
                 self.stats,
-                self.fp16_cache,
+                self.segment_high if family == 3 else self.fp16_cache,
                 family,
                 decoder,
                 config.group_size,
@@ -583,7 +632,7 @@ class GGUFPreparedProjection(Module):
                 config.partition_weight_shape[1],
                 self.logical_output_size,
                 _admitted_bands(self.cache_capabilities),
-                _admitted_bands(blas),
+                [] if family == 3 else _admitted_bands(blas),
             )
         # Imported lazily because the GGUF method owns fallback dispatch.
         from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf
