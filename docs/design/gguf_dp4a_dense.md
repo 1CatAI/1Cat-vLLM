@@ -14,8 +14,10 @@ using TurboMind's integer IQ4 lookup. Original base scales remain FP16 values
 from the file. Duplicating these original values per subgroup introduces no
 rounding and permits load-time head-order permutations without input copies.
 
-Six CPU tests reconstruct K1536/K2560 weights elementwise identically to the
-official GGUF reader and invert normalized packet order. Storage expansion,
+Twelve CPU tests reconstruct K1536/K2560 weights elementwise identically to the
+official GGUF reader, invert normalized packet order, and restore GDN
+head order at load time. Expanded original subgroup scales are permuted
+with the integer packets, so the runtime does not reorder activation inputs. Storage expansion,
 especially signed Q6 bytes and duplicated scale levels, must be included in
 model memory accounting; retaining both canonical and normalized weights can
 exhaust the small TP4 V100 headroom.
@@ -41,3 +43,11 @@ bytes. GPU correctness, bandwidth and the chosen split-K schedules are still
 pending the normal complete-extension build. No model dispatcher selects
 these operators yet. Model integration must preserve mixed-projection order,
 share QKV/Z encoding, preserve head layout, and avoid duplicated weight banks.
+
+For the three supported types in the Flash-Next tensor inventory, normalized
+storage increases an estimated 81.6 MiB per TP4 rank: Q6_K contributes
+73.9 MiB, Q4_K 5.3 MiB and IQ4_XS 2.4 MiB, excluding padding. These are
+storage estimates, not a measured model allocation. Keeping both complete
+layouts would add about 571 MiB, exceeding the observed tightest rank's
+headroom. Integration therefore needs one resident weight representation and
+a shared FP16 prefill workspace, with actual memory validation before adoption.
