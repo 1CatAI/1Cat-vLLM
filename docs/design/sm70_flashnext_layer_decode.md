@@ -171,8 +171,45 @@ The router and expert screen reports exact selected IDs and small numerical
 errors, but its combined timing does not isolate the expert fusion cost.
 An expert-only screen therefore freezes native routing outside the graph.
 
-Two distinct follow-up screens are compiled: fixed HC normalization producers
-with native up/mix, and Tensor Core shared experts that reuse weights across
-all M5 rows. They address the specific repeated-work and scalar-compute costs;
-their GPU measurements remain pending. No runtime dispatch has changed and
-no candidate has been submitted to model distribution admission.
+## Follow-up measurements
+
+New captures count driver graph nodes directly. The fixed-normalization HC
+uses four independent branch producers; each branch is normalized once.
+The reduction control uses the production registered-buffer path. Both QSA
+follow-ups rotate twelve separate cache allocations rather than repeatedly
+reading one cache. The Tensor Core QSA screen retains the native exact selector
+and FP32 QK/PV accumulation with FP16 probability materialization.
+
+| Screen | Calls | M1 control / candidate (ms) | M5 control / candidate (ms) | M1 kernels control / candidate |
+| --- | ---: | ---: | ---: | ---: |
+| HC, fixed normalization producers | 16 | 0.286003 / 0.439747 | 0.553579 / 1.103773 | 64 / 32 |
+| HC, fixed producers and preceding reduction | 16 | 0.351396 / 0.596746 | 0.663565 / 2.112250 | 80 / 32 |
+| Experts with frozen native routing | 4 | 0.081592 / 0.112855 | 0.289295 / 0.456638 | 8 / 4 |
+| QSA, parallel heads | 12 | 0.554906 / 1.146860 | 1.032283 / 3.728270 | 48 / 12 |
+| QSA, Tensor Core QK/PV | 12 | 0.556790 / 0.665313 | 1.032655 / 1.981976 | 48 / 12 |
+| Shared expert, ten Tensor Core producers | 16 | 0.289188 / 0.282921 | 0.517016 / 0.470519 | 80 / 16 |
+| Shared expert, forty K-partitioned producers | 16 | 0.289782 / 0.193219 | 0.308644 / 0.322171 | 80 / 16 |
+
+All rows except forty-producer shared M1 are rejected for M1 admission. The
+ten-producer shared M1 saving is only 0.006267 ms over sixteen calls and is
+insufficient. The forty-producer M1 segment saves 0.096563 ms over sixteen
+real weight banks (33.3%), with 32 single-CTA kernels reduced to zero.
+This is a segment candidate, not an endpoint saving or completed layer gate.
+
+The shared M5 numbers need their resolved control recorded. The ten-producer
+row uses the strict FP32 cuBLAS fallback. Forty-producer M5 against that fallback
+measures 0.516258 / 0.329388 ms, but this is **not** the shipped MTP speed
+baseline. Against the shipped batched-up path and its existing precision
+policy, M5 measures 0.308644 / 0.322171 ms, 96 / 16 kernels: a 4.4% regression.
+Keep the existing M5 route. M1 maximum output error is 9.54e-7; the actual M5
+control comparison has maximum error 1.91e-6. These arithmetic comparisons
+do not substitute for teacher-forcing KL, top-1 or natural termination.
+
+The first shared Tensor Core attempt encountered unaligned shared storage;
+explicit sixteen-byte alignment fixes that correctness issue. Measurements
+above come from the corrected implementations. A queue-script failure skipped
+one invocation; it contributes no timing result.
+
+The account cannot change application clocks, so the historical/current clock
+difference remains unquantified. No clock setting changed. No runtime dispatch
+has changed and no candidate has passed model distribution admission.

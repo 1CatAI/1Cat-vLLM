@@ -49062,6 +49062,14 @@ screen and are rejected. The tile-preserving GDN variant improves only the M5
 hot-state proxy, not M1 or a complete layer. Fixed HC normalization and batched
 Tensor Core shared-expert follow-ups are compiled and awaiting their lease;
 an expert-only graph isolates expert fusion from the single-CTA router.
+Those HC and expert follow-ups also regress M1. Three QSA schedules, including
+Tensor Core QK/PV with native exact selection, fail the segment speed screen.
+Forty K-partitioned shared-expert producers are the first M1 segment candidate:
+sixteen real weight banks measure 0.289782 / 0.193219 ms, 80 / 16 graph kernels,
+32 / 0 single-CTA kernels. This does not establish a complete-layer or model
+gain. Against the shipped MTP batched-up control, M5 measures 0.308644 /
+0.322171 ms and regresses; retain its existing route. The faster strict-FP32
+cuBLAS comparison is a separate policy and cannot be relabeled as MTP speed.
 New graph captures count driver nodes and dimensions directly rather than
 treat incomplete profiler events as complete counts. No route/default
 change or endpoint saving is accepted. Retain exclusions and exact-shape
