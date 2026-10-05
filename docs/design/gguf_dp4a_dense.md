@@ -107,3 +107,31 @@ official weight reconstruction, including head-order permutations. Dispatch
 checks cover unsupported M fallback, shared activation encoding, mixed output
 views and changed-input graph replay. Model speed and quality results must be
 recorded separately before enabling the proposed small-projection route.
+
+## Calibrated small gated projections
+
+Cold-cache TP4 shared-expert gate/up tests include the existing FP16 SiLU
+and multiplication in the control, and activation encoding in the candidate.
+The complete extension passes 175 operator checks; eight additional dispatcher
+checks cover five source pairs, unsupported-M fallback and changed-input graphs.
+
+| Gate/up types | Local combined N/K | M5 control/candidate, us | M20 control/candidate, us |
+|---|---|---:|---:|
+|Q4_K / IQ4_XS|320/2560|34.82 / 14.34|33.79 / 16.38|
+|IQ4_XS / Q4_K|320/2560|33.79 / 12.29|34.82 / 14.34|
+|Q4_K / Q4_K|320/2560|18.43 / 12.29|18.43 / 14.08|
+|IQ4_XS / IQ4_XS|320/2560|22.53 / 12.29|22.53 / 13.31|
+|Q6_K / Q6_K|320/2560|22.53 / 12.29|22.53 / 13.31|
+
+The Q6 pair keeps original superblock scales and folds only identical adjacent
+base-scale entries, retaining separate signed group16 scales. Mixed U4 pairs
+use one packed bank and select affine or lookup decoding by output row.
+The capability framework admits only the measured source pairs at M5/M20;
+other batches retain canonical projection and activation operations.
+
+Folding Q6 scales does not rescue large projections: QKV is 24.58/24.06 us
+at M5 and 29.70/34.82 us at M20. The local Q6 LM head is 62080/2560;
+folded integer dots cost 233/263/538 us at M1/M5/M20 against 211/213/287 us
+for the retained head. Raw decoding is also slower. Neither is selected.
+These are single-layer measurements, not end-to-end gains. Model validation
+uses one installed complete artifact for both control and candidate.
