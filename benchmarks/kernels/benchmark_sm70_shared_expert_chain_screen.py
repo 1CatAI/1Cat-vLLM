@@ -37,7 +37,7 @@ def main():
         args.output.write_text(json.dumps({"library": extension.__file__}) + "\n")
         return
     assert torch.cuda.get_device_capability() == (7, 0)
-    import vllm._custom_ops as ops
+    import vllm._custom_ops  # noqa: F401
     from vllm import _sm70_ops as sm70_ops
 
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -98,7 +98,7 @@ def main():
             for x, (w13, w2, gate) in zip(inputs, weights):
                 projected = torch.nn.functional.linear(x, w13)
                 intermediate = x.new_empty((m, 160))
-                ops.silu_and_mul(intermediate, projected)
+                torch.ops._C.silu_and_mul(intermediate, projected)
                 y = torch.nn.functional.linear(intermediate, w2)
                 if m == 1:
                     sm70_ops.qwen38_shared_gate_exact_out(y, x, gate)

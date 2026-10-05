@@ -167,7 +167,7 @@ def main():
                     state, xn = hc_combine_norm(state, core, injection, norm, 1e-6, 4)
                     if m == 1:
                         block, injection = torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
-                            xn, down, up
+                            xn, down, up, None, None, False, True
                         )
                     else:
                         packed_down, packed_up = packed_banks[i]
