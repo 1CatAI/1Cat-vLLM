@@ -998,3 +998,12 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x,
 void gguf_dense_restore_canonical_sm70_out(
     torch::Tensor weight, torch::Tensor stats, torch::Tensor codes,
     torch::Tensor high, torch::Tensor scale, int64_t fmt, int64_t k, int64_t n);
+
+void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
+                         torch::Tensor cnt, std::vector<int64_t> ll,
+                         torch::Tensor seq, int64_t rank, int64_t variant);
+void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
+                       torch::Tensor cnt, std::vector<int64_t> ll,
+                       torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
+                       torch::Tensor out, torch::Tensor lora_out,
+                       torch::Tensor inj_out, int64_t warps);

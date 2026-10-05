@@ -206,6 +206,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ring_comm = Sm70RingCommunicator(
             self.cpu_group, self.device, self.unique_name, use_custom_allreduce
         )
+        from .sm70_hc_ll import Sm70HcLLCommunicator
+
+        self.hc_ll_comm = Sm70HcLLCommunicator(
+            self.cpu_group, self.device, self.unique_name
+        )
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -658,6 +663,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        hc_ll_comm = getattr(self, "hc_ll_comm", None)
+        if hc_ll_comm is not None:
+            hc_ll_comm.close()
         ring_comm = getattr(self, "ring_comm", None)
         if ring_comm is not None:
             ring_comm.close()

@@ -81,10 +81,16 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
         return
     if not ops.supports_sm70_qwen38_hc_batch():
         raise RuntimeError("Rebuild the SM70 extension for batched HC")
+    hc_ll = getattr(get_tp_group().device_communicator, "hc_ll_comm", None)
     rank: int | None = get_tp_group().rank_in_group
+    ll_admitted = hc_ll is not None and hc_ll.status["enabled"]
+    if ll_admitted:
+        assert hc_ll is not None
+        rank = hc_ll.logical_rank
     ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
     if (
-        not (ca is not None and not ca.disabled and ca.fully_connected)
+        not ll_admitted
+        and not (ca is not None and not ca.disabled and ca.fully_connected)
         and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and ops.supports_sm70_qwen38_hc_replicated()
     ):
@@ -415,6 +421,36 @@ def _qwen38_sm70_fp16_fused_hc(
     concurrent_batch: bool = False,
     reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.distributed.parallel_state import (
+        get_tp_group,
+        model_parallel_is_initialized,
+    )
+
+    hc_ll = (
+        getattr(get_tp_group().device_communicator, "hc_ll_comm", None)
+        if model_parallel_is_initialized()
+        else None
+    )
+    if (
+        hc_ll is not None
+        and hc_ll.status["enabled"]
+        and concurrent_batch
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= 20
+        and x.shape[1] == _HC_HIDDEN
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and packed_down is not None
+        and packed_down.shape == (3, 640, 2, 32, 8)
+        and packed_up is not None
+        and packed_up.shape == (80, 20, 2, 4, 8, 8)
+    ):
+        result = hc_ll.apply(x, packed_down, packed_up)
+        logger.info_once(
+            "SM70 TP4 HC uses two-launch LL shards over direct NVLink peers."
+        )
+        assert result is not None
+        return result
     if _replicated_runtime_ok(x, packed_down, packed_up, concurrent_batch):
         from vllm import _custom_ops as ops
 
