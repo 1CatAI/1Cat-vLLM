@@ -102,6 +102,51 @@ the final mixer and remaining clear/copy nodes. The zero-single-CTA target
 also requires removing QSA fill and final-mixer activation nodes. Neither
 target follows automatically from summing the main layer changes.
 
+## Historical down/push prototype: rejected
+
+The completed screen rotates all 96 checkpoint HC weight pairs (both
+boundaries in 48 layers). Both arms include combine/norm, use FP16 inputs and
+weights with FP32 accumulation, and run five alternating CUDA-graph samples
+on four fully connected V100 SXM2 32-GB devices. Inputs are deterministic
+synthetic activations. These are complete HC-boundary timings, not model
+TPOT, MTP round times or a model-quality qualification.
+
+| M | Baseline 96-boundary ms | Candidate ms | Baseline kernels | Candidate kernels | Baseline single-CTA | Candidate single-CTA |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 1.93623 | 8.10460 | 384 | 288 | 96 | 0 |
+| 4 | 2.68472 | 9.16480 | 384 | 288 | 0 | 0 |
+| 5 | 2.70817 | 14.40748 | 384 | 384 | 0 | 0 |
+
+Per-boundary M1 latency rises from 20.169 to 84.423 us. M4 rises from 27.966
+to 95.467 us, and M5 from 28.210 to 150.078 us. Addressed weight bytes are
+3317760 per boundary, a 4.424-us weight-only floor at 750 GB/s. The implied
+M1 addressed-weight rate falls from 164.50 to 39.30 GB/s; these are not DRAM
+counters. The M5 candidate's occupancy fallback retains four nodes, so it
+does not even reduce the node count for that width.
+
+Changed-input comparisons have maximum output differences of 0.001953125
+at M1/M4 and 0.00390625 at M5; maximum injection difference is 0.00390625.
+These comparisons use synthetic inputs and do not establish a real-activation
+FP64 or model-quality pass. The independent packet fixture passes on all four
+ranks at M1/M5 with zero packet, injection and output errors, including an M1
+generation of 131201 (tag 129) after wrap and changed inputs.
+
+The first fixture failed because it passed foreign-context PyTorch IPC tensor
+pointers directly to peer-write kernels. The repaired harness uses the normal
+communication allocator and opens each peer mapping in the consumer's CUDA
+context. A separate partial-topology test then missed exactly the two SYS
+links; an NVLink pair passes. A peer-access claim alone cannot admit a direct
+all-peer protocol on that topology. These diagnostic failures are preserved
+separately from the fully connected timing result.
+
+The projected 0.236-ms saving is not realized. This prototype is discarded,
+with no production integration, model endpoint or quality campaign. Its
+per-row 32-bit peer stores and repeated volatile per-element input polling
+differ from the production packed transport; this is a code-level distinction,
+not a measured breakdown of the slowdown. Do not pursue register-prefetch
+tuning or promote fewer nodes as proof of a speedup. The next HC work follows
+the shared-layer scope above and reuses the production epoch/packet protocol.
+
 ## Per-layer accounting
 
 | Layer (zero based) | Kind | Kernels | Stream 364 kernels | Sync kernels on 364 | Span us | Auxiliary overlap us | Weight bytes | Floor us | Span minus floor us |
