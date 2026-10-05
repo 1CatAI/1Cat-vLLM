@@ -215,6 +215,33 @@ def test_compact_top_p_rounding_boundary(direction):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("rows", [33, 64])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compact_dense_fallback_bounds_temporary_rows(monkeypatch, rows):
+    from vllm.v1.sample.ops import topk_topp_sampler
+    from vllm.v1.sample.ops.topk_topp_triton import _apply_top_k_top_p_compact
+
+    # Every row exceeds the shortlist at its top-k cutoff. Different top-p
+    # parameters exercise row mapping across complete and partial chunks.
+    logits = torch.ones((rows, 248320), device="cuda")
+    logits[:, :2] = 2.0
+    k = torch.full((rows,), 20, dtype=torch.int32, device="cuda")
+    p = torch.linspace(0.6, 1.0, rows, device="cuda")
+    expected = apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    dense_batch_sizes = []
+
+    def reference(chunk, chunk_k, chunk_p):
+        dense_batch_sizes.append(chunk.shape[0])
+        return apply_top_k_top_p_pytorch(chunk, chunk_k, chunk_p)
+
+    monkeypatch.setattr(topk_topp_sampler, "apply_top_k_top_p_pytorch", reference)
+    actual = _apply_top_k_top_p_compact(logits, k, p, -float("inf"))
+    assert torch.equal(actual, expected)
+    assert actual.data_ptr() == logits.data_ptr()
+    assert sum(dense_batch_sizes) == rows
+    assert max(dense_batch_sizes) <= 16
+
+
 @pytest.mark.parametrize("rows", [2, 8, 32])
 @pytest.mark.parametrize("vocab", [32768, 248320])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
