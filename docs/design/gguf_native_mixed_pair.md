@@ -68,5 +68,17 @@ layouts, other types and uncalibrated shapes retain canonical dispatch with
 reported reasons. The loader and fused-SiLU interface use the same capability.
 
 Five new CPU dispatch/graph checks and the adjacent canonical regressions
-pass. The installed preparation/opaque-operator GPU graph fallback check is
-pending before promotion; its benchmark covers M512/8/1/5/16/20/32/8.
+pass. Normal installed wheel `dev16+ga5e43e667d` also passes preparation and
+opaque-operator GPU graph checks for both orientations, covering
+M512/8/1/5/16/20/32/8. M8 selects the native pair; other M match canonical
+outputs bitwise, and every CUDA graph replay matches its eager output.
+Both native modules match the wheel members, with only standard libraries
+resolved and no source override.
+
+The installed opaque path's layer39 ABBA at steady 1530/877MHz is
+canonical 74.752/73.728us versus native 55.296/55.296us. Layer42 changes
+clocks between arms in that installed wiring run; its timing is not treated
+as a stable ABBA result. The focused stable raw-operator comparison above
+establishes its admission, and the installed run establishes its numerical
+and graph behavior. Natural model output and primary-machine operator
+comparison remain pending before promotion.
