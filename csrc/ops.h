@@ -979,7 +979,7 @@ void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
-                                bool activated);
+                                bool activated, int64_t lanes_per_row);
 
 void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
                          torch::Tensor cnt, std::vector<int64_t> ll,
