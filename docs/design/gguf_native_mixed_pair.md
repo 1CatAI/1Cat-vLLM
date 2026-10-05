@@ -81,7 +81,7 @@ clocks between arms in that installed wiring run; its timing is not treated
 as a stable ABBA result. The focused stable raw-operator comparison above
 establishes its admission, and the installed run establishes its numerical
 and graph behavior. Natural model output passes as described below. Primary-machine operator
-comparison remains pending before promotion.
+comparison also passes as recorded below.
 
 ## AOT module integration
 
@@ -108,3 +108,28 @@ The complete package SHA256 is
 `d72cd64639199773252bc3617b74397a240657a502d3eb13a653d2a6c114373b`.
 The source-sized readers preserve both scale levels; neither the AOT fix
 nor model wiring changes FP16 operand or FP32 accumulation precision.
+
+## Primary-machine comparison
+
+The normal `dev19+ge2164e25c1` wheel includes the latest shared allreduce
+implementation and the unchanged pair kernel objects. On V100-SXM2-32GB,
+CUDA 12.8, Torch 2.10, 300W, every timed arm records 1290/877MHz. Cold-L2
+graph replay uses the same 16MiB eviction and 84 samples per ABBA arm.
+
+| Actual TP4 slice | Canonical ABBA arms | Native ABBA arms | Source-payload bandwidth |
+| --- | --- | --- | --- |
+| Layer39, IQ4_XS/IQ3_S | 83.968/83.968us | 61.440/61.440us | 348.5GB/s |
+| Layer42, IQ3_S/IQ4_XS | 84.480/83.968us | 62.464/62.464us | 342.8GB/s |
+
+Three numerical inputs per orientation give native relative L2
+0.000497–0.000534 versus canonical 0.000598–0.000623; maximum absolute
+native error remains 0.00390625–0.0078125. Runtime M512/8/1/5/16/20/32/8
+checks pass, with M8 native and other M bitwise canonical, and every short
+CUDA graph replay equals its eager result. The primary machine's first
+operator attempt waits for the lock and then returns busy while a departing
+CUDA context remains; the queued retry performs no overlapping GPU work.
+
+Nine IQ4_XS/IQ3_S layers save 22.528us each, and two reverse-orientation
+layers save 21.504–22.016us each: approximately 0.246ms of projection saving
+per verifier round. This is a weighted operator estimate; no additional
+end-to-end measurement or full trace was run for this change.
