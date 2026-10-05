@@ -457,6 +457,21 @@ all-reduce selection is unaffected. The four-decision TP4 graph benchmark
 compares changed inputs, shard ties, width changes and repeated epochs against
 NCCL. This is communication-only evidence; full-model gates remain required.
 
+The published owned branch merges main `0e359c87d3` (including the newer GDN
+projection tails, strided QKV, direct GDN output and compact target top-k).
+The earlier 23.186-ms endpoint is a frozen historical control, not the current
+main result. Rebuild normal native extensions before measuring the merged
+endpoint; do not reuse the older extension with newer dispatch code.
+
+The router structural prototype spreads checkpoint-FP16 projection across
+80 CTAs, sharing each weight load across all rows. Writers publish their
+results before a completion ticket; the last CTA runs normalized top10 and
+the existing integer-only route-group plan. There are no spinning CTAs or
+cooperative-launch assumptions. FP32 accumulation retains the FP16 router
+logit boundary. The checkpoint graph compares projection/selection/plan over
+48 layers; production dispatch remains unchanged pending measured gains and
+shared model gates. It is not a register-prefetch experiment.
+
 Source controls for rebase bisection must retain complete-round timing and
 normal sampling, identical 8K prompt/256K capacity/power/precision/cache policy.
 Record both token tape and draft counts at each source. The old and new timing
