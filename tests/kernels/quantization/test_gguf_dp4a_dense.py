@@ -22,12 +22,14 @@ def oracle(x):
     return (q.float() * d.half().float()).reshape_as(x), groups.sum(-1).half().float()
 
 
-@pytest.mark.parametrize("kind", [12, 14, 23])
+@pytest.mark.parametrize(
+    "kind,activated", [(12, False), (14, False), (23, False), (23, True)]
+)
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("cooperative", [False, True])
 def test_dense_matches_official_q8_formula_and_output_views(
-    kind, m, split, cooperative
+    kind, activated, m, split, cooperative
 ):
     n, k = 64, 768
     _, size = quant_size(kind)
@@ -45,14 +47,15 @@ def test_dense_matches_official_q8_formula_and_output_views(
     torch.manual_seed(970 + m)
     x = torch.randn((m, k), device="cuda", dtype=torch.float16)
     q8 = torch.empty((m, k // 32, 36), device="cuda", dtype=torch.uint8)
-    parent = torch.full((m, n + 16), -3.0, device="cuda", dtype=torch.float16)
-    out = parent[:, 8 : n + 8]  # Direct mixed-projection output, no copyback.
+    width = n // 2 if activated else n
+    parent = torch.full((m, width + 16), -3.0, device="cuda", dtype=torch.float16)
+    out = parent[:, 8 : width + 8]  # Direct mixed-projection output, no copyback.
     scratch = torch.empty((split, m, n), device="cuda", dtype=torch.float32)
 
     def run():
         torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
         torch.ops._C.gguf_dp4a_dense_sm70_out(
-            out, scratch, q8, *packed, kind, split, cooperative, False
+            out, scratch, q8, *packed, kind, split, cooperative, activated
         )
 
     def check():
@@ -64,6 +67,11 @@ def test_dense_matches_official_q8_formula_and_output_views(
             delta = original_sum - decoded.reshape(m, -1, 32).sum(-1)
             # Standard Q8_1 stores the original (rounded) sum for affine offsets.
             expected -= delta @ torch.from_numpy(minimum).cuda().T
+        if activated:
+            rounded = expected.half()
+            expected = (
+                torch.nn.functional.silu(rounded[:, :width]) * rounded[:, width:]
+            ).float()
         torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.003)
         assert torch.isfinite(out).all()
         assert torch.all(parent[:, :8] == -3) and torch.all(parent[:, -8:] == -3)
