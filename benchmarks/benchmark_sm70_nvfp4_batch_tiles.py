@@ -34,6 +34,7 @@ if a.ncu_candidate and not (a.candidate or a.candidate_so):
 a.out.parent.mkdir(parents=True, exist_ok=True)
 candidate_binary = a.candidate_so
 torch.manual_seed(20261005)
+torch.backends.cuda.matmul.allow_tf32 = False
 if a.candidate_so:
     torch.ops.load_library(str(a.candidate_so))
 elif a.candidate:
@@ -112,6 +113,17 @@ for proj in ["gate_up", "down"] if a.projection == "both" else [a.projection]:
     else:
         w, s, g = shard("down_proj", True)
     w, s = w.cuda(), s.cuda()
+    # Check against an FP32 dense multiply of the same FP16 dequantized
+    # weights. This isolates accumulation from load-time weight rounding.
+    lookup = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float16,
+        device="cuda",
+    )
+    raw_codes = torch.stack([w & 15, w >> 4], -1).flatten(1).long()
+    effective_rows = (s.float() * g).half().repeat_interleave(16, dim=1)
+    dense_weights = (lookup[raw_codes] * effective_rows).float()
+    del raw_codes, effective_rows
     n, k = w.shape[0], w.shape[1] * 2
     codes = torch.stack([w & 15, w >> 4], -1).flatten(1).t().contiguous()
     effective = (s.float().t() * g).half().contiguous()
@@ -161,6 +173,14 @@ for proj in ["gate_up", "down"] if a.projection == "both" else [a.projection]:
         for _ in range(3):
             run()
         torch.cuda.synchronize()
+        dense_reference = torch.nn.functional.linear(x.float(), dense_weights)
+        if proj == "gate_up":
+            gate, up = dense_reference.half().chunk(2, dim=1)
+            dense_reference = (
+                torch.nn.functional.silu(gate.float()).half() * up
+            ).float()
+        else:
+            dense_reference = dense_reference.half().float()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
@@ -191,7 +211,12 @@ for proj in ["gate_up", "down"] if a.projection == "both" else [a.projection]:
                 graph.replay()
                 torch.cuda.synchronize()
             prof.export_chrome_trace(str(a.out.with_suffix(f".{proj}.m{m}.trace.json")))
+        control_diff = out.float() - dense_reference
         row = {
+            "control_vs_fp32_dense": {
+                "max_abs": float(control_diff.abs().max()),
+                "mean_abs": float(control_diff.abs().mean()),
+            },
             "projection": proj,
             "m": m,
             "n": n,
@@ -231,6 +256,11 @@ for proj in ["gate_up", "down"] if a.projection == "both" else [a.projection]:
             candidate_run()
             graph.replay()
             torch.cuda.synchronize()
+            oracle_diff = candidate_out.float() - dense_reference
+            row["candidate_vs_fp32_dense"] = {
+                "max_abs": float(oracle_diff.abs().max()),
+                "mean_abs": float(oracle_diff.abs().mean()),
+            }
             diff = candidate_out.float() - out.float()
             row["candidate_vs_production"] = {
                 "max_abs": float(diff.abs().max()),
@@ -271,6 +301,6 @@ for proj in ["gate_up", "down"] if a.projection == "both" else [a.projection]:
                 )
         result["rows"].append(row)
         print(json.dumps(row), flush=True)
-    del tmw, tms, cs, w, s, codes, effective
+    del tmw, tms, cs, w, s, codes, effective, dense_weights, dense_reference
     torch.cuda.empty_cache()
 a.out.write_text(json.dumps(result, indent=2) + "\n")
