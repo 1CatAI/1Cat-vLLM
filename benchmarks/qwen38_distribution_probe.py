@@ -40,7 +40,6 @@ DISTRIBUTION_LIMITS = {
     "p99_kl": 0.01,
     "max_kl": 0.05,
     "top1_agreement": 0.99,
-    "max_logit_error": 0.5,
 }
 
 

@@ -430,9 +430,10 @@ The frozen 16-prompt reference/candidate comparison contains 2,656 target
 positions and 2,176 draft positions. Target shared-FP32 comparison passes all
 limits (zero KL/raw logit difference, 100% top1). Draft-head QPN8 gives mean KL
 0.000466, p99 0.006037, max 0.020955 and top1 99.724%; raw maximum logit error
-0.710938 fails 0.5. Remove automatic draft-head activation. Retain its explicit
-benchmark-only candidate and do not merge it as an admitted default. Shared
-and output projections now have independent diagnostic reference paths.
+0.710938 is recorded only. Under the shared owner-revised contract this
+draft distribution passes; restore automatic draft-only QPN8 preparation.
+The target head and checkpoint parameter remain unchanged. Shared and output
+projections retain independent diagnostic reference paths.
 
 A full HC graph over 96 real checkpoint pairs includes combine/norm, down
 projection/SiLU/gather and up/mix/gather. Unprofiled critical-rank medians:
@@ -493,16 +494,10 @@ The unprofiled control must not be equated with the older 1.62-ms profiled
 router family service sum. A further design must preserve tensor-core batch
 projection and prove that its selection/plan finish does not serialize work.
 
-Source controls for rebase bisection must retain complete-round timing and
-normal sampling, identical 8K prompt/256K capacity/power/precision/cache policy.
-Record both token tape and draft counts at each source. The old and new timing
-harnesses take the same ordinary generation branch; their reset-cache change
-only affects node diagnostics. Do not label the 1.352-ms difference a source
-regression until old/new endpoints are reproduced in the matched environment.
-Relevant first-parent changes include QSA concurrency/long-context, GDN
-preprocessing and HC topology; quantized GGUF-only changes are not candidates
-unless a selected shared dispatch is affected. Bisect using actual endpoints,
-not profiled service or a tokens/s conversion.
+The apparent 1.352-ms rebase regression was not reproduced under matched
+conditions. The owner closed this investigation on 2026-10-05; no further
+bisection, historical-runtime audit or regression experiments are scheduled.
+The latest-main baseline is fixed at **23.216 ms per complete round**.
 
 Matched fresh-process controls, normal extensions built from each source,
 TP4/300 W/8K input/256K capacity/no profiler, three repeats:
@@ -516,11 +511,8 @@ TP4/300 W/8K input/256K capacity/no profiler, three repeats:
 The matched old/new controls emit identical token tapes and the newer path
 saves 0.659944 ms. The rebuilt historical source does not reproduce the saved
 21.835-ms/311-round tape: its output matches the frozen newer tape instead.
-This does not resolve the historical runtime discrepancy. Audit its original
-native components, precision policy and cache provenance before assigning
-the apparent 1.352-ms difference to any main commit. Source-checksum validation
-did reject and regenerate changed AOT model artifacts in the fresh control;
-stale-cache reuse is not a demonstrated cause.
+The owner closed the historical discrepancy without further investigation.
+These source controls remain historical evidence, not a new optimization task.
 
 Latest-main default timing samples are 23.308418, 23.150912 and 23.188432 ms
 (900 rounds total, 73.513 decode tokens/s, 1.706667 emitted tokens/round).
@@ -530,3 +522,29 @@ the correct 240-km distance and 480/7-km/h average speed. This is output health,
 not task-set or C4 admission. The 15-ms objective remains unmet. Updated
 same-process event calibration and one node-level capture are queued under
 the shared GPU locks; preserve their overhead separately from endpoint speed.
+
+## Current implementation sequence (owner revision, 2026-10-05)
+
+Restore the admitted draft-only QPN8 head, compact top1 IPC, and the positive
+8-warp TP4 HC split on the FP32 fused batched route. The measured operator
+savings are approximately 1.048 ms across four draft heads and 0.335 ms across
+96 HC pairs; these estimates are not an endpoint measurement. Keep output
+projection QPN8 disabled. No new acceleration environment switches are added.
+
+1. Build a 32768-token draft shortlist from corpus frequencies. Freeze eight
+   bilingual prompts before collecting candidate results, each with exactly
+   8192 input tokens and 600 output tokens. Compare full-QPN8 and shortlisted
+   QPN8 heads: acceptance may fall by at most one percentage point, and draft
+   head time must decrease. Report proposals, emitted tokens per round, whole
+   round latency and tokens/s. Corpus coverage is descriptive, never a gate.
+2. Fuse shared gate/up/SiLU/down into one kernel with deterministic tiled down
+   reduction and no floating-point atomics; target <=0.3 ms for 48 layers.
+3. Use one multi-warp CTA per token for router projection and top10, without
+   a last-finishing-CTA protocol; target <=0.3 ms for 48 layers.
+4. Rank draft single-CTA, grid-at-most-four and one-warp kernels by service,
+   then combine dependent work. Deep HC, QSA and GDN changes are owned by
+   the shared decode line; ensure their supported M5 routes are selected here.
+
+Each new structure first needs a real-weight whole-layer graph microbenchmark.
+Run full-model timing after accumulated predicted gains reach about 1 ms, or
+before merging. Shared GPU locks govern every GPU job and source deployment.

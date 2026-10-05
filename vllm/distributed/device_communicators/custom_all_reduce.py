@@ -514,6 +514,7 @@ class CustomAllreduce:
             cooperative,
             full_unroll,
             fused_chain,
+            8 if fused_chain else 0,
         )
 
     def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:

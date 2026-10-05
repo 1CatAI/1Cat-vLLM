@@ -22,7 +22,8 @@ def test_common_shift_changes_raw_error_but_not_distribution():
     assert result["mean_kl"] == pytest.approx(0, abs=1e-14)
     assert result["max_centered_logit_error"] == 0
     assert result["max_logit_error"] == 1
-    assert not result["passed"]
+    assert result["passed"]
+    assert "max_logit_error" not in result["checks"]
 
 
 def test_confident_token_flip_fails_with_known_kl():

@@ -45,3 +45,23 @@ def test_draft_head_preserves_shared_target_and_uses_actual_probe_path(monkeypat
     view.apply(view, torch.randn(9, 2560, dtype=torch.float16))
     assert calls[-1] == "reference"
     assert torch.equal(shared.weight, original)
+
+
+def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    target_head, draft_view = object(), object()
+    model = SimpleNamespace(_sm70_draft_head=None, lm_head=target_head)
+    seen = []
+
+    def prepare_head(head):
+        seen.append(head)
+        return draft_view
+
+    monkeypatch.setattr(head_ops, "prepare_mtp_qpn8_head", prepare_head)
+    monkeypatch.setattr(mtp.envs, "VLLM_SM70_QWEN38_DUAL_COMPILE", False)
+    prepare = mtp.Qwen4ExpMTP.prepare_sm70_decode_graph_model
+    assert not prepare(model)
+    assert not prepare(model)
+    assert seen == [target_head]
+    assert model._sm70_draft_head is draft_view
