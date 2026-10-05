@@ -77,18 +77,18 @@ def main():
     experts = args.experts
     kind = int(tensor.tensor_type)
     if (
-        kind not in (21, 22)
+        kind not in (18, 21, 22)
         or tensor.data.ndim != 3
         or not 1 <= experts <= tensor.data.shape[0]
     ):
-        raise ValueError("Expected stacked IQ3_S/IQ2_S experts")
+        raise ValueError("Expected stacked IQ3_XXS/IQ3_S/IQ2_S experts")
     first = RawGGUFProjection.from_rows(tensor.data[0], kind).tp_slice(
         args.tp_rank, args.tp_size, axis=args.tp_axis
     )
     n, k = first.shape
     if n % 32:
         raise ValueError("Grouped packets require N divisible by 32")
-    compact_bytes = n * (k // 256) * (110 if kind == 21 else 82)
+    compact_bytes = n * (k // 256) * ({18: 98, 21: 110, 22: 82}[kind])
     banks_count = max(
         1,
         int(
