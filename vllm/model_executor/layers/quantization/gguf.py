@@ -747,6 +747,20 @@ class GGUFLinearMethod(LinearMethodBase):
             self.native_admission["canonical_projections"] = [
                 projection.admission() for projection in projections
             ]
+            if not isinstance(self, GGUFEmbeddingMethod):
+                from vllm.model_executor.layers.quantization.gguf_small_output import (
+                    prepare_small_output,
+                )
+
+                output_admission = prepare_small_output(
+                    layer, sources, projections, self.native_enabled, self.layout
+                )
+                self.native_admission["small_output_projection"] = output_admission
+                if output_admission["reason"] is None:
+                    # Runtime M8 restores GDN heads while loading shared A.
+                    # The opaque fallback restores them only when canonical
+                    # preparation could not restore the weight layout.
+                    self.layout = None
             self.native_admission["mixed_projection_operators"] = [
                 asdict(c) for c in mixed_projection_capabilities(projections)
             ]
@@ -907,6 +921,12 @@ class GGUFLinearMethod(LinearMethodBase):
                 )
 
                 out = apply_native_qkv(layer, x)
+            elif hasattr(layer, "gguf_small_output_records"):
+                from vllm.model_executor.layers.quantization.gguf_small_output import (
+                    apply_small_output,
+                )
+
+                out = apply_small_output(layer, x)
             elif hasattr(layer, "gguf_native_linear_records"):
                 from vllm.model_executor.layers.quantization.gguf_native_linear import (
                     apply_native_linear,

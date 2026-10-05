@@ -766,7 +766,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned_decode_active()
         spill = None
         if cascade or (explicit_host is None and not hybrid):
             spill = self._device_spill_bytes(device, table_bytes)
@@ -1134,6 +1136,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
         )
         self._cascade = ple_cascade_configured()
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        self._pinned_decode = pinned_decode_active()
+
         self._remote_placements: list[PLERemotePlacement] = []
         self._disk_segments: list[PLEDiskSegment] = []
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
@@ -1256,7 +1262,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     @classmethod
     def offload_keeps_local_tables(cls) -> bool:
-        return ple_cascade_configured()
+        from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
+
+        return ple_cascade_configured() or pinned_decode_active()
 
     def remote_placement(self) -> PLERemotePlacement | None:
         """The rows of this rank the cascade worker has to serve."""

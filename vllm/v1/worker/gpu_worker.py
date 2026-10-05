@@ -987,6 +987,17 @@ class Worker(WorkerBase):
             ),
             "ple_result_transports": transports,
             "ple_disk_row_readers": row_readers,
+            "ple_pinned_decoders": self.vllm_config.kernel_config.ple_pinned_decoders,
+            "ple_pinned_tables": [
+                {
+                    "layer": name,
+                    "packed_bytes": module.ple_host_storage.numel(),
+                    "rows": module._host_rows,
+                    "source_type": module._source_type,
+                }
+                for name, module in self.model_runner.model.named_modules()
+                if hasattr(module, "_pinned_codebook")
+            ],
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
             "model_input_preparation": {
