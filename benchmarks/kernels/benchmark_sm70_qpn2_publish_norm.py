@@ -86,7 +86,52 @@ def row_norm_source(original):
     )
 
 
-def generate(root, row_norm=False):
+def parallel_row_norm_source(original):
+    """Retain each CUB warp reduction and ordered sums in one 640-thread CTA."""
+    begin = original.index("template <typename WeightT, bool Reference = false>")
+    end = original.index("\nclass CustomAllreduce", begin)
+    norm = original[begin:end]
+    reduce_begin = norm.index("  using Reduce = cub::BlockReduce<float, Threads>;")
+    epilogue_begin = norm.index("  if (tid < PacksPerPart) {", reduce_begin)
+    return (
+        norm[:reduce_begin]
+        .replace("sm70_push_allreduce_gemma_rms_norm", "round12_parallel_row_norm")
+        .replace("__launch_bounds__(128, 1)", "__launch_bounds__(640, 1)")
+        .replace(
+            "const int row = blockIdx.x / Parts, part = blockIdx.x % Parts;",
+            "const int row = blockIdx.x, part = threadIdx.x / Threads;",
+        )
+        .replace(
+            "const int tid = threadIdx.x;", "const int tid = threadIdx.x % Threads;"
+        )
+        + """
+  using Warp = cub::WarpReduce<float, 32>;
+  __shared__ typename Warp::TempStorage warp_storage[20];
+  __shared__ float warp_sums[20];
+  __shared__ float inverse;
+  const int warp = threadIdx.x / 32;
+  const float aggregate = Warp(warp_storage[warp]).Reduce(variance, CubAddOp{});
+  if ((threadIdx.x % 32) == 0) warp_sums[warp] = aggregate;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0;
+#pragma unroll
+    for (int p=0; p<Parts; ++p) {
+      float partial = warp_sums[p*4];
+#pragma unroll
+      for (int w=1; w<4; ++w) partial += warp_sums[p*4+w];
+      total += partial;
+    }
+    inverse = rsqrtf(total / Width + epsilon);
+    meta->generation[row] = generation;
+  }
+  __syncthreads();
+"""
+        + norm[epilogue_begin:]
+    )
+
+
+def generate(root, row_norm=0):
     original = (root / "csrc/custom_all_reduce.cuh").read_text()
     begin = original.index("template <typename WeightT, bool Reference = false>")
     end = original.index("\nclass CustomAllreduce", begin)
@@ -157,7 +202,13 @@ def generate(root, row_norm=False):
             + skeleton
             + producer
             + norm
-            + (row_norm_source(original) if row_norm else "")
+            + (
+                parallel_row_norm_source(original)
+                if row_norm == 2
+                else row_norm_source(original)
+                if row_norm
+                else ""
+            )
             + """
 size_t buffer_bytes() { return kSm70Tp4PushAllreduceBufferBytes; }
 vllm::RankData peers(const std::vector<int64_t>& pointers) {
@@ -198,7 +249,8 @@ void launch_norm(torch::Tensor y,torch::Tensor residual_out,torch::Tensor input,
   const auto* r=residual.data_ptr<float>(); const auto* w=weight.data_ptr<float>();
   auto* out=reinterpret_cast<half*>(y.data_ptr<at::Half>());
   auto* rout=residual_out.data_ptr<float>();
-  if(consume) ROUND12_NORM_VARIANT<float><<<ROUND12_NORM_GRID,128,0,stream>>>(
+  if(consume) ROUND12_NORM_VARIANT<float>\
+<<<ROUND12_NORM_GRID,ROUND12_NORM_THREADS,0,stream>>>(
       buffers,x,r,w,out,rout,rank,1e-6f);
   else vllm::sm70_push_allreduce_gemma_rms_norm<float><<<40,128,0,stream>>>(
       buffers,x,r,w,out,rout,rank,1e-6f);
@@ -211,9 +263,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         )
         .replace(
             "ROUND12_NORM_VARIANT",
-            "round12_row_gemma_norm" if row_norm else "round12_consume_gemma_norm",
+            "round12_parallel_row_norm"
+            if row_norm == 2
+            else "round12_row_gemma_norm"
+            if row_norm
+            else "round12_consume_gemma_norm",
         )
         .replace("ROUND12_NORM_GRID", "8" if row_norm else "40")
+        .replace("ROUND12_NORM_THREADS", "640" if row_norm == 2 else "128")
     )
 
 
@@ -240,17 +297,23 @@ def main():
     parser.add_argument("--extension", type=Path)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--row-norm-screen", action="store_true")
+    parser.add_argument("--row-parallel-screen", action="store_true")
     parser.add_argument("--norm-only-screen", action="store_true")
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
-    if args.norm_only_screen and not args.row_norm_screen:
-        parser.error("--norm-only-screen requires --row-norm-screen")
+    if args.row_norm_screen and args.row_parallel_screen:
+        parser.error("Select either serial or parallel row norm")
+    row_mode = 2 if args.row_parallel_screen else int(args.row_norm_screen)
+    if args.norm_only_screen and not row_mode:
+        parser.error("--norm-only-screen requires a row norm screen")
     args.out.mkdir(parents=True, exist_ok=True)
     source = args.out / "publish-down.cu"
-    source.write_text(generate(args.source_root, args.row_norm_screen))
+    source.write_text(generate(args.source_root, row_mode))
     name = "round12_qpn2_publish_norm"
-    if args.row_norm_screen:
+    if row_mode:
         name += "_row"
+    if row_mode == 2:
+        name += "640"
     if args.extension:
         spec = importlib.util.spec_from_file_location(name, args.extension)
         extension = importlib.util.module_from_spec(spec)
@@ -328,7 +391,7 @@ def main():
                 projection.inverse_global_scale,
                 pointers,
                 rank,
-                bool(arm) and not args.row_norm_screen,
+                bool(arm) and not row_mode,
             )
         extension.norm(
             normalized, rout, partial, residual, weight, pointers, rank, bool(arm)
@@ -380,7 +443,11 @@ def main():
         rank=rank,
         control_us=statistics.median(samples[0]),
         candidate_us=statistics.median(samples[1]),
-        candidate="row_norm" if args.row_norm_screen else "epilogue_publication",
+        candidate="parallel_row_norm"
+        if row_mode == 2
+        else "row_norm"
+        if row_mode
+        else "epilogue_publication",
         samples_us=samples,
         bitwise_four_amplitudes=True,
         projection_included=not args.norm_only_screen,
