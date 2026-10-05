@@ -100,10 +100,31 @@ hides that position launch but does not meet the100µs objective. Further
 diagnosis needs the attention-wait/output boundary. The observed arms have
 large scheduling outliers and do not replace unobserved speed measurements.
 
-The fresh graph-node ledger is pending. Nsight2024.6.2 fails during NCCL NVTX
-initialization before weights load. Its failed path is retained; a normal
-four-rank NCCL initialization succeeds under Nsight2026.2.1. Neither failure
-nor graph-node service time supplies an unprofiled performance result.
+The fresh graph-node ledger is pending. Nsight2024.6.2 with NVTX tracing fails
+during NCCL NVTX initialization. Nsight2026.2.1 passes initialization but
+produces no report even for a single-process256-kernel CUDA smoke on this
+system. CUDA-only2024.6.2 with fork tracing captures all four NCCL ranks.
+Use `--kill=none` so ending collection does not terminate the application.
+The CUDA-only ledger strips Nsight's system-ID bits from process identifiers
+and selects the largest repeating graph, checking its launch count against
+the independent M5 CPU records. A regression using the retained historical
+trace reproduces2175 nodes on each rank across59 middle rounds; this is
+parser validation, not a new model measurement.
+
+A whole-wheel native template passes CPU checks but fails model startup with
+rank1 cuBLAS allocation failure; it is not model-qualified. An owned SM70
+native build then passes29 CPU and25 GPU checks, including official expert
+dequantization, changed-input graphs and mixed-output bitwise comparisons.
+Its ordinary wheel uses source `b8dbe0d0ae715b2b5e12889ecb1115fe8ec3c1f4`, with core
+`d9a0d86934a412c1847d20ce4422216d93b720d1f25019568e0d650e3117f6e6`.
+The source build retains existing CUDA objects and rebuilds the new CPU
+gather registration through the normal CMake/package path. Neither failed
+startup nor profiled service time supplies an unprofiled speed result.
+
+An asynchronous-output event experiment reduces waiting-thread CPU from
+129.62ms busy waiting to0.066ms blocking in a150ms GPU-wait proxy, but median
+host position launches remain67.47 versus66.18µs. It does not explain the
+model's rank0 launch discrepancy, so no production event-wait change is made.
 
 ## Prepared GGUF coverage
 
@@ -120,3 +141,62 @@ changing runtime dispatch.
 HC modules, row GEMV, GDN projection tails, router top-k, shared-expert gates,
 QSA batch selection and FlashQLA report preparation/route hits. Graph-node
 inspection must confirm the final captured kernel composition.
+
+## CUDA-only target graph ledger
+
+Fresh CUDA-only captures use the same installed SM70 wheel (`b8dbe0d0ae715b2b5e12889ecb1115fe8ec3c1f4`),
+TP4 MTP4 and verifier M5. Each rank has1,799 GGUF target nodes and1,527
+NVFP4 target nodes, a272-node difference. The historical2,175/1,428 counts
+are different snapshots and must not be used as this comparison's control.
+The GGUF capture retains12 middle rounds per rank. Its short128-token run
+completed generation but failed the optional interval summary before saving
+CPU events; its ledger is explicitly GPU-only. NVFP4 retains81 middle rounds,
+checked against97 independent M5 CPU replay records before trimming.
+The collector now saves CPU records before optional statistics and captures256
+output tokens. Profiling service durations do not establish round latency.
+
+| Operation family | GGUF calls | NVFP4 calls |
+|---|---:|---:|
+|HC|386|386|
+|Router|96|96|
+|Shared gate|48|48|
+|QSA|72|72|
+|TP ring|98|98|
+|FP16 row GEMV|36|0|
+|Tensor copies|41|5|
+|GGUF affine bitplane GEMM|131|0|
+|GGUF LUT GEMM|87|0|
+|Other TurboMind GEMM|41|0|
+|FP16 CUTLASS|16|76|
+|Raw expert gate/up|47|0|
+|Canonical expert down|48|0|
+|Expert route/gather|48|0|
+|Expert unroute|48|0|
+|PLE n-gram|1|1|
+|Packed PLE row gather|1|0|
+|PLE dequantization|1|0|
+|Tensor scatter|1|0|
+|Other|552|745|
+
+GGUF raw joint gate/up comprises17 IQ3_XXS,20 IQ2_S and10 IQ3_S calls.
+IQ2_S retains its canonical M20 fallback. Neither trace has torch sort or
+searchsorted in the target graph. The36 additional copies occur between the
+GDN gated normalization and its Q6_K output projection: GGUF head-tiling
+restoration currently permutes activations on every forward. Restoration of
+canonical weight groups at load time is investigated separately. Six mixed
+GDN input projections and shared gate/up projections already write directly
+into merged output views; the remaining dense format/tile tuning belongs to
+the GGUF operator line.
+
+All common HC/router/QSA/GDN recurrent kernels appear in the GGUF trace.
+NVFP4 combines the GDN input projection where GGUF uses its quantized
+projections plus the FP16 a/b row GEMV and split. NVFP4 also combines shared
+expert operations and has a different expert plan/W13/W2 organization.
+Those are operator replacements, not copies removable by deleting an op.
+
+The CUDA-only GGUF API entry spread has median113.427us over12 middle rounds;
+NVFP4 has138.440us over81 rounds under profiling. These are not substituted
+for the unprofiled early-input A/B result. Each rank's attention preparation
+contains two synchronous8-byte host-to-device transfers. A benchmark-only
+one-shot dispatcher records blocking host transfers or CPU tensor indices
+with source stacks; it adds no fence and is not enabled in production.

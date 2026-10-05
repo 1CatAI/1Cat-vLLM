@@ -56,15 +56,16 @@ def analyze(sqlite_path, benchmark_path):
     with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as db:
         names = dict(db.execute("select id,value from StringIds"))
         ranges = collections.defaultdict(list)
-        for start, end, tid in db.execute(
-            "select n.start,n.end,n.globalTid from NVTX_EVENTS n "
-            "left join StringIds s on s.id=n.textId "
-            "where coalesce(n.text,s.value)='graph_parity.target.replay' "
-            "order by n.start"
-        ):
-            if tid >> 24 in ranks:
-                ranges[tid].append((start, end))
-        assert len(ranges) == 4, list(ranges)
+        tables = {r[0] for r in db.execute("select name from sqlite_master")}
+        if "NVTX_EVENTS" in tables:
+            for start, end, tid in db.execute(
+                "select n.start,n.end,n.globalTid from NVTX_EVENTS n "
+                "left join StringIds s on s.id=n.textId "
+                "where coalesce(n.text,s.value)='graph_parity.target.replay' "
+                "order by n.start"
+            ):
+                if (tid >> 24) & 0xFFFFFF in ranks:
+                    ranges[tid].append((start, end))
         selected = collections.defaultdict(list)
         for start, end, tid, correlation in db.execute(
             "select a.start,a.end,a.globalTid,a.correlationId "
@@ -73,7 +74,38 @@ def analyze(sqlite_path, benchmark_path):
             "order by a.start"
         ):
             if any(a <= start and end <= b for a, b in ranges.get(tid, ())):
-                selected[tid >> 24].append(correlation)
+                selected[(tid >> 24) & 0xFFFFFF].append(correlation)
+        selection = "actual replay NVTX ranges"
+        if not ranges:
+            # CUDA-only capture avoids old NCCL NVTX extension incompatibility.
+            # Select the repeated graph with most nodes, then verify its launch
+            # count against the independent M5 target CPU records.
+            candidates = collections.defaultdict(list)
+            for pid, cid, graph, count in db.execute(
+                "select (globalPid >> 24) & 16777215,correlationId,"
+                "graphNodeId >> 32,count(*) from CUPTI_ACTIVITY_KIND_KERNEL "
+                "where graphNodeId != 0 group by 1,2,3 order by min(start)"
+            ):
+                if pid in ranks:
+                    candidates[(pid, graph)].append((cid, count))
+            for worker in workers:
+                pid = worker["pid"]
+                replay_count = sum(
+                    e["label"] == "target.replay"
+                    and e.get("tokens") == 5
+                    and e.get("requests") == 1
+                    for e in worker["events"]
+                )
+                eligible = [
+                    rows
+                    for (p, _), rows in candidates.items()
+                    if p == pid and abs(len(rows) - replay_count) <= 2
+                ]
+                assert eligible, (pid, replay_count)
+                rows = max(eligible, key=lambda r: statistics.median(n for _, n in r))
+                assert statistics.median(n for _, n in rows) > 500
+                selected[pid] = [cid for cid, _ in rows]
+            selection = "largest repeated graph, checked against M5 CPU replay counts"
         assert set(selected) == set(ranks)
         # Trim transitions independently by rank ordinal, never by a time window.
         lengths = {len(v) for v in selected.values()}
@@ -89,10 +121,11 @@ def analyze(sqlite_path, benchmark_path):
         service = collections.defaultdict(float)
         graphs = collections.Counter()
         for pid, cid, graph, name_id, duration, count in db.execute(
-            "select k.globalPid >> 24,k.correlationId,k.graphNodeId >> 32,"
+            "select (k.globalPid >> 24) & 16777215,k.correlationId,"
+            "k.graphNodeId >> 32,"
             "k.demangledName,sum(k.end-k.start),count(*) "
             "from CUPTI_ACTIVITY_KIND_KERNEL k join launches l "
-            "on l.pid=(k.globalPid >> 24) and l.cid=k.correlationId "
+            "on l.pid=((k.globalPid >> 24) & 16777215) and l.cid=k.correlationId "
             "group by 1,2,3,4"
         ):
             assert graph, (pid, cid, graph)
@@ -123,6 +156,7 @@ def analyze(sqlite_path, benchmark_path):
             cell[1] += row["rank_mean_service_ms"]
         return dict(
             per_rank=per_rank,
+            selection=selection,
             rank_mean_kernel_count=statistics.mean(
                 r["kernels"] for r in per_rank.values()
             ),

@@ -79,6 +79,7 @@ def main():
     parser.add_argument("--trace-only", action="store_true")
     parser.add_argument("--input-phase-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
+    parser.add_argument("--diagnose-attention-transfers", action="store_true")
     args = parser.parse_args()
     if args.trace_only:
         args.probe = args.node_trace = True
@@ -220,6 +221,15 @@ def main():
                 temperature=0, top_p=1, top_k=-1, max_tokens=256, ignore_eos=True
             )
             llm.generate({"prompt_token_ids": fixed_ids}, probe_params, use_tqdm=False)
+            if args.diagnose_attention_transfers:
+                llm.collective_rpc("start_attention_transfer_diagnosis", timeout=30)
+                llm.generate(
+                    {"prompt_token_ids": fixed_ids}, probe_params, use_tqdm=False
+                )
+                report["attention_transfers"] = llm.collective_rpc(
+                    "read_attention_transfer_diagnosis", timeout=30
+                )
+                save()
             arms = (
                 ("late_observed", "early_observed", "early_off", "late_off")
                 if args.input_phase_ab
@@ -286,18 +296,24 @@ def main():
                     steps, outputs = observed_cohort(
                         llm,
                         fixed_ids,
-                        SamplingParams(temperature=0, max_tokens=128, ignore_eos=True),
+                        SamplingParams(temperature=0, max_tokens=256, ignore_eos=True),
                     )
+                    report["node_trace"] = dict(
+                        output_token_ids=[
+                            list(o.outputs[0].token_ids) for o in outputs
+                        ],
+                        generation_complete=True,
+                        workers=llm.collective_rpc(
+                            "read_graph_parity_observer", timeout=30
+                        ),
+                    )
+                    # Preserve completed generation and CPU records before
+                    # profiler shutdown or optional interval statistics.
+                    save()
+                    report["node_trace"]["summary"] = summarize(steps, 1)
+                    save()
                 finally:
                     llm.collective_rpc("stop_graph_parity_capture", timeout=30)
-                report["node_trace"] = dict(
-                    output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
-                    summary=summarize(steps, 1),
-                    workers=llm.collective_rpc(
-                        "read_graph_parity_observer", timeout=30
-                    ),
-                )
-                save()
         report["complete"] = True
         save()
     finally:
