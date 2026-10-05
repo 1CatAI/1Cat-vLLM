@@ -117,3 +117,44 @@ timing: allocated bytes were 28.84GB and reserved bytes 33.01GB, with only
 `expandable_segments:True` allocator setting on both arms, preserving model,
 batch budget and arithmetic. This failed startup is retained separately from
 performance evidence.
+
+## Whole-model comparison
+
+Both arms use the same complete `dev1000+ge1b71bb5a` wheel on four
+V100-SXM2-32GB GPUs at 1290/877MHz and 300W, Torch 2.10/CUDA 12.8,
+Flash-Next IQ3_S, TP4 and MTP4 with FP16 draft weights. Activation/KV are
+FP16; recurrent state and MMA accumulation are FP32. Target decode uses FULL
+graphs, max length 9216, batch budget 512, four sequences and greedy sampling.
+Only `small_m_hmma` and `hc_ll_shard` change. The Q8 expert intermediate path
+is enabled in both arms. Both use `expandable_segments:True`.
+
+|Unprofiled result|Control|Segments and HC LL|
+|---|---:|---:|
+|C1, 8K input / 256 output, first median round ms|23.652|22.077|
+|C1, second median round ms|22.526|22.085|
+|C1, pooled mean round ms|23.301|22.107|
+|C1, steady tokens per round|4.886|4.886|
+|C4, 128 input / 600 output each, median round ms|54.581|50.830|
+|C4, mean round ms|55.110|51.008|
+|C4, aggregate decode tokens/s|173.283|186.113|
+|C4, steady tokens per round|9.550|9.493|
+
+Eight natural prompts show mean draft acceptance 44.320% to 44.802%.
+The paired prompt-bootstrap difference is +0.482 percentage points with
+95% interval [-0.724, +1.634]. Mean acceptance length is 2.773 to 2.792,
+with difference interval [-0.029, +0.065]. Matched full-vocabulary
+teacher-forcing gives 63/64 equal top-1 choices, mean KL 0.001010 and maximum
+KL 0.009730. Both bounded short answers stop normally and match.
+
+All four loaded reports admit 257 segment projections and the TP HC LL
+transport. Model weight allocation falls from approximately 26.78 to 25.57
+GiB per rank. These results are joint changes; neither optimization receives
+the whole measured gain. Microbenchmark service savings are larger than the
+critical-path gain, and the 18.5ms round target remains open. A node trace is
+required to quantify overlap and synchronization before selecting the next
+change.
+
+The comparison precedes the inactive-row tag-reuse guard described in
+[the HC design](sm70_hc_ll_shards.md). The guard is qualified separately in a
+fresh normal extension; these round numbers are not relabeled as timings of
+that newer extension.
