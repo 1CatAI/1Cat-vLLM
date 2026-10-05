@@ -25,6 +25,7 @@ def _native_qkvz(
     weights: list[torch.Tensor],
     scales: list[torch.Tensor],
     types: list[int],
+    floating: list[torch.Tensor],
     partials: torch.Tensor,
     counters: torch.Tensor,
     codes: list[torch.Tensor],
@@ -41,9 +42,15 @@ def _native_qkvz(
             out, rows, weights, scales, types, partials, counters
         )
     else:
-        out = _prepared_gguf_mixed_projection(
+        quantized = _prepared_gguf_mixed_projection(
             rows, codes, stats, caches, descriptors, cache_bands, blas_bands
         )
+        outputs = [quantized]
+        for weight in floating:
+            outputs.append(
+                torch.ops.vllm.prepared_gguf_fp16_projection(rows, weight, 30, True)
+            )
+        out = torch.cat(outputs, dim=-1)
     return out.reshape(*x.shape[:-1], 4120)
 
 
@@ -52,6 +59,7 @@ def _native_qkvz_fake(
     weights: list[torch.Tensor],
     scales: list[torch.Tensor],
     types: list[int],
+    floating: list[torch.Tensor],
     partials: torch.Tensor,
     counters: torch.Tensor,
     codes: list[torch.Tensor],
@@ -170,6 +178,9 @@ def prepare_native_qkvz(layer, sources, projections, enabled: bool):
             Parameter(s, False) for s in scales
         )
         layer.gguf_qkvz_types = types
+        layer.gguf_qkvz_floating = torch.nn.ParameterList(
+            Parameter(p.weight, False) for p in projections if p.kernel is None
+        )
         layer.register_buffer(
             "gguf_qkvz_partials",
             torch.empty((65, 2, 512), dtype=torch.float32, device=device),
@@ -200,7 +211,10 @@ def apply_native_qkvz(layer, x):
         list(layer.gguf_qkvz_weights),
         list(layer.gguf_qkvz_scales),
         layer.gguf_qkvz_types,
+        list(layer.gguf_qkvz_floating),
         layer.gguf_qkvz_partials,
         layer.gguf_qkvz_counters,
-        *prepared_projection_arguments(layer.gguf_tm_projections),
+        *prepared_projection_arguments(
+            [p for p in layer.gguf_tm_projections if p.kernel is not None]
+        ),
     )

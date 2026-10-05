@@ -10,6 +10,7 @@ import torch
 from vllm.model_executor.kernels.gguf import native_qkvz_capabilities
 from vllm.model_executor.layers.quantization.gguf_qkvz import (
     _native_qkvz,
+    apply_native_qkvz,
     prepared_source_views,
 )
 
@@ -92,13 +93,19 @@ def test_runtime_rows_keep_fallback_and_workspace_explicit(monkeypatch):
 
     def fallback(x, codes, stats, caches, descriptors, cache_bands, blas_bands):
         calls.append(("canonical", x.shape[0]))
-        return x.new_full((*x.shape[:-1], 4120), 3)
+        return x.new_full((*x.shape[:-1], 4096), 3)
 
     monkeypatch.setattr(torch.ops._C, "gguf_qkvz_sm70_out", joint, raising=False)
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.gguf_qkvz._prepared_gguf_mixed_projection",
         fallback,
     )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "prepared_gguf_fp16_projection",
+        lambda x, w, t, enabled: x.new_full((*x.shape[:-1], 12), 3),
+    )
+    floating = [torch.empty(12, 5120), torch.empty(12, 5120)]
     partials, counters = torch.empty(65, 2, 512), torch.zeros(65, dtype=torch.int32)
     for m in (512, 8, 1, 5, 16, 20, 32, 8):
         output = _native_qkvz(
@@ -106,6 +113,7 @@ def test_runtime_rows_keep_fallback_and_workspace_explicit(monkeypatch):
             [],
             [],
             [],
+            floating,
             partials,
             counters,
             [],
@@ -134,6 +142,7 @@ def test_dynamic_export_keeps_joint_projection_opaque():
                 [],
                 [],
                 [],
+                [],
                 self.partials,
                 self.counters,
                 [],
@@ -153,3 +162,33 @@ def test_dynamic_export_keeps_joint_projection_opaque():
     nodes = [n for n in exported.graph.nodes if n.op == "call_function"]
     assert any(n.target == torch.ops.vllm.gguf_native_qkvz.default for n in nodes)
     assert not any("cat" in str(n.target) or "mm" in str(n.target) for n in nodes)
+
+
+def test_apply_serializes_quantized_and_floating_fallbacks_separately(monkeypatch):
+    quantized = SimpleNamespace(kernel=object())
+    floating_projection = SimpleNamespace(kernel=None)
+    half_weight = torch.empty(12, 5120, dtype=torch.float16)
+    layer = SimpleNamespace(
+        gguf_tm_projections=[quantized, floating_projection, floating_projection],
+        gguf_qkvz_weights=[],
+        gguf_qkvz_scales=[],
+        gguf_qkvz_types=[],
+        gguf_qkvz_floating=[half_weight, half_weight],
+        gguf_qkvz_partials=torch.empty(65, 2, 512),
+        gguf_qkvz_counters=torch.zeros(65, dtype=torch.int32),
+    )
+
+    def serialize(projections):
+        assert projections == [quantized]
+        return [], [], [], [], [], []
+
+    def call(x, weights, scales, types, floating, partials, counters, *args):
+        assert len(floating) == 2 and floating[0] is half_weight
+        return x.new_empty((*x.shape[:-1], 4120))
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.gguf_qkvz.prepared_projection_arguments",
+        serialize,
+    )
+    monkeypatch.setattr(torch.ops.vllm, "gguf_native_qkvz", call)
+    assert apply_native_qkvz(layer, torch.empty(512, 5120)).shape == (512, 4120)
