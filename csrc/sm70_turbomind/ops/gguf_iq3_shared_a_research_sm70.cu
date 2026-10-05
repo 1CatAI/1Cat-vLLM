@@ -32,22 +32,6 @@ __device__ uint2 direct_packet(const uint8_t* tile, int width, int octet,
 
 // Fixed fields in aligned uint4 records. Crossing fields use one PRMT
 // byte window, with no dynamic funnelshift or address recomputation.
-template <int Bit>
-__device__ __forceinline__ uint32_t signed_index(const uint32_t (&words)[13]) {
-  constexpr int word = Bit / 32, offset = Bit % 32;
-  if constexpr (offset + 13 <= 32)
-    return (words[word] >> offset) & 8191;
-  else {
-    constexpr int byte = offset / 8;
-    constexpr int selector =
-        (byte + 3) * 4096 + (byte + 2) * 256 + (byte + 1) * 16 + byte;
-    uint32_t window;
-    asm("prmt.b32 %0,%1,%2,%3;"
-        : "=r"(window)
-        : "r"(words[word]), "r"(words[word + 1]), "n"(selector));
-    return (window >> (offset % 8)) & 8191;
-  }
-}
 
 template <int SplitK, bool TwoChains, bool FullActivation = false,
           int CacheHint = 1, bool SharedA = false>
@@ -138,11 +122,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 0)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<0>(words), signed_index<13>(words),
-          grid);
+          parameters, nibble, D::signed_index<0>(words),
+          D::signed_index<13>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<26>(words), signed_index<39>(words),
-          grid);
+          parameters, nibble, D::signed_index<26>(words),
+          D::signed_index<39>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 0);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 8);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -155,11 +139,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 0)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<52>(words), signed_index<65>(words),
-          grid);
+          parameters, nibble, D::signed_index<52>(words),
+          D::signed_index<65>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<78>(words), signed_index<91>(words),
-          grid);
+          parameters, nibble, D::signed_index<78>(words),
+          D::signed_index<91>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 16);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 24);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -172,11 +156,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 4)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<104>(words),
-          signed_index<117>(words), grid);
+          parameters, nibble, D::signed_index<104>(words),
+          D::signed_index<117>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<130>(words),
-          signed_index<143>(words), grid);
+          parameters, nibble, D::signed_index<130>(words),
+          D::signed_index<143>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 32);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 40);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -189,11 +173,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 4)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<156>(words),
-          signed_index<169>(words), grid);
+          parameters, nibble, D::signed_index<156>(words),
+          D::signed_index<169>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<182>(words),
-          signed_index<195>(words), grid);
+          parameters, nibble, D::signed_index<182>(words),
+          D::signed_index<195>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 48);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 56);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -206,11 +190,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 8)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<208>(words),
-          signed_index<221>(words), grid);
+          parameters, nibble, D::signed_index<208>(words),
+          D::signed_index<221>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<234>(words),
-          signed_index<247>(words), grid);
+          parameters, nibble, D::signed_index<234>(words),
+          D::signed_index<247>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 64);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 72);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -223,11 +207,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 8)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<260>(words),
-          signed_index<273>(words), grid);
+          parameters, nibble, D::signed_index<260>(words),
+          D::signed_index<273>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<286>(words),
-          signed_index<299>(words), grid);
+          parameters, nibble, D::signed_index<286>(words),
+          D::signed_index<299>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 80);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 88);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -240,11 +224,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 12)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<312>(words),
-          signed_index<325>(words), grid);
+          parameters, nibble, D::signed_index<312>(words),
+          D::signed_index<325>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<338>(words),
-          signed_index<351>(words), grid);
+          parameters, nibble, D::signed_index<338>(words),
+          D::signed_index<351>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 96);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 104);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
@@ -257,11 +241,11 @@ __global__ void iq3_pair_kernel(half* __restrict__ output,
     {
       const int nibble = (parameters.scales >> (16 * half_block + 12)) & 15;
       const auto b0 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<364>(words),
-          signed_index<377>(words), grid);
+          parameters, nibble, D::signed_index<364>(words),
+          D::signed_index<377>(words), grid);
       const auto b1 = D::fragment_signed<half, true>(
-          parameters, nibble, signed_index<390>(words),
-          signed_index<403>(words), grid);
+          parameters, nibble, D::signed_index<390>(words),
+          D::signed_index<403>(words), grid);
       const uint4 a0 = *reinterpret_cast<const uint4*>(current_a + 112);
       const uint4 a1 = *reinterpret_cast<const uint4*>(current_a + 120);
       const unsigned* b = reinterpret_cast<const unsigned*>(&b0);
