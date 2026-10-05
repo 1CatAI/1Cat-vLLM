@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--wired", action="store_true")
+    parser.add_argument("--compiled", action="store_true")
     args = parser.parse_args()
     assert 0 <= args.rank < 4
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
@@ -87,6 +89,45 @@ def main():
         def canonical(x, prepared=prepared):
             return apply_prepared_gguf_projections(x, prepared)
 
+        admission = None
+        runtime_checks = []
+        if args.wired:
+            from vllm.model_executor.layers.quantization.gguf_qkv import (
+                apply_native_qkv,
+                prepare_native_qkv,
+            )
+
+            module = torch.nn.Module()
+            module.prefix = f"model.layers.{layer}.self_attn.qkv_proj"
+            module.gguf_tm_projections = torch.nn.ModuleList(prepared)
+            admission = prepare_native_qkv(module, sources, prepared, True)
+            assert admission["reason"] is None, admission
+            weights = list(module.gguf_qkv_weights)
+            scales = list(module.gguf_qkv_scales)
+            partials = module.gguf_qkv_partials
+            counters = module.gguf_qkv_counters
+
+            def wired(x, module=module):
+                return apply_native_qkv(module, x)
+
+            candidate = wired
+            if args.compiled:
+                torch._dynamo.reset()
+                candidate = torch.compile(candidate, dynamic=True, fullgraph=True)
+                candidate(torch.randn(512, 5120, dtype=torch.float16, device="cuda"))
+            for m in (512, 8, 1, 5, 16, 20, 32, 8):
+                rows = torch.randn(m, 5120, dtype=torch.float16, device="cuda")
+                actual = candidate(rows)
+                if m != 8:
+                    torch.testing.assert_close(actual, canonical(rows), rtol=0, atol=0)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    replay = candidate(rows)
+                graph.replay()
+                torch.accelerator.synchronize()
+                torch.testing.assert_close(replay, actual, rtol=0, atol=0)
+                runtime_checks.append({"m": m, "bitwise_graph": True})
+
         checks = []
         for seed in (131, 132, 133):
             torch.manual_seed(seed)
@@ -129,6 +170,9 @@ def main():
         report["cases"].append(
             {
                 "layer": layer,
+                "admission": admission,
+                "compiled": args.compiled,
+                "runtime_checks": runtime_checks,
                 "source_types": kinds,
                 "m": 8,
                 "n": 3584,
