@@ -973,3 +973,12 @@ sampling-only measurements, not complete-round improvements. Teacher forcing
 overrides the sampling method, so its distribution dumps cannot prove this
 verifier executed; natural-cohort route counts and exact operator comparisons
 are required before promotion.
+
+A canonical row-major block32 INT8 reader was screened to test whether one
+weight store could serve native draft decode and the existing W8A16 fallback,
+instead of retaining both FP16 and packed INT8 experts. The four-step chain
+matches the independent dequantization oracle, but its same-session FP16
+control/candidate times are 0.408668/0.463677 ms. Row-major lane reads destroy
+the packed reader's memory locality. Remove this uncommitted native/helper
+variant; do not enable it to solve C4 memory pressure. A single-store design
+would need to preserve the packed layout for both decode and fallback.
