@@ -131,6 +131,27 @@ def parallel_row_norm_source(original):
     )
 
 
+def eighty_block_norm_source(original):
+    """Use all 80 SMs with ten 64-thread parts, retaining payload protocol."""
+    begin = original.index("template <typename WeightT, bool Reference = false>")
+    end = original.index("\nclass CustomAllreduce", begin)
+    norm = original[begin:end]
+    return """
+struct alignas(8) Round12EightyMeta {
+  uint32_t generation[8];
+  float partial[2][8][10];
+  uint64_t inverse_packet[8];
+};
+static_assert(sizeof(Round12EightyMeta) <= 768);
+""" + norm.replace("sm70_push_allreduce_gemma_rms_norm", "round12_eighty_norm").replace(
+        "__launch_bounds__(128, 1)", "__launch_bounds__(64, 1)"
+    ).replace(
+        "Threads = 128, Parts = kSm70PushNormParts", "Threads = 64, Parts = 10"
+    ).replace("kSm70PushNormOffset", "kSm70Tp4PushAllreduceBufferBytes").replace(
+        "kSm70PushNormMetaBytes", "768"
+    ).replace("Sm70PushNormMeta>", "Round12EightyMeta>")
+
+
 def generate(root, row_norm=0):
     original = (root / "csrc/custom_all_reduce.cuh").read_text()
     begin = original.index("template <typename WeightT, bool Reference = false>")
@@ -191,7 +212,7 @@ def generate(root, row_norm=0):
 }
 """
     )
-    return (
+    result = (
         (
             '#include "custom_all_reduce.cuh"\n'
             "using vllm::kSm70PushNormOffset; using vllm::kSm70PushNormMetaBytes;\n"
@@ -203,7 +224,9 @@ def generate(root, row_norm=0):
             + producer
             + norm
             + (
-                parallel_row_norm_source(original)
+                eighty_block_norm_source(original)
+                if row_norm == 3
+                else parallel_row_norm_source(original)
                 if row_norm == 2
                 else row_norm_source(original)
                 if row_norm
@@ -263,15 +286,46 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
         )
         .replace(
             "ROUND12_NORM_VARIANT",
-            "round12_parallel_row_norm"
+            "round12_eighty_norm"
+            if row_norm == 3
+            else "round12_parallel_row_norm"
             if row_norm == 2
             else "round12_row_gemma_norm"
             if row_norm
             else "round12_consume_gemma_norm",
         )
-        .replace("ROUND12_NORM_GRID", "8" if row_norm else "40")
-        .replace("ROUND12_NORM_THREADS", "640" if row_norm == 2 else "128")
+        .replace(
+            "ROUND12_NORM_GRID", "80" if row_norm == 3 else "8" if row_norm else "40"
+        )
+        .replace(
+            "ROUND12_NORM_THREADS",
+            "64" if row_norm == 3 else "640" if row_norm == 2 else "128",
+        )
     )
+
+    if row_norm == 3:
+        result = result.replace(
+            "size_t buffer_bytes() { return kSm70Tp4PushAllreduceBufferBytes; }",
+            """
+__global__ void initialize_eighty_packets(char* buffer) {
+  auto* meta=reinterpret_cast<Round12EightyMeta*>(
+      buffer+kSm70Tp4PushAllreduceBufferBytes);
+  for(int i=threadIdx.x;i<160;i+=128)
+    reinterpret_cast<float*>(meta->partial)[i]=-1.0f;
+}
+size_t buffer_bytes() { return kSm70Tp4PushAllreduceBufferBytes+1048576; }
+""",
+        ).replace(
+            "  initialize_norm_packets<<<1,128,0,stream>>>(buffer);",
+            """
+  initialize_norm_packets<<<1,128,0,stream>>>(buffer);
+  cudaMemsetAsync(buffer+kSm70Tp4PushAllreduceBufferBytes,0,768,stream);
+  cudaMemsetAsync(buffer+kSm70Tp4PushAllreduceBufferBytes+768,0x7f,
+                 1048576-768,stream);
+  initialize_eighty_packets<<<1,128,0,stream>>>(buffer);
+""",
+        )
+    return result
 
 
 def graph_kernel_nodes(graph):
@@ -298,12 +352,22 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--row-norm-screen", action="store_true")
     parser.add_argument("--row-parallel-screen", action="store_true")
+    parser.add_argument("--eighty-block-screen", action="store_true")
     parser.add_argument("--norm-only-screen", action="store_true")
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
-    if args.row_norm_screen and args.row_parallel_screen:
+    if (
+        sum((args.row_norm_screen, args.row_parallel_screen, args.eighty_block_screen))
+        > 1
+    ):
         parser.error("Select either serial or parallel row norm")
-    row_mode = 2 if args.row_parallel_screen else int(args.row_norm_screen)
+    row_mode = (
+        3
+        if args.eighty_block_screen
+        else 2
+        if args.row_parallel_screen
+        else int(args.row_norm_screen)
+    )
     if args.norm_only_screen and not row_mode:
         parser.error("--norm-only-screen requires a row norm screen")
     args.out.mkdir(parents=True, exist_ok=True)
@@ -314,6 +378,8 @@ def main():
         name += "_row"
     if row_mode == 2:
         name += "640"
+    elif row_mode == 3:
+        name += "80"
     if args.extension:
         spec = importlib.util.spec_from_file_location(name, args.extension)
         extension = importlib.util.module_from_spec(spec)
@@ -429,7 +495,16 @@ def main():
             graph.replay()
         torch.cuda.synchronize()
         for control, candidate in zip(outputs[0], outputs[1]):
-            assert torch.equal(control.view(torch.int16), candidate.view(torch.int16))
+            if (
+                row_mode == 3
+                and control.dtype == torch.float16
+                and control is outputs[0][1]
+            ):
+                torch.testing.assert_close(control, candidate, rtol=0.002, atol=0.0005)
+            else:
+                assert torch.equal(
+                    control.view(torch.int16), candidate.view(torch.int16)
+                )
     samples = [[], []]
     for iteration in range(args.iters + 20):
         for arm in (0, 1) if iteration % 2 == 0 else (1, 0):
@@ -443,13 +518,16 @@ def main():
         rank=rank,
         control_us=statistics.median(samples[0]),
         candidate_us=statistics.median(samples[1]),
-        candidate="parallel_row_norm"
+        candidate="eighty_block_norm"
+        if row_mode == 3
+        else "parallel_row_norm"
         if row_mode == 2
         else "row_norm"
         if row_mode
         else "epilogue_publication",
         samples_us=samples,
-        bitwise_four_amplitudes=True,
+        bitwise_four_amplitudes=row_mode != 3,
+        numerical_model_gate_passed=False,
         projection_included=not args.norm_only_screen,
         compute_nodes_per_arm=1 if args.norm_only_screen else 2,
         measured_graph_kernel_nodes=[graph_kernel_nodes(g) for g, _, _ in graphs],

@@ -52,6 +52,45 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
 }
 """
         )
+    shared_decode = ""
+    if decoder == "shared":
+        helpers += """
+__device__ __forceinline__ void shared_e2m1x16(uint2 packed, half2 scale,
+                                             volatile float* lut, int lane,
+                                             half2 output[8]) {
+  // Each lane owns its eight entries. Entry-major storage selects a distinct
+  // shared-memory bank for each lane; no inter-lane synchronization is needed.
+  const unsigned codes[4] = {0x38000000u, 0x3e003c00u,
+                             0x42004000u, 0x46004400u};
+#pragma unroll
+  for(int i=0; i<4; ++i) {
+    const half2 v=__hmul2(*reinterpret_cast<const half2*>(&codes[i]), scale);
+    const unsigned b=*reinterpret_cast<const unsigned*>(&v);
+    lut[(i*2)*32+lane]=__uint_as_float(b&0xffffu);
+    lut[(i*2+1)*32+lane]=__uint_as_float(b>>16);
+  }
+  const unsigned words[2]={packed.x,packed.y};
+#pragma unroll
+  for(int w=0;w<2;++w) {
+#pragma unroll
+    for(int i=0;i<4;++i) {
+      const unsigned word=words[w];
+      const unsigned lo=__float_as_uint(lut[((word>>(4*i))&7u)*32+lane]);
+      const unsigned hi=__float_as_uint(lut[((word>>(16+4*i))&7u)*32+lane]);
+      const unsigned sign=(word<<(12-4*i))&0x80008000u;
+      const unsigned bits=(lo|(hi<<16))^sign;
+      output[w*4+i]=*reinterpret_cast<const half2*>(&bits);
+    }
+  }
+}
+"""
+        shared_decode = """
+    static_assert(RowTiles==1, "The research LUT reuses one row tile's scratch");
+    half2 weights[8];
+    volatile float* lut = reinterpret_cast<float*>(partials) +
+                           (threadIdx.x>>5)*256;
+    shared_e2m1x16(packed,scale,lut,lane,weights);
+"""
     macro = original[
         original.index("#define VLLM_SM70_QPN2_MMA") : original.index(
             "// Four row tiles reuse"
@@ -62,6 +101,15 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
     # Identify the launch template directly rather than depending on lines.
     end = original.rfind("template <", begin, original.index("\nvoid launch_qpn2"))
     complete = original[begin:end]
+    if decoder == "shared":
+        old_decode = """    half2 weights[8];
+    dequant_e2m1x8(packed.x, scale, weights);
+    dequant_e2m1x8(packed.y, scale, weights + 4);
+"""
+        assert complete.count(old_decode) == 2
+        # Every warp owns its original 256-float partial tile during the loop,
+        # then overwrites only that same tile before the unchanged CTA barrier.
+        complete = complete.replace(old_decode, shared_decode)
     gated_template = (
         "template <int SplitK, int NAcc, int RowTiles = 1, "
         "bool TurboMindLayout = false>"
@@ -96,7 +144,7 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
     checks[2] ^= raw_scale;
 """
             else:
-                variant += """
+                decode_body = """
     const half2 scale = nvfp4_effective_scale(raw_scale, global_scale);
     half2 weights[8];
     dequant_e2m1x8(packed.x, scale, weights);
@@ -105,6 +153,9 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
 #pragma unroll
     for (int j = 0; j < 4; ++j) checks[j] ^= b[j] ^ b[j + 4];
 """
+                if decoder == "shared":
+                    decode_body = decode_body.replace(old_decode, shared_decode)
+                variant += decode_body
             variants.append(
                 variant
                 + """
@@ -175,7 +226,7 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument(
-        "--decoder", choices=("production", "prmt"), default="production"
+        "--decoder", choices=("production", "prmt", "shared"), default="production"
     )
     parser.add_argument(
         "--profile-launches-only",
