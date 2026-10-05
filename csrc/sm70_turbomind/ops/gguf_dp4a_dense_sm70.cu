@@ -169,6 +169,71 @@ __global__ void dense(half* out, float* partial, const Q8_1* x,
   }
 }
 
+template <int TileM, bool Activated>
+__global__ void raw_q6_dense(half* out, float* partial, const Q8_1* x,
+                             const uint8_t* weight, int m, int n, int k,
+                             int split, int out_stride, int row_stride) {
+  extern __shared__ Q8_1 activations[];
+  const int tiles_m = (m + TileM - 1) / TileM;
+  const int begin_m = (blockIdx.x % tiles_m) * TileM;
+  const int groups = k / 32, begin = groups * blockIdx.y / split,
+            end = groups * (blockIdx.y + 1) / split, span = end - begin;
+  auto* cached = reinterpret_cast<int*>(activations);
+  const auto* source = reinterpret_cast<const int*>(x);
+  for (int i = threadIdx.x; i < TileM * span * 9; i += blockDim.x) {
+    const int token = i / (span * 9), offset = i % (span * 9);
+    cached[i] = begin_m + token < m
+                    ? source[((begin_m + token) * groups + begin) * 9 + offset]
+                    : 0;
+  }
+  __syncthreads();
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int row = blockIdx.x / tiles_m * 8 + warp * 2 + lane / 16;
+  if (row >= n) return;
+  const uint8_t* w = weight + int64_t{row} * row_stride;
+  float values[TileM] = {};
+  for (int group = begin + lane % 16; group < end; group += 16) {
+    const auto decoded = vllm::sm70_gguf::RawQ6KGroup::load(w, group);
+#pragma unroll
+    for (int t = 0; t < TileM; ++t)
+      if (begin_m + t < m)
+        values[t] += decoded.dot(activations[t * span + group - begin]);
+  }
+#pragma unroll
+  for (int t = 0; t < TileM; ++t) {
+#pragma unroll
+    for (int offset = 8; offset; offset >>= 1)
+      values[t] += __shfl_down_sync(__activemask(), values[t], offset, 16);
+    if (lane % 16 == 0 && begin_m + t < m) {
+      if (!Activated && split == 1)
+        out[int64_t{begin_m + t} * out_stride + row] =
+            __float2half_rn(values[t]);
+      else
+        partial[(int64_t{blockIdx.y} * m + begin_m + t) * n + row] = values[t];
+    }
+  }
+}
+
+template <int TileM, bool Activated>
+void launch_raw(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
+                torch::Tensor weight, int split) {
+  const int m = x.size(0), n = weight.size(0), k = x.size(1) * 32;
+  const int shared = TileM * ((k / 32 + split - 1) / split) * sizeof(Q8_1);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  raw_q6_dense<TileM, Activated>
+      <<<dim3((n + 7) / 8 * ((m + TileM - 1) / TileM), split), 128, shared,
+         stream>>>(reinterpret_cast<half*>(out.data_ptr()),
+                   partial.data_ptr<float>(),
+                   reinterpret_cast<const Q8_1*>(x.data_ptr()),
+                   weight.data_ptr<uint8_t>(), m, n, k, split, out.stride(0),
+                   weight.stride(0));
+  if (Activated || split > 1)
+    reduce_dense<Activated>
+        <<<dim3(((Activated ? n / 2 : n) + 127) / 128, m), 128, 0, stream>>>(
+            reinterpret_cast<half*>(out.data_ptr()), partial.data_ptr<float>(),
+            m, n, split, out.stride(0));
+}
+
 template <int Kind, int TileM, bool Activated>
 void launch(torch::Tensor out, torch::Tensor partial, torch::Tensor x,
             torch::Tensor codes, torch::Tensor d, torch::Tensor scales,
@@ -255,6 +320,40 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
   for (const auto& t : {out, partial, codes, d, scales, dmin, mins})
     TORCH_CHECK(t.device() == x.device(),
                 "Integer GEMM tensors must share a CUDA device");
+  if (codes.scalar_type() == torch::kUInt8) {
+    TORCH_CHECK(source_type == 14 && codes.dim() == 2 &&
+                    codes.is_contiguous() && codes.size(0) > 0 &&
+                    codes.size(1) == k / 256 * 210,
+                "Raw integer dense currently requires complete Q6_K rows");
+    const int n = codes.size(0);
+    TORCH_CHECK(!cooperative,
+                "Raw integer dense cooperative reduction unavailable");
+    TORCH_CHECK(
+        out.scalar_type() == torch::kFloat16 && out.dim() == 2 &&
+            out.size(0) == m && out.size(1) == (activated ? n / 2 : n) &&
+            out.stride(1) == 1 && out.stride(0) >= out.size(1) &&
+            (!activated || n % 2 == 0) && split >= 1 && split <= 16 &&
+            split <= x.size(1) && partial.scalar_type() == torch::kFloat32 &&
+            partial.is_contiguous() && partial.numel() == split * m * n,
+        "Invalid raw integer output or FP32 split scratch");
+    const c10::cuda::CUDAGuard guard(x.device());
+    const auto* props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props->major == 7 && props->minor == 0,
+                "Integer GEMM requires SM70");
+    if (m == 1) {
+      if (activated)
+        launch_raw<1, true>(out, partial, x, codes, split);
+      else
+        launch_raw<1, false>(out, partial, x, codes, split);
+    } else {
+      if (activated)
+        launch_raw<5, true>(out, partial, x, codes, split);
+      else
+        launch_raw<5, false>(out, partial, x, codes, split);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
   const int group = source_type == 14 ? 16 : 32;
   TORCH_CHECK(codes.scalar_type() == torch::kInt32 && codes.dim() == 3 &&
                   codes.is_contiguous() && codes.size(0) > 0 &&

@@ -23,14 +23,23 @@ def oracle(x):
 
 
 @pytest.mark.parametrize(
-    "kind,activated",
-    [(12, False), (14, False), (23, False), (12, True), (14, True), (23, True)],
+    "kind,activated,raw_source",
+    [
+        (12, False, False),
+        (14, False, False),
+        (23, False, False),
+        (12, True, False),
+        (14, True, False),
+        (23, True, False),
+        (14, False, True),
+        (14, True, True),
+    ],
 )
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("split", [1, 4])
 @pytest.mark.parametrize("cooperative", [False, True])
 def test_dense_matches_official_q8_formula_and_output_views(
-    kind, activated, m, split, cooperative
+    kind, activated, raw_source, m, split, cooperative
 ):
     n, k = 64, 768
     _, size = quant_size(kind)
@@ -47,6 +56,14 @@ def test_dense_matches_official_q8_formula_and_output_views(
     raw = blocks.reshape(n, -1)
     codec = transcode_integer_dot(raw, kind)
     packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+    if raw_source:
+        packed = [
+            torch.from_numpy(raw).cuda(),
+            torch.empty(0, device="cuda", dtype=torch.float16),
+            torch.empty(0, device="cuda", dtype=torch.int8),
+            torch.empty(0, device="cuda", dtype=torch.float16),
+            torch.empty(0, device="cuda", dtype=torch.int8),
+        ]
     reference = torch.from_numpy(dequantize(raw, kind)).cuda()
     torch.manual_seed(970 + m)
     x = torch.randn((m, k), device="cuda", dtype=torch.float16)
@@ -80,6 +97,12 @@ def test_dense_matches_official_q8_formula_and_output_views(
         assert torch.isfinite(out).all()
         assert torch.all(parent[:, :8] == -3) and torch.all(parent[:, -8:] == -3)
 
+    if raw_source and cooperative:
+        with pytest.raises(
+            RuntimeError, match="Raw integer dense cooperative reduction unavailable"
+        ):
+            run()
+        return
     run()
     check()
     graph = torch.cuda.CUDAGraph()

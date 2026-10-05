@@ -125,6 +125,43 @@ struct LatticeDot {
 };
 using IQ3SDot = LatticeDot<21>;
 
+// Raw Q6_K integer groups share Q8_1 and dp4a arithmetic with lattice
+// projections. Signed subgroup scales stay in the integer dot domain.
+struct RawQ6KGroup {
+  int words[8];
+  int scale0, scale1;
+  float d;
+  __device__ static RawQ6KGroup load(const uint8_t* row, int group) {
+    RawQ6KGroup result;
+    const uint8_t* block = row + (group / 8) * 210;
+    const int sub = group % 8, half_block = sub / 4;
+    const uint8_t* low = block + half_block * 64 + (sub % 2) * 32;
+    const uint8_t* high = block + 128 + half_block * 32;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t ql =
+          (load_u32_2(low + i * 4) >> ((sub % 4 >= 2) * 4)) & 0x0f0f0f0fU;
+      const uint32_t qh =
+          (load_u32_2(high + i * 4) >> ((sub % 4) * 2)) & 0x03030303U;
+      result.words[i] = __vsub4(ql | (qh << 4), 0x20202020U);
+    }
+    const auto* scales = reinterpret_cast<const int8_t*>(block + 192);
+    result.scale0 = scales[2 * sub];
+    result.scale1 = scales[2 * sub + 1];
+    result.d = __half2float(*reinterpret_cast<const half*>(block + 208));
+    return result;
+  }
+  __device__ float dot(const Q8_1& x) const {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int a = 0, b = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) a = __dp4a(words[i], activation[i], a);
+#pragma unroll
+    for (int i = 4; i < 8; ++i) b = __dp4a(words[i], activation[i], b);
+    return float(a * scale0 + b * scale1) * d * __low2float(x.ds);
+  }
+};
+
 // Existing N32/K8 storage handles TP boundaries inside Q2_0's source K64
 // blocks without expanded FP16 weights or a second layout. Its scale and
 // centered integer values are exact; IQ4_NL uses the shared TurboMind LUT.

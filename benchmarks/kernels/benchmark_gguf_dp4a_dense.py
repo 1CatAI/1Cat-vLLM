@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--join", nargs="+", default=[])
     parser.add_argument("--activated", action="store_true")
+    parser.add_argument("--raw-source", action="store_true")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 20])
     parser.add_argument("--split", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--iterations", type=int, default=20)
@@ -97,6 +98,15 @@ def main():
     codec = transcode_integer_dot(raw, kind)
     n, k = codec.shape
     packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+    if args.raw_source:
+        assert kind == 14
+        packed = [
+            torch.from_numpy(raw).cuda(),
+            torch.empty(0, device="cuda", dtype=torch.float16),
+            torch.empty(0, device="cuda", dtype=torch.int8),
+            torch.empty(0, device="cuda", dtype=torch.float16),
+            torch.empty(0, device="cuda", dtype=torch.int8),
+        ]
     control = GGUFPreparedProjection(
         torch.from_numpy(raw).cuda(), kind, torch.float16, True, 8
     )
@@ -115,6 +125,7 @@ def main():
         cache_policy="cold_L2_32MiB_read_write_eviction_before_each_projection",
         tensor=[args.tensor, *args.join],
         activated=args.activated,
+        storage="raw_Q6_K" if args.raw_source else "N32_integer_packets",
         shape=[n, k],
         source_type=kind,
         tp_rank=args.rank,
@@ -188,7 +199,13 @@ def main():
                     operation()
                     torch.accelerator.synchronize()
                 except RuntimeError as error:
-                    if "resident block capacity" not in str(error):
+                    if not any(
+                        reason in str(error)
+                        for reason in (
+                            "resident block capacity",
+                            "Raw integer dense cooperative reduction unavailable",
+                        )
+                    ):
                         raise
                     cases.append(
                         dict(split=split, cooperative=cooperative, rejected=str(error))
