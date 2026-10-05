@@ -3,8 +3,10 @@
 """Measure pure MTP PLE metadata host work with an installed runtime."""
 
 import argparse
+import importlib.util
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,10 +19,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 
 
-def fixture(n):
-    builder = PleShortConvAttentionMetadataBuilder.__new__(
-        PleShortConvAttentionMetadataBuilder
-    )
+def fixture(n, builder_class=PleShortConvAttentionMetadataBuilder):
+    builder = builder_class.__new__(builder_class)
     builder.use_spec_decode = True
     builder.use_full_cuda_graph = True
     builder.num_spec = 4
@@ -66,10 +66,57 @@ def main():
     p.add_argument("output", type=Path)
     p.add_argument("--profile", action="store_true")
     p.add_argument("--requests", type=int, choices=(1, 4))
+    p.add_argument("--reference-module", type=Path)
     args = p.parse_args()
     torch.set_num_threads(1)
     if "site-packages" not in vllm.__file__:
         raise RuntimeError("Use an ordinary installed runtime")
+    if args.reference_module:
+        spec = importlib.util.spec_from_file_location(
+            "_ple_metadata_reference", args.reference_module
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        rows = []
+        for n in (1, 4):
+            builds = [
+                fixture(n, module.PleShortConvAttentionMetadataBuilder),
+                fixture(n),
+            ]
+            for build in builds:
+                for _ in range(20):
+                    build()
+            samples = [[], []]
+            for epoch in range(8):
+                for arm in (0, 1) if epoch % 2 == 0 else (1, 0):
+                    torch.accelerator.synchronize()
+                    values = []
+                    for _ in range(100):
+                        start = time.perf_counter_ns()
+                        builds[arm]()
+                        values.append((time.perf_counter_ns() - start) / 1000)
+                    samples[arm].append(statistics.median(values))
+            rows.append(
+                {
+                    "requests": n,
+                    "baseline_host_us": statistics.median(samples[0]),
+                    "candidate_host_us": statistics.median(samples[1]),
+                    "epoch_medians": samples,
+                }
+            )
+        report = {
+            "version": vllm.__version__,
+            "rows": rows,
+            "qualification": (
+                "Same-runtime alternating metadata host wall; reference Python "
+                "implementation only, no native library overlays."
+            ),
+        }
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+        return
     rows = []
     for n in (args.requests,) if args.requests else (1, 4):
         build = fixture(n)
