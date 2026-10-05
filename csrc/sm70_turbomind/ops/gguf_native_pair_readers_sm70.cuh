@@ -11,6 +11,98 @@ namespace vllm::sm70_gguf {
 template <int Type>
 struct NativePairReader;
 
+// Original Q4_K field layout follows llama.cpp's get_scale_min_k4;
+// its MIT license is retained in
+// csrc/quantization/gguf_upstream/llama.cpp/LICENSE.
+template <>
+struct NativePairReader<12> {
+  static constexpr int kBlockBytes = 144;
+  static constexpr int kBookId = -1;
+  static constexpr int kBookBytes = 0;
+  struct Parameters {
+    float d, dmin;
+    uint32_t scales[3];
+  };
+  struct Record {
+    uint4 packets[4];
+    Parameters params;
+    int half_block;
+  };
+  const uint8_t* payload;
+  const uint4* metadata;
+  Parameters cache;
+  int half_block;
+  bool first;
+
+  __device__ NativePairReader(const uint8_t* source, int tile, int blocks_k,
+                              int first_part, int col) {
+    const uint8_t* macro = source + int64_t{tile} * blocks_k * 32 * kBlockBytes;
+    payload = macro + first_part * 2048 + col * 16;
+    metadata = reinterpret_cast<const uint4*>(
+        macro + blocks_k * 4096 + (first_part / 2) * 512 + col * 16);
+    cache = {};
+    half_block = first_part & 1;
+    first = true;
+  }
+
+  __device__ static void initialize(uint8_t*) {}
+
+  __device__ Record load() {
+    if (first || half_block == 0) {
+      const uint4 original = *metadata;
+      cache.d = __half2float(__ushort_as_half(original.x & 65535));
+      cache.dmin = __half2float(__ushort_as_half(original.x >> 16));
+      cache.scales[0] = original.y;
+      cache.scales[1] = original.z;
+      cache.scales[2] = original.w;
+    }
+    Record record{{*reinterpret_cast<const uint4*>(payload),
+                   *reinterpret_cast<const uint4*>(payload + 512),
+                   *reinterpret_cast<const uint4*>(payload + 1024),
+                   *reinterpret_cast<const uint4*>(payload + 1536)},
+                  cache,
+                  half_block};
+    payload += 2048;
+    metadata += half_block * 32;
+    half_block ^= 1;
+    first = false;
+    return record;
+  }
+
+  template <int Segment, int Fragment>
+  __device__ static turbomind::Array<half, 8> fragment(const Record& record,
+                                                       const uint8_t*) {
+    static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
+    constexpr int local_group = Segment / 2;
+    constexpr int shift = local_group * 8;
+    const uint32_t lo_scale = record.params.scales[0] >> shift;
+    const uint32_t lo_min = record.params.scales[1] >> shift;
+    const uint32_t high = record.params.scales[2] >> shift;
+    const int scale = record.half_block
+                          ? (high & 15) | ((lo_scale >> 6) & 3) << 4
+                          : lo_scale & 63;
+    const int minimum = record.half_block
+                            ? ((high >> 4) & 15) | ((lo_min >> 6) & 3) << 4
+                            : lo_min & 63;
+    const float d = __fmul_rn(record.params.d, static_cast<float>(scale));
+    const float m = __fmul_rn(record.params.dmin, static_cast<float>(minimum));
+    const uint4 data = record.packets[(Segment / 4) * 2 + (Segment & 1)];
+    const uint32_t a = Fragment == 0 ? data.x : data.z;
+    const uint32_t b = Fragment == 0 ? data.y : data.w;
+    turbomind::Array<half, 8> result;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t bytes = i < 4 ? a : b;
+      const int q = (bytes >> ((i & 3) * 8 + (local_group & 1) * 4)) & 15;
+      // For finite FP16 metadata, d*scale*q has at most 21 significant
+      // bits and is exact in FP32. FMA thus preserves the official separate
+      // multiply/subtract rounding before the final FP16 operand conversion.
+      result[i] = __float2half_rn(__fmaf_rn(d, static_cast<float>(q), -m));
+    }
+    return result;
+  }
+};
+
 template <>
 struct NativePairReader<18> {
   using Decoder = LatticeRawDecoder<18>;
@@ -157,8 +249,8 @@ template <>
 struct NativePairReader<23> {
   using Decoder = Iq4XsNativeDecoder;
   static constexpr int kBlockBytes = 136;
-  static constexpr int kBookId = -1;
-  static constexpr int kBookBytes = 0;
+  static constexpr int kBookId = 23;
+  static constexpr int kBookBytes = 16 * sizeof(float);
   struct Record {
     uint4 packets[4];
     Decoder::Parameters params;
@@ -188,7 +280,9 @@ struct NativePairReader<23> {
     first = true;
   }
 
-  __device__ static void initialize(uint8_t*) {}
+  __device__ static void initialize(uint8_t* book) {
+    Decoder::initialize_float_book(book);
+  }
 
   __device__ Record load() {
     if (first || half_block == 0) {
@@ -213,7 +307,7 @@ struct NativePairReader<23> {
 
   template <int Segment, int Fragment>
   __device__ static turbomind::Array<half, 8> fragment(const Record& record,
-                                                       const uint8_t*) {
+                                                       const uint8_t* book) {
     static_assert(Segment >= 0 && Segment < 8 && Fragment >= 0 && Fragment < 2);
     const uint4 data = record.packets[Segment / 2];
     uint32_t packet;
@@ -221,8 +315,8 @@ struct NativePairReader<23> {
       packet = Fragment == 0 ? data.x : data.y;
     else
       packet = Fragment == 0 ? data.z : data.w;
-    return Decoder::fragment<half>(record.params,
-                                   record.half_block * 4 + Segment / 2, packet);
+    return Decoder::fragment_from_float_book<half>(
+        record.params, record.half_block * 4 + Segment / 2, packet, book);
   }
 };
 }  // namespace vllm::sm70_gguf

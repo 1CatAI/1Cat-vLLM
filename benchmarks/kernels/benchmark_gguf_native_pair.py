@@ -31,7 +31,9 @@ def main():
         action="store_true",
         help="Test the unadmitted IQ3_XXS reader through the raw operator",
     )
+    parser.add_argument("--prototype-q4-k", action="store_true")
     args = parser.parse_args()
+    assert not (args.prototype_iq3_xxs and args.prototype_q4_k)
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     assert torch.cuda.get_device_capability() == (7, 0)
@@ -42,7 +44,9 @@ def main():
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
         allowed = (
-            ((18, 21), (21, 18))
+            ((12, 23), (23, 12))
+            if args.prototype_q4_k
+            else ((18, 21), (21, 18))
             if args.prototype_iq3_xxs
             else ((21, 23), (23, 21), (18, 21), (21, 18))
         )
@@ -55,7 +59,7 @@ def main():
         layer_module = torch.nn.Module()
         layer_module.prefix = f"model.layers.{layer}.mlp.gate_up_proj"
         layer_module.gguf_tm_projections = torch.nn.ModuleList(projections)
-        if args.prototype_iq3_xxs:
+        if args.prototype_iq3_xxs or args.prototype_q4_k:
             from vllm.model_executor.layers.quantization.gguf_iq3_records import (
                 signed_index_records,
             )
@@ -63,13 +67,20 @@ def main():
                 pack_iq3_xxs_records,
             )
 
+            packers = {18: pack_iq3_xxs_records, 21: signed_index_records}
+            if args.prototype_q4_k:
+                from vllm.model_executor.layers.quantization.gguf_iq4_native import (
+                    pack_iq4_xs_records,
+                )
+                from vllm.model_executor.layers.quantization.gguf_q4_k_records import (
+                    pack_q4_k_records,
+                )
+
+                packers.update({12: pack_q4_k_records, 23: pack_iq4_xs_records})
+
             layer_module.gguf_native_gated_records = torch.nn.ParameterList(
                 torch.nn.Parameter(
-                    torch.from_numpy(
-                        (pack_iq3_xxs_records if kind == 18 else signed_index_records)(
-                            data
-                        )
-                    ).cuda(),
+                    torch.from_numpy(packers[kind](data)).cuda(),
                     False,
                 )
                 for data, kind in zip(raw, types)
