@@ -1177,6 +1177,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm", torch::kCUDA,
                  &sm70_tp4_all_reduce_gemma_rms_norm);
   custom_ar.def(
+      "sm70_tp4_all_reduce_gemma_rms_norm_reference(int fa, Tensor inp, Tensor "
+      "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
+      "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm_reference", torch::kCUDA,
+                 &sm70_tp4_all_reduce_gemma_rms_norm_reference);
+  custom_ar.def(
       "sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(int fa, Tensor inp, "
       "Tensor residual, Tensor weight, Tensor! normalized_out, Tensor! "
       "residual_out, int reg_input_buffer, int reg_output_buffer, int "
