@@ -783,9 +783,16 @@ class LogitsProcessor(PluggableLayer):
         self,
         local_pair: torch.Tensor,
     ) -> torch.Tensor | None:
-        if not envs.VLLM_SM70_TOP1_CUSTOM_AR:
+        if (
+            not envs.VLLM_SM70_TOP1_CUSTOM_AR
+            or not current_platform.is_device_capability(70)
+        ):
             return None
-        if local_pair.numel() != 2 or local_pair.dtype != torch.float32:
+        if (
+            local_pair.dtype != torch.float32
+            or not 2 <= local_pair.numel() <= 256
+            or local_pair.numel() % 2 != 0
+        ):
             return None
         try:
             communicator = get_tp_group().device_communicator

@@ -409,7 +409,7 @@ the existing padding mask/global-ID/compact top1 transport. Wide batches use
 the original head. Channel preparation shares the existing implementation and
 bounds FP32 scratch by 4,096 weight rows. Raw full-vocabulary teacher-forcing
 logits use the same candidate view as greedy proposals. No user environment
-variable is added. The default candidate remains unmerged pending target and
+variable is added. The benchmark candidate remains unmerged pending target and
 draft distribution, task quality/acceptance, C4 and complete-round validation.
 
 A diagnostic reference worker restores main's vendor shared-up policy and
@@ -438,10 +438,24 @@ A full HC graph over 96 real checkpoint pairs includes combine/norm, down
 projection/SiLU/gather and up/mix/gather. Unprofiled critical-rank medians:
 production 2.713 ms, 8-warp CTA split 2.378 ms, 16-warp 2.450 ms. These are
 operator-chain measurements, not endpoint speed. The 8-warp saving is only
-0.335 ms and does not satisfy the HC-chain goal of 1 ms. Next use complete
-column-pair ownership to absorb down reduction/SiLU/TP packets in one finish
-kernel, avoiding an inter-CTA barrier and removing the separate down gather.
-The norm finish remains a separate required integration stage.
+0.335 ms and does not satisfy the HC-chain goal of 1 ms. Complete column-pair
+ownership removes the separate down gather, but seven alternating full-chain
+trials regress: control 2.709 ms, 8-warp finish 3.374 ms, 16-warp finish
+2.977 ms. This implementation is rejected; do not integrate or tune it.
+
+Output-projection QPN8 independently fails the same 16-prompt gate. Target:
+mean KL 0.006661, p99 0.089210, max 0.552678, top1 98.117%, raw maximum
+logit error 9.433594. Draft: mean KL 0.018349, p99 0.268329, max 6.915023,
+top1 98.851%, maximum error 25.859375. No runtime default is enabled.
+
+Compact top1 transport was default-off and accepted only one value/ID pair.
+The structural candidate enables the existing IPC reducer automatically on
+SM70 and extends its one-block protocol to 128 independent row pairs. C4
+uses the same compact payload instead of reverting to NCCL. Topology and
+graph-warmup guards retain the exact NCCL fallback. Ordinary hidden-state
+all-reduce selection is unaffected. The four-decision TP4 graph benchmark
+compares changed inputs, shard ties, width changes and repeated epochs against
+NCCL. This is communication-only evidence; full-model gates remain required.
 
 Source controls for rebase bisection must retain complete-round timing and
 normal sampling, identical 8K prompt/256K capacity/power/precision/cache policy.

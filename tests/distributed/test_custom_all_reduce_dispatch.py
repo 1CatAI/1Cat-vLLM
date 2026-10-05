@@ -22,6 +22,26 @@ def _mock_communicator() -> CustomAllreduce:
     return communicator
 
 
+@pytest.mark.parametrize("rows", [1, 4, 5, 16, 128])
+def test_compact_top1_admits_batch_and_preserves_topology_fallback(rows):
+    comm = _mock_communicator()
+    comm._IS_CAPTURING = False
+    comm.top1_argmax = Mock(return_value=torch.empty(rows, dtype=torch.int64))
+    pairs = torch.empty(rows, 2, dtype=torch.float32)
+    assert comm.custom_top1_argmax(pairs) is not None
+    comm.top1_argmax.assert_called_once_with(pairs, registered=False)
+    comm.fully_connected = False
+    assert comm.custom_top1_argmax(pairs) is None
+
+
+@pytest.mark.parametrize("size", [0, 1, 3, 258])
+def test_compact_top1_rejects_unsupported_packet_size(size):
+    comm = _mock_communicator()
+    comm.top1_argmax = Mock()
+    assert comm.custom_top1_argmax(torch.empty(size)) is None
+    comm.top1_argmax.assert_not_called()
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_should_custom_ar_accepts_supported_dtype(dtype: torch.dtype) -> None:
     communicator = _mock_communicator()

@@ -744,7 +744,9 @@ class CustomAllreduce:
         registered: bool = False,
     ) -> torch.Tensor:
         if out is None:
-            out = torch.empty((1,), dtype=torch.int64, device=input_pair.device)
+            out = torch.empty(
+                (input_pair.numel() // 2,), dtype=torch.int64, device=input_pair.device
+            )
         if registered:
             ops.top1_argmax(self._ptr, input_pair, out, 0, 0)
         else:
@@ -943,7 +945,11 @@ class CustomAllreduce:
     def custom_top1_argmax(self, input_pair: torch.Tensor) -> torch.Tensor | None:
         if self.disabled:
             return None
-        if input_pair.dtype != torch.float32 or input_pair.numel() != 2:
+        if (
+            input_pair.dtype != torch.float32
+            or not 2 <= input_pair.numel() <= 256
+            or input_pair.numel() % 2 != 0
+        ):
             return None
         if not is_weak_contiguous(input_pair):
             return None

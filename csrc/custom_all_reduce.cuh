@@ -1675,24 +1675,25 @@ __global__ void __launch_bounds__(512, 1)
 template <int ngpus>
 __global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
                                          Signal* self_sg, int64_t* output,
-                                         int rank) {
+                                         int rank, int rows) {
   barrier_at_start<ngpus>(sg, self_sg, rank);
 
-  if (threadIdx.x == 0) {
+  const int row = threadIdx.x;
+  if (row < rows) {
     float best_value = -std::numeric_limits<float>::infinity();
     int64_t best_index = std::numeric_limits<int64_t>::max();
 
 #pragma unroll
     for (int i = 0; i < ngpus; ++i) {
       const float* pair = reinterpret_cast<const float*>(_dp->ptrs[i]);
-      const float value = pair[0];
-      const int64_t index = static_cast<int64_t>(llrintf(pair[1]));
+      const float value = pair[2 * row];
+      const int64_t index = static_cast<int64_t>(llrintf(pair[2 * row + 1]));
       if (value > best_value || (value == best_value && index < best_index)) {
         best_value = value;
         best_index = index;
       }
     }
-    output[0] = best_index;
+    output[row] = best_index;
   }
 
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
@@ -2742,7 +2743,8 @@ class CustomAllreduce {
 #undef TILE_RUNTIME_WAIT_REDUCE_CASE
   }
 
-  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output) {
+  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output,
+                   int rows) {
     RankData* ptrs;
     cudaStreamCaptureStatus status;
     CUDACHECK(cudaStreamIsCapturing(stream, &status));
@@ -2759,11 +2761,11 @@ class CustomAllreduce {
       ptrs = it->second;
     }
 
-#define TOP1_CASE(ngpus)                                            \
-  case ngpus: {                                                     \
-    cross_device_top1_argmax<ngpus>                                 \
-        <<<1, 32, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_); \
-    break;                                                          \
+#define TOP1_CASE(ngpus)                                                   \
+  case ngpus: {                                                            \
+    cross_device_top1_argmax<ngpus>                                        \
+        <<<1, 128, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, rows); \
+    break;                                                                 \
   }
 
     switch (world_size_) {
