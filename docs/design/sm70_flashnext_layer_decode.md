@@ -362,3 +362,19 @@ no longer prepares or enables this chain. The ordinary native operator and
 explicit benchmark preparation remain available solely for reproducing the
 rejected experiment. QSA package layer and distribution tests now retain the
 original shared-expert route in both arms and qualify QSA independently.
+
+The corrected convolution/recurrence/sigmoid GDN prototype passes both complete
+layer screens. M1 critical-rank medians are 0.148716/0.144978 ms with 21/18
+kernels. Actual MTP4 M5 measures 0.275958/0.271739 ms with 28/25 kernels.
+Convolution state matches; recurrent-state maximum differences are 1.49e-8
+and 5.96e-8, respectively. Maximum hidden-output difference is 1.53e-5;
+maximum MLP difference is 1.22e-4. These paired research graphs retain the
+now-rejected shared chain in both arms. The M5 control profiler reports one
+extra event and is marked incomplete; counts come from CUDA driver graph
+nodes. Neither measurement qualifies an endpoint.
+
+The GDN kernel is being moved into the ordinary native extension with explicit
+device, dtype, layout and cooperative-residency checks. Normal preparation is
+restricted to the validated sigmoid/FP16-convolution/FP32-state geometry.
+Unsupported metadata retains the original complete forward method. Ordinary
+M1/M5 layer checks and combined GDN/QSA distribution qualification are pending.

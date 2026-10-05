@@ -3929,6 +3929,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
     ):
+        from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+
+        if (
+            getattr(self, "_sm70_gdn_conv_norm", False)
+            and use_sm70_decode_graph_semantics()
+            and hidden_states.shape[0] in (1, 5)
+        ):
+            from vllm.models.qwen4_exp.nvidia.sm70_gdn_conv_norm import (
+                conv_norm_forward,
+            )
+
+            return conv_norm_forward(self, hidden_states, output)
         if self.maybe_sm70_qwen_gdn_full_forward:
             layer_name = _encode_layer_name(self.prefix)
             if _sm70_qwen_gdn_full_forward_enabled(

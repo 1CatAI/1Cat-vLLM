@@ -39,6 +39,7 @@ class SharedLayerWorkerExtension:
     def reset_layer_research_routes(self):
         self._qsa_jointprep = self._gdn_conv_chain = self._hc_sharded = False
         self._qsa_package = False
+        self._gdn_package = False
         for layer, *_ in self._shared_layer_records.values():
             gdn = getattr(layer, "linear_attn", None)
             qsa = getattr(layer, "self_attn", None)
@@ -84,6 +85,7 @@ class SharedLayerWorkerExtension:
         gdn_conv_chain=False,
         hc_sharded=False,
         qsa_package=False,
+        gdn_package=False,
     ):
         from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
         from vllm.config import CUDAGraphMode
@@ -95,6 +97,7 @@ class SharedLayerWorkerExtension:
         self._gdn_conv_chain = gdn_conv_chain
         self._hc_sharded = hc_sharded
         self._qsa_package = qsa_package
+        self._gdn_package = gdn_package
         self._shared_layer_records = {}
         self._shared_layer_hooks = []
         model = self.model_runner.get_model()
@@ -104,13 +107,13 @@ class SharedLayerWorkerExtension:
 
         # The model distribution gate rejected the shared chain. Prepare its
         # buffers only for explicit research comparisons, outside normal init.
-        if not qsa_package:
+        if not (qsa_package or gdn_package):
             prepare_shared_expert_chains(model, self.vllm_config)
         prepared = sum(
             bool(getattr(m, "_sm70_qwen38_shared_chain", False))
             for m in model.modules()
         )
-        expected_shared = 0 if qsa_package else 48
+        expected_shared = 0 if (qsa_package or gdn_package) else 48
         if prepared != expected_shared:
             raise RuntimeError(
                 f"Expected {expected_shared} prepared shared experts, got {prepared}"
@@ -284,8 +287,14 @@ class SharedLayerWorkerExtension:
                             or self._hc_sharded
                             else arm == "candidate"
                         )
-                        if self._qsa_package:
+                        if self._qsa_package or self._gdn_package:
                             shared._sm70_qwen38_shared_chain = False
+                        if self._gdn_package and gdn is not None:
+                            if not hasattr(gdn, "_sm70_gdn_conv_norm"):
+                                raise RuntimeError(
+                                    "Ordinary GDN preparation not selected"
+                                )
+                            gdn._sm70_gdn_conv_norm = arm == "candidate"
                         if self._qsa_package and layer.layer_type == "full_attention":
                             if not hasattr(
                                 layer.self_attn, "_sm70_qwen38_qsa_jointprep"
@@ -439,6 +448,7 @@ def main():
     parser.add_argument("--eager-layer", action="store_true")
     parser.add_argument("--qsa-jointprep", action="store_true")
     parser.add_argument("--qsa-package", action="store_true")
+    parser.add_argument("--gdn-package", action="store_true")
     parser.add_argument("--also-qsa-jointprep", action="store_true")
     parser.add_argument("--gdn-conv-chain", action="store_true")
     parser.add_argument("--hc-sharded-chain", action="store_true")
@@ -477,6 +487,7 @@ def main():
                 args.gdn_conv_chain,
                 args.hc_sharded_chain,
                 args.qsa_package,
+                args.gdn_package,
             ),
         )
         tokenizer = llm.get_tokenizer()
@@ -504,7 +515,9 @@ def main():
             "scope": "complete non-PLE decoder layers; standalone layer CUDA graphs",
             "compiler": "eager" if args.eager_layer else "standalone_inductor",
             "candidate": (
-                "qsa_package"
+                "gdn_package"
+                if args.gdn_package
+                else "qsa_package"
                 if args.qsa_package
                 else "hc_sharded_chain"
                 if args.hc_sharded_chain

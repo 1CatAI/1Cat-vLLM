@@ -1163,6 +1163,9 @@ class Qwen4ExpForCausalLM(
         from .sm70_qsa_jointprep import prepare_qsa_joint_decode
 
         prepare_qsa_joint_decode(self, self.vllm_config)
+        from .sm70_gdn_conv_norm import prepare_gdn_conv_norm
+
+        prepare_gdn_conv_norm(self, self.vllm_config)
         return loaded
 
 
@@ -1383,6 +1386,9 @@ class Qwen4ExpForConditionalGeneration(
         from .sm70_qsa_jointprep import prepare_qsa_joint_decode
 
         prepare_qsa_joint_decode(self, self.language_model.vllm_config)
+        from .sm70_gdn_conv_norm import prepare_gdn_conv_norm
+
+        prepare_gdn_conv_norm(self, self.language_model.vllm_config)
         return loaded
 
     @classmethod
