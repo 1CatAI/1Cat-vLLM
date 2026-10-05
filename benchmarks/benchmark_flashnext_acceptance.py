@@ -154,6 +154,14 @@ def main():
         completions=[],
         trace_only=args.trace_only,
     )
+    if args.require_installed:
+        report["flash_v100_artifact"] = {
+            "package": flash_attn_v100.__file__,
+            "extension": flash_attn_v100_cuda.__file__,
+            "sha256": hashlib.sha256(
+                Path(flash_attn_v100_cuda.__file__).read_bytes()
+            ).hexdigest(),
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
