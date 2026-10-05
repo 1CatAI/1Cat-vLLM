@@ -50,11 +50,6 @@ class SharedLayerWorkerExtension:
                 if hasattr(hc, "_hc_sharded_enabled"):
                     hc._hc_sharded_enabled = False
 
-    def enable_retained_shared_chain(self, layers):
-        self.reset_layer_research_routes()
-        # Leave the admitted QSA route fixed in both shared-expert arms.
-        return {"rank": self.rank, "shared_layers": layers}
-
     def enable_retained_qsa_jointprep(self, layers):
         from benchmarks.kernels.sm70_qsa_jointprep_research import attach
 
@@ -103,12 +98,23 @@ class SharedLayerWorkerExtension:
         self._shared_layer_records = {}
         self._shared_layer_hooks = []
         model = self.model_runner.get_model()
+        from vllm.models.qwen4_exp.nvidia.sm70_shared_expert_chain import (
+            prepare_shared_expert_chains,
+        )
+
+        # The model distribution gate rejected the shared chain. Prepare its
+        # buffers only for explicit research comparisons, outside normal init.
+        if not qsa_package:
+            prepare_shared_expert_chains(model, self.vllm_config)
         prepared = sum(
             bool(getattr(m, "_sm70_qwen38_shared_chain", False))
             for m in model.modules()
         )
-        if prepared != 48:
-            raise RuntimeError(f"Expected 48 prepared shared experts, got {prepared}")
+        expected_shared = 0 if qsa_package else 48
+        if prepared != expected_shared:
+            raise RuntimeError(
+                f"Expected {expected_shared} prepared shared experts, got {prepared}"
+            )
         startup_epochs = [
             int(m._sm70_shared_chain_epochs[0].item())
             for m in model.modules()
@@ -276,9 +282,10 @@ class SharedLayerWorkerExtension:
                             if self._qsa_jointprep
                             or self._gdn_conv_chain
                             or self._hc_sharded
-                            or self._qsa_package
                             else arm == "candidate"
                         )
+                        if self._qsa_package:
+                            shared._sm70_qwen38_shared_chain = False
                         if self._qsa_package and layer.layer_type == "full_attention":
                             if not hasattr(
                                 layer.self_attn, "_sm70_qwen38_qsa_jointprep"
@@ -527,12 +534,6 @@ def main():
         # Keep successful phases even if a later research phase fails.
         save()
         for enabled, name, layer_ids, method in (
-            (
-                args.qsa_package and args.width == 1,
-                "shared_expert_with_qsa_package",
-                args.layers,
-                "enable_retained_shared_chain",
-            ),
             (
                 args.also_qsa_jointprep,
                 "qsa_jointprep",

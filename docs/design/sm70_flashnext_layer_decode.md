@@ -353,3 +353,12 @@ without further tuning. Actual MTP4 M5 also regresses: GDN
 The GDN M5 profiler includes one additional event in each arm, so its event
 stream is marked incomplete; counts above come from retained CUDA driver graph
 nodes. No production HC dispatch is added.
+
+The SiLU-boundary shared requalification again captures all 192 rows and fails:
+mean KL 0.002857, p99 0.030546, maximum 0.068376 and top-1 agreement 97.396%.
+Raw maximum logit difference 5.046875 remains diagnostic. No further numerical
+tuning is attempted for its small complete-layer gain. Normal model loading
+no longer prepares or enables this chain. The ordinary native operator and
+explicit benchmark preparation remain available solely for reproducing the
+rejected experiment. QSA package layer and distribution tests now retain the
+original shared-expert route in both arms and qualify QSA independently.

@@ -1160,9 +1160,6 @@ class Qwen4ExpForCausalLM(
                     self.vllm_config.kernel_config.qsa_auto_e4m3_active
                 ),
             )
-        from .sm70_shared_expert_chain import prepare_shared_expert_chains
-
-        prepare_shared_expert_chains(self, self.vllm_config)
         from .sm70_qsa_jointprep import prepare_qsa_joint_decode
 
         prepare_qsa_joint_decode(self, self.vllm_config)
@@ -1383,9 +1380,6 @@ class Qwen4ExpForConditionalGeneration(
                 self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
             ),
         )
-        from .sm70_shared_expert_chain import prepare_shared_expert_chains
-
-        prepare_shared_expert_chains(self, self.language_model.vllm_config)
         from .sm70_qsa_jointprep import prepare_qsa_joint_decode
 
         prepare_qsa_joint_decode(self, self.language_model.vllm_config)
