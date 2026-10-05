@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "gguf_pair_shared_a_sm70.cuh"
 
+using R12 = vllm::sm70_gguf::NativePairReader<12>;
 using R18 = vllm::sm70_gguf::NativePairReader<18>;
 using R21 = vllm::sm70_gguf::NativePairReader<21>;
 using R23 = vllm::sm70_gguf::NativePairReader<23>;
@@ -29,9 +30,12 @@ void launch_pair(torch::Tensor output, torch::Tensor input, torch::Tensor gate,
 void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
                                torch::Tensor gate, torch::Tensor up,
                                int64_t gate_type, int64_t up_type) {
-  TORCH_CHECK((gate_type == 21 && (up_type == 23 || up_type == 18)) ||
-                  ((gate_type == 23 || gate_type == 18) && up_type == 21),
-              "GGUF native pair requires IQ3_S with IQ4_XS or IQ3_XXS");
+  TORCH_CHECK(
+      (gate_type == 21 && (up_type == 23 || up_type == 18)) ||
+          ((gate_type == 23 || gate_type == 18) && up_type == 21) ||
+          (gate_type == 12 && up_type == 23) ||
+          (gate_type == 23 && up_type == 12),
+      "GGUF native pair requires a supported original-byte format pair");
   TORCH_CHECK(output.is_cuda() && input.is_cuda() && gate.is_cuda() &&
                   up.is_cuda() && output.device() == input.device() &&
                   gate.device() == input.device() &&
@@ -50,7 +54,7 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
                   k % 1024 == 0 && n <= INT_MAX && k <= INT_MAX,
               "GGUF native pair requires M8/N32/K1024");
   const auto block_bytes = [](int64_t type) {
-    return type == 18 ? 98 : type == 21 ? 110 : 136;
+    return type == 12 ? 144 : type == 18 ? 98 : type == 21 ? 110 : 136;
   };
   TORCH_CHECK(gate.numel() == n * (k / 256) * block_bytes(gate_type) &&
                   up.numel() == n * (k / 256) * block_bytes(up_type),
@@ -60,7 +64,11 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "GGUF native pair requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (gate_type == 21 && up_type == 23)
+  if (gate_type == 12)
+    launch_pair<R12, R23>(output, input, gate, up, n, k, stream);
+  else if (up_type == 12)
+    launch_pair<R23, R12>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 21 && up_type == 23)
     launch_pair<R21, R23>(output, input, gate, up, n, k, stream);
   else if (gate_type == 23)
     launch_pair<R23, R21>(output, input, gate, up, n, k, stream);
