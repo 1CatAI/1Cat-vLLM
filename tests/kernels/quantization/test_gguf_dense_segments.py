@@ -45,10 +45,11 @@ def test_projection_official_and_graph(source, m, split):
         pytest.skip("SM70 required")
     import vllm._C  # noqa: F401
 
-    raw = raw_weights(source)
+    k = 512 if split == 4 else 256
+    raw = raw_weights(source, k=k)
     fmt, q, scale, minimum, group = decode(raw, source)
     payload = [torch.from_numpy(p).cuda() for p in pack(fmt, q, scale, minimum, group)]
-    x = torch.randn(m, 256, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
     output = torch.empty(m, 69, device="cuda", dtype=torch.float16)[:, 3:67]
     ws = torch.empty(2 * split * 256, device="cuda", dtype=torch.float32)
     counter = torch.zeros(2, device="cuda", dtype=torch.int32)
@@ -65,7 +66,7 @@ def test_projection_official_and_graph(source, m, split):
             [output],
             [fmt],
             [64],
-            256,
+            k,
             split,
             4,
             ws,
