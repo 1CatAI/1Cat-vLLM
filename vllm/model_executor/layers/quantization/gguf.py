@@ -735,6 +735,16 @@ class GGUFLinearMethod(LinearMethodBase):
             if any(projection.kernel is not None for projection in projections):
                 layer.gguf_tm_projections = torch.nn.ModuleList(projections)
                 self.canonical_projections = layer.gguf_tm_projections
+                if self.layout is None and not isinstance(self, GGUFEmbeddingMethod):
+                    from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                        prepare_dp4a_gated_dense,
+                    )
+
+                    self.native_admission["dp4a_gated_operators"] = (
+                        prepare_dp4a_gated_dense(
+                            layer, sources, projections, self.dense_dp4a_enabled
+                        )
+                    )
                 if all(p.input_layout_restored for p in projections):
                     self.layout = None
                 qweight.data_container.clear()
@@ -803,6 +813,12 @@ class GGUFLinearMethod(LinearMethodBase):
         self._create_padded_weight_param(layer)
 
     def apply_fused_silu_and_mul(self, layer, x):
+        if hasattr(layer, "gguf_dp4a_gated_payload"):
+            from vllm.model_executor.layers.quantization.gguf_turbomind import (
+                apply_dp4a_gated_dense,
+            )
+
+            return apply_dp4a_gated_dense(layer, x)
         if hasattr(layer, "gguf_native_gated_records"):
             from vllm.model_executor.layers.quantization.gguf_native_pair import (
                 apply_native_gated_pair,

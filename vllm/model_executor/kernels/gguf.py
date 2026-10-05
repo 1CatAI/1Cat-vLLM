@@ -454,6 +454,54 @@ DENSE_DP4A_SCHEDULES = {
     (23, 2560, 160, 20): (16, False),
 }
 
+# Local N is the width of each half, not the concatenated gated projection.
+DENSE_GATED_DP4A_SCHEDULES = {
+    ((14, 14), 2560, 160, 5): (8, False),
+    ((14, 14), 2560, 160, 20): (8, False),
+    ((12, 12), 2560, 160, 5): (8, False),
+    ((12, 12), 2560, 160, 20): (8, False),
+    ((23, 23), 2560, 160, 5): (8, False),
+    ((23, 23), 2560, 160, 20): (8, False),
+    ((12, 23), 2560, 160, 5): (16, False),
+    ((12, 23), 2560, 160, 20): (16, False),
+    ((23, 12), 2560, 160, 5): (16, False),
+    ((23, 12), 2560, 160, 20): (8, False),
+}
+
+
+def dense_gated_dp4a_capabilities(
+    sources, k, n, dtype, enabled=True, compute_capability=70
+):
+    result = []
+    for m in (5, 20):
+        reason = None
+        if not enabled:
+            reason = "disabled_by_kernel_config"
+        elif compute_capability != 70:
+            reason = "requires_sm70_device"
+        elif dtype != torch.float16:
+            reason = "requires_fp16_activations"
+        elif (tuple(sources), k, n, m) not in DENSE_GATED_DP4A_SCHEDULES:
+            reason = "integer_gated_shape_or_source_has_no_calibration"
+        elif not all(
+            hasattr(torch.ops._C, name)
+            for name in ("gguf_quantize_q8_1_sm70_out", "gguf_dp4a_dense_sm70_out")
+        ):
+            reason = "integer_dense_operator_missing"
+        for source in sources:
+            result.append(
+                GGUFOperatorCapability(
+                    decoder_family(source),
+                    quant_type_name(source),
+                    "prepared_gguf_dp4a_gated_dense",
+                    True,
+                    min_m=m,
+                    max_m=m,
+                    reason=reason,
+                )
+            )
+    return tuple(result)
+
 
 def dense_dp4a_capabilities(
     source_type, k, n, dtype, enabled=True, compute_capability=70

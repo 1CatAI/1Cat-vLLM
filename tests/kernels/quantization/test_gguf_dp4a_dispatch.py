@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -10,7 +11,10 @@ from vllm.model_executor.kernels.gguf import dense_dp4a_capabilities
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
     GGUFPreparedProjection,
     _prepared_gguf_mixed_projection,
+    apply_dp4a_gated_dense,
     apply_prepared_gguf_projections,
+    prepare_dp4a_gated_dense,
+    prepare_gguf_projections,
     prepared_projection_arguments,
 )
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
@@ -88,3 +92,53 @@ def test_mixed_projection_encodes_once_and_keeps_canonical_fallback():
             graph.replay()
             expected = apply_prepared_gguf_projections(x, projections)
             torch.testing.assert_close(replay, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("kinds", [(12, 12), (14, 14), (23, 23), (12, 23), (23, 12)])
+def test_gated_dispatch_coalesces_and_retains_exact_fallback(kinds):
+    originals = []
+    for kind in kinds:
+        _, size = quant_size(kind)
+        rng = np.random.default_rng(kind)
+        raw = rng.integers(0, 256, (160, 10, size), dtype=np.uint8)
+        d = rng.uniform(0.0001, 0.001, raw.shape[:2]).astype("<f2")
+        start = 208 if kind == 14 else 0
+        raw[:, :, start : start + 2] = d[..., None].view(np.uint8)
+        if kind == 12:
+            raw[:, :, 2:4] = (d * np.float16(0.5))[..., None].view(np.uint8)
+        originals.append((torch.from_numpy(raw.reshape(160, -1)).cuda(), kind))
+    projections = prepare_gguf_projections(originals, torch.float16, True, 8)
+    layer = SimpleNamespace(
+        prefix="model.layers.0.mlp.shared_expert.gate_up_proj",
+        gguf_tm_projections=projections,
+    )
+    caps = prepare_dp4a_gated_dense(layer, originals, projections, True)
+    assert all(c["reason"] is None for c in caps)
+    assert hasattr(layer, "gguf_dp4a_gated_payload")
+    for m in (1, 5, 20, 64):
+        x = torch.randn((m, 2560), device="cuda", dtype=torch.float16)
+        quantize = torch.ops._C.gguf_quantize_q8_1_sm70_out
+        with patch.object(
+            torch.ops._C, "gguf_quantize_q8_1_sm70_out", wraps=quantize
+        ) as encode:
+            out = apply_dp4a_gated_dense(layer, x)
+            assert encode.call_count == int(m in (5, 20))
+        assert (
+            out.shape == (m, 160) and out.is_contiguous() and torch.isfinite(out).all()
+        )
+        if m not in (5, 20):
+            pair = _prepared_gguf_mixed_projection(
+                x, *prepared_projection_arguments(projections)
+            )
+            expected = torch.empty_like(out)
+            torch.ops._C.silu_and_mul(expected, pair)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replay = apply_dp4a_gated_dense(layer, x)
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.testing.assert_close(
+            replay, apply_dp4a_gated_dense(layer, x), rtol=0, atol=0
+        )

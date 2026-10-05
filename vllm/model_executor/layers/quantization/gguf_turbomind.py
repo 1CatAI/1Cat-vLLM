@@ -11,10 +11,12 @@ from torch.nn import Module, Parameter
 
 from vllm.model_executor.kernels.gguf import (
     DENSE_DP4A_SCHEDULES,
+    DENSE_GATED_DP4A_SCHEDULES,
     GGUFOperatorCapability,
     decoder_family,
     dense_dp4a_capabilities,
     dense_fp16_cache_capabilities,
+    dense_gated_dp4a_capabilities,
 )
 from vllm.model_executor.kernels.linear import (
     Sm70GgufAffineConfig,
@@ -304,6 +306,134 @@ direct_register_custom_op(
     op_func=_prepared_gguf_dp4a_dense,
     fake_impl=_prepared_gguf_dp4a_dense_fake,
 )
+
+
+def _prepared_gguf_dp4a_gated_dense(
+    x: torch.Tensor,
+    payload: list[torch.Tensor],
+    sources: list[int],
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    width = sum(descriptors[6::9]) // 2
+    schedule = DENSE_GATED_DP4A_SCHEDULES.get(
+        ((sources[0], sources[1]), rows.shape[1], width, rows.shape[0])
+    )
+    out = rows.new_empty((rows.shape[0], width))
+    if schedule is None:
+        pair = _prepared_gguf_mixed_projection(
+            x, codes, stats, caches, descriptors, cache_bands, blas_bands
+        )
+        torch.ops._C.silu_and_mul(out, pair.reshape(rows.shape[0], 2 * width))
+    else:
+        split, cooperative = schedule
+        q8 = torch.empty(
+            (rows.shape[0], rows.shape[1] // 32, 36), device=x.device, dtype=torch.uint8
+        )
+        scratch = torch.empty(
+            (split, rows.shape[0], 2 * width), device=x.device, dtype=torch.float32
+        )
+        torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, rows)
+        torch.ops._C.gguf_dp4a_dense_sm70_out(
+            out,
+            scratch,
+            q8,
+            *payload,
+            sources[0],
+            split,
+            cooperative,
+            True,
+            sources[1] if sources[1] != sources[0] else 0,
+        )
+    return out.reshape(*x.shape[:-1], width)
+
+
+def _prepared_gguf_dp4a_gated_dense_fake(
+    x: torch.Tensor,
+    payload: list[torch.Tensor],
+    sources: list[int],
+    codes: list[torch.Tensor],
+    stats: list[torch.Tensor],
+    caches: list[torch.Tensor | None],
+    descriptors: list[int],
+    cache_bands: list[int],
+    blas_bands: list[int],
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], sum(descriptors[6::9]) // 2))
+
+
+direct_register_custom_op(
+    op_name="prepared_gguf_dp4a_gated_dense",
+    op_func=_prepared_gguf_dp4a_gated_dense,
+    fake_impl=_prepared_gguf_dp4a_gated_dense_fake,
+)
+
+
+def prepare_dp4a_gated_dense(layer, originals, projections, enabled):
+    """Coalesce only measured pairs; preserve canonical projections for fallback."""
+    sources = tuple(source for _, source in originals)
+    reason = None
+    if (
+        len(originals) != 2
+        or any(w.shape[0] != 160 for w, _ in originals)
+        or any(
+            p.kernel is None or p.kernel.config.partition_weight_shape[0] != 2560
+            for p in projections
+        )
+    ):
+        reason = "integer_gated_shape_or_source_has_no_calibration"
+    elif not layer.prefix.endswith(".gate_up_proj"):
+        reason = "requires_gate_up_projection_pair"
+    capabilities = dense_gated_dp4a_capabilities(
+        sources,
+        2560,
+        160,
+        projections[0].kernel.config.act_type
+        if projections and projections[0].kernel is not None
+        else None,
+        enabled=enabled,
+        compute_capability=70 if current_platform.is_device_capability(70) else 0,
+    )
+    if reason is not None:
+        capabilities = tuple(replace(c, reason=reason) for c in capabilities)
+    if any(c.reason is None for c in capabilities):
+        from vllm.model_executor.layers.quantization.gguf_dp4a_formats import (
+            pack_mixed_u4_pair,
+            transcode_integer_dot,
+        )
+
+        raw = [w.detach().cpu().numpy() for w, _ in originals]
+        if sources[0] == sources[1]:
+            codec = transcode_integer_dot(np.concatenate(raw), sources[0])
+            payload = (
+                codec.packed(fold_q6_base=True) if sources[0] == 14 else codec.packed()
+            )
+        else:
+            payload = pack_mixed_u4_pair(
+                *[transcode_integer_dot(w, source) for w, source in zip(raw, sources)]
+            )
+        layer.gguf_dp4a_gated_payload = torch.nn.ParameterList(
+            Parameter(
+                torch.from_numpy(p).to(originals[0][0].device), requires_grad=False
+            )
+            for p in payload
+        )
+        layer.gguf_dp4a_gated_sources = sources
+    return [asdict(c) for c in capabilities]
+
+
+def apply_dp4a_gated_dense(layer, x):
+    return torch.ops.vllm.prepared_gguf_dp4a_gated_dense(
+        x,
+        list(layer.gguf_dp4a_gated_payload),
+        list(layer.gguf_dp4a_gated_sources),
+        *prepared_projection_arguments(layer.gguf_tm_projections),
+    )
 
 
 def mixed_projection_capabilities(projections):
