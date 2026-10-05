@@ -227,4 +227,29 @@ reproducible with `benchmark_gguf_quantization_inventory.py`.
 
 Latest-main end-to-end, graph-boundary ledger and both machines' packaged
 operator checks are recorded above. The native-route natural termination
-check is pending. No end-to-end gain is claimed from isolated operator timings.
+check passes in the normal installed joint pure/mixed package. No end-to-end gain is claimed from isolated operator timings.
+
+## Model compilation and natural output
+
+A real-module regression exposed unsupported star unpacking of registered
+parameter lists during AOT capture. Indexing the two records explicitly
+fixes both the pure and mixed wrappers. Twelve combined dispatch and
+module-capture tests pass with Torch 2.10. The initial failed model startup
+is retained as a negative result; it did not reach inference.
+
+The normal installed `dev18+ge3ac73f9d5` wheel passes joint TP4 model
+startup, AOT compilation and M8 full graph capture on four V100-SXM2-32GB
+cards with ring NVLink, CUDA 12.8 and Torch 2.10. Configuration uses
+FP16 operands/KV, FP32 SSM, 32K capacity, batch budget 1024, one sequence,
+seven-token probabilistic Q8_0 DFlash2, temperature 0.7/top-p 0.9/top-k 20
+and seed 123. With thinking disabled and EOS respected, the two 128-token
+limit prompts naturally stop: the arithmetic answer is `391`; the English
+answer explains unit testing in one sentence. All four rank reports admit
+eight pure IQ3_S pairs and eleven IQ3_S/IQ4_XS pairs. This is a model
+quality and integration check; it provides no end-to-end speed claim.
+
+The joint wheel's SHA256 is
+`d72cd64639199773252bc3617b74397a240657a502d3eb13a653d2a6c114373b`.
+Both native modules are bitwise identical to the previously measured mixed
+package; the AOT fix only changes Python argument construction. The
+primary-machine pure operator check above remains the performance evidence.
