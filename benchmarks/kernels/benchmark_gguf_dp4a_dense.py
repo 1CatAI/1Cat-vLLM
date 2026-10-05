@@ -9,6 +9,7 @@ import statistics
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import torch
 import vllm._C as core
 
@@ -60,6 +61,8 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--axis", type=int, choices=[0, 1], default=0)
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--join", nargs="+", default=[])
+    parser.add_argument("--activated", action="store_true")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 20])
     parser.add_argument("--split", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--iterations", type=int, default=20)
@@ -72,14 +75,25 @@ def main():
     tensor = next(t for t in reader.tensors if t.name == args.tensor)
     kind = int(tensor.tensor_type)
     block, size = quant_size(kind)
-    raw = tensor.data
-    if args.axis == 0:
-        span = raw.shape[0] // 4
-        raw = raw[args.rank * span : (args.rank + 1) * span].copy()
-    else:
+
+    def shard(tensor):
+        assert int(tensor.tensor_type) == kind
+        raw = tensor.data
+        if args.axis == 0:
+            span = raw.shape[0] // 4
+            return raw[args.rank * span : (args.rank + 1) * span].copy()
         span = raw.shape[1] // 4
         assert span % size == 0
-        raw = raw[:, args.rank * span : (args.rank + 1) * span].copy()
+        return raw[:, args.rank * span : (args.rank + 1) * span].copy()
+
+    raw = np.concatenate(
+        [shard(tensor)]
+        + [
+            shard(next(t for t in reader.tensors if t.name == name))
+            for name in args.join
+        ],
+        axis=0,
+    )
     codec = transcode_integer_dot(raw, kind)
     n, k = codec.shape
     packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
@@ -99,7 +113,8 @@ def main():
         activation_encoding="q8_1_group32_original_half_sum",
         calls_per_graph=16,
         cache_policy="cold_L2_32MiB_read_write_eviction_before_each_projection",
-        tensor=args.tensor,
+        tensor=[args.tensor, *args.join],
+        activated=args.activated,
         shape=[n, k],
         source_type=kind,
         tp_rank=args.rank,
@@ -111,7 +126,8 @@ def main():
         torch.manual_seed(20261005 + m)
         x = torch.randn((m, k), device="cuda", dtype=torch.float16)
         q8 = torch.empty((m, k // 32, 36), device="cuda", dtype=torch.uint8)
-        out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+        width = n // 2 if args.activated else n
+        out = torch.empty((m, width), device="cuda", dtype=torch.float16)
         torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
         integer = q8[:, :, 4:].view(torch.int8).float()
         scale = q8[:, :, :2].contiguous().view(torch.float16).float()
@@ -126,6 +142,24 @@ def main():
             delta = original_sum - decoded.reshape(m, -1, 32).sum(-1)
             expected -= delta @ torch.from_numpy(minimum).cuda().T
         fp16_expected = x.float() @ reference.T
+        if args.activated:
+
+            def finish(values, width=width):
+                values = values.half()
+                return (
+                    torch.nn.functional.silu(values[:, :width]) * values[:, width:]
+                ).float()
+
+            expected, fp16_expected = finish(expected), finish(fp16_expected)
+        control_out = torch.empty_like(out)
+
+        def control_operation(x=x, control_out=control_out):
+            result = control(x)
+            if args.activated:
+                torch.ops._C.silu_and_mul(control_out, result)
+                return control_out
+            return result
+
         event_boundary_us = cold_graph_time(lambda: None, eviction, args.iterations)
         cases = []
         for split in args.split:
@@ -140,7 +174,14 @@ def main():
                     q8=q8,
                 ):
                     torch.ops._C.gguf_dp4a_dense_sm70_out(
-                        out, scratch, q8, *packed, kind, split, cooperative, False
+                        out,
+                        scratch,
+                        q8,
+                        *packed,
+                        kind,
+                        split,
+                        cooperative,
+                        args.activated,
                     )
 
                 try:
@@ -164,7 +205,7 @@ def main():
 
                 operations = {
                     "candidate": operation,
-                    "control": lambda x=x: control(x),
+                    "control": control_operation,
                     "combined": combined,
                 }
                 timing = {
@@ -205,7 +246,11 @@ def main():
                         source_gbps=sum(t.numel() * t.element_size() for t in packed)
                         / elapsed
                         / 1000,
-                        kernel_count=1 if split == 1 or cooperative else 2,
+                        kernel_count=(
+                            1
+                            if cooperative or (split == 1 and not args.activated)
+                            else 2
+                        ),
                         official_q8_relative_l2=(
                             (out.float() - expected).norm() / expected.norm()
                         ).item(),

@@ -23,7 +23,8 @@ def oracle(x):
 
 
 @pytest.mark.parametrize(
-    "kind,activated", [(12, False), (14, False), (23, False), (23, True)]
+    "kind,activated",
+    [(12, False), (14, False), (23, False), (12, True), (14, True), (23, True)],
 )
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("split", [1, 4])
