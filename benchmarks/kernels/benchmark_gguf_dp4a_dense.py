@@ -11,7 +11,6 @@ from pathlib import Path
 
 import torch
 import vllm._C as core
-from benchmark_gguf_dp4a_expert import graph_time
 
 import vllm
 from vllm.model_executor.layers.quantization.gguf_dp4a_formats import (
@@ -25,6 +24,33 @@ from vllm.transformers_utils.gguf_tensor_reader import (
     dequantize,
     quant_size,
 )
+
+
+def cold_graph_time(operation, eviction, iterations):
+    """Time graph event boundaries after eviction, excluding the eviction cost."""
+    for _ in range(3):
+        eviction.add_(1)
+        operation()
+    pairs = [
+        (
+            torch.cuda.Event(enable_timing=True, external=True),
+            torch.cuda.Event(enable_timing=True, external=True),
+        )
+        for _ in range(16)
+    ]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for start, end in pairs:
+            eviction.add_(1)
+            start.record()
+            operation()
+            end.record()
+    samples = []
+    for _ in range(iterations):
+        graph.replay()
+        pairs[-1][1].synchronize()
+        samples.extend(start.elapsed_time(end) * 1000 for start, end in pairs)
+    return statistics.median(samples)
 
 
 def main():
@@ -41,6 +67,7 @@ def main():
     assert "site-packages" in vllm.__file__, vllm.__file__
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    eviction = torch.zeros(32 * 1024 * 1024 // 4, device="cuda", dtype=torch.float32)
     reader = GGUFReader(args.model)
     tensor = next(t for t in reader.tensors if t.name == args.tensor)
     kind = int(tensor.tensor_type)
@@ -71,6 +98,7 @@ def main():
         accumulation="fp32",
         activation_encoding="q8_1_group32_original_half_sum",
         calls_per_graph=16,
+        cache_policy="cold_L2_32MiB_read_write_eviction_before_each_projection",
         tensor=args.tensor,
         shape=[n, k],
         source_type=kind,
@@ -146,7 +174,7 @@ def main():
                 for epoch in range(4):
                     for name in list(operations)[:: 1 if epoch % 2 == 0 else -1]:
                         timing[name].append(
-                            graph_time(operations[name], args.iterations)
+                            cold_graph_time(operations[name], eviction, args.iterations)
                         )
                     clocks.append(
                         subprocess.check_output(
