@@ -49084,3 +49084,16 @@ on CPU marks both for the unchanged dense callback (distance to top-p:
 fallback. GPU flag confirmation and the effective sampling comparison are
 pending; do not describe those raw-probe diagnostics as a demonstrated failure
 of the complete sampler. The measured C8 timing still requires investigation.
+
+GPU replay of the actual guard confirms both nucleus-boundary cases take the
+reference path. The effective sampling comparison has zero missing support,
+mean/p99/max KL 4.88e-10/3.88e-9/1.05e-8 and top-1 agreement100%, with maximum
+retained-logit error0.000816. This measures filtered sampling probabilities,
+not a full-vocabulary teacher-forcing KL. The maximum probability difference
+on retained support is7.22e-5. Keep the raw diagnostics alongside this result.
+
+A fresh32K service with max-num-seqs4 and the same688 KV blocks completes C4.
+The target-only same-wheel comparison measures C2 23.334→22.757ms and
+C4 32.938→32.698ms, averaging the surrounding dense controls. The larger
+8K C8 target route remains slower on its complete-round mean. Do not promote
+that shape based on its positive cold operator timing or median alone.
