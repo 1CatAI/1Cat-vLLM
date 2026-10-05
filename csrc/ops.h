@@ -989,6 +989,10 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
                                 bool activated, int64_t lanes_per_row);
+void gguf_dp4a_lut4_gate_up_sm70_out(
+    torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
+    torch::Tensor gate, torch::Tensor gate_stats, torch::Tensor up,
+    torch::Tensor up_stats, int64_t num_experts, int64_t lanes_per_row);
 
 void gguf_dense_segments_sm70_out(
     torch::Tensor x, std::vector<torch::Tensor> codes,

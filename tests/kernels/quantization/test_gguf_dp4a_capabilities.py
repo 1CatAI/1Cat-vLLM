@@ -45,6 +45,7 @@ def packaged(monkeypatch):
         for name in (
             "gguf_quantize_q8_1_sm70_out",
             "gguf_dp4a_gate_up_sm70_out",
+            "gguf_dp4a_lut4_gate_up_sm70_out",
             "gguf_dp4a_down_unroute_sm70_out",
         )
     }
@@ -106,3 +107,33 @@ def test_missing_packaged_component_rejects_entire_route(packaged, monkeypatch, 
     monkeypatch.delattr(torch.ops._C, name)
     caps = dp4a_expert_capabilities(21, 42, 2560, 160, 512, torch.float16, is_sm70=True)
     assert all(c.reason == f"operator_missing:{name}" for c in caps)
+
+
+@pytest.mark.parametrize("source", [20, 23])
+def test_iq4_requires_qualified_canonical_banks(packaged, monkeypatch, source):
+    parameters = dict(
+        source_type=source,
+        down_type=20,
+        k=2560,
+        n=160,
+        num_experts=512,
+        dtype=torch.float16,
+        is_sm70=True,
+        original_storage_available=False,
+    )
+    rejected = dp4a_expert_capabilities(**parameters)
+    assert all(
+        c.reason == "requires_iq4_codebook_zero_group32_banks_without_ep"
+        for c in rejected
+    )
+    caps = dp4a_expert_capabilities(**parameters, canonical_storage_available=True)
+    assert [
+        m
+        for m in (1, 5, 10, 20, 32)
+        if any(c.reason is None and c.supports_m(m) for c in caps)
+    ] == [5, 20]
+    monkeypatch.delattr(torch.ops._C, "gguf_dp4a_lut4_gate_up_sm70_out")
+    rejected = dp4a_expert_capabilities(**parameters, canonical_storage_available=True)
+    assert all(
+        c.reason == "operator_missing:gguf_dp4a_lut4_gate_up_sm70_out" for c in rejected
+    )
