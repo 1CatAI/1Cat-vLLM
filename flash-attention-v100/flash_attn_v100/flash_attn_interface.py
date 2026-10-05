@@ -1601,6 +1601,41 @@ def flash_attn_prefill_paged(
         and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
         and (out is None or out.is_contiguous())
     ):
+        # Single-request query blocks benefit from splitting the live window.
+        # Concurrent blocks retain the qualified native WMMA route.
+        if (
+            q.shape[0] == 1
+            and q.is_contiguous()
+            and k_cache.device == v_cache.device == q.device
+            and k_cache.shape == v_cache.shape
+            and block_table.device == seq_lens.device == q.device
+            and block_table.dtype == seq_lens.dtype == torch.int32
+            and block_table.ndim == 2
+            and block_table.shape[0] == 1
+            and seq_lens.shape == (1,)
+            and (
+                out is None
+                or (
+                    out.shape == q.shape
+                    and out.dtype == q.dtype
+                    and out.device == q.device
+                )
+            )
+        ):
+            try:
+                from .sm70_dflash2_split import forward as split_window
+            except ImportError:
+                split_window = None
+            if split_window is not None:
+                return split_window(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_table.contiguous(),
+                    seq_lens,
+                    softmax_scale,
+                    out,
+                )
         return flash_attn_v100_cuda.dflash2_paged_bmhd_fwd(
             q.contiguous(),
             k_cache,

@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.gguf_turbomind_moe import GGUFExper
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("m", [5, 20])
 def test_opaque_gate_up_dispatch_and_changed_input_graph(kind, m):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -67,7 +67,7 @@ def test_opaque_gate_up_dispatch_and_changed_input_graph(kind, m):
             banks[0].group,
             n,
             top_k,
-            [1, 5, 20] if kind == 21 else [1, 5],
+            [1, 5, 20] if kind in (18, 21) else [1, 5],
             [],
         )
 
