@@ -21,22 +21,28 @@ from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
 p = argparse.ArgumentParser()
 p.add_argument("model")
 p.add_argument("output")
+p.add_argument("--all-output-projections", action="store_true")
 a = p.parse_args()
 torch.set_num_threads(1)
 reader = GGUFReader(a.model)
 ts = [
     t
     for t in reader.tensors
-    if t.name.endswith("ssm_out.weight") and int(t.tensor_type) == 14
-][:6]
-assert len(ts) == 6
+    if t.name.endswith("ssm_out.weight")
+    and (a.all_output_projections or int(t.tensor_type) == 14)
+]
+if not a.all_output_projections:
+    ts = ts[:6]
+assert ts
+banks = len(ts)
 layout = GGUFHeadTilingLayout(3, 128)
 old = []
 new = []
 errors = []
 for t in ts:
     raw = np.asarray(t.data)
-    assert int(t.tensor_type) == 14
+    weight_type = int(t.tensor_type)
+    assert weight_type in (12, 13, 14)
     raw = layout.shard_weight(
         torch.from_numpy(raw.copy()),
         dim=1,
@@ -46,14 +52,14 @@ for t in ts:
         tp_size=4,
     ).numpy()
     w = torch.from_numpy(raw).cuda()
-    old.append(prepare_gguf_projections([(w, 14)], torch.float16, True, 256))
+    old.append(prepare_gguf_projections([(w, weight_type)], torch.float16, True, 256))
     new.append(
         prepare_gguf_projections(
-            [(w, 14)], torch.float16, True, 256, input_layout=layout
+            [(w, weight_type)], torch.float16, True, 256, input_layout=layout
         )
     )
     assert new[-1][0].input_layout_restored
-    c = transcode_affine(raw, 14)
+    c = transcode_affine(raw, weight_type)
     oracle = gguf.quants.dequantize(raw, t.tensor_type)
     d = c.dequantize() - oracle
     errors.append(
@@ -82,14 +88,14 @@ for m in [1, 5, 20]:
         )
     graphs = []
     for projs, shuffle in [(old, True), (new, False)]:
-        for i in range(6):
+        for i in range(banks):
             apply_prepared_gguf_projections(
                 layout.input_to_gguf(x) if shuffle else x, projs[i]
             )
         torch.accelerator.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            for i in range(6):
+            for i in range(banks):
                 apply_prepared_gguf_projections(
                     layout.input_to_gguf(x) if shuffle else x, projs[i]
                 )
@@ -104,7 +110,7 @@ for m in [1, 5, 20]:
                 graphs[arm].replay()
             end.record()
             end.synchronize()
-            samples[arm].append(start.elapsed_time(end) * 1000 / 600)
+            samples[arm].append(start.elapsed_time(end) * 1000 / (100 * banks))
     rows.append(
         {
             "m": m,
@@ -115,12 +121,12 @@ for m in [1, 5, 20]:
         }
     )
 report = {
-    "weight_banks": 6,
+    "weight_banks": banks,
     "source_types": [int(t.tensor_type) for t in ts],
     "canonical_errors": errors,
     "rows": rows,
     "qualification": (
-        "Graph microbenchmark, six distinct real TP4 GDN output weights; "
+        "Graph microbenchmark, distinct real TP4 GDN output weights; "
         "not full-model timing."
     ),
 }
