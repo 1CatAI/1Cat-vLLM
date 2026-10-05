@@ -58,12 +58,22 @@ def candidate_module(directory: Path):
                         mask=mask_v, other=0).to(tl.float32)
                     old_k = old_k / tl.sqrt(tl.sum(old_k * old_k) + 1e-6)
                 old_g = tl.load(replay_g + (i_n * 8 + step) * HV + i_hv)
-                b_h *= exp(old_g)
-                if not CACHE_FACTORS:
+                if CACHE_FACTORS:
+                    # In verification the decayed state is also consumed by
+                    # the dot product, so it rounds before the rank-1 FMA.
+                    # Omitting that consumer otherwise permits fusion across
+                    # the decay multiply and changes the FP32 state by one ULP.
+                    decayed = tl.inline_asm_elementwise(
+                        "mul.rn.f32 $0, $1, $2;", constraints="=f,f,f",
+                        args=[b_h, exp(old_g)], dtype=tl.float32,
+                        is_pure=True, pack=1)
+                    b_h = tl.fma(old_v[:, None], old_k[None, :], decayed)
+                else:
+                    b_h *= exp(old_g)
                     old_beta = tl.load(replay_beta + (i_n * 8 + step) * HV + i_hv)
                     old_v -= tl.sum(b_h * old_k[None, :], 1)
                     old_v *= old_beta
-                b_h += old_v[:, None] * old_k[None, :]
+                    b_h += old_v[:, None] * old_k[None, :]
         # Persist the start of this round, not its unaccepted final state.
         tl.store(p_h0, b_h, mask=mask_h)
 

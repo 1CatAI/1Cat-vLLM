@@ -10,6 +10,7 @@ Do not interpret logical bytes/time as measured DRAM bandwidth.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import runpy
 import statistics
@@ -152,22 +153,36 @@ def main():
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--extension",
+        type=Path,
+        help="Precompiled research extension with matching Torch ABI",
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     cuda_source = args.source_root / "csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu"
     generated = args.out / "qpn2-stage-skeleton.cu"
     generated.write_text(source_for_screen(cuda_source))
-    extension = load(
-        name="round12_qpn2_stage_skeleton",
-        sources=[str(generated)],
-        extra_include_paths=[str(cuda_source.parent)],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
-        verbose=True,
-    )
+    if args.extension is None:
+        extension = load(
+            name="round12_qpn2_stage_skeleton",
+            sources=[str(generated)],
+            extra_include_paths=[str(cuda_source.parent)],
+            extra_cuda_cflags=["-O3", "-lineinfo"],
+            verbose=True,
+        )
+    else:
+        spec = importlib.util.spec_from_file_location(
+            "round12_qpn2_stage_skeleton", args.extension
+        )
+        assert spec is not None and spec.loader is not None
+        extension = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(extension)
     if args.compile_only:
         print("Compiled research stages; no GPU execution.", flush=True)
         return
     torch.set_grad_enabled(False)
+    torch.manual_seed(123)
     assert torch.cuda.get_device_capability() == (7, 0)
     helpers = runpy.run_path(
         str(args.source_root / "benchmarks/kernels/benchmark_sm70_nvfp4_qpn2.py")
