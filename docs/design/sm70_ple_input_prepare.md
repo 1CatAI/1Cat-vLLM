@@ -71,9 +71,14 @@ The fused observer has long submission outliers, p90 18.565ms; reference p90
 is 1.399ms. CPU launch times may lead queued GPU work. This does not establish
 the 0.1ms GPU-entry goal, and no new GPU-entry speed claim is made.
 
-Two bounded natural completions terminate normally. Sixty-four matched
-teacher distributions and eight natural-prompt acceptance records are retained
-alongside the model comparison. The 18.5ms C1 stage target remains open.
+Two bounded natural completions terminate normally. Sixty-four candidate teacher distributions are retained. Fifty-six match
+the previous artifact's exact prefix, forced token and position; mean KL
+is 0.000986, maximum 0.010389 and top-1 agreement 55/56. Eight changed-prefix
+positions are excluded. Acceptance across eight natural prompts increases
+44.802 to 47.170%, paired difference CI [+0.792,+4.439] percentage points.
+These compare separately loaded artifacts, rather than isolating integer
+input preparation. Future reports save complete teacher prefixes and reject
+unrecoverable legacy conditions instead of comparing different histories. The 18.5ms C1 stage target remains open.
 
 The previous graph-node trace separates asynchronous output materialization:
 median 24.116ms total contains 24.086ms in cudaEventSynchronize. Work after

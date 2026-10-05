@@ -25,6 +25,7 @@ from benchmarks.benchmark_sm70_qwen38_concurrency import (  # noqa: E402
     generate_cohort,
     summarize,
 )
+from benchmarks.sm70_teacher_conditions import teacher_conditions  # noqa: E402
 
 
 def digest(value):
@@ -399,50 +400,46 @@ def main():
             root = args.output.with_suffix("").with_name(args.output.stem + "-teacher")
             root.mkdir(parents=True, exist_ok=True)
             report["teacher_forcing"] = dict(directory=str(root), rows=[])
-            for row in reference["rows"]:
-                if len(row["output_token_ids"]) <= args.teacher_positions:
-                    raise RuntimeError("Teacher continuation is too short")
-                for position in range(args.teacher_positions):
-                    prefix = (
-                        row["prompt_token_ids"] + row["output_token_ids"][:position]
+            report["teacher_forcing"]["reference"] = (
+                str(args.teacher_reference) if args.teacher_reference else None
+            )
+            for key, prefix, forced in teacher_conditions(
+                reference, args.teacher_positions
+            ):
+                llm.collective_rpc(
+                    "start_teacher_capture", args=(str(root), key), timeout=30
+                )
+                try:
+                    llm.generate(
+                        {"prompt_token_ids": prefix},
+                        SamplingParams(
+                            temperature=0, max_tokens=6, allowed_token_ids=[forced]
+                        ),
+                        use_tqdm=False,
                     )
-                    forced = row["output_token_ids"][position]
-                    key = f"{row['id']}-{position:03d}"
-                    llm.collective_rpc(
-                        "start_teacher_capture", args=(str(root), key), timeout=30
+                finally:
+                    workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
+                if any(w["captured"] != 1 for w in workers):
+                    raise RuntimeError(f"M5 teacher target was not captured: {workers}")
+                captured = torch.load(root / f"{key}.pt", weights_only=True)
+                if (
+                    captured["position"].item() != len(prefix)
+                    or captured["input_ids"].item() != forced
+                ):
+                    raise RuntimeError(
+                        "Captured distribution has different teacher conditioning"
                     )
-                    try:
-                        llm.generate(
-                            {"prompt_token_ids": prefix},
-                            SamplingParams(
-                                temperature=0, max_tokens=6, allowed_token_ids=[forced]
-                            ),
-                            use_tqdm=False,
-                        )
-                    finally:
-                        workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
-                    if any(w["captured"] != 1 for w in workers):
-                        raise RuntimeError(
-                            f"M5 teacher target was not captured: {workers}"
-                        )
-                    captured = torch.load(root / f"{key}.pt", weights_only=True)
-                    if (
-                        captured["position"].item() != len(prefix)
-                        or captured["input_ids"].item() != forced
-                    ):
-                        raise RuntimeError(
-                            "Captured distribution has different teacher conditioning"
-                        )
-                    report["teacher_forcing"]["rows"].append(
-                        dict(
-                            key=key,
-                            prefix_sha256=digest(prefix),
-                            forced=forced,
-                            position=len(prefix),
-                            workers=workers,
-                        )
+                report["teacher_forcing"]["rows"].append(
+                    dict(
+                        key=key,
+                        prefix_sha256=digest(prefix),
+                        prefix_token_ids=list(prefix),
+                        forced=forced,
+                        position=len(prefix),
+                        workers=workers,
                     )
-                    save()
+                )
+                save()
         report["complete"] = True
         save()
     finally:
