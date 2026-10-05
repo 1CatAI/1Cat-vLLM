@@ -17,9 +17,9 @@ No decoder, weight format, activation precision or accumulation policy changes.
 ## Validation
 
 An ordinary source-containing wheel built for V100-SXM2-32GB with CUDA12.8,
-Torch2.10.0+cu128 and Python3.12 passes 16 focused GPU checks: mixed affine/LUT4/
+Torch2.10.0+cu128 and Python3.12 passes 10 focused mixed-output GPU checks: mixed affine/LUT4/
 lattice outputs at M5/M20/M32, padded fallback, compiled fullgraph calls,
-changed-input expert graph replay and IQ2_S M20 canonical fallback. Mixed output
+graph replay and contiguous outputs. Mixed output
 comparisons are bitwise against independent projection outputs. The existing
 original-block expert operators remain registered in the normal extension.
 
@@ -30,19 +30,27 @@ The Flash-Next IQ3_S TP4 projection descriptors are:
 | GDN QKV + Z | Q6_K + Q4_K | 2560 + 1536 | 2560 |
 | Shared gate + up | Q4_K + IQ4_XS | 160 + 160 | 2560 |
 
-Repeated-weight CUDA graph microbenchmarks alternate control/candidate order,
-use 64 warmup replays, then 12 alternating epochs of 128 replays each. Medians
-exclude the first two epochs. FP16 results match bitwise.
+CUDA graph microbenchmarks alternate control/candidate order, use 64 warmup
+replays, then 12 alternating epochs of 128 replays each. Medians exclude the first
+two epochs. Each replay cycles distinct physical weight banks: six QKV/Z banks
+occupy 54,067,200 bytes; 39 shared gate/up banks occupy 18,969,600 bytes. Both
+exceed twice the V100 6 MiB L2. Outputs match bitwise.
 
 | Projection | M | Independent + concat (µs) | Direct output (µs) |
 |---|---:|---:|---:|
-| GDN QKV + Z | 5 | 78.140 | 35.008 |
-| GDN QKV + Z | 20 | 42.988 | 41.568 |
-| Shared gate + up | 5 | 30.300 | 28.908 |
-| Shared gate + up | 20 | 30.080 | 28.712 |
+| GDN QKV + Z | 5 | 43.395 | 34.532 |
+| GDN QKV + Z | 20 | 42.944 | 41.201 |
+| Shared gate + up | 5 | 31.734 | 29.311 |
+| Shared gate + up | 20 | 31.538 | 29.007 |
 
-These repeated-weight results do not establish model step savings. In particular,
-the large M5 QKV/Z difference is stable across alternating epochs but is not
-attributed solely to eliminating a concatenation launch. The merged output also
-changes the GEMM destination stride. Cache-exceeding bank measurements and the
-matched model run are required before final promotion.
+A repeated single-bank QKV/Z M5 test measured 78.140 versus 35.008 µs. The gain
+shrinks with distinct weight banks; the single-bank result is not a model speed
+claim. Direct writes also change destination stride.
+
+A combined TP4 Flash-Next IQ3_S/FP16-MTP4 run completes eight natural requests of
+600 tokens with plausible text. It reports C1 verification-round mean 24.252 ms
+(I8192/O256) and C4 mean 49.728 ms (I128/O600). That run also enables IQ3_XXS
+original expert banks, so these absolute values do not isolate this change.
+Both use FP16 activations/KV, FP32 recurrent state and accumulation, FULL graphs,
+max length9216, max batch512, four sequences and memory utilization0.95.
+The scoped microbenchmark establishes the projection benefit.
