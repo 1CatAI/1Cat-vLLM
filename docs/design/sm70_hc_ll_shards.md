@@ -39,3 +39,32 @@ The supplied shard3 implementation provides the arithmetic and LL protocol.
 The parallel token-group extension preserves each group's FP32 reduction
 and FP16 materialization boundaries. The supplied hc_one single-kernel
 combine/norm variant is excluded.
+
+## Tag reuse across changing batches
+
+Alternating pages alone do not protect rows that have been inactive for a
+complete tag cycle. A reproduced M20, long M5 interval, then M20 case with
+a 5ms rank-0 delay reads old values whose 16-bit tags match the new operation.
+Skipping complete modulo cycles preserves the same inactive receive state
+without executing thousands of redundant operations. Mix relative maximum
+errors reach 0.976–1.415 while injection remains exact.
+
+Both existing kernels now invalidate inactive rows of their local current
+receive page. They leave the next page untouched because a faster peer may
+already be writing it. No extra launch or system fence is introduced. All
+ranks use the same batch shape, so active peer writes cannot race these
+inactive-row stores. Completion counters publish only after those stores
+finish. M20 has no inactive served rows to clear.
+
+The same regression passes in the complete installed extension with mix
+relative maximum 0.000213 on all four ranks and exact injection. Standard
+M1/M5/M8/M20 changed-generation and delayed-rank checks also pass; maximum
+mix difference is below 0.000430. Amortized four-process graph times on two
+real HC pairs are 17.11/17.41/18.93/30.82us respectively. These use a different
+contract from the eight-pair research timings above; they are not subtracted
+from those earlier results.
+
+The joint dense/HC whole-model comparison in
+[the segment design](gguf_dense_segments.md) reports the earlier extension
+explicitly. Guarded HC performance is checked against the packaged replicated
+operator in the same four-process ABBA benchmark before promotion.
