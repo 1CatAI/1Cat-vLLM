@@ -323,6 +323,12 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
             "components": copies,
             "total_bytes": sum(copies.values()) if reference_layout else None,
             "excludes": "allocator overhead, graphs, temporary workspaces and KV cache",
+            "precision_policy_note": (
+                "Router/shared estimates require FP16 accumulation disabled; "
+                "shared packs also require FP16 reduced-precision reductions. "
+                "Router partials remain FP32. Inspect sm70_preparations for "
+                "actual packed bytes and per-layer precision rejection reasons."
+            ),
             "capacity_note": (
                 "Packed weights reduce memory available to KV and graph/workspace "
                 "peaks. An explicit KV byte budget does not shrink automatically. "
@@ -341,6 +347,8 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
 
 
 def _native_capabilities(page_size: int) -> dict[str, bool]:
+    import torch
+
     # Register FA2 operators before probing availability.
     import vllm.vllm_flash_attn._vllm_fa2_C  # noqa: F401
 
@@ -366,6 +374,7 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
     from vllm.v1.attention.ops.sm70_e4m3_scalar import scalar_tail_attention_available
 
     return {
+        "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
         "grouped_fp32": bool(flash_attn_grouped_e4m3_fp32_available()),
         "long_operator": builtin_long_attention() is not None,
         "long_enabled": long_attention_enabled(),
@@ -485,6 +494,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
     report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections
+    report["collective_kernel_selections"] = (
+        cfg.kernel_config.collective_kernel_selections
+    )
     report["ple_disk_cascade"] = {
         "enabled": cfg.kernel_config.ple_disk_cascade_active,
         "reason": cfg.kernel_config.ple_disk_cascade_reason,
@@ -502,7 +514,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": sparse_policy.reason,
         "configuration": asdict(sparse_policy),
         "decode_fallback": "retain configured paged QK-D for low query/index workloads",
-        "indexer_graph_fallback": "paged indexer for fixed full-graph key buckets",
+        "indexer_graph_fallback": (
+            "paged indexer for unbounded full graphs or rejected key layouts"
+        ),
         "layout": "packed 448 FP8 + 64 RoPE decode; FP16 dense prefill",
     }
     report["ple_result_transports"] = cfg.kernel_config.ple_result_transports
@@ -531,6 +545,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         names = set(load_profile()["expected_acceleration"]) | {
             "qwen38_decode",
             "e4m3_grouped_fp32",
+            "fp16_grouped_fp32",
             "long_context",
             "scalar_tail",
             "q8000_prefill",
@@ -610,6 +625,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         native = dict.fromkeys(
             (
                 "grouped_fp32",
+                "fp16_grouped",
                 "long_operator",
                 "long_enabled",
                 "page_supported",
@@ -620,6 +636,36 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         )
         report["operator_probe_error"] = type(exc).__name__ + ": " + str(exc)
     dtype = cfg.cache_config.cache_dtype
+    text = cfg.model_config.hf_text_config
+    full_heads = getattr(text, "num_attention_heads", 0)
+    kv_heads = getattr(text, "num_key_value_heads", 0)
+    fp16_shape = (
+        str(cfg.model_config.dtype) == "torch.float16"
+        and tp > 0
+        and full_heads == 6 * tp
+        and kv_heads == tp
+        and getattr(text, "head_dim", 0) == 256
+    )
+    fp16_reason = (
+        "not_applicable"
+        if dtype not in ("auto", "float16", "bfloat16") or not fp16_shape
+        else "operator_missing:sm70_grouped_fp16_fwd"
+        if not native.get("fp16_grouped", False)
+        else None
+    )
+    paths["fp16_grouped_fp32"] = _row(
+        fp16_reason,
+        kv_cache_dtype=dtype,
+        runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
+        "causal full context; B1 q2..8 or B2..4 q8; capacity<=266240",
+        arithmetic="FP32 probability/PV/numerator/max/sum",
+    )
+    if release_profile and dtype in ("auto", "float16", "bfloat16") and fp16_shape:
+        report["expected_acceleration"] = [
+            name
+            for name in cast(list[str], report["expected_acceleration"])
+            if name not in ("e4m3_grouped_fp32", "long_context", "scalar_tail")
+        ] + ["fp16_grouped_fp32"]
     paths["bm32_paged_prefill"] = _bm32_paged_prefill_report(cfg, native)
     grouped_reason = (
         "kv_dtype"

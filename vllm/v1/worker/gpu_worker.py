@@ -5,7 +5,7 @@
 import gc
 import os
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from copy import deepcopy
 from datetime import timedelta
 from types import NoneType
@@ -533,8 +533,27 @@ class Worker(WorkerBase):
             if current_platform.is_cuda() and current_platform.is_device_capability(70)
             else nullcontext()
         )
-        with warmup_allocator:
-            self.model_runner.profile_run()
+        try:
+            with warmup_allocator:
+                self.model_runner.profile_run()
+        except torch.AcceleratorError:
+            stats = {}
+            with suppress(Exception):
+                stats = torch.accelerator.memory_stats(self.device)
+            free: int | None = None
+            total: int | None = None
+            with suppress(Exception):
+                free, total = current_platform.mem_get_info(self.device)
+            logger.error(
+                "GPU memory profiling failed: allocated=%s reserved=%s "
+                "inactive_split=%s driver_free=%s driver_total=%s bytes",
+                stats.get("allocated_bytes.all.current"),
+                stats.get("reserved_bytes.all.current"),
+                stats.get("inactive_split_bytes.all.current"),
+                free,
+                total,
+            )
+            raise
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
@@ -949,16 +968,39 @@ class Worker(WorkerBase):
             if self._ple_offload_worker_handle is not None
             else {}
         )
-        return {
+        manager = getattr(self.model_runner, "cudagraph_manager", None)
+        mode = (
+            self.compilation_config.cudagraph_mode
+            if manager is None
+            else manager.cudagraph_mode
+        )
+        report = {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
+            "compilation_mode": self.compilation_config.mode.name,
+            "cudagraph_mode": mode.name,
+            "decode_cudagraph_mode": mode.decode_mode().name,
+            "mixed_cudagraph_mode": mode.mixed_mode().name,
             "linear_kernel_selections": selections,
+            "collective_kernel_selections": (
+                self.vllm_config.kernel_config.collective_kernel_selections
+            ),
             "ple_result_transports": transports,
             "ple_disk_row_readers": row_readers,
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
             "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
         }
+        if manager is not None:
+            report["captured_full_decode_tokens"] = sorted(
+                {
+                    desc.num_tokens
+                    for desc in manager.graphs
+                    if desc.cg_mode.name == "FULL"
+                    and desc.uniform_token_count in (None, manager.decode_query_len)
+                }
+            )
+        return report
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

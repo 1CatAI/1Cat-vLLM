@@ -104,3 +104,133 @@ component priorities, isolated counters and current endpoint qualification.
 | `triton_poi_fused_0` | [92, 1, 1] | 0.25 | 0 | 2.496 | 0.000 | 0.624 | 0.624 |
 | `triton_poi_fused_copy__3` | [20, 1, 1] | 0.25 | 0 | 2.400 | 0.000 | 0.602 | 0.602 |
 | `triton_poi_fused_zeros_like_2` | [40, 1, 1] | 0.25 | 0 | 1.952 | 0.000 | 0.488 | 0.488 |
+
+## Boundary baselines and actual shared-down traffic
+
+The standalone boundary benchmark uses CUDA 12.8, Torch 2.10/cu128 and the
+full-NVLink V100-SXM2-32GB machine. It holds the shared GPU lock. This is a
+research microbenchmark, with no model computation or runtime dispatch change.
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 TORCH_CUDA_ARCH_LIST=7.0 \
+  python benchmarks/benchmark_sm70_decode_boundaries.py --output boundaries.json
+```
+
+The graph contains 64 dependent producer/consumer pairs. Kernel-side global
+timestamps bracket each boundary; the retained interior intervals exclude
+the first and last pair. The global timer is coarse, so use the mean and
+range alongside the quantized median. These intervals include the producer's
+last store and timestamp instructions; they are not a pure scheduling-gap
+measurement and cannot be multiplied by the model kernel count to close TPOT.
+
+| Probe | Median us | Mean us | Sample range us |
+| --- | ---: | ---: | ---: |
+| Instrumented dependent graph boundary, 558 intervals | 1.024 | 1.2894 | 0.608–2.048 |
+| GPU 0–1 system release/acquire flag round trip | 4.8647 | 4.8686 | 4.8320–4.8925 |
+
+The flag test measures nine samples of 4096 round trips after warmup. The two
+kernels run on separate GPU streams and validate every final generation;
+launch skew is amortized over the loop. It is a two-GPU baseline without
+model contention, not a four-rank all-reduce or per-layer synchronization time.
+
+An isolated cold-cache NCU replay of the ordinary shared-down cuBLAS GEMV
+uses a real captured input and checkpoint weight, FP16 operands and FP32
+accumulation. The addressed weight is 819,200 bytes; actual DRAM reads include
+other traffic and are reported separately.
+
+| Grid | Registers/thread | Actual DRAM read B | Actual DRAM write B | NCU us | Read GB/s | Read floor us at 750 GB/s | NCU minus read floor us |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 320×1×1 | 50 | 825152 | 0 | 6.624 | 124.57 | 1.1002 | 5.5238 |
+
+Zero DRAM writes does not mean zero logical output: stores can remain in
+cache. NCU cold replay and profiler clock control differ from the graph-node
+trace above; these counters do not replace its service times. Ordinary-user
+counter access was unavailable, so this isolated sample ran with elevated
+profiling permission, without changing driver permissions. Other kernel
+families still require actual traffic counters.
+
+## C1 SiLU/down fusion decision
+
+The cold 48-layer operator comparison improved from 7.7733 to 6.5920 us,
+with two kernels becoming one. The matched installed-artifact model gate
+rejects it. Both endpoint arms use TP4, 262144 startup capacity, fixed 8192
+input / 513 output tokens, FP16 dense/activations/KV, FP32 state, CUDA graphs,
+disk-mapped ngrams and no MTP. The source-complete artifact is built from
+native source `f551e0afea` with Python kernel source `6400e9a04d`.
+
+| Arm | C1 median ms/token | Sample range ms/token | Task scores | Natural EOS |
+| --- | ---: | ---: | ---: | ---: |
+| Existing registry disables the fusion | 11.04115 | 10.92117–11.17972 | 36/36 | 36/36 |
+| Fusion enabled | 11.06298 | 10.86482–11.24090 | 36/36 | 35/36 |
+
+There is no demonstrated endpoint speedup. MBPP-16 stops at 628 tokens in
+the control, but reaches 4096 tokens and repeats a long final-answer line
+eleven times in the candidate. The 32-position C1 focus also fails the
+unchanged KL/raw-logit gates, despite 100% top-1 agreement. Further full
+distribution collection, C4 smoke and promotion tracing were skipped after
+the C1 quality failure. [PR #872](https://github.com/1CatAI/1Cat-vLLM/pull/872)
+is closed without merge; its model kernel count is not presented as measured.
+
+The accepted path therefore retains the earlier graph budget and priority
+order. Using its 2.7250-GB addressed-weight audit gives a 3.6334-ms weight-only
+floor at 750 GB/s, approximately 7.41 ms below this new control endpoint;
+this difference is not a wall-clock decomposition. The 7.5/6-ms phase targets
+remain unmet. PLE phase timings are being collected before selecting a cache
+or publish-path change.
+
+## PLE publish, lookup, writeback and flag phases
+
+An observer-only C1 run uses the same installed artifact with the rejected
+SiLU/down kernel disabled. It captures a fixed 8K/64 timing-only request and
+four seeded natural requests, yielding 1196 single-token CPU requests. The
+four natural requests finish normally. CPU and notifier records are joined
+by request ordinal, with matching token counts checked. These CPU timings
+include hook overhead and are not GPU critical-path waits.
+
+| Instrumented phase | Median us | p95 us |
+| --- | ---: | ---: |
+| Notifier start to socket send, including D2H-event wait | 9372.9 | 10097.4 |
+| Socket send call | 188.7 | 295.5 |
+| Socket-send start to CPU dispatch | 246.5 | 337.6 |
+| Previous-result consumption/reset wait | 46.3 | 66.4 |
+| Ngram key computation | 143.6 | 192.7 |
+| Mmap row gather | 1610.2 | 1945.6 |
+| Staging overhead beyond row gather | 72.0 | 98.5 |
+| Result fan-out plus four flag publications | 89.0 | 177.6 |
+| Four flag calls, included in fan-out above | 23.2 | 47.7 |
+| Complete CPU handler | 1942.0 | 2432.6 |
+
+The notifier's 9.37-ms wait includes queued preceding GPU work. It must not
+be labeled a 9.37-ms PLE lookup penalty. Socket-call and dispatch intervals
+overlap; nested phase medians must not be added to form a wall budget.
+The 100-ms process samples enclosing the decode campaign, including its
+interleaved prefills, record 19008 major and 22501 minor faults. This supports
+investigating cold file-page reads before treating flag publication as the
+main PLE cost. A fresh graph trace is still needed to measure the resulting
+GPU critical-path wait.
+
+A decode-only cold-start LRU simulation, without prefill warming, gives
+22.7% individual-row hits and 14.5% all-row hits with 8192 rows. Increasing
+to 65536 rows gives 24.4% row hits and 16.1% all-row hits. This is a trace
+simulation, not a measured UVA cache speedup; a cache still needs an efficient
+CPU miss path and byte/sequence checks.
+
+CPU-only probes rotate 16 recorded row sets from the real checkpoint. Cold
+arms discard only the selected file pages, with major faults confirming
+physical cold reads. Warm arms retain them. Nine alternating repetitions
+check every output byte and retain the table as mmap throughout.
+
+| Lookup experiment | Warm mean-per-case median us | Cold mean-per-case median us |
+| --- | ---: | ---: |
+| Serial row copies | 28.24 | 1450.12 |
+| Sixteen worker threads | 409.59 | 846.63 |
+| Selected-page read-ahead then serial copies | 80.30 | 246.13 |
+| Residency check then read-ahead for cold pages | 89.29 | 295.65 |
+
+The thread-pool variant has excessive warm overhead. Selected-page read-ahead
+is promising for misses, but these are CPU microbenchmarks; no model speedup
+or default admission follows from them. The probe never prefaults the whole
+table. Residency is a snapshot, and a page can be reclaimed before copying;
+the original file-backed read remains the correctness path. See the Linux
+[mincore API](https://man7.org/linux/man-pages/man2/mincore.2.html) and
+[madvise API](https://man7.org/linux/man-pages/man2/madvise.2.html).

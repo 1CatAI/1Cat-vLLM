@@ -904,6 +904,12 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=(
+                self.quant_config
+                if self.quant_config is not None
+                and self.quant_config.get_name() == "gguf"
+                else None
+            ),
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -917,6 +923,20 @@ class Qwen4ExpForCausalLM(
             self, self.model_config.dtype, self.vllm_config
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+
+    def prepare_loaded_linear_weights(self) -> None:
+        """Prepare dense routes discovered by checkpoint format loaders."""
+        previous = {
+            module: getattr(module, "quant_method", None) for module in self.modules()
+        }
+        enable_qwen38_sm70_fp16_gemv(self, self.model_config.dtype, self.vllm_config)
+        enable_qwen38_sm70_fp16_fused_hc(
+            self, self.model_config.dtype, self.vllm_config
+        )
+        for module in self.modules():
+            method = getattr(module, "quant_method", None)
+            if method is not None and method is not previous.get(module):
+                method.process_weights_after_loading(module)
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""

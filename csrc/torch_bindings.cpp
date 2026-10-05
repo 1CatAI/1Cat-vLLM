@@ -197,6 +197,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
            &gguf_affine_blas_sm70_out);
   ops.def(
+      "gguf_small_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
+      "int num_experts, int group_size) -> ()");
+  ops.impl("gguf_small_grouped_vec_sm70_out", torch::kCUDA,
+           &gguf_small_grouped_vec_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_dequantize_sm70_out(Tensor(a!) out, Tensor weight, int "
+      "source_type) -> ()");
+  ops.impl("gguf_lattice_raw_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_grouped_gate_up_sm70_out(Tensor(a!) gate, Tensor(b!) "
+      "up, Tensor input, Tensor gate_weights, Tensor up_weights, Tensor "
+      "offsets, "
+      "Tensor ids, int source_type, int top_k) -> ()");
+  ops.impl("gguf_lattice_raw_grouped_gate_up_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_grouped_gate_up_sm70_out);
+  ops.def(
       "gguf_lattice_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
       "Tensor stats, int source_type, int group_size) -> ()");
   ops.impl("gguf_lattice_dequantize_sm70_out", torch::kCUDA,
@@ -325,6 +343,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu, bool preserve_default_partition=False) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+
+  ops.def(
+      "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);
+  ops.def(
+      "sm70_dflash2_fp16_dispatch_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, Tensor weight, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
+           &sm70_dflash2_fp16_dispatch_out);
 
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
@@ -1171,6 +1199,22 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "full_unroll=False, bool fused_chain=False) -> "
       "()");
   custom_ar.impl("sm70_qwen38_hc_batch", torch::kCUDA, &sm70_qwen38_hc_batch);
+  custom_ar.def(
+      "sm70_qwen38_hc_down_local(Tensor input, Tensor packed, "
+      "Tensor(a!) partials, Tensor(b!) output, int rank) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_down_local", torch::kCUDA,
+                 &sm70_qwen38_hc_down_local);
+  custom_ar.def(
+      "sm70_qwen38_hc_up_local(Tensor lora, Tensor packed, Tensor branches, "
+      "Tensor(a!) output, int rank) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_up_local", torch::kCUDA,
+                 &sm70_qwen38_hc_up_local);
+  custom_ar.def(
+      "sm70_qwen38_hc_replicated(Tensor input, Tensor packed_down, "
+      "Tensor packed_up, Tensor(a!) partials, Tensor(b!) lora, "
+      "Tensor(c!) output, Tensor(d!) injection) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_replicated", torch::kCUDA,
+                 &sm70_qwen38_hc_replicated);
   custom_ar.def(
       "sm70_qwen38_hc_gate_mix(int fa, Tensor local_gate, Tensor branches, "
       "Tensor! out) -> ()");

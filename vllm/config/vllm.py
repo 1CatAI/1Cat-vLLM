@@ -341,8 +341,8 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
         or envs.VLLM_PLE_CPU_OFFLOAD
     ):
         reason = "existing explicit PLE placement takes precedence"
-    elif cfg.load_config.load_format not in ("auto", "safetensors"):
-        reason = "requires file-backed safetensors shards"
+    elif cfg.load_config.load_format not in ("auto", "safetensors", "gguf"):
+        reason = "requires file-backed safetensors or GGUF shards"
     elif cfg.parallel_config.prefill_context_parallel_size != 1:
         reason = "PLE worker does not yet support prefill context-parallel groups"
     elif (
@@ -386,7 +386,10 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
                 for layer_id in layers
             ]
             if any(method is None for method in methods):
-                reason = "checkpoint metadata does not provide raw E4M3 PLE storage"
+                reason = (
+                    "checkpoint metadata does not provide raw E4M3 or packed GGUF "
+                    "PLE storage"
+                )
     policy.ple_disk_cascade_reason = reason
     policy.ple_disk_cascade_active = reason is None
     return policy.ple_disk_cascade_active
@@ -668,8 +671,12 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
         )
 
     sm70_gemma_tp = (
-        envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
-        and cfg.parallel_config.tensor_parallel_size == 2
+        (
+            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+            and cfg.parallel_config.tensor_parallel_size == 2
+        )
+        # TP4 admission is checked against the active communicator by the pass.
+        or cfg.parallel_config.tensor_parallel_size == 4
     )
     if sm70_gemma_tp:
         return (

@@ -92,13 +92,13 @@ def _compact_target_reference_rows_kernel(
     tl.store(reference_rows + row, reference)
 
 
-def _compact_target_reference_rows_gpu(
+def _compact_target_reference_flags(
     probe: torch.Tensor,
     temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
-) -> np.ndarray:
-    """Copy only fallback decisions, preserving the request-slot parameter map."""
+) -> torch.Tensor:
+    """Compute graph-capturable fallback flags with the request-slot map."""
     rows, width = probe.shape
     result = torch.empty(rows, device=probe.device, dtype=torch.bool)
     _compact_target_reference_rows_kernel[(rows,)](
@@ -113,7 +113,21 @@ def _compact_target_reference_rows_gpu(
         triton.next_power_of_2(width),
         num_warps=1,
     )
-    return result.cpu().numpy()
+    return result
+
+
+def _compact_target_reference_rows_gpu(
+    probe: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+) -> np.ndarray:
+    """Copy only fallback decisions, preserving the request-slot parameter map."""
+    return (
+        _compact_target_reference_flags(probe, temperatures, top_ps, row_to_request)
+        .cpu()
+        .numpy()
+    )
 
 
 def _compact_target_reference_rows(
@@ -403,6 +417,8 @@ def try_dflash2_sparse_target_rejection(
     sample_hidden_states: torch.Tensor,
     input_batch: InputBatch,
     grammar_output: GrammarOutput | None,
+    *,
+    allow_graph: bool = True,
 ) -> SamplerOutput | DFlash2LogitsFallback | None:
     """Sample compact supports or retain computed logits for exact fallback."""
     if not sm70_dflash2_enabled(
@@ -425,15 +441,36 @@ def try_dflash2_sparse_target_rejection(
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
+    if allow_graph and not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        from .sampler_graph import try_graph_rejection
+
+        result = try_graph_rejection(
+            model,
+            speculator,
+            rejection_sampler,
+            sample_hidden_states,
+            input_batch,
+            sparse_draft_logits,
+        )
+        if result is not None:
+            return result
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
     idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
-    # Preserve the small single-request path. The large-vocabulary reference
-    # uses stable radix order; retain the existing fallback for other sorts.
-    retain_ties = idx.size > 1 and getattr(states, "vocab_size", 0) >= 32768
+    # The reference sampler dispatches on logit rows, not request count.
+    # A single q8 verifier has eight rows and uses the same large-vocabulary
+    # radix tie order as a batch. Retain every cutoff tie in that case too.
+    retain_ties = (
+        int(input_batch.cu_num_logits_np[-1]) >= 2
+        and getattr(states, "vocab_size", 0) >= 32768
+    )
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
-    if hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
+    if retain_ties and hasattr(model, "get_compact_target_probe_with_fallback"):
+        target_topk_ids, target_topk_logits, fallback = (
+            model.get_compact_target_probe_with_fallback(sample_hidden_states, probe_k)
+        )
+    elif hasattr(model, "get_topk_tokens_and_logits_with_fallback"):
         target_topk_ids, target_topk_logits, fallback = (
             model.get_topk_tokens_and_logits_with_fallback(
                 sample_hidden_states, probe_k

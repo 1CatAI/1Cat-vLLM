@@ -15,6 +15,10 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.gguf import (
+    GGUFOperatorCapability,
+    decoder_family,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -44,6 +48,7 @@ from vllm.model_executor.layers.quantization.gguf_native import (
     pad_weight_tail,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
@@ -64,6 +69,8 @@ class GGUFConfig(QuantizationConfig):
         self.unquantized_modules = unquantized_modules or []
         self.linear_layouts: dict[str, GGUFLinearLayout] = {}
         self.fallback_reasons: dict[str, str] = {}
+        self.native_expert_storage = False
+        self.canonical_expert_storage = False
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -117,8 +124,20 @@ class GGUFConfig(QuantizationConfig):
                 prefix, self.unquantized_modules, self.packed_modules_mapping
             ):
                 return UnquantizedEmbeddingMethod()
+            if isinstance(layer, ParallelLMHead):
+                return GGUFLMHeadMethod(self)
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, RoutedExperts):
+            if self.native_expert_storage:
+                if self.canonical_expert_storage:
+                    from .gguf_turbomind_moe import GGUFTurboMindMoEMethod
+
+                    return GGUFTurboMindMoEMethod(self, layer.moe_config)
+                from vllm.model_executor.layers.quantization.gguf_moe import (
+                    GGUFNativeMoEMethod,
+                )
+
+                return GGUFNativeMoEMethod(self, layer.moe_config)
             # TODO: Select UnquantizedFusedMoEMethod on unquantized layers.
             return GGUFMoEMethod(self, layer.moe_config)
         return None
@@ -456,7 +475,7 @@ def _apply_gguf_embedding_fake(
     dtype: torch.dtype | None = None,
     native_enabled: bool = True,
 ) -> torch.Tensor:
-    return torch.empty(x.shape[0], hidden_size, dtype=dtype, device=x.device)
+    return torch.empty((*x.shape, hidden_size), dtype=dtype, device=x.device)
 
 
 try:
@@ -538,7 +557,56 @@ class GGUFLinearMethod(LinearMethodBase):
         set_weight_attrs(qweight_type, extra_weight_attrs)
         layer.register_parameter("qweight_type", qweight_type)
 
+    def _prepare_dense_weight(self, layer: torch.nn.Module) -> bool:
+        """Restore ordinary floating projections to the dense linear lifecycle.
+
+        A floating shard inside a mixed projection is still a GGUF projection.
+        Only a complete, unpacked matrix with no input-layout transform can
+        replace the method, without changing the layer's forward semantics.
+        """
+        if isinstance(self, GGUFEmbeddingMethod) or self.layout is not None:
+            return False
+        qweight = layer.qweight
+        if qweight.data_container:
+            ids = (
+                ["q", "k", "v"] if "q" in qweight.shard_id else sorted(qweight.shard_id)
+            )
+            sources = [
+                (
+                    qweight.data_container[qweight.shard_id_map[index]],
+                    layer.qweight_type.shard_weight_type[index],
+                )
+                for index in ids
+            ]
+        else:
+            sources = [(qweight, layer.qweight_type.weight_type)]
+        if not sources or any(
+            source_type not in UNQUANTIZED_TYPES
+            or weight.ndim != 2
+            or weight.dtype != self.params_dtype
+            or not weight.is_floating_point()
+            for weight, source_type in sources
+        ):
+            return False
+        expected_n, expected_k = qweight.tensor_shape
+        if (
+            any(weight.shape[1] != expected_k for weight, _ in sources)
+            or sum(weight.shape[0] for weight, _ in sources) != expected_n
+        ):
+            return False
+        weights = [weight.to(qweight.device) for weight, _ in sources]
+        weight = weights[0] if len(weights) == 1 else torch.cat(weights, dim=0)
+        layer.register_parameter("weight", Parameter(weight.contiguous(), False))
+        # Replace the layer's references, not shared checkpoint storage.
+        del layer.qweight
+        del layer.qweight_type
+        layer.quant_method = UnquantizedLinearMethod()
+        layer.quant_method.process_weights_after_loading(layer)
+        return True
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self._prepare_dense_weight(layer):
+            return
         ready = self.native_enabled and native_available()
         self.native_admission: dict[str, Any] = {
             "enabled": self.native_enabled,
@@ -569,7 +637,10 @@ class GGUFLinearMethod(LinearMethodBase):
         if (
             ready
             and layer.qweight.device.type == "cuda"
-            and not isinstance(self, GGUFEmbeddingMethod)
+            and (
+                not isinstance(self, GGUFEmbeddingMethod)
+                or getattr(self, "canonical_lm_head", False)
+            )
         ):
             qweight = layer.qweight
             from vllm.model_executor.layers.quantization.gguf_turbomind import (
@@ -909,6 +980,145 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
             dtype=self.params_dtype,
             native_enabled=self.native_enabled,
         )
+
+
+def _gguf_lm_head_projection(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    k_ld: int,
+    q_ld: int,
+    minimum_m: int,
+    maximum_m: int,
+    native_enabled: bool,
+    prefill_min_m: int,
+    source_type: int = int(WeightType.Q4_K),
+    bits: int = 4,
+    group_size: int = 32,
+) -> torch.Tensor:
+    rows = x.numel() // x.shape[-1]
+    if minimum_m <= rows <= maximum_m:
+        return torch.ops.vllm.prepared_gguf_projection(
+            x,
+            codes,
+            stats,
+            None,
+            0,
+            bits,
+            group_size,
+            k_ld,
+            q_ld,
+            raw.shape[0],
+            raw.shape[0],
+            [],
+            [],
+        )
+    return fused_mul_mat_gguf(x, raw, source_type, native_enabled, prefill_min_m)
+
+
+def _gguf_lm_head_projection_fake(
+    x: torch.Tensor,
+    raw: torch.Tensor,
+    codes: torch.Tensor,
+    stats: torch.Tensor,
+    k_ld: int,
+    q_ld: int,
+    minimum_m: int,
+    maximum_m: int,
+    native_enabled: bool,
+    prefill_min_m: int,
+    source_type: int = int(WeightType.Q4_K),
+    bits: int = 4,
+    group_size: int = 32,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], raw.shape[0]), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="gguf_lm_head_projection",
+    op_func=_gguf_lm_head_projection,
+    fake_impl=_gguf_lm_head_projection_fake,
+)
+
+
+class GGUFLMHeadMethod(GGUFEmbeddingMethod):
+    """Vocabulary projection policy with separate embedding storage semantics."""
+
+    def process_weights_after_loading(self, layer):
+        weight_type = layer.qweight_type.weight_type
+        raw = layer.qweight.detach()
+        calibration = {
+            (int(WeightType.Q4_K), (62080, 2880)): (2, 16),
+            (int(WeightType.Q6_K), (62080, 2100)): (1, 20),
+        }.get((weight_type, tuple(raw.shape)))
+        minimum_m, maximum_m = calibration or (2, 16)
+        reason = None
+        if not self.native_enabled:
+            reason = "disabled_by_kernel_config"
+        elif self.params_dtype != torch.float16:
+            reason = "requires_fp16_activations"
+        elif raw.device.type != "cuda" or not current_platform.is_device_capability(70):
+            reason = "requires_sm70"
+        elif calibration is None:
+            reason = "lm_head_shape_or_format_has_no_calibration"
+        self.canonical_lm_head = reason is None
+        self.lm_head_capability = (
+            GGUFOperatorCapability(
+                decoder_family(weight_type),
+                quant_type_name(weight_type),
+                "gguf_lm_head_projection",
+                True,
+                min_m=minimum_m,
+                max_m=maximum_m,
+            )
+            if self.canonical_lm_head
+            else None
+        )
+        super().process_weights_after_loading(layer)
+        if self.canonical_lm_head and self.canonical_projections:
+            assert self.lm_head_capability is not None
+            # Keep the faster M1 route and unmeasured M intervals. This raw
+            # parameter is separate from the canonical streams and embedding.
+            layer.register_parameter(
+                "gguf_lm_head_raw", Parameter(pad_weight_tail(raw, weight_type), False)
+            )
+            self.native_admission["lm_head"] = {
+                "operator": self.lm_head_capability.operator,
+                "min_m": minimum_m,
+                "max_m": maximum_m,
+                "reason": None,
+                "raw_fallback": "outside_measured_m_band",
+            }
+        else:
+            self.native_admission["lm_head"] = {
+                "operator": "gguf_lm_head_projection",
+                "min_m": minimum_m,
+                "max_m": maximum_m,
+                "reason": reason or "canonical_kernel_unavailable",
+            }
+
+    def apply(self, layer, x, bias=None):
+        if hasattr(layer, "gguf_lm_head_raw"):
+            assert self.lm_head_capability is not None
+            projection = layer.gguf_tm_projections[0]
+            output = torch.ops.vllm.gguf_lm_head_projection(
+                x,
+                layer.gguf_lm_head_raw,
+                projection.codes,
+                projection.stats,
+                projection.gguf_tm_k_ld,
+                projection.gguf_tm_q_ld,
+                self.lm_head_capability.min_m,
+                self.lm_head_capability.max_m,
+                self.native_enabled,
+                self.prefill_min_m,
+                projection.source_type,
+                projection.kernel.bits,
+                projection.kernel.config.group_size,
+            )
+            return output if bias is None else output + bias
+        return super().apply(layer, x, bias)
 
 
 class GGUFUninitializedParameter(UninitializedParameter):

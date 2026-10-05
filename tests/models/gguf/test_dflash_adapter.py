@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import gguf
+import numpy as np
+import pytest
+import torch
+
+from vllm.model_executor.model_loader.gguf_adapters import get_gguf_adapter
+from vllm.model_executor.model_loader.gguf_adapters.dflash import DFlashAdapter
+from vllm.transformers_utils.gguf_config import (
+    gguf_config_dict,
+    gguf_config_from_metadata,
+)
+
+
+def metadata():
+    return json.loads(Path(__file__).with_name("dflash2_metadata.json").read_text())
+
+
+def test_metadata_recovers_dflash2_arithmetic_and_layer_contract():
+    config = gguf_config_from_metadata(metadata())
+    assert config.architectures == ["DFlash2DraftModel"]
+    assert config.dtype == torch.bfloat16
+    assert (config.hidden_size, config.intermediate_size) == (5120, 17408)
+    assert (config.num_attention_heads, config.num_key_value_heads) == (32, 8)
+    assert config.head_dim == 128
+    assert config.layer_types == ["sliding_attention"] * 5
+    assert config.sliding_window == 2048 and config.is_causal is False
+    assert config.dflash_config["target_layer_ids"] == [5, 19, 33, 47, 61]
+    assert config.dflash_config["mask_token_id"] == 248070
+    assert config.dflash_config["block_size"] == 8
+    assert isinstance(get_gguf_adapter(config, tp_size=4), DFlashAdapter)
+
+
+@pytest.mark.parametrize(
+    "key,value,match",
+    [
+        ("dflash.target_layers", [0, 20], "1-based"),
+        ("dflash.target_layers", [20, 6], "ordered"),
+        ("tokenizer.ggml.mask_token_id", 248320, "mask token"),
+        ("dflash.conv_group_size", 17, "incompatible"),
+        ("dflash.attention.sliding_window_pattern", [True], "match layers"),
+        ("dflash.attention.sliding_window", 0, "positive window"),
+    ],
+)
+def test_reject_incompatible_metadata(key, value, match):
+    data = metadata()
+    data[key] = value
+    with pytest.raises(ValueError, match=match):
+        gguf_config_dict(data)
+
+
+def test_real_checkpoint_directory_has_no_unmapped_tensors():
+    directory = json.loads(
+        Path(__file__).with_name("dflash2_tensor_directory.json").read_text()
+    )
+    adapter = get_gguf_adapter(gguf_config_from_metadata(metadata()), tp_size=4)
+    mapping = adapter.build_name_map({t["name"]: None for t in directory})
+    assert len(mapping) == 81
+    assert mapping["fc.weight"] == "fc.weight"
+    assert mapping["enc.output_norm.weight"] == "hidden_norm.weight"
+    assert mapping["blk.4.ffn_conv_base"] == "layers.4.mlp_conv.base_kernel"
+    assert not any("embed_tokens" in name or "lm_head" in name for name in mapping)
+    with pytest.raises(ValueError, match="Unmapped DFlash"):
+        adapter.build_name_map({"blk.5.attn_q.weight": None})
+
+
+def test_explicit_hf_draft_config_selects_native_adapter():
+    config = gguf_config_from_metadata(metadata())
+    del config.gguf_architecture
+    assert isinstance(get_gguf_adapter(config, tp_size=4), DFlashAdapter)
+
+
+def test_dense_dequantization_retains_owned_output_without_an_extra_copy(monkeypatch):
+    adapter = get_gguf_adapter(gguf_config_from_metadata(metadata()), tp_size=4)
+    values = np.ones((4, 32), dtype=np.float32)
+    monkeypatch.setattr(gguf.quants, "dequantize", lambda *_: values)
+    tensor = SimpleNamespace(
+        tensor_type=gguf.GGMLQuantizationType.Q8_0,
+        data=np.zeros((4, 34), dtype=np.uint8),
+        shape=[32, 4],
+    )
+    weight = dict(
+        adapter.weights(
+            {"selector_hidden.weight": tensor},
+            {"selector_hidden.weight": "candidate_selector.hidden_projection.weight"},
+            torch.float32,
+        )
+    )["candidate_selector.hidden_projection.weight"]
+    assert weight.data_ptr() == values.ctypes.data
+
+
+def test_quantized_context_projection_uses_declared_operand_dtype():
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+
+    class Projection(torch.nn.Module):
+        input_size = 32
+        quant_method = SimpleNamespace(params_dtype=torch.float16)
+
+        def forward(self, x):
+            assert x.dtype == torch.float16
+            return x
+
+    draft = DFlashQwen3ForCausalLM.__new__(DFlashQwen3ForCausalLM)
+    torch.nn.Module.__init__(draft)
+    draft.model = SimpleNamespace(fc=Projection(), use_aux_hidden_state=True)
+    inputs = torch.linspace(-1, 1, 32, dtype=torch.float32)
+    assert torch.equal(draft.combine_hidden_states(inputs), inputs.half())
+
+
+def test_release_profile_accepts_local_gguf_draft(tmp_path, monkeypatch, capsys):
+    from vllm.sm70_profiles.profile import main
+
+    path = tmp_path / "draft.gguf"
+    path.write_bytes(b"GGUF")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["profile", "argv", "--json", "--draft", str(path)],
+    )
+    main()
+    argv = json.loads(capsys.readouterr().out)
+    config = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert config["model"] == str(path)
+    assert config["quantization"] == "gguf"
+    assert "revision" not in config
+
+
+def test_text_gguf_target_qualifies_the_same_dflash_pipeline():
+    from vllm.model_executor.models.config import sm70_dflash2_verifier_qualified
+
+    model = SimpleNamespace(
+        architectures=["Qwen3_5ForCausalLM"],
+        dtype=torch.float16,
+        hf_text_config=SimpleNamespace(
+            hidden_size=5120,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            head_dim=256,
+        ),
+    )
+    spec = SimpleNamespace(
+        method="dflash",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(
+            hf_config=gguf_config_from_metadata(metadata())
+        ),
+    )
+    parallel = SimpleNamespace(
+        pipeline_parallel_size=1, enable_dbo=False, ubatch_size=1
+    )
+    assert sm70_dflash2_verifier_qualified(model, spec, parallel)
+    model.hf_text_config.head_dim = 128
+    assert not sm70_dflash2_verifier_qualified(model, spec, parallel)
+
+
+def test_dense_auxiliaries_decode_without_qwen35_norm_offsets():
+    adapter = get_gguf_adapter(gguf_config_from_metadata(metadata()), tp_size=4)
+    data = gguf.quants.quantize(
+        np.arange(4 * 32, dtype=np.float32).reshape(4, 32) / 128,
+        gguf.GGMLQuantizationType.Q8_0,
+    )
+    packed = SimpleNamespace(
+        data=data, tensor_type=gguf.GGMLQuantizationType.Q8_0, shape=[32, 4]
+    )
+    norm = np.full(32, 1.25, dtype=np.float32)
+    tensors = {
+        "selector_predecessor.weight": packed,
+        "blk.0.attn_conv_proj.weight": packed,
+        "blk.0.attn_q.weight": packed,
+        "output_norm.weight": SimpleNamespace(
+            data=norm, tensor_type=gguf.GGMLQuantizationType.F32, shape=[32]
+        ),
+    }
+    weights = dict(
+        adapter.weights(tensors, adapter.build_name_map(tensors), torch.float16)
+    )
+    expected = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType.Q8_0)
+    ).half()
+    assert torch.equal(weights["candidate_selector.predecessor_codebook"], expected)
+    assert torch.equal(
+        weights["layers.0.attention_conv.kernel_projection.weight"], expected
+    )
+    assert torch.equal(weights["norm.weight"], torch.from_numpy(norm).half())
+    assert torch.equal(
+        weights["layers.0.self_attn.q_proj.qweight"], torch.from_numpy(data)
+    )
+    assert "layers.0.self_attn.q_proj.qweight_type" in weights
+    assert "candidate_selector.predecessor_codebook.qweight_type" not in weights
+
+
+def test_gguf_loader_honors_draft_model_config(monkeypatch):
+    from vllm.model_executor.model_loader import gguf_loader
+    from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+
+    target = SimpleNamespace(name="target")
+    draft = SimpleNamespace(dtype=torch.float16, hf_config=SimpleNamespace())
+    engine = SimpleNamespace(
+        model_config=target,
+        device_config=SimpleNamespace(device="cpu"),
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        quant_config=SimpleNamespace(unquantized_modules=[]),
+    )
+    loader = GGUFModelLoader.__new__(GGUFModelLoader)
+    monkeypatch.setattr(loader, "_prepare_weights", lambda *_: "draft.gguf")
+    monkeypatch.setattr(loader, "_get_gguf_weights_map", lambda *_: {})
+    monkeypatch.setattr(loader, "_get_all_gguf_files", lambda *_: [])
+    monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *_: {})
+    loaded = []
+    monkeypatch.setattr(
+        loader, "load_weights", lambda model, config: loaded.append(config)
+    )
+
+    def initialize(*, vllm_config, model_config, prefix):
+        assert vllm_config.model_config is target
+        assert model_config is draft
+        assert prefix == "draft"
+        return torch.nn.Module()
+
+    monkeypatch.setattr(gguf_loader, "initialize_model", initialize)
+    monkeypatch.setattr(gguf_loader, "process_weights_after_loading", lambda *_: None)
+    loader.load_model(engine, draft, prefix="draft")
+    assert loaded == [draft]
+
+
+@pytest.mark.parametrize("source_kind", ["file", "resolved_gguf", "directory"])
+@pytest.mark.parametrize("has_override", [False, True])
+def test_local_draft_mask_override_never_uses_hf_lookup(
+    tmp_path, monkeypatch, source_kind, has_override
+):
+    from vllm.model_executor.models import qwen3_dflash
+
+    model = qwen3_dflash.DFlashQwen3ForCausalLM.__new__(
+        qwen3_dflash.DFlashQwen3ForCausalLM
+    )
+    torch.nn.Module.__init__(model)
+    model.model = SimpleNamespace(mask_token_id=248070)
+    source = tmp_path / "draft.gguf"
+    source.write_bytes(b"GGUF")
+    model.draft_model_config = SimpleNamespace(
+        model=str(tmp_path if source_kind == "directory" else source), revision=None
+    )
+    if source_kind == "resolved_gguf":
+        model.draft_model_config.model = "example/draft:Q8_0"
+        model._gguf_model_path = str(source)
+    expected = torch.arange(4, dtype=torch.float32)
+    if has_override:
+        torch.save(
+            {"mask_token_id": 248070, "embedding": expected},
+            tmp_path / "mask_embedding.pt",
+        )
+    monkeypatch.setattr(
+        qwen3_dflash,
+        "get_hf_file_bytes",
+        lambda *_: pytest.fail("Local draft must not query a HF repository"),
+    )
+    actual = model._read_mask_embedding()
+    if has_override:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        assert actual is None
