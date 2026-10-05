@@ -91,4 +91,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             del draft_inner.topk_indices_buffer
         draft_inner.topk_indices_buffer = target_inner.topk_indices_buffer
 
+    # Specialized draft packs must use the final shared checkpoint head and
+    # be resident before KV allocation/graph warmup reduce startup headroom.
+    prepare_head = getattr(eagle_model, "prepare_sm70_draft_head", None)
+    if prepare_head is not None:
+        prepare_head()
+
     return eagle_model

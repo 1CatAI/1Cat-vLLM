@@ -57,6 +57,9 @@ def test_default_head_preparation_precedes_graph_mode_guard(monkeypatch):
 
     target_head, draft_view = object(), object()
     model = SimpleNamespace(_sm70_draft_head=None, lm_head=target_head)
+    model.prepare_sm70_draft_head = lambda: mtp.Qwen4ExpMTP.prepare_sm70_draft_head(
+        model
+    )
     seen = []
 
     def prepare_head(head):

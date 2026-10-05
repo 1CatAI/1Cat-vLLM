@@ -603,13 +603,17 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         object.__setattr__(self, "_sm70_decode_graph_model", None)
         self._sm70_draft_head = None
 
-    def prepare_sm70_decode_graph_model(self) -> bool:
-        # The proposer shares the target head only after loading. Prepare its
-        # admitted, draft-only QPN8 view before graph capture, never in __init__.
+    def prepare_sm70_draft_head(self) -> None:
+        # Called after checkpoint loading and target-head sharing, before KV
+        # allocation and warmup consume the startup quantization workspace.
         if self._sm70_draft_head is None:
             from .sm70_mtp_head import prepare_mtp_qpn8_head
 
             self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
+
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        # Retain the fallback for callers that do not use the Eagle loader.
+        self.prepare_sm70_draft_head()
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
             return False
         if self._sm70_decode_graph_model is None:
