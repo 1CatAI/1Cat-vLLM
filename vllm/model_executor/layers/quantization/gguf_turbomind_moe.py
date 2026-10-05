@@ -409,7 +409,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 self.params_dtype,
                 retain_raw=self.native_enabled
                 and shard_id in ("w1", "w3")
-                and self.weight_types[shard_id] in (21, 22),
+                and self.weight_types[shard_id] in (18, 21, 22),
             )
         self.builders[shard_id].add(
             expert_id,
