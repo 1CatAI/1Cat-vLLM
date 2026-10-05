@@ -3,8 +3,9 @@
 """Channel-FP8 M8 projection route for the SM70 DFlash2 decoder.
 
 Only the four large decoder projections are quantized. The existing FP16
-matrices and dispatch remain available for context preparation and other batch
-sizes. Norms and the LM head are outside this route.
+matrices remain available for context preparation and other batch sizes. The
+FP8 layout replaces the FP16 M8 packing. Norms and the LM head are outside this
+route.
 """
 
 import torch
@@ -28,32 +29,24 @@ _SHAPES = {
 def _dispatch(
     x: torch.Tensor,
     weight: torch.Tensor,
-    fp16_packed: torch.Tensor,
     codes: torch.Tensor,
     scales: torch.Tensor,
-    tile: int,
-    warps: int,
     split: int,
 ) -> torch.Tensor:
     output = x.new_empty((x.shape[0], weight.shape[0]))
     if x.shape[0] == 8:
         ops.fp8_qpn8_gemm_sm70_out(output, x, codes, scales, split, 2, True, False)
     else:
-        # Preserve the compiled FP16 fallback for prefill and batched drafting.
-        torch.ops._C.sm70_dflash2_fp16_dispatch_out(
-            output, x, fp16_packed, weight, tile, warps
-        )
+        # This is the same mm_out used by the old FP16 M8 dispatch fallback.
+        torch.mm(x, weight.t(), out=output)
     return output
 
 
 def _dispatch_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
-    fp16_packed: torch.Tensor,
     codes: torch.Tensor,
     scales: torch.Tensor,
-    tile: int,
-    warps: int,
     split: int,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]))
@@ -71,8 +64,7 @@ def prepare_dflash2_fp8_m8(layer: torch.nn.Module) -> bool:
     if getattr(layer, "_sm70_dflash2_fp8_codes", None) is not None:
         return True
     if (
-        not getattr(layer, "_sm70_dflash2_fp16_m8", False)
-        or getattr(layer, "_sm70_dflash2_fp16_packed", None) is None
+        not getattr(layer, "_sm70_dflash2_fp8_m8", False)
         or envs.VLLM_BATCH_INVARIANT
         or getattr(layer, "bias", None) is not None
     ):
@@ -123,14 +115,10 @@ def apply_dflash2_fp8_m8(
         return None
     if not torch.compiler.is_compiling() and x.shape[0] != 8:
         return None
-    tile, warps = layer._sm70_dflash2_fp16_geometry
     return torch.ops.vllm.sm70_dflash2_fp8_m8_dispatch(
         x,
         layer.weight,
-        layer._sm70_dflash2_fp16_packed,
         codes,
         layer._sm70_dflash2_fp8_scales,
-        tile,
-        warps,
         layer._sm70_dflash2_fp8_split,
     )
