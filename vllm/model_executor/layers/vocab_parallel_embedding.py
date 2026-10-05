@@ -186,7 +186,7 @@ def _sm70_dflash2_qpn8_row_capacity() -> int:
     config = get_current_vllm_config_or_none()
     spec = getattr(config, "speculative_config", None)
     scheduler = getattr(config, "scheduler_config", None)
-    if spec is None or spec.method != "dflash2" or scheduler is None:
+    if spec is None or spec.method not in ("dflash", "dflash2") or scheduler is None:
         return _SM70_DFLASH2_QPN8_MAX_ROWS
     verify_rows = scheduler.max_num_seqs * (spec.num_speculative_tokens + 1)
     return min(64, max(_SM70_DFLASH2_QPN8_MAX_ROWS, verify_rows))
