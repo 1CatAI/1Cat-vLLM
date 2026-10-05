@@ -33,6 +33,7 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(
       (gate_type == 21 && (up_type == 23 || up_type == 18)) ||
           ((gate_type == 23 || gate_type == 18) && up_type == 21) ||
+          (gate_type == 18 && up_type == 23) ||
           (gate_type == 12 && up_type == 23) ||
           (gate_type == 23 && up_type == 12),
       "GGUF native pair requires a supported original-byte format pair");
@@ -68,6 +69,8 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
     launch_pair<R12, R23>(output, input, gate, up, n, k, stream);
   else if (up_type == 12)
     launch_pair<R23, R12>(output, input, gate, up, n, k, stream);
+  else if (gate_type == 18 && up_type == 23)
+    launch_pair<R18, R23>(output, input, gate, up, n, k, stream);
   else if (gate_type == 21 && up_type == 23)
     launch_pair<R21, R23>(output, input, gate, up, n, k, stream);
   else if (gate_type == 23)
