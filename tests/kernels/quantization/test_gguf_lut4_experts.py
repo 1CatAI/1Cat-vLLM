@@ -29,6 +29,12 @@ def test_canonical_iq4_integer_dot_and_changed_graph(source_type, m, index_dtype
             raw[:, :, :2] = d[..., None].view(np.uint8)
             raw = raw.reshape(n, -1)
             canonical = transcode_lut4(raw, source_type)
+            official = gguf.quants.dequantize(
+                raw, gguf.GGMLQuantizationType(source_type)
+            )
+            np.testing.assert_allclose(
+                canonical.dequantize(), official, rtol=0.001, atol=0
+            )
             codes.append(torch.from_numpy(canonical.codes.copy()))
             coefficients.append(torch.from_numpy(canonical.scales.copy()))
             bank.add(expert, torch.from_numpy(raw), rank=0, size=1, axis=0)
