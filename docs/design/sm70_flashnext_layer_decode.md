@@ -378,3 +378,10 @@ device, dtype, layout and cooperative-residency checks. Normal preparation is
 restricted to the validated sigmoid/FP16-convolution/FP32-state geometry.
 Unsupported metadata retains the original complete forward method. Ordinary
 M1/M5 layer checks and combined GDN/QSA distribution qualification are pending.
+
+The ordinary QSA package passes its M1 complete-layer screen with the original
+shared expert fixed in both arms: 0.285542/0.250563 ms, 37/27 kernels and 9/6
+single-CTA kernels. All three layer outputs and selection IDs match on all four
+ranks. Startup reports zero prepared shared chains. The graph profiler event
+count agrees with retained CUDA driver nodes. MTP4 M5 and model distribution
+qualification are still pending.
