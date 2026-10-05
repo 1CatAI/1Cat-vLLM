@@ -11,6 +11,9 @@ from vllm.model_executor.kernels.gguf import native_gated_pair_capabilities
 from vllm.model_executor.layers.quantization.gguf_iq3_records import (
     signed_index_records,
 )
+from vllm.model_executor.layers.quantization.gguf_iq3_xxs_records import (
+    pack_iq3_xxs_records,
+)
 from vllm.model_executor.layers.quantization.gguf_iq4_native import pack_iq4_xs_records
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
     _prepared_gguf_mixed_projection,
@@ -18,6 +21,13 @@ from vllm.model_executor.layers.quantization.gguf_turbomind import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+_SOURCE_BLOCK_BYTES = {18: 98, 21: 110, 23: 136}
+_SOURCE_PACKERS = {
+    18: pack_iq3_xxs_records,
+    21: signed_index_records,
+    23: pack_iq4_xs_records,
+}
 
 
 def _native_gated_pair(
@@ -95,7 +105,7 @@ def prepare_native_gated_pair(layer, sources, projections, enabled: bool):
         if not layer.prefix.endswith(".gate_up_proj"):
             reason = "requires_gate_up_projection_pair"
         elif any(
-            w.dtype != torch.uint8 or w.shape != (4352, 20 * (110 if t == 21 else 136))
+            w.dtype != torch.uint8 or w.shape != (4352, 20 * _SOURCE_BLOCK_BYTES[t])
             for w, t in sources
         ):
             reason = "gated_pair_shape_or_source_has_no_calibration"
@@ -106,11 +116,9 @@ def prepare_native_gated_pair(layer, sources, projections, enabled: bool):
     if reason is None:
         layer.gguf_native_gated_records = torch.nn.ParameterList(
             Parameter(
-                torch.from_numpy(
-                    (signed_index_records if t == 21 else pack_iq4_xs_records)(
-                        w.detach().cpu().numpy()
-                    )
-                ).to(w.device),
+                torch.from_numpy(_SOURCE_PACKERS[t](w.detach().cpu().numpy())).to(
+                    w.device
+                ),
                 requires_grad=False,
             )
             for w, t in sources
