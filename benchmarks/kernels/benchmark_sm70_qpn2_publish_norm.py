@@ -8,6 +8,7 @@ Use only a leased, fully NVLink-connected SM70 TP4 group.
 """
 
 import argparse
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -149,6 +150,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
     )
 
 
+def graph_kernel_nodes(graph):
+    driver = ctypes.CDLL("libcuda.so.1")
+    handle = ctypes.c_void_p(graph.raw_cuda_graph())
+    size = ctypes.c_size_t()
+    assert driver.cuGraphGetNodes(handle, None, ctypes.byref(size)) == 0
+    nodes = (ctypes.c_void_p * size.value)()
+    assert driver.cuGraphGetNodes(handle, nodes, ctypes.byref(size)) == 0
+    kernels = 0
+    for node in nodes:
+        kind = ctypes.c_int()
+        assert driver.cuGraphNodeGetType(ctypes.c_void_p(node), ctypes.byref(kind)) == 0
+        kernels += kind.value == 0
+    return kernels
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", required=True, type=Path)
@@ -246,7 +262,7 @@ def main():
 
     graphs = []
     for arm in range(2):
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
         start = torch.cuda.Event(enable_timing=True, external=True)
         end = torch.cuda.Event(enable_timing=True, external=True)
         dist.barrier()
@@ -280,6 +296,8 @@ def main():
         samples_us=samples,
         bitwise_four_amplitudes=True,
         compute_nodes_per_arm=2,
+        measured_graph_kernel_nodes=[graph_kernel_nodes(g) for g, _, _ in graphs],
+        eviction_included_in_graph_count=True,
         torch=torch.__version__,
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
     )
