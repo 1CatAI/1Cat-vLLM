@@ -49029,3 +49029,33 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## Flash-Next whole-layer decode campaign, 2026-10-05
+
+The owned line starts from `615710ae5106beeeab87950599fff28977e92962` and targets
+TP4 SM70 M1 decode, M5 verification, <=600 nodes with zero single-CTA kernels,
+and <=7.5 ms ordinary pure decode. PR #831 records disk/mapped PLE at
+10.98609 ms; the newer PR #885 requalification records 11.95157/11.87902 ms
+for reference/native CPU readers. This is separate from the earlier roughly
+97.7 tok/s pinned-UVA lane. The retained normal `fd65333826e9` package has
+identical CUDA/NVFP4 sources to the integration base; their differences are
+four GGUF Python files. Compare the old and recent disk artifacts under the
+same frozen contract before attributing a regressing commit.
+
+Five segment research implementations compile: two-kernel HC with redundant
+combine/norm and producer-pushed tagged packets, including a preceding
+all-reduce variant; one-kernel shared expert with intermediate tiling and
+ordered sums; one-kernel GDN recurrence plus gated norm with all M5 states;
+QSA selection/expansion/core/merge/gate; and router/expert compute with a
+single multiwarp router CTA, fused intermediate tiles and ordered W2 sums.
+No last-finisher CTA or floating atomic reduction is used. Cooperative launches
+ensure residency where required and do not contain a grid barrier.
+GPU measurements and distribution admission are pending. No route/default
+change or endpoint saving is accepted. Retain exclusions and exact-shape
+contracts in [the campaign record](sm70_flashnext_layer_decode.md).
+
+For this owner-directed campaign, maximum raw-logit difference is recorded
+without a veto, and FP32 reassociation does not require bit identity. Matching
+teacher-forcing KL mean/p99/max, top-1 agreement and natural termination remain
+required. Earlier producer/consumer expert and router variants regressed;
+the intermediate-fused and one-router-CTA schedules are distinct experiments.
