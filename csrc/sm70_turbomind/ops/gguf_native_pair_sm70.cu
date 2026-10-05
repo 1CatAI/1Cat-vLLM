@@ -62,11 +62,23 @@ void gguf_native_pair_sm70_out(torch::Tensor output, torch::Tensor input,
                   k % 1024 == 0 && n <= INT_MAX && k <= INT_MAX,
               "GGUF native pair requires M8/N32/K1024");
   const auto block_bytes = [](int64_t type) {
-    return type == 12   ? 144
-           : type == 18 ? 98
-           : type == 21 ? 110
-           : type == 22 ? 82
-                        : 136;
+    switch (type) {
+      case 12:
+        return R12::kBlockBytes;
+      case 17:
+        return R17::kBlockBytes;
+      case 18:
+        return R18::kBlockBytes;
+      case 21:
+        return R21::kBlockBytes;
+      case 22:
+        return R22::kBlockBytes;
+      case 23:
+        return R23::kBlockBytes;
+      default:
+        TORCH_CHECK(false, "Unsupported original pair format");
+    }
+    return 0;
   };
   TORCH_CHECK(gate.numel() == n * (k / 256) * block_bytes(gate_type) &&
                   up.numel() == n * (k / 256) * block_bytes(up_type),
