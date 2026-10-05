@@ -94,7 +94,8 @@ def main():
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                candidate = owner.apply(x, sd, su)
+                for _ in range(16):
+                    candidate = owner.apply(x, sd, su)
             for iteration in range(32):
                 if rank == 0 and iteration % 7 == 0:
                     time.sleep(0.002)
@@ -116,7 +117,7 @@ def main():
                     graph.replay()
             b.record()
             torch.accelerator.synchronize()
-            times.append(a.elapsed_time(b) * 1000 / 200 / len(graphs))
+            times.append(a.elapsed_time(b) * 1000 / 200 / len(graphs) / 16)
         rows.append(dict(m=m, graph_us=times, relative_max=worst))
     records = [None] * 4
     dist.all_gather_object(records, rows)

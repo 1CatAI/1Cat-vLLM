@@ -38,7 +38,7 @@ def test_codec_official_reference(source):
 
 
 @pytest.mark.parametrize("source", [8, 12, 13, 14, 20, 23])
-@pytest.mark.parametrize("m,split", [(1, 1), (5, 2), (8, 4)])
+@pytest.mark.parametrize("m,split", [(1, 1), (5, 2), (8, 4), (20, 2)])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_projection_official_and_graph(source, m, split):
     if torch.cuda.get_device_capability() != (7, 0):
@@ -51,8 +51,10 @@ def test_projection_official_and_graph(source, m, split):
     payload = [torch.from_numpy(p).cuda() for p in pack(fmt, q, scale, minimum, group)]
     x = torch.randn(m, k, device="cuda", dtype=torch.float16)
     output = torch.empty(m, 69, device="cuda", dtype=torch.float16)[:, 3:67]
-    ws = torch.empty(2 * split * 256, device="cuda", dtype=torch.float32)
-    counter = torch.zeros(2, device="cuda", dtype=torch.int32)
+    ws = torch.empty(
+        2 * ((m + 7) // 8) * split * 256, device="cuda", dtype=torch.float32
+    )
+    counter = torch.zeros(2 * ((m + 7) // 8), device="cuda", dtype=torch.int32)
     official = torch.from_numpy(
         gguf.quants.dequantize(raw, gguf.GGMLQuantizationType(source))
     ).cuda()
@@ -90,11 +92,11 @@ def test_projection_official_and_graph(source, m, split):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_reject_m20_without_launch():
+def test_reject_m33_without_launch():
     import vllm._C  # noqa: F401
 
-    x = torch.empty(20, 256, device="cuda", dtype=torch.float16)
-    with pytest.raises(RuntimeError, match="1..8"):
+    x = torch.empty(33, 256, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="1..32"):
         torch.ops._C.gguf_dense_segments_sm70_out(
             x,
             [],

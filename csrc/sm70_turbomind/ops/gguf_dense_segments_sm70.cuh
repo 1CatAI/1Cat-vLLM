@@ -293,6 +293,13 @@ __global__ void __launch_bounds__(32 * W)
   extern __shared__ uint4 smem[];
   __shared__ int last;
   const int tile = blockIdx.x, sp = blockIdx.y;
+  const int first_row = blockIdx.z * 8;
+  const int scratch_tile = blockIdx.z * gridDim.x + tile;
+  M = min(8, M - first_row);
+  x += first_row * ldx;
+  for (int i = 0; i < segs.nseg; ++i)
+    segs.s[i].out += first_row * segs.s[i].out_ld;
+  if (segs.sgate) segs.sgate += first_row;
   int si = 0;
 #pragma unroll
   for (int i = 1; i < MAXSEG; ++i)
@@ -334,13 +341,13 @@ __global__ void __launch_bounds__(32 * W)
     if (split == 1)
       write_out(sg, t, v, s, M, segs.sgate);
     else
-      ws[(static_cast<size_t>(tile) * split + sp) * 256 + v] = s;
+      ws[(static_cast<size_t>(scratch_tile) * split + sp) * 256 + v] = s;
   }
   if (split == 1) return;
   __threadfence();
   __syncthreads();
   if (threadIdx.x == 0) {
-    last = atomicAdd(cnt + tile, 1) == split - 1;
+    last = atomicAdd(cnt + scratch_tile, 1) == split - 1;
     if (last) __threadfence();
   }
   __syncthreads();
@@ -348,10 +355,11 @@ __global__ void __launch_bounds__(32 * W)
   for (int v = threadIdx.x; v < 256; v += 32 * W) {
     float s = 0.f;
     for (int p = 0; p < split; ++p)
-      s += __ldcg(ws + (static_cast<size_t>(tile) * split + p) * 256 + v);
+      s += __ldcg(ws + (static_cast<size_t>(scratch_tile) * split + p) * 256 +
+                  v);
     write_out(sg, t, v, s, M, segs.sgate);
   }
-  if (threadIdx.x == 0) cnt[tile] = 0;
+  if (threadIdx.x == 0) cnt[scratch_tile] = 0;
 }
 
 template <int W>
@@ -364,8 +372,8 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         dense_mv<W>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   }
-  dense_mv<W><<<dim3(tiles, split), 32 * W, smem, st>>>(segs, x, ldx, M, K, S,
-                                                        G, split, ws, cnt);
+  dense_mv<W><<<dim3(tiles, split, (M + 7) / 8), 32 * W, smem, st>>>(
+      segs, x, ldx, M, K, S, G, split, ws, cnt);
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "dense_mv launch: ", cudaGetErrorString(e),
               " tiles=", tiles, " split=", split, " W=", W, " smem=", smem);
@@ -381,8 +389,8 @@ void gguf_dense_segments_sm70_out(
     std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
     torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
-                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 8,
-              "input must be CUDA FP16 [1..8, K] with contiguous rows");
+                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 32,
+              "input must be CUDA FP16 [1..32, K] with contiguous rows");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -452,10 +460,11 @@ void gguf_dense_segments_sm70_out(
     tiles += (s.n + 31) / 32;
   }
   TORCH_CHECK(
-      ws.numel() >= int64_t{tiles} * split * 256 && cnt.numel() >= tiles,
+      ws.numel() >= int64_t{tiles} * ((x.size(0) + 7) / 8) * split * 256 &&
+          cnt.numel() >= tiles * ((x.size(0) + 7) / 8),
       "split workspace or counter storage is too small");
   const int M = static_cast<int>(x.size(0));
-  TORCH_CHECK(M <= 8);
+  TORCH_CHECK(M <= 32);
   const int S = static_cast<int>((K + 31) / 32);
   const int G = (S + 3) / 4;
   auto st = at::cuda::getCurrentCUDAStream();

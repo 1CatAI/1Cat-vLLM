@@ -83,7 +83,7 @@ def _prepared_gguf_projection(
         from .gguf_dense_hmma import apply_segments, restore_and_apply
 
         out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
-        if rows.shape[0] <= 8:
+        if rows.shape[0] <= 8 or rows.shape[0] == 20:
             apply_segments(
                 rows, [codes], [stats], [cache], [decoder], [output_size], out, [out]
             )

@@ -79,6 +79,13 @@ __global__ void __launch_bounds__(32 * W) swiglu_mv(SwArgs a) {
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int npair = (a.I + 31) / 32;
   const int p = blockIdx.x, sp = blockIdx.y;
+  const int first_row = blockIdx.z * 8;
+  a.M = min(8, a.M - first_row);
+  a.x += first_row * a.ldx;
+  a.h += first_row * a.I;
+  a.sg += first_row;
+  a.ws += blockIdx.z * (npair + 1) * a.split * 512;
+  a.cnt += blockIdx.z * (npair + 1);
   half2* lut = reinterpret_cast<half2*>(smem + W * 256);
   if (p == npair) {  // shared gate dot (only split 0)
     if (sp != 0) return;
@@ -179,7 +186,7 @@ void launch_sw(const SwArgs& a) {
         swiglu_mv<W>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   }
   const int npair = (a.I + 31) / 32;
-  swiglu_mv<W><<<dim3(npair + 1, a.split), 32 * W, smem,
+  swiglu_mv<W><<<dim3(npair + 1, a.split, (a.M + 7) / 8), 32 * W, smem,
                  at::cuda::getCurrentCUDAStream()>>>(a);
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "swiglu_mv launch: ", cudaGetErrorString(e));
@@ -193,8 +200,8 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x, std::vector<torch::Tensor> g,
                                   torch::Tensor ws, torch::Tensor cnt,
                                   int64_t split, int64_t warps) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
-                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 8,
-              "input must be CUDA FP16 [1..8, K]");
+                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 32,
+              "input must be CUDA FP16 [1..32, K]");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -223,7 +230,8 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x, std::vector<torch::Tensor> g,
   TORCH_CHECK(wg.numel() == x.size(1) && sg.numel() >= x.size(0),
               "invalid shared gate size");
   const int64_t tiles = (h.size(1) + 31) / 32, groups = (x.size(1) + 127) / 128;
-  TORCH_CHECK(ws.numel() >= tiles * split * 512 && cnt.numel() >= tiles,
+  TORCH_CHECK(ws.numel() >= ((x.size(0) + 7) / 8) * (tiles + 1) * split * 512 &&
+                  cnt.numel() >= ((x.size(0) + 7) / 8) * (tiles + 1),
               "shared-expert workspace or counters too small");
   for (int i = 0; i < 2; ++i) {
     auto& packed = i == 0 ? g : u;
@@ -257,7 +265,7 @@ void gguf_shared_gate_up_sm70_out(torch::Tensor x, std::vector<torch::Tensor> g,
   a.K = static_cast<int>(x.size(1));
   a.I = static_cast<int>(I);
   a.split = static_cast<int>(split);
-  TORCH_CHECK(a.M <= 8);
+  TORCH_CHECK(a.M <= 32);
   switch (warps) {
     case 4:
       launch_sw<4>(a);

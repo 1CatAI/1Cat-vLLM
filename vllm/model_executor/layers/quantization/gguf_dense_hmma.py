@@ -25,8 +25,8 @@ def workspace(device, shared=False):
             stats=torch.empty(8 * 1024 * 1024, device=device, dtype=torch.uint8),
             partial=torch.empty(1024 * 1024, device=device, dtype=torch.float32),
             counters=torch.zeros(1024, device=device, dtype=torch.int32),
-            h=torch.empty((8, 160), device=device, dtype=torch.float16),
-            gate=torch.empty(8, device=device, dtype=torch.float16),
+            h=torch.empty((32, 160), device=device, dtype=torch.float16),
+            gate=torch.empty(32, device=device, dtype=torch.float16),
         )
     return _workspaces[key]
 
@@ -99,7 +99,7 @@ def apply_segments(rows, codes, scales, high, formats, ns, output, views):
     k = rows.shape[1]
     shared = k == 160 or sum(ns) <= 320
     scratch = workspace(rows.device, shared)
-    if 1 <= rows.shape[0] <= 8:
+    if 1 <= rows.shape[0] <= 8 or rows.shape[0] == 20:
         warps = 4 if k == 2560 and sum(ns) > 320 else 8
         if k == 1536:
             warps = 8
@@ -193,7 +193,7 @@ def _shared_expert(
     from .gguf_turbomind import _prepared_gguf_mixed_projection
 
     rows = x.reshape(-1, x.shape[-1]).contiguous()
-    if rows.shape[0] > 8:
+    if rows.shape[0] > 8 and rows.shape[0] != 20:
         gu = _prepared_gguf_mixed_projection(
             rows, gu_codes, gu_stats, gu_caches, gu_specs, gu_cache_bands, gu_blas_bands
         )
