@@ -192,7 +192,7 @@ def main():
                 graphs = {}
                 for name, fn in (("control", reference), ("candidate", candidate)):
                     dist.barrier()
-                    graph = torch.cuda.CUDAGraph()
+                    graph = torch.cuda.CUDAGraph(keep_graph=True)
                     with comm.capture(), torch.cuda.graph(graph):
                         fn()
                     graphs[name] = graph

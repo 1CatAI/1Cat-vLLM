@@ -94,7 +94,7 @@ using Selection = cub::BlockReduce<Choice, kThreads>;
 __global__ __launch_bounds__(kThreads, 2) void router_expert_chain(
     Nvfp4Reader reader, const half* input, const half* router, int* ids,
     float* weights, float* partial, half* output, unsigned* flags,
-    unsigned* epochs, int m) {
+    unsigned* epochs, int m, bool include_router) {
   __shared__ float local[512];
   __shared__ half activation[16];
   __shared__ typename Selection::TempStorage selection;
@@ -106,7 +106,9 @@ __global__ __launch_bounds__(kThreads, 2) void router_expert_chain(
   for (int row = 0; row < m; ++row) {
     const half* x = input + row * kHidden;
     unsigned* ready = flags + row * (kProducers + 1);
-    if (blockIdx.x == kProducers) {
+    if (blockIdx.x == kProducers && !include_router) {
+      if (threadIdx.x == 0) release_gpu(ready, generation);
+    } else if (blockIdx.x == kProducers) {
       // A single multiwarp CTA produces all logits and exact top-10.
       // Warp MMA columns are independent experts, with FP32 accumulation.
       for (int bank = 0; bank < 2; ++bank) {
@@ -270,7 +272,8 @@ __global__ __launch_bounds__(kThreads, 2) void router_expert_chain(
 void run_chain(torch::Tensor x, torch::Tensor router, torch::Tensor ids,
                torch::Tensor weights, torch::Tensor w13, torch::Tensor s13,
                torch::Tensor w2, torch::Tensor s2, torch::Tensor partial,
-               torch::Tensor out, torch::Tensor flags, torch::Tensor epochs) {
+               torch::Tensor out, torch::Tensor flags, torch::Tensor epochs,
+               bool include_router) {
   const int m = x.size(0);
   TORCH_CHECK((m == 1 || m == 5) && x.size(1) == kHidden);
   TORCH_CHECK(router.sizes() == at::IntArrayRef({512, kHidden}));
@@ -298,8 +301,8 @@ void run_chain(torch::Tensor x, torch::Tensor router, torch::Tensor ids,
   auto* op = (half*)out.data_ptr();
   auto* fp = (unsigned*)flags.data_ptr();
   auto* ep = (unsigned*)epochs.data_ptr();
-  void* arguments[] = {&reader, &ip, &rp, &idp, &wp,
-                       &pp,     &op, &fp, &ep,  (void*)&m};
+  void* arguments[] = {&reader, &ip, &rp,       &idp,           &wp, &pp, &op,
+                       &fp,     &ep, (void*)&m, &include_router};
   C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
       (const void*)router_expert_chain, dim3(kBlocks), dim3(kThreads),
       arguments, 0, at::cuda::getCurrentCUDAStream()));

@@ -24,6 +24,17 @@ control. A fresh normal native build from this owned tree is in progress.
 Historical pinned-UVA timing cannot by itself identify a regression commit in
 the disk route; same-contract comparisons must locate the later disk slowdown.
 
+The retained ordinary PR #831 package was rerun on the same host immediately
+after current main, with the contract below. Its six decode samples were
+11.979898, 11.920696, 11.863334, 11.889318, 11.874748 and 11.818351 ms/token,
+median 11.882033. Current main measured 11.851278. All six pairs of 513 output
+token IDs match exactly. The recent source regression is not reproduced by
+this comparison; do not assign a regressing commit from unmatched old timings.
+The PR #872 hardware record reports active SM clocks of 1507–1530 MHz, whereas
+the current host reports 1290 MHz during load with the same GPU UUIDs and
+300 W power limits. This is a measured condition difference, not a quantified
+clock attribution or a completed regression fix.
+
 The maintained regression entry records source, native hashes, resolved worker
 routes, full timing token IDs and natural health outputs. It fixes FP16 dense
 and KV, FP32 recurrent state, TP4, 262144 startup capacity, 94% memory budget,
@@ -73,8 +84,11 @@ CUDA_VISIBLE_DEVICES= TORCH_CUDA_ARCH_LIST=7.0 \
   --build-only --output hc-build.json
 ```
 
-Each screen records graph measurements and retained CUDA profiler node counts,
-including grid geometry when the profiler exports it. Missing geometry is not
+Each screen records graph measurements and retained CUDA profiler evidence.
+New captures retain the raw graph and count kernel nodes and grid dimensions
+directly through the CUDA driver, including child graphs. Profiler completeness
+is reported separately: one older M5 router trace dropped events, so its 23/3
+event counts are not an authoritative graph count. Missing geometry is not
 reported as zero single-CTA kernels. Keep kernels with insufficient whole
 segment benefit out of model execution. A microbenchmark delta cannot be
 subtracted from endpoint TPOT or credited as an end-to-end result.
@@ -89,8 +103,9 @@ precision changes require the same distribution and output-health gate.
 This campaign contract supersedes the historical raw-logit maximum veto for
 these changes; old evidence and thresholds remain historical records.
 
-Compilation and Python syntax/lint checks have passed. GPU measurements,
-matched endpoint qualification and model distribution gates are pending. No
+Compilation and Python syntax/lint checks have passed. Matched endpoint and
+initial segment measurements are complete; additional segment screens and
+candidate model distribution gates remain pending. No
 speed improvement, kernel-count acceptance or default production admission is
 claimed yet.
 
@@ -122,3 +137,42 @@ The initial shared-expert invocation failed before candidate execution because
 its control called a removed Python wrapper. Its corrected control calls the
 normal registered SiLU operator. This is benchmark plumbing, with no speed
 measurement or numerical admission from the failed invocation.
+
+## Segment screening results
+
+These are complete **screened segments**, not complete model layers. Every
+screen explicitly excludes the operations described above. Real checkpoint
+weights use synthetic activations; QSA uses synthetic cache contents. GDN
+repeats the same state buffers and therefore measures a hot-state proxy.
+No delta below is credited against endpoint TPOT.
+
+| Screen | Calls | M1 control / candidate (ms) | M5 control / candidate (ms) | M1 kernels control / candidate |
+| --- | ---: | ---: | ---: | ---: |
+| HC, redundant normalization | 16 | 0.286024 / 0.470241 | 0.552449 / 1.174292 | 64 / 32 |
+| HC with preceding reduction | 16 | 0.384389 / 0.698982 | 0.716217 / 4.218812 | 96 / 32 |
+| Shared expert, scalar intermediate tiles | 16 | 0.288256 / 0.546929 | 0.514108 / 1.721543 | 80 / 16 |
+| GDN, complete heads | 36 | 0.229089 / 0.302019 | 0.649751 / 1.098775 | 72 / 36 |
+| GDN, state tiles and fixed norm consumers | 36 | 0.231434 / 0.237076 | 0.649915 / 0.580351 | 72 / 36 |
+| QSA selection through output gate | 12 | 0.521789 / 1.538847 | 1.018569 / 6.460572 | 48 / 12 |
+| Router and complete experts | 4 | 0.126536 / 4.600648 | 0.367797 / 22.636609 | 16 / 4 |
+
+All initial M1 candidates are rejected. The tile-preserving GDN variant improves
+the M5 hot-state proxy by 10.7%, but neither improves M1 nor establishes a
+cold-state whole-layer or model gain. Do not promote it on this evidence.
+The earlier HC reduction control includes a staging copy and two reduction
+kernels; its result is still negative, but it is not an exact production
+reduction count. The later fixed-normalization screen uses the registered
+production reduction control.
+
+All candidates with retained grid geometry have zero single-CTA graph kernels.
+Removing small grids alone is insufficient: redundant normalization, fewer
+state tiles and serial row/head work can cost more than the removed launches.
+The router and expert screen reports exact selected IDs and small numerical
+errors, but its combined timing does not isolate the expert fusion cost.
+An expert-only screen therefore freezes native routing outside the graph.
+
+Two distinct follow-up screens are compiled: fixed HC normalization producers
+with native up/mix, and Tensor Core shared experts that reuse weights across
+all M5 rows. They address the specific repeated-work and scalar-compute costs;
+their GPU measurements remain pending. No runtime dispatch has changed and
+no candidate has been submitted to model distribution admission.

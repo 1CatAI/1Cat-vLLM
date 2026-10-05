@@ -138,7 +138,7 @@ def main():
         ]
         graphs = {}
         for name, fn in (("control", control), ("candidate", candidate)):
-            graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(graph):
                 fn()
             graphs[name] = graph

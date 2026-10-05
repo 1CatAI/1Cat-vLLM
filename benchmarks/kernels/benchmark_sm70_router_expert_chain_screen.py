@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--expert-only", action="store_true")
     args = parser.parse_args()
     source = Path(__file__).parents[1] / "csrc/sm70_router_expert_chain_screen.cu"
     extension = load(
@@ -68,7 +69,12 @@ def main():
     report = {
         "research_only": True,
         "model_admission": False,
-        "scope": "router/top-10/complete experts; no shared expert or TP reduction",
+        "scope": (
+            "complete experts; precomputed routing; no shared expert or TP reduction"
+            if args.expert_only
+            else "router/top-10/complete experts; no shared expert or TP reduction"
+        ),
+        "includes_router": not args.expert_only,
         "checkpoint_weights": True,
         "synthetic_activations": True,
         "tp_shard": 0,
@@ -109,8 +115,11 @@ def main():
             for i, (x, (router, packed, (w13, s13, w2, s2))) in enumerate(
                 zip(inputs, banks)
             ):
-                logits = _qwen38_sm70_fp16_gemv(x, router, ".mlp.gate", packed)
-                routing_weights, routing_ids, _ = fused_topk(x, logits, 10, True)
+                if args.expert_only:
+                    routing_weights, routing_ids = weights[i], ids[i]
+                else:
+                    logits = _qwen38_sm70_fp16_gemv(x, router, ".mlp.gate", packed)
+                    routing_weights, routing_ids, _ = fused_topk(x, logits, 10, True)
                 control_ids.append(routing_ids)
                 route = routing_ids.view(-1)
                 if m == 1:
@@ -142,12 +151,19 @@ def main():
                     outputs[i],
                     flags[i],
                     epochs[i],
+                    not args.expert_only,
                 )
 
         errors = []
         for scale in (0.3, 1.0, 3.0):
             for x in inputs:
                 x.normal_(0, 0.1 * scale)
+            if args.expert_only:
+                for i, (x, (router, packed, _)) in enumerate(zip(inputs, banks)):
+                    logits = _qwen38_sm70_fp16_gemv(x, router, ".mlp.gate", packed)
+                    routing_weights, routing_ids, _ = fused_topk(x, logits, 10, True)
+                    ids[i].copy_(routing_ids)
+                    weights[i].copy_(routing_weights)
             control()
             candidate()
             torch.cuda.synchronize()
@@ -169,7 +185,7 @@ def main():
             )
         graphs = {}
         for name, fn in (("control", control), ("candidate", candidate)):
-            graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(graph):
                 fn()
             graphs[name] = graph

@@ -49050,7 +49050,20 @@ QSA selection/expansion/core/merge/gate; and router/expert compute with a
 single multiwarp router CTA, fused intermediate tiles and ordered W2 sums.
 No last-finisher CTA or floating atomic reduction is used. Cooperative launches
 ensure residency where required and do not contain a grid barrier.
-GPU measurements and distribution admission are pending. No route/default
+The same-contract current/PR #831 endpoint medians are 11.851278/11.882033
+ms/token, with all six timing token sequences identical. That recent source
+regression is not reproduced. Earlier 10.3 ms timings use pinned-UVA; historical
+disk records also have different active SM clocks (1507–1530 versus current
+1290 MHz), whose effect has not been quantified. Do not assign a regression
+commit from these unmatched records.
+
+All seven initial M1 segment screens reduce launch counts but fail the speed
+screen and are rejected. The tile-preserving GDN variant improves only the M5
+hot-state proxy, not M1 or a complete layer. Fixed HC normalization and batched
+Tensor Core shared-expert follow-ups are compiled and awaiting their lease;
+an expert-only graph isolates expert fusion from the single-CTA router.
+New graph captures count driver nodes and dimensions directly rather than
+treat incomplete profiler events as complete counts. No route/default
 change or endpoint saving is accepted. Retain exclusions and exact-shape
 contracts in [the campaign record](sm70_flashnext_layer_decode.md).
 
