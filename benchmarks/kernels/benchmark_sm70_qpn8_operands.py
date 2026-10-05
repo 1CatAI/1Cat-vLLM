@@ -12,7 +12,7 @@ import argparse
 import os
 from pathlib import Path
 
-VARIANTS = ["control", "packed", "postscale", "packed_postscale"]
+VARIANTS = ["control", "packed", "postscale", "packed_postscale", "loop1", "loop2"]
 
 
 def generate(root):
@@ -36,6 +36,12 @@ def generate(root):
     copies = []
     for variant in VARIANTS:
         kernel = original.replace("fp8_qpn8_sm70_kernel", "qpn8_" + variant)
+        if variant.startswith("loop"):
+            marker = "#pragma unroll 4\n  for (int group"
+            assert kernel.count(marker) == 1
+            kernel = kernel.replace(
+                marker, f"#pragma unroll {variant[-1]}\n  for (int group"
+            )
         if "packed" in variant:
             old = (
                 "const half* input_row = input + static_cast<size_t>(input_row_idx) * k;\n"
@@ -76,6 +82,8 @@ def generate(root):
         copies.append(kernel)
     launches = []
     for index, variant in enumerate(VARIANTS):
+        if index >= 4:
+            index += 1  # case 4 is the separately implemented N16 control.
         launches.append(f"""    case {index}:
       if (kind == 0) qpn8_{variant}<16,2,true,false,false,true,true>
         <<<224,512,0,stream>>>(w,s,x,y,z,bw,nullptr,b,a,24,2560,4096,k,8,true);

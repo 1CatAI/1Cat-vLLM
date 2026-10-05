@@ -76,6 +76,22 @@ void run(torch::Tensor output, torch::Tensor input, torch::Tensor codes,
   const float scale = static_cast<float>(global_scale);
   switch (variant) {
     // GENERATED_LAUNCHES
+    case 10: {
+      if (gated) {
+        static bool configured = false;
+        if (!configured) {
+          C10_CUDA_CHECK(cudaFuncSetAttribute(
+              operand_warp_stage_gate,
+              cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+          configured = true;
+        }
+        operand_warp_stage_gate<<<272, 384, 0, stream>>>(w, s, x, y, scale);
+      } else {
+        operand_packed_scaled_chain_down<16, 2>
+            <<<160, 512, 0, stream>>>(w, s, x, y, n, k, m, scale);
+      }
+      break;
+    }
     case 8: {
       auto kernel = gated ? operand_n16<true> : operand_n16<false>;
       static bool configured[2] = {false, false};

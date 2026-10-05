@@ -83,6 +83,10 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--operand-library", type=Path, required=True)
     parser.add_argument("--norm-library", type=Path, required=True)
+    parser.add_argument("--overlap-library", type=Path)
+    parser.add_argument("--norm-overlap-library", type=Path)
+    parser.add_argument("--warm-blocks", type=int, default=80)
+    parser.add_argument("--variants", nargs="+")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--profile", action="store_true")
@@ -104,6 +108,14 @@ def main():
     torch.ops.load_library(str(args.norm_library))
     ext = torch.ops._qpn_operands700
     norm_ext = torch.ops._qpn_norm_layout700
+    if args.overlap_library:
+        torch.ops.load_library(str(args.overlap_library))
+    if args.norm_overlap_library:
+        torch.ops.load_library(str(args.norm_overlap_library))
+    warm_stream = torch.cuda.Stream()
+    warm_start = torch.cuda.Event()
+    warm_end = torch.cuda.Event()
+    warm_sink = torch.empty(160 * 128, device="cuda", dtype=torch.int32)
     prefix = f"model.language_model.layers.{args.layer}."
     with safe_open(
         str(args.model / "model.safetensors"), framework="pt", device="cpu"
@@ -206,9 +218,48 @@ def main():
         state.copy_(initial)
         hist.copy_(history)
 
+    def warm(kind, prefix):
+        if kind == "out":
+            codes, tiles, groups, group_bytes, splits = outq, 160, 96, 512, 12
+        else:
+            codes, tiles, groups, group_bytes, splits = mlp[0][0], 272, 320, 256, 8
+        torch.ops._qpn_overlap700.warm(
+            codes,
+            warm_sink,
+            tiles,
+            groups,
+            group_bytes,
+            splits,
+            prefix,
+            args.warm_blocks,
+        )
+
+    def fork_warm(kind, prefix):
+        warm_start.record()
+        warm_stream.wait_event(warm_start)
+        with torch.cuda.stream(warm_stream):
+            warm(kind, prefix)
+            warm_end.record()
+
+    def join_warm():
+        torch.cuda.current_stream().wait_event(warm_end)
+
     def run(variant):
+        overlap = variant not in [
+            "production",
+            "norm_control",
+            "explicit_pack",
+            "producer_pack",
+        ]
+        out_warm = overlap and variant.startswith(("out_", "both_"))
+        fused_warm = variant.startswith("fused_")
+        gate_warm = overlap and variant.startswith(("gate_", "both_"))
+        serial = "serial" in variant
+        prefix = int(variant.rsplit("_", 1)[1]) if overlap else 0
         normalized, _ = input_norm(x, residual, inputnorm, 1e-6)
         q, z, b, a = apply_gdn_ba_verify(layer, normalized)
+        if out_warm and not serial:
+            fork_warm("out", prefix)
         transformed, g, beta = conv_gate_zero(
             q,
             hist,
@@ -251,10 +302,31 @@ def main():
             eps=1e-6,
             norm_before_gate=True,
         ).view(8, 1536)
+        if out_warm:
+            if serial:
+                warm("out", prefix)
+            else:
+                join_warm()
         _sm70_ops.fp8_qpn8_gemm_sm70_out(
             projected, core, outq, outs, 12, 2, True, False
         )
-        if variant in ["production", "explicit_pack"]:
+        if gate_warm and not serial:
+            fork_warm("gate", prefix)
+        if fused_warm:
+            torch.ops._qpn_norm_overlap700.run(
+                post,
+                next_residual,
+                projected,
+                residual,
+                postnorm,
+                mlp[0][0],
+                ca.sm70_tp4_push_buffer_ptrs,
+                rank,
+                buffer_bytes,
+                prefix,
+            )
+            p, r = post, next_residual
+        elif variant in ["production", "explicit_pack"] or overlap:
             p, r = ca.sm70_tp4_all_reduce_gemma_rms_norm(
                 projected, residual, postnorm, 1e-6
             )
@@ -274,7 +346,12 @@ def main():
                 variant == "producer_pack",
             )
             p, r = post, next_residual
-        if variant in ["production", "norm_control"]:
+        if gate_warm:
+            if serial:
+                warm("gate", prefix)
+            else:
+                join_warm()
+        if variant in ["production", "norm_control"] or overlap:
             _sm70_ops.nvfp4_qpn2_gated_sm70_out(up, p, *mlp[0], 8, 1)
             _sm70_ops.nvfp4_qpn2_gemm_sm70_out(down, up, *mlp[1], 16, 2)
         else:
@@ -283,6 +360,25 @@ def main():
         return ca.sm70_tp4_all_reduce_gemma_rms_norm(down, r, inputnorm, 1e-6)
 
     names = ["production", "norm_control", "explicit_pack", "producer_pack"]
+    if args.overlap_library:
+        names = ["production"] + [
+            f"{kind}_{mode}_{prefix}"
+            for kind in ["out", "gate", "both"]
+            for mode in (["serial", "overlap"] if kind != "both" else ["overlap"])
+            for prefix in [2, 4]
+        ]
+    if args.variants:
+        assert args.variants[0] == "production"
+        assert set(args.variants) <= set(names)
+        names = args.variants
+    if args.norm_overlap_library:
+        assert not args.overlap_library and not args.variants
+        names = ["production", "fused_0", "fused_1", "fused_2", "fused_4"]
+    profile_indices = (
+        list(range(len(names)))
+        if args.overlap_library or args.norm_overlap_library
+        else [0, 3]
+    )
     checks = []
     for amplitude in [0.0, 0.125, -0.125, 0.25]:
         x.copy_(torch.randn_like(x) * amplitude)
@@ -325,7 +421,7 @@ def main():
             end.synchronize()
         dist.barrier(group=group)
         torch.cuda.cudart().cudaProfilerStart()
-        for i in [0, 3]:
+        for i in profile_indices:
             graphs[i][0].replay()
             graphs[i][2].synchronize()
             dist.barrier(group=group)
@@ -342,7 +438,7 @@ def main():
                 torch.profiler.ProfilerActivity.CUDA,
             ]
         ) as profiler:
-            for i in [0, 3]:
+            for i in profile_indices:
                 with torch.profiler.record_function(names[i]):
                     for _ in range(15):
                         graphs[i][0].replay()
@@ -351,7 +447,9 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         profiler.export_chrome_trace(str(args.output / f"rank{rank}.trace.json"))
     samples = {name: [] for name in names}
-    for repeat in range(45):
+    # Graphs instrumented by a profiler are unsuitable for event admission,
+    # including after its context exits. Use a separate unprofiled process.
+    for repeat in range(0 if args.profile or args.ncu else 45):
         for offset in range(len(names)):
             i = (repeat + offset) % len(names)
             graph, begin, end = graphs[i]
@@ -364,19 +462,27 @@ def main():
     result = dict(
         scope="Complete TP4 M8 GDN layer including both AR+norm boundaries",
         research_only=True,
+        profiling_only=args.profile or args.ncu,
         original_weights=True,
+        warm_blocks=args.warm_blocks if args.overlap_library else None,
         layer=args.layer,
         rank=rank,
         cold_l2_bytes=eviction.numel() * eviction.element_size(),
         checks=checks,
         graph_nodes_including_reset_and_eviction=counts,
         timing={
-            name: dict(mean_us=statistics.mean(s), samples_us=s)
+            name: dict(mean_us=statistics.mean(s) if s else None, samples_us=s)
             for name, s in samples.items()
         },
         library_sha256={
             str(p.name): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in [args.operand_library, args.norm_library]
+            for p in [
+                args.operand_library,
+                args.norm_library,
+                args.overlap_library,
+                args.norm_overlap_library,
+            ]
+            if p is not None
         },
     )
     args.output.mkdir(parents=True, exist_ok=True)
@@ -386,7 +492,10 @@ def main():
             dict(
                 rank=rank,
                 graph_counts=counts,
-                mean_us={name: statistics.mean(s) for name, s in samples.items()},
+                mean_us={
+                    name: statistics.mean(s) if s else None
+                    for name, s in samples.items()
+                },
             )
         ),
         flush=True,

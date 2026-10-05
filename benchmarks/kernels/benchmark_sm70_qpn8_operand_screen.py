@@ -84,6 +84,7 @@ def main():
     parser.add_argument("--cases", nargs="*")
     parser.add_argument("--n16", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--unroll", action="store_true")
     args = parser.parse_args()
     torch.set_grad_enabled(False)
     torch.manual_seed(20261005)
@@ -150,6 +151,14 @@ def main():
             for v in range(4)
         ]
         names = ["production", "control", "packed", "postscale", "packed_postscale"]
+        if args.unroll:
+            functions.extend(
+                partial(
+                    extension.run, out, z, b, a, x, codes, scales, ba_weight, kind, v
+                )
+                for v in [5, 6]
+            )
+            names.extend(["loop1", "loop2"])
         if kind == 1 and args.n16:
             functions.append(
                 partial(
@@ -183,7 +192,7 @@ def main():
                 exact = torch.equal(
                     actual.view(torch.int16), expected.view(torch.int16)
                 )
-                if variant in ["control", "packed"] and not exact:
+                if variant in ["control", "packed", "loop1", "loop2"] and not exact:
                     raise AssertionError((name, variant, "bitwise mismatch"))
                 if kind == 0 and not torch.equal(torch.cat((b, a), dim=1), expected_ba):
                     raise AssertionError((name, variant, "BA changed"))

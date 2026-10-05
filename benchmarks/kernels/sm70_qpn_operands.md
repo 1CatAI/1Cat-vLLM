@@ -124,3 +124,104 @@ Other controls were not admitted:
 No full wheel, C1/C4 serving rollout, acceptance-rate result or model KL pass
 is claimed. Reuse these negative controls and whole-layer results before
 proposing further kernel variants.
+
+## Dependency and address controls
+
+The follow-up controls use the same hardware, real weights and timing method.
+Use `--variants` to select only the controls relevant to an investigation.
+They preserve FP16 operands, FP32 accumulation and the logical reduction order.
+All new NVFP4 and FP8 arithmetic-preserving variants pass the four-amplitude
+bitwise screen on the representative weight shards.
+
+| Control | Gate production / candidate | Down production / candidate | Decision |
+| --- | ---: | ---: | --- |
+| Four loader/decoder warps and eight HMMA warps | 44.26 / 69.25µs | Unchanged implementation | Reject |
+| Weight loads with `.cg` | 44.31 / 44.67µs | 23.63 / 23.83µs | Reject |
+| Weight loads with `.ca` | 44.31 / 44.77µs | 23.63 / 23.60µs | No gain |
+| Loop unroll 1 | 44.49 / 47.13µs | 23.55 / 27.98µs | Reject |
+| Loop unroll 2 | 44.49 / 45.85µs | 23.55 / 23.71µs | Reject |
+| Eight address phases, same weight bytes | 44.31 / 47.80µs | 23.42 / 24.22µs | Reject |
+| Sixteen address phases, same weight bytes | 44.31 / 47.51µs | 23.42 / 25.27µs | Reject |
+| Stream shuffled A fragments directly into each HMMA | 44.47 / 43.90µs | 23.63 / 24.47µs | Insufficient gain; down regresses |
+
+The warp-stage prototype has 40 registers/thread, 24KiB shared memory and no
+spills. Paired named barriers protect the shared operands. Its gate uses the
+original eight logical K partitions; its down call delegates to the previously
+measured packed-chain implementation. Separating producer and consumer warps
+did not yield a usable overlap benefit.
+
+The address-phase variants rotate the physical K groups within each N tile and
+invert that mapping on both code and scale reads. They add no padding or weight
+bytes and do not reorder arithmetic. Their negative result does not identify
+the GPU's undocumented memory-controller address mapping.
+
+The streamed-fragment control is compared with a gather-all-fragments control
+using the same coalesced activation read. Those variants differ by only about
+0.05µs on gate and 0.13µs on down in this screen; reducing source-level lifetimes
+did not produce the desired gain. Neither needs an activation-pack kernel.
+
+For FP8, `--unroll` selects the two additional loop controls. GDN QKVZ measures
+31.97 / 32.26 / 33.08µs for production / unroll 1 / unroll 2. The output,
+attention-QKV and final-MLP-down cases also provide no material benefit.
+
+`benchmark_sm70_qpn_address_span.py` leaves the target kernel unchanged and
+compares read-based L2 eviction with additional sparse reads across 128MiB and
+4GiB, at a 2MiB stride. Gate measures 44.13µs in all three cases; down measures
+23.98 / 23.94 / 23.88µs. This address-translation perturbation did not reproduce
+the model-versus-isolated timing gap. It is not a model working-set measurement.
+
+No candidate in this follow-up is promoted to a serving test. Production graph
+kernel counts and model numerical paths remain unchanged. The target projection
+payload is about 4.46GB per rank per step, so a 6ms payload-service target requires
+roughly 743GB/s; it has not been reached by these controls.
+
+## Cross-operator weight reads
+
+Two further controls leave the production projections and GDN arithmetic
+unchanged. `benchmark_sm70_qpn_overlap.py` builds a sector-reading kernel;
+`benchmark_sm70_qpn_norm_overlap.py` builds an extracted AR+norm with L2 hints
+after publishing its peer packets. Pass the respective `--overlap-library` or
+`--norm-overlap-library` to the complete-layer driver. Do not install either
+extension into a serving environment.
+
+The separate reader fetches the first two or four K groups of each existing
+partition, without changing the partition count or arithmetic. For out
+projection these cover 1.875/3.75MiB; for gate/up, 1.0625/2.125MiB. Its graph
+branch starts alongside GDN preprocessing or alongside AR+norm, respectively,
+and rejoins before the consumer. A serial-read control includes the same reads
+immediately before that consumer. All extra work is inside the layer events.
+
+| Complete layer, rank 0 | Time | Kernel nodes |
+| --- | ---: | ---: |
+| Production | 152.19µs | 11 |
+| Serial out read, two groups | 157.82µs | 12 |
+| Out read overlapping GDN, two groups | 162.76µs | 12 |
+| Serial gate read, two groups | 157.16µs | 12 |
+| Gate read overlapping AR+norm, two groups | 158.18µs | 12 |
+| Both overlap branches, two groups | 165.71µs | 13 |
+
+Four groups regress further. These are unprofiled event measurements with
+128MiB cold-L2 eviction. Counts include the untimed eviction kernel; reset
+copies are separate memcpy nodes. All four ranks pass bitwise comparison at
+four input amplitudes.
+
+A separate trace confirms actual reader/producer overlap, with roughly
+3.1–3.3µs at the branch fork and 3.5µs at the join. The extra reader also costs
+6–10µs. All-rank profiling perturbs collective wait times, so neither its layer
+totals nor subsequent event samples are admission results. The driver now
+omits event admission for profiling runs; use a fresh unprofiled process.
+
+The fused AR variant removes the extra node and branch. It issues hints for
+one, two or four starting groups, preserves packet and norm arithmetic, and
+passes the same four-rank bitwise checks. Production and every fused variant
+retain 11 kernel nodes. In a fresh unprofiled run, production measures
+152.63µs, the zero-hint extracted control 153.96µs, and the best hinted variant
+153.06µs. The latter improves on its extracted control but remains slower than
+the installed implementation; no rank shows an admitted improvement over
+production. Two/four groups measure 154.29/154.09µs on rank 0.
+
+The collective source has no intervening algorithm change relative to the
+installed baseline. The source-control timing offset is retained in the
+results rather than subtracted from a claimed speedup. **Neither cross-operator
+variant is promoted.** This does not rule out every future dataflow design,
+but it rejects adding these readers or hints to the current production route.
