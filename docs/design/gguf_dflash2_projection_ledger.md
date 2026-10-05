@@ -135,10 +135,52 @@ These intervals are subsets of the wall-time gaps, not additional costs.
 
 ## Projection counterpart measurements
 
-Pending the same-machine operator sweep. The NVFP4-labelled checkpoint
-stores FFN weights in NVFP4 and attention/GDN weights in channel FP8;
-the comparison must name those actual formats. Cold-L2 operator timings
-will remain separate from traced model service.
+The complete `dev43+g05ef35e37c` runtime measures real rank0 TP4 slices
+from the NVFP4 checkpoint on the same GPUs at 1290/877MHz and 300W.
+FFN uses NVFP4 QPN2; attention/GDN uses channel-FP8 QPN8. Each arm
+uses 16MiB eviction outside the timed graph, with 84 samples. These
+operator values are separate from traced GGUF service; they are not an
+unprofiled model-to-model comparison or a predicted wall-time saving.
+
+| Role | M/N/K | Format | Bytes/rank | Cold graph arms us |
+| --- | --- | --- | ---: | --- |
+| gate_up | 8/4352/5120 | NVFP4 | 25067520 | 53.248 / 50.176 |
+| down | 8/5120/4352 | NVFP4 | 12533760 | 26.624 / 26.624 |
+| qkvz | 8/4096/5120 | FP8 | 20979712 | 38.912 / 35.840 |
+| GDN_out | 8/5120/1536 | FP8 | 7874560 | 18.432 / 18.432 |
+| attention_qkv | 8/3584/5120 | FP8 | 18357248 | 34.816 / 31.744 |
+| attention_q | 8/3072/5120 | FP8 | 15734784 | 31.744 / 30.720 |
+| attention_k | 8/256/5120 | FP8 | 1311232 | 20.480 / 20.480 |
+| attention_v | 8/256/5120 | FP8 | 1311232 | 20.480 / 19.968 |
+| attention_kv | 8/512/5120 | FP8 | 2622464 | 20.480 / 20.480 |
+| attention_qk | 8/3328/5120 | FP8 | 17046016 | 33.280 / 31.744 |
+| attention_o | 8/5120/1536 | FP8 | 7874560 | 19.456 / 18.432 |
+| qkvz_ab | 8/4120/5120 | FP8 + FP16 a/b | 21225472 | 35.840 / 35.840 |
+
+The qkvz+a/b output consists of 2560 q/k/v, 1536 z and 24 a/b columns.
+The counterpart prepares channel scales in FP32 as required by its API;
+NVFP4 group scales retain E4M3. An initial probe incorrectly converted
+NVFP4 scales to FP32 and was rejected by the dtype guard before timing.
+The corrected probe completes all twelve roles; FP8 projections are
+checked against FP32 accumulation of their FP16 reconstructed operands.
+
+| Target role | Traced GGUF service us per logical layer | Counterpart cold graph range us |
+| --- | ---: | ---: |
+| Native gate/up, mixed average | 61.410 | 50.176–53.248 |
+| Canonical gate/up, pure average | 63.875 | 50.176–53.248 |
+| Down | 39.730 | 26.624 |
+| qkvz, all source fragments | 62.191 | 35.840–38.912 |
+| qkvz plus dense a/b | 70.858 | 35.840 |
+| GDN output | 25.279 | 18.432 |
+| Attention q/k/v, all source fragments | 85.686 | 31.744–34.816 |
+| Attention output | 22.167 | 18.432–19.456 |
+
+Fragmented roles use total service divided by logical layer count, not
+mean fragment latency. The final two tables use different measurement
+modes; their differences identify work to investigate rather than admit
+a route. Admission uses same-round ABBA against GGUF canonical.
+The counterpart output-head and draft/sampling kernels are not measured
+by this projection sweep and have no same-contract values assigned here.
 
 ## Next implementation boundary
 
