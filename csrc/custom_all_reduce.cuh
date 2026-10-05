@@ -1688,7 +1688,13 @@ __global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
       const float* pair = reinterpret_cast<const float*>(_dp->ptrs[i]);
       const float value = pair[2 * row];
       const int64_t index = static_cast<int64_t>(llrintf(pair[2 * row + 1]));
-      if (value > best_value || (value == best_value && index < best_index)) {
+      // Match full-vocabulary argmax: NaNs precede finite values, and the
+      // first original vocabulary ID wins among NaNs or equal logits.
+      const bool value_nan = isnan(value), best_nan = isnan(best_value);
+      if ((value_nan && (!best_nan || index < best_index)) ||
+          (!value_nan && !best_nan &&
+           (value > best_value ||
+            (value == best_value && index < best_index)))) {
         best_value = value;
         best_index = index;
       }

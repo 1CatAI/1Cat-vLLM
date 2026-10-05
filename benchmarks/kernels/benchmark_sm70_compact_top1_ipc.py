@@ -69,6 +69,8 @@ def main():
             pair[:, 0].normal_()
             if case in (0, 1, 2):
                 pair[:, 0].fill_((0.0, float("inf"), -float("inf"))[case])
+            if (case == 3 and rank == 2) or (case == 4 and rank in (1, 3)) or case == 5:
+                pair[:, 0].fill_(float("nan"))
             for name in ("nccl", "ipc"):
                 for _ in range(3):
                     graphs[name].replay()

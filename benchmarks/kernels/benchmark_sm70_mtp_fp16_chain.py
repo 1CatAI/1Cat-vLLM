@@ -61,7 +61,7 @@ def main():
             torch.ops._C.sm70_mtp_moe_fp16_out(
                 c["up"], x, w13, ids.flatten(), probabilities, padded, False
             )
-            ops.silu_and_mul(c["activation"], c["up"].view(-1, 320))
+            torch.ops._C.silu_and_mul(c["activation"], c["up"].view(-1, 320))
             torch.ops._C.sm70_mtp_moe_fp16_out(
                 c["down"],
                 c["activation"],
@@ -132,6 +132,51 @@ def main():
         samples_ms=trials,
         median_ms={arm: statistics.median(s) for arm, s in trials.items()},
     )
+
+    # Localize changes in the two stages independently; same routing/weights,
+    # and the down-only comparison uses the identical control activation.
+    def control_stage(stage):
+        for x, ids, probabilities, padded, b in stages:
+            c = b["control"]
+            if stage == 1:
+                torch.ops._C.sm70_mtp_moe_fp16_out(
+                    c["up"], x, w13, ids.flatten(), probabilities, padded, False
+                )
+                torch.ops._C.silu_and_mul(c["activation"], c["up"].view(-1, 320))
+            else:
+                torch.ops._C.sm70_mtp_moe_fp16_out(
+                    c["down"],
+                    c["activation"],
+                    w2,
+                    ids.flatten(),
+                    probabilities,
+                    padded,
+                    True,
+                )
+                ops.moe_sum(c["down"], c["out"])
+
+    def fused_stage(stage):
+        for x, ids, probabilities, _, b in stages:
+            f = b["fused"]
+            activation = f["activation"] if stage == 1 else b["control"]["activation"]
+            torch.ops._C.sm70_mtp_moe_fp16_chain_out(
+                f["out"], activation, x, w13, w2, ids, probabilities, stage
+            )
+
+    result["stage_medians_ms"] = {}
+    for stage in (1, 2):
+        pair = {
+            "control": capture(lambda s=stage: control_stage(s)),
+            "fused": capture(lambda s=stage: fused_stage(s)),
+        }
+        samples = {name: [] for name in pair}
+        for trial in range(7):
+            order = ("control", "fused") if trial % 2 else ("fused", "control")
+            for name in order:
+                samples[name].append(elapsed(pair[name]))
+        result["stage_medians_ms"][str(stage)] = {
+            name: statistics.median(s) for name, s in samples.items()
+        }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))

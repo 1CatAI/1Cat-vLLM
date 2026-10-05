@@ -8,6 +8,10 @@ from torch import nn
 from vllm.models.qwen4_exp.nvidia import sm70_mtp_head as head_ops
 
 
+def test_missing_pipeline_head_skips_draft_preparation():
+    assert head_ops.prepare_mtp_qpn8_head(nn.Module()) is None
+
+
 def test_draft_head_preserves_shared_target_and_uses_actual_probe_path(monkeypatch):
     calls = []
 

@@ -100,3 +100,18 @@ class RestorationControlWorker(Worker):
 
         ops.sm70_qwen38_hc_batch = zero_split
         super().load_model(load_dummy_weights=load_dummy_weights)
+
+
+class SharedChainCandidateWorker(Worker):
+    def load_model(self, *, load_dummy_weights=False):
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        from vllm.models.qwen4_exp.nvidia.sm70_mtp_structural import (
+            prepare_shared_chain_probe,
+        )
+
+        target = prepare_shared_chain_probe(self.model_runner.model)
+        draft = prepare_shared_chain_probe(self.model_runner.speculator.model)
+        if target != 48 or draft != 1:
+            raise RuntimeError(
+                f"Shared-chain preparation missed layers: {target}/{draft}"
+            )

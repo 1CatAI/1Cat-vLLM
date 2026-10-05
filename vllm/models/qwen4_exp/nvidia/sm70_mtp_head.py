@@ -122,14 +122,17 @@ class MTPQPN8Head(nn.Module):
 
 
 def prepare_mtp_qpn8_head(head):
+    weight = getattr(head, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        return None
     if (
         envs.VLLM_BATCH_INVARIANT
         or not current_platform.is_cuda()
         or not current_platform.is_device_capability(70)
         or get_tensor_model_parallel_world_size() != 4
-        or not head.weight.is_cuda
-        or head.weight.dtype != torch.float16
-        or tuple(head.weight.shape) != (62080, 2560)
+        or not weight.is_cuda
+        or weight.dtype != torch.float16
+        or tuple(weight.shape) != (62080, 2560)
         or any(
             not hasattr(torch.ops._C, name)
             for name in ("fp8_qpn8_prepare_sm70", "fp8_qpn8_gemm_sm70_out")

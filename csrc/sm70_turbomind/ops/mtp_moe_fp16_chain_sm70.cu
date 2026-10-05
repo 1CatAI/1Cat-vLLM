@@ -31,7 +31,7 @@ __global__ __launch_bounds__(256, 1) void w13_silu(const half* x,
   __shared__ float partials[2][16][16];
   float gate_acc[8] = {}, up_acc[8] = {};
   if (expert >= 0 && expert < 512) {
-#pragma unroll
+#pragma unroll 1
     for (int g = 0; g < 10; ++g) {
       const int k = split * 160 + g * 16;
       const half* input = x + row * 2560 + k;
@@ -83,16 +83,34 @@ __global__ __launch_bounds__(320, 1) void w2_weighted_sum(
   const int lane = threadIdx.x % 32, route = threadIdx.x / 32;
   const int row = blockIdx.y, c = blockIdx.x * 32 + lane;
   const int expert = ids[row * 10 + route];
-  __shared__ half input[10][160], partial[10][32];
+  __shared__ half input[10][160], partial[10][32], tile[10][32][18];
   for (int k = lane; k < 160; k += 32)
     input[route][k] = activation[(row * 10 + route) * 160 + k];
   __syncthreads();
   float accum = 0.0f;
   if (expert >= 0 && expert < 512) {
     const half* w = weights + (int64_t(expert) * 2560 + c) * 160;
-#pragma unroll 8
-    for (int k = 0; k < 160; ++k)
-      accum = fmaf(__half2float(input[route][k]), __half2float(w[k]), accum);
+    for (int base = 0; base < 160; base += 16) {
+      // Pair adjacent 128-bit vectors of each output row. Scalar strided
+      // half loads issued one sector per lane for only two useful bytes.
+      for (int i = lane; i < 64; i += 32) {
+        const int n = i / 2, k = (i % 2) * 8;
+        union {
+          uint4 vector;
+          half elements[8];
+        } data;
+        data.vector =
+            *reinterpret_cast<const uint4*>(w + (n - lane) * 160 + base + k);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) tile[route][n][k + j] = data.elements[j];
+      }
+      __syncwarp();
+#pragma unroll
+      for (int k = 0; k < 16; ++k)
+        accum = fmaf(__half2float(input[route][base + k]),
+                     __half2float(tile[route][lane][k]), accum);
+      __syncwarp();
+    }
   }
   // Preserve the old FP16 boundary after route weighting. The final route
   // reduction is deterministic, with one owner for each output element.
@@ -109,7 +127,9 @@ __global__ __launch_bounds__(320, 1) void w2_weighted_sum(
 
 void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
          torch::Tensor w13, torch::Tensor w2, torch::Tensor ids,
-         torch::Tensor probabilities) {
+         torch::Tensor probabilities, int64_t stage) {
+  TORCH_CHECK(stage >= 0 && stage <= 2,
+              "Stage must be chain(0), up(1), down(2)");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0);
@@ -128,15 +148,17 @@ void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
               ids.sizes() == at::IntArrayRef({m, 10}) &&
               probabilities.sizes() == ids.sizes());
   const auto stream = at::cuda::getCurrentCUDAStream();
-  w13_silu<<<dim3(10, m * 10), 256, 0, stream>>>(
-      reinterpret_cast<const half*>(x.data_ptr()),
-      reinterpret_cast<const half*>(w13.data_ptr()), ids.data_ptr<int>(),
-      reinterpret_cast<half*>(activation.data_ptr()));
-  w2_weighted_sum<<<dim3(80, m), 320, 0, stream>>>(
-      reinterpret_cast<const half*>(activation.data_ptr()),
-      reinterpret_cast<const half*>(w2.data_ptr()), ids.data_ptr<int>(),
-      probabilities.data_ptr<float>(),
-      reinterpret_cast<half*>(output.data_ptr()));
+  if (stage != 2)
+    w13_silu<<<dim3(10, m * 10), 256, 0, stream>>>(
+        reinterpret_cast<const half*>(x.data_ptr()),
+        reinterpret_cast<const half*>(w13.data_ptr()), ids.data_ptr<int>(),
+        reinterpret_cast<half*>(activation.data_ptr()));
+  if (stage != 1)
+    w2_weighted_sum<<<dim3(80, m), 320, 0, stream>>>(
+        reinterpret_cast<const half*>(activation.data_ptr()),
+        reinterpret_cast<const half*>(w2.data_ptr()), ids.data_ptr<int>(),
+        probabilities.data_ptr<float>(),
+        reinterpret_cast<half*>(output.data_ptr()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 }  // namespace
@@ -144,7 +166,8 @@ void run(torch::Tensor output, torch::Tensor activation, torch::Tensor x,
 TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
       "sm70_mtp_moe_fp16_chain_out(Tensor(a!) out, Tensor(b!) activation, "
-      "Tensor x, Tensor w13, Tensor w2, Tensor ids, Tensor probabilities) -> "
+      "Tensor x, Tensor w13, Tensor w2, Tensor ids, Tensor probabilities, int "
+      "stage=0) -> "
       "()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) { m.impl("sm70_mtp_moe_fp16_chain_out", &run); }

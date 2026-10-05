@@ -548,3 +548,42 @@ projection QPN8 disabled. No new acceleration environment switches are added.
 Each new structure first needs a real-weight whole-layer graph microbenchmark.
 Run full-model timing after accumulated predicted gains reach about 1 ms, or
 before merging. Shared GPU locks govern every GPU job and source deployment.
+
+### Structural operator screens, 2026-10-05
+
+These are unprofiled, single-card CUDA graph measurements on an uncontested
+V100-SXM2-32GB at 300 W. The TP0 tensors come from the same checkpoint as
+the remote TP4 baseline. No full-model speed or quality is admitted here.
+Seven alternating graph trials use real weights; shared/router chains rotate
+all 48 layers to avoid a single hot-weight fixture.
+
+| Operator chain | Control | Candidate | Decision |
+| --- | ---: | ---: | --- |
+| Four QPN8 draft heads, M1, largest shortlist shard | 0.833485 ms | 0.268585 ms | 32K candidate reduces head time; acceptance pending |
+| Four QPN8 draft heads, M5 | 0.840376 ms | 0.270705 ms | Original global IDs preserved |
+| 48 shared gate/up/SiLU/down chains | 0.994468 ms | 0.690063 ms | 0.304405-ms operator gain; model gates pending |
+| 48 routers, projection/top10/plan | 0.631368 ms | 3.190070 ms | Reject token-CTA prototype; no production dispatch |
+| Four FP16 draft expert chains, M5 + three M1 | 0.436480 ms | 0.449876 ms | First fused version regresses; do not integrate |
+
+The router candidate uses five 16-warp CTAs, 128 registers/thread, zero
+local spills. More warps inside a CTA still leave at most five active SMs.
+Its single-token tensor-core projection repeats the token across eight MMA
+rows instead of sharing one weight load across the five real tokens. The
+weight read instructions also repeat for each token. These structural limits
+remain even without register spilling. Local hardware-counter collection
+was denied by driver counter permissions; DRAM bytes/utilization are not
+filled with estimates.
+
+The shared candidate uses one residency-checked cooperative launch, 80
+eight-warp CTAs, and fixed-order down reductions without floating atomics.
+Maximum local-output differences versus the five-launch control are 0,
+1.19e-7, 6.10e-5 and 9.77e-4 at input scales 0, .03, 1 and 3. This passes
+a layout/finite-value screen, not the independent model distribution gate.
+It remains above the 0.3-ms component goal.
+
+The first draft fusion passes finite/zero-input/layout screens and shows
+relative output L2 differences below 1.41e-4, but its down stage issues
+strided scalar half loads. The next implementation pairs adjacent 128-bit
+loads in padded shared tiles and reports up/down stage timing separately.
+The up loop also avoids compiler-expanded register preloading. This is a
+structural memory-access correction, not a parameter sweep.

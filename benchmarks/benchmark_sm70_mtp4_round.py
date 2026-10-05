@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--quality-manifest", type=Path)
     parser.add_argument("--fixture-manifest", type=Path)
     parser.add_argument("--draft-vocab", type=Path)
+    parser.add_argument("--structural-candidate", choices=("shared",))
     parser.add_argument("--diagnostics-only", action="store_true")
     parser.add_argument("--projection-reference", action="store_true")
     parser.add_argument(
@@ -177,6 +178,12 @@ def main() -> None:
         engine["worker_cls"] = (
             "benchmarks.sm70_mtp_reference_worker.ShortlistCandidateWorker"
         )
+    if args.structural_candidate:
+        if args.draft_vocab or args.diagnostic_path or args.projection_reference:
+            parser.error("Structural precision probe requires its own candidate arm")
+        engine["worker_cls"] = (
+            "benchmarks.sm70_mtp_reference_worker.SharedChainCandidateWorker"
+        )
     if args.projection_reference:
         engine["worker_cls"] = "benchmarks.sm70_mtp_reference_worker.ReferenceWorker"
     if args.diagnostic_path and args.diagnostic_path != "shared":
@@ -197,7 +204,7 @@ def main() -> None:
         "warmup_outputs": [],
         "complete": False,
         "startup_diagnostics": args.startup_diagnostics,
-        "default_configuration": args.draft_vocab is None,
+        "default_configuration": not (args.draft_vocab or args.structural_candidate),
         "measurement_kind": (
             "diagnostic_node_trace"
             if args.node_trace
@@ -354,6 +361,7 @@ def main() -> None:
         report["latency_passed"] = (
             report["speed_complete"]
             and not args.draft_vocab
+            and not args.structural_candidate
             and all(row["complete_round_ms"] <= 15 for row in report["cases"])
         )
         save()
