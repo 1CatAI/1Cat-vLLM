@@ -919,3 +919,38 @@ It shares no shortlist buffers, replaces only the target head in the benchmark
 worker, leaves output projections untouched and retains the original method
 at unsupported widths. An opaque operator records actual execution separately
 for target numerical tapes. There is no target-head serving dispatch change.
+
+The CJK head screen includes production value/ID packet generation. Critical
+four-head times are 0.785971 -> 0.535419 ms at M1 and 0.797594 -> 0.540897 ms
+at M5. Original TP vocabulary ownership gives 32,715/35,890/29,640/8,776 rows;
+these counts expose residual imbalance but do not change admission. The
+`--include-cjk` corpus builder reproduces the exact 107,021-ID union, with
+four focused CPU tests passing. Model acceptance remains pending.
+
+A separate target LM-head screen uses the real 62,080-by-2,560 checkpoint
+shard and one invocation per graph: M5 FP16/QPN8 measures 0.481403/0.192010 ms;
+M20 measures 0.502303/0.357335 ms. These are projection-only timings. The
+benchmark target view currently changes only M1--8, retaining its original
+method at M20. Eleven CPU scope/load-order checks pass, including identical
+full-pack sharing and shortlist exclusion. Model gates remain pending.
+
+Reading router row-major weights could remove 125,829,120 additional bytes
+across 48 layers, but the existing direct-reader screen is slower despite
+identical FP16 output: M5 0.355226 -> 0.550359 ms; M10 0.404838 -> 0.577014 ms.
+Do not enable it to hide the C4 allocation failure. The shared-expert gate
+boundary audit also finds no new mismatch: both current default and fusion
+materialize FP16 sigmoid before FP16 multiplication. Its numerical rejection
+stands until an independently demonstrated cause is corrected.
+
+The CJK extension completes acceptance: 3,098/6,804 proposed tokens, or
+45.5320%, versus 50.2035% for full vocabulary. Natural-cohort round time is
+25.11718 ms, 2.81717 steady tokens per round and 112.161 tokens/s. Twelve
+automatic tasks pass, all sixteen outputs stop naturally and health checks
+find no failures. Acceptance rejects this subset. Retain the full vocabulary
+by default and stop further subset expansion or repartitioning on this line.
+
+A cooperative row-major router loader preserves all tested FP16 values but
+is slower: M5 packed/direct/cooperative times 0.355451/0.551199/0.920535 ms,
+and M10 0.405699/0.576594/0.908068 ms. Remove the uncommitted cooperative
+implementation. Do not repeat either original-weight reader or enable one
+as a workaround for the C4 memory failure.
