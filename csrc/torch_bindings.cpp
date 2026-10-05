@@ -34,6 +34,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // vLLM custom ops
   //
 
+#ifdef ENABLE_SM70_TURBOMIND
+  ops.def(
+      "gguf_iq3_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor gate, "
+      "Tensor up) -> ()");
+  ops.impl("gguf_iq3_gated_sm70_out", torch::kCUDA, &gguf_iq3_gated_sm70_out);
+#endif
   ops.def(
       "persistent_masked_m_silu_mul_quant(Tensor input, Tensor counts, Tensor! "
       "y_q, Tensor! y_s,"

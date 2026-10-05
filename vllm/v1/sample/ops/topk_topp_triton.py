@@ -1090,6 +1090,43 @@ def sort_topk_with_vocab_ties(
     return out_values, out_indices
 
 
+@triton.jit
+def _clear_compact_rows_kernel(
+    logits,
+    reference_rows,
+    row_stride,
+    vocab_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if not tl.load(reference_rows + row):
+        offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(
+            logits + row * row_stride + offsets,
+            -float("inf"),
+            mask=offsets < vocab_size,
+        )
+
+
+@triton.jit
+def _scatter_compact_rows_kernel(
+    logits,
+    reference_rows,
+    values,
+    indices,
+    row_stride,
+    values_stride,
+    indices_stride,
+    CAPACITY: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if not tl.load(reference_rows + row):
+        offsets = tl.arange(0, CAPACITY)
+        value = tl.load(values + row * values_stride + offsets)
+        index = tl.load(indices + row * indices_stride + offsets)
+        tl.store(logits + row * row_stride + index, value)
+
+
 def _apply_top_k_top_p_compact(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -1127,19 +1164,44 @@ def _apply_top_k_top_p_compact(
     remove = cumulative <= boundary
     remove[:, -1] = False
     values.masked_fill_(remove, -float("inf"))
-    result = torch.full_like(logits, -float("inf"))
-    result.scatter_(1, indices, values)
+    # Direct callers permit in-place filtering. Keep the original logits in
+    # ambiguous rows until their dense reference is computed, and rewrite the
+    # other rows from the shortlist without another full-vocabulary tensor.
+    result = logits
+    _clear_compact_rows_kernel[(logits.shape[0], triton.cdiv(logits.shape[1], 4096))](
+        result,
+        reference_rows,
+        result.stride(0),
+        result.shape[1],
+        BLOCK=4096,
+    )
+    _scatter_compact_rows_kernel[(logits.shape[0],)](
+        result,
+        reference_rows,
+        values,
+        indices,
+        result.stride(0),
+        values.stride(0),
+        indices.stride(0),
+        CAPACITY=capacity,
+        num_warps=4,
+    )
 
     if reference_rows.any():
         from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
         rows = reference_rows.nonzero(as_tuple=True)[0]
-        reference = apply_top_k_top_p_pytorch(
-            logits.index_select(0, rows),
-            k.index_select(0, rows),
-            p.index_select(0, rows),
-        )
-        result.index_copy_(0, rows, reference)
+        # Dense sorting creates an int64 index for every vocabulary entry.
+        # Bound the temporary working set when many verifier rows need the
+        # reference, while preserving each row's full-vocabulary operation.
+        max_reference_rows = 16 if rows.numel() > 32 else 32
+        for chunk in rows.split(max_reference_rows):
+            reference = apply_top_k_top_p_pytorch(
+                logits.index_select(0, chunk),
+                k.index_select(0, chunk),
+                p.index_select(0, chunk),
+            )
+            result.index_copy_(0, chunk, reference)
     if mask_value != float("-inf"):
         result.masked_fill_(torch.isneginf(result), mask_value)
     return result
