@@ -54,3 +54,25 @@ This is a weighted microbenchmark estimate, not an end-to-end result.
 The first GPU attempt failed while the filesystem was full; its controller
 and logs are retained. Duplicate archived artifacts were retired before
 repeating the operator checks. Model integration checks remain pending.
+
+## Shared-activation hardware counters
+
+A separate one-node CUDA graph capture profiles the already admitted pure
+IQ3_S gate/up operator from the normal installed wheel. It uses actual
+layer6 TP4 weights, M8/N4352/K5120, a 16MiB flush before the node,
+fixed SM/memory 1290/877MHz and 300W. No private extension is loaded.
+Ordinary-user counter permission failed; an authorized privileged retry
+passes under the same GPU leases. The failed capture is retained.
+
+| Actual total counter | Earlier signed pair | Shared-A pair |
+| --- | ---: | ---: |
+| L1 global read bytes | 68,497,152 | 33,221,120 |
+| L2 read sectors times 32 | 31,000,096 | 31,044,928 |
+| DRAM read bytes | 19,466,304 | 19,457,728 |
+
+L1 read demand falls 51.5%, while measured total L2 traffic is essentially
+unchanged. These totals do not identify activation-only L2 bytes. The
+profiled 47.360us service and 7,837,952 warp instructions are counter evidence,
+not an unprofiled speed result. Excess shared wavefronts remain 911,091;
+shared activation reuse does not remove the codebook conflict. The earlier
+two-copy parity lookup was measured equal in latency and remains rejected.
