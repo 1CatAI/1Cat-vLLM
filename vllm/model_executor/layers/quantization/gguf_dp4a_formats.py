@@ -10,6 +10,25 @@ import numpy as np
 from vllm.transformers_utils.gguf_tensor_reader import quant_size
 
 
+def pack_mixed_u4_pair(gate, up):
+    """Keep original U4 payloads in gate/up order, with zero LUT minima."""
+    if (gate.source_type, up.source_type) not in ((12, 23), (23, 12)):
+        raise ValueError("Mixed U4 pairs require Q4_K/IQ4_XS")
+    if gate.shape != up.shape:
+        raise ValueError("Mixed U4 pairs require matching projection shapes")
+    payloads = []
+    for codec in (gate, up):
+        packed = list(codec.packed())
+        if codec.source_type == 23:
+            packed[3] = np.zeros_like(packed[1])
+            packed[4] = np.zeros_like(packed[2])
+        payloads.append(packed)
+    return tuple(
+        np.ascontiguousarray(np.concatenate(parts, axis=0 if field == 0 else 1))
+        for field, parts in enumerate(zip(*payloads))
+    )
+
+
 @dataclass(frozen=True)
 class GGUFIntegerDotProjection:
     source_type: int

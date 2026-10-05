@@ -39,18 +39,19 @@ The benchmark reads actual TP4 model tensor dimensions, compares normalized
 integer dots with the current TurboMind preparation, alternates controls,
 reports core/memory clocks and includes activation encoding separately.
 Bandwidth counts actual normalized storage, rather than original GGUF file
-bytes. GPU correctness, bandwidth and the chosen split-K schedules are still
-pending the normal complete-extension build. No model dispatcher selects
-these operators yet. Model integration must preserve mixed-projection order,
-share QKV/Z encoding, preserve head layout, and avoid duplicated weight banks.
+bytes. Complete-extension builds and GPU checks cover the operators. A proposed
+dispatcher admits only measured N160/K2560 Q4_K and IQ4_XS projections at
+M5/M20, with one activation encoding for mixed projections. Its model quality
+and round-latency checks remain pending. Large QKV/Z shapes retain TurboMind.
 
 For the three supported types in the Flash-Next tensor inventory, normalized
 storage increases an estimated 81.6 MiB per TP4 rank: Q6_K contributes
 73.9 MiB, Q4_K 5.3 MiB and IQ4_XS 2.4 MiB, excluding padding. These are
 storage estimates, not a measured model allocation. Keeping both complete
 layouts would add about 571 MiB, exceeding the observed tightest rank's
-headroom. Integration therefore needs one resident weight representation and
-a shared FP16 prefill workspace, with actual memory validation before adoption.
+headroom. The small-projection dispatcher retains both layouts only for the
+admitted N160 projections. Actual model memory validation remains required
+before adoption; these storage estimates do not establish that the model fits.
 
 ## Cold-cache operator measurements
 
@@ -86,12 +87,23 @@ projections. Nsight Compute on the initial QKV kernel reports 47 registers,
 long-scoreboard waiting. Cooperative shared activation staging improves
 some measurements but leaves the large projections short of the target.
 
-The next variant reads raw Q6_K through the shared integer-dot header and
+Another variant reads raw Q6_K through the shared integer-dot header and
 uses the routed expert kernel's two-row, 16-lane K partition. It retains the
 original signed subgroup scales in integer sums, then multiplies by the
 original Half superblock scale and Q8 activation scale with FP32 accumulation.
 It avoids expanded weight bytes. Raw K256 blocks cannot generally restore a
 128-element GDN head permutation losslessly; that layout must keep a
 normalized representation. Raw cooperative reduction is explicitly rejected.
-No model dispatch selects the new variants until their measured bands and
-quality checks pass.
+Its cold M5/M20 QKV times are 33.79/80.90 us, compared with 24.58/28.67 us
+for TurboMind. It is rejected for those shapes. A logical row representation
+with exact FP32 coefficients also underperforms: 28.67/55.30 us for QKV and
+19.46/36.86 us for Z. Read-only vector loads do not recover the difference.
+The row variants use 30–47 registers with no stack or local-memory allocation,
+so register spilling does not explain the regression. None is admitted for
+large model projections.
+
+The final operator build passes 168 GPU checks. Twelve CPU checks cover exact
+official weight reconstruction, including head-order permutations. Dispatch
+checks cover unsupported M fallback, shared activation encoding, mixed output
+views and changed-input graph replay. Model speed and quality results must be
+recorded separately before enabling the proposed small-projection route.

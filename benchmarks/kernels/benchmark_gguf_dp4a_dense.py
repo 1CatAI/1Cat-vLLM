@@ -15,10 +15,13 @@ import vllm._C as core
 
 import vllm
 from vllm.model_executor.layers.quantization.gguf_dp4a_formats import (
+    pack_mixed_u4_pair,
     transcode_integer_dot,
 )
 from vllm.model_executor.layers.quantization.gguf_turbomind import (
     GGUFPreparedProjection,
+    apply_prepared_gguf_projections,
+    prepare_gguf_projections,
 )
 from vllm.transformers_utils.gguf_tensor_reader import (
     GGUFReader,
@@ -63,6 +66,7 @@ def main():
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--join", nargs="+", default=[])
     parser.add_argument("--activated", action="store_true")
+    parser.add_argument("--mixed-u4-pair", action="store_true")
     parser.add_argument("--raw-source", action="store_true")
     parser.add_argument("--row-major", action="store_true")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 5, 20])
@@ -79,7 +83,6 @@ def main():
     block, size = quant_size(kind)
 
     def shard(tensor):
-        assert int(tensor.tensor_type) == kind
         raw = tensor.data
         if args.axis == 0:
             span = raw.shape[0] // 4
@@ -88,17 +91,45 @@ def main():
         assert span % size == 0
         return raw[:, args.rank * span : (args.rank + 1) * span].copy()
 
-    raw = np.concatenate(
-        [shard(tensor)]
-        + [
-            shard(next(t for t in reader.tensors if t.name == name))
-            for name in args.join
-        ],
-        axis=0,
-    )
-    codec = transcode_integer_dot(raw, kind)
-    n, k = codec.shape
-    packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+    tensors = [tensor] + [
+        next(t for t in reader.tensors if t.name == name) for name in args.join
+    ]
+    types = [int(t.tensor_type) for t in tensors]
+    shards = [shard(t) for t in tensors]
+    paired_type = 0
+    if args.mixed_u4_pair:
+        assert args.activated and not args.raw_source and not args.row_major
+        assert types in ([12, 23], [23, 12])
+        paired_type = types[1]
+        codecs = [transcode_integer_dot(r, t) for r, t in zip(shards, types)]
+        n, k = codecs[0].shape
+        n *= 2
+        codec = codecs[0]
+        packed = [torch.from_numpy(a).cuda() for a in pack_mixed_u4_pair(*codecs)]
+        projections = prepare_gguf_projections(
+            [(torch.from_numpy(r).cuda(), t) for r, t in zip(shards, types)],
+            torch.float16,
+            True,
+            8,
+        )
+
+        def control(x):
+            return apply_prepared_gguf_projections(x, projections)
+
+        reference = torch.cat(
+            [torch.from_numpy(dequantize(r, t)).cuda() for r, t in zip(shards, types)]
+        )
+    else:
+        assert all(t == kind for t in types)
+        raw = np.concatenate(shards, axis=0)
+        codec = transcode_integer_dot(raw, kind)
+        n, k = codec.shape
+        packed = [torch.from_numpy(t).cuda() for t in codec.packed()]
+        control = GGUFPreparedProjection(
+            torch.from_numpy(raw).cuda(), kind, torch.float16, True, 8
+        )
+        assert control.rejection_reason is None
+        reference = torch.from_numpy(dequantize(raw, kind)).cuda()
     if args.row_major:
         assert not args.raw_source
         packed = [torch.from_numpy(t).cuda() for t in codec.row_storage()]
@@ -111,11 +142,6 @@ def main():
             torch.empty(0, device="cuda", dtype=torch.float16),
             torch.empty(0, device="cuda", dtype=torch.int8),
         ]
-    control = GGUFPreparedProjection(
-        torch.from_numpy(raw).cuda(), kind, torch.float16, True, 8
-    )
-    assert control.rejection_reason is None
-    reference = torch.from_numpy(dequantize(raw, kind)).cuda()
     result = dict(
         version=vllm.__version__,
         core_sha256=hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest(),
@@ -138,6 +164,7 @@ def main():
         ),
         shape=[n, k],
         source_type=kind,
+        source_types=types,
         tp_rank=args.rank,
         tp_size=4,
         axis=args.axis,
@@ -154,9 +181,19 @@ def main():
         scale = q8[:, :, :2].contiguous().view(torch.float16).float()
         decoded = (integer * scale).reshape(m, k)
         expected = decoded @ reference.T
-        if kind == 12:
-            minimum = codec.dmin.astype("float32").repeat(8, axis=1)
-            minimum *= codec.small_mins.astype("float32")
+        if kind == 12 or paired_type:
+
+            def minima(codec):
+                if codec.source_type != 12:
+                    return np.zeros((codec.shape[0], k // 32), dtype=np.float32)
+                result = codec.dmin.astype("float32").repeat(8, axis=1)
+                return result * codec.small_mins.astype("float32")
+
+            minimum = (
+                np.concatenate([minima(c) for c in codecs])
+                if paired_type
+                else minima(codec)
+            )
             original_sum = (
                 q8[:, :, 2:4].contiguous().view(torch.float16).float().squeeze(-1)
             )
@@ -203,6 +240,7 @@ def main():
                         split,
                         cooperative,
                         args.activated,
+                        *([paired_type] if paired_type else []),
                     )
 
                 try:

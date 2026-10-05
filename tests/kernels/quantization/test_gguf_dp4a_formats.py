@@ -5,10 +5,34 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.quantization.gguf_dp4a_formats import (
+    pack_mixed_u4_pair,
     transcode_integer_dot,
 )
 from vllm.model_executor.layers.quantization.gguf_layout import GGUFHeadTilingLayout
 from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
+
+
+@pytest.mark.parametrize("kinds", [(12, 23), (23, 12)])
+def test_mixed_u4_pair_retains_packets_and_original_coefficients(kinds):
+    codecs = []
+    for kind in kinds:
+        _, size = quant_size(kind)
+        raw = np.random.default_rng(kind).integers(
+            0, 256, (160, 10 * size), dtype=np.uint8
+        )
+        codecs.append(transcode_integer_dot(raw, kind))
+    pair = pack_mixed_u4_pair(*codecs)
+    for index, codec in enumerate(codecs):
+        packed = codec.packed()
+        rows = slice(160 * index, 160 * (index + 1))
+        np.testing.assert_array_equal(pair[0][5 * index : 5 * (index + 1)], packed[0])
+        for field in (1, 2):
+            np.testing.assert_array_equal(pair[field][:, rows], packed[field])
+        for field in (3, 4):
+            if codec.source_type == 23:
+                assert not pair[field][:, rows].any()
+            else:
+                np.testing.assert_array_equal(pair[field][:, rows], packed[field])
 
 
 @pytest.mark.parametrize("kind", [12, 14, 23])

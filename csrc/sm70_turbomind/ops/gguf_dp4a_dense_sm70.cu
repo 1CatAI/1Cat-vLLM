@@ -34,13 +34,17 @@ struct IntegerGroup {
       const uint32_t value = codes[packet + i * 32];
       if constexpr (Kind == 0)
         result.words[i] = value;
-      else if constexpr (Kind == 1) {
-        result.words[2 * i] = u4_word(value);
-        result.words[2 * i + 1] = u4_word(value >> 16);
-      } else {
-        using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
-        result.words[2 * i] = Lut::iq_values(value) ^ 0x80808080U;
-        result.words[2 * i + 1] = Lut::iq_values(value >> 16) ^ 0x80808080U;
+      else {
+        const bool lut = Kind == 2 || (Kind == 3 && col >= n / 2) ||
+                         (Kind == 4 && col < n / 2);
+        if (lut) {
+          using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+          result.words[2 * i] = Lut::iq_values(value) ^ 0x80808080U;
+          result.words[2 * i + 1] = Lut::iq_values(value >> 16) ^ 0x80808080U;
+        } else {
+          result.words[2 * i] = u4_word(value);
+          result.words[2 * i + 1] = u4_word(value >> 16);
+        }
       }
     }
     if constexpr (Kind == 0) {
@@ -52,8 +56,9 @@ struct IntegerGroup {
       const int64_t index = int64_t{group} * n + col;
       result.scale0 = __half2float(d[index]) * float(scales[index]);
       result.scale1 = result.scale0;
-      result.minimum =
-          Kind == 1 ? __half2float(dmin[index]) * float(mins[index]) : 0.f;
+      result.minimum = (Kind == 1 || Kind >= 3)
+                           ? __half2float(dmin[index]) * float(mins[index])
+                           : 0.f;
     }
     return result;
   }
@@ -66,7 +71,8 @@ struct IntegerGroup {
 #pragma unroll
     for (int i = 4; i < 8; ++i) b = __dp4a(words[i], values[i], b);
     float result = (float(a) * scale0 + float(b) * scale1) * __low2float(x.ds);
-    if constexpr (Kind == 1) result -= minimum * __high2float(x.ds);
+    if constexpr (Kind == 1 || Kind >= 3)
+      result -= minimum * __high2float(x.ds);
     return result;
   }
 };
@@ -340,9 +346,14 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
                               torch::Tensor d, torch::Tensor scales,
                               torch::Tensor dmin, torch::Tensor mins,
                               int64_t source_type, int64_t split,
-                              bool cooperative, bool activated) {
+                              bool cooperative, bool activated,
+                              int64_t paired_type) {
   TORCH_CHECK(source_type == 12 || source_type == 14 || source_type == 23,
               "Unsupported integer-dot storage family");
+  TORCH_CHECK(paired_type == 0 ||
+                  (activated && ((source_type == 12 && paired_type == 23) ||
+                                 (source_type == 23 && paired_type == 12))),
+              "Mixed integer pairs require Q4_K/IQ4_XS gated projections");
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kUInt8 && x.dim() == 3 &&
                   x.size(2) == sizeof(Q8_1) && x.is_contiguous() &&
                   (x.size(0) == 1 || x.size(0) == 5 || x.size(0) == 20) &&
@@ -353,6 +364,7 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
     TORCH_CHECK(t.device() == x.device(),
                 "Integer GEMM tensors must share a CUDA device");
   if (codes.scalar_type() == torch::kUInt8) {
+    TORCH_CHECK(!paired_type, "Mixed pairs require normalized N32 packets");
     const bool normalized = d.scalar_type() == torch::kFloat32;
     const int group = source_type == 14 ? 16 : 32;
     TORCH_CHECK(
@@ -414,7 +426,7 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
               "Invalid original scale levels");
   TORCH_CHECK(dmin.scalar_type() == torch::kFloat16 && dmin.is_contiguous() &&
                   mins.scalar_type() == torch::kInt8 && mins.is_contiguous() &&
-                  (source_type != 12 ||
+                  ((source_type != 12 && !paired_type) ||
                    (dmin.sizes() == d.sizes() && mins.sizes() == d.sizes())),
               "Invalid affine minimum levels");
   TORCH_CHECK(split >= 1 && split <= 16 && split <= x.size(1) &&
@@ -425,7 +437,13 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
   const auto* props = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(props->major == 7 && props->minor == 0,
               "Integer GEMM requires SM70");
-  if (source_type == 14)
+  if (paired_type == 23)
+    dispatch<3>(out, partial, x, codes, d, scales, dmin, mins, split,
+                cooperative, activated);
+  else if (paired_type == 12)
+    dispatch<4>(out, partial, x, codes, d, scales, dmin, mins, split,
+                cooperative, activated);
+  else if (source_type == 14)
     dispatch<0>(out, partial, x, codes, d, scales, dmin, mins, split,
                 cooperative, activated);
   else if (source_type == 12)

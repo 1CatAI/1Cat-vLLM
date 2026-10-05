@@ -979,7 +979,8 @@ void gguf_dp4a_dense_sm70_out(torch::Tensor out, torch::Tensor partial,
                               torch::Tensor d, torch::Tensor scales,
                               torch::Tensor dmin, torch::Tensor mins,
                               int64_t source_type, int64_t split,
-                              bool cooperative, bool activated);
+                              bool cooperative, bool activated,
+                              int64_t paired_type);
 void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,

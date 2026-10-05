@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
@@ -63,7 +65,12 @@ def test_mixed_projection_encodes_once_and_keeps_canonical_fallback():
     assert all(len(p.dp4a_payload) == 5 for p in projections)
     for m in (1, 5, 20, 64):
         x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
-        out = apply_prepared_gguf_projections(x, projections)
+        quantize = torch.ops._C.gguf_quantize_q8_1_sm70_out
+        with patch.object(
+            torch.ops._C, "gguf_quantize_q8_1_sm70_out", wraps=quantize
+        ) as encode:
+            out = apply_prepared_gguf_projections(x, projections)
+            assert encode.call_count == int(m in (5, 20))
         assert out.shape == (m, 320) and out.is_contiguous()
         assert torch.isfinite(out).all()
         if m not in (5, 20):
