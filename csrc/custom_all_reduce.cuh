@@ -136,7 +136,8 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
-constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
+// Full-K down finish owns 44 column-pair counters per eight-token tile.
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 512;
 constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);

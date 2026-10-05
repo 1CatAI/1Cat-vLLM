@@ -35,7 +35,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--fused-down-finish", action="store_true")
     args = parser.parse_args()
+    arms = (0, -8, -16) if args.fused_down_finish else (0, 8, 16)
     rank = int(os.environ["LOCAL_RANK"])
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
@@ -99,7 +101,7 @@ def main():
             saved.extend((state, xn, work[-2], injection))
 
     outputs, graphs = {}, {}
-    for warps in (0, 8, 16):
+    for warps in arms:
         saved = []
         dist.barrier()
         graphs[warps] = capture(partial(chain, warps, saved))
@@ -110,7 +112,7 @@ def main():
         initial.normal_(0, scale)
         graphs[0].replay()
         reference = [t.clone() for t in outputs[0]]
-        for warps in (8, 16):
+        for warps in arms[1:]:
             graphs[warps].replay()
             torch.accelerator.synchronize()
             assert all(torch.isfinite(t).all() for t in outputs[warps])
@@ -121,7 +123,7 @@ def main():
             checks.append(dict(warps=warps, scale=scale, max_abs=delta))
     trials = {w: [] for w in graphs}
     for trial in range(7):
-        order = (0, 8, 16) if trial % 2 else (16, 8, 0)
+        order = arms if trial % 2 else arms[::-1]
         for warps in order:
             dist.barrier()
             times = [None] * 4
@@ -139,7 +141,7 @@ def main():
             x.new_empty(rows, 2560),
             x.new_empty(rows, 4),
         )
-        for warps in (0, 8, 16):
+        for warps in arms:
             dist.barrier()
             g = capture(partial(pair, x, *packed[0], work, warps))
             g.replay()

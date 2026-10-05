@@ -670,6 +670,112 @@ __global__ __launch_bounds__(32 * Warps) void hc_up_cta_split_gather(
   hc_publish_packets(buffers, rank, group, tile, packets, gathered, rows);
 }
 
+// Complete column-pair ownership fuses projection, SiLU and disjoint TP
+// packets without a cross-CTA barrier. Quad K slices only load live columns.
+template <int Warps>
+__global__ __launch_bounds__(32 * Warps) void hc_down_cta_finish(
+    const half* x, const half* packed, half* lora, half* injection, int rows,
+    RankData buffers, int rank) {
+  __shared__ float sums[Warps][8][2];
+  __shared__ __align__(16) uint32_t packets[16];
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int group = blockIdx.y, column = blockIdx.x * 2;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0), quad = (lane >> 2) & 3;
+  const int row = group * 8 + r;
+  const half* w = packed + static_cast<size_t>(column / 32) * 10240 * 32;
+  float accum[8] = {};
+  for (int g = 0; g < 640 / (Warps * 4); ++g) {
+    const int kg = (warp * 4 + quad) * (640 / (Warps * 4)) + g;
+    uint4 lo = {}, hi = {}, a = {}, b = {};
+    if (r < 2 && (column < 80 || rank == 3)) {
+      const int col = column % 32 + r;
+      lo = *reinterpret_cast<const uint4*>(w + (kg * 64 + col) * 8);
+      hi = *reinterpret_cast<const uint4*>(w + (kg * 64 + 32 + col) * 8);
+    }
+    if (row < rows) {
+      const half* input = x + row * 10240 + kg * 16;
+      a = *reinterpret_cast<const uint4*>(input);
+      b = *reinterpret_cast<const uint4*>(input + 8);
+    }
+    mma(accum, a.x, a.y, lo.x, lo.y);
+    mma(accum, a.z, a.w, lo.z, lo.w);
+    mma(accum, b.x, b.y, hi.x, hi.y);
+    mma(accum, b.z, b.w, hi.z, hi.w);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int rr = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+    const int cc = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+    float value = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q)
+      value = __fadd_rn(
+          value, __shfl_sync(0xffffffff, accum[i], (lane & ~12) | (q << 2)));
+    if (quad == 0 && cc < 2) sums[warp][rr][cc] = value;
+  }
+  __syncthreads();
+  constexpr int stride = 16 * 88;
+  constexpr size_t channel = kSm70Qwen38HcBatchDownOffset;
+  const int block = group * 44 + blockIdx.x;
+  auto* local =
+      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
+      channel;
+  auto* counters = reinterpret_cast<uint32_t*>(local);
+  const uint32_t epoch = counters[block], tag = epoch + 1u;
+  const int slot = epoch * 4 * stride, t = threadIdx.x;
+  if (t < 16) {
+    float projected = 0.0f;
+#pragma unroll
+    for (int w = 0; w < Warps; ++w)
+      projected = __fadd_rn(projected, sums[w][t / 2][t % 2]);
+    half value = __float2half_rn(projected);
+    if (column < 80) {
+      const float scaled = div_full(__half2float(value), 4.0f);
+      value = __float2half_rn(__fmul_rn(scaled, sigmoid(scaled)));
+    }
+    packets[t] = (tag << 16) | __half_as_ushort(value);
+  }
+  __syncthreads();
+  if (t < 4) {
+    const int pack = block * 4 + t;
+    const uint4 words = reinterpret_cast<const uint4*>(packets)[t];
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      auto* dest =
+          const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+          channel + kSm70Qwen38HcBatchCounterBytes +
+          (slot + rank * stride) * sizeof(uint32_t);
+      sm70_push_store_volatile_16b(words, dest, pack);
+    }
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      void* source = local + kSm70Qwen38HcBatchCounterBytes +
+                     (slot + peer * stride) * sizeof(uint32_t);
+      uint4 received;
+      do {
+        sm70_push_load_volatile_16b(received, source, pack);
+      } while ((received.x >> 16) != tag || (received.y >> 16) != tag ||
+               (received.z >> 16) != tag || (received.w >> 16) != tag);
+      const uint32_t values[4] = {received.x, received.y, received.z,
+                                  received.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = group * 8 + (t * 4 + i) / 2, col = column + i % 2;
+        if (row < rows) {
+          const half value = __ushort_as_half(values[i] & 0xffffu);
+          if (col < 80)
+            lora[row * 320 + peer * 80 + col] = value;
+          else if (peer == 3 && col < 84)
+            injection[row * 4 + col - 80] = value;
+        }
+      }
+      sm70_push_store_volatile_16b(make_uint4(0, 0, 0, 0), source, pack);
+    }
+  }
+  __syncthreads();
+  if (t == 0) counters[block] = (epoch + 1u) & 1u;
+}
+
 inline void launch(RankData buffers, int rank, const half* input,
                    const half* packed_down, const half* packed_up,
                    float* partials, half* lora, half* local_output,
@@ -678,19 +784,28 @@ inline void launch(RankData buffers, int rank, const half* input,
                    bool fused_chain, int cta_split_warps = 0) {
   TORCH_CHECK(!fused_chain || (!round_partials && !cooperative),
               "Fused concurrent HC requires FP32 partials");
-  TORCH_CHECK(cta_split_warps == 0 || (fused_chain && (cta_split_warps == 8 ||
-                                                       cta_split_warps == 16)),
+  TORCH_CHECK(cta_split_warps == 0 ||
+                  (fused_chain &&
+                   (abs(cta_split_warps) == 8 || abs(cta_split_warps) == 16)),
               "HC CTA split requires 8/16 warps and the FP32 fused chain");
   if (cta_split_warps) {
-    if (cta_split_warps == 8)
+    const int warps = abs(cta_split_warps);
+    if (cta_split_warps == -8)
+      hc_down_cta_finish<8><<<dim3(44, (rows + 7) / 8), 256, 0, stream>>>(
+          input, packed_down, lora, injection, rows, buffers, rank);
+    else if (cta_split_warps == -16)
+      hc_down_cta_finish<16><<<dim3(44, (rows + 7) / 8), 512, 0, stream>>>(
+          input, packed_down, lora, injection, rows, buffers, rank);
+    else if (warps == 8)
       hc_down_cta_split<8><<<dim3(3, (rows + 7) / 8, 20), 256, 0, stream>>>(
           input, packed_down, partials, rows);
     else
       hc_down_cta_split<16><<<dim3(3, (rows + 7) / 8, 20), 512, 0, stream>>>(
           input, packed_down, partials, rows);
-    down_gather_coalesced<<<(rows * 88 + 127) / 128, 128, 0, stream>>>(
-        buffers, partials, lora, injection, rank, rows);
-    if (cta_split_warps == 8)
+    if (cta_split_warps > 0)
+      down_gather_coalesced<<<(rows * 88 + 127) / 128, 128, 0, stream>>>(
+          buffers, partials, lora, injection, rank, rows);
+    if (warps == 8)
       hc_up_cta_split_gather<8><<<dim3(80, (rows + 7) / 8), 256, 0, stream>>>(
           lora, packed_up, input, local_output, rows, buffers, rank, output);
     else

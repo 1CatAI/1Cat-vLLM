@@ -100,10 +100,11 @@ Use [draft-vocab documentation](https://github.com/Niko1221/Strata/blob/6f32ec07
 [the corpus/script builder](https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/tools/draft_vocab.py)
 and [multi-token HC kernels](https://github.com/Niko1221/Strata/blob/6f32ec070f23ced9f50e704d854d775da52591ab/src/kernels/cuda/fused_gr.cu).
 Its current CJK subset contains 106299 IDs; the English/code subset contains
-40525. These sizes are references, not our vocabulary choice. Measure
-coverage on our own frozen corpus with an independent held-out split and
-Chinese, Japanese, Korean, English and code statistics before selecting IDs.
-Keep all required script/byte/special-token coverage. Preserve original token
+40525. These sizes are references, not our vocabulary choice. Evaluate three candidates: the Strata English/code set, its CJK extension,
+and a set ranked by actual target-model outputs. Corpus coverage is descriptive
+and cannot admit or reject a draft set. Compare Chinese/English acceptance,
+actual emitted tokens/round, complete-round latency and tokens/s with a fixed
+MTP4 control; select by tokens/s. Retain the original token IDs. Preserve original token
 IDs and use compact value/ID IPC instead of gathering full vocabulary logits.
 
 The current Strata confidence cutoff defaults to zero in source; a 0.5 gate
@@ -416,3 +417,39 @@ checkpoint draft head. Its requests are explicitly ineligible for default
 speed admission. Use the frozen 16-prompt manifest (math, code, Chinese and
 retrieval) with the same 8K prompt/256K capacity, and compare target/draft
 separately through the shared distribution tool and limits.
+
+### Structural campaign and numerical gates, 2026-10-05
+
+Stop register-prefetch attempts. Priority is HC CTA-parallel reduction/finish,
+fused router projection/softmax/top10/plan, fused shared-expert chain, segmented
+QSA selection/attention, distributed GDN state updates, and expert plan/launch
+fusion. All proposals first use whole-layer graph benchmarks. Keep default
+endpoint timing at 8K input/256K capacity, no profiler and actual round counts.
+
+The frozen 16-prompt reference/candidate comparison contains 2,656 target
+positions and 2,176 draft positions. Target shared-FP32 comparison passes all
+limits (zero KL/raw logit difference, 100% top1). Draft-head QPN8 gives mean KL
+0.000466, p99 0.006037, max 0.020955 and top1 99.724%; raw maximum logit error
+0.710938 fails 0.5. Remove automatic draft-head activation. Retain its explicit
+benchmark-only candidate and do not merge it as an admitted default. Shared
+and output projections now have independent diagnostic reference paths.
+
+A full HC graph over 96 real checkpoint pairs includes combine/norm, down
+projection/SiLU/gather and up/mix/gather. Unprofiled critical-rank medians:
+production 2.713 ms, 8-warp CTA split 2.378 ms, 16-warp 2.450 ms. These are
+operator-chain measurements, not endpoint speed. The 8-warp saving is only
+0.335 ms and does not satisfy the HC-chain goal of 1 ms. Next use complete
+column-pair ownership to absorb down reduction/SiLU/TP packets in one finish
+kernel, avoiding an inter-CTA barrier and removing the separate down gather.
+The norm finish remains a separate required integration stage.
+
+Source controls for rebase bisection must retain complete-round timing and
+normal sampling, identical 8K prompt/256K capacity/power/precision/cache policy.
+Record both token tape and draft counts at each source. The old and new timing
+harnesses take the same ordinary generation branch; their reset-cache change
+only affects node diagnostics. Do not label the 1.352-ms difference a source
+regression until old/new endpoints are reproduced in the matched environment.
+Relevant first-parent changes include QSA concurrency/long-context, GDN
+preprocessing and HC topology; quantized GGUF-only changes are not candidates
+unless a selected shared dispatch is affected. Bisect using actual endpoints,
+not profiled service or a tokens/s conversion.
