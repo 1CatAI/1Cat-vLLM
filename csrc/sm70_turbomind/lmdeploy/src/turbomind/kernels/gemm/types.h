@@ -100,11 +100,19 @@ enum class QuantType : int {
   kLatticeIQ3S = 12,
   kLatticeIQ2S = 13,
   kLatticeIQ1M = 14,
+  kOriginalIQ3S = 15,
+  kOriginalIQ2S = 16,
+  kRoundedOriginalIQ3S = 17,
+  kRoundedOriginalIQ2S = 18,
   kDefault = kK,
 };
 
 inline const char* to_string(QuantType q) {
   switch (q) {
+    case QuantType::kRoundedOriginalIQ3S: return "rounded_original_iq3_s";
+    case QuantType::kRoundedOriginalIQ2S: return "rounded_original_iq2_s";
+    case QuantType::kOriginalIQ3S: return "original_iq3_s";
+    case QuantType::kOriginalIQ2S: return "original_iq2_s";
     case QuantType::kNone:
       return "none";
     case QuantType::kK:

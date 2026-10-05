@@ -1,0 +1,1121 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from functools import partial
+
+import gguf
+import numpy as np
+import pytest
+import torch
+import vllm._C  # noqa: F401
+
+from vllm.model_executor.layers.quantization.gguf_raw import RawGGUFProjection
+from vllm.transformers_utils.gguf_tensor_reader import quant_size
+
+
+def packed(kind, n=7, k=768):
+    block, size = quant_size(kind)
+    rng = np.random.default_rng(8431 + kind)
+    data = rng.integers(0, 256, (n, k // block, size), dtype=np.uint8)
+    scales = rng.uniform(0.005, 0.03, (n, k // block)).astype("<f2")
+    data[:, :, :2] = scales[..., None].view(np.uint8)
+    return data.reshape(n, -1)
+
+
+@pytest.mark.parametrize("kind", [18, 21, 22])
+def test_original_payload_and_tp_slicing(kind):
+    data = packed(kind, n=12, k=1024)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    assert raw.shape == (12, 1024)
+    assert raw.padding_bytes_per_row <= 7
+    assert raw.storage_bytes == 12 * ((data.shape[1] + 7) // 8 * 8)
+    assert np.array_equal(raw.data[:, : data.shape[1]], data)
+    for axis in (0, 1):
+        shards = [raw.tp_slice(rank, 4, axis=axis) for rank in range(4)]
+        payload = [s.data[:, : s.payload_bytes_per_row] for s in shards]
+        assert np.array_equal(np.concatenate(payload, axis=axis), data)
+        assert all(s.padding_bytes_per_row <= 7 for s in shards)
+    with pytest.raises(ValueError, match="cuts a source block"):
+        RawGGUFProjection.from_rows(packed(kind, k=768), kind).tp_slice(0, 4, axis=1)
+
+
+@pytest.mark.parametrize("kind", [18, 21, 22])
+@pytest.mark.parametrize("factor_scale", [False, True])
+def test_raw_dequant_and_vector_graph(kind, factor_scale):
+    data = packed(kind)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    w = torch.from_numpy(raw.data).cuda()
+    expected = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    ).cuda()
+    fp32 = torch.empty_like(expected)
+    torch.ops._C.gguf_lattice_raw_dequantize_sm70_out(fp32, w, kind)
+    torch.testing.assert_close(fp32, expected, rtol=0, atol=0)
+    fp16 = torch.empty_like(expected, dtype=torch.float16)
+    torch.ops._C.gguf_lattice_raw_dequantize_sm70_out(fp16, w, kind)
+    torch.testing.assert_close(fp16, expected.half(), rtol=0, atol=0)
+    x = torch.randn(1, raw.logical_k, device="cuda", dtype=torch.float16)
+    out = torch.empty((1, raw.shape[0]), device="cuda", dtype=torch.float16)
+    partial = torch.empty((3, raw.shape[0]), device="cuda", dtype=torch.float32)
+    for splits in (1, 3):
+        for prefetch in (False, True):
+            run = lambda splits=splits, prefetch=prefetch: (
+                torch.ops._C.gguf_lattice_raw_vec_sm70_out(
+                    out, x, w, kind, partial, splits, prefetch, factor_scale
+                )
+            )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            torch.testing.assert_close(
+                out.float(), x.float() @ expected.T, rtol=0.001, atol=0.002
+            )
+
+
+@pytest.mark.parametrize("kind", [18, 21, 22])
+@pytest.mark.parametrize("m", [5, 8, 16])
+def test_raw_mma_matches_fp32_accumulation_and_graph(kind, m):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    data = packed(kind, n=37)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    w = torch.from_numpy(raw.data).cuda()
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn(m, raw.logical_k, device="cuda", dtype=torch.float16)
+    out = torch.empty((m, raw.shape[0]), device="cuda", dtype=torch.float16)
+    partial = torch.empty((3, m, raw.shape[0]), device="cuda", dtype=torch.float32)
+    for tile in (8, 32):
+        for splits in (1, 3):
+            run = lambda splits=splits, tile=tile: (
+                torch.ops._C.gguf_lattice_raw_mma_sm70_out(
+                    out, x, w, kind, partial, splits, tile
+                )
+            )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            torch.testing.assert_close(
+                out.float(), x.float() @ reference.float().T, rtol=0.003, atol=0.01
+            )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_raw_blas_graph(kind):
+    data = packed(kind)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    w = torch.from_numpy(raw.data).cuda()
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn(512, raw.logical_k, device="cuda", dtype=torch.float16)
+    out = torch.empty((512, raw.shape[0]), device="cuda", dtype=torch.float16)
+    scratch = torch.empty(reference.T.shape, dtype=torch.float16, device="cuda")
+    run = lambda: torch.ops._C.gguf_lattice_raw_blas_sm70_out(out, x, w, kind, scratch)
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.testing.assert_close(scratch, reference.T, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out.float(), x.float() @ reference.float().T, rtol=0.003, atol=0.01
+    )
+
+
+def restore_compact_bytes(storage, kind, n, k):
+    """Independent bitstream inverse: verify every source bit survives."""
+    block_bytes, bits, small_bytes = {
+        18: (98, 23, 4),
+        21: (110, 26, 4),
+        22: (82, 18, 8),
+    }[kind]
+    blocks = k // 256
+    restored = np.zeros((n, blocks, block_bytes), dtype=np.uint8)
+    for first in range(0, n, 32):
+        width = min(32, n - first)
+        packet_bytes = width * bits * 4
+        for block in range(blocks):
+            start = first * blocks * block_bytes + block * width * block_bytes
+            tile = storage[start : start + width * block_bytes]
+            stream = int.from_bytes(tile[:packet_bytes].tobytes(), "little")
+            target = restored[first : first + width, block]
+            target[:, :2] = tile[packet_bytes : packet_bytes + width * 2].reshape(
+                width, 2
+            )
+            scales = tile[packet_bytes + width * 2 :].reshape(width, small_bytes)
+            if kind == 18:
+                for group in range(8):
+                    target[:, 69 + 4 * group] = (
+                        (scales[:, group // 2] >> (4 * (group % 2))) & 15
+                    ) << 4
+            else:
+                target[:, 106 if kind == 21 else 74 :] = scales
+            for octet in range(32):
+                for col in range(width):
+                    packet = (stream >> ((octet * width + col) * bits)) & (
+                        (1 << bits) - 1
+                    )
+                    if kind == 18:
+                        target[col, 2 + octet * 2] = packet & 255
+                        target[col, 3 + octet * 2] = (packet >> 8) & 255
+                        offset = 66 + 4 * (octet // 4)
+                        aux = int.from_bytes(
+                            target[col, offset : offset + 4].tobytes(), "little"
+                        )
+                        aux |= (packet >> 16) << (7 * (octet % 4))
+                        target[col, offset : offset + 4] = np.frombuffer(
+                            aux.to_bytes(4, "little"), dtype=np.uint8
+                        )
+                    elif kind == 21:
+                        target[col, 2 + octet * 2] = packet & 255
+                        target[col, 3 + octet * 2] = (packet >> 9) & 255
+                        target[col, 66 + octet // 4] |= (
+                            ((packet >> 8) & 1) | (((packet >> 17) & 1) << 1)
+                        ) << (2 * (octet % 4))
+                        target[col, 74 + octet] = packet >> 18
+                    else:
+                        target[col, 2 + octet] = packet & 255
+                        target[col, 66 + octet // 4] |= ((packet >> 8) & 3) << (
+                            2 * (octet % 4)
+                        )
+                        target[col, 34 + octet] = packet >> 10
+    return restored.reshape(n, -1)
+
+
+@pytest.mark.parametrize("kind", [18, 21, 22])
+@pytest.mark.parametrize("n", [1, 7, 37, 64])
+def test_equal_byte_gpu_reorder_and_compact_graph(kind, n):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    data = packed(kind, n=n)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    count = (data.nbytes + 7) // 8 * 8
+    weight = torch.empty(count, dtype=torch.uint8, device="cuda")
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+        weight, source, kind, raw.logical_k
+    )
+    encoded = weight.cpu().numpy()
+    assert count - data.nbytes <= 7
+    assert np.array_equal(restore_compact_bytes(encoded, kind, n, raw.logical_k), data)
+    assert not encoded[data.nbytes :].any()
+    reference = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    ).cuda()
+    decoded = torch.empty_like(reference)
+    torch.ops._C.gguf_lattice_compact_dequantize_sm70_out(decoded, weight, kind)
+    torch.testing.assert_close(decoded, reference, rtol=0, atol=0)
+    for m in (1, 5, 8, 16, 512):
+        x = torch.randn(m, raw.logical_k, device="cuda", dtype=torch.float16)
+        out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+        scratch = torch.empty(reference.T.shape, dtype=torch.float16, device="cuda")
+        plans = (
+            [
+                (split, variant, False, 0)
+                for split in (1, 3)
+                for variant in (False, True)
+            ]
+            if m <= 64
+            else [(1, natural, False, 0) for natural in (False, True)]
+        )
+        if 1 < m <= 64 and n % 32 == 0:
+            plans += [(split, True, True, 0) for split in (1, 3)]
+        if m == 16:
+            plans += [(split, True, False, 8) for split in (1, 3)]
+            if n % 32 == 0:
+                plans += [(split, True, True, 8) for split in (1, 3)]
+        bounded_plans = [(*plan, False) for plan in plans]
+        if m == 16:
+            bounded_plans += [(*plan, True) for plan in plans if plan[3] == 0]
+        algorithm_plans = [
+            (*plan, algorithm)
+            for plan in bounded_plans
+            for algorithm in ((99, 102) if m == 512 else (99,))
+        ]
+        activation_plans = [(*plan, False) for plan in algorithm_plans]
+        if m == 16:
+            activation_plans += [
+                (*plan, True)
+                for plan in algorithm_plans
+                if not plan[2] and plan[3] == 0 and not plan[4]
+            ]
+        for (
+            split,
+            variant,
+            staged,
+            row_tile,
+            bounded,
+            algorithm,
+            stage_activation,
+        ) in activation_plans:
+            partials = torch.empty((split, m, n), dtype=torch.float32, device="cuda")
+            if m == 512:
+                scratch = torch.empty(
+                    reference.shape if variant else reference.T.shape,
+                    dtype=torch.float16,
+                    device="cuda",
+                )
+                run = partial(
+                    torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                    out,
+                    x,
+                    weight,
+                    kind,
+                    scratch,
+                    variant,
+                    algorithm,
+                )
+            else:
+                op = (
+                    torch.ops._C.gguf_lattice_compact_vec_sm70_out
+                    if m == 1
+                    else torch.ops._C.gguf_lattice_compact_mma_sm70_out
+                )
+                run = partial(
+                    op,
+                    out,
+                    x,
+                    weight,
+                    kind,
+                    partials,
+                    split,
+                    variant,
+                    *([staged, row_tile, bounded, stage_activation] if m != 1 else []),
+                )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+            expected = x.float() @ (reference if m == 1 else reference.half().float()).T
+            torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.01)
+            if m == 512:
+                expected_scratch = reference.half() if variant else reference.half().T
+                torch.testing.assert_close(scratch, expected_scratch, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_all_codebook_entries_and_signs(kind):
+    count = 512 if kind == 21 else 1024
+    _, size = quant_size(kind)
+    data = np.zeros((count * 2, size), dtype=np.uint8)
+    data[:, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    for row in range(count * 2):
+        index = row % count
+        if kind == 21:
+            data[row, 2:66] = index & 255
+            data[row, 66:74] = 255 if index & 256 else 0
+            data[row, 74:106] = 255 if row >= count else 0
+        else:
+            data[row, 2:34] = index & 255
+            data[row, 66:74] = (index >> 8) * 85
+            data[row, 34:66] = 255 if row >= count else 0
+    raw = RawGGUFProjection.from_rows(data, kind)
+    weight = torch.from_numpy(raw.data).cuda()
+    compact = torch.empty((data.nbytes + 7) // 8 * 8, dtype=torch.uint8, device="cuda")
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(compact, weight, kind, 256)
+    reference = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    ).cuda()
+    for layout, storage in (("raw", weight), ("compact", compact)):
+        out = torch.empty_like(reference)
+        getattr(torch.ops._C, f"gguf_lattice_{layout}_dequantize_sm70_out")(
+            out, storage, kind
+        )
+        torch.testing.assert_close(out, reference, rtol=0, atol=0)
+        rounded = torch.empty_like(reference, dtype=torch.float16)
+        getattr(torch.ops._C, f"gguf_lattice_{layout}_dequantize_sm70_out")(
+            rounded, storage, kind
+        )
+        torch.testing.assert_close(
+            rounded.view(torch.int16),
+            reference.half().view(torch.int16),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_final_half_rounding_for_every_finite_block_scale(kind):
+    # Include signed zero, every subnormal, overflow boundaries and both signs.
+    bits = np.arange(65536, dtype=np.uint16)
+    bits = bits[(bits & 0x7C00) != 0x7C00]
+    count = len(bits)
+    _, size = quant_size(kind)
+    blocks = 2 if kind == 21 else 1
+    data = np.zeros((count, blocks, size), dtype=np.uint8)
+    data[:, :, :2] = bits.view(np.uint8).reshape(count, 1, 2)
+    quant = getattr(gguf.quants, "IQ3_S" if kind == 21 else "IQ2_S")
+    quant.init_grid()
+    grid = quant.grid.reshape(-1, 4 if kind == 21 else 8)
+    if kind == 21:
+        indices = [
+            int(np.flatnonzero(np.any(grid == value, axis=1))[0])
+            for value in np.unique(grid)
+        ]
+        for block in range(blocks):
+            for octet in range(32):
+                first, second = indices[(2 * octet) % 8], indices[(2 * octet + 1) % 8]
+                data[:, block, 2 + 2 * octet] = first & 255
+                data[:, block, 3 + 2 * octet] = second & 255
+                data[:, block, 66 + octet // 4] |= (
+                    (first >> 8) << (2 * (octet % 4))
+                ) | ((second >> 8) << (2 * (octet % 4) + 1))
+            data[:, block, 74:106] = 0x55
+            for byte in range(4):
+                low = block * 8 + byte * 2
+                data[:, block, 106 + byte] = low | ((low + 1) << 4)
+    else:
+        index = next(i for i, row in enumerate(grid) if len(np.unique(row)) == 3)
+        data[:, :, 2:34] = index & 255
+        data[:, :, 66:74] = (index >> 8) * 85
+        data[:, :, 34:66] = 0x55
+        for byte in range(8):
+            data[:, :, 74 + byte] = 2 * byte | ((2 * byte + 1) << 4)
+    data = data.reshape(count, -1)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    weight = torch.from_numpy(raw.data).cuda()
+    compact = torch.empty((data.nbytes + 7) // 8 * 8, dtype=torch.uint8, device="cuda")
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+        compact, weight, kind, raw.logical_k
+    )
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+    )
+    for layout, storage in (("raw", weight), ("compact", compact)):
+        out = torch.empty_like(reference)
+        getattr(torch.ops._C, f"gguf_lattice_{layout}_dequantize_sm70_out")(
+            out, storage, kind
+        )
+        torch.testing.assert_close(
+            out.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_compact_blas_cancellation_retains_fp32_partials(kind):
+    _, size = quant_size(kind)
+    n, k = 1536, 2560
+    blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+    blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    data = blocks.reshape(n, -1)
+    # Grid index zero and zero small-scale bits reconstruct exactly one.
+    expected = gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    assert np.array_equal(expected, np.ones((n, k), dtype=np.float32))
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x = torch.full((512, k), 128.0, device="cuda", dtype=torch.float16)
+    x[:, k // 2 :] = -128.0
+    for natural in (False, True):
+        scratch = torch.empty(
+            (n, k) if natural else (k, n), device="cuda", dtype=torch.float16
+        )
+        for algorithm, dtype in [
+            (algo, dtype)
+            for algo in (99, 102)
+            for dtype in (torch.float16, torch.float32)
+        ]:
+            out = torch.empty((512, n), device="cuda", dtype=dtype)
+            run = partial(
+                torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+                out,
+                x,
+                weight,
+                kind,
+                scratch,
+                natural,
+                algorithm,
+            )
+            for _ in range(3):
+                run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            # Intermediate positive/negative partials exceed FP16 range,
+            # while the final dot product cancels exactly to zero.
+            graph.replay()
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+            x.neg_()
+            graph.replay()
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_compact_blas_fp32_output_and_final_cast_graph(kind):
+    data = packed(kind, n=37, k=2560)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty((data.nbytes + 7) // 8 * 8, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, 2560)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn((512, 2560), device="cuda", dtype=torch.float16)
+    result = torch.empty((512, 37), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(result, dtype=torch.float16)
+    for natural in (False, True):
+        scratch = torch.empty(
+            reference.shape if natural else reference.T.shape,
+            device="cuda",
+            dtype=torch.float16,
+        )
+
+        def run(scratch=scratch, natural=natural):
+            torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+                result,
+                x,
+                weight,
+                kind,
+                scratch,
+                natural,
+            )
+            out.copy_(result)
+
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        expected = x.float() @ reference.float().T
+        torch.testing.assert_close(result, expected, rtol=5e-5, atol=0.001)
+        torch.testing.assert_close(out, result.half(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+@pytest.mark.parametrize("dq_partitions", [1, 2, 4])
+def test_compact_turbomind_fp16_workspace_graph(kind, cancellation, dq_partitions):
+    n, k, m = (1536, 2560, 512) if cancellation else (64, 768, 512)
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        data.fill(0)
+        data.reshape(n, k // 256, -1)[:, :, :2] = np.array([1.0], dtype="<f2").view(
+            np.uint8
+        )
+    expected = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+    )
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    scratch = torch.empty_like(expected)
+    official = torch.empty_like(expected)
+    torch.ops._C.gguf_workspace_f16_prepare_sm70_out(official, expected)
+    oracle = expected.reshape(n // 32, 32, k // 8, 8).permute(0, 2, 1, 3)
+    torch.testing.assert_close(official.flatten(), oracle.flatten(), rtol=0, atol=0)
+    pointers, _ = torch.ops._C.awq_moe_build_strided_ptrs(
+        scratch.unsqueeze(0), scratch.unsqueeze(0), k * 32, k * 32, 1
+    )
+    offsets = torch.tensor([0, m], device="cuda", dtype=torch.int32)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(128.0)
+        x[:, k // 2 :] = -128.0
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_tm_f16_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        offsets,
+        pointers,
+        dq_partitions,
+    )
+    blas_scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+        out, x, weight, kind, blas_scratch, False, 102, dq_partitions
+    )
+    torch.testing.assert_close(blas_scratch.T, expected, rtol=0, atol=0)
+    for _ in range(3):
+        run()
+    torch.testing.assert_close(scratch, official, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        if cancellation:
+            x.neg_()
+        else:
+            x.copy_(torch.randn_like(x))
+        graph.replay()
+        if cancellation:
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                out.float(), x.float() @ expected.float().T, rtol=0.003, atol=0.01
+            )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_blaslt_fp32_reductions_and_graph(kind, cancellation):
+    n, k, m = (1536, 2560, 512) if cancellation else (160, 768, 512)
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        data.fill(0)
+        data.reshape(n, k // 256, -1)[:, :, :2] = np.array([1.0], dtype="<f2").view(
+            np.uint8
+        )
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+        .float()
+    )
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(128.0)
+        x[:, k // 2 :] = -128.0
+    out = torch.empty((m, n), device="cuda", dtype=torch.float16)
+    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    algorithms, sizes = torch.ops._C.gguf_lattice_compact_lt_sm70_prepare(x, out)
+    assert len(algorithms) > 0
+    assert int(sizes.max()) <= workspace.numel()
+    for algorithm in algorithms:
+        run = partial(
+            torch.ops._C.gguf_lattice_compact_lt_sm70_out,
+            out,
+            x,
+            weight,
+            kind,
+            scratch,
+            workspace,
+            algorithm,
+            2,
+        )
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        if cancellation:
+            x.neg_()
+        else:
+            x.copy_(torch.randn_like(x))
+        graph.replay()
+        if cancellation:
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                out.float(), x.float() @ reference.T, rtol=0.003, atol=0.01
+            )
+
+
+@pytest.mark.parametrize("kind", [18, 21, 22])
+@pytest.mark.parametrize("experts", [1, 7, 512, 1024])
+def test_compact_grouped_offsets_and_changed_graph(kind, experts):
+    n, k = 32, 768
+    data = [packed(kind, n=n, k=k) for _ in range(experts)]
+    for index, raw in enumerate(data):
+        blocks = raw.reshape(n, k // 256, -1)
+        scales = blocks[:, :, :2].copy().view("<f2")
+        scales *= 1 + (index % 31) / 32
+        blocks[:, :, :2] = scales.view(np.uint8)
+    original = [
+        torch.from_numpy(RawGGUFProjection.from_rows(d, kind).data).cuda() for d in data
+    ]
+    weight = torch.empty((experts, data[0].nbytes), device="cuda", dtype=torch.uint8)
+    reference = []
+    for index, (source, raw) in enumerate(zip(original, data)):
+        torch.ops._C.gguf_lattice_compact_reorder_sm70_out(
+            weight[index], source, kind, k
+        )
+        reference.append(
+            torch.from_numpy(
+                gguf.quants.dequantize(raw, gguf.GGMLQuantizationType(kind))
+            )
+            .half()
+            .cuda()
+        )
+    # Uneven expert rows, zero-row experts, and more than one tile per expert.
+    first = [0] * experts
+    first[0] = 17
+    first[-1] += 19
+    total = sum(first)
+    x = torch.randn((total, k), device="cuda", dtype=torch.float16)
+    out = torch.empty((total, n), device="cuda", dtype=torch.float16)
+    offsets = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
+    prefix = torch.empty_like(offsets)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_grouped_sm70_out,
+        out,
+        x,
+        weight,
+        offsets,
+        prefix,
+        kind,
+    )
+
+    def routing(counts):
+        cpu = torch.tensor([0, *counts], dtype=torch.int32).cumsum(0).to(torch.int32)
+        offsets.copy_(cpu)
+        return cpu.tolist()
+
+    routing(first)
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    second = [0] * experts
+    second[experts // 2] = total
+    third = [total // experts + (index < total % experts) for index in range(experts)]
+    for counts in (first, second, third):
+        boundaries = routing(counts)
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        expected = torch.empty_like(out, dtype=torch.float32)
+        for index in range(experts):
+            start, end = boundaries[index : index + 2]
+            if end > start:
+                expected[start:end] = x[start:end].float() @ reference[index].float().T
+        torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.01)
+        expected_prefix = (
+            torch.tensor(
+                [0, *[(count + 15) // 16 for count in counts]], dtype=torch.int32
+            )
+            .cumsum(0)
+            .to(torch.int32)
+        )
+        torch.testing.assert_close(prefix.cpu(), expected_prefix, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_compact_blas_cooperative_original_metadata_graph(kind, dtype):
+    n, k, m = 160, 768, 512
+    data = packed(kind, n=n, k=k)
+    raw = RawGGUFProjection.from_rows(data, kind)
+    source = torch.from_numpy(raw.data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .cuda()
+        .half()
+    )
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        False,
+        99,
+        2,
+        True,
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out.float(), x.float() @ reference.float().T, rtol=0.003, atol=0.01
+    )
+    data.fill(0)
+    data.reshape(n, k // 256, -1)[:, :, :2] = np.array([2.0], dtype="<f2").view(
+        np.uint8
+    )
+    source.copy_(torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data))
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    x.fill_(1024)
+    x[:, k // 2 :] = -1024
+    graph.replay()
+    torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_blas_algorithm11_requires_float_output_and_graph(kind, cancellation):
+    n, k, m = (1536, 2560, 512) if cancellation else (160, 768, 512)
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        data.fill(0)
+        data.reshape(n, k // 256, -1)[:, :, :2] = np.array([2.0], dtype="<f2").view(
+            np.uint8
+        )
+    source = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.nbytes, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, source, kind, k)
+    scratch = torch.empty((k, n), device="cuda", dtype=torch.float16)
+    result = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    out = torch.empty_like(result, dtype=torch.float16)
+    x = torch.randn((m, k), device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(1024)
+        x[:, k // 2 :] = -1024
+    with pytest.raises(RuntimeError, match="FP32 output"):
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+            out, x, weight, kind, scratch, False, 111, 2, True
+        )
+
+    def run():
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+            result, x, weight, kind, scratch, False, 111, 2, True
+        )
+        out.copy_(result)
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.neg_() if cancellation else x.copy_(torch.randn_like(x))
+    graph.replay()
+    if cancellation:
+        torch.testing.assert_close(result, torch.zeros_like(result), rtol=0, atol=0)
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+    else:
+        expected = (
+            torch.from_numpy(
+                gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+            )
+            .cuda()
+            .half()
+        )
+        torch.testing.assert_close(
+            result, x.float() @ expected.float().T, rtol=5e-5, atol=0.001
+        )
+        torch.testing.assert_close(out, result.half(), rtol=0, atol=0)
+
+
+def restore_planar(blob, kind, n, k):
+    """Independent byte inverse for the equal-byte MMA planes."""
+    blocks = k // 256
+    size = 110 if kind == 21 else 82
+    groups = 8 if kind == 21 else 16
+    count = n * blocks
+    result = np.empty((n, blocks, size), dtype=np.uint8)
+    codes = blob[: count * 64].view("<u2")
+    scales = blob[count * 66 : count * (70 if kind == 21 else 74)]
+    high = blob[count * (70 if kind == 21 else 74) :]
+    for row in range(n):
+        for block in range(blocks):
+            raw = result[row, block]
+            raw[:2] = blob[
+                count * 64 + (block * n + row) * 2 : count * 64
+                + (block * n + row + 1) * 2
+            ]
+            for octet in range(32):
+                packet = int(
+                    codes[
+                        ((row // 32 * blocks * 32 + block * 32 + octet) * 32) + row % 32
+                    ]
+                )
+                if kind == 21:
+                    raw[2 + octet * 2 : 4 + octet * 2] = [packet & 255, packet >> 8]
+                else:
+                    raw[2 + octet], raw[34 + octet] = packet & 255, packet >> 8
+            for group in range(groups):
+                index = (block * groups + group) * n + row
+                small = (int(scales[index // 2]) >> (4 * (index % 2))) & 15
+                offset = (106 if kind == 21 else 74) + group // 2
+                if group % 2 == 0:
+                    raw[offset] = small
+                else:
+                    raw[offset] |= small << 4
+                if kind == 21:
+                    raw[66 + group] = high[index]
+                    raw[74 + group * 4 : 78 + group * 4] = high[
+                        count * 8 + index * 4 : count * 8 + index * 4 + 4
+                    ]
+                else:
+                    hi = (int(high[index // 2]) >> (4 * (index % 2))) & 15
+                    offset = 66 + group // 2
+                    if group % 2 == 0:
+                        raw[offset] = hi
+                    else:
+                        raw[offset] |= hi << 4
+    return result.reshape(n, -1)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("m", [5, 16, 512])
+def test_planar_equal_bytes_official_values_and_graph(kind, m):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    n, k = 160, 768
+    data = packed(kind, n=n, k=k)
+    raw = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_planar_reorder_sm70_out(weight, raw, kind, k)
+    assert np.array_equal(restore_planar(weight.cpu().numpy(), kind, n, k), data)
+    expected = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(torch.ops._C.gguf_lattice_planar_gemm_sm70_out, out, x, weight, kind)
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), x.float() @ expected.float().T, rtol=0.001, atol=0.003
+        )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("threads", [128, 512])
+def test_compact_workspace_thread_layout_graph(kind, threads):
+    n, k, m = 160, 768, 512
+    data = packed(kind, n=n, k=k)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, original, kind, k)
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float32)
+    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        False,
+        111,
+        2,
+        True,
+        threads,
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    x.normal_()
+    graph.replay()
+    torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out, x.float() @ reference.float().T, rtol=0.001, atol=0.002
+    )
+    with pytest.raises(RuntimeError, match="32 source octets"):
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out(
+            out, x, weight, kind, scratch, False, 111, 4, True, 512
+        )
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_planar_rounded_scale_matches_canonical_and_graph(kind):
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        transcode_lattice,
+    )
+
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    n, k, m = 160, 768, 512
+    data = packed(kind, n=n, k=k)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_planar_reorder_sm70_out(weight, original, kind, k)
+    canonical = transcode_lattice(data, kind).dequantize().astype(np.float16)
+    official = gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    assert (
+        np.linalg.norm(canonical.astype(np.float32) - official)
+        / np.linalg.norm(official)
+        < 0.001
+    )
+    reference = torch.from_numpy(canonical).cuda().float()
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_planar_gemm_sm70_out, out, x, weight, kind, True
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), x.float() @ reference.T, rtol=0.001, atol=0.003
+        )
+    assert np.array_equal(restore_planar(weight.cpu().numpy(), kind, n, k), data)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+def test_planar_rounded_scale_retains_fp32_cancellation(kind):
+    n, k, m = 160, 2560, 512
+    _, size = quant_size(kind)
+    blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+    blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+    data = blocks.reshape(n, -1)
+    official = gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind))
+    assert np.array_equal(official, np.ones((n, k), dtype=np.float32))
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_planar_reorder_sm70_out(weight, original, kind, k)
+    x = torch.full((m, k), 128.0, device="cuda", dtype=torch.float16)
+    x[:, k // 2 :] = -128.0
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_planar_gemm_sm70_out, out, x, weight, kind, True
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.neg_()
+        graph.replay()
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_compact_rounded_workspace_and_fp32_graph(kind, cancellation):
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        transcode_lattice,
+    )
+
+    n, k, m = 160, 2560, 512
+    data = packed(kind, n=n, k=k)
+    if cancellation:
+        _, size = quant_size(kind)
+        blocks = np.zeros((n, k // 256, size), dtype=np.uint8)
+        blocks[:, :, :2] = np.array([1.0], dtype="<f2").view(np.uint8)
+        data = blocks.reshape(n, -1)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    weight = torch.empty(data.size, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_lattice_compact_reorder_sm70_out(weight, original, kind, k)
+    reference = (
+        torch.from_numpy(transcode_lattice(data, kind).dequantize()).half().cuda()
+    )
+    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    if cancellation:
+        x.fill_(128.0)
+        x[:, k // 2 :] = -128.0
+    out = torch.empty(m, n, device="cuda", dtype=torch.float32)
+    run = partial(
+        torch.ops._C.gguf_lattice_compact_blas_sm70_out,
+        out,
+        x,
+        weight,
+        kind,
+        scratch,
+        False,
+        111,
+        2,
+        True,
+        256,
+        True,
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.neg_() if cancellation else x.normal_()
+        graph.replay()
+        torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+        if cancellation:
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(
+                out, x.float() @ reference.float().T, rtol=0.001, atol=0.003
+            )
+
+
+def test_iq3_xxs_raw_prefill_workspace_and_changed_graph():
+    n, k, m, kind = 37, 768, 512, 18
+    data = packed(kind, n=n, k=k)
+    original = torch.from_numpy(RawGGUFProjection.from_rows(data, kind).data).cuda()
+    reference = (
+        torch.from_numpy(gguf.quants.dequantize(data, gguf.GGMLQuantizationType(kind)))
+        .half()
+        .cuda()
+    )
+    scratch = torch.empty(k, n, device="cuda", dtype=torch.float16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+    out = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    run = partial(
+        torch.ops._C.gguf_lattice_raw_blas_sm70_out, out, x, original, kind, scratch
+    )
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        torch.testing.assert_close(scratch.T, reference, rtol=0, atol=0)
+        torch.testing.assert_close(
+            out.float(), x.float() @ reference.float().T, rtol=0.001, atol=0.003
+        )
+
+
+def test_iq3_xxs_raw_and_compact_capabilities():
+    from vllm.model_executor.kernels.gguf import (
+        compact_lattice_capabilities,
+        raw_lattice_capabilities,
+    )
+
+    caps = raw_lattice_capabilities(18, 2560, 160, torch.float16)
+    assert all(cap.reason is None for cap in caps)
+    assert [cap.supports_m(1) for cap in caps] == [True, False, False]
+    assert all(
+        cap.reason is None
+        for cap in compact_lattice_capabilities(18, 2560, 160, torch.float16)
+    )

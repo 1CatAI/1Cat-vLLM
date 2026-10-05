@@ -308,3 +308,142 @@ def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapabilit
     return GGUFOperatorCapability(
         family, quant_type_name(weight_type), operator, graph_safe, reason=reason
     )
+
+
+def raw_lattice_capabilities(
+    source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Original IQ blocks; each operator owns its FP32 accumulation policy."""
+    return _lattice_storage_capabilities("raw", source_type, k, n, dtype, enabled)
+
+
+def compact_lattice_capabilities(
+    source_type: int, k: int, n: int, dtype: torch.dtype, enabled: bool = True
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Equal-byte GPU permutation with unchanged original scale precision."""
+    return _lattice_storage_capabilities("compact", source_type, k, n, dtype, enabled)
+
+
+def compact_lattice_grouped_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    num_experts: int,
+    dtype: torch.dtype,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Admit original-byte grouped MMA without reading routed rows on CPU."""
+    reason = None
+    operator = "gguf_lattice_compact_grouped_sm70_out"
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif source_type not in (18, 21, 22):
+        reason = "raw_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif k <= 0 or k % 256 or n <= 0 or n % 32:
+        reason = "raw_grouped_shape_cuts_source_block_or_output_pack"
+    elif not 1 <= num_experts <= 1024:
+        reason = "raw_grouped_expert_count_unavailable"
+    elif not hasattr(torch.ops._C, operator):
+        reason = "operator_unavailable"
+    return (
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            reason=reason,
+        ),
+    )
+
+
+def _lattice_storage_capabilities(layout, source_type, k, n, dtype, enabled):
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif source_type not in (18, 21, 22):
+        reason = "raw_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif k <= 0 or k % 256 or n <= 0:
+        reason = "raw_shape_cuts_source_block"
+    bands: tuple[tuple[str, int, int | None], ...] = (
+        (f"gguf_lattice_{layout}_vec_sm70_out", 1, 1),
+        (f"gguf_lattice_{layout}_mma_sm70_out", 2, 64),
+        (f"gguf_lattice_{layout}_blas_sm70_out", 512, None),
+    )
+    if layout == "compact":
+        bands += (
+            ("gguf_lattice_compact_tm_f16_sm70_out", 512, None),
+            ("gguf_lattice_compact_lt_sm70_out", 512, None),
+        )
+    return tuple(
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=minimum,
+            max_m=maximum,
+            reason=reason
+            or (
+                "fp16_workspace_requires_output_pack_alignment"
+                if operator
+                in (
+                    "gguf_lattice_compact_tm_f16_sm70_out",
+                    "gguf_lattice_compact_lt_sm70_out",
+                )
+                and n % 32
+                else None
+            )
+            or (None if hasattr(torch.ops._C, operator) else "operator_unavailable"),
+        )
+        for operator, minimum, maximum in bands
+    )
+
+
+def planar_lattice_capabilities(
+    source_type: int,
+    k: int,
+    n: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+) -> tuple[GGUFOperatorCapability, ...]:
+    """Select equal-byte MMA planes only for a measured faster descriptor."""
+    operator = "gguf_lattice_planar_gemm_sm70_out"
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif source_type not in (21, 22):
+        reason = "raw_source_format_unavailable"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif k <= 0 or k % 256 or n <= 0 or n % 32:
+        reason = "raw_shape_cuts_source_block_or_output_pack"
+    elif n > 65535 or k // 256 > 32767 or k * 32 > 2**31 - 1:
+        reason = "planar_descriptor_exceeds_dimension_encoding"
+    elif not hasattr(torch.ops._C, operator):
+        reason = f"operator_missing:{operator}"
+    elif (n, k) != (160, 2560):
+        reason = (
+            "measured_slower_than_canonical_gemm"
+            if source_type == 21
+            and (n, k) in ((4352, 5120), (5120, 4352), (1536, 2560), (2560, 1536))
+            else "planar_shape_has_no_calibration"
+        )
+    return (
+        GGUFOperatorCapability(
+            decoder_family(source_type),
+            quant_type_name(source_type),
+            operator,
+            True,
+            min_m=512,
+            max_m=512,
+            reason=reason,
+        ),
+    )

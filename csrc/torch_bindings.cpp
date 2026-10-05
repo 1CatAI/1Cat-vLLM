@@ -197,16 +197,91 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_affine_blas_sm70_out", torch::kCUDA,
            &gguf_affine_blas_sm70_out);
   ops.def(
+      "gguf_lattice_planar_reorder_sm70_out(Tensor(a!) out, Tensor raw, "
+      "int source_type, int logical_k) -> ()");
+  ops.impl("gguf_lattice_planar_reorder_sm70_out", torch::kCUDA,
+           &gguf_lattice_planar_reorder_sm70_out);
+  ops.def(
+      "gguf_lattice_planar_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, int source_type, bool rounded_scale=False) -> ()");
+  ops.impl("gguf_lattice_planar_gemm_sm70_out", torch::kCUDA,
+           &gguf_lattice_planar_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_reorder_sm70_out(Tensor(a!) out, Tensor raw, int "
+      "source_type, int logical_k) -> ()");
+  ops.impl("gguf_lattice_compact_reorder_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_reorder_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
+      "int source_type) -> ()");
+  ops.impl("gguf_lattice_compact_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
+      "row_wise=False) -> ()");
+  ops.impl("gguf_lattice_compact_vec_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_vec_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
+      "prefetch=False, bool staged=False, int row_tile=0, bool "
+      "occupancy7=False, bool stage_activation=False) -> ()");
+  ops.impl("gguf_lattice_compact_mma_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_mma_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) scratch, bool natural_layout=False, "
+      "int algorithm=99, int dq_partitions=1, bool shared_metadata=False, "
+      "int dq_threads=256, bool rounded_scale=False) "
+      "-> ()");
+  ops.impl("gguf_lattice_compact_blas_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_blas_sm70_out);
+  ops.def(
+      "gguf_workspace_f16_prepare_sm70_out(Tensor(a!) out, Tensor input) -> "
+      "()");
+  ops.impl("gguf_workspace_f16_prepare_sm70_out", torch::kCUDA,
+           &gguf_workspace_f16_prepare_sm70_out);
+  ops.def(
+      "gguf_workspace_f16_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs) -> ()");
+  ops.impl("gguf_workspace_f16_gemm_sm70_out", torch::kCUDA,
+           &gguf_workspace_f16_gemm_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_tm_f16_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, int source_type, Tensor(b!) scratch, Tensor offsets, "
+      "Tensor weight_ptrs, int dq_partitions=1) -> ()");
+  ops.impl("gguf_lattice_compact_tm_f16_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_tm_f16_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_lt_sm70_prepare(Tensor input, Tensor out, "
+      "int max_candidates=32) -> Tensor[]");
+  ops.impl("gguf_lattice_compact_lt_sm70_prepare", torch::kCUDA,
+           &gguf_lattice_compact_lt_sm70_prepare);
+  ops.def(
+      "gguf_lattice_compact_lt_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) scratch, Tensor(c!) workspace, "
+      "Tensor algorithm, int dq_partitions=1) -> ()");
+  ops.impl("gguf_lattice_compact_lt_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_lt_sm70_out);
+  ops.def(
+      "gguf_lattice_compact_grouped_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor offsets, Tensor(b!) tile_prefix, int source_type) "
+      "-> ()");
+  ops.impl("gguf_lattice_compact_grouped_sm70_out", torch::kCUDA,
+           &gguf_lattice_compact_grouped_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_mma_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) partial, int splits=1, int "
+      "tile_n=32) -> ()");
+  ops.impl("gguf_lattice_raw_mma_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_mma_sm70_out);
+  ops.def(
       "gguf_small_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
       "int num_experts, int group_size) -> ()");
   ops.impl("gguf_small_grouped_vec_sm70_out", torch::kCUDA,
            &gguf_small_grouped_vec_sm70_out);
-  ops.def(
-      "gguf_lattice_raw_dequantize_sm70_out(Tensor(a!) out, Tensor weight, int "
-      "source_type) -> ()");
-  ops.impl("gguf_lattice_raw_dequantize_sm70_out", torch::kCUDA,
-           &gguf_lattice_raw_dequantize_sm70_out);
   ops.def(
       "gguf_lattice_raw_grouped_gate_up_sm70_out(Tensor(a!) gate, Tensor(b!) "
       "up, Tensor input, Tensor gate_weights, Tensor up_weights, Tensor "
@@ -214,6 +289,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor ids, int source_type, int top_k) -> ()");
   ops.impl("gguf_lattice_raw_grouped_gate_up_sm70_out", torch::kCUDA,
            &gguf_lattice_raw_grouped_gate_up_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_dequantize_sm70_out(Tensor(a!) out, Tensor weight, int "
+      "source_type) -> ()");
+  ops.impl("gguf_lattice_raw_dequantize_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_dequantize_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_vec_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) partial, int splits=1, bool "
+      "prefetch=False, bool factor_scale=False) -> ()");
+  ops.impl("gguf_lattice_raw_vec_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_vec_sm70_out);
+  ops.def(
+      "gguf_lattice_raw_blas_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "weight, int source_type, Tensor(b!) scratch) -> ()");
+  ops.impl("gguf_lattice_raw_blas_sm70_out", torch::kCUDA,
+           &gguf_lattice_raw_blas_sm70_out);
   ops.def(
       "gguf_lattice_dequantize_sm70_out(Tensor(a!) out, Tensor weight, "
       "Tensor stats, int source_type, int group_size) -> ()");

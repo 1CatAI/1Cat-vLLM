@@ -57,7 +57,7 @@ struct LatticeRawDecoder {
   // so the reference FP32 product is exact too. One final half2 multiply
   // therefore matches FP32 dequantization followed by round-to-nearest half.
   // Float output and vector FMA still use the original FP32 scale formula.
-  template <class Output>
+  template <class Output, bool RoundedScale = false>
   __device__ static turbomind::Array<Output, 8> table_fragment(uint64_t packed,
                                                                uint32_t signs,
                                                                float d,
@@ -67,7 +67,7 @@ struct LatticeRawDecoder {
                               ? float(1 + 2 * nibble)
                               : (0.5f + nibble) * (Type == 18 ? 0.5f : 0.25f);
       const half2 factor = __float2half2_rn(small);
-      const half2 base = __float2half2_rn(d);
+      const half2 base = __float2half2_rn(RoundedScale ? d * small : d);
       turbomind::Array<half, 8> result;
 #pragma unroll
       for (int i = 0; i < 8; i += 2) {
@@ -78,7 +78,8 @@ struct LatticeRawDecoder {
         const uint32_t mask =
             (((signs >> i) & 1) << 15) | (((signs >> (i + 1)) & 1) << 31);
         (uint32_t&)values ^= mask;
-        const half2 exact_factor = __hmul2(values, factor);
+        const half2 exact_factor =
+            RoundedScale ? values : __hmul2(values, factor);
         (half2&)result[i] = __hmul2(exact_factor, base);
       }
       return result;
@@ -98,6 +99,9 @@ struct LatticeRawDecoder {
       const int nibble =
           (block[106 + base / 64] >> (4 * ((base / 32) % 2))) & 15;
       return d * (1 + 2 * nibble);
+    } else if constexpr (Type == 18) {
+      const int nibble = block[69 + 4 * (base / 32)] >> 4;
+      return (d * (0.5f + nibble)) * 0.5f;
     } else {
       const int nibble =
           (block[74 + base / 32] >> (4 * ((base / 16) % 2))) & 15;
@@ -111,7 +115,6 @@ struct LatticeRawDecoder {
   __device__ static turbomind::Array<Output, 8> fragment(const uint8_t* block,
                                                          int base,
                                                          const uint8_t* grid) {
-    static_assert(Type != 18 || ApplyScale);
     const float d = __half2float(*reinterpret_cast<const half*>(block));
     const int octet = base / 8;
     if constexpr (Type == 18) {
@@ -129,8 +132,13 @@ struct LatticeRawDecoder {
           *reinterpret_cast<const uint32_t*>(grid + block[2 + 2 * octet] * 4);
       const uint32_t b =
           *reinterpret_cast<const uint32_t*>(grid + block[3 + 2 * octet] * 4);
-      return table_fragment<Output>(a | (uint64_t(b) << 32), signs, d,
-                                    aux >> 28);
+      if constexpr (ApplyScale) {
+        return table_fragment<Output>(a | (uint64_t(b) << 32), signs, d,
+                                      aux >> 28);
+      } else {
+        static_assert(std::is_same_v<Output, float>);
+        return table_values(a | (uint64_t(b) << 32), signs, 1.f);
+      }
     }
     const uint8_t high = block[66 + base / 32];
     const uint8_t signs = block[(Type == 21 ? 74 : 34) + octet];
