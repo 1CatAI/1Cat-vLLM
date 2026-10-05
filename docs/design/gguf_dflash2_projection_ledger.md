@@ -14,7 +14,9 @@ TP4 on four NVLink-connected V100-SXM2-32GB GPUs; CUDA 12.8,
 Torch 2.10.0+cu128, Python 3.12.14, normal `dev41+g5620850f81` package.
 Input is exactly 1024 tokens, output budget 64, maximum length 32768,
 FP16 activation/KV, FP32 SSM and MMA accumulation, seven draft tokens,
-temperature 0.7, top-p 0.9, top-k 20, seed 123, thinking disabled.
+temperature 0.7, top-p 0.95, top-k 20, seed 123, thinking disabled.
+This historical trace fixture differs from the sixteen-prompt unprofiled
+comparison, which uses top-p 0.9.
 The four-GPU leases are held throughout capture. Power is 300W;
 every timed capture sample records 1290MHz SM and 877MHz memory.
 
