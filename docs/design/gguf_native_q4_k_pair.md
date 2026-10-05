@@ -85,3 +85,15 @@ are admitted only for SM70 FP16 M8/N4352/K5120 gate/up projections; all
 other shapes retain canonical fallback. The three layers save an estimated
 5.12–6.14us per M8 round, not an end-to-end measurement. Source-sized
 packing preserves 73,113,600 bytes of original weights per TP4 rank.
+
+The primary admitted IQ4_XS/IQ3_S regression passes at the same fixed
+1290/877MHz: layer 39 native58.368us versus canonical84.480–84.992us,
+and reverse layer 42 native59.392us versus canonical84.992–85.504us.
+Original payload is 21,411,840 bytes, giving 366.8/360.5GB/s. Relative
+L2 versus official FP32 GEMM is 0.000497–0.000534. Runtime-M and graph
+fallback checks pass for both already enabled orientations.
+
+With the three new Q4_K mixed layers, the original-byte gate/up route
+covers 29/64 layers: eight IQ3_S pairs and 21/40 mixed pairs. Mixed-pair
+source-byte coverage rises from 48.463% to 58.244%; the other nineteen
+mixed layers retain canonical dispatch.
