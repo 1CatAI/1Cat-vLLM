@@ -27,10 +27,10 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 }
 
 template <bool Activated>
-__global__ void gate_up(half* output, const Q8_1* activation,
-                        const int64_t* ids, const uint8_t* gate,
-                        const uint8_t* up, int n, int k, int stride,
-                        int top_k) {
+__global__ __launch_bounds__(128, 12) void gate_up(
+    half* output, const Q8_1* activation, const int64_t* ids,
+    const uint8_t* gate, const uint8_t* up, int n, int k, int stride,
+    int top_k) {
   __shared__ uint32_t book[IQ3SDot::kBookWords];
   __shared__ uint32_t masks[16];
   extern __shared__ Q8_1 shared_x[];

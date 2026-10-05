@@ -25,3 +25,39 @@ References: [llama.cpp integer dot](https://github.com/ggml-org/llama.cpp/blob/m
 [shared-expert fusion](https://github.com/ggml-org/llama.cpp/pull/29184).
 The original MIT licenses are packaged with the GGUF implementation. Strix
 wave tuning targets AMD and needs independent Volta measurements.
+
+## First IQ3_S measurements
+
+The initial whole-wheel implementation uses layer17's original IQ3_S rows,
+512 experts, TP4 local N160 and K2560. Random top10 routing touches49 unique
+experts at M5 and168 at M20. Activation inputs are synthetic FP16 normal
+samples with standard deviation0.125. Measurements use CUDA Graph replay,
+eight alternating candidate/control epochs and100 replays per epoch.
+The native control is the current original-block FP32 grouped vector dot;
+its activation gather and separate SiLU are prepared outside the timed region.
+The dp4a candidate includes direct routing and the FP16 SiLU/multiply boundary.
+
+| M | Native gate/up | dp4a fused | Q8_1 plus fused | Unique-source bandwidth |
+|---|---:|---:|---:|---:|
+|5|73.82us|42.85us|44.06us|403.94GB/s|
+|20|210.37us|120.90us|121.99us|490.90GB/s|
+
+M5 runs at1290MHz core and877MHz memory. M20 boosts to1530MHz in later
+epochs, so these rows are not a controlled clock comparison. The M5 result
+does **not** meet the450GB/s expansion gate. Its49 active experts contain
+17,310,720 bytes: the gate requires at most38.47us for this routing sample.
+One M5 combined epoch reached241us; it remains in the raw samples.
+Standalone quantization replay is host-starved and is not a reliable measure
+of its GPU cost; combined minus fused is approximately1.2us.
+
+The actual NVFP4 TP4 weights, prepared by the production converter, measure
+41.25us for plan plus W13 at M5. This is a separately quantized weight
+representation, not an output oracle. That comparator supports at most160
+routes and is explicitly omitted at M20 (200 routes).
+
+Nine focused GPU tests pass, including changed-input graph replay. On real
+IQ3_S rows the relative L2 error against official GGUF dequantization with
+the same Q8_1 activations is0.00020–0.00021; against the FP16-activation
+control it is0.0053–0.0054. These are projection measurements, not model
+KL, top1, acceptance or end-to-end latency evidence. No model dispatch is
+enabled by this initial result.

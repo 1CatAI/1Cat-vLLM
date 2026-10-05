@@ -27,7 +27,9 @@ def graph_time(operation, iterations):
         operation()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        operation()
+        # Amortize host replay submission even for the activation-only kernel.
+        for _ in range(16):
+            operation()
     for _ in range(10):
         graph.replay()
     start = torch.cuda.Event(enable_timing=True)
@@ -37,7 +39,7 @@ def graph_time(operation, iterations):
         graph.replay()
     end.record()
     end.synchronize()
-    return start.elapsed_time(end) * 1000 / iterations
+    return start.elapsed_time(end) * 1000 / (iterations * 16)
 
 
 def nvfp4_bank(model, layer, rank):
