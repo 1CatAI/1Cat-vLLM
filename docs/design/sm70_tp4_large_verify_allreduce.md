@@ -9,7 +9,7 @@ existing implementations. No new runtime option is required.
 Messages above 32 rows use 256 threads per CTA, with the existing 80-CTA grid
 and two-epoch protocol. Smaller-message launch geometry and accumulation order
 are unchanged. The maximum persistent IPC allocation grows by approximately
-2.6 MiB per rank; account for this allocation when sizing a nearly full device.
+2.5 MiB per rank; account for this allocation when sizing a nearly full device.
 
 ## Validation
 
