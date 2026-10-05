@@ -40,6 +40,8 @@ def main():
         "model_admission": False,
         "finite_score_contract": True,
         "producer_ctas": 144,
+        "cache_banks": 12,
+        "calls_per_graph": 12,
         "fixed_consumer_ctas": 7,
         "scope": (
             "selection/expansion/sparse attention/merge/gate; "
@@ -70,60 +72,107 @@ def main():
         requests = torch.zeros(m, device="cuda", dtype=torch.int32)
         seq_lens = torch.tensor([8192 + m], device="cuda", dtype=torch.int32)
 
-        def control():
-            torch.ops._C.qsa_lexicographic_topk(
-                scores, lengths, selected[0], 512, m == 5
+        banks = [
+            (
+                scores.clone(),
+                queries.clone(),
+                cache.clone(),
+                gate.clone(),
+                [torch.empty_like(t) for t in selected],
+                torch.empty_like(indices),
+                torch.empty_like(partial),
+                torch.empty_like(lse),
+                torch.zeros_like(flags),
+                torch.zeros_like(epochs),
+                [torch.empty_like(t) for t in outputs],
             )
-            qsa.expand_qsa_block_indices_cuda(
-                selected[0], positions, seq_lens, requests, 4, 2048, indices
-            )
-            qsa.qsa_sparse_paged_attention(
-                queries,
-                cache[:, 0].unsqueeze(2),
-                cache[:, 1].unsqueeze(2),
-                indices,
-                table,
-                requests,
-                outputs[0],
-                output_gate=gate,
-                query_positions=positions,
-                sequence_lengths=seq_lens,
-            )
+            for _ in range(12)
+        ]
 
-        def candidate():
-            extension.run(
+        def control():
+            for (
                 scores,
-                lengths,
                 queries,
                 cache,
-                table,
-                positions,
                 gate,
-                selected[1],
+                selected,
+                indices,
                 partial,
                 lse,
                 flags,
                 epochs,
-                outputs[1],
-            )
+                outputs,
+            ) in banks:
+                torch.ops._C.qsa_lexicographic_topk(
+                    scores, lengths, selected[0], 512, m == 5
+                )
+                qsa.expand_qsa_block_indices_cuda(
+                    selected[0], positions, seq_lens, requests, 4, 2048, indices
+                )
+                qsa.qsa_sparse_paged_attention(
+                    queries,
+                    cache[:, 0].unsqueeze(2),
+                    cache[:, 1].unsqueeze(2),
+                    indices,
+                    table,
+                    requests,
+                    outputs[0],
+                    output_gate=gate,
+                    query_positions=positions,
+                    sequence_lengths=seq_lens,
+                )
+
+        def candidate():
+            for (
+                scores,
+                queries,
+                cache,
+                gate,
+                selected,
+                indices,
+                partial,
+                lse,
+                flags,
+                epochs,
+                outputs,
+            ) in banks:
+                extension.run(
+                    scores,
+                    lengths,
+                    queries,
+                    cache,
+                    table,
+                    positions,
+                    gate,
+                    selected[1],
+                    partial,
+                    lse,
+                    flags,
+                    epochs,
+                    outputs[1],
+                )
 
         control()
         candidate()
         torch.cuda.synchronize()
-        errors = {
-            "selected_ids_equal": bool(torch.equal(selected[0], selected[1])),
-            "max_abs": float((outputs[0].float() - outputs[1].float()).abs().max()),
-            "rel_l2": float(
-                (outputs[0].float() - outputs[1].float()).norm()
-                / outputs[0].float().norm()
-            ),
-        }
+        errors = [
+            {
+                "selected_ids_equal": bool(torch.equal(bank[4][0], bank[4][1])),
+                "max_abs": float(
+                    (bank[10][0].float() - bank[10][1].float()).abs().max()
+                ),
+                "rel_l2": float(
+                    (bank[10][0].float() - bank[10][1].float()).norm()
+                    / bank[10][0].float().norm()
+                ),
+            }
+            for bank in banks
+        ]
         graphs = {}
         for name, fn in (("control", control), ("candidate", candidate)):
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(graph):
-                for _ in range(12):
-                    fn()
+                fn()
             graphs[name] = graph
         samples = {name: [] for name in graphs}
         for rep in range(7):
