@@ -5,15 +5,18 @@
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import torch
 import vllm._C as core
 
 import vllm
-from benchmarks.kernels.benchmark_gguf_q8_intermediate import cold_time
 from vllm.model_executor.layers.quantization.gguf_turbomind_moe import GGUFExpertBank
 from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+from benchmarks.kernels.benchmark_gguf_q8_intermediate import cold_time  # noqa: E402
 
 
 @torch.compile
