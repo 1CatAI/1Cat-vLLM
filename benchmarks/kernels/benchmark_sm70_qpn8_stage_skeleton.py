@@ -253,6 +253,7 @@ def main():
                 projection=name,
                 control_us=statistics.median(samples[0]),
                 fixed_shape_us=statistics.median(samples[1]),
+                paired_samples_us=samples,
                 full_output_bitwise_four_amplitudes=True,
             )
             rows.append(row)
