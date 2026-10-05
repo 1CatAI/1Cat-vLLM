@@ -1,5 +1,35 @@
 # Original IQ3_XXS/IQ4_XS gated pairs
 
+## Pure pairs on the shared-activation skeleton
+
+The same operator now supports IQ3_XXS/IQ3_XXS and IQ4_XS/IQ4_XS.
+Only the measured IQ3_XXS pair is admitted to model dispatch. Preparation
+also accepts its coalesced canonical projection, retaining the two original
+N4352 source boundaries and direct single-projection fallback for other M.
+
+On the primary V100 at 1290/877 MHz, CUDA 12.8 and Torch 2.10.0+cu128,
+actual TP4 M8/N4352/K5120 weights give these cold-L2 graph ABBA results:
+
+| Source pair | Layer | Native (µs) | Canonical (µs) | Source bytes/rank | Native GB/s | Decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| IQ3_XXS/IQ3_XXS | 3 | 58.368 / 58.368 | 67.584 / 68.608 | 17,059,840 | 292.28 | Admit |
+| IQ4_XS/IQ4_XS | 40 | 62.464 / 62.464 | 61.440 / 61.440 | 23,674,880 | 379.02 | Keep canonical |
+
+Both reader combinations pass three seeded comparisons against official
+GGUF FP32 dequantization and FP32 matrix products. Relative L2 error is
+0.000501–0.000533, below 0.001. FP32 scale products and accumulation remain
+unchanged. Runtime M512/8/1/5/16/20/32/8 and repeated graph checks pass;
+every non-M8 result is bitwise canonical.
+
+The IQ3_XXS pair occurs in twelve layers: 3, 4, 8, 10, 15, 19, 20, 21,
+29, 30, 31 and 32. Its operator timings imply an estimated 0.111–0.123 ms
+per M8 round; this is not an end-to-end measurement. Four pure IQ4_XS
+layers, 40, 43, 57 and 63, retain canonical. The twelve admitted layers
+retain 204,718,080 bytes of source-sized records per rank. Sixty-eight
+installed CPU capability, runtime-M and graph-export checks pass.
+
+## Earlier mixed-pair coverage
+
 Layers 26, 27 and 34 share the IQ3_XXS gate and IQ4_XS up combination at
 TP4 N4352/K5120. Their original payload is 20,367,360 bytes per rank and
 layer, and together they account for 8.174% of mixed gate/up bytes.

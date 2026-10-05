@@ -969,6 +969,15 @@ void gguf_native_pair_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor gate, torch::Tensor up,
                                int64_t gate_type, int64_t up_type);
 
+void gguf_native_linear_sm70_out(torch::Tensor out, torch::Tensor input,
+                                 torch::Tensor weight, int64_t source_type);
+
+void gguf_native_linear_n64_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor weight,
+                                     torch::Tensor partials,
+                                     torch::Tensor counters,
+                                     int64_t source_type);
+
 void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor ids,
                                      torch::Tensor route_weights,
@@ -989,3 +998,7 @@ void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
                        torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
                        torch::Tensor out, torch::Tensor lora_out,
                        torch::Tensor inj_out, int64_t warps);
+void gguf_canonical_linear_n64_sm70_out(
+    torch::Tensor output, torch::Tensor input, torch::Tensor weight,
+    torch::Tensor stats, torch::Tensor partials, torch::Tensor counters,
+    int64_t bits, int64_t group_size);

@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.gguf_native_pair import (
 @pytest.mark.parametrize(
     "types",
     [
+        (18, 18),
         (21, 23),
         (23, 21),
         (18, 21),
@@ -61,6 +62,7 @@ def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
 @pytest.mark.parametrize(
     "types",
     [
+        (18, 18),
         (21, 23),
         (23, 21),
         (18, 21),
@@ -170,6 +172,7 @@ def test_dynamic_compile_keeps_runtime_dispatch_opaque():
 @pytest.mark.parametrize(
     "types",
     [
+        (18, 18),
         (21, 23),
         (23, 21),
         (18, 21),
@@ -244,3 +247,43 @@ def test_registered_parameter_lists_support_aot_module_capture(types):
     with get_metrics_context():
         assert fullgraph_capture(layer, (x,), {}) is not None
     torch._dynamo.reset()
+
+
+def test_pure_pair_uses_single_merged_canonical_fallback(monkeypatch):
+    calls = []
+
+    def canonical(
+        x, code, stat, cache, family, decoder, group, kld, qld, n, logical, cb, bb
+    ):
+        calls.append((x.shape[0], decoder, n, cb, bb))
+        return x.new_full((x.shape[0], 8704), 2)
+
+    def silu(output, pair):
+        gate, up = pair.chunk(2, dim=-1)
+        output.copy_(torch.nn.functional.silu(gate) * up)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.gguf_native_pair._prepared_gguf_projection",
+        canonical,
+    )
+    monkeypatch.setattr(torch.ops._C, "silu_and_mul", silu, raising=False)
+    empty = torch.empty(0)
+    for m in (512, 1, 5, 16, 20, 32):
+        x = torch.empty(m, 5120, dtype=torch.float16)
+        out = _native_gated_pair(
+            x,
+            empty,
+            empty,
+            18,
+            18,
+            [empty],
+            [empty],
+            [None],
+            [2, 18, 32, 0, 0, 8704, 8704, 0, 2],
+            [],
+            [128, -1],
+        )
+        expected = torch.nn.functional.silu(torch.full_like(out, 2)) * 2
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert len(calls) == 6
+    assert all(c[1:] == (18, 8704, [], [128, -1]) for c in calls)
