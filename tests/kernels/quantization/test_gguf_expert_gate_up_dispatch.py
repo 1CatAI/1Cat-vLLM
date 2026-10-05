@@ -15,6 +15,10 @@ from vllm.model_executor.layers.quantization.gguf_turbomind_moe import (
 @pytest.mark.parametrize(
     "source,m,expected",
     [
+        (18, 1, "raw"),
+        (18, 5, "raw"),
+        (18, 20, "raw"),
+        (18, 512, "gemm"),
         (21, 1, "raw"),
         (21, 5, "raw"),
         (21, 20, "raw"),
@@ -62,7 +66,7 @@ def test_original_batch_controls_dispatch(monkeypatch, source, m, expected):
         16,
         n,
         top_k,
-        [1, 5, 20] if source == 21 else [1, 5],
+        [1, 5, 20] if source in (18, 21) else [1, 5],
         [],
     )
     assert calls == (["raw"] if expected == "raw" else ["gemm", "gemm"])
@@ -107,7 +111,7 @@ def test_canonical_vector_fallback_uses_routed_rows(monkeypatch):
     assert calls == ["vector", "vector"]
 
 
-@pytest.mark.parametrize("kind", [21, 22])
+@pytest.mark.parametrize("kind", [18, 21, 22])
 @pytest.mark.parametrize("rank", range(4))
 def test_expert_bank_retains_complete_tp_rows_and_counts_storage(
     monkeypatch, kind, rank
