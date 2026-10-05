@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
 from vllm.model_executor.kernels.gguf import native_gated_pair_capabilities
-from vllm.model_executor.layers.quantization.gguf_native_pair import _native_gated_pair
+from vllm.model_executor.layers.quantization.gguf_native_pair import (
+    _native_gated_pair,
+    apply_native_gated_pair,
+)
 
 
 @pytest.mark.parametrize("types", [(21, 23), (23, 21)])
@@ -113,4 +117,59 @@ def test_dynamic_compile_keeps_runtime_dispatch_opaque():
     assert len(graphs) == 1
     nodes = [node for node in graphs[0].graph.nodes if node.op == "call_function"]
     assert len(nodes) == 1 and "gguf_native_gated_pair" in str(nodes[0].target)
+    torch._dynamo.reset()
+
+
+def test_registered_parameter_lists_support_aot_module_capture():
+    class Projection(torch.nn.Module):
+        def __init__(self, source_type):
+            super().__init__()
+            self.kernel = SimpleNamespace(
+                config=SimpleNamespace(
+                    group_size=32, partition_weight_shape=(5120, 4352)
+                ),
+                source_type=source_type,
+                operator_capabilities=(),
+            )
+            self.codes = torch.nn.Parameter(
+                torch.empty(0, device="meta", dtype=torch.int32), False
+            )
+            self.stats = torch.nn.Parameter(
+                torch.empty(0, device="meta", dtype=torch.int64), False
+            )
+            self.fp16_cache = None
+            self.cache_capabilities = ()
+            self.gguf_tm_k_ld = self.gguf_tm_q_ld = 0
+            self.logical_output_size = 4352
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gguf_native_gated_records = torch.nn.ParameterList(
+                [
+                    torch.nn.Parameter(
+                        torch.empty(0, device="meta", dtype=torch.uint8), False
+                    )
+                    for _ in range(2)
+                ]
+            )
+            self.gguf_native_gated_types = (21, 23)
+            self.gguf_tm_projections = torch.nn.ModuleList(
+                [Projection(21), Projection(23)]
+            )
+
+        def forward(self, x):
+            return apply_native_gated_pair(self, x)
+
+    torch._dynamo.reset()
+    layer = Layer()
+    compiled = torch.compile(layer, backend="eager", fullgraph=True, dynamic=True)
+    for m in (512, 8, 16, 8):
+        x = torch.empty(m, 5120, dtype=torch.float16, device="meta")
+        assert compiled(x).shape == (m, 4352)
+    from torch._dynamo.convert_frame import fullgraph_capture
+    from torch._dynamo.utils import get_metrics_context
+
+    with get_metrics_context():
+        assert fullgraph_capture(layer, (x,), {}) is not None
     torch._dynamo.reset()

@@ -133,7 +133,9 @@ def prepare_native_gated_pair(layer, sources, projections, enabled: bool):
 def apply_native_gated_pair(layer, x):
     return torch.ops.vllm.gguf_native_gated_pair(
         x,
-        *layer.gguf_native_gated_records,
-        *layer.gguf_native_gated_types,
+        layer.gguf_native_gated_records[0],
+        layer.gguf_native_gated_records[1],
+        layer.gguf_native_gated_types[0],
+        layer.gguf_native_gated_types[1],
         *prepared_projection_arguments(layer.gguf_tm_projections),
     )
