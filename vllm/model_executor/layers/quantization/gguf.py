@@ -438,6 +438,44 @@ except AttributeError as error:
     raise error
 
 
+def _dequantize_gguf_rows(
+    quant: torch.Tensor,
+    qweight_type: int,
+    hidden_size: int,
+    dtype: torch.dtype | None = None,
+    native_enabled: bool = True,
+) -> torch.Tensor:
+    if qweight_type not in DEQUANT_TYPES | NATIVE_TYPES:
+        raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+    rows = quant.shape[0]
+    dequant = (
+        native_dequantize(quant, qweight_type, rows, hidden_size, dtype)
+        if native_enabled
+        else None
+    )
+    if dequant is None:
+        dequant = ops.ggml_dequantize(quant, qweight_type, hidden_size, rows, dtype)
+    return dequant
+
+
+def _dequantize_gguf_rows_fake(
+    quant: torch.Tensor,
+    qweight_type: int,
+    hidden_size: int,
+    dtype: torch.dtype | None = None,
+    native_enabled: bool = True,
+) -> torch.Tensor:
+    return torch.empty((quant.shape[0], hidden_size), dtype=dtype, device=quant.device)
+
+
+direct_register_custom_op(
+    op_name="dequantize_gguf_rows",
+    op_func=_dequantize_gguf_rows,
+    fake_impl=_dequantize_gguf_rows_fake,
+)
+dequantize_gguf_rows = torch.ops.vllm.dequantize_gguf_rows
+
+
 def _apply_gguf_embedding(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -453,15 +491,9 @@ def _apply_gguf_embedding(
         x_flat = x.flatten()
         assert hidden_size == qweight.shape[1] // type_size * block_size
         quant = torch.index_select(qweight, dim=0, index=x_flat)
-        dequant = (
-            native_dequantize(quant, qweight_type, x_flat.shape[0], hidden_size, dtype)
-            if native_enabled
-            else None
+        dequant = dequantize_gguf_rows(
+            quant, qweight_type, hidden_size, dtype, native_enabled
         )
-        if dequant is None:
-            dequant = ops.ggml_dequantize(
-                quant, qweight_type, hidden_size, x_flat.shape[0], dtype
-            )
         return dequant.view(*x.shape, hidden_size)
     else:
         qweight_type = WeightType(qweight_type)
