@@ -56,6 +56,13 @@ def _ddtree_worker_profile_enabled() -> bool:
 
 class DFlashProposer(SpecDecodeBaseProposer):
     @override
+    def _maybe_share_lm_head(self, target_language_model: torch.nn.Module) -> None:
+        super()._maybe_share_lm_head(target_language_model)
+        prepare_head = getattr(self.model, "prepare_sm70_nvfp4_draft_head", None)
+        if prepare_head is not None:
+            prepare_head()
+
+    @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
         if (
