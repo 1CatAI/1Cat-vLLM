@@ -38,6 +38,7 @@ def main() -> None:
             "draft-int8",
             "draft-int8-block32",
             "target-head-qpn8",
+            "target-top1",
         ),
     )
     parser.add_argument("--restoration-control", action="store_true")
@@ -213,6 +214,7 @@ def main() -> None:
             "draft-int8": "DraftExpertINT8CandidateWorker",
             "draft-int8-block32": "DraftExpertINT8Block32CandidateWorker",
             "target-head-qpn8": "TargetHeadQPN8CandidateWorker",
+            "target-top1": "TargetTop1CandidateWorker",
         }[args.structural_candidate]
         engine["worker_cls"] = (
             "benchmarks.sm70_mtp_reference_worker." + candidate_worker
@@ -513,7 +515,8 @@ def main() -> None:
             report["structural_route_proof"] = proof
             widths = (
                 {5}
-                if args.structural_candidate in ("shared", "target-head-qpn8")
+                if args.structural_candidate
+                in ("shared", "target-head-qpn8", "target-top1")
                 else {1, 5}
             )
             if len(proof) != 4 or any(

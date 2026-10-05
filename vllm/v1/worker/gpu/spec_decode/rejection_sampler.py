@@ -13,6 +13,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    greedy_rejection_from_top_tokens,
     rejection_sample,
 )
 
@@ -57,6 +58,26 @@ class RejectionSampler:
                 dtype=torch.float32,
                 device=device,
             )
+
+    def sample_from_top_tokens(
+        self, top_tokens: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """Greedy-only verification after the caller checks sampler eligibility."""
+        if self.rejection_sample_method != "standard":
+            raise ValueError("Compact top1 verification requires standard sampling")
+        sampled, num_sampled = greedy_rejection_from_top_tokens(
+            top_tokens,
+            input_batch.input_ids,
+            input_batch.logits_indices,
+            input_batch.cu_num_logits,
+            self.num_speculative_steps,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+        )
 
     def _get_logprobs_tensors(
         self,

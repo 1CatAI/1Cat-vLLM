@@ -954,3 +954,22 @@ is slower: M5 packed/direct/cooperative times 0.355451/0.551199/0.920535 ms,
 and M10 0.405699/0.576594/0.908068 ms. Remove the uncommitted cooperative
 implementation. Do not repeat either original-weight reader or enable one
 as a workaround for the C4 memory failure.
+
+The MRv2 target verifier still gathers dense vocabulary logits before greedy
+rejection, while ordinary decode already uses compact TP top1. Add a
+benchmark-only MTP4 verifier that reuses the same model top1 method and sampler
+eligibility gate, then performs prefix verification in one kernel. Keep the
+common sampled/rejected count postprocessing. Stochastic, synthetic, grammar,
+penalty, logprob and prefill cases retain the original sampler.
+
+Thirty GPU cases match the dense reference for valid output tokens and counts,
+including ragged/zero draft counts, rejection at every position, full acceptance,
+ties across vocabulary blocks and all-negative-infinity logits. Twenty-four CPU
+route/eligibility checks pass. An isolated graph screen, excluding head and TP
+communication, measures dense FP32-copy/rejection versus argmax/rejection at
+0.029716/0.016824 ms for five rows and 0.086456/0.030792 ms for twenty rows.
+Verification with existing top1 IDs alone takes 0.004157/0.004362 ms. These are
+sampling-only measurements, not complete-round improvements. Teacher forcing
+overrides the sampling method, so its distribution dumps cannot prove this
+verifier executed; natural-cohort route counts and exact operator comparisons
+are required before promotion.

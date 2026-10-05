@@ -11,6 +11,70 @@ from vllm.v1.worker.gpu.sample.gumbel import (
 
 
 @triton.jit
+def _greedy_rejection_from_top_tokens_kernel(
+    top_tokens_ptr,
+    input_ids_ptr,
+    logits_indices_ptr,
+    cu_num_logits_ptr,
+    sampled_ptr,
+    num_sampled_ptr,
+    NUM_STEPS: tl.constexpr,
+):
+    req = tl.program_id(0)
+    start = tl.load(cu_num_logits_ptr + req)
+    end = tl.load(cu_num_logits_ptr + req + 1)
+    num_draft = end - start - 1
+    active = True
+    count = 0
+    for step in tl.static_range(NUM_STEPS + 1):
+        token = tl.full((), -1, tl.int64)
+        if active and step <= num_draft:
+            token = tl.load(top_tokens_ptr + start + step).to(tl.int64)
+            count += 1
+            if step < num_draft:
+                input_idx = tl.load(logits_indices_ptr + start + step + 1)
+                proposal = tl.load(input_ids_ptr + input_idx).to(tl.int64)
+                active = token == proposal
+            else:
+                active = False
+        tl.store(sampled_ptr + req * (NUM_STEPS + 1) + step, token)
+    tl.store(num_sampled_ptr + req, count)
+
+
+def greedy_rejection_from_top_tokens(
+    top_tokens: torch.Tensor,
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_speculative_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accept a greedy prefix, then emit the target recovery or bonus token.
+
+    The caller must exclude synthetic/stochastic sampling and any transform
+    that can change argmax. This consumes existing global top1 IDs, so neither
+    full-vocabulary communication nor another logit reduction is needed.
+    """
+    if top_tokens.ndim != 1 or top_tokens.shape != logits_indices.shape:
+        raise ValueError("One global top1 ID is required for each logit row")
+    num_reqs = cu_num_logits.numel() - 1
+    sampled = top_tokens.new_empty(
+        (num_reqs, num_speculative_steps + 1), dtype=torch.int64
+    )
+    num_sampled = top_tokens.new_empty(num_reqs, dtype=torch.int32)
+    _greedy_rejection_from_top_tokens_kernel[(num_reqs,)](
+        top_tokens,
+        input_ids,
+        logits_indices,
+        cu_num_logits,
+        sampled,
+        num_sampled,
+        NUM_STEPS=num_speculative_steps,
+        num_warps=1,
+    )
+    return sampled, num_sampled
+
+
+@triton.jit
 def _compute_block_max_and_sumexp(logits):
     block_max = tl.max(logits, axis=0)
     block_sumexp = tl.where(

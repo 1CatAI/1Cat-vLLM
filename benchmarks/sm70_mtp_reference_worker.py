@@ -177,3 +177,12 @@ class TargetHeadQPN8CandidateWorker(Worker):
         prepare_target_head_qpn8_probe(
             self.model_runner.model, self.model_runner.speculator.model
         )
+
+
+class TargetTop1CandidateWorker(Worker):
+    """Research-only reuse of the existing greedy compact TP top1 path."""
+
+    def load_model(self, *, load_dummy_weights=False):
+        super().load_model(load_dummy_weights=load_dummy_weights)
+        self.model_runner._sm70_mtp_target_top1_probe = True
+        self.model_runner._sm70_mtp_target_top1_proof = {"calls": 0, "widths": set()}

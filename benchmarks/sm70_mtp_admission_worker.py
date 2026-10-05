@@ -9,7 +9,14 @@ class MtpAdmissionExtension:
             structural_route_proof,
         )
 
-        return structural_route_proof()
+        proof = structural_route_proof()
+        top1 = getattr(self.model_runner, "_sm70_mtp_target_top1_proof", None)
+        if top1 is not None:
+            proof["target-top1"] = {
+                "calls": top1["calls"],
+                "widths": sorted(top1["widths"]),
+            }
+        return proof
 
     def install_mtp_phase_events(self):
         from benchmarks.sm70_mtp_phase_events import install
