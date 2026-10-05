@@ -29,6 +29,11 @@ cluster unit. They do not treat4,800 output tokens as independent observations.
 The earlier large acceptance decrease is not reproduced on this set. Eight
 prompt clusters do not establish equivalence for all workloads.
 
+The individual 95% mean intervals are 34.789–58.168% for GGUF acceptance
+and 34.378–57.973% for NVFP4. Mean-length intervals are 2.3916–3.3267 and
+2.3751–3.3189 respectively. Prompt-to-prompt variation is much larger than
+the paired difference.
+
 ## Complete-round probes
 
 Separate synthetic probes respect exact token budgets and ignore EOS to keep
@@ -65,7 +70,26 @@ Subsequent model-input preparation expands this to100.99µs; actual replay
 entry reaches109.80µs. The post-attention tail is255–303µs, including201–230µs
 for model input preparation. This motivates moving independent position
 preparation before attention metadata while preserving current-stream order.
-The same-engine phase A/B and fresh graph-node difference ledger are pending.
+The same-engine phase comparison uses the ordinary wheel from `173fc0b97a`.
+All four C1 arms have identical complete output IDs; both C4 arms have
+identical IDs in all streams. Unobserved C1 round means change from24.3621ms
+late to23.9364ms early (35 middle intervals,171 tokens). C4 changes from
+49.2177 to48.9204ms (232 middle intervals,2171 tokens). This comparison does
+not mix different speculative trajectories.
+
+In38 matched middle observed rounds, median actual replay spread changes
+from547.455 to202.568µs. The early post-attention tail is45.5–50.9µs across
+ranks; the remaining spread already exists at attention preparation exit.
+Rank0's position-launch wall is620µs versus246–251µs on other ranks, and only
+rank0 handles asynchronous output materialization/serialization. Reordering
+hides that position launch but does not meet the100µs objective. Further
+diagnosis needs the attention-wait/output boundary. The observed arms have
+large scheduling outliers and do not replace unobserved speed measurements.
+
+The fresh graph-node ledger is pending. Nsight2024.6.2 fails during NCCL NVTX
+initialization before weights load. Its failed path is retained; a normal
+four-rank NCCL initialization succeeds under Nsight2026.2.1. Neither failure
+nor graph-node service time supplies an unprofiled performance result.
 
 ## Prepared GGUF coverage
 
