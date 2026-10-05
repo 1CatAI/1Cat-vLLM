@@ -192,18 +192,21 @@ def main():
     cuda_source = args.source_root / "csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu"
     generated = args.out / "qpn2-stage-skeleton.cu"
     generated.write_text(source_for_screen(cuda_source, args.decoder))
+    extension_name = "round12_qpn2_stage_skeleton"
+    if args.decoder != "production":
+        # Pybind caches modules by exported name. Give candidate DSOs distinct
+        # names so a paired process cannot accidentally reuse the control.
+        extension_name += "_" + args.decoder
     if args.extension is None:
         extension = load(
-            name="round12_qpn2_stage_skeleton",
+            name=extension_name,
             sources=[str(generated)],
             extra_include_paths=[str(cuda_source.parent)],
             extra_cuda_cflags=["-O3", "-lineinfo"],
             verbose=True,
         )
     else:
-        spec = importlib.util.spec_from_file_location(
-            "round12_qpn2_stage_skeleton", args.extension
-        )
+        spec = importlib.util.spec_from_file_location(extension_name, args.extension)
         assert spec is not None and spec.loader is not None
         extension = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(extension)
