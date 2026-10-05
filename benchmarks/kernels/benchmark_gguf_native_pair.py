@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--prototype-q4-k", action="store_true")
     parser.add_argument("--prototype-iq3xxs-iq4", action="store_true")
     parser.add_argument("--prototype-iq2-s", action="store_true")
+    parser.add_argument("--prototype-iq2-xs", action="store_true")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -47,6 +48,7 @@ def main():
                 args.prototype_q4_k,
                 args.prototype_iq3xxs_iq4,
                 args.prototype_iq2_s,
+                args.prototype_iq2_xs,
             )
         )
         <= 1
@@ -61,7 +63,9 @@ def main():
         names = [f"blk.{layer}.ffn_{role}.weight" for role in ("gate", "up")]
         types = [int(tensors[name].tensor_type) for name in names]
         allowed = (
-            ((22, 21), (21, 22), (22, 18), (18, 22))
+            ((17, 18), (22, 17))
+            if args.prototype_iq2_xs
+            else ((22, 21), (21, 22), (22, 18), (18, 22))
             if args.prototype_iq2_s
             else ((18, 23),)
             if args.prototype_iq3xxs_iq4
@@ -83,6 +87,8 @@ def main():
                 (21, 22),
                 (22, 18),
                 (18, 22),
+                (17, 18),
+                (22, 17),
             )
         )
         assert tuple(types) in allowed, types
@@ -99,6 +105,7 @@ def main():
             or args.prototype_q4_k
             or args.prototype_iq3xxs_iq4
             or args.prototype_iq2_s
+            or args.prototype_iq2_xs
         ):
             from vllm.model_executor.layers.quantization.gguf_iq3_records import (
                 signed_index_records,
@@ -108,12 +115,16 @@ def main():
             )
 
             packers = {18: pack_iq3_xxs_records, 21: signed_index_records}
-            if args.prototype_iq2_s:
+            if args.prototype_iq2_s or args.prototype_iq2_xs:
                 from vllm.model_executor.layers.quantization.gguf_iq2_s_records import (
                     pack_iq2_s_records,
                 )
 
                 packers[22] = pack_iq2_s_records
+            if args.prototype_iq2_xs:
+                from vllm.model_executor.layers.quantization import gguf_iq2_xs_records
+
+                packers[17] = gguf_iq2_xs_records.pack_iq2_xs_records
             if args.prototype_q4_k or args.prototype_iq3xxs_iq4:
                 from vllm.model_executor.layers.quantization.gguf_iq4_native import (
                     pack_iq4_xs_records,

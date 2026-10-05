@@ -30,6 +30,8 @@ from vllm.model_executor.layers.quantization.gguf_native_pair import (
         (21, 22),
         (22, 18),
         (18, 22),
+        (17, 18),
+        (22, 17),
     ],
 )
 def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
@@ -68,6 +70,8 @@ def test_capabilities_admit_only_measured_mixed_pairs(monkeypatch, types):
         (21, 22),
         (22, 18),
         (18, 22),
+        (17, 18),
+        (22, 17),
     ],
 )
 def test_runtime_m_preserves_mixed_canonical_policy(monkeypatch, types):
@@ -171,6 +175,8 @@ def test_dynamic_compile_keeps_runtime_dispatch_opaque():
         (21, 22),
         (22, 18),
         (18, 22),
+        (17, 18),
+        (22, 17),
     ],
 )
 def test_registered_parameter_lists_support_aot_module_capture(types):
