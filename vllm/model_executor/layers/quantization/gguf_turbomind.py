@@ -232,7 +232,9 @@ direct_register_custom_op(
 
 def mixed_projection_capabilities(projections):
     """Declare output-view eligibility independently of quantization family."""
-    if len(projections) < 2:
+    if len(projections) < 2 or any(p.kernel is None for p in projections):
+        # An imported fallback format may not have a canonical family at all.
+        # Its existing projection admission carries the rejection reason.
         return ()
     capabilities = []
     for projection in projections:
