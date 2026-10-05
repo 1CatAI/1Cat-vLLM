@@ -35,8 +35,10 @@ C4 short concurrency must not regress.
 ## Rebuild the baseline before optimization
 
 The campaign has been rebased onto current main. #831 and #832 are merged;
-PRs #859 and #885 were still open when checked on 2026-10-05. Record their actual
-merge state rather than treating either candidate as a main dependency.
+The rebuilt baseline records the main SHA below. A subsequent merge of main
+at `6ae4c0c1c9` includes #885's CPU mapped-result reader and earlier draft-input
+preparation. Preserve source identities instead of attributing later results
+to the original baseline.
 Include #914's batched PLE n-gram implementation. Freeze the final main SHA
 before recording any new timings. The previous 22--24-ms results are historical
 and cannot establish the new baseline.
@@ -775,3 +777,31 @@ unquantized ColumnParallelLinear projections and a single feature gather.
 Other devices, quantized or LoRA wrappers, batch-invariant mode and large
 prefill retain the original path. Nine CPU FC/stage-local tests pass. This
 0.055337-ms operator gain remains separate from complete-round admission.
+
+### Draft expert QPN8 model rejection and independent shortlist
+
+The grouped draft expert QPN8 candidate completes all sixteen teacher-forcing
+cases with actual opaque-op execution proved on every TP rank. Target logits
+are unchanged. Across 2,176 draft positions, mean/p99/maximum KL are
+0.00029649/0.00472838/0.09147594 and top1 agreement is 99.8162%. Maximum KL
+fails the shared 0.05 limit; maximum logit error is recorded only. The largest
+case is `chinese/2`. Twelve automatic quality tasks pass and all sixteen
+outputs finish naturally, but the frozen eight-by-600-token acceptance falls
+from 50.2035% to 46.2315% (minus 3.9721 percentage points). This candidate stays
+disabled. Its 20.6926/20.8012/20.7786-ms fixed-input measurements cannot be
+reported as admitted default performance.
+
+The latest valid default fixed-input mean remains 21.244033 ms, from 963
+rounds and three repetitions within one engine. Its eight-prompt acceptance
+is 50.2035%. The original main baseline remains 23.215921 ms, and the alleged
+1.35-ms regression investigation is closed.
+
+An independent target-output shortlist has 32,768 global token IDs, built from
+32 training prompts disjoint from the evaluation cohort (18,358 output IDs).
+The frozen language weights are English 0.40, Chinese 0.40, code 0.15,
+Japanese 0.025 and Korean 0.025; within each language, target-output frequency
+has weight 0.70 and corpus frequency 0.30. Special tokens are retained.
+Coverage is descriptive only. Compare its head against the current parallel
+full-head selector, and admit only a head-time reduction plus at most one
+percentage point of acceptance loss on the frozen eight-by-600 cohort.
+The earlier corpus-only 32K and 64K candidates remain rejected.
