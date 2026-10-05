@@ -1,0 +1,214 @@
+{
+  "prototype_source": "9da4442bcab135676f63304bf8446c027b7e2eb9",
+  "benchmark_source": "5ed74d13e6",
+  "screening": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "cases": [
+      {
+        "layer": 5,
+        "role": "down",
+        "source_types": [
+          23
+        ],
+        "n": 5120,
+        "k": 4352,
+        "source_bytes": 11837440,
+        "candidate_weight_stream_bytes": 12533760,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.000375677045667544,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.00037407479248940945,
+            "max_abs": 0.001953125
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0003704658302012831,
+            "max_abs": 0.001953125
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 39.93599861860275,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 40.95999896526337,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 28,
+        "role": "down",
+        "source_types": [
+          12
+        ],
+        "n": 5120,
+        "k": 4352,
+        "source_bytes": 12533760,
+        "candidate_weight_stream_bytes": 13926400,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0007296151597984135,
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0007445550290867686,
+            "max_abs": 0.0029296875
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0007213649805635214,
+            "max_abs": 0.0029296875
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 34.81600061058998,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 38.91199827194214,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 34.81600061058998,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      },
+      {
+        "layer": 40,
+        "role": "pair",
+        "source_types": [
+          23,
+          23
+        ],
+        "n": 4352,
+        "k": 5120,
+        "source_bytes": 23674880,
+        "candidate_weight_stream_bytes": 25067520,
+        "checks": [
+          {
+            "seed": 131,
+            "relative_l2": 0.0005807412089779973,
+            "max_abs": 0.00390625
+          },
+          {
+            "seed": 132,
+            "relative_l2": 0.0005937577225267887,
+            "max_abs": 0.005859375
+          },
+          {
+            "seed": 133,
+            "relative_l2": 0.0005740343476645648,
+            "max_abs": 0.00390625
+          }
+        ],
+        "timings": [
+          {
+            "route": "canonical",
+            "us": 60.416001826524734,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 63.48799914121628,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "candidate",
+            "us": 63.48799914121628,
+            "clock": "1290, 877, 300.00"
+          },
+          {
+            "route": "canonical",
+            "us": 60.92800013720989,
+            "clock": "1290, 877, 300.00"
+          }
+        ]
+      }
+    ],
+    "complete": true
+  },
+  "lossless_expansion_budget": {
+    "scope": "Counterfactual projection-only lossless U4+FP32 per-group coefficient stream; no allocation or model route created; group assumption requires codec validation for each type; source retained in addition to this new stream",
+    "by_type": {
+      "22": {
+        "tensors": 16,
+        "source_bytes_per_rank": 98242560,
+        "expanded_bytes_per_rank": 230031360,
+        "additional_bytes_per_rank": 131788800
+      },
+      "17": {
+        "tensors": 9,
+        "source_bytes_per_rank": 55316480,
+        "expanded_bytes_per_rank": 143523840,
+        "additional_bytes_per_rank": 88207360
+      },
+      "16": {
+        "tensors": 5,
+        "source_bytes_per_rank": 24668160,
+        "expanded_bytes_per_rank": 59801600,
+        "additional_bytes_per_rank": 35133440
+      },
+      "18": {
+        "tensors": 78,
+        "source_bytes_per_rank": 518819840,
+        "expanded_bytes_per_rank": 847052800,
+        "additional_bytes_per_rank": 328232960
+      },
+      "21": {
+        "tensors": 144,
+        "source_bytes_per_rank": 910694400,
+        "expanded_bytes_per_rank": 1324646400,
+        "additional_bytes_per_rank": 413952000
+      },
+      "29": {
+        "tensors": 1,
+        "source_bytes_per_rank": 4874240,
+        "expanded_bytes_per_rank": 16711680,
+        "additional_bytes_per_rank": 11837440
+      }
+    },
+    "extra_if_source_replaced_bytes_per_rank": 1009152000,
+    "extra_if_source_retained_bytes_per_rank": 2621767680,
+    "profiled_allocated_bytes_per_rank": 30005748224,
+    "group_sizes": {
+      "16": 32,
+      "17": 16,
+      "18": 32,
+      "21": 32,
+      "22": 16,
+      "29": 16
+    }
+  },
+  "decision": "No model admission; all candidates lose to canonical; original routes retained; prototype source remains reproducible in commit history"
+}
