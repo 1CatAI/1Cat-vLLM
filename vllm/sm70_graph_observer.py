@@ -206,6 +206,9 @@ class GraphParityWorkerExtension:
 
         @wraps(original)
         def diagnosed(*args, **kwargs):
+            batch = args[0] if args else kwargs["input_batch"]
+            if batch.num_tokens != 5 or batch.num_reqs != 1:
+                return original(*args, **kwargs)
             state.prepare_attn = original
             with TransferDiagnosis():
                 return original(*args, **kwargs)
