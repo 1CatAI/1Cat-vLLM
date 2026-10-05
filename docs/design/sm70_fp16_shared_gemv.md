@@ -309,3 +309,25 @@ remain FP32; no FP64 arithmetic is introduced in the kernel. Regressions
 cover both signs, subnormal and overflow boundaries. This revised candidate
 remains research-only until the real-activation and installed-source gates
 are rerun; previous compensated timings do not qualify this revision.
+
+## Final requalification: closed for C1 regression
+
+The source-complete midpoint-correction artifact at
+`811e68c58f80db3f3866232f6f595635db6f8f38` passes all 384 real-activation
+FP64 comparisons. Weights and activations remain FP16, with FP32 accumulation.
+Three seed bases (4201, 5201, 6201) use the same frozen prompts in both arms.
+
+| Quality category | Baseline passes | Candidate passes | Baseline unhealthy | Candidate unhealthy |
+|---|---:|---:|---:|---:|
+| Chinese QA | 24/24 | 24/24 | 0 | 0 |
+| GSM8K | 36/36 | 36/36 | 0 | 0 |
+| MBPP | 35/36 | 36/36 | 1 | 0 |
+| Needle retrieval, including 128K and 258048 tokens | 12/12 | 12/12 | 0 | 0 |
+
+The matched six-sample C1 medians are **10.94638 ms/token baseline and
+11.14966 ms/token candidate**: a 0.20327-ms (1.86%) regression. The required
+positive C1 gate fails even though numerical and quality gates pass. Both CI
+checks pass on the measured source head. PR #859 is closed without merging.
+Earlier faster timings belong to different arithmetic revisions and must not
+be substituted for this result. Preserve the midpoint correction for future
+fusion work, without promoting this standalone adapter.
