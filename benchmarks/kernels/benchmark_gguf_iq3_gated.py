@@ -127,6 +127,11 @@ def main():
             }
         )
     flush = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    canonical_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for projection in projections
+        for tensor in (projection.codes, projection.stats)
+    )
     samples = []
     for label, call in (
         ("canonical", lambda: canonical(x)),
@@ -136,12 +141,19 @@ def main():
     ):
         before = clocks()
         us = cold_graph(call, flush)
+        packed_bytes = (
+            sum(data.nbytes for data in payload)
+            if label == "native_pair"
+            else canonical_bytes
+        )
         samples.append(
             {
                 "route": label,
                 "median_us": us,
                 "source_bytes": sum(data.nbytes for data in payload),
                 "source_gbps": sum(data.nbytes for data in payload) / us / 1000,
+                "packed_weight_bytes": packed_bytes,
+                "packed_weight_gbps": packed_bytes / us / 1000,
                 "clocks_before": before,
                 "clocks_after": clocks(),
             }

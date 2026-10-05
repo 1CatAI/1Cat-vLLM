@@ -1,7 +1,10 @@
 # IQ3_S gated-pair dispatch on SM70
 
-Merged GGUF gate/up projections previously launched two canonical GEMMs,
-concatenated their outputs, and launched SiLU/multiply. The calibrated IQ3_S
+Mixed GGUF gate/up projections launch separate canonical GEMMs and concatenate
+their outputs before SiLU/multiply. Latest main already coalesces adjacent
+same-type projections into one canonical GEMM; an IQ3_S pair therefore retains
+that N8704 fallback, rather than splitting it back into two N4352 GEMMs.
+The calibrated IQ3_S
 pair reads the source-sized lossless records and performs FP32 MMA,
 FP32 split-K reduction, and the existing FP16 projection/activation rounding
 in one launch.
@@ -29,7 +32,8 @@ Random blocks, disabled/missing capability conditions, mixed types,
 uncalibrated dimensions, FP16 policy and actual-M fallback are tested.
 A single dynamic compilation covers M=512/8/16/512 and keeps exactly one
 opaque gated-pair node. The existing runtime projection tests are rerun.
-Six targeted CPU tests passed with Torch 2.10 / CUDA 12.8.
+Thirteen targeted CPU tests passed with Torch 2.10 / CUDA 12.8, including the
+coalesced canonical fallback, M32, runtime projection and IQ4 layout checks.
 
 The public nibble-book decoder uses exact signed lookup and half unpacking;
 the existing raw lattice device API remains intact. The original d and small scale
@@ -37,7 +41,7 @@ remain separate. The reference forms GGUF weights using the official reader,
 and forms projection products with FP32 GEMM. Projection results and SiLU
 round to FP16 as in the existing path; the dot products and reduction remain
 FP32. A new packaged-operator benchmark checks native M8 and canonical
-M1/M16/M512 before comparing cold-L2 graph medians in ABBA order.
+M1/M16/M32/M512 before comparing cold-L2 graph medians in ABBA order.
 
 ## Research measurements
 
@@ -82,6 +86,10 @@ all counters reset correctly across the 84-sample graph replay. These
 variants are slower and are not admitted. No separate reduction launch was
 introduced.
 
+The original 76–81us canonical comparison used separate projections. The
+packaged comparison measures latest main’s coalesced N8704 canonical GEMM
+plus SiLU; it must pass independently before the native pair is admitted.
+
 Only eight layers have two IQ3_S FFN projections. Their source byte share is
 12.765% of all gate/up pairs. A 62.5us pair versus the recorded 76–81us
 canonical pair saves about 13.5–18.5us per eligible layer, approximately
@@ -89,6 +97,49 @@ canonical pair saves about 13.5–18.5us per eligible layer, approximately
 not a measured full-round saving. The 40 mixed-type pairs account for
 62.286% of pair bytes; see the complete
 [source inventory](gguf_qwen38_iq3s_source_inventory.md).
+
+## Packaged operator and latest-main baseline
+
+Normal source-built wheel `1.5.2.dev13+g1997e1bb24.precompiled`, Torch 2.10,
+CUDA 12.8, passes the installed-operator check on a V100 SXM2 32GB.
+Both installed native modules match their wheel members. No private library
+or source overlay is used. M1/M16/M32/M512 fallback outputs are bitwise equal
+to the existing coalesced canonical path. Against official FP32 GGUF weights
+and FP32 GEMM, native M8 relative L2 is 0.000497/0.000516 on two independent
+inputs; maximum absolute errors are 0.00390625/0.0078125. Canonical fallback
+relative L2 is 0.000615–0.000628.
+
+This secondary machine ran at SM/memory 1530/877MHz and 300W, whereas the
+research table used 1290/877MHz. Do not compare the two timing tables across
+clocks. Within its single ABBA session, the packaged canonical N8704 GEMM
+plus SiLU took 62.464us in both arms, versus 45.056us in both native arms.
+Native source-payload bandwidth is 425.0GB/s. This is installed-package
+validation; the primary-machine operator comparison remains pending.
+
+Latest-main baseline source `0e359c87d315931b89b7d5a774927f212d57f3b1`
+uses its normal `dev11+g0e359c87d3` wheel on four fully connected V100s,
+TP4, 300W, steady SM/memory 1290/877MHz, FP16 KV/operands and FP32 SSM.
+The target and Q8_0 DFlash2 checkpoints match the recorded hashes. Maximum
+length is 262144, batched tokens 1024, maximum sequences four, prefix cache
+off, Flash-V100, CUDA graph, seven probabilistic draft proposals, temperature
+0.7/top-p0.9/top-k20/seed123, thinking off. Eight fixed 600-token speed
+requests per input length explicitly ignore EOS; the separate natural C4
+smoke has a 96-token limit. Prompt token IDs and sampling equal the previous
+baseline. First twenty rounds are excluded per prompt.
+
+| Input | Full-round mean | Emitted tokens/round | Emitted 95% prompt-bootstrap interval | TTFT |
+| --- | ---: | ---: | --- | ---: |
+| 1024 | 34.173ms | 2.962 | 2.846–3.091 | 330.996ms |
+| 8192 | 35.292ms | 2.974 | 2.790–3.167 | 2669.433ms |
+
+Intervals use 10,000 whole-prompt resamples. Counter-based bonus-plus-accepted
+means are 2.959 and 2.958; they are distinct from observed emitted batches.
+TTFT includes prefill and scheduling; pure prefill is not measured separately.
+C4 completes four nonempty reasonable answers in 4.688s; all reach the chosen
+96-token limit. It is a smoke, not a matched concurrency throughput claim.
+The previous round means were 34.940/35.398ms. The latest graph-boundary
+trace is queued to explain remaining service and gaps; no 25ms prediction
+is presented as a measured result.
 
 ## Activation traffic
 
@@ -125,6 +176,7 @@ checks runtime canonical fallbacks. Acquire the shared GPU lock and the
 selected device lock before running it. The complete source inventory is
 reproducible with `benchmark_gguf_quantization_inventory.py`.
 
-Latest-main end-to-end baseline, graph-boundary ledger and clean packaged
-operator measurements are pending the normal CUDA build. No new
-end-to-end claim is made from these research timings.
+Latest-main end-to-end and secondary-machine packaged operator checks are
+recorded above. The primary-machine operator comparison, graph-boundary ledger
+and native-route natural termination check are pending. No end-to-end gain is
+claimed from isolated operator timings.
